@@ -26,9 +26,9 @@ evaluate.
 
 | Platform | Backend | State |
 |---|---|---|
-| Windows | D3D12 / Vulkan | Working |
-| Linux | Vulkan | Should work; not yet tested by the author |
-| macOS | Metal | Should work; not yet tested by the author |
+| Windows | D3D12 / Vulkan | Working; run interactively |
+| Linux | Vulkan | Builds and tests pass in CI; not yet run interactively |
+| macOS | Metal | Builds and tests pass in CI; not yet run interactively |
 | Android | Vulkan | Architecture is ready, build scaffolding is not written |
 | iOS / iPadOS | Metal | Architecture is ready, build scaffolding is not written |
 
