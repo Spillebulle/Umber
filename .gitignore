@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Android
+/platform/android/.gradle
+/platform/android/build
+/platform/android/local.properties
+/platform/android/app/build
+
+# iOS / Xcode
+/platform/ios/build
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store

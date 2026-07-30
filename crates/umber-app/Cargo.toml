@@ -1,0 +1,29 @@
+[package]
+name = "umber-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib is what Android's JNI loader and the iOS static link both consume;
+# rlib keeps the desktop binary linking normally.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+umber-core = { workspace = true }
+umber-render = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+glam = { workspace = true }
+pollster = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { workspace = true, features = ["android-native-activity"] }
+android_logger = "0.15"
