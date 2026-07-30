@@ -4,7 +4,7 @@ use crate::editor::{Editor, Interaction};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
-use umber_core::{Brush, BrushMode, Camera, PixelPatch};
+use umber_core::{Brush, BrushMode, Camera, Dab, InputPoint, PixelPatch};
 use umber_render::{CanvasRenderer, Gpu};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -57,29 +57,40 @@ impl UmberApp {
         self.editor.stroke.end();
         self.editor.interaction = Interaction::Idle;
 
+        let mut enc = gfx
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("finish-stroke"),
+            });
+
+        // Dabs produced since the last frame are still queued — pointer events
+        // arrive far faster than frames. They have to reach the scratch texture
+        // before it is committed, or the tail of the stroke is left behind: it
+        // reappears as a live preview on the next frame (the stroke "hangs"),
+        // and then gets baked in by the *next* stroke's commit, wearing that
+        // stroke's colour and opacity.
+        let tail: Vec<Dab> = self.editor.stroke.drain_pending().collect();
+        if !tail.is_empty() {
+            gfx.canvas.begin_frame();
+            gfx.canvas.draw_dabs(&gfx.gpu.queue, &mut enc, &tail);
+        }
+
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
             // Stroke fell entirely outside the canvas — nothing to commit, but
             // the scratch surface may still hold dabs.
-            let mut enc = gfx
-                .gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             gfx.canvas.clear_stroke(&mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
             return;
         };
 
+        // Capture undo state first. `read_layer_rect` submits and blocks on its
+        // own encoder, so it observes the layer before `enc` commits anything.
         let before = gfx
             .canvas
             .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, rect);
         self.editor.history.record(PixelPatch::new(rect, before));
 
-        let mut enc = gfx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("commit-stroke"),
-            });
         gfx.canvas.commit_stroke(
             &gfx.gpu.queue,
             &mut enc,
@@ -102,6 +113,9 @@ impl UmberApp {
             return;
         }
         self.editor.stroke.end();
+        // Unlike a normal finish, these are dropped rather than flushed — the
+        // whole point is that nothing from this gesture reaches the canvas.
+        self.editor.stroke.clear_pending();
         self.editor.interaction = Interaction::Idle;
 
         let mut enc = gfx
@@ -112,6 +126,27 @@ impl UmberApp {
             });
         gfx.canvas.clear_stroke(&mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
+    }
+
+    /// Begin a stroke, guaranteeing the scratch surface starts empty.
+    ///
+    /// Every path that ends a stroke already clears the scratch, so this is
+    /// belt-and-braces — but stale coverage leaking into a new stroke is
+    /// precisely the failure this module has already been bitten by, and it
+    /// presents as a mystery colour change rather than as anything obvious.
+    fn start_stroke(&mut self, point: InputPoint) {
+        self.editor.begin_stroke(point);
+
+        if let Some(gfx) = self.gfx.as_ref() {
+            let mut enc = gfx
+                .gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("begin-stroke"),
+                });
+            gfx.canvas.clear_stroke(&mut enc);
+            gfx.gpu.queue.submit(Some(enc.finish()));
+        }
     }
 
     fn undo(&mut self) {
@@ -516,7 +551,7 @@ impl ApplicationHandler for UmberApp {
                         let pos = self.editor.cursor;
                         self.editor.last_cursor = pos;
                         let point = self.editor.sample(pos, viewport, None);
-                        self.editor.begin_stroke(point);
+                        self.start_stroke(point);
                     } else if !pressed {
                         self.finish_stroke();
                     }
@@ -556,7 +591,7 @@ impl ApplicationHandler for UmberApp {
                             self.editor.cursor = pos;
                             self.editor.last_cursor = pos;
                             let point = self.editor.sample(pos, viewport, reported);
-                            self.editor.begin_stroke(point);
+                            self.start_stroke(point);
                             self.editor.drawing_touch = Some(touch.id);
                         } else {
                             // A second finger means the gesture was a pinch,

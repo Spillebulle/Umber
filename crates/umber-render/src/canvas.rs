@@ -6,9 +6,15 @@ use glam::{UVec2, Vec2};
 use umber_core::{BrushMode, Camera, Color, Dab, PixelRect};
 use wgpu::util::DeviceExt;
 
-/// Layer storage format. Linear (not `Srgb`) because blending must happen in
-/// linear space; the surface handles display encoding.
-const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Layer storage format.
+///
+/// `Srgb`, despite the engine working in linear throughout, because eight bits
+/// of *linear* storage spends nearly all its precision on highlights: a dark
+/// ink at linear 0.0056 lands on 1–2 of 255, so dark tones band badly and drift
+/// a couple of sRGB levels between the float preview and the stored result. An
+/// sRGB-typed target distributes precision perceptually. Blending stays correct
+/// — the hardware decodes to linear, blends, and re-encodes on write.
+const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// The stroke scratch only needs coverage, so one channel instead of four —
 /// a 4x saving on the bandwidth of the hottest texture in the frame.
 const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;

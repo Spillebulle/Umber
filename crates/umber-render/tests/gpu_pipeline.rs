@@ -178,6 +178,31 @@ fn commit_clears_the_scratch_surface() {
 }
 
 #[test]
+fn a_dark_colour_survives_the_round_trip_to_the_layer() {
+    // The live preview computes in float, but the committed result has to
+    // survive 8 bits of layer storage. Storing *linear* values in 8 bits spends
+    // almost all its precision on highlights: the default brush colour is
+    // sRGB 20, which is linear 0.0056, or 1.4/255 — it quantises to 1 and reads
+    // back as sRGB 13. That is a visible jump in colour the moment the pointer
+    // is released, and it is worst for exactly the dark colours people draw
+    // with. An sRGB-encoded layer distributes precision perceptually instead.
+    let mut h = harness_or_skip!();
+
+    let ink = Color::from_srgb_u8(20, 20, 24, 255);
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(ink, 1.0, BrushMode::Paint);
+
+    // The layer is sRGB-encoded, so the bytes read back are directly
+    // comparable to the sRGB values that went in.
+    let px = h.pixel(32, 32);
+    assert_eq!(px[3], 255, "should be fully opaque");
+    assert!(
+        px[0].abs_diff(20) <= 2 && px[2].abs_diff(24) <= 2,
+        "committed colour drifted from sRGB (20, 20, 24): got {px:?}"
+    );
+}
+
+#[test]
 fn layer_readback_and_writeback_round_trip() {
     let mut h = harness_or_skip!();
 

@@ -171,6 +171,14 @@ impl StrokeBuilder {
         self.pending.len()
     }
 
+    /// Drop dabs that have not been handed to the renderer.
+    ///
+    /// Only for abandoning a stroke. On a normal finish the pending dabs must
+    /// be *flushed*, not dropped — they are the tail of the stroke.
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
     fn emit(&mut self, pos: Vec2, pressure: f32) {
         let radius = self.brush.radius_at(pressure);
         let coverage = self.brush.coverage_at(pressure);
@@ -270,6 +278,43 @@ mod tests {
         let before = s.pending_len();
         s.extend(InputPoint::new(Vec2::ZERO, 1.0, 0.01));
         assert_eq!(s.pending_len(), before);
+    }
+
+    #[test]
+    fn ending_a_stroke_keeps_its_tail_pending() {
+        // The renderer drains pending dabs once per frame, but pointer events
+        // arrive far more often than frames. Whatever is still pending when the
+        // stroke ends is its tail, and it must survive `end()` so the caller
+        // can flush it into the scratch texture before committing.
+        //
+        // Dropping it here was a real bug: the tail stayed as stale coverage in
+        // the scratch, reappeared as a live preview (the stroke appeared to
+        // hang), and was then baked in by the *next* stroke's commit, wearing
+        // that stroke's colour.
+        let mut s = StrokeBuilder::new();
+        s.begin(unsmoothed(20.0, 0.1), InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(40.0, 0.0), 1.0, 0.05));
+        let tail = s.pending_len();
+        assert!(tail > 1, "expected a tail to have accumulated");
+
+        s.end();
+        assert_eq!(
+            s.pending_len(),
+            tail,
+            "end() must not discard the tail of the stroke"
+        );
+    }
+
+    #[test]
+    fn clear_pending_discards_the_tail() {
+        // The abandon path — a gesture that turned out to be a pinch, not a
+        // stroke — is the one case where dropping is correct.
+        let mut s = StrokeBuilder::new();
+        s.begin(unsmoothed(20.0, 0.1), InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(40.0, 0.0), 1.0, 0.05));
+        s.end();
+        s.clear_pending();
+        assert_eq!(s.pending_len(), 0);
     }
 
     #[test]
