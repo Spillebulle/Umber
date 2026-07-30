@@ -4,9 +4,10 @@ use glam::Vec2;
 use std::collections::HashMap;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, Camera, Color, Document, History, InputPoint, StrokeBuilder,
+    Brush, Camera, Color, Document, History, InputPoint, LayerStack, StrokeBuilder,
     input::{PressureModel, PressureSource},
 };
+use umber_render::{LayerDraw, StrokeStyle};
 
 /// What the pointer is currently doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct Editor {
     pub camera: Camera,
     pub brush: Brush,
     pub color: Color,
+    pub layers: LayerStack,
 
     pub stroke: StrokeBuilder,
     pub history: History,
@@ -36,9 +38,10 @@ pub struct Editor {
     /// Brush settings captured at stroke start. The user can change the colour
     /// mid-stroke via the UI; the stroke must still commit with what it began
     /// with, or the preview and the committed result disagree.
-    pub stroke_color: Color,
-    pub stroke_opacity: f32,
-    pub stroke_mode: BrushMode,
+    pub stroke_style: StrokeStyle,
+    /// Layer slot the stroke started on. Captured because the user can select a
+    /// different layer mid-stroke, and the stroke must land where it began.
+    pub stroke_slot: u32,
 
     /// Touch points currently down, for pinch handling.
     pub touches: HashMap<u64, Vec2>,
@@ -64,6 +67,7 @@ impl Default for Editor {
             },
             brush: Brush::default(),
             color: Color::from_srgb_u8(20, 20, 24, 255),
+            layers: LayerStack::new(),
             stroke: StrokeBuilder::new(),
             history: History::default(),
             pressure: PressureModel::default(),
@@ -71,9 +75,8 @@ impl Default for Editor {
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             space_down: false,
-            stroke_color: Color::BLACK,
-            stroke_opacity: 1.0,
-            stroke_mode: BrushMode::Paint,
+            stroke_style: StrokeStyle::default(),
+            stroke_slot: 0,
             touches: HashMap::new(),
             drawing_touch: None,
             pinch: None,
@@ -110,12 +113,33 @@ impl Editor {
     }
 
     pub fn begin_stroke(&mut self, point: InputPoint) {
-        self.stroke_color = self.color;
-        self.stroke_opacity = self.brush.opacity;
-        self.stroke_mode = self.brush.mode;
+        // Snapshot the brush: the user can change colour, opacity or layer via
+        // the panel mid-stroke, but the stroke must finish as it started.
+        self.stroke_style = StrokeStyle {
+            color: self.color,
+            opacity: self.brush.opacity,
+            mode: self.brush.mode,
+        };
+        self.stroke_slot = self.layers.active_slot();
         self.pressure.reset();
         self.stroke.begin(self.brush, point);
         self.interaction = Interaction::Drawing;
+    }
+
+    /// Flatten the layer stack into what the composite pass consumes.
+    ///
+    /// Bottom-to-top, matching the shader's iteration order.
+    pub fn layer_draws(&self) -> Vec<LayerDraw> {
+        self.layers
+            .layers()
+            .iter()
+            .map(|l| LayerDraw {
+                slot: l.slot(),
+                opacity: l.opacity,
+                blend: l.blend.index(),
+                visible: l.visible,
+            })
+            .collect()
     }
 
     pub fn record_frame_time(&mut self, dt: f32) {

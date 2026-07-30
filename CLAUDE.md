@@ -32,7 +32,7 @@ Four crates, layered so each can be tested in isolation:
 
 | Crate | Contains | Must not depend on |
 |---|---|---|
-| `umber-core` | document, brush, dab generation, camera, undo | wgpu, winit, egui |
+| `umber-core` | document, brush, dab generation, camera, layers, undo | wgpu, winit, egui |
 | `umber-render` | textures, pipelines, WGSL shaders | winit, egui |
 | `umber-app` | event loop, input translation, egui panel | — |
 | `umber-desktop` | binary entry point | — |
@@ -71,6 +71,32 @@ Invariants that are easy to break:
   paints. This was a real bug; `erasing_removes_coverage` guards it.
 - **The dab pass loads rather than clears.** The scratch accumulates across
   frames for the whole stroke; only new dabs are drawn each frame.
+- **`finish_stroke` must flush `StrokeBuilder::pending` before committing.**
+  Pointer events outpace frames, so a stroke always ends with dabs that have not
+  reached the GPU. Leaving them behind strands coverage in the scratch: it
+  redraws as a live preview (the stroke "hangs") and is then baked in by the
+  *next* stroke's commit, wearing that stroke's colour. This was a real bug;
+  `ending_a_stroke_keeps_its_tail_pending` guards the core half of it.
+
+### Layers
+
+Layers occupy slices ("slots") of one texture array, and the whole stack
+composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
+"simplify" this into a pass per layer.
+
+- **A layer's slot never changes.** Stack order is the `Vec` order, so
+  reordering is a pointer shuffle, not a texture copy. Anything indexing layers
+  by position must not assume position equals slot.
+- **`LayerStack::MAX`, `MAX_LAYERS` in `canvas.rs`, and `MAX_LAYERS` in
+  `composite.wgsl` must agree.** The last one sizes a uniform array.
+- **Deleting a layer clears undo history.** Slots are recycled, so a patch
+  recorded against a freed slot would be replayed into whichever layer inherits
+  it. Structural undo is the real fix and is not built yet.
+- **A recycled slot still holds the old layer's pixels** — clear it on the GPU
+  when a new layer takes it.
+- **The in-progress stroke blends inside the stack**, at the active layer's
+  position, not over the finished composite. Otherwise painting beneath a
+  Multiply layer previews wrongly and jumps on release.
 
 ### Colour space
 
@@ -112,6 +138,17 @@ than fail when no adapter exists, so they stay meaningful on CI runners.
 When changing rendering, add a test there. `overlapping_dabs_do_not_compound` is
 the model: it asserts a specific pixel value that only holds if the wet-layer
 design is intact.
+
+`composite_pixel` runs the real composite pass into an offscreen target, which
+is the only way to test layer opacity and blend modes. Two things to copy when
+adding to it:
+
+- Use a **non-sRGB** target format, matching the real surface. An sRGB target
+  double-encodes and every expected colour becomes wrong.
+- Prefer blend identities over hand-computed values — "Multiply by white is the
+  identity", "Screen with black is the identity" are exact and survive rounding.
+  Where a value is unavoidable, remember blending is **linear**: 50% white over
+  black is sRGB ~188, not 128.
 
 ## Platform support
 

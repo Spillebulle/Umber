@@ -24,7 +24,60 @@ const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// even the fastest flick can produce.
 const MAX_DABS_PER_FRAME: usize = 65_536;
 
+/// Mirrored by `MAX_LAYERS` in `composite.wgsl` and `LayerStack::MAX` in
+/// umber-core. All three must agree.
+const MAX_LAYERS: usize = 64;
+
+/// Texture-array slices allocated up front. Growth doubles this, so a typical
+/// document never pays for a copy.
+const INITIAL_SLOTS: u32 = 4;
+
 const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
+
+/// One layer's contribution to the composite, in stack order.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerDraw {
+    /// Texture-array slice holding the pixels.
+    pub slot: u32,
+    pub opacity: f32,
+    /// Matches `umber_core::BlendMode::index`.
+    pub blend: u32,
+    pub visible: bool,
+}
+
+/// How the stroke in the scratch surface should look.
+///
+/// Preview and commit must be handed the *same* style — they implement the same
+/// blending maths, and any disagreement shows up as the stroke jumping at
+/// pointer-up. Passing them together makes that hard to get wrong.
+#[derive(Clone, Copy, Debug)]
+pub struct StrokeStyle {
+    pub color: Color,
+    /// Applied once, on commit — never folded into per-dab coverage.
+    pub opacity: f32,
+    pub mode: BrushMode,
+}
+
+impl Default for StrokeStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::BLACK,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+        }
+    }
+}
+
+/// Everything the composite pass needs for a frame.
+pub struct CompositeParams<'a> {
+    pub camera: &'a Camera,
+    pub viewport: Vec2,
+    /// Bottom-to-top.
+    pub layers: &'a [LayerDraw],
+    /// Stack position (not slot) receiving the in-progress stroke.
+    pub active_index: u32,
+    pub stroke: StrokeStyle,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -40,10 +93,13 @@ struct ViewUniforms {
     offset: [f32; 2],
     doc_size: [f32; 2],
     viewport: [f32; 2],
-    color: [f32; 4],
-    mode: u32,
+    stroke_color: [f32; 4],
+    layer_count: u32,
+    stroke_mode: u32,
+    active_index: u32,
     checker: f32,
-    _pad: [f32; 2],
+    /// (opacity, blend, slot, visible) per stack position.
+    layers: [[f32; 4]; MAX_LAYERS],
 }
 
 #[repr(C)]
@@ -59,26 +115,81 @@ struct CommitUniforms {
     _pad2: [f32; 2],
 }
 
+/// The layer texture array and the views onto it.
+struct LayerStore {
+    texture: wgpu::Texture,
+    /// Sampled by the composite pass.
+    array_view: wgpu::TextureView,
+    /// One per slice, used as render targets by commit and clear.
+    slot_views: Vec<wgpu::TextureView>,
+    capacity: u32,
+}
+
+impl LayerStore {
+    fn new(device: &wgpu::Device, size: UVec2, capacity: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-layers"),
+            size: wgpu::Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: capacity,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LAYER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("umber-layers-array"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        let slot_views = (0..capacity)
+            .map(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("umber-layer-slot"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        Self {
+            texture,
+            array_view,
+            slot_views,
+            capacity,
+        }
+    }
+}
+
 pub struct CanvasRenderer {
     doc_size: UVec2,
 
-    layer: wgpu::Texture,
-    layer_view: wgpu::TextureView,
-    // Held for ownership and for the document-resize path; the views and bind
-    // groups are what the passes actually touch.
+    layers: LayerStore,
     #[allow(dead_code)]
     stroke: wgpu::Texture,
     stroke_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
 
     dab_pipeline: wgpu::RenderPipeline,
     dab_bind_group: wgpu::BindGroup,
     #[allow(dead_code)]
     dab_uniforms: wgpu::Buffer,
     dab_instances: wgpu::Buffer,
-    /// Dabs already written into `dab_instances` this frame.
     dabs_this_frame: u32,
 
     composite_pipeline: wgpu::RenderPipeline,
+    composite_layout: wgpu::BindGroupLayout,
     composite_bind_group: wgpu::BindGroup,
     view_uniforms: wgpu::Buffer,
 
@@ -94,23 +205,23 @@ impl CanvasRenderer {
         doc_size: UVec2,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        let (layer, layer_view) = create_texture(
-            device,
-            "umber-layer",
-            doc_size,
-            LAYER_FORMAT,
-            wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-        );
-        let (stroke, stroke_view) = create_texture(
-            device,
-            "umber-stroke-scratch",
-            doc_size,
-            STROKE_FORMAT,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
+        let layers = LayerStore::new(device, doc_size, INITIAL_SLOTS);
+
+        let stroke = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-stroke-scratch"),
+            size: wgpu::Extent3d {
+                width: doc_size.x,
+                height: doc_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: STROKE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("umber-sampler"),
@@ -244,33 +355,19 @@ impl CanvasRenderer {
             label: Some("composite-bgl"),
             entries: &[
                 uniform_entry(0),
-                texture_entry(1),
+                texture_array_entry(1),
                 texture_entry(2),
                 sampler_entry(3),
             ],
         });
-        let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("composite-bg"),
-            layout: &composite_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: view_uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&layer_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&stroke_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let composite_bind_group = make_composite_bind_group(
+            device,
+            &composite_layout,
+            &view_uniforms,
+            &layers.array_view,
+            &stroke_view,
+            &sampler,
+        );
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite-pipeline"),
             layout: Some(
@@ -332,6 +429,7 @@ impl CanvasRenderer {
                 },
             ],
         });
+
         let commit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("commit-pl"),
             bind_group_layouts: &[Some(&commit_layout)],
@@ -395,16 +493,17 @@ impl CanvasRenderer {
 
         Self {
             doc_size,
-            layer,
-            layer_view,
+            layers,
             stroke,
             stroke_view,
+            sampler,
             dab_pipeline,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
             dabs_this_frame: 0,
             composite_pipeline,
+            composite_layout,
             composite_bind_group,
             view_uniforms,
             commit_pipeline,
@@ -418,14 +517,78 @@ impl CanvasRenderer {
         self.doc_size
     }
 
+    pub fn slot_capacity(&self) -> u32 {
+        self.layers.capacity
+    }
+
+    /// Guarantee at least `needed` texture-array slices exist.
+    ///
+    /// Growth reallocates the array and copies every existing slice, so it
+    /// doubles rather than growing by one — a document that reaches eight
+    /// layers pays for two copies, not eight.
+    pub fn ensure_slots(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
+        if needed <= self.layers.capacity {
+            return;
+        }
+        let mut capacity = self.layers.capacity.max(1);
+        while capacity < needed {
+            capacity *= 2;
+        }
+        let capacity = capacity.min(MAX_LAYERS as u32);
+        log::info!(
+            "growing layer storage {} -> {} slots",
+            self.layers.capacity,
+            capacity
+        );
+
+        let grown = LayerStore::new(device, self.doc_size, capacity);
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("grow-layers"),
+        });
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &grown.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: self.layers.capacity,
+            },
+        );
+        // Slices beyond the old capacity are freshly allocated and hold
+        // whatever the driver left behind.
+        for slot in self.layers.capacity..capacity {
+            clear_view(&mut enc, &grown.slot_views[slot as usize], "clear-new-slot");
+        }
+        queue.submit(Some(enc.finish()));
+
+        self.composite_bind_group = make_composite_bind_group(
+            device,
+            &self.composite_layout,
+            &self.view_uniforms,
+            &grown.array_view,
+            &self.stroke_view,
+            &self.sampler,
+        );
+        self.layers = grown;
+    }
+
     /// Reset the per-frame instance cursor. Call once at the top of a frame.
     pub fn begin_frame(&mut self) {
         self.dabs_this_frame = 0;
     }
 
     /// Upload dabs and stamp them into the scratch texture.
-    ///
-    /// Safe to call with an empty slice; does nothing in that case.
     pub fn draw_dabs(
         &mut self,
         queue: &wgpu::Queue,
@@ -476,22 +639,29 @@ impl CanvasRenderer {
         self.dabs_this_frame += dabs.len() as u32;
     }
 
-    /// Draw layer + in-progress stroke to the given target.
-    #[allow(clippy::too_many_arguments)]
+    /// Draw the whole layer stack plus the in-progress stroke to `target`.
     pub fn composite(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
-        camera: &Camera,
-        viewport: Vec2,
-        color: Color,
-        opacity: f32,
-        mode: BrushMode,
+        params: &CompositeParams<'_>,
     ) {
-        let scale = 1.0 / camera.zoom;
-        let offset = camera.center - viewport * 0.5 * scale;
+        let scale = 1.0 / params.camera.zoom;
+        let offset = params.camera.center - params.viewport * 0.5 * scale;
 
+        let mut packed = [[0.0f32; 4]; MAX_LAYERS];
+        let count = params.layers.len().min(MAX_LAYERS);
+        for (dst, src) in packed.iter_mut().zip(&params.layers[..count]) {
+            *dst = [
+                src.opacity.clamp(0.0, 1.0),
+                src.blend as f32,
+                src.slot as f32,
+                if src.visible { 1.0 } else { 0.0 },
+            ];
+        }
+
+        let color = params.stroke.color;
         queue.write_buffer(
             &self.view_uniforms,
             0,
@@ -499,11 +669,18 @@ impl CanvasRenderer {
                 scale: [scale, scale],
                 offset: [offset.x, offset.y],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                viewport: [viewport.x, viewport.y],
-                color: [color.r, color.g, color.b, opacity.clamp(0.0, 1.0)],
-                mode: mode_index(mode),
+                viewport: [params.viewport.x, params.viewport.y],
+                stroke_color: [
+                    color.r,
+                    color.g,
+                    color.b,
+                    params.stroke.opacity.clamp(0.0, 1.0),
+                ],
+                layer_count: count as u32,
+                stroke_mode: mode_index(params.stroke.mode),
+                active_index: params.active_index,
                 checker: 8.0,
-                _pad: [0.0; 2],
+                layers: packed,
             }),
         );
 
@@ -528,16 +705,21 @@ impl CanvasRenderer {
         pass.draw(0..3, 0..1);
     }
 
-    /// Bake the scratch stroke into the layer over `rect`, then clear scratch.
+    /// Bake the scratch stroke into `slot` over `rect`, then clear the scratch.
     pub fn commit_stroke(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
         rect: PixelRect,
-        color: Color,
-        opacity: f32,
-        mode: BrushMode,
+        style: StrokeStyle,
     ) {
+        let Some(view) = self.layers.slot_views.get(slot as usize) else {
+            log::error!("commit to slot {slot} beyond capacity");
+            return;
+        };
+
+        let color = style.color;
         queue.write_buffer(
             &self.commit_uniforms,
             0,
@@ -546,8 +728,8 @@ impl CanvasRenderer {
                 rect_max: [(rect.x + rect.width) as f32, (rect.y + rect.height) as f32],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
                 _pad0: [0.0; 2],
-                color: [color.r, color.g, color.b, opacity.clamp(0.0, 1.0)],
-                mode: mode_index(mode),
+                color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
+                mode: mode_index(style.mode),
                 _pad1: 0.0,
                 _pad2: [0.0; 2],
             }),
@@ -557,7 +739,7 @@ impl CanvasRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("commit-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.layer_view,
+                    view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -570,7 +752,7 @@ impl CanvasRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(match mode {
+            pass.set_pipeline(match style.mode {
                 BrushMode::Paint => &self.commit_pipeline,
                 BrushMode::Erase => &self.commit_erase_pipeline,
             });
@@ -583,44 +765,24 @@ impl CanvasRenderer {
 
     /// Wipe the scratch surface.
     pub fn clear_stroke(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear-stroke"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.stroke_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_view(encoder, &self.stroke_view, "clear-stroke");
     }
 
-    pub fn clear_layer(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear-layer"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.layer_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+    /// Wipe one layer.
+    pub fn clear_layer(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+        if let Some(view) = self.layers.slot_views.get(slot as usize) {
+            clear_view(encoder, view, "clear-layer");
+        }
     }
 
-    /// Read a rectangle of the layer back to the CPU, for the undo stack.
+    /// Wipe every allocated slot. Used at startup.
+    pub fn clear_all_layers(&self, encoder: &mut wgpu::CommandEncoder) {
+        for view in &self.layers.slot_views {
+            clear_view(encoder, view, "clear-layer");
+        }
+    }
+
+    /// Read a rectangle of one layer back to the CPU, for the undo stack.
     ///
     /// This blocks until the GPU catches up. That is acceptable because it runs
     /// once per stroke at pointer-up, never inside the drawing loop.
@@ -628,6 +790,7 @@ impl CanvasRenderer {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        slot: u32,
         rect: PixelRect,
     ) -> Vec<u8> {
         let unpadded = rect.width * 4;
@@ -646,12 +809,12 @@ impl CanvasRenderer {
         });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.layer,
+                texture: &self.layers.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: rect.x,
                     y: rect.y,
-                    z: 0,
+                    z: slot,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -687,17 +850,17 @@ impl CanvasRenderer {
         out
     }
 
-    /// Write a previously captured rectangle back into the layer.
-    pub fn write_layer_rect(&self, queue: &wgpu::Queue, rect: PixelRect, bytes: &[u8]) {
+    /// Write a previously captured rectangle back into one layer.
+    pub fn write_layer_rect(&self, queue: &wgpu::Queue, slot: u32, rect: PixelRect, bytes: &[u8]) {
         debug_assert_eq!(bytes.len() as u64, rect.area() * 4);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.layer,
+                texture: &self.layers.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: rect.x,
                     y: rect.y,
-                    z: 0,
+                    z: slot,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -723,29 +886,55 @@ fn mode_index(mode: BrushMode) -> u32 {
     }
 }
 
-fn create_texture(
-    device: &wgpu::Device,
-    label: &str,
-    size: UVec2,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &str) {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d {
-            width: size.x,
-            height: size.y,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+}
+
+fn make_composite_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    layers: &wgpu::TextureView,
+    stroke: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("composite-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(layers),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(stroke),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -768,6 +957,19 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_array_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,

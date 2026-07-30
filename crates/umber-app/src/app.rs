@@ -5,7 +5,7 @@ use crate::ui;
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use umber_core::{Brush, BrushMode, Camera, Dab, InputPoint, PixelPatch};
-use umber_render::{CanvasRenderer, Gpu};
+use umber_render::{CanvasRenderer, CompositeParams, Gpu};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -84,20 +84,23 @@ impl UmberApp {
             return;
         };
 
+        let slot = self.editor.stroke_slot;
+
         // Capture undo state first. `read_layer_rect` submits and blocks on its
         // own encoder, so it observes the layer before `enc` commits anything.
         let before = gfx
             .canvas
-            .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, rect);
-        self.editor.history.record(PixelPatch::new(rect, before));
+            .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
+        self.editor
+            .history
+            .record(PixelPatch::new(rect, slot, before));
 
         gfx.canvas.commit_stroke(
             &gfx.gpu.queue,
             &mut enc,
+            slot,
             rect,
-            self.editor.stroke_color,
-            self.editor.stroke_opacity,
-            self.editor.stroke_mode,
+            self.editor.stroke_style,
         );
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
@@ -154,14 +157,14 @@ impl UmberApp {
         let Some(patch) = self.editor.history.take_undo() else {
             return;
         };
-        let current = gfx
-            .canvas
-            .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.rect);
+        let current =
+            gfx.canvas
+                .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         gfx.canvas
-            .write_layer_rect(&gfx.gpu.queue, patch.rect, &patch.bytes);
+            .write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
         self.editor
             .history
-            .push_redo(PixelPatch::new(patch.rect, current));
+            .push_redo(PixelPatch::new(patch.rect, patch.slot, current));
     }
 
     fn redo(&mut self) {
@@ -169,17 +172,19 @@ impl UmberApp {
         let Some(patch) = self.editor.history.take_redo() else {
             return;
         };
-        let current = gfx
-            .canvas
-            .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.rect);
+        let current =
+            gfx.canvas
+                .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         gfx.canvas
-            .write_layer_rect(&gfx.gpu.queue, patch.rect, &patch.bytes);
+            .write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
         self.editor
             .history
-            .push_undo(PixelPatch::new(patch.rect, current));
+            .push_undo(PixelPatch::new(patch.rect, patch.slot, current));
     }
 
-    fn clear_canvas(&mut self) {
+    /// Erase the active layer, leaving the rest of the stack alone.
+    fn clear_active_layer(&mut self) {
+        let slot = self.editor.layers.active_slot();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let mut enc = gfx
             .gpu
@@ -187,11 +192,43 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("clear"),
             });
-        gfx.canvas.clear_layer(&mut enc);
+        gfx.canvas.clear_layer(&mut enc, slot);
         gfx.canvas.clear_stroke(&mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
-        // sense; keeping them would let undo resurrect part of a cleared canvas.
+        // sense; keeping them would let undo resurrect part of a cleared layer.
+        self.editor.history.clear();
+    }
+
+    fn add_layer(&mut self) {
+        let Some(slot) = self.editor.layers.add() else {
+            log::warn!("layer limit reached");
+            return;
+        };
+        let needed = self.editor.layers.slot_capacity_needed();
+
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.canvas
+            .ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+
+        // A recycled slot still holds the deleted layer's pixels.
+        let mut enc = gfx
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("init-layer"),
+            });
+        gfx.canvas.clear_layer(&mut enc, slot);
+        gfx.gpu.queue.submit(Some(enc.finish()));
+    }
+
+    fn delete_layer(&mut self, index: usize) {
+        if self.editor.layers.remove(index).is_none() {
+            return;
+        }
+        // Slots are recycled, so an undo entry recorded against the freed slot
+        // would later be replayed into whichever layer inherits it. Dropping
+        // history is the blunt but safe fix; structural undo is the real one.
         self.editor.history.clear();
     }
 
@@ -318,15 +355,18 @@ impl UmberApp {
         }
 
         let viewport = Vec2::new(gfx.config.width as f32, gfx.config.height as f32);
+        let layer_draws = self.editor.layer_draws();
         gfx.canvas.composite(
             &gfx.gpu.queue,
             &mut encoder,
             &view,
-            &self.editor.camera,
-            viewport,
-            self.editor.stroke_color,
-            self.editor.stroke_opacity,
-            self.editor.stroke_mode,
+            &CompositeParams {
+                camera: &self.editor.camera,
+                viewport,
+                layers: &layer_draws,
+                active_index: self.editor.layers.active_index() as u32,
+                stroke: self.editor.stroke_style,
+            },
         );
 
         // --- egui on top ---
@@ -387,7 +427,19 @@ impl UmberApp {
             self.redo();
         }
         if actions.clear {
-            self.clear_canvas();
+            self.clear_active_layer();
+        }
+        if actions.add_layer {
+            self.add_layer();
+        }
+        if let Some(index) = actions.delete_layer {
+            self.delete_layer(index);
+        }
+        if let Some(index) = actions.move_layer_up {
+            self.editor.layers.move_up(index);
+        }
+        if let Some(index) = actions.move_layer_down {
+            self.editor.layers.move_down(index);
         }
         if actions.fit_view {
             self.editor.camera = Camera::fit(self.editor.doc.size_vec2(), viewport);
@@ -430,13 +482,13 @@ impl ApplicationHandler for UmberApp {
             config.format,
         );
 
-        // Start with a blank layer rather than whatever the allocation held.
+        // Start blank rather than showing whatever the allocation held.
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init"),
             });
-        canvas.clear_layer(&mut enc);
+        canvas.clear_all_layers(&mut enc);
         canvas.clear_stroke(&mut enc);
         gpu.queue.submit(Some(enc.finish()));
 

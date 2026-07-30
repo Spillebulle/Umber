@@ -11,17 +11,21 @@ use crate::geom::PixelRect;
 #[derive(Clone, Debug)]
 pub struct PixelPatch {
     pub rect: PixelRect,
+    /// Texture-array slot this patch belongs to. Slots are recycled on layer
+    /// deletion, which is why [`History::clear`] must be called then — replaying
+    /// this patch into a layer that merely inherited the slot would corrupt it.
+    pub slot: u32,
     pub bytes: Vec<u8>,
 }
 
 impl PixelPatch {
-    pub fn new(rect: PixelRect, bytes: Vec<u8>) -> Self {
+    pub fn new(rect: PixelRect, slot: u32, bytes: Vec<u8>) -> Self {
         debug_assert_eq!(
             bytes.len() as u64,
             rect.area() * 4,
             "patch byte count must match rect area"
         );
-        Self { rect, bytes }
+        Self { rect, slot, bytes }
     }
 
     pub fn byte_len(&self) -> usize {
@@ -129,7 +133,7 @@ mod tests {
             width: w,
             height: h,
         };
-        PixelPatch::new(rect, vec![fill; (w * h * 4) as usize])
+        PixelPatch::new(rect, 0, vec![fill; (w * h * 4) as usize])
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The tool panel.
 
 use crate::editor::Editor;
-use umber_core::{Brush, BrushMode, Color, input::PressureSource};
+use umber_core::{BlendMode, Brush, BrushMode, Color, LayerStack, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -11,6 +11,10 @@ pub struct UiActions {
     pub redo: bool,
     pub fit_view: bool,
     pub reset_zoom: bool,
+    pub add_layer: bool,
+    pub delete_layer: Option<usize>,
+    pub move_layer_up: Option<usize>,
+    pub move_layer_down: Option<usize>,
 }
 
 /// egui 0.35 merged `SidePanel`/`TopBottomPanel` into one `Panel` type that
@@ -132,9 +136,13 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiActions {
             });
 
             ui.add_space(6.0);
-            if ui.button("Clear canvas").clicked() {
+            if ui.button("Clear layer").clicked() {
                 actions.clear = true;
             }
+
+            ui.add_space(12.0);
+            ui.separator();
+            layer_panel(ui, ed, &mut actions);
 
             ui.add_space(10.0);
             ui.label(
@@ -171,4 +179,99 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiActions {
         });
 
     actions
+}
+
+/// The layer stack, listed top-down the way it is drawn.
+fn layer_panel(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Layers").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let room = ed.layers.len() < LayerStack::MAX;
+            if ui
+                .add_enabled(room, egui::Button::new("+").small())
+                .on_hover_text("Add a layer above the current one")
+                .clicked()
+            {
+                actions.add_layer = true;
+            }
+        });
+    });
+
+    ui.add_space(4.0);
+
+    // The stack is stored bottom-first; show it top-first, as it appears.
+    let active = ed.layers.active_index();
+    let count = ed.layers.len();
+    let mut select: Option<usize> = None;
+
+    egui::ScrollArea::vertical()
+        .max_height(190.0)
+        .show(ui, |ui| {
+            for index in (0..count).rev() {
+                let Some(layer) = ed.layers.get_mut(index) else {
+                    continue;
+                };
+                let is_active = index == active;
+
+                ui.horizontal(|ui| {
+                    // Visibility toggles independently of selection, so it must
+                    // not be swallowed by the row's select handler.
+                    let eye = if layer.visible { "◉" } else { "○" };
+                    if ui
+                        .add(egui::Button::new(eye).small().frame(false))
+                        .on_hover_text("Show or hide")
+                        .clicked()
+                    {
+                        layer.visible = !layer.visible;
+                    }
+
+                    let label = egui::RichText::new(layer.name.clone());
+                    let label = if layer.visible { label } else { label.weak() };
+                    if ui.selectable_label(is_active, label).clicked() {
+                        select = Some(index);
+                    }
+                });
+            }
+        });
+
+    if let Some(index) = select {
+        ed.layers.set_active(index);
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(active + 1 < count, egui::Button::new("↑").small())
+            .clicked()
+        {
+            actions.move_layer_up = Some(active);
+        }
+        if ui
+            .add_enabled(active > 0, egui::Button::new("↓").small())
+            .clicked()
+        {
+            actions.move_layer_down = Some(active);
+        }
+        // The last layer cannot go — a document needs somewhere to paint.
+        if ui
+            .add_enabled(count > 1, egui::Button::new("Delete").small())
+            .on_hover_text("Deleting a layer clears undo history")
+            .clicked()
+        {
+            actions.delete_layer = Some(active);
+        }
+    });
+
+    ui.add_space(6.0);
+
+    let layer = ed.layers.active_mut();
+    ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("Layer opacity"));
+
+    egui::ComboBox::from_label("Blend")
+        .selected_text(layer.blend.label())
+        .show_ui(ui, |ui| {
+            for mode in BlendMode::ALL {
+                ui.selectable_value(&mut layer.blend, mode, mode.label());
+            }
+        });
 }

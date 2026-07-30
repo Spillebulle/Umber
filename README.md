@@ -6,8 +6,8 @@ Umber is being written for one goal above all others: **latency**. Every design
 decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
-> **Status: early.** The canvas, brush and eraser work on desktop. Layers,
-> file saving and mobile packaging do not exist yet. See [Roadmap](#roadmap).
+> **Status: early.** The canvas, brush, eraser and layers work on desktop.
+> File saving and mobile packaging do not exist yet. See [Roadmap](#roadmap).
 
 ## Building
 
@@ -64,7 +64,7 @@ Four crates, layered so the engine can be tested without a GPU and the GPU can
 be tested without a window:
 
 ```
-umber-core      document model, brush, dab generation, camera, undo — no GPU types
+umber-core      document model, brush, dab generation, camera, layers, undo — no GPU types
 umber-render    wgpu: textures, pipelines, shaders
 umber-app       winit event loop, input translation, egui tool panel
 umber-desktop   thin binary for Windows/macOS/Linux
@@ -86,10 +86,11 @@ Umber instead uses a **wet layer**:
    coverage texture using a `max` blend, so coverage saturates at 1.0 no matter
    how many dabs land on a pixel. All dabs in a frame are instances of one
    4-vertex quad, so a thousand dabs cost a single draw call.
-2. **Composite pass.** Layer and scratch are combined and drawn under the camera
-   transform. One fullscreen triangle.
-3. **Commit.** At pointer-up the scratch is baked into the layer *once*, over
-   only the rectangle the stroke actually touched, and the scratch is cleared.
+2. **Composite pass.** The layer stack and the scratch are combined and drawn
+   under the camera transform. One fullscreen triangle.
+3. **Commit.** At pointer-up the scratch is baked into the active layer *once*,
+   over only the rectangle the stroke actually touched, and the scratch is
+   cleared.
 
 Stroke opacity is therefore applied exactly once, at commit — which is why
 `Brush::opacity` is deliberately excluded from per-dab coverage. The composite
@@ -99,6 +100,24 @@ stroke visibly jumps at pointer-up.
 The scratch texture is `R8Unorm` rather than RGBA: a stroke has a single colour,
 so only coverage needs storing. That is a 4× bandwidth saving on the hottest
 texture in the frame.
+
+### Layers
+
+Layers live in slices of a single GPU **texture array**, and the whole stack
+composites in **one pass** — the fragment shader walks the array bottom to top.
+An extra layer therefore costs a loop iteration, not a render pass and a
+fullscreen bandwidth round trip. Blend modes (Normal, Multiply, Screen,
+Overlay, Add) use the W3C compositing formulas on premultiplied colour.
+
+Each layer owns a **slot** — its array slice — assigned at creation and never
+changed. Stack order is just the order of a `Vec`, so reordering layers is a
+pointer shuffle rather than 16 MB of texture copies per move. Growing past the
+allocated slice count reallocates and copies, so it doubles rather than growing
+by one.
+
+The in-progress stroke is blended *inside* the stack at the active layer's
+position, not on top of the finished composite. Painting underneath a Multiply
+layer would otherwise preview wrongly and then jump on release.
 
 ### Other decisions worth knowing
 
@@ -111,6 +130,9 @@ texture in the frame.
   exactly the pixels you would get at 100%.
 - **Undo stores damaged rectangles, not whole layers.** A full snapshot per
   stroke would be 16 MB at 2048², exhausting a gigabyte in about sixty strokes.
+  Undo covers painting only — adding, deleting or reordering a layer is *not*
+  undoable yet, and deleting one clears the history, because slots are recycled
+  and a stale entry would otherwise be replayed into the wrong layer.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 
@@ -148,8 +170,8 @@ rather than removing it.
 
 Next, roughly in order:
 
-- Layers, with blend modes and a layer panel
 - Saving and loading documents
+- Structural undo, so layer add/delete/reorder joins the history
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop

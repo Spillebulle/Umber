@@ -12,6 +12,7 @@ pub mod document;
 pub mod geom;
 pub mod history;
 pub mod input;
+pub mod layer;
 pub mod stroke;
 
 pub use brush::{Brush, BrushMode};
@@ -21,4 +22,5 @@ pub use document::Document;
 pub use geom::{PixelRect, Rect};
 pub use history::{History, PixelPatch};
 pub use input::InputPoint;
+pub use layer::{BlendMode, Layer, LayerStack};
 pub use stroke::{Dab, StrokeBuilder};
