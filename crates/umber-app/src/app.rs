@@ -1,7 +1,9 @@
 //! Window lifecycle, input translation and the frame loop.
 
 use crate::editor::{Editor, Interaction, Tool};
+use crate::logo;
 use crate::shortcuts::{self, Action};
+use crate::splash::Splash;
 use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
@@ -38,6 +40,10 @@ pub struct UmberApp {
     /// an actual change.
     applied_theme: Option<ThemeKind>,
     bindings: Vec<shortcuts::Binding>,
+    /// The brand overlay on the opening frames. `None` once it has faded, and
+    /// never rebuilt — see `splash.rs` for why it is an overlay rather than a
+    /// loading window.
+    splash: Option<Splash>,
 }
 
 impl Default for UmberApp {
@@ -49,6 +55,7 @@ impl Default for UmberApp {
             last_frame: None,
             applied_theme: None,
             bindings: shortcuts::defaults(),
+            splash: Some(Splash::default()),
         }
     }
 }
@@ -376,13 +383,20 @@ impl UmberApp {
         // `Context::run_ui` discards the closure's return value, so the panel's
         // output is captured out of it instead.
         let editor = &mut self.editor;
+        let splash = &mut self.splash;
         let mut actions = ui::UiActions::default();
         let mut canvas_rect = egui::Rect::ZERO;
+        let mut splash_alive = false;
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
             let out = ui::draw(ui, editor);
             actions = out.actions;
             canvas_rect = out.canvas_rect;
+            // Over the finished frame, not in place of it: the interface below
+            // is already drawn and already live.
+            if let Some(splash) = splash.as_mut() {
+                splash_alive = splash.draw(ui, &theme::Palette::of(editor.ui.theme));
+            }
         });
 
         let egui::FullOutput {
@@ -502,10 +516,17 @@ impl UmberApp {
         gfx.gpu.queue.submit(Some(encoder.finish()));
         surface_texture.present();
 
-        // Keep the frames coming while a stroke is live; otherwise the app
-        // goes back to sleep until the next input event.
-        if self.editor.interaction == Interaction::Drawing {
+        // Keep the frames coming while a stroke is live, or while the splash is
+        // still fading; otherwise the app goes back to sleep until the next
+        // input event.
+        if self.editor.interaction == Interaction::Drawing || splash_alive {
             gfx.window.request_redraw();
+        }
+
+        // Dropped on the frame it stops drawing, so from here on the splash
+        // costs one `Option` check that is always `None`.
+        if !splash_alive {
+            self.splash = None;
         }
 
         // Applied after the `gfx` borrow ends, since these take `&mut self`.
@@ -548,14 +569,31 @@ impl ApplicationHandler for UmberApp {
             return;
         }
 
+        // The window appears early and then sits unpainted until the rest of
+        // this function has finished, so this is the number that decides
+        // whether Umber needs a real loading screen. Logged rather than
+        // measured once and written down, because it is a property of the
+        // driver and the machine rather than of this code.
+        let started = std::time::Instant::now();
+
         let attrs = Window::default_attributes()
             .with_title("Umber")
+            // Per-platform, and quietly so: Windows uses it for the title bar
+            // and taskbar button, X11 for the window list. Wayland ignores it
+            // entirely and takes its icon from the `.desktop` file matching the
+            // app id, and on macOS `set_window_icon` is documented as a no-op —
+            // there the icon comes from the `.app` bundle's `Info.plist`. The
+            // executable resource in `crates/umber-desktop/build.rs` is what
+            // gives Explorer and the taskbar an icon before the process starts.
+            .with_window_icon(logo::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
+
+        let window_ready = started.elapsed();
 
         let instance = Gpu::create_instance();
         let surface = instance
@@ -616,6 +654,17 @@ impl ApplicationHandler for UmberApp {
             egui_state,
             egui_renderer,
         });
+
+        // Split, because the two halves have very different characters and only
+        // one of them is ours to improve: window creation is fast and constant,
+        // while adapter enumeration and device creation are the graphics
+        // driver's own start-up and dominate the total. `splash.rs` explains
+        // what these numbers mean for the overlay it draws.
+        log::info!(
+            "window in {:.0} ms, GPU and fonts {:.0} ms more",
+            window_ready.as_secs_f64() * 1000.0,
+            (started.elapsed() - window_ready).as_secs_f64() * 1000.0
+        );
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
