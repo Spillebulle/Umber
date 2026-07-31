@@ -3,7 +3,7 @@
 use crate::editor::{Editor, Interaction, Tool};
 use crate::logo;
 use crate::shortcuts::{self, Action};
-use crate::splash::Splash;
+use crate::splash::{self, Splash};
 use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
@@ -40,10 +40,6 @@ pub struct UmberApp {
     /// an actual change.
     applied_theme: Option<ThemeKind>,
     bindings: Vec<shortcuts::Binding>,
-    /// The brand overlay on the opening frames. `None` once it has faded, and
-    /// never rebuilt — see `splash.rs` for why it is an overlay rather than a
-    /// loading window.
-    splash: Option<Splash>,
 }
 
 impl Default for UmberApp {
@@ -55,7 +51,6 @@ impl Default for UmberApp {
             last_frame: None,
             applied_theme: None,
             bindings: shortcuts::defaults(),
-            splash: Some(Splash::default()),
         }
     }
 }
@@ -383,20 +378,13 @@ impl UmberApp {
         // `Context::run_ui` discards the closure's return value, so the panel's
         // output is captured out of it instead.
         let editor = &mut self.editor;
-        let splash = &mut self.splash;
         let mut actions = ui::UiActions::default();
         let mut canvas_rect = egui::Rect::ZERO;
-        let mut splash_alive = false;
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
             let out = ui::draw(ui, editor);
             actions = out.actions;
             canvas_rect = out.canvas_rect;
-            // Over the finished frame, not in place of it: the interface below
-            // is already drawn and already live.
-            if let Some(splash) = splash.as_mut() {
-                splash_alive = splash.draw(ui, &theme::Palette::of(editor.ui.theme));
-            }
         });
 
         let egui::FullOutput {
@@ -516,17 +504,10 @@ impl UmberApp {
         gfx.gpu.queue.submit(Some(encoder.finish()));
         surface_texture.present();
 
-        // Keep the frames coming while a stroke is live, or while the splash is
-        // still fading; otherwise the app goes back to sleep until the next
-        // input event.
-        if self.editor.interaction == Interaction::Drawing || splash_alive {
+        // Keep the frames coming while a stroke is live; otherwise the app
+        // goes back to sleep until the next input event.
+        if self.editor.interaction == Interaction::Drawing {
             gfx.window.request_redraw();
-        }
-
-        // Dropped on the frame it stops drawing, so from here on the splash
-        // costs one `Option` check that is always `None`.
-        if !splash_alive {
-            self.splash = None;
         }
 
         // Applied after the `gfx` borrow ends, since these take `&mut self`.
@@ -595,6 +576,14 @@ impl ApplicationHandler for UmberApp {
 
         let window_ready = started.elapsed();
 
+        // From here to the end of this function the window is on screen with
+        // nothing in it, and most of the wait is the graphics driver's. The
+        // splash paints it from the CPU — the only way to reach a window that
+        // has no GPU surface yet. Each stage is shown *before* the work it
+        // names, so the bar never claims progress that has not happened.
+        let mut splash = Splash::new(window.clone(), theme::Palette::of(self.editor.ui.theme));
+        splash.show(splash::Stage::Adapter);
+
         let instance = Gpu::create_instance();
         let surface = instance
             .create_surface(window.clone())
@@ -602,10 +591,14 @@ impl ApplicationHandler for UmberApp {
         let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))
             .expect("failed to initialise GPU");
 
+        splash.adapter(&gpu.adapter.get_info());
+        splash.show(splash::Stage::Surface);
+
         let size = window.inner_size();
         let config = gpu.surface_config(&surface, size.width, size.height);
         surface.configure(&gpu.device, &config);
 
+        splash.show(splash::Stage::Shaders);
         let canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
@@ -622,6 +615,7 @@ impl ApplicationHandler for UmberApp {
         canvas.clear_stroke(&mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
+        splash.show(splash::Stage::Fonts);
         let egui_ctx = egui::Context::default();
         theme::install_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
@@ -637,6 +631,13 @@ impl ApplicationHandler for UmberApp {
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
+
+        // Everything is ready, so the splash goes now — not when its bar
+        // finishes. A progress bar that held the first frame back to complete
+        // its own animation would be a lie about latency in an application that
+        // exists for latency.
+        splash.show(splash::Stage::Ready);
+        drop(splash);
 
         // Provisional: the real canvas region is not known until the first
         // frame has laid the panels out, which corrects both of these.

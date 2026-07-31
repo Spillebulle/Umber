@@ -26,6 +26,19 @@ env_logger = { workspace = true }
 png = "0.18.1"
 rfd = "0.17.2"
 
+# The splash paints the window before wgpu exists, which is the only way to
+# cover the driver's device-creation stall. All three of these are already in
+# the tree underneath egui, so none of them is a new build.
+#
+# softbuffer draws to a winit window with no GPU at all. skrifa reads glyph
+# outlines *with variation axes applied*, which ab_glyph — what egui rasterises
+# with — does not do; that is what lets the splash ask Archivo for the weight
+# 900 the design specifies and actually get it. ab_glyph_rasterizer turns those
+# outlines into coverage. See `cputext.rs`.
+softbuffer = "0.4"
+skrifa = "0.42"
+ab_glyph_rasterizer = "0.1"
+
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }
 android_logger = "0.15"

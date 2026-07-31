@@ -6,6 +6,7 @@
 
 mod app;
 mod colorpicker;
+mod cputext;
 mod editor;
 mod icons;
 mod logo;

@@ -28,6 +28,17 @@ use egui::{Color32, CornerRadius, Painter, Rect, Vec2};
 /// are recognisably the same shape.
 pub const CORNER_RATIO: f32 = 3.0 / 15.0;
 
+/// Corner radius the design uses for the mark **on the splash**, where it is
+/// drawn at 52 px with an 8 px radius.
+///
+/// That is 0.154, not the 0.2 of [`CORNER_RATIO`]. The design is simply
+/// inconsistent between its two instances of the mark, and this records the
+/// discrepancy rather than quietly averaging it away or "fixing" one to match
+/// the other. Each size uses the number the design states for that size, which
+/// is also the safer reading: a corner radius that looks right at 15 px is
+/// usually too round when scaled to 52.
+pub const SPLASH_CORNER_RATIO: f32 = 8.0 / 52.0;
+
 /// Clear space left around the mark inside a raster icon, as a fraction of the
 /// bitmap's side.
 ///
@@ -51,9 +62,16 @@ const WINDOW_ICON: u32 = 64;
 /// Draw the mark, filling `rect`.
 ///
 /// Everything is derived from `rect`, so the same call gives the 15 px menu-bar
-/// mark and an 88 px splash mark. A non-square rect yields a square mark
-/// centred inside it rather than a stretched one — the mark is a square, and
-/// stretching a brand element is worse than ignoring the extra space.
+/// mark and a 200 px one. A non-square rect yields a square mark centred inside
+/// it rather than a stretched one — the mark is a square, and stretching a brand
+/// element is worse than ignoring the extra space.
+///
+/// Currently unused inside this crate: the splash draws the mark on the CPU
+/// because it runs before egui exists, and the menu bar still inlines its own
+/// `rect_filled`. This is the shared entry point that call site should move to,
+/// and it is deliberately kept rather than deleted — it is the only place the
+/// mark's geometry is stated for an egui painter.
+#[allow(dead_code, reason = "the menu bar has not been moved onto it yet")]
 pub fn draw_mark(painter: &Painter, rect: Rect, palette: &Palette) {
     let side = rect.width().min(rect.height());
     if side <= 0.0 {
@@ -91,13 +109,13 @@ pub fn mark_rgba(size: u32, colour: Color32) -> Vec<u8> {
     let mut out = Vec::with_capacity((size as usize) * (size as usize) * 4);
     for y in 0..size {
         for x in 0..size {
-            let d = rounded_box_sdf(
+            let coverage = rounded_box_coverage(
                 x as f32 + 0.5 - centre,
                 y as f32 + 0.5 - centre,
                 half,
+                half,
                 radius,
             );
-            let coverage = (0.5 - d).clamp(0.0, 1.0);
             out.extend_from_slice(&[r, g, b, (coverage * 255.0).round() as u8]);
         }
     }
@@ -123,15 +141,30 @@ pub fn window_icon() -> Option<winit::window::Icon> {
     }
 }
 
+/// Coverage of a rounded box at `(x, y)`, measured from its centre.
+///
+/// Shared with the splash, which paints the mark — and its progress bar, which
+/// is the same shape at a very different aspect ratio — on the CPU, for the same
+/// reason this module rasterises it: no GPU exists yet when it runs.
+pub fn rounded_box_coverage(x: f32, y: f32, half_w: f32, half_h: f32, radius: f32) -> f32 {
+    // Distance is in pixels and signed, so how far the pixel centre sits inside
+    // the shape is the coverage: exact for the straight edges, and close enough
+    // on the corner arcs to be indistinguishable from a supersampled result.
+    (0.5 - rounded_box_sdf(x, y, half_w, half_h, radius)).clamp(0.0, 1.0)
+}
+
 /// Signed distance from `(x, y)` to a rounded box centred on the origin, with
-/// half-extent `half` on both axes and corner radius `radius`. Negative inside.
+/// the given half-extents and corner radius. Negative inside.
 ///
 /// `hypot` rather than `powf`: the exponent is fixed at a half, and `powf` on a
 /// value that has drifted a hair below zero is NaN — a trap this codebase has
 /// already been bitten by once.
-fn rounded_box_sdf(x: f32, y: f32, half: f32, radius: f32) -> f32 {
-    let qx = x.abs() - half + radius;
-    let qy = y.abs() - half + radius;
+fn rounded_box_sdf(x: f32, y: f32, half_w: f32, half_h: f32, radius: f32) -> f32 {
+    // A radius larger than the box is not a rounder box, it is a broken one:
+    // the corner arcs would cross and the distance field would fold inside out.
+    let radius = radius.min(half_w).min(half_h).max(0.0);
+    let qx = x.abs() - half_w + radius;
+    let qy = y.abs() - half_h + radius;
     qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius
 }
 
