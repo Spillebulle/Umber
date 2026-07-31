@@ -7,11 +7,14 @@
 mod app;
 mod colorpicker;
 mod controls;
+mod cputext;
 mod editor;
 mod icons;
+mod logo;
 mod prefs;
 mod settings;
 mod shortcuts;
+mod splash;
 mod theme;
 mod ui;
 mod widgets;

@@ -1,7 +1,9 @@
 //! Window lifecycle, input translation and the frame loop.
 
 use crate::editor::{Editor, Interaction, Tool};
+use crate::logo;
 use crate::shortcuts::{self, Action};
+use crate::splash::{self, Splash};
 use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
@@ -548,14 +550,39 @@ impl ApplicationHandler for UmberApp {
             return;
         }
 
+        // The window appears early and then sits unpainted until the rest of
+        // this function has finished, so this is the number that decides
+        // whether Umber needs a real loading screen. Logged rather than
+        // measured once and written down, because it is a property of the
+        // driver and the machine rather than of this code.
+        let started = std::time::Instant::now();
+
         let attrs = Window::default_attributes()
             .with_title("Umber")
+            // Per-platform, and quietly so: Windows uses it for the title bar
+            // and taskbar button, X11 for the window list. Wayland ignores it
+            // entirely and takes its icon from the `.desktop` file matching the
+            // app id, and on macOS `set_window_icon` is documented as a no-op —
+            // there the icon comes from the `.app` bundle's `Info.plist`. The
+            // executable resource in `crates/umber-desktop/build.rs` is what
+            // gives Explorer and the taskbar an icon before the process starts.
+            .with_window_icon(logo::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
+
+        let window_ready = started.elapsed();
+
+        // From here to the end of this function the window is on screen with
+        // nothing in it, and most of the wait is the graphics driver's. The
+        // splash paints it from the CPU — the only way to reach a window that
+        // has no GPU surface yet. Each stage is shown *before* the work it
+        // names, so the bar never claims progress that has not happened.
+        let mut splash = Splash::new(window.clone(), theme::Palette::of(self.editor.ui.theme));
+        splash.show(splash::Stage::Adapter);
 
         let instance = Gpu::create_instance();
         let surface = instance
@@ -564,10 +591,14 @@ impl ApplicationHandler for UmberApp {
         let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))
             .expect("failed to initialise GPU");
 
+        splash.adapter(&gpu.adapter.get_info());
+        splash.show(splash::Stage::Surface);
+
         let size = window.inner_size();
         let config = gpu.surface_config(&surface, size.width, size.height);
         surface.configure(&gpu.device, &config);
 
+        splash.show(splash::Stage::Shaders);
         let canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
@@ -584,6 +615,7 @@ impl ApplicationHandler for UmberApp {
         canvas.clear_stroke(&mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
+        splash.show(splash::Stage::Fonts);
         let egui_ctx = egui::Context::default();
         theme::install_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
@@ -599,6 +631,13 @@ impl ApplicationHandler for UmberApp {
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
+
+        // Everything is ready, so the splash goes now — not when its bar
+        // finishes. A progress bar that held the first frame back to complete
+        // its own animation would be a lie about latency in an application that
+        // exists for latency.
+        splash.show(splash::Stage::Ready);
+        drop(splash);
 
         // Provisional: the real canvas region is not known until the first
         // frame has laid the panels out, which corrects both of these.
@@ -616,6 +655,17 @@ impl ApplicationHandler for UmberApp {
             egui_state,
             egui_renderer,
         });
+
+        // Split, because the two halves have very different characters and only
+        // one of them is ours to improve: window creation is fast and constant,
+        // while adapter enumeration and device creation are the graphics
+        // driver's own start-up and dominate the total. `splash.rs` explains
+        // what these numbers mean for the overlay it draws.
+        log::info!(
+            "window in {:.0} ms, GPU and fonts {:.0} ms more",
+            window_ready.as_secs_f64() * 1000.0,
+            (started.elapsed() - window_ready).as_secs_f64() * 1000.0
+        );
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {

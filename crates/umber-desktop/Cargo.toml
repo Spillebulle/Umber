@@ -14,3 +14,11 @@ path = "src/main.rs"
 umber-app = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+
+# Compiles the icon (and a version block taken from this manifest) into the
+# executable, so Explorer and the taskbar have one before the process starts.
+# Cargo selects `[target.…build-dependencies]` on the *host* triple, which is
+# what is wanted: the resource compiler is a host tool, and Linux and macOS
+# builds never see this crate at all. See `build.rs`.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
