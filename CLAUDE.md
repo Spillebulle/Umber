@@ -130,7 +130,16 @@ acceptable once per stroke but must never move into the drawing loop.
 
 ## Interface
 
-Layout and tokens come from the "Graphite" screens of the Umber design project.
+Layout and tokens come from the **"Umber app"** screen of the Umber design
+project (Claude Design project `3bfca321-22c2-4bf2-bbc9-80fab57f1e65`, read via
+the `DesignSync` tool). That page supersedes the earlier "Umber Explorations"
+page — go by it.
+
+The design is the full endgame app; a good deal of it is deliberately not built
+(layout edit mode, brush editor, settings dialog, document tabs, navigator,
+sixteen tools). The README lists what and why. **Do not add UI for features that
+do not work** — a disabled control with an explanatory tooltip is better than a
+live one that lies.
 
 - **Never hard-code a colour.** Everything comes from `theme::Palette`, which is
   what makes the second theme a table of values rather than an edit sweep.
@@ -148,6 +157,15 @@ Layout and tokens come from the "Graphite" screens of the Umber design project.
 - egui keeps separate light and dark styles; `theme::apply` writes both and sets
   the preference, otherwise switching themes leaves egui's internals in the old
   mode.
+- **HSV is the colour picker's state, not a derivative of the colour.** Hue is
+  undefined for greys, so deriving it from RGB each frame means dragging value
+  to black silently resets the hue to red. `Editor::hsv` is the source of truth;
+  `set_color` preserves hue when the incoming colour has none.
+- `Color::to_hsv` runs over **sRGB** components, not linear ones. A picker is a
+  perceptual instrument; HSV over linear values bunches badly in the shadows.
+- Watch for `powf` on a value that can go slightly negative — `sin(PI)` in f32
+  is just below zero, and a negative base with a fractional exponent is NaN,
+  which ecolor's `gamma_multiply` asserts on. This has already bitten once.
 
 ## Testing
 

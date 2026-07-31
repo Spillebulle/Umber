@@ -15,9 +15,9 @@ pub mod input;
 pub mod layer;
 pub mod stroke;
 
-pub use brush::{Brush, BrushMode};
+pub use brush::{Brush, BrushMode, BrushPreset};
 pub use camera::Camera;
-pub use color::Color;
+pub use color::{Color, Hsv};
 pub use document::Document;
 pub use geom::{PixelRect, Rect};
 pub use history::{History, PixelPatch};

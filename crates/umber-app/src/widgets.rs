@@ -171,105 +171,288 @@ pub fn segmented<T: PartialEq + Copy>(
     changed
 }
 
-/// Full-width pills, used for Paint / Erase.
-pub fn pills<T: PartialEq + Copy>(
-    ui: &mut Ui,
-    p: &Palette,
-    current: &mut T,
-    options: &[(T, &str)],
+/// Map a value onto `0..=1` along a slider, linearly or logarithmically.
+///
+/// A logarithmic map is what makes a 1–400 px brush size usable: half the
+/// travel covers 1–20 px, where the useful sizes actually live.
+fn to_t(v: f32, lo: f32, hi: f32, log: bool) -> f32 {
+    let v = v.clamp(lo, hi);
+    if log {
+        (v.ln() - lo.ln()) / (hi.ln() - lo.ln())
+    } else {
+        (v - lo) / (hi - lo)
+    }
+}
+
+fn from_t(t: f32, lo: f32, hi: f32, log: bool) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if log {
+        (lo.ln() + t * (hi.ln() - lo.ln())).exp()
+    } else {
+        lo + t * (hi - lo)
+    }
+}
+
+/// Drag a track and report whether the value moved.
+fn drag_track(
+    response: &Response,
+    track: Rect,
+    value: &mut f32,
+    lo: f32,
+    hi: f32,
+    log: bool,
 ) -> bool {
-    let mut changed = false;
-    let gap = 6.0;
-    let width = ui.available_width();
-    let cell_w = (width - gap * (options.len() as f32 - 1.0)) / options.len() as f32;
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
+    if !(response.dragged() || response.clicked()) {
+        return false;
+    }
+    let Some(pos) = response.interact_pointer_pos() else {
+        return false;
+    };
+    let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+    let next = from_t(t, lo, hi, log);
+    if next == *value {
+        return false;
+    }
+    *value = next;
+    true
+}
 
-    for (i, (value, label)) in options.iter().enumerate() {
-        let cell = Rect::from_min_size(
-            pos2(rect.left() + (cell_w + gap) * i as f32, rect.top()),
-            vec2(cell_w, rect.height()),
-        );
-        let response = ui.interact(cell, ui.id().with((label, i)), Sense::click());
-        if response.clicked() {
-            *current = *value;
-            changed = true;
-        }
-
-        let selected = *current == *value;
-        let fill = if selected {
-            p.control_active
-        } else if response.hovered() {
-            p.control_hover
-        } else {
-            p.control
-        };
-        let painter = ui.painter();
-        painter.rect_filled(cell, metrics::RADIUS, fill);
-        painter.text(
-            cell.center(),
-            Align2::CENTER_CENTER,
-            *label,
-            FontId::proportional(text::CONTROL),
-            if selected { p.accent } else { p.text_muted },
+fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: f32) {
+    let radius = track.height() * 0.5;
+    painter.rect_filled(track, radius, p.rail);
+    if t > 0.0 {
+        let filled = Rect::from_min_size(track.min, vec2(track.width() * t, track.height()));
+        painter.rect_filled(filled, radius, p.accent);
+    }
+    if knob > 0.0 {
+        painter.circle_filled(
+            pos2(track.left() + track.width() * t, track.center().y),
+            knob * 0.5,
+            p.knob,
         );
     }
+}
+
+/// Compact label + rail + readout, laid out horizontally for the options strip.
+pub fn inline_slider(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    log: bool,
+    display: impl Fn(f32) -> String,
+) -> bool {
+    let (lo, hi) = (*range.start(), *range.end());
+    let log = log && lo > 0.0 && hi > lo;
+
+    ui.label(
+        egui::RichText::new(label)
+            .size(text::SMALL)
+            .color(p.text_dim),
+    );
+
+    let (row, response) = ui.allocate_exact_size(vec2(90.0, 16.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(row.center(), vec2(row.width() - 10.0, 3.0));
+    let changed = drag_track(&response, track, value, lo, hi, log);
+    paint_track(ui.painter(), p, track, to_t(*value, lo, hi, log), 10.0);
+
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(display(*value))
+            .monospace()
+            .size(text::TINY)
+            .color(p.text),
+    );
 
     changed
 }
 
-/// Tabs with an accent underline on the active one.
-pub fn tabs<T: PartialEq + Copy>(
+/// A rail with no label or readout, for rows that supply their own.
+pub fn bare_slider(ui: &mut Ui, p: &Palette, value: &mut f32, range: RangeInclusive<f32>) -> bool {
+    let (lo, hi) = (*range.start(), *range.end());
+    let width = (ui.available_width() - 30.0).max(24.0);
+    let (row, response) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(row.center(), vec2(row.width(), 3.0));
+    let changed = drag_track(&response, track, value, lo, hi, false);
+    paint_track(ui.painter(), p, track, to_t(*value, lo, hi, false), 0.0);
+    changed
+}
+
+/// A read-only bordered pill showing a name and its value.
+pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
+    let padding = 9.0;
+    let font = FontId::proportional(text::SMALL);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(format!("{label}  {value}"), font.clone(), p.text)
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(vec2(text_w + padding * 2.0, 22.0), Sense::hover());
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS, p.window);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + vec2(padding, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        font.clone(),
+        p.text_dim,
+    );
+    painter.text(
+        rect.right_center() - vec2(padding, 0.0),
+        Align2::RIGHT_CENTER,
+        value,
+        font,
+        p.text,
+    );
+}
+
+/// A brush preset: a tapered stroke sample, then the name.
+///
+/// The sample is drawn from the preset's own opacity and hardness, so the rows
+/// differ the way the brushes do rather than all showing the same smear.
+pub fn brush_preset_row(
     ui: &mut Ui,
     p: &Palette,
-    current: &mut T,
-    options: &[(T, &str)],
-) -> bool {
-    let mut changed = false;
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
-    let cell_w = rect.width() / options.len() as f32;
+    name: &str,
+    opacity: f32,
+    hardness: f32,
+    selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
 
-    ui.painter().line_segment(
-        [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, p.border),
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+    } else if response.hovered() {
+        painter.rect_filled(rect, metrics::RADIUS, p.control);
+    }
+
+    // Tapered sample: a row of circles whose radius and alpha rise then fall.
+    let sample = Rect::from_min_size(rect.left_top() + vec2(7.0, 6.0), vec2(64.0, 14.0));
+    const STEPS: usize = 26;
+    for i in 0..STEPS {
+        let t = i as f32 / (STEPS - 1) as f32;
+        // Ends taper to nothing; the middle is the brush at full width.
+        //
+        // The `max(0.0)` is load-bearing: `sin(PI)` in f32 lands just *below*
+        // zero, and a negative base with a fractional exponent is NaN, which
+        // propagates into the alpha and trips ecolor's assert.
+        let taper = (t * std::f32::consts::PI).sin().max(0.0);
+        let radius = (sample.height() * 0.5) * taper.powf(0.6);
+        if radius <= 0.2 {
+            continue;
+        }
+        // Softer brushes read as a wider, fainter smear.
+        let alpha = opacity * taper.powf(1.0 + (1.0 - hardness) * 1.5);
+        painter.circle_filled(
+            pos2(sample.left() + sample.width() * t, sample.center().y),
+            radius,
+            p.text_strong.gamma_multiply(alpha.clamp(0.0, 1.0)),
+        );
+    }
+
+    painter.text(
+        pos2(sample.right() + 9.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(text::TINY),
+        if selected { p.text_strong } else { p.text },
     );
 
-    for (i, (value, label)) in options.iter().enumerate() {
-        let cell = Rect::from_min_size(
-            pos2(rect.left() + cell_w * i as f32, rect.top()),
-            vec2(cell_w, rect.height()),
-        );
-        let response = ui.interact(cell, ui.id().with(("tab", label, i)), Sense::click());
-        if response.clicked() {
-            *current = *value;
-            changed = true;
-        }
+    response
+}
 
-        let selected = *current == *value;
-        let painter = ui.painter();
-        painter.text(
-            cell.center(),
-            Align2::CENTER_CENTER,
-            *label,
-            FontId::proportional(text::CONTROL),
-            if selected {
-                p.text_strong
-            } else if response.hovered() {
-                p.text
-            } else {
-                p.text_dim
-            },
+pub struct LayerRowResponse {
+    pub clicked: bool,
+    pub eye_clicked: bool,
+}
+
+/// One row of the layer stack: visibility, a thumbnail chip, name and blend.
+pub fn layer_row(
+    ui: &mut Ui,
+    p: &Palette,
+    name: &str,
+    visible: bool,
+    active: bool,
+    blend: &str,
+) -> LayerRowResponse {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+        painter.rect_stroke(
+            rect,
+            metrics::RADIUS,
+            Stroke::new(1.0, p.accent_dim),
+            egui::StrokeKind::Inside,
         );
-        if selected {
-            let underline = Rect::from_min_size(
-                pos2(cell.left(), cell.bottom() - 2.0),
-                vec2(cell.width(), 2.0),
+    } else if response.hovered() {
+        painter.rect_filled(rect, metrics::RADIUS, p.control);
+    }
+
+    // The eye is its own hit target inside the row, so toggling visibility
+    // does not also change the selection.
+    let eye = Rect::from_min_size(rect.left_top() + vec2(5.0, 6.0), vec2(18.0, 18.0));
+    let eye_response = ui.interact(eye, ui.id().with(("eye", name)), Sense::click());
+
+    let painter = ui.painter();
+    painter.text(
+        eye.center(),
+        Align2::CENTER_CENTER,
+        if visible { "◉" } else { "○" },
+        FontId::proportional(text::SMALL),
+        if visible { p.text } else { p.text_dim },
+    );
+
+    // Thumbnail placeholder: a checker chip. Rendering real layer thumbnails
+    // needs a downscale pass that does not exist yet.
+    let thumb = Rect::from_min_size(rect.left_top() + vec2(27.0, 3.0), vec2(24.0, 24.0));
+    painter.rect_filled(thumb, 3.0, p.window);
+    for i in 0..4 {
+        for j in 0..4 {
+            if (i + j) % 2 == 0 {
+                continue;
+            }
+            let cell = Rect::from_min_size(
+                thumb.left_top() + vec2(i as f32 * 6.0, j as f32 * 6.0),
+                vec2(6.0, 6.0),
             );
-            painter.rect_filled(underline, 0.0, p.accent);
+            painter.rect_filled(cell.intersect(thumb), 0.0, p.control_hover);
         }
     }
 
-    changed
+    painter.text(
+        pos2(thumb.right() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(text::SMALL),
+        match (active, visible) {
+            (true, _) => p.text_strong,
+            (false, true) => p.text,
+            (false, false) => p.text_dim,
+        },
+    );
+    painter.text(
+        rect.right_center() - vec2(7.0, 0.0),
+        Align2::RIGHT_CENTER,
+        blend,
+        FontId::proportional(9.0),
+        p.text_dim.gamma_multiply(0.8),
+    );
+
+    LayerRowResponse {
+        clicked: response.clicked(),
+        eye_clicked: eye_response.clicked(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,37 +575,4 @@ pub fn section(ui: &mut Ui, p: &Palette, label: &str, open: &mut bool, badge: Op
             p.text_dim,
         );
     }
-}
-
-/// A flat text button sized to fill its share of a row.
-pub fn flat_button(ui: &mut Ui, p: &Palette, label: &str, width: f32, enabled: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
-    let response = if enabled {
-        response
-    } else {
-        // Still consumes the space, but reports no clicks.
-        ui.interact(rect, ui.id().with(("disabled", label)), Sense::hover())
-    };
-
-    let fill = if enabled && response.hovered() {
-        p.control_hover
-    } else {
-        p.control
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, metrics::RADIUS, fill);
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(text::SMALL),
-        if !enabled {
-            p.text_dim.gamma_multiply(0.5)
-        } else if response.hovered() {
-            p.text_strong
-        } else {
-            p.text_muted
-        },
-    );
-    response
 }

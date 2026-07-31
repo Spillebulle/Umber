@@ -47,29 +47,41 @@ sudo pacman -S wayland libxkbcommon libx11 libxrandr libxi vulkan-icd-loader
 
 ## Interface
 
-The workspace follows the "Graphite" direction from the Umber design project
-(screen `1b`, evolved in `2a`): a menu bar, a 48 px tool rail, the canvas, a
-264 px tabbed panel, and a status bar. The whole layout mirrors for left-handed
-use, so the rail sits under the drawing hand.
+The workspace follows the **Umber app** screen of the design project: a menu
+bar, a tool options strip, a two-column tool rail, the canvas, and a docked
+column of stacked panels (Colour, Brushes, Layers). The whole layout mirrors
+for left-handed use, so the rail sits under the drawing hand.
+
+The Colour panel implements three of the design's five picker modes — a hue
+ring with a switchable triangle or square centre, a saturation/value square
+with a hue bar, and RGB sliders. Palette and Harmony are not built.
 
 Two themes ship — **Graphite** (near-black, the default) and **Paper** (warm
 neutrals) — under *View*. Colours, type scale and metrics live in
 `crates/umber-app/src/theme.rs`; nothing else hard-codes a colour, so a third
 theme is a table of values.
 
-The design's sliders, pill toggles and segmented pickers are painted directly
-(`widgets.rs`) rather than restyled out of egui's stock widgets, which have a
-look of their own that fights the design.
+The design's sliders, pill toggles, segmented pickers, tool icons and brush
+previews are painted directly (`widgets.rs`, `colorpicker.rs`) rather than
+restyled out of egui's stock widgets, which have a look of their own that
+fights the design.
 
-**Taken from the design but not built yet**, in rough order of how much work
-each is: the bespoke colour picker (egui's stock picker stands in), the brush
-editor dialog, alternative colour-picker systems, the splash screen, settings
-and shortcut dialogs, and — the big one — dockable, tear-off and floating
-panels. The docking explorations (`1d`, `2c`, `3c`, `4a`) are a large project in
-an immediate-mode UI and are not attempted.
+### Not built yet
 
-The design specifies **Archivo** for UI text. That font is not bundled, so egui's
-default face is used; typography is the one part of the design that is
+Taken from the design but not implemented, roughly by size:
+
+- **Layout edit mode** — dragging panels out to float, dock zones, tear-off and
+  re-docking, drag-to-reorder tools. This is the design's "advanced endgame"
+  and is a large project in an immediate-mode UI.
+- **Brush editor dialog** — tip, dynamics with pressure curves, texture.
+- **Settings dialog** — theme cards, shortcut editor.
+- Document tabs (single-document only), the Navigator overlay, Palette and
+  Harmony colour modes, and per-brush blend modes.
+- The design shows a sixteen-tool rail; Umber has four. The missing twelve are
+  not drawn rather than shown as buttons that do nothing.
+
+The design specifies **Archivo** for UI text. That font is not bundled, so
+egui's default face is used; typography is the one part of the design that is
 approximated rather than matched.
 
 ## Controls
@@ -77,7 +89,8 @@ approximated rather than matched.
 | Input | Action |
 |---|---|
 | Left drag | Use the selected tool |
-| `B` / `E` | Brush / eraser |
+| `B` / `E` / `H` / `Z` | Brush / eraser / pan / zoom |
+| `X` | Swap foreground and background colours |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
 | Wheel | Zoom at cursor |

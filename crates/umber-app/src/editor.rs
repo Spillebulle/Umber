@@ -1,11 +1,13 @@
 //! Editor state — everything that is not a GPU resource or a window.
 
+use crate::colorpicker::{PickerMode, WheelShape};
 use crate::theme::ThemeKind;
 use glam::Vec2;
 use std::collections::HashMap;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, Camera, Color, Document, History, InputPoint, LayerStack, StrokeBuilder,
+    Brush, BrushMode, BrushPreset, Camera, Color, Document, History, Hsv, InputPoint, LayerStack,
+    StrokeBuilder,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -34,12 +36,6 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PanelTab {
-    Brush,
-    Layers,
-}
-
 /// Presentation state — what the interface looks like, not what the document
 /// contains. Kept apart from the document so it can be persisted separately
 /// later without dragging artwork into a preferences file.
@@ -48,10 +44,12 @@ pub struct UiState {
     pub theme: ThemeKind,
     /// Mirrors the workspace so the tool rail sits under the drawing hand.
     pub left_handed: bool,
-    pub tab: PanelTab,
     pub pressure_open: bool,
     pub tool: Tool,
-    pub picker_open: bool,
+    pub picker: PickerMode,
+    pub wheel_shape: WheelShape,
+    /// Open state of the picker-mode dropdown in the Colour panel header.
+    pub picker_menu_open: bool,
 }
 
 impl Default for UiState {
@@ -59,10 +57,11 @@ impl Default for UiState {
         Self {
             theme: ThemeKind::Graphite,
             left_handed: false,
-            tab: PanelTab::Brush,
             pressure_open: true,
             tool: Tool::Brush,
-            picker_open: false,
+            picker: PickerMode::Wheel,
+            wheel_shape: WheelShape::Triangle,
+            picker_menu_open: false,
         }
     }
 }
@@ -72,6 +71,13 @@ pub struct Editor {
     pub camera: Camera,
     pub brush: Brush,
     pub color: Color,
+    /// Background colour, swapped with `color` by X.
+    pub secondary: Color,
+    /// The picker's own state. Deriving hue from `color` each frame would lose
+    /// it whenever saturation or value reaches zero.
+    pub hsv: Hsv,
+    pub presets: Vec<BrushPreset>,
+    pub active_preset: Option<usize>,
     pub layers: LayerStack,
     pub ui: UiState,
     /// Centre of the region the document is drawn in, in physical pixels.
@@ -125,6 +131,10 @@ impl Default for Editor {
             },
             brush: Brush::default(),
             color: Color::from_srgb_u8(20, 20, 24, 255),
+            secondary: Color::WHITE,
+            hsv: Color::from_srgb_u8(20, 20, 24, 255).to_hsv(),
+            presets: BrushPreset::defaults(),
+            active_preset: None,
             layers: LayerStack::new(),
             ui: UiState::default(),
             canvas_pivot: Vec2::ZERO,
@@ -182,6 +192,41 @@ impl Editor {
             Tool::Eraser => self.brush.mode = BrushMode::Erase,
             Tool::Pan | Tool::Zoom => {}
         }
+    }
+
+    /// Adopt the picker's HSV as the painting colour.
+    pub fn commit_picker(&mut self) {
+        self.color = self.hsv.to_color(1.0);
+    }
+
+    /// Point the picker at a colour chosen elsewhere, preserving hue for greys.
+    pub fn set_color(&mut self, color: Color) {
+        let next = color.to_hsv();
+        self.color = color;
+        self.hsv.s = next.s;
+        self.hsv.v = next.v;
+        if next.s > 1e-4 {
+            self.hsv.h = next.h;
+        }
+    }
+
+    /// Swap foreground and background colours.
+    pub fn swap_colors(&mut self) {
+        std::mem::swap(&mut self.color, &mut self.secondary);
+        let color = self.color;
+        self.set_color(color);
+    }
+
+    /// Load a brush preset, keeping the current paint/erase mode — switching
+    /// brush should not silently turn the eraser back into a brush.
+    pub fn apply_preset(&mut self, index: usize) {
+        let Some(preset) = self.presets.get(index) else {
+            return;
+        };
+        let mode = self.brush.mode;
+        self.brush = preset.brush;
+        self.brush.mode = mode;
+        self.active_preset = Some(index);
     }
 
     pub fn fit_view(&mut self) {

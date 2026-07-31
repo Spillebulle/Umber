@@ -32,10 +32,14 @@ impl ThemeKind {
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub accent: Color32,
+    /// Muted accent — dashed outlines, subtle tints.
+    pub accent_dim: Color32,
     /// Behind the document — the darkest surface.
     pub backdrop: Color32,
     /// Panel interiors and inset wells.
     pub window: Color32,
+    /// The docked panel column.
+    pub dock: Color32,
     /// Menu bar, rails, side panels.
     pub chrome: Color32,
     pub border: Color32,
@@ -58,9 +62,11 @@ pub struct Palette {
 impl Palette {
     pub const fn graphite() -> Self {
         Self {
-            accent: Color32::from_rgb(0xC1, 0x8B, 0x5E),
+            accent: Color32::from_rgb(0xC0, 0x8A, 0x4E),
+            accent_dim: Color32::from_rgb(0x6B, 0x4E, 0x2E),
             backdrop: Color32::from_rgb(0x0D, 0x0E, 0x10),
             window: Color32::from_rgb(0x11, 0x12, 0x14),
+            dock: Color32::from_rgb(0x14, 0x15, 0x17),
             chrome: Color32::from_rgb(0x17, 0x18, 0x1A),
             border: Color32::from_rgb(0x26, 0x28, 0x2B),
             popover: Color32::from_rgb(0x1B, 0x1C, 0x1F),
@@ -80,8 +86,10 @@ impl Palette {
     pub const fn paper() -> Self {
         Self {
             accent: Color32::from_rgb(0x9C, 0x62, 0x2F),
+            accent_dim: Color32::from_rgb(0xC9, 0xB8, 0xA2),
             backdrop: Color32::from_rgb(0xE4, 0xE0, 0xD9),
             window: Color32::from_rgb(0xEF, 0xEC, 0xE7),
+            dock: Color32::from_rgb(0xF2, 0xEF, 0xEA),
             chrome: Color32::from_rgb(0xF7, 0xF5, 0xF1),
             border: Color32::from_rgb(0xDE, 0xDA, 0xD3),
             popover: Color32::from_rgb(0xFF, 0xFF, 0xFF),
@@ -135,12 +143,14 @@ pub mod text {
 
 /// Fixed sizes taken straight from the design.
 pub mod metrics {
-    pub const MENU_BAR: f32 = 36.0;
+    pub const MENU_BAR: f32 = 34.0;
+    pub const OPTIONS_STRIP: f32 = 36.0;
     pub const STATUS_BAR: f32 = 26.0;
-    pub const TOOL_RAIL: f32 = 48.0;
-    pub const TOOL_BUTTON: f32 = 36.0;
+    pub const TOOL_RAIL: f32 = 76.0;
+    pub const TOOL_BUTTON: f32 = 32.0;
     pub const PANEL: f32 = 264.0;
-    pub const PANEL_PAD: f32 = 14.0;
+    /// Horizontal padding inside a docked panel.
+    pub const PANEL_PAD: i8 = 12;
     pub const RADIUS: f32 = 5.0;
     pub const RADIUS_LARGE: f32 = 6.0;
     pub const SLIDER_ROW: f32 = 16.0;

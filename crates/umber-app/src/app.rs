@@ -5,7 +5,7 @@ use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
-use umber_core::{Brush, BrushMode, Camera, Dab, InputPoint, PixelPatch};
+use umber_core::{Brush, Camera, Dab, InputPoint, PixelPatch};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -256,8 +256,11 @@ impl UmberApp {
                 self.editor.camera = Camera::fit(self.editor.doc.size_vec2(), self.viewport());
             }
             KeyCode::Digit1 if ctrl => self.editor.camera.zoom = 1.0,
-            KeyCode::KeyB => self.editor.brush.mode = BrushMode::Paint,
-            KeyCode::KeyE => self.editor.brush.mode = BrushMode::Erase,
+            KeyCode::KeyB => self.editor.set_tool(Tool::Brush),
+            KeyCode::KeyE => self.editor.set_tool(Tool::Eraser),
+            KeyCode::KeyH => self.editor.set_tool(Tool::Pan),
+            KeyCode::KeyZ => self.editor.set_tool(Tool::Zoom),
+            KeyCode::KeyX => self.editor.swap_colors(),
             KeyCode::BracketLeft => {
                 self.editor.brush.size =
                     (self.editor.brush.size / 1.15).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE);

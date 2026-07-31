@@ -1,15 +1,21 @@
-//! The Graphite workspace.
+//! The Umber workspace.
 //!
-//! Layout follows screen 1b of the Umber design project: a menu bar, a 48 px
-//! tool rail, the canvas, a 264 px tabbed panel, and a status bar. The whole
-//! arrangement mirrors for left-handed use, which is why the rail and panel
-//! sides are chosen rather than fixed.
+//! Layout follows the "Umber app" screen of the design project: menu bar, tool
+//! options strip, a two-column tool rail, the canvas, and a docked column of
+//! stacked panels (Colour, Brushes, Layers). The whole arrangement mirrors for
+//! left-handed use, which is why the rail and dock sides are chosen rather than
+//! fixed.
+//!
+//! The design's layout-edit mode — dragging panels out to float or re-dock
+//! them — is not implemented. See the README for the full list of what was and
+//! was not taken.
 
-use crate::editor::{Editor, PanelTab, Tool};
+use crate::colorpicker::{self, PickerMode};
+use crate::editor::{Editor, Tool};
 use crate::theme::{Palette, ThemeKind, metrics, text};
 use crate::widgets::{self, ToolIcon};
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
-use umber_core::{BlendMode, Brush, Color, LayerStack, input::PressureSource};
+use umber_core::{BlendMode, Brush, LayerStack, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -48,38 +54,42 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .frame(chrome.inner_margin(Margin::symmetric(12, 0)))
         .show(root, |ui| menu_bar(ui, &p, ed, &mut actions));
 
+    egui::Panel::top("options-strip")
+        .exact_size(metrics::OPTIONS_STRIP)
+        .frame(chrome.inner_margin(Margin::symmetric(12, 0)))
+        .show(root, |ui| options_strip(ui, &p, ed));
+
     egui::Panel::bottom("status-bar")
         .exact_size(metrics::STATUS_BAR)
         .frame(chrome.inner_margin(Margin::symmetric(12, 0)))
         .show(root, |ui| status_bar(ui, &p, ed, &mut actions));
 
     // Mirrored layout: the rail sits on the drawing-hand side so the hand does
-    // not cover the panel it is reaching past.
-    let (rail_id, panel_id) = ("tool-rail", "tool-panel");
+    // not cover the panels it reaches past.
     let rail_frame = chrome.inner_margin(Margin::symmetric(0, 8));
-    let panel_frame = Frame {
-        fill: p.chrome,
+    let dock_frame = Frame {
+        fill: p.dock,
         ..Default::default()
     };
 
     if ed.ui.left_handed {
-        egui::Panel::right(rail_id)
+        egui::Panel::right("tool-rail")
             .exact_size(metrics::TOOL_RAIL)
             .frame(rail_frame)
             .show(root, |ui| tool_rail(ui, &p, ed));
-        egui::Panel::left(panel_id)
+        egui::Panel::left("dock")
             .exact_size(metrics::PANEL)
-            .frame(panel_frame)
-            .show(root, |ui| tool_panel(ui, &p, ed, &mut actions));
+            .frame(dock_frame)
+            .show(root, |ui| dock(ui, &p, ed, &mut actions));
     } else {
-        egui::Panel::left(rail_id)
+        egui::Panel::left("tool-rail")
             .exact_size(metrics::TOOL_RAIL)
             .frame(rail_frame)
             .show(root, |ui| tool_rail(ui, &p, ed));
-        egui::Panel::right(panel_id)
+        egui::Panel::right("dock")
             .exact_size(metrics::PANEL)
-            .frame(panel_frame)
-            .show(root, |ui| tool_panel(ui, &p, ed, &mut actions));
+            .frame(dock_frame)
+            .show(root, |ui| dock(ui, &p, ed, &mut actions));
     }
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
@@ -97,8 +107,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     ui.horizontal_centered(|ui| {
-        // Brand mark.
-        let (mark, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+        let (mark, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
         ui.painter().rect_filled(mark, 3.0, p.accent);
         ui.add_space(6.0);
 
@@ -162,6 +171,9 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                 {
                     ui.close();
                 }
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new("Customise layout…"))
+                    .on_disabled_hover_text("Panel docking is not implemented yet");
             });
 
             ui.menu_button("Help", |ui| {
@@ -172,8 +184,8 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
             });
         });
 
-        // Document title, centred across the whole bar rather than after the
-        // menus, so it does not drift as menu labels change.
+        // Document title, centred on the whole bar rather than after the menus,
+        // so it does not drift as menu labels change.
         let bar = ui.max_rect();
         ui.painter().text(
             bar.center(),
@@ -186,363 +198,464 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!("{:.0} fps", ed.average_fps()))
-                    .small()
+                    .size(text::TINY)
                     .color(p.text_dim),
             );
         });
     });
 }
 
+/// The horizontal strip of settings for the current tool.
+///
+/// Size and opacity live here as well as further down the dock because they are
+/// the two a painter reaches for constantly.
+fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.horizontal_centered(|ui| {
+        let (glyph, name) = match ed.ui.tool {
+            Tool::Brush => ("✎", "Brush"),
+            Tool::Eraser => ("◻", "Eraser"),
+            Tool::Pan => ("✥", "Pan"),
+            Tool::Zoom => ("⌕", "Zoom"),
+        };
+        ui.label(egui::RichText::new(glyph).size(13.0).color(p.accent));
+        ui.label(
+            egui::RichText::new(name)
+                .size(text::SMALL)
+                .color(p.text_strong)
+                .strong(),
+        );
+
+        divider(ui, p);
+
+        if ed.ui.tool.paints() {
+            widgets::inline_slider(
+                ui,
+                p,
+                "Size",
+                &mut ed.brush.size,
+                Brush::MIN_SIZE..=400.0,
+                true,
+                |v| format!("{v:.0}"),
+            );
+            widgets::inline_slider(
+                ui,
+                p,
+                "Opacity",
+                &mut ed.brush.opacity,
+                0.0..=1.0,
+                false,
+                |v| format!("{:.0}", v * 100.0),
+            );
+
+            divider(ui, p);
+
+            widgets::chip(
+                ui,
+                p,
+                "Stabiliser",
+                &format!("{:.0}", ed.brush.stabilization * 100.0),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("drag on the canvas")
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled(
+                false,
+                egui::Label::new(
+                    egui::RichText::new("✎ Edit brush…")
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                ),
+            )
+            .on_disabled_hover_text("The brush editor dialog is not implemented yet");
+        });
+    });
+}
+
+fn divider(ui: &mut egui::Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(1.0, 16.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, p.border);
+}
+
 fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
 
-        for (tool, icon, tip) in [
+        // Two columns, as the design lays out its tool grid. Umber has four
+        // tools where the design shows sixteen; the rest are simply not drawn,
+        // rather than shown as buttons that do nothing.
+        let tools = [
             (Tool::Brush, ToolIcon::Brush, "Brush (B)"),
             (Tool::Eraser, ToolIcon::Eraser, "Eraser (E)"),
             (Tool::Pan, ToolIcon::Pan, "Pan (H, or hold Space)"),
             (Tool::Zoom, ToolIcon::Zoom, "Zoom (Z)"),
-        ] {
-            if widgets::tool_button(ui, p, icon, ed.ui.tool == tool, tip).clicked() {
-                ed.set_tool(tool);
-            }
-        }
-
-        // Colour well pinned to the bottom of the rail.
-        let remaining = ui.available_height() - 38.0;
-        if remaining > 0.0 {
-            ui.add_space(remaining);
-        }
-
-        let [r, g, b, _] = ed.color.to_srgb_u8();
-        let mut rgba = egui::Color32::from_rgb(r, g, b);
-        let (well, response) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-        ui.painter().rect_filled(well, metrics::RADIUS_LARGE, rgba);
-        ui.painter().rect_stroke(
-            well,
-            metrics::RADIUS_LARGE,
-            Stroke::new(1.0, p.border),
-            egui::StrokeKind::Inside,
-        );
-        if response.clicked() {
-            ed.ui.picker_open = !ed.ui.picker_open;
-        }
-
-        // egui's own picker rather than the design's bespoke SV square — see
-        // the README's note on what was and was not taken from the design.
-        let popup = egui::Popup::from_response(&response)
-            .open(ed.ui.picker_open)
-            .show(|ui| {
-                ui.spacing_mut().slider_width = 180.0;
-                if egui::color_picker::color_picker_color32(
-                    ui,
-                    &mut rgba,
-                    egui::color_picker::Alpha::Opaque,
-                ) {
-                    ed.color = Color::from_srgb_u8(rgba.r(), rgba.g(), rgba.b(), 255);
+        ];
+        let mut picked = None;
+        for pair in tools.chunks(2) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (tool, icon, tip) in pair {
+                    if widgets::tool_button(ui, p, *icon, ed.ui.tool == *tool, tip).clicked() {
+                        picked = Some(*tool);
+                    }
                 }
             });
-        if popup.is_none() {
-            ed.ui.picker_open = false;
         }
+        if let Some(tool) = picked {
+            ed.set_tool(tool);
+        }
+
+        ui.add_space(6.0);
+        let (line, _) = ui.allocate_exact_size(vec2(44.0, 1.0), Sense::hover());
+        ui.painter().rect_filled(line, 0.0, p.border);
+        ui.add_space(6.0);
+
+        // Overlapping foreground/background wells, click to swap.
+        let (well, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+        let fg = Rect::from_min_size(well.left_top(), vec2(24.0, 24.0));
+        let bg = Rect::from_min_size(well.left_top() + vec2(10.0, 10.0), vec2(24.0, 24.0));
+        let to32 = |c: umber_core::Color| {
+            let [r, g, b, _] = c.to_srgb_u8();
+            egui::Color32::from_rgb(r, g, b)
+        };
+        let painter = ui.painter();
+        for (rect, colour) in [(bg, ed.secondary), (fg, ed.color)] {
+            painter.rect_filled(rect, metrics::RADIUS, to32(colour));
+            painter.rect_stroke(
+                rect,
+                metrics::RADIUS,
+                Stroke::new(1.0, p.popover_border),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if response.on_hover_text("Swap colours (X)").clicked() {
+            ed.swap_colors();
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("X swap")
+                .size(9.0)
+                .color(p.text_dim.gamma_multiply(0.8)),
+        );
     });
 }
 
-fn tool_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
-    widgets::tabs(
-        ui,
-        p,
-        &mut ed.ui.tab,
-        &[(PanelTab::Brush, "Brush"), (PanelTab::Layers, "Layers")],
-    );
-
-    // Action row is pinned to the bottom, so reserve it before the scroll area
-    // claims the remaining height.
-    let footer = 46.0;
-    let body = (ui.available_height() - footer).max(0.0);
-
+/// The docked column: Colour, Brushes and Layers stacked.
+fn dock(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     egui::ScrollArea::vertical()
-        .max_height(body)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            Frame::NONE
-                .inner_margin(Margin::symmetric(metrics::PANEL_PAD as i8, 14))
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 13.0;
-                    match ed.ui.tab {
-                        PanelTab::Brush => brush_tab(ui, p, ed),
-                        PanelTab::Layers => layers_tab(ui, p, ed, actions),
+            colour_panel(ui, p, ed);
+            dock_rule(ui, p);
+            brushes_panel(ui, p, ed);
+            dock_rule(ui, p);
+            layers_panel(ui, p, ed, actions);
+            dock_rule(ui, p);
+            brush_detail_panel(ui, p, ed);
+        });
+}
+
+fn dock_rule(ui: &mut egui::Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, p.border);
+}
+
+fn panel_frame() -> Frame {
+    Frame::NONE.inner_margin(Margin {
+        left: metrics::PANEL_PAD,
+        right: metrics::PANEL_PAD,
+        top: 9,
+        bottom: 10,
+    })
+}
+
+fn panel_title(ui: &mut egui::Ui, p: &Palette, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(text::SMALL)
+            .color(p.text_strong)
+            .strong(),
+    );
+}
+
+fn colour_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    panel_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            panel_title(ui, p, "Colour");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = format!("◐ {} ▾", ed.ui.picker.label());
+                let response = ui.add(
+                    egui::Label::new(egui::RichText::new(label).size(9.5).color(p.text_dim))
+                        .sense(Sense::click()),
+                );
+                if response.clicked() {
+                    ed.ui.picker_menu_open = !ed.ui.picker_menu_open;
+                }
+                let popup = egui::Popup::from_response(&response)
+                    .open(ed.ui.picker_menu_open)
+                    .show(|ui| {
+                        for mode in PickerMode::ALL {
+                            if ui
+                                .selectable_label(ed.ui.picker == mode, mode.label())
+                                .clicked()
+                            {
+                                ed.ui.picker = mode;
+                                ed.ui.picker_menu_open = false;
+                            }
+                        }
+                    });
+                if popup.is_none() {
+                    ed.ui.picker_menu_open = false;
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+
+        let mut shape = ed.ui.wheel_shape;
+        let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut ed.hsv);
+        ed.ui.wheel_shape = shape;
+        if changed {
+            ed.commit_picker();
+        }
+
+        ui.add_space(9.0);
+        ui.horizontal(|ui| {
+            let [r, g, b, _] = ed.color.to_srgb_u8();
+            let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+            ui.painter()
+                .rect_filled(chip, metrics::RADIUS, egui::Color32::from_rgb(r, g, b));
+            ui.label(
+                egui::RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
+                    .monospace()
+                    .size(text::TINY)
+                    .color(p.text),
+            );
+        });
+    });
+}
+
+fn brushes_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    panel_frame().show(ui, |ui| {
+        panel_title(ui, p, "Brushes");
+        ui.add_space(6.0);
+
+        let mut pick = None;
+        for (index, preset) in ed.presets.iter().enumerate() {
+            let selected = ed.active_preset == Some(index);
+            if widgets::brush_preset_row(
+                ui,
+                p,
+                preset.name,
+                preset.brush.opacity,
+                preset.brush.hardness,
+                selected,
+            )
+            .clicked()
+            {
+                pick = Some(index);
+            }
+        }
+        if let Some(index) = pick {
+            ed.apply_preset(index);
+        }
+    });
+}
+
+fn layers_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    panel_frame().show(ui, |ui| {
+        let count = ed.layers.len();
+        let active = ed.layers.active_index();
+
+        ui.horizontal(|ui| {
+            panel_title(ui, p, "Layers");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, p, "🗑", count > 1, "Delete layer — clears undo history") {
+                    actions.delete_layer = Some(active);
+                }
+                if icon_button(ui, p, "▾", active > 0, "Move layer down") {
+                    actions.move_layer_down = Some(active);
+                }
+                if icon_button(ui, p, "▴", active + 1 < count, "Move layer up") {
+                    actions.move_layer_up = Some(active);
+                }
+                if icon_button(
+                    ui,
+                    p,
+                    "＋",
+                    count < LayerStack::MAX,
+                    "Add a layer above the current one",
+                ) {
+                    actions.add_layer = true;
+                }
+            });
+        });
+
+        ui.add_space(7.0);
+
+        // Blend and opacity for the selected layer, on one row.
+        ui.horizontal(|ui| {
+            let layer = ed.layers.active_mut();
+            egui::ComboBox::from_id_salt("layer-blend")
+                .selected_text(
+                    egui::RichText::new(layer.blend.label())
+                        .size(text::TINY)
+                        .color(p.text),
+                )
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut layer.blend, mode, mode.label());
                     }
                 });
+            let value = layer.opacity;
+            widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
+            ui.label(
+                egui::RichText::new(format!("{:.0}", value * 100.0))
+                    .monospace()
+                    .size(10.0)
+                    .color(p.text),
+            );
         });
 
-    // Footer.
-    ui.painter().line_segment(
-        [
-            ui.max_rect().left_bottom() - vec2(0.0, footer),
-            ui.max_rect().right_bottom() - vec2(0.0, footer),
-        ],
-        Stroke::new(1.0, p.border),
-    );
-    Frame::NONE
-        .inner_margin(Margin::symmetric(metrics::PANEL_PAD as i8, 10))
-        .show(ui, |ui| {
-            let gap = 6.0;
-            let width = (ui.available_width() - gap * 2.0) / 3.0;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                if widgets::flat_button(ui, p, "Undo", width, ed.history.can_undo()).clicked() {
-                    actions.undo = true;
-                }
-                if widgets::flat_button(ui, p, "Redo", width, ed.history.can_redo()).clicked() {
-                    actions.redo = true;
-                }
-                if widgets::flat_button(ui, p, "Clear", width, true).clicked() {
-                    actions.clear = true;
-                }
-            });
-        });
-}
+        ui.add_space(7.0);
 
-fn brush_tab(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    let mut tool = ed.ui.tool;
-    if widgets::pills(
-        ui,
-        p,
-        &mut tool,
-        &[(Tool::Brush, "Paint"), (Tool::Eraser, "Erase")],
-    ) {
-        ed.set_tool(tool);
-    }
-
-    widgets::slider_row(
-        ui,
-        p,
-        "Size",
-        &mut ed.brush.size,
-        Brush::MIN_SIZE..=400.0,
-        true,
-        |v| format!("{v:.0} px"),
-    );
-    widgets::slider_row(
-        ui,
-        p,
-        "Hardness",
-        &mut ed.brush.hardness,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
-    );
-    widgets::slider_row(
-        ui,
-        p,
-        "Opacity",
-        &mut ed.brush.opacity,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
-    );
-    widgets::slider_row(
-        ui,
-        p,
-        "Spacing",
-        &mut ed.brush.spacing,
-        0.01..=0.5,
-        true,
-        |v| format!("{:.0}%", v * 100.0),
-    );
-    widgets::slider_row(
-        ui,
-        p,
-        "Stabilisation",
-        &mut ed.brush.stabilization,
-        0.0..=0.95,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
-    );
-
-    separator(ui, p);
-
-    widgets::section(ui, p, "Pressure", &mut ed.ui.pressure_open, Some("pro"));
-    if ed.ui.pressure_open {
-        Frame::NONE
-            .inner_margin(Margin {
-                left: 16,
-                ..Default::default()
-            })
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 9.0;
-
-                toggle_row(ui, p, "Pressure → size", &mut ed.brush.pressure_size);
-                toggle_row(ui, p, "Pressure → opacity", &mut ed.brush.pressure_opacity);
-
-                widgets::slider_row(
-                    ui,
-                    p,
-                    "Min size",
-                    &mut ed.brush.min_size_ratio,
-                    0.0..=1.0,
-                    false,
-                    |v| format!("{:.0}%", v * 100.0),
-                );
-
-                ui.label(
-                    egui::RichText::new("Source")
-                        .size(text::SMALL)
-                        .color(p.text_dim),
-                );
-                widgets::segmented(
-                    ui,
-                    p,
-                    &mut ed.pressure.source,
-                    &[
-                        (PressureSource::Device, "Device"),
-                        (PressureSource::Simulated, "Speed"),
-                        (PressureSource::Constant, "Off"),
-                    ],
-                );
-
-                if ed.pressure.source == PressureSource::Device {
-                    ui.label(
-                        egui::RichText::new(
-                            "Touch screens report real pressure. Desktop pens \
-                             fall back to full pressure.",
-                        )
-                        .size(10.0)
-                        .color(p.text_dim),
-                    );
-                }
-            });
-    }
-}
-
-fn layers_tab(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Layers")
-                .size(text::CONTROL)
-                .color(p.text)
-                .strong(),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let room = ed.layers.len() < LayerStack::MAX;
-            if ui
-                .add_enabled(room, egui::Button::new("+").small())
-                .on_hover_text("Add a layer above the current one")
-                .clicked()
-            {
-                actions.add_layer = true;
+        // Stored bottom-first; shown top-first, the way it is drawn.
+        let mut select = None;
+        let mut toggle = None;
+        for index in (0..count).rev() {
+            let Some(layer) = ed.layers.get(index) else {
+                continue;
+            };
+            let row = widgets::layer_row(
+                ui,
+                p,
+                &layer.name,
+                layer.visible,
+                index == active,
+                layer.blend.label(),
+            );
+            if row.eye_clicked {
+                toggle = Some(index);
+            } else if row.clicked {
+                select = Some(index);
             }
-        });
-    });
-
-    // Stored bottom-first; shown top-first, the way it is drawn.
-    let active = ed.layers.active_index();
-    let count = ed.layers.len();
-    let mut select = None;
-
-    egui::ScrollArea::vertical()
-        .id_salt("layer-list")
-        .max_height(200.0)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for index in (0..count).rev() {
-                let Some(layer) = ed.layers.get_mut(index) else {
-                    continue;
-                };
-                let is_active = index == active;
-
-                let (row, response) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-                let painter = ui.painter();
-                if is_active {
-                    painter.rect_filled(row, metrics::RADIUS, p.control_active);
-                } else if response.hovered() {
-                    painter.rect_filled(row, metrics::RADIUS, p.control);
-                }
-
-                // The eye is its own hit target inside the row, so toggling
-                // visibility does not also change the selection.
-                let eye = Rect::from_min_size(row.left_top() + vec2(4.0, 4.0), vec2(18.0, 18.0));
-                let eye_response = ui.interact(eye, ui.id().with(("eye", index)), Sense::click());
-                if eye_response.clicked() {
-                    layer.visible = !layer.visible;
-                }
-                let painter = ui.painter();
-                painter.text(
-                    eye.center(),
-                    Align2::CENTER_CENTER,
-                    if layer.visible { "◉" } else { "○" },
-                    FontId::proportional(text::SMALL),
-                    if layer.visible { p.text } else { p.text_dim },
-                );
-                painter.text(
-                    row.left_center() + vec2(28.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    &layer.name,
-                    FontId::proportional(text::CONTROL),
-                    match (is_active, layer.visible) {
-                        (true, _) => p.text_strong,
-                        (false, true) => p.text,
-                        (false, false) => p.text_dim,
-                    },
-                );
-
-                if response.clicked() && !eye_response.clicked() {
-                    select = Some(index);
-                }
-            }
-        });
-
-    if let Some(index) = select {
-        ed.layers.set_active(index);
-    }
-
-    ui.horizontal(|ui| {
-        let gap = 6.0;
-        let width = (ui.available_width() - gap * 2.0) / 3.0;
-        ui.spacing_mut().item_spacing.x = gap;
-        if widgets::flat_button(ui, p, "↑", width, active + 1 < count).clicked() {
-            actions.move_layer_up = Some(active);
         }
-        if widgets::flat_button(ui, p, "↓", width, active > 0).clicked() {
-            actions.move_layer_down = Some(active);
-        }
-        // The last layer stays: a document needs somewhere to paint.
-        if widgets::flat_button(ui, p, "Delete", width, count > 1)
-            .on_hover_text("Deleting a layer clears undo history")
-            .clicked()
+        if let Some(index) = toggle
+            && let Some(layer) = ed.layers.get_mut(index)
         {
-            actions.delete_layer = Some(active);
+            layer.visible = !layer.visible;
+        }
+        if let Some(index) = select {
+            ed.layers.set_active(index);
         }
     });
+}
 
-    separator(ui, p);
+/// The rest of the brush parameters, which the design puts in its brush editor
+/// dialog. Kept in the dock until that dialog exists, so the controls stay
+/// reachable rather than disappearing.
+fn brush_detail_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    panel_frame().show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 11.0;
 
-    let layer = ed.layers.active_mut();
-    widgets::slider_row(
-        ui,
-        p,
-        "Layer opacity",
-        &mut layer.opacity,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
+        widgets::section(ui, p, "Brush detail", &mut ed.ui.pressure_open, None);
+        if !ed.ui.pressure_open {
+            return;
+        }
+
+        widgets::slider_row(
+            ui,
+            p,
+            "Hardness",
+            &mut ed.brush.hardness,
+            0.0..=1.0,
+            false,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+        widgets::slider_row(
+            ui,
+            p,
+            "Spacing",
+            &mut ed.brush.spacing,
+            0.01..=0.5,
+            true,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+        widgets::slider_row(
+            ui,
+            p,
+            "Stabilisation",
+            &mut ed.brush.stabilization,
+            0.0..=0.95,
+            false,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+
+        ui.add_space(2.0);
+        toggle_row(ui, p, "Pressure → size", &mut ed.brush.pressure_size);
+        toggle_row(ui, p, "Pressure → opacity", &mut ed.brush.pressure_opacity);
+        widgets::slider_row(
+            ui,
+            p,
+            "Min size",
+            &mut ed.brush.min_size_ratio,
+            0.0..=1.0,
+            false,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+
+        ui.label(
+            egui::RichText::new("Pressure source")
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        widgets::segmented(
+            ui,
+            p,
+            &mut ed.pressure.source,
+            &[
+                (PressureSource::Device, "Device"),
+                (PressureSource::Simulated, "Speed"),
+                (PressureSource::Constant, "Off"),
+            ],
+        );
+        if ed.pressure.source == PressureSource::Device {
+            ui.label(
+                egui::RichText::new(
+                    "Touch screens report real pressure. Desktop pens fall back \
+                     to full pressure.",
+                )
+                .size(10.0)
+                .color(p.text_dim),
+            );
+        }
+    });
+}
+
+fn icon_button(ui: &mut egui::Ui, p: &Palette, glyph: &str, enabled: bool, tip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    let hovered = enabled && response.hovered();
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(text::SMALL),
+        if !enabled {
+            p.text_dim.gamma_multiply(0.4)
+        } else if hovered {
+            p.text_strong
+        } else {
+            p.text_dim
+        },
     );
-
-    ui.label(
-        egui::RichText::new("Blend")
-            .size(text::SMALL)
-            .color(p.text_dim),
-    );
-    egui::ComboBox::from_id_salt("blend-mode")
-        .selected_text(layer.blend.label())
-        .width(ui.available_width())
-        .show_ui(ui, |ui| {
-            for mode in BlendMode::ALL {
-                ui.selectable_value(&mut layer.blend, mode, mode.label());
-            }
-        });
+    enabled && response.on_hover_text(tip).clicked()
 }
 
 fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
@@ -619,9 +732,4 @@ fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut bool) {
             widgets::toggle(ui, p, value);
         });
     });
-}
-
-fn separator(ui: &mut egui::Ui, p: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, p.border);
 }

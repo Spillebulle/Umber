@@ -5,6 +5,7 @@
 //! and the iOS host can all drive the same code.
 
 mod app;
+mod colorpicker;
 mod editor;
 mod theme;
 mod ui;
