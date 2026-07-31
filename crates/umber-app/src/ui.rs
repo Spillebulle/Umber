@@ -11,11 +11,11 @@
 //! was not taken.
 
 use crate::colorpicker::{self, PickerMode};
-use crate::editor::{Editor, Tool};
+use crate::editor::{BrushTab, Editor, Tool};
 use crate::theme::{Palette, ThemeKind, metrics, text};
 use crate::widgets::{self, ToolIcon};
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
-use umber_core::{BlendMode, Brush, LayerStack, input::PressureSource};
+use umber_core::{BlendMode, Brush, LayerStack, ResponseCurve, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -91,6 +91,8 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
             .frame(dock_frame)
             .show(root, |ui| dock(ui, &p, ed, &mut actions));
     }
+
+    brush_editor(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
     // beneath egui, so this panel only reports its rect and stays transparent.
@@ -264,15 +266,20 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_enabled(
-                false,
-                egui::Label::new(
-                    egui::RichText::new("✎ Edit brush…")
-                        .size(text::SMALL)
-                        .color(p.text_dim),
-                ),
-            )
-            .on_disabled_hover_text("The brush editor dialog is not implemented yet");
+            if ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new("✎ Edit brush…")
+                            .size(text::SMALL)
+                            .color(p.text_dim),
+                    )
+                    .sense(Sense::click()),
+                )
+                .on_hover_text("Open the brush editor")
+                .clicked()
+            {
+                ed.ui.brush_editor_open = true;
+            }
         });
     });
 }
@@ -356,8 +363,6 @@ fn dock(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
             brushes_panel(ui, p, ed);
             dock_rule(ui, p);
             layers_panel(ui, p, ed, actions);
-            dock_rule(ui, p);
-            brush_detail_panel(ui, p, ed);
         });
 }
 
@@ -558,87 +563,6 @@ fn layers_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
     });
 }
 
-/// The rest of the brush parameters, which the design puts in its brush editor
-/// dialog. Kept in the dock until that dialog exists, so the controls stay
-/// reachable rather than disappearing.
-fn brush_detail_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    panel_frame().show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 11.0;
-
-        widgets::section(ui, p, "Brush detail", &mut ed.ui.pressure_open, None);
-        if !ed.ui.pressure_open {
-            return;
-        }
-
-        widgets::slider_row(
-            ui,
-            p,
-            "Hardness",
-            &mut ed.brush.hardness,
-            0.0..=1.0,
-            false,
-            |v| format!("{:.0}%", v * 100.0),
-        );
-        widgets::slider_row(
-            ui,
-            p,
-            "Spacing",
-            &mut ed.brush.spacing,
-            0.01..=0.5,
-            true,
-            |v| format!("{:.0}%", v * 100.0),
-        );
-        widgets::slider_row(
-            ui,
-            p,
-            "Stabilisation",
-            &mut ed.brush.stabilization,
-            0.0..=0.95,
-            false,
-            |v| format!("{:.0}%", v * 100.0),
-        );
-
-        ui.add_space(2.0);
-        toggle_row(ui, p, "Pressure → size", &mut ed.brush.pressure_size);
-        toggle_row(ui, p, "Pressure → opacity", &mut ed.brush.pressure_opacity);
-        widgets::slider_row(
-            ui,
-            p,
-            "Min size",
-            &mut ed.brush.min_size_ratio,
-            0.0..=1.0,
-            false,
-            |v| format!("{:.0}%", v * 100.0),
-        );
-
-        ui.label(
-            egui::RichText::new("Pressure source")
-                .size(text::SMALL)
-                .color(p.text_dim),
-        );
-        widgets::segmented(
-            ui,
-            p,
-            &mut ed.pressure.source,
-            &[
-                (PressureSource::Device, "Device"),
-                (PressureSource::Simulated, "Speed"),
-                (PressureSource::Constant, "Off"),
-            ],
-        );
-        if ed.pressure.source == PressureSource::Device {
-            ui.label(
-                egui::RichText::new(
-                    "Touch screens report real pressure. Desktop pens fall back \
-                     to full pressure.",
-                )
-                .size(10.0)
-                .color(p.text_dim),
-            );
-        }
-    });
-}
-
 fn icon_button(ui: &mut egui::Ui, p: &Palette, glyph: &str, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
     let hovered = enabled && response.hovered();
@@ -731,5 +655,228 @@ fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut bool) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             widgets::toggle(ui, p, value);
         });
+    });
+}
+
+/// The brush editor, matching the design's dialog.
+///
+/// Holds every brush parameter that is not on the options strip, so the strip
+/// can stay short. Edits apply live — there is no OK or Cancel, because a paint
+/// app should let you see a change as you make it.
+fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    if !ed.ui.brush_editor_open {
+        return;
+    }
+
+    let name = ed
+        .active_preset
+        .and_then(|i| ed.presets.get(i))
+        .map(|preset| preset.name)
+        .unwrap_or("Brush");
+
+    let response = egui::Modal::new(egui::Id::new("brush-editor"))
+        .frame(
+            Frame::NONE
+                .fill(p.popover)
+                .stroke(Stroke::new(1.0, p.popover_border))
+                .corner_radius(8)
+                .inner_margin(Margin::same(18)),
+        )
+        .show(root.ctx(), |ui| {
+            ui.set_width(430.0);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Edit brush — {name}"))
+                        .size(text::CONTROL)
+                        .color(p.text_strong)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new("✕")
+                                    .size(text::CONTROL)
+                                    .color(p.text_dim),
+                            )
+                            .sense(Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        ed.ui.brush_editor_open = false;
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            widgets::segmented(
+                ui,
+                p,
+                &mut ed.ui.brush_tab,
+                &[(BrushTab::Tip, "Tip"), (BrushTab::Dynamics, "Dynamics")],
+            );
+            ui.add_space(12.0);
+
+            match ed.ui.brush_tab {
+                BrushTab::Tip => brush_editor_tip(ui, p, ed),
+                BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
+            }
+        });
+
+    // Clicking the backdrop or pressing Escape dismisses it.
+    if response.should_close() {
+        ed.ui.brush_editor_open = false;
+    }
+}
+
+fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 12.0;
+    widgets::slider_row(
+        ui,
+        p,
+        "Size",
+        &mut ed.brush.size,
+        Brush::MIN_SIZE..=400.0,
+        true,
+        |v| format!("{v:.0} px"),
+    );
+    widgets::slider_row(
+        ui,
+        p,
+        "Hardness",
+        &mut ed.brush.hardness,
+        0.0..=1.0,
+        false,
+        |v| format!("{:.0}%", v * 100.0),
+    );
+    widgets::slider_row(
+        ui,
+        p,
+        "Opacity",
+        &mut ed.brush.opacity,
+        0.0..=1.0,
+        false,
+        |v| format!("{:.0}%", v * 100.0),
+    );
+    widgets::slider_row(
+        ui,
+        p,
+        "Spacing",
+        &mut ed.brush.spacing,
+        0.01..=0.5,
+        true,
+        |v| format!("{:.0}%", v * 100.0),
+    );
+    widgets::slider_row(
+        ui,
+        p,
+        "Stabilisation",
+        &mut ed.brush.stabilization,
+        0.0..=0.95,
+        false,
+        |v| format!("{:.0}%", v * 100.0),
+    );
+}
+
+fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 10.0;
+
+    ui.label(
+        egui::RichText::new("Pressure source")
+            .size(text::SMALL)
+            .color(p.text_dim),
+    );
+    widgets::segmented(
+        ui,
+        p,
+        &mut ed.pressure.source,
+        &[
+            (PressureSource::Device, "Device"),
+            (PressureSource::Simulated, "Speed"),
+            (PressureSource::Constant, "Off"),
+        ],
+    );
+    if ed.pressure.source == PressureSource::Device {
+        ui.label(
+            egui::RichText::new(
+                "Touch screens report real pressure. Desktop pens fall back to \
+                 full pressure.",
+            )
+            .size(10.0)
+            .color(p.text_dim),
+        );
+    }
+
+    ui.add_space(4.0);
+
+    ui.columns(2, |columns| {
+        curve_column(
+            &mut columns[0],
+            p,
+            "Pressure → size",
+            "size",
+            &mut ed.brush.pressure_size,
+            &mut ed.brush.size_curve,
+        );
+        curve_column(
+            &mut columns[1],
+            p,
+            "Pressure → opacity",
+            "opacity",
+            &mut ed.brush.pressure_opacity,
+            &mut ed.brush.opacity_curve,
+        );
+    });
+
+    ui.add_space(4.0);
+    widgets::slider_row(
+        ui,
+        p,
+        "Min size",
+        &mut ed.brush.min_size_ratio,
+        0.0..=1.0,
+        false,
+        |v| format!("{:.0}%", v * 100.0),
+    );
+}
+
+/// One dynamics column: an on/off toggle, the curve, and its presets.
+fn curve_column(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    salt: &str,
+    enabled: &mut bool,
+    curve: &mut ResponseCurve,
+) {
+    toggle_row(ui, p, label, enabled);
+
+    ui.add_space(6.0);
+
+    // The curve stays visible when the mapping is off, but disabled, so its
+    // shape is not a surprise the moment it is switched back on.
+    ui.scope(|ui| {
+        if !*enabled {
+            ui.disable();
+        }
+        let size = ui.available_width().min(150.0);
+        widgets::curve_editor(ui, p, curve, size);
+
+        ui.add_space(6.0);
+        let current = curve.preset_name().unwrap_or("Custom");
+        egui::ComboBox::from_id_salt(("curve-preset", salt))
+            .selected_text(egui::RichText::new(current).size(text::TINY).color(p.text))
+            .width(size)
+            .show_ui(ui, |ui| {
+                for (name, preset) in ResponseCurve::PRESETS {
+                    if ui
+                        .selectable_label(curve.preset_name() == Some(name), name)
+                        .clicked()
+                    {
+                        *curve = preset;
+                    }
+                }
+            });
     });
 }

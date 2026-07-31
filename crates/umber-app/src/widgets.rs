@@ -8,6 +8,7 @@
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
+use umber_core::ResponseCurve;
 
 /// Label on the left, monospace readout on the right, thin rail beneath.
 ///
@@ -455,6 +456,77 @@ pub fn layer_row(
     }
 }
 
+/// A draggable response curve.
+///
+/// Handles move vertically only — their inputs are fixed and evenly spaced —
+/// so the curve cannot be dragged into a shape that maps one pressure to two
+/// values.
+pub fn curve_editor(ui: &mut Ui, p: &Palette, curve: &mut ResponseCurve, size: f32) -> bool {
+    let mut changed = false;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+
+    let at = |i: usize, v: f32| {
+        pos2(
+            rect.left() + rect.width() * ResponseCurve::x_of(i),
+            rect.bottom() - rect.height() * v,
+        )
+    };
+
+    // Drag whichever handle is nearest horizontally — with five fixed columns
+    // that is unambiguous, and it means you never have to hit the dot exactly.
+    if (response.dragged() || response.clicked())
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+        let i = (t * (ResponseCurve::N - 1) as f32).round() as usize;
+        let v = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+        let before = curve.points[i.min(ResponseCurve::N - 1)];
+        curve.set(i, v);
+        changed = (curve.points[i.min(ResponseCurve::N - 1)] - before).abs() > 1e-5;
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS, p.window);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // Quarter grid, plus the diagonal as a reference for "no change".
+    for k in 1..4 {
+        let f = k as f32 / 4.0;
+        let x = rect.left() + rect.width() * f;
+        let y = rect.top() + rect.height() * f;
+        painter.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(1.0, p.border.gamma_multiply(0.6)),
+        );
+        painter.line_segment(
+            [pos2(rect.left(), y), pos2(rect.right(), y)],
+            Stroke::new(1.0, p.border.gamma_multiply(0.6)),
+        );
+    }
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_top()],
+        Stroke::new(1.0, p.border),
+    );
+
+    let points: Vec<_> = (0..ResponseCurve::N)
+        .map(|i| at(i, curve.points[i]))
+        .collect();
+    painter.add(egui::Shape::line(
+        points.clone(),
+        Stroke::new(2.0, p.accent),
+    ));
+    for point in points {
+        painter.circle_filled(point, 4.0, p.knob);
+    }
+
+    changed
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolIcon {
     Brush,
@@ -536,43 +608,5 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: ToolIcon, colour: Color3
             painter.circle_stroke(at(8.0, 8.0), 4.5, stroke);
             painter.line_segment([at(11.5, 11.5), at(15.0, 15.0)], stroke);
         }
-    }
-}
-
-/// A collapsible section heading with a disclosure arrow.
-pub fn section(ui: &mut Ui, p: &Palette, label: &str, open: &mut bool, badge: Option<&str>) {
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 18.0), Sense::click());
-    if response.clicked() {
-        *open = !*open;
-    }
-
-    let painter = ui.painter();
-    painter.text(
-        rect.left_center() + vec2(2.0, 0.0),
-        Align2::LEFT_CENTER,
-        if *open { "▾" } else { "▸" },
-        FontId::proportional(9.0),
-        p.text_dim,
-    );
-    painter.text(
-        rect.left_center() + vec2(16.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(text::CONTROL),
-        if response.hovered() {
-            p.text_strong
-        } else {
-            p.text
-        },
-    );
-    if let Some(badge) = badge {
-        painter.text(
-            rect.right_center(),
-            Align2::RIGHT_CENTER,
-            badge,
-            FontId::proportional(10.0),
-            p.text_dim,
-        );
     }
 }

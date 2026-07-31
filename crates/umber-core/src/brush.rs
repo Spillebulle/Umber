@@ -1,5 +1,7 @@
 //! Brush parameters.
 
+use crate::curve::ResponseCurve;
+
 /// What a stroke does to the layer underneath it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushMode {
@@ -30,6 +32,10 @@ pub struct Brush {
     pub spacing: f32,
     pub pressure_size: bool,
     pub pressure_opacity: bool,
+    /// Shapes how pressure drives size.
+    pub size_curve: ResponseCurve,
+    /// Shapes how pressure drives per-dab coverage.
+    pub opacity_curve: ResponseCurve,
     /// Input smoothing, `0.0` (raw) to just under `1.0` (very heavy).
     pub stabilization: f32,
     pub mode: BrushMode,
@@ -45,6 +51,8 @@ impl Default for Brush {
             spacing: 0.1,
             pressure_size: true,
             pressure_opacity: false,
+            size_curve: ResponseCurve::LINEAR,
+            opacity_curve: ResponseCurve::LINEAR,
             stabilization: 0.35,
             mode: BrushMode::Paint,
         }
@@ -57,7 +65,7 @@ impl Brush {
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {
-        let p = pressure.clamp(0.0, 1.0);
+        let p = self.size_curve.sample(pressure.clamp(0.0, 1.0));
         let scale = if self.pressure_size {
             self.min_size_ratio + (1.0 - self.min_size_ratio) * p
         } else {
@@ -72,7 +80,7 @@ impl Brush {
     /// a `max` blend, so stroke opacity has to be applied once afterwards.
     pub fn coverage_at(&self, pressure: f32) -> f32 {
         if self.pressure_opacity {
-            pressure.clamp(0.0, 1.0)
+            self.opacity_curve.sample(pressure.clamp(0.0, 1.0))
         } else {
             1.0
         }
@@ -126,6 +134,7 @@ impl BrushPreset {
                     spacing: 0.04,
                     stabilization: 0.6,
                     min_size_ratio: 0.15,
+                    size_curve: ResponseCurve::EASE_IN,
                     ..Brush::default()
                 },
             },
@@ -137,6 +146,7 @@ impl BrushPreset {
                     opacity: 0.18,
                     spacing: 0.03,
                     pressure_opacity: true,
+                    opacity_curve: ResponseCurve::EASE_IN,
                     ..Brush::default()
                 },
             },

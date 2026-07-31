@@ -166,6 +166,11 @@ live one that lies.
 - Watch for `powf` on a value that can go slightly negative — `sin(PI)` in f32
   is just below zero, and a negative base with a fractional exponent is NaN,
   which ecolor's `gamma_multiply` asserts on. This has already bitten once.
+- `ResponseCurve` is a fixed array of evenly spaced samples, not free control
+  points. That keeps `Brush` `Copy`, makes sampling a lerp with no search, and
+  means the editor's handles move only vertically — so the curve can never be
+  dragged into mapping one pressure to two values. Do not "improve" it into a
+  `Vec` of points without solving all three.
 
 ## Testing
 

@@ -8,6 +8,7 @@
 pub mod brush;
 pub mod camera;
 pub mod color;
+pub mod curve;
 pub mod document;
 pub mod geom;
 pub mod history;
@@ -18,6 +19,7 @@ pub mod stroke;
 pub use brush::{Brush, BrushMode, BrushPreset};
 pub use camera::Camera;
 pub use color::{Color, Hsv};
+pub use curve::ResponseCurve;
 pub use document::Document;
 pub use geom::{PixelRect, Rect};
 pub use history::{History, PixelPatch};

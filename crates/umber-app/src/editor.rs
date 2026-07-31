@@ -50,6 +50,15 @@ pub struct UiState {
     pub wheel_shape: WheelShape,
     /// Open state of the picker-mode dropdown in the Colour panel header.
     pub picker_menu_open: bool,
+    pub brush_editor_open: bool,
+    pub brush_tab: BrushTab,
+}
+
+/// Tabs of the brush editor dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushTab {
+    Tip,
+    Dynamics,
 }
 
 impl Default for UiState {
@@ -62,6 +71,8 @@ impl Default for UiState {
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             picker_menu_open: false,
+            brush_editor_open: false,
+            brush_tab: BrushTab::Tip,
         }
     }
 }

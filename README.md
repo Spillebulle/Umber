@@ -73,8 +73,8 @@ Taken from the design but not implemented, roughly by size:
 - **Layout edit mode** — dragging panels out to float, dock zones, tear-off and
   re-docking, drag-to-reorder tools. This is the design's "advanced endgame"
   and is a large project in an immediate-mode UI.
-- **Brush editor dialog** — tip, dynamics with pressure curves, texture.
 - **Settings dialog** — theme cards, shortcut editor.
+- The brush editor's **Texture** tab. Tip and Dynamics are built.
 - Document tabs (single-document only), the Navigator overlay, Palette and
   Harmony colour modes, and per-brush blend modes.
 - The design shows a sixteen-tool rail; Umber has four. The missing twelve are
