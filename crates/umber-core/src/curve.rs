@@ -10,8 +10,10 @@
 //! handles to drag — you can only move a point up and down, never past its
 //! neighbours, so the curve can never become non-monotonic in x.
 
+use serde::{Deserialize, Serialize};
+
 /// Maps `0.0..=1.0` to `0.0..=1.0`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResponseCurve {
     /// Output at inputs 0, 0.25, 0.5, 0.75, 1.
     pub points: [f32; Self::N],

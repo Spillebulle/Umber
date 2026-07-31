@@ -6,6 +6,7 @@
 //! testable without a GPU.
 
 pub mod brush;
+pub mod brushimport;
 pub mod camera;
 pub mod color;
 pub mod curve;
@@ -15,9 +16,11 @@ pub mod geom;
 pub mod history;
 pub mod input;
 pub mod layer;
+pub mod preset;
 pub mod stroke;
+pub mod tip;
 
-pub use brush::{Brush, BrushMode, BrushPreset};
+pub use brush::{Brush, BrushMode};
 pub use camera::Camera;
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
@@ -27,4 +30,6 @@ pub use geom::{PixelRect, Rect};
 pub use history::{History, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
+pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
 pub use stroke::{Dab, StrokeBuilder};
+pub use tip::TipMask;
