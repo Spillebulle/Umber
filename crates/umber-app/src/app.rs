@@ -2,11 +2,15 @@
 
 use crate::editor::{Editor, Interaction, Tool};
 use crate::logo;
+use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
+use crate::tabs::{self, Notice};
 use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu};
@@ -25,10 +29,44 @@ struct Graphics {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
-    canvas: CanvasRenderer,
+    /// One renderer per open document, keyed by [`DocId`].
+    ///
+    /// A document's pixels live in its renderer's texture array, so switching
+    /// tabs is a different key in this map — no reallocation, no re-upload and
+    /// nothing copied. Keyed by id rather than by tab position because
+    /// positions shift when a tab is closed and a texture array must not
+    /// change owner underneath a document.
+    canvases: HashMap<DocId, CanvasRenderer>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+}
+
+impl Graphics {
+    /// Give a document its own layer storage, cleared and ready to paint on.
+    ///
+    /// Built from an existing renderer where there is one: pipelines and
+    /// shaders are shared, so this is a few textures rather than three shader
+    /// compilations on the frame the user opened a document.
+    fn add_canvas(&mut self, id: DocId, size: UVec2) {
+        let canvas = match self.canvases.values().next() {
+            Some(existing) => existing.for_document(&self.gpu.device, size),
+            None => CanvasRenderer::new(&self.gpu.device, size, self.config.format),
+        };
+
+        // Fresh textures hold whatever the allocation contained.
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("init-document"),
+            });
+        canvas.clear_all_layers(&mut enc);
+        canvas.clear_stroke(&mut enc);
+        self.gpu.queue.submit(Some(enc.finish()));
+
+        self.canvases.insert(id, canvas);
+    }
 }
 
 pub struct UmberApp {
@@ -68,7 +106,11 @@ impl UmberApp {
     /// The layer is untouched until this point, so reading it here captures
     /// exactly the pre-stroke pixels the undo stack needs.
     fn finish_stroke(&mut self) {
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
         if !self.editor.stroke.is_active() {
             return;
         }
@@ -92,14 +134,14 @@ impl UmberApp {
         // stroke's colour and opacity.
         let tail: Vec<Dab> = self.editor.stroke.drain_pending().collect();
         if !tail.is_empty() {
-            gfx.canvas.begin_frame();
-            gfx.canvas.draw_dabs(&gfx.gpu.queue, &mut enc, &tail);
+            canvas.begin_frame();
+            canvas.draw_dabs(&gfx.gpu.queue, &mut enc, &tail);
         }
 
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
             // Stroke fell entirely outside the canvas — nothing to commit, but
             // the scratch surface may still hold dabs.
-            gfx.canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
             return;
         };
@@ -108,14 +150,12 @@ impl UmberApp {
 
         // Capture undo state first. `read_layer_rect` submits and blocks on its
         // own encoder, so it observes the layer before `enc` commits anything.
-        let before = gfx
-            .canvas
-            .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
+        let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
         self.editor
             .history
             .record(PixelPatch::new(rect, slot, before));
 
-        gfx.canvas.commit_stroke(
+        canvas.commit_stroke(
             &gfx.gpu.queue,
             &mut enc,
             slot,
@@ -123,6 +163,8 @@ impl UmberApp {
             self.editor.stroke_style,
         );
         gfx.gpu.queue.submit(Some(enc.finish()));
+        // Something is now on the canvas that closing the tab would lose.
+        self.editor.mark_modified();
     }
 
     /// Throw the in-progress stroke away without touching the layer.
@@ -131,7 +173,11 @@ impl UmberApp {
     /// landing means the user meant to pinch, and the stray dab from the first
     /// finger should never reach the canvas or the undo stack.
     fn cancel_stroke(&mut self) {
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
         if !self.editor.stroke.is_active() {
             return;
         }
@@ -147,7 +193,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cancel-stroke"),
             });
-        gfx.canvas.clear_stroke(&mut enc);
+        canvas.clear_stroke(&mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -160,64 +206,80 @@ impl UmberApp {
     fn start_stroke(&mut self, point: InputPoint) {
         self.editor.begin_stroke(point);
 
-        if let Some(gfx) = self.gfx.as_ref() {
+        let id = self.editor.session.active_id();
+        if let Some(gfx) = self.gfx.as_ref()
+            && let Some(canvas) = gfx.canvases.get(&id)
+        {
             let mut enc = gfx
                 .gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("begin-stroke"),
                 });
-            gfx.canvas.clear_stroke(&mut enc);
+            canvas.clear_stroke(&mut enc);
             gfx.gpu.queue.submit(Some(enc.finish()));
         }
     }
 
     fn undo(&mut self) {
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        // The history is the live document's own, so this can only ever undo
+        // work done on the canvas the user is looking at.
         let Some(patch) = self.editor.history.take_undo() else {
             return;
         };
         let current =
-            gfx.canvas
-                .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
-        gfx.canvas
-            .write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
+            canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
+        canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
         self.editor
             .history
             .push_redo(PixelPatch::new(patch.rect, patch.slot, current));
+        self.editor.mark_modified();
     }
 
     fn redo(&mut self) {
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
         let Some(patch) = self.editor.history.take_redo() else {
             return;
         };
         let current =
-            gfx.canvas
-                .read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
-        gfx.canvas
-            .write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
+            canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
+        canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
         self.editor
             .history
             .push_undo(PixelPatch::new(patch.rect, patch.slot, current));
+        self.editor.mark_modified();
     }
 
     /// Erase the active layer, leaving the rest of the stack alone.
     fn clear_active_layer(&mut self) {
         let slot = self.editor.layers.active_slot();
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
         let mut enc = gfx
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("clear"),
             });
-        gfx.canvas.clear_layer(&mut enc, slot);
-        gfx.canvas.clear_stroke(&mut enc);
+        canvas.clear_layer(&mut enc, slot);
+        canvas.clear_stroke(&mut enc);
         gfx.gpu.queue.submit(Some(enc.finish()));
         // Undo entries reference pixels that no longer exist in any meaningful
         // sense; keeping them would let undo resurrect part of a cleared layer.
         self.editor.history.clear();
+        self.editor.mark_modified();
     }
 
     fn add_layer(&mut self) {
@@ -226,10 +288,14 @@ impl UmberApp {
             return;
         };
         let needed = self.editor.layers.slot_capacity_needed();
+        self.editor.mark_modified();
 
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
-        gfx.canvas
-            .ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
+        canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
 
         // A recycled slot still holds the deleted layer's pixels.
         let mut enc = gfx
@@ -238,7 +304,7 @@ impl UmberApp {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("init-layer"),
             });
-        gfx.canvas.clear_layer(&mut enc, slot);
+        canvas.clear_layer(&mut enc, slot);
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -250,6 +316,7 @@ impl UmberApp {
         // would later be replayed into whichever layer inherits it. Dropping
         // history is the blunt but safe fix; structural undo is the real one.
         self.editor.history.clear();
+        self.editor.mark_modified();
     }
 
     fn handle_keys(&mut self, key: KeyCode, pressed: bool) -> bool {
@@ -298,10 +365,12 @@ impl UmberApp {
         }
 
         let layers = self.editor.layer_draws();
+        let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_ref() else { return };
-        let px = gfx
-            .canvas
-            .pick_colour(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc);
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let px = canvas.pick_colour(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc);
 
         // Transparent means there is nothing to pick; taking it would silently
         // set the brush to black.
@@ -314,21 +383,24 @@ impl UmberApp {
 
     /// Flatten the visible stack and write it to a PNG the user picks.
     fn export_png(&mut self) {
+        let id = self.editor.session.active_id();
+        let suggested = format!("{}.png", self.editor.session.active_title());
         let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
 
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export PNG")
             .add_filter("PNG image", &["png"])
-            .set_file_name("untitled.png")
+            .set_file_name(suggested)
             .save_file()
         else {
             return;
         };
 
         let layers = self.editor.layer_draws();
-        let pixels = gfx
-            .canvas
-            .export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
+        let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
 
         let size = self.editor.doc.size;
         match write_png(&path, size.x, size.y, &pixels) {
@@ -442,14 +514,20 @@ impl UmberApp {
             });
 
         // --- canvas ---
-        gfx.canvas.begin_frame();
+        // The renderer of the document in front. Every other open document has
+        // one of its own, holding its pixels, untouched until it is switched to.
+        let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id()) else {
+            log::error!("the active document has no canvas renderer");
+            return;
+        };
+        canvas.begin_frame();
         if self.editor.stroke.pending_len() > 0 {
             let dabs: Vec<_> = self.editor.stroke.drain_pending().collect();
-            gfx.canvas.draw_dabs(&gfx.gpu.queue, &mut encoder, &dabs);
+            canvas.draw_dabs(&gfx.gpu.queue, &mut encoder, &dabs);
         }
 
         let layer_draws = self.editor.layer_draws();
-        gfx.canvas.composite(
+        canvas.composite(
             &gfx.gpu.queue,
             &mut encoder,
             &view,
@@ -536,15 +614,189 @@ impl UmberApp {
         }
         if let Some(index) = actions.move_layer_up {
             self.editor.layers.move_up(index);
+            self.editor.mark_modified();
         }
         if let Some(index) = actions.move_layer_down {
             self.editor.layers.move_down(index);
+            self.editor.mark_modified();
         }
         if actions.fit_view {
             self.editor.fit_view();
         }
         if actions.reset_zoom {
             self.editor.camera.zoom = 1.0;
+        }
+        if let Some(index) = actions.pick_tab {
+            self.switch_document(index);
+        }
+        if actions.new_document {
+            self.new_document();
+        }
+        if actions.open_file {
+            self.open_file();
+        }
+        if let Some(index) = actions.close_tab {
+            self.close_document(index);
+        }
+    }
+
+    // --- documents -------------------------------------------------------
+
+    /// Show another open document.
+    ///
+    /// The state swap is the editor's; all that happens here is that a stroke
+    /// still in flight is finished into the document it was started on, before
+    /// that document stops being the one the renderer writes to.
+    fn switch_document(&mut self, index: usize) {
+        if index == self.editor.session.active_index() {
+            return;
+        }
+        self.finish_stroke();
+        if self.editor.switch_tab(index) {
+            self.request_redraw();
+        }
+    }
+
+    fn new_document(&mut self) {
+        self.finish_stroke();
+        let id = self.editor.new_document();
+        let size = self.editor.doc.size;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.add_canvas(id, size);
+        }
+        self.request_redraw();
+    }
+
+    /// Close a document and free the GPU storage that was holding its pixels.
+    fn close_document(&mut self, index: usize) {
+        self.finish_stroke();
+        self.editor.ui.close_prompt = None;
+        let Some(closed) = self.editor.close_tab(index) else {
+            return;
+        };
+        if let Some(gfx) = self.gfx.as_mut() {
+            // Dropping the renderer releases the layer texture array — several
+            // megabytes per document, which is the whole reason closing a tab
+            // has to reach the GPU at all.
+            gfx.canvases.remove(&closed);
+        }
+        self.request_redraw();
+    }
+
+    /// Open a document written by another application.
+    fn open_file(&mut self) {
+        let extensions = umber_core::docimport::supported_extensions();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open document")
+            // Built from the importer's own list rather than typed out again,
+            // so a format added there appears here without a second edit.
+            .add_filter("Paintable documents", extensions)
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.open_path(&path);
+    }
+
+    fn open_path(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let imported = match umber_core::docimport::import(path) {
+            Ok(doc) => doc,
+            Err(error) => {
+                // `ImportError` displays as a finished sentence written for the
+                // user; showing it verbatim beats inventing a second wording.
+                log::warn!("could not open {}: {error}", path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not open “{name}”"),
+                    lines: vec![error.to_string()],
+                });
+                return;
+            }
+        };
+
+        // The importer bounds itself at 16384 px, but the device is the
+        // authority — and it is asked before any of this becomes a document,
+        // so a refusal leaves the session exactly as it was.
+        if let Some(gfx) = self.gfx.as_ref() {
+            let max = gfx.gpu.device.limits().max_texture_dimension_2d;
+            if imported.size.x > max || imported.size.y > max {
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not open “{name}”"),
+                    lines: vec![format!(
+                        "The canvas is {} × {}, and this GPU cannot hold a texture \
+                         larger than {max} pixels on a side.",
+                        imported.size.x, imported.size.y,
+                    )],
+                });
+                return;
+            }
+        }
+
+        let format = imported.format.label();
+        let notes = tabs::summarise(&imported.warnings);
+        let (doc, layers, uploads) = imported.into_stack();
+        let size = doc.size;
+        let slots = layers.slot_capacity_needed();
+
+        let id = self.editor.open_document(
+            DocumentState {
+                camera: umber_core::Camera::fit(doc.size_vec2(), self.editor.canvas_size),
+                doc,
+                layers,
+                history: umber_core::History::default(),
+            },
+            name.clone(),
+            Some(path.to_path_buf()),
+            notes.clone(),
+        );
+
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.add_canvas(id, size);
+            if let Some(canvas) = gfx.canvases.get_mut(&id) {
+                canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, slots);
+                for upload in &uploads {
+                    canvas.write_layer_rect(
+                        &gfx.gpu.queue,
+                        upload.slot,
+                        umber_core::PixelRect {
+                            x: 0,
+                            y: 0,
+                            width: size.x,
+                            height: size.y,
+                        },
+                        &upload.pixels,
+                    );
+                }
+            }
+        }
+
+        log::info!(
+            "opened {} as {format}, {} × {}, {} layer(s)",
+            path.display(),
+            size.x,
+            size.y,
+            uploads.len(),
+        );
+
+        // Losses are reported, never left in the log: a painter who opens a
+        // Photoshop file and finds it flattened deserves to be told why.
+        if !notes.is_empty() {
+            self.editor.notice = Some(Notice {
+                title: format!("“{name}” opened with changes"),
+                lines: notes,
+            });
+        }
+        self.request_redraw();
+    }
+
+    fn request_redraw(&self) {
+        if let Some(gfx) = self.gfx.as_ref() {
+            gfx.window.request_redraw();
         }
     }
 }
@@ -607,6 +859,8 @@ impl ApplicationHandler for UmberApp {
         surface.configure(&gpu.device, &config);
 
         splash.show(splash::Stage::Shaders);
+        // Compiled once here; every further document clones the pipeline
+        // handles out of this one. See `Graphics::add_canvas`.
         let canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
@@ -653,16 +907,42 @@ impl ApplicationHandler for UmberApp {
         self.editor.canvas_pivot = self.editor.canvas_size * 0.5;
         self.editor.fit_view();
 
+        let documents = self.editor.open_documents();
+        let active = self.editor.session.active_id();
+        let mut canvases = HashMap::new();
+        canvases.insert(active, canvas);
+
         self.gfx = Some(Graphics {
             window,
             surface,
             config,
             gpu,
-            canvas,
+            canvases,
             egui_ctx,
             egui_state,
             egui_renderer,
         });
+
+        // Normally there is exactly one document here, this being start-up.
+        // The loop is for the Android path, where the surface is destroyed on
+        // suspend and rebuilt on resume with the session still open: every
+        // document needs its storage back. Their pixels do not survive that —
+        // they never have — but a document without a renderer would be a blank
+        // window with no way out.
+        if documents.len() > 1 {
+            log::warn!(
+                "rebuilding storage for {} documents after the surface was lost; \
+                 their contents are gone",
+                documents.len(),
+            );
+        }
+        if let Some(gfx) = self.gfx.as_mut() {
+            for (id, size) in documents {
+                if id != active {
+                    gfx.add_canvas(id, size);
+                }
+            }
+        }
 
         // Split, because the two halves have very different characters and only
         // one of them is ours to improve: window creation is fast and constant,
@@ -730,6 +1010,12 @@ impl ApplicationHandler for UmberApp {
                     gfx.window.request_redraw();
                 }
             }
+
+            // Dropping a file on the window is the gesture people already have
+            // for this, and it reaches exactly the same importer the File menu
+            // does — including its refusals, so an unsupported format explains
+            // itself here too rather than silently doing nothing.
+            WindowEvent::DroppedFile(path) => self.open_path(&path),
 
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 

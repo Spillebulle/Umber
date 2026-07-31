@@ -2,10 +2,13 @@
 
 use crate::colorpicker::{PickerMode, WheelShape};
 use crate::dock::Layout;
+use crate::session::{DocId, DocumentState, Session};
 use crate::settings::SettingsTab;
+use crate::tabs::Notice;
 use crate::theme::{Accent, ThemeKind};
-use glam::Vec2;
+use glam::{UVec2, Vec2};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 use umber_core::{
     Brush, BrushMode, BrushPreset, Camera, Color, Document, History, Hsv, InputPoint, LayerStack,
@@ -58,6 +61,8 @@ pub struct UiState {
     pub brush_tab: BrushTab,
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
+    /// Tab whose close is waiting on confirmation, if any.
+    pub close_prompt: Option<usize>,
 }
 
 /// Tabs of the brush editor dialog.
@@ -81,11 +86,14 @@ impl Default for UiState {
             brush_tab: BrushTab::Tip,
             settings_open: false,
             settings_tab: SettingsTab::Themes,
+            close_prompt: None,
         }
     }
 }
 
 pub struct Editor {
+    /// The live document. Every other open document is parked in its tab —
+    /// see [`crate::session`] for why the active one stays out here.
     pub doc: Document,
     pub camera: Camera,
     pub brush: Brush,
@@ -98,6 +106,11 @@ pub struct Editor {
     pub presets: Vec<BrushPreset>,
     pub active_preset: Option<usize>,
     pub layers: LayerStack,
+    /// Every open document, and which of them the fields above belong to.
+    pub session: Session,
+    /// A message that has to reach the user rather than the log — an import
+    /// that could not be represented in full, or one that failed outright.
+    pub notice: Option<Notice>,
     pub ui: UiState,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
@@ -166,6 +179,8 @@ impl Default for Editor {
             presets: umber_core::preset::builtin().to_vec(),
             active_preset: None,
             layers: LayerStack::new(),
+            session: Session::default(),
+            notice: None,
             ui: UiState::default(),
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
@@ -306,6 +321,124 @@ impl Editor {
 
     pub fn fit_view(&mut self) {
         self.camera = Camera::fit(self.doc.size_vec2(), self.canvas_size);
+    }
+
+    // --- documents -------------------------------------------------------
+    //
+    // A tab switch moves state between here and [`Session`]; nothing above
+    // this line is per-document, which is the whole design. See the module
+    // docs in `session.rs`.
+
+    /// Move the live document's state out, leaving a blank stand-in behind.
+    ///
+    /// The stand-in never reaches the screen: every caller installs another
+    /// document in the same breath. It exists because these fields are read by
+    /// name all over the interface, so they cannot be an `Option`.
+    fn take_document(&mut self) -> DocumentState {
+        DocumentState {
+            doc: std::mem::take(&mut self.doc),
+            layers: std::mem::replace(&mut self.layers, LayerStack::new()),
+            history: std::mem::take(&mut self.history),
+            camera: self.camera,
+        }
+    }
+
+    fn install_document(&mut self, state: DocumentState) {
+        self.doc = state.doc;
+        self.layers = state.layers;
+        self.history = state.history;
+        self.camera = state.camera;
+        // The stroke that was in flight, if any, was finished by the caller
+        // before the swap; this only stops a stale slot from the *previous*
+        // document being carried into the next commit.
+        self.stroke_slot = self.layers.active_slot();
+        self.interaction = Interaction::Idle;
+    }
+
+    /// Open a document that has already been built — an import, or a blank one.
+    ///
+    /// Returns its id so the caller can give it GPU storage.
+    pub fn open_document(
+        &mut self,
+        state: DocumentState,
+        title: String,
+        path: Option<PathBuf>,
+        notes: Vec<String>,
+    ) -> DocId {
+        let outgoing = self.take_document();
+        let id = self.session.open(title, path, outgoing);
+        self.session.active_tab_mut().notes = notes;
+        self.install_document(state);
+        self.fit_view();
+        id
+    }
+
+    /// Open a new blank document the size of the current one.
+    ///
+    /// Inheriting the size rather than always using the default is what makes
+    /// "new document" useful next to an imported one: the common reason to
+    /// open a second tab is to try something at the same scale.
+    pub fn new_document(&mut self) -> DocId {
+        let doc = self.doc;
+        let title = self.session.next_untitled_title();
+        self.open_document(DocumentState::blank(doc), title, None, Vec::new())
+    }
+
+    /// Make tab `index` the live document.
+    ///
+    /// Returns false when there is nothing to do, so the caller can skip the
+    /// GPU work that follows a real switch.
+    pub fn switch_tab(&mut self, index: usize) -> bool {
+        if index >= self.session.len() || index == self.session.active_index() {
+            return false;
+        }
+        // Taken before the live state is disturbed: if the parked state were
+        // missing, the editor would otherwise be left holding the stand-in.
+        let Some(incoming) = self.session.take_parked(index) else {
+            log::error!("tab {index} has no parked document");
+            return false;
+        };
+        let outgoing = self.take_document();
+        self.session.park_active(outgoing);
+        self.session.set_active(index);
+        self.install_document(incoming);
+        true
+    }
+
+    /// Close tab `index`, returning the id whose GPU storage can now be freed.
+    ///
+    /// The last document cannot be closed — Umber has nowhere to go with no
+    /// document open, and the tab strip draws no close mark on it.
+    pub fn close_tab(&mut self, index: usize) -> Option<DocId> {
+        let successor = self.session.successor_of(index)?;
+        if index == self.session.active_index() {
+            let incoming = self.session.take_parked(successor)?;
+            let closed = self.session.remove(index)?;
+            // The live state belonged to the document being closed, so it is
+            // dropped rather than parked.
+            self.install_document(incoming);
+            Some(closed.id)
+        } else {
+            self.session.remove(index).map(|tab| tab.id)
+        }
+    }
+
+    /// Note that the live document has changed, so closing it would lose work.
+    pub fn mark_modified(&mut self) {
+        self.session.mark_modified();
+    }
+
+    /// Every open document and its canvas size, live one included.
+    ///
+    /// Used to rebuild GPU storage after the surface has been destroyed and
+    /// recreated, which on Android happens whenever the app is backgrounded.
+    pub fn open_documents(&self) -> Vec<(DocId, UVec2)> {
+        let live = self.doc.size;
+        self.session
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, tab.parked_size().unwrap_or(live)))
+            .collect()
     }
 
     pub fn begin_stroke(&mut self, point: InputPoint) {

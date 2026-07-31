@@ -185,17 +185,38 @@ impl LayerStore {
     }
 }
 
+/// Everything that does not depend on the document: compiled shaders,
+/// pipelines, bind group layouts and the sampler.
+///
+/// Split out so a second open document can have its own textures without its
+/// own shaders. Every field is a reference-counted wgpu handle, so cloning this
+/// is a few atomic increments where rebuilding it is three shader compilations
+/// and four pipeline creations — a stall the user would pay on the frame they
+/// open a document. See [`CanvasRenderer::for_document`].
+#[derive(Clone)]
+struct Shared {
+    sampler: wgpu::Sampler,
+
+    dab_pipeline: wgpu::RenderPipeline,
+    dab_layout: wgpu::BindGroupLayout,
+
+    composite_pipeline: wgpu::RenderPipeline,
+    composite_layout: wgpu::BindGroupLayout,
+
+    commit_layout: wgpu::BindGroupLayout,
+    commit_pipeline: wgpu::RenderPipeline,
+    commit_erase_pipeline: wgpu::RenderPipeline,
+}
+
 pub struct CanvasRenderer {
     doc_size: UVec2,
+    shared: Shared,
 
     layers: LayerStore,
     #[allow(dead_code)]
     stroke: wgpu::Texture,
     stroke_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
 
-    dab_pipeline: wgpu::RenderPipeline,
-    dab_layout: wgpu::BindGroupLayout,
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
     dab_instances: wgpu::Buffer,
@@ -205,41 +226,15 @@ pub struct CanvasRenderer {
     tip: wgpu::Texture,
     has_tip: bool,
 
-    composite_pipeline: wgpu::RenderPipeline,
-    composite_layout: wgpu::BindGroupLayout,
     composite_bind_group: wgpu::BindGroup,
     view_uniforms: wgpu::Buffer,
 
-    commit_pipeline: wgpu::RenderPipeline,
-    commit_erase_pipeline: wgpu::RenderPipeline,
     commit_bind_group: wgpu::BindGroup,
     commit_uniforms: wgpu::Buffer,
 }
 
-impl CanvasRenderer {
-    pub fn new(
-        device: &wgpu::Device,
-        doc_size: UVec2,
-        surface_format: wgpu::TextureFormat,
-    ) -> Self {
-        let layers = LayerStore::new(device, doc_size, INITIAL_SLOTS);
-
-        let stroke = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("umber-stroke-scratch"),
-            size: wgpu::Extent3d {
-                width: doc_size.x,
-                height: doc_size.y,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: STROKE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
-
+impl Shared {
+    fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("umber-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -256,36 +251,10 @@ impl CanvasRenderer {
             label: Some("dab"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/dab.wgsl").into()),
         });
-        let dab_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dab-uniforms"),
-            contents: bytemuck::bytes_of(&DabUniforms {
-                doc_size: [doc_size.x as f32, doc_size.y as f32],
-                use_tip: 0,
-                _pad: 0.0,
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let dab_instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dab-instances"),
-            size: DAB_STRIDE * MAX_DABS_PER_FRAME as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // A 1x1 placeholder stands in when no tip is set, so the bind group
-        // layout never varies and there is still exactly one dab pipeline. Its
-        // contents do not matter: with `use_tip` at zero the shader samples it
-        // and discards the result, which is the price of keeping
-        // `textureSample` out of non-uniform control flow.
-        let tip = make_tip_texture(device, 1, 1);
-        let tip_view = tip.create_view(&wgpu::TextureViewDescriptor::default());
-
         let dab_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dab-bgl"),
             entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
         });
-        let dab_bind_group =
-            make_dab_bind_group(device, &dab_layout, &dab_uniforms, &tip_view, &sampler);
 
         let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dab-pipeline"),
@@ -365,12 +334,6 @@ impl CanvasRenderer {
             label: Some("composite"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/composite.wgsl").into()),
         });
-        let view_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("view-uniforms"),
-            size: std::mem::size_of::<ViewUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite-bgl"),
             entries: &[
@@ -380,14 +343,6 @@ impl CanvasRenderer {
                 sampler_entry(3),
             ],
         });
-        let composite_bind_group = make_composite_bind_group(
-            device,
-            &composite_layout,
-            &view_uniforms,
-            &layers.array_view,
-            &stroke_view,
-            &sampler,
-        );
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite-pipeline"),
             layout: Some(
@@ -421,33 +376,9 @@ impl CanvasRenderer {
             label: Some("commit"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/commit.wgsl").into()),
         });
-        let commit_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("commit-uniforms"),
-            size: std::mem::size_of::<CommitUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let commit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("commit-bgl"),
             entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
-        });
-        let commit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("commit-bg"),
-            layout: &commit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: commit_uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&stroke_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
         });
 
         let commit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -512,25 +443,145 @@ impl CanvasRenderer {
         );
 
         Self {
-            doc_size,
-            layers,
-            stroke,
-            stroke_view,
             sampler,
             dab_pipeline,
             dab_layout,
+            composite_pipeline,
+            composite_layout,
+            commit_layout,
+            commit_pipeline,
+            commit_erase_pipeline,
+        }
+    }
+}
+
+impl CanvasRenderer {
+    pub fn new(
+        device: &wgpu::Device,
+        doc_size: UVec2,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
+        Self::with_shared(device, doc_size, Shared::new(device, surface_format))
+    }
+
+    /// A renderer for a second document, reusing this one's compiled pipelines.
+    ///
+    /// Layer storage is emphatically *not* shared: each document owns its own
+    /// texture array and its own stroke scratch, so switching tabs is a
+    /// different renderer rather than a reallocation and a re-upload. What is
+    /// shared is everything that would otherwise be recompiled — see [`Shared`].
+    ///
+    /// The new renderer's textures hold whatever the allocation contained, so
+    /// the caller must clear them before the first composite, exactly as it
+    /// does after [`CanvasRenderer::new`].
+    pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2) -> Self {
+        Self::with_shared(device, doc_size, self.shared.clone())
+    }
+
+    fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared) -> Self {
+        let layers = LayerStore::new(device, doc_size, INITIAL_SLOTS);
+
+        let stroke = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-stroke-scratch"),
+            size: wgpu::Extent3d {
+                width: doc_size.x,
+                height: doc_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: STROKE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let dab_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dab-uniforms"),
+            contents: bytemuck::bytes_of(&DabUniforms {
+                doc_size: [doc_size.x as f32, doc_size.y as f32],
+                use_tip: 0,
+                _pad: 0.0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let dab_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dab-instances"),
+            size: DAB_STRIDE * MAX_DABS_PER_FRAME as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // A 1x1 placeholder stands in when no tip is set, so the bind group
+        // layout never varies and there is still exactly one dab pipeline. Its
+        // contents do not matter: with `use_tip` at zero the shader samples it
+        // and discards the result, which is the price of keeping
+        // `textureSample` out of non-uniform control flow.
+        let tip = make_tip_texture(device, 1, 1);
+        let tip_view = tip.create_view(&wgpu::TextureViewDescriptor::default());
+        let dab_bind_group = make_dab_bind_group(
+            device,
+            &shared.dab_layout,
+            &dab_uniforms,
+            &tip_view,
+            &shared.sampler,
+        );
+
+        let view_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view-uniforms"),
+            size: std::mem::size_of::<ViewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let composite_bind_group = make_composite_bind_group(
+            device,
+            &shared.composite_layout,
+            &view_uniforms,
+            &layers.array_view,
+            &stroke_view,
+            &shared.sampler,
+        );
+
+        let commit_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("commit-uniforms"),
+            size: std::mem::size_of::<CommitUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let commit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("commit-bg"),
+            layout: &shared.commit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: commit_uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&stroke_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shared.sampler),
+                },
+            ],
+        });
+
+        Self {
+            doc_size,
+            shared,
+            layers,
+            stroke,
+            stroke_view,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
             dabs_this_frame: 0,
             tip,
             has_tip: false,
-            composite_pipeline,
-            composite_layout,
             composite_bind_group,
             view_uniforms,
-            commit_pipeline,
-            commit_erase_pipeline,
             commit_bind_group,
             commit_uniforms,
         }
@@ -597,11 +648,11 @@ impl CanvasRenderer {
 
         self.composite_bind_group = make_composite_bind_group(
             device,
-            &self.composite_layout,
+            &self.shared.composite_layout,
             &self.view_uniforms,
             &grown.array_view,
             &self.stroke_view,
-            &self.sampler,
+            &self.shared.sampler,
         );
         self.layers = grown;
     }
@@ -652,10 +703,10 @@ impl CanvasRenderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.dab_bind_group = make_dab_bind_group(
             device,
-            &self.dab_layout,
+            &self.shared.dab_layout,
             &self.dab_uniforms,
             &view,
-            &self.sampler,
+            &self.shared.sampler,
         );
         self.tip = texture;
         self.has_tip = has_tip;
@@ -719,7 +770,7 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.dab_pipeline);
+        pass.set_pipeline(&self.shared.dab_pipeline);
         pass.set_bind_group(0, &self.dab_bind_group, &[]);
         pass.set_vertex_buffer(
             0,
@@ -804,7 +855,7 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.composite_pipeline);
+        pass.set_pipeline(&self.shared.composite_pipeline);
         pass.set_bind_group(0, &self.composite_bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
@@ -857,8 +908,8 @@ impl CanvasRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(match style.mode {
-                BrushMode::Paint => &self.commit_pipeline,
-                BrushMode::Erase => &self.commit_erase_pipeline,
+                BrushMode::Paint => &self.shared.commit_pipeline,
+                BrushMode::Erase => &self.shared.commit_erase_pipeline,
             });
             pass.set_bind_group(0, &self.commit_bind_group, &[]);
             pass.draw(0..4, 0..1);
