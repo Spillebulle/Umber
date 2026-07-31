@@ -35,10 +35,13 @@ struct View {
     // keep in step, and exports that differ from the screen are a classic bug.
     // Named with a prefix because `export` is a reserved word in WGSL.
     is_export: u32,
-    // Three scalars, not a vec3<u32>: a vec3 carries 16-byte alignment, which
-    // would push it to the next 16-byte boundary and leave the struct 16 bytes
-    // longer than the Rust side. Scalars are 4-aligned and pack as intended.
-    _pad0: u32,
+    // Non-zero when the stroke carries a colour per dab — a smudging brush —
+    // and `stroke_color.rgb` is therefore not the whole story.
+    per_dab_color: u32,
+    // Two scalars, not a vec2/vec3<u32>: a vec3 carries 16-byte alignment,
+    // which would push it to the next 16-byte boundary and leave the struct 16
+    // bytes longer than the Rust side. Scalars are 4-aligned and pack as
+    // intended.
     _pad1: u32,
     _pad2: u32,
     // Per stack position, bottom first: (opacity, blend mode, slot, visible).
@@ -51,6 +54,23 @@ struct View {
 @group(0) @binding(1) var layer_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var stroke_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+// Per-dab colour, premultiplied linear RGBA. A 1x1 placeholder unless the
+// stroke in progress smudges.
+@group(0) @binding(4) var stroke_color_tex: texture_2d<f32>;
+
+// The stroke's colour at this fragment.
+//
+// MUST stay identical to `stroke_rgb` in `commit.wgsl`. The preview and the
+// committed result are two renderings of the same thing, and any difference
+// between them shows up as the stroke visibly jumping at pointer-up.
+fn stroke_rgb(uv: vec2<f32>) -> vec3<f32> {
+    let picked = textureSampleLevel(stroke_color_tex, samp, uv, 0.0);
+    // Un-premultiply. Where a smudging stroke has laid nothing down yet the
+    // sample is all zeroes, and dividing would be a NaN, so the uniform colour
+    // stands in — which is also what a dab with no pickup deposits.
+    let smudged = select(v.stroke_color.rgb, picked.rgb / max(picked.a, 1e-4), picked.a > 1e-4);
+    return select(v.stroke_color.rgb, smudged, v.per_dab_color != 0u);
+}
 
 // The surface is a linear (non-sRGB) format so egui can write its already
 // gamma-encoded colours without the hardware encoding them twice. That makes
@@ -157,7 +177,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         if (i == v.active_index) {
             let cov = coverage * v.stroke_color.a;
             if (v.stroke_mode == 0u) {
-                let s = vec4<f32>(v.stroke_color.rgb * cov, cov);
+                let s = vec4<f32>(stroke_rgb(uv) * cov, cov);
                 lay = s + lay * (1.0 - s.a);
             } else {
                 lay = lay * (1.0 - cov);

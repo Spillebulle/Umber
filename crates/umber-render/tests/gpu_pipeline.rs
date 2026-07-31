@@ -38,6 +38,10 @@ struct Harness {
     _guard: MutexGuard<'static, ()>,
     gpu: &'static Gpu,
     canvas: CanvasRenderer,
+    /// Carried so `commit` and `composite` agree with whatever `stamp_colored`
+    /// last did. Preview and commit disagreeing about where the colour comes
+    /// from is exactly the bug this pairing exists to prevent.
+    per_dab_color: bool,
 }
 
 impl Harness {
@@ -61,6 +65,7 @@ impl Harness {
             _guard: guard,
             gpu,
             canvas,
+            per_dab_color: false,
         })
     }
 
@@ -71,9 +76,16 @@ impl Harness {
     }
 
     fn stamp(&mut self, dabs: &[Dab]) {
+        self.stamp_colored(dabs, false);
+    }
+
+    /// Stamp with the per-dab colour path on, as a smudging brush does.
+    fn stamp_colored(&mut self, dabs: &[Dab], colored: bool) {
+        self.per_dab_color = colored;
         let mut enc = self.encoder();
         self.canvas.begin_frame();
-        self.canvas.draw_dabs(&self.gpu.queue, &mut enc, dabs);
+        self.canvas
+            .draw_dabs(&self.gpu.device, &self.gpu.queue, &mut enc, dabs, colored);
         self.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -94,6 +106,7 @@ impl Harness {
                 color,
                 opacity,
                 mode,
+                per_dab_color: self.per_dab_color,
             },
         );
         self.gpu.queue.submit(Some(enc.finish()));
@@ -226,12 +239,16 @@ impl Harness {
 }
 
 fn dab(x: f32, y: f32, radius: f32, coverage: f32) -> Dab {
+    coloured_dab(x, y, radius, coverage, [0.0; 3])
+}
+
+fn coloured_dab(x: f32, y: f32, radius: f32, coverage: f32, color: [f32; 3]) -> Dab {
     Dab {
         pos: [x, y],
         radius,
         hardness: 0.95,
         coverage,
-        _pad: [0.0; 3],
+        color,
     }
 }
 
@@ -293,6 +310,83 @@ fn overlapping_dabs_do_not_compound() {
     assert!(
         (100..=155).contains(&alpha),
         "expected ~128 (single coverage), got {alpha} — dabs are compounding"
+    );
+}
+
+#[test]
+fn a_smudging_stroke_commits_the_colour_its_dabs_carried() {
+    // The per-dab colour path. `commit` is given black as the stroke colour;
+    // if the colour scratch were ignored — the flag unset, the texture unbound,
+    // the un-premultiply wrong — the mark would come out black rather than red.
+    let mut h = harness_or_skip!();
+
+    h.stamp_colored(
+        &[coloured_dab(32.0, 32.0, 12.0, 1.0, [1.0, 0.0, 0.0])],
+        true,
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    // sRGB 255 for linear 1.0; the layer stores sRGB-encoded bytes.
+    assert_near(h.pixel(32, 32), [255, 0, 0], 4, "smudged dab");
+}
+
+#[test]
+fn smudged_dabs_still_do_not_compound() {
+    // The wet-layer guarantee has to survive the second attachment. Coverage
+    // keeps its `max` blend while colour blends `over`, and it would be easy to
+    // give both the same state — at which point a blender scrubbed back and
+    // forth over one spot would darken with every pass.
+    let mut h = harness_or_skip!();
+
+    let d = coloured_dab(32.0, 32.0, 12.0, 0.5, [1.0, 0.0, 0.0]);
+    h.stamp_colored(&[d, d, d, d], true);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (single coverage), got {alpha} — smudged dabs are compounding"
+    );
+}
+
+#[test]
+fn later_dabs_win_the_colour_where_a_smudge_crosses_itself() {
+    // Colour blends `over`, so a pixel ends up wearing the most recent dab that
+    // covered it. That is what makes a smear trail along a stroke instead of
+    // averaging everything the brush picked up over its whole length.
+    let mut h = harness_or_skip!();
+
+    h.stamp_colored(
+        &[
+            coloured_dab(32.0, 32.0, 12.0, 1.0, [1.0, 0.0, 0.0]),
+            coloured_dab(32.0, 32.0, 12.0, 1.0, [0.0, 0.0, 1.0]),
+        ],
+        true,
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    assert_near(h.pixel(32, 32), [0, 0, 255], 4, "last dab's colour");
+}
+
+#[test]
+fn an_ordinary_stroke_ignores_the_colour_scratch_entirely() {
+    // The fast path must stay exactly as it was. A dab carrying a red colour
+    // that is *not* stamped through the coloured pipeline has to commit as the
+    // stroke colour — otherwise the flag is being ignored somewhere and every
+    // ordinary stroke would start paying for a feature it does not use.
+    let mut h = harness_or_skip!();
+
+    h.stamp_colored(
+        &[coloured_dab(32.0, 32.0, 12.0, 1.0, [1.0, 0.0, 0.0])],
+        false,
+    );
+    h.commit(Color::new(0.0, 1.0, 0.0, 1.0), 1.0, BrushMode::Paint);
+
+    assert_near(
+        h.pixel(32, 32),
+        [0, 255, 0],
+        4,
+        "stroke colour, not the dab's",
     );
 }
 

@@ -18,5 +18,5 @@
 pub mod canvas;
 pub mod gpu;
 
-pub use canvas::{CanvasRenderer, CompositeParams, LayerDraw, StrokeStyle};
+pub use canvas::{CanvasRenderer, CompositeParams, LayerDraw, ProbeParams, StrokeStyle};
 pub use gpu::Gpu;

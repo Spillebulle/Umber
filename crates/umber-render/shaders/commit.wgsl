@@ -13,13 +13,19 @@ struct Commit {
     _pad0: vec2<f32>,
     color: vec4<f32>,   // linear RGB, .a = stroke opacity
     mode: u32,          // 0 = paint, 1 = erase
-    _pad1: f32,
+    // Non-zero when the stroke carries a colour per dab — a smudging brush —
+    // and `color.rgb` is therefore not the whole story. Scalar padding, not a
+    // vec3: see the uniform-layout note in CLAUDE.md.
+    per_dab_color: u32,
     _pad2: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Commit;
 @group(0) @binding(1) var stroke_tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+// Per-dab colour, premultiplied linear RGBA. A 1x1 placeholder unless this
+// stroke smudges.
+@group(0) @binding(3) var stroke_color_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -47,13 +53,27 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// The stroke's colour at this fragment.
+//
+// MUST stay identical to `stroke_rgb` in `composite.wgsl`. The preview and the
+// committed result are two renderings of the same thing, and any difference
+// between them shows up as the stroke visibly jumping at pointer-up.
+fn stroke_rgb(uv: vec2<f32>) -> vec3<f32> {
+    let picked = textureSampleLevel(stroke_color_tex, samp, uv, 0.0);
+    // Un-premultiply. Where a smudging stroke has laid nothing down yet the
+    // sample is all zeroes, and dividing would be a NaN, so the uniform colour
+    // stands in — which is also what a dab with no pickup deposits.
+    let smudged = select(u.color.rgb, picked.rgb / max(picked.a, 1e-4), picked.a > 1e-4);
+    return select(u.color.rgb, smudged, u.per_dab_color != 0u);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let uv = in.doc / u.doc_size;
     let cov = textureSampleLevel(stroke_tex, samp, uv, 0.0).r * u.color.a;
 
     if (u.mode == 0u) {
-        return vec4<f32>(u.color.rgb * cov, cov);
+        return vec4<f32>(stroke_rgb(uv) * cov, cov);
     }
     return vec4<f32>(0.0, 0.0, 0.0, cov);
 }

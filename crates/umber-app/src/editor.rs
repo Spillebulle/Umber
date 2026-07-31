@@ -448,10 +448,18 @@ impl Editor {
             color: self.color,
             opacity: self.brush.opacity,
             mode: self.brush.mode,
+            // Decided once, here, from the brush this stroke started with. It
+            // must not change mid-stroke: dabs already stamped without a colour
+            // recorded would commit as the flat palette colour while the rest
+            // smudged.
+            per_dab_color: self.brush.smudges(),
         };
         self.stroke_slot = self.layers.active_slot();
         self.pressure.reset();
-        self.stroke.begin(self.brush, point);
+        // `Color` is already linear — the engine works in linear throughout —
+        // so this is the same value the composite would have used.
+        let paint = [self.color.r, self.color.g, self.color.b];
+        self.stroke.begin(self.brush, paint, point);
         self.interaction = Interaction::Drawing;
     }
 

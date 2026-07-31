@@ -47,6 +47,30 @@ pub struct Brush {
     /// Input smoothing, `0.0` (raw) to just under `1.0` (very heavy).
     pub stabilization: f32,
     pub mode: BrushMode,
+    /// How much of each dab's colour is picked up off the canvas rather than
+    /// taken from the palette. `0.0` is an ordinary brush; `1.0` deposits only
+    /// what it found, which is a pure blender.
+    ///
+    /// Non-zero is what makes a stroke *per-dab coloured*, and that costs a
+    /// second scratch target — see [`crate::stroke::StrokeBuilder`]. Zero is
+    /// therefore not merely the default but the fast path, and the overwhelming
+    /// majority of brushes stay on it.
+    pub smudge: f32,
+    /// How long picked-up colour survives, `0.0` (replaced at every sample) to
+    /// just under `1.0` (a very long smear). MyPaint's `smudge_length`.
+    pub smudge_length: f32,
+    /// Radius of the canvas patch a dab averages when it picks colour up, as a
+    /// multiple of the dab radius. MyPaint's `smudge_radius_log`, already
+    /// exponentiated.
+    pub smudge_radius: f32,
+    /// Dabs deposited per second while the pen is down, *in addition* to the
+    /// distance-driven ones. `0.0` — the default — is a purely distance-driven
+    /// brush, which is what almost every brush wants.
+    ///
+    /// A handful of MyPaint brushes set only this and no distance term: they
+    /// are airbrushes, and they are supposed to keep depositing paint while the
+    /// pen is held still. Without it they import as a solid line.
+    pub dabs_per_second: f32,
 }
 
 impl Default for Brush {
@@ -63,6 +87,10 @@ impl Default for Brush {
             opacity_curve: ResponseCurve::LINEAR,
             stabilization: 0.35,
             mode: BrushMode::Paint,
+            smudge: 0.0,
+            smudge_length: 0.5,
+            smudge_radius: 1.0,
+            dabs_per_second: 0.0,
         }
     }
 }
@@ -97,6 +125,20 @@ impl Brush {
     /// Distance to the next dab, in document pixels.
     pub fn step_at(&self, pressure: f32) -> f32 {
         (self.radius_at(pressure) * 2.0 * self.spacing).max(0.25)
+    }
+
+    /// Whether this brush picks colour up off the canvas.
+    ///
+    /// The threshold is not zero: a smudge of a few thousandths is a rounding
+    /// artefact of the import, and turning the whole per-dab colour path on for
+    /// it would cost a scratch target to render something indistinguishable.
+    pub fn smudges(&self) -> bool {
+        self.smudge > 0.004
+    }
+
+    /// Whether the brush keeps depositing paint while the pen is stationary.
+    pub fn is_timed(&self) -> bool {
+        self.dabs_per_second > 0.0
     }
 }
 

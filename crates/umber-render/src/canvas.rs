@@ -3,6 +3,8 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use umber_core::{BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use wgpu::util::DeviceExt;
 
@@ -34,6 +36,164 @@ const INITIAL_SLOTS: u32 = 4;
 
 const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 
+/// Per-dab colour, for a smudging stroke only.
+///
+/// `Rgba16Float` rather than `Rgba8Unorm` because these are **linear** values.
+/// Eight bits of linear light bands visibly in the shadows, and a blender
+/// working over a dark painting is precisely where it would show. Allocated
+/// only when a smudging stroke starts, so an ordinary session never holds it.
+const STROKE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The coverage attachment's blend state.
+///
+/// `Max` is the whole trick: coverage saturates instead of accumulating, so a
+/// stroke crossing itself stays even. Shared by both dab pipelines, so smudging
+/// cannot quietly reintroduce the compounding this prevents.
+const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
+    format: STROKE_FORMAT,
+    blend: Some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        },
+    }),
+    write_mask: wgpu::ColorWrites::ALL,
+};
+
+/// The colour attachment's blend state: premultiplied `over`.
+///
+/// Deliberately *not* `Max`, which is meaningless for colour — it would take
+/// the brightest channel wherever a stroke overlapped itself. `over` makes each
+/// pixel hold the most recent dabs' colour, which is what produces a smear that
+/// trails along the stroke instead of one flat average of everything picked up.
+const STROKE_COLOR_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
+    format: STROKE_COLOR_FORMAT,
+    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+    write_mask: wgpu::ColorWrites::ALL,
+};
+
+/// Instance layout, shared by both dab pipelines so they cannot disagree about
+/// what a `Dab` looks like in memory.
+const DAB_ATTRS: [wgpu::VertexAttribute; 5] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 0,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 8,
+        shader_location: 1,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 12,
+        shader_location: 2,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 16,
+        shader_location: 3,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 20,
+        shader_location: 4,
+    },
+];
+
+const DAB_VERTEX_LAYOUT: &[wgpu::VertexBufferLayout] = &[wgpu::VertexBufferLayout {
+    array_stride: DAB_STRIDE,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &DAB_ATTRS,
+}];
+
+/// Side of the square the smudge probe composites into.
+///
+/// Small on purpose: it is averaged to a single colour, so it only has to be
+/// wide enough that one stray pixel cannot dominate what the brush picks up.
+const PROBE_SIZE: u32 = 8;
+const PROBE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Rows in a texture-to-buffer copy must be a multiple of 256 bytes, and eight
+/// RGBA pixels are 32 — so each row is padded and the reader strides over it.
+const PROBE_ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+/// Probes in flight at once. Two is enough to keep a sample arriving every
+/// frame while never waiting on one: while the first is being mapped the second
+/// is being rendered.
+const PROBE_SLOTS: usize = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeState {
+    /// Free to be handed to a new probe.
+    Idle,
+    /// A copy has been recorded into it but not yet mapped.
+    Rendering,
+    /// `map_async` is outstanding.
+    Mapping,
+}
+
+/// One slot in the smudge probe's rotation: a staging buffer and where it is
+/// up to.
+struct Probe {
+    buffer: wgpu::Buffer,
+    state: ProbeState,
+    /// Set by the map callback, which runs on whichever thread polls the
+    /// device — hence the atomic rather than a plain `bool`.
+    ready: Arc<AtomicBool>,
+}
+
+/// Average a probe readback into one linear RGBA.
+///
+/// The composite's export path writes **sRGB** with straight alpha, so the
+/// decode happens here. Averaging the sRGB bytes directly would be the classic
+/// mistake — the mean of two gamma-encoded values is not the gamma encoding of
+/// their mean, and a blender working across an edge would pick up a colour
+/// lighter than either side of it.
+///
+/// Colour is weighted by coverage so that transparent pixels do not drag the
+/// average towards whatever happens to sit in their unused colour channels.
+fn average_probe(bytes: &[u8]) -> [f32; 4] {
+    let decode = |b: u8| {
+        let c = b as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+
+    let mut rgb = [0.0f32; 3];
+    let mut alpha = 0.0f32;
+    let mut weight = 0.0f32;
+    for y in 0..PROBE_SIZE {
+        let row = (y * PROBE_ROW_BYTES) as usize;
+        for x in 0..PROBE_SIZE {
+            let i = row + x as usize * 4;
+            let Some(px) = bytes.get(i..i + 4) else {
+                continue;
+            };
+            let a = px[3] as f32 / 255.0;
+            alpha += a;
+            weight += a;
+            for c in 0..3 {
+                rgb[c] += decode(px[c]) * a;
+            }
+        }
+    }
+
+    let n = (PROBE_SIZE * PROBE_SIZE) as f32;
+    if weight <= 0.0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    [rgb[0] / weight, rgb[1] / weight, rgb[2] / weight, alpha / n]
+}
+
 /// One layer's contribution to the composite, in stack order.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerDraw {
@@ -56,6 +216,13 @@ pub struct StrokeStyle {
     /// Applied once, on commit — never folded into per-dab coverage.
     pub opacity: f32,
     pub mode: BrushMode,
+    /// The stroke deposits a colour per dab — it smudges — so `color` is only
+    /// the fallback and the real colour comes from the stroke's colour scratch.
+    ///
+    /// Must match what was passed to [`CanvasRenderer::draw_dabs`] for the same
+    /// stroke. Preview and commit both read it, which is what keeps them from
+    /// disagreeing about where the colour came from.
+    pub per_dab_color: bool,
 }
 
 impl Default for StrokeStyle {
@@ -64,8 +231,26 @@ impl Default for StrokeStyle {
             color: Color::BLACK,
             opacity: 1.0,
             mode: BrushMode::Paint,
+            per_dab_color: false,
         }
     }
+}
+
+/// Where a smudging brush should sample the canvas, and what it is painting.
+///
+/// The stack and stroke are the same ones the screen composite is given, and
+/// deliberately so: the probe reuses the composite pass, so a blender picks up
+/// exactly what the painter can see under the brush — including the wet stroke.
+#[derive(Clone, Copy)]
+pub struct ProbeParams<'a> {
+    /// Bottom-to-top, as [`CompositeParams::layers`].
+    pub layers: &'a [LayerDraw],
+    pub active_index: u32,
+    pub stroke: StrokeStyle,
+    /// Centre of the sample, in document pixels.
+    pub doc_point: Vec2,
+    /// Radius of the patch to average, in document pixels.
+    pub radius: f32,
 }
 
 /// Everything the composite pass needs for a frame.
@@ -110,7 +295,8 @@ struct ViewUniforms {
     active_index: u32,
     checker: f32,
     is_export: u32,
-    _pad: [u32; 3],
+    per_dab_color: u32,
+    _pad: [u32; 2],
     /// (opacity, blend, slot, visible) per stack position.
     layers: [[f32; 4]; MAX_LAYERS],
 }
@@ -124,7 +310,7 @@ struct CommitUniforms {
     _pad0: [f32; 2],
     color: [f32; 4],
     mode: u32,
-    _pad1: f32,
+    per_dab_color: u32,
     _pad2: [f32; 2],
 }
 
@@ -198,6 +384,9 @@ struct Shared {
     sampler: wgpu::Sampler,
 
     dab_pipeline: wgpu::RenderPipeline,
+    /// Writes the colour scratch as well. Used only while a smudging stroke is
+    /// in progress, so an ordinary stroke never pays for the second attachment.
+    dab_colored_pipeline: wgpu::RenderPipeline,
     dab_layout: wgpu::BindGroupLayout,
 
     composite_pipeline: wgpu::RenderPipeline,
@@ -216,6 +405,14 @@ pub struct CanvasRenderer {
     #[allow(dead_code)]
     stroke: wgpu::Texture,
     stroke_view: wgpu::TextureView,
+    /// Per-dab colour, or a 1x1 placeholder until a smudging stroke first needs
+    /// it. Held so it outlives the bind groups referencing it.
+    stroke_color: wgpu::Texture,
+    stroke_color_view: wgpu::TextureView,
+    has_stroke_color: bool,
+    /// Staging buffers for the smudge probe, rotated so a stroke never waits on
+    /// the GPU to tell it what colour it is passing over.
+    probes: Vec<Probe>,
 
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
@@ -256,73 +453,58 @@ impl Shared {
             entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
         });
 
+        let dab_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("dab-pl"),
+            bind_group_layouts: &[Some(&dab_layout)],
+            immediate_size: 0,
+        });
+        let dab_primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        };
+
         let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dab-pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("dab-pl"),
-                    bind_group_layouts: &[Some(&dab_layout)],
-                    immediate_size: 0,
-                }),
-            ),
+            layout: Some(&dab_pl),
             vertex: wgpu::VertexState {
                 module: &dab_shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: DAB_STRIDE,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32,
-                            offset: 12,
-                            shader_location: 2,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32,
-                            offset: 16,
-                            shader_location: 3,
-                        },
-                    ],
-                }],
+                buffers: DAB_VERTEX_LAYOUT,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &dab_shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: STROKE_FORMAT,
-                    // `Max` is the whole trick: coverage saturates instead of
-                    // accumulating, so a stroke crossing itself stays even.
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Max,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Max,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(COVERAGE_TARGET)],
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
+            primitive: dab_primitive,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Same geometry, same coverage target, plus the colour scratch. Kept as
+        // a separate pipeline rather than one that always writes both, because
+        // the second attachment is pure cost for the strokes — nearly all of
+        // them — that paint a single colour.
+        let dab_colored_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("dab-colored-pipeline"),
+            layout: Some(&dab_pl),
+            vertex: wgpu::VertexState {
+                module: &dab_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: DAB_VERTEX_LAYOUT,
             },
+            fragment: Some(wgpu::FragmentState {
+                module: &dab_shader,
+                entry_point: Some("fs_colored"),
+                compilation_options: Default::default(),
+                targets: &[Some(COVERAGE_TARGET), Some(STROKE_COLOR_TARGET)],
+            }),
+            primitive: dab_primitive,
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
@@ -341,6 +523,7 @@ impl Shared {
                 texture_array_entry(1),
                 texture_entry(2),
                 sampler_entry(3),
+                texture_entry(4),
             ],
         });
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -378,7 +561,12 @@ impl Shared {
         });
         let commit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("commit-bgl"),
-            entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
+            entries: &[
+                uniform_entry(0),
+                texture_entry(1),
+                sampler_entry(2),
+                texture_entry(3),
+            ],
         });
 
         let commit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -445,6 +633,7 @@ impl Shared {
         Self {
             sampler,
             dab_pipeline,
+            dab_colored_pipeline,
             dab_layout,
             composite_pipeline,
             composite_layout,
@@ -497,6 +686,12 @@ impl CanvasRenderer {
         });
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // A 1x1 stand-in, exactly as the tip has. Nearly every stroke paints one
+        // colour and never touches this, so a document-sized allocation here
+        // would be megabytes held for a feature most sessions never use.
+        let stroke_color = make_stroke_color_texture(device, UVec2::ONE);
+        let stroke_color_view = stroke_color.create_view(&wgpu::TextureViewDescriptor::default());
+
         let dab_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dab-uniforms"),
             contents: bytemuck::bytes_of(&DabUniforms {
@@ -541,6 +736,7 @@ impl CanvasRenderer {
             &layers.array_view,
             &stroke_view,
             &shared.sampler,
+            &stroke_color_view,
         );
 
         let commit_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -549,24 +745,14 @@ impl CanvasRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let commit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("commit-bg"),
-            layout: &shared.commit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: commit_uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&stroke_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shared.sampler),
-                },
-            ],
-        });
+        let commit_bind_group = make_commit_bind_group(
+            device,
+            &shared.commit_layout,
+            &commit_uniforms,
+            &stroke_view,
+            &shared.sampler,
+            &stroke_color_view,
+        );
 
         Self {
             doc_size,
@@ -574,6 +760,21 @@ impl CanvasRenderer {
             layers,
             stroke,
             stroke_view,
+            stroke_color,
+            stroke_color_view,
+            has_stroke_color: false,
+            probes: (0..PROBE_SLOTS)
+                .map(|i| Probe {
+                    buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("umber-probe-{i}")),
+                        size: (PROBE_ROW_BYTES * PROBE_SIZE) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    state: ProbeState::Idle,
+                    ready: Arc::new(AtomicBool::new(false)),
+                })
+                .collect(),
             dab_bind_group,
             dab_uniforms,
             dab_instances,
@@ -653,6 +854,7 @@ impl CanvasRenderer {
             &grown.array_view,
             &self.stroke_view,
             &self.shared.sampler,
+            &self.stroke_color_view,
         );
         self.layers = grown;
     }
@@ -732,15 +934,62 @@ impl CanvasRenderer {
         self.dabs_this_frame = 0;
     }
 
+    /// Give the stroke somewhere to record a colour per dab.
+    ///
+    /// Allocated the first time a smudging stroke needs it and kept thereafter:
+    /// a painter who reaches for a blender once will reach for it again, and
+    /// re-allocating a document-sized texture per stroke would be a stutter at
+    /// exactly the wrong moment. The two bind groups that name it have to be
+    /// rebuilt, which is why this is not simply a lazy getter.
+    fn ensure_stroke_color(&mut self, device: &wgpu::Device) {
+        if self.has_stroke_color {
+            return;
+        }
+        self.stroke_color = make_stroke_color_texture(device, self.doc_size);
+        self.stroke_color_view = self
+            .stroke_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.has_stroke_color = true;
+
+        self.composite_bind_group = make_composite_bind_group(
+            device,
+            &self.shared.composite_layout,
+            &self.view_uniforms,
+            &self.layers.array_view,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
+        self.commit_bind_group = make_commit_bind_group(
+            device,
+            &self.shared.commit_layout,
+            &self.commit_uniforms,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
+    }
+
     /// Upload dabs and stamp them into the scratch texture.
+    ///
+    /// `colored` must be true for every frame of a stroke whose brush smudges,
+    /// and must match the `per_dab_color` handed to [`Self::composite`] and
+    /// [`Self::commit_stroke`]. Turning it on midway through a stroke would
+    /// leave the earlier dabs with no colour recorded, and they would commit as
+    /// the flat palette colour while the rest smudged.
     pub fn draw_dabs(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         dabs: &[Dab],
+        colored: bool,
     ) {
         if dabs.is_empty() {
             return;
+        }
+        if colored {
+            self.ensure_stroke_color(device);
         }
         let room = MAX_DABS_PER_FRAME.saturating_sub(self.dabs_this_frame as usize);
         if room == 0 {
@@ -752,25 +1001,43 @@ impl CanvasRenderer {
         let offset = self.dabs_this_frame as u64 * DAB_STRIDE;
         queue.write_buffer(&self.dab_instances, offset, bytemuck::cast_slice(dabs));
 
+        // Load, never clear: the scratch accumulates across frames for the whole
+        // stroke, so only the new dabs are drawn each frame.
+        let load = wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        };
+        let coverage_attachment = Some(wgpu::RenderPassColorAttachment {
+            view: &self.stroke_view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: load,
+        });
+        let color_attachment = Some(wgpu::RenderPassColorAttachment {
+            view: &self.stroke_color_view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: load,
+        });
+        let attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>] = if colored {
+            &[coverage_attachment, color_attachment]
+        } else {
+            std::slice::from_ref(&coverage_attachment)
+        };
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("dab-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.stroke_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    // Load: the scratch accumulates across frames for the whole
-                    // stroke, so only the new dabs are drawn each frame.
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
+            color_attachments: attachments,
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.shared.dab_pipeline);
+        pass.set_pipeline(if colored {
+            &self.shared.dab_colored_pipeline
+        } else {
+            &self.shared.dab_pipeline
+        });
         pass.set_bind_group(0, &self.dab_bind_group, &[]);
         pass.set_vertex_buffer(
             0,
@@ -834,7 +1101,8 @@ impl CanvasRenderer {
                 active_index: params.active_index,
                 checker: 8.0,
                 is_export: if params.export { 1 } else { 0 },
-                _pad: [0; 3],
+                per_dab_color: u32::from(params.stroke.per_dab_color),
+                _pad: [0; 2],
                 layers: packed,
             }),
         );
@@ -885,7 +1153,7 @@ impl CanvasRenderer {
                 _pad0: [0.0; 2],
                 color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
                 mode: mode_index(style.mode),
-                _pad1: 0.0,
+                per_dab_color: u32::from(style.per_dab_color),
                 _pad2: [0.0; 2],
             }),
         );
@@ -919,8 +1187,15 @@ impl CanvasRenderer {
     }
 
     /// Wipe the scratch surface.
+    ///
+    /// Both halves of it. Leaving stale colour behind would be the same class
+    /// of bug as leaving stale coverage: the next smudging stroke would pick up
+    /// the previous one's smear wherever its own dabs had not yet reached.
     pub fn clear_stroke(&self, encoder: &mut wgpu::CommandEncoder) {
         clear_view(encoder, &self.stroke_view, "clear-stroke");
+        if self.has_stroke_color {
+            clear_view(encoder, &self.stroke_color_view, "clear-stroke-colour");
+        }
     }
 
     /// Wipe one layer.
@@ -1143,6 +1418,180 @@ impl CanvasRenderer {
         px
     }
 
+    /// Ask what the canvas looks like under the brush, without waiting for it.
+    ///
+    /// This is [`Self::pick_colour`] with the blocking removed, and it exists
+    /// for one caller: a smudging brush, which needs the canvas colour on every
+    /// frame of a stroke. `pick_colour` blocks on the GPU, and a blocking read
+    /// per frame during a stroke is exactly the thing this project is built to
+    /// avoid — `read_layer_rect` carries the same warning for the same reason.
+    ///
+    /// So the answer arrives a frame or two later, through [`Self::take_probe`].
+    /// The stroke it feeds is a trailing average by definition, and MyPaint's
+    /// own smudge lags far more than the readback does, so the delay costs
+    /// nothing visible.
+    ///
+    /// The composite pass is reused with the stroke *included*, so a blender
+    /// scrubbed back and forth picks up its own wet paint rather than only what
+    /// was on the layer when the stroke started.
+    pub fn probe_canvas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &ProbeParams<'_>,
+    ) {
+        let ProbeParams {
+            layers,
+            active_index,
+            stroke,
+            doc_point,
+            radius,
+        } = *params;
+        // By index rather than by reference: `composite` below needs `&self`,
+        // and a live `&mut` into `self.probes` would still be outstanding.
+        let Some(index) = self.probes.iter().position(|p| p.state == ProbeState::Idle) else {
+            // Every slot is still in flight. Dropping this sample is right: the
+            // ones outstanding are more recent than anything a queue would hold,
+            // and a smudge that lags further is worse than one that samples less
+            // often.
+            return;
+        };
+        self.probes[index].state = ProbeState::Rendering;
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-probe"),
+            size: wgpu::Extent3d {
+                width: PROBE_SIZE,
+                height: PROBE_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PROBE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Zoom so the brush's footprint fills the little target exactly, which
+        // makes the readback an area average over what the dab covers rather
+        // than a point sample that a single stray pixel could dominate.
+        let camera = Camera {
+            center: doc_point,
+            zoom: PROBE_SIZE as f32 / (radius * 2.0).max(0.5),
+        };
+        self.composite(
+            queue,
+            encoder,
+            &view,
+            &CompositeParams {
+                camera: &camera,
+                pivot: Vec2::splat(PROBE_SIZE as f32 * 0.5),
+                layers,
+                active_index,
+                stroke,
+                backdrop: [0.0, 0.0, 0.0],
+                // The export path returns straight alpha and skips the sRGB
+                // encode, which is what makes the result usable as linear
+                // colour with a meaningful alpha. Exactly what `pick_colour`
+                // relies on, for the same reason.
+                export: true,
+            },
+        );
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.probes[index].buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(PROBE_ROW_BYTES),
+                    rows_per_image: Some(PROBE_SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: PROBE_SIZE,
+                height: PROBE_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Start the map for any probe whose copy has been submitted.
+    ///
+    /// Split from [`Self::probe_canvas`] because `map_async` may only be called
+    /// on a buffer whose writes are already submitted, and the encoder holding
+    /// that copy is still open when the probe is recorded.
+    pub fn submit_probes(&mut self) {
+        for slot in &mut self.probes {
+            if slot.state != ProbeState::Rendering {
+                continue;
+            }
+            slot.state = ProbeState::Mapping;
+            let done = slot.ready.clone();
+            slot.buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    // On failure the slot simply never reports ready and is
+                    // recycled below; a smudge that misses a sample is a
+                    // cosmetic loss, not a reason to take the app down.
+                    done.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                });
+        }
+    }
+
+    /// Collect whichever probe has come home, averaged to one linear RGBA.
+    ///
+    /// Polls without blocking — `PollType::Poll` returns immediately whether or
+    /// not the GPU has caught up, which is the entire point.
+    pub fn take_probe(&mut self, device: &wgpu::Device) -> Option<[f32; 4]> {
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let mut out = None;
+        for slot in &mut self.probes {
+            if slot.state != ProbeState::Mapping
+                || !slot.ready.swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                continue;
+            }
+            {
+                let mapped = slot.buffer.slice(..).get_mapped_range();
+                out = Some(average_probe(&mapped));
+            }
+            slot.buffer.unmap();
+            slot.state = ProbeState::Idle;
+        }
+        out
+    }
+
+    /// Return every probe slot to service, discarding anything in flight.
+    ///
+    /// Called when a stroke ends: a sample of the *previous* stroke arriving
+    /// during the next one would smear a colour picked up somewhere else.
+    pub fn reset_probes(&mut self) {
+        for slot in &mut self.probes {
+            if slot.state == ProbeState::Mapping
+                && slot.ready.swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                slot.buffer.unmap();
+            }
+            // A slot still `Rendering` has a copy recorded against it that may
+            // not have been submitted. Leaving it there is safe: it is never
+            // mapped, and the next `submit_probes` will map and then collect it
+            // into a stroke that has already been told to ignore stale samples.
+            if slot.state != ProbeState::Rendering {
+                slot.state = ProbeState::Idle;
+            }
+        }
+    }
+
     /// Read a rectangle of one layer back to the CPU, for the undo stack.
     ///
     /// This blocks until the GPU catches up. That is acceptable because it runs
@@ -1313,6 +1762,23 @@ fn make_dab_bind_group(
     })
 }
 
+fn make_stroke_color_texture(device: &wgpu::Device, size: UVec2) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("umber-stroke-colour"),
+        size: wgpu::Extent3d {
+            width: size.x.max(1),
+            height: size.y.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: STROKE_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
+}
+
 fn make_composite_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1320,6 +1786,7 @@ fn make_composite_bind_group(
     layers: &wgpu::TextureView,
     stroke: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    stroke_color: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("composite-bg"),
@@ -1340,6 +1807,42 @@ fn make_composite_bind_group(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(stroke_color),
+            },
+        ],
+    })
+}
+
+fn make_commit_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    stroke: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    stroke_color: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("commit-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(stroke),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(stroke_color),
             },
         ],
     })

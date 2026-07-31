@@ -29,6 +29,8 @@
 //! | `dabs_per_actual_radius`, `dabs_per_basic_radius` | `spacing` | |
 //! | `eraser` | `mode` | |
 //! | `slow_tracking` | `stabilization` | ordering preserved, feel differs |
+//! | `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius` | the sample lags a frame or two |
+//! | `dabs_per_second` | `dabs_per_second` | direct |
 //!
 //! Dropped, and where that shows:
 //!
@@ -38,16 +40,12 @@
 //!   about a quarter of the MyPaint set is elliptical.
 //! - **`offset_by_random`, `radius_by_random`, `offset_by_speed`** — no scatter
 //!   or jitter, so spray, splatter and "bulk" brushes come out as smooth lines.
-//! - **`smudge`, `smudge_length`, `smudge_radius_log`** — Umber's dab pass
-//!   writes coverage into a scratch texture and never reads the layer, so a
-//!   brush cannot pick colour up off the canvas. A smudge brush imported here
-//!   would paint solid colour instead of blending, which is why the library
-//!   generator refuses to ship them.
-//! - **`colorize`, `lock_alpha`, `change_color_*`** — no per-dab colour
-//!   modulation; the stroke is one colour by construction (the scratch texture
-//!   is `R8Unorm` coverage, which is a deliberate 4× bandwidth saving).
-//! - **`dabs_per_second`** — Umber's dab loop is driven by distance, so a brush
-//!   that keeps depositing paint while the pen is stationary has no equivalent.
+//! - **`colorize`, `change_color_*`** — the dab pass modulates a colour, it does
+//!   not recolour what is under it, so a brush that shifts the hue of the paint
+//!   beneath has no equivalent.
+//! - **`lock_alpha`** — painting only where the layer already has coverage
+//!   needs the layer read at composite time as a mask; the stroke scratch has
+//!   no channel for it.
 //! - **`opaque_linearize`** — MyPaint uses it to compensate for dabs
 //!   compounding as they overlap. Umber's wet layer takes a `max` of coverage,
 //!   so there is nothing to compensate for.
@@ -160,8 +158,7 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // Umber has a single spacing expressed as a fraction of the diameter, so
     // the two terms are added as though the radii were equal — true at full
     // pressure, and increasingly wrong at light pressure for the few brushes
-    // that use `dabs_per_basic_radius`. `dabs_per_second` has no equivalent at
-    // all and is ignored.
+    // that use `dabs_per_basic_radius`.
     let per_radius =
         file.setting("dabs_per_actual_radius").base + file.setting("dabs_per_basic_radius").base;
     let spacing = if per_radius > 0.0 {
@@ -169,6 +166,26 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     } else {
         Brush::default().spacing
     };
+
+    // `dabs_per_second` carries straight across — Umber's dab loop now has a
+    // time term of its own. A brush with *no* distance term is an airbrush and
+    // depends on this entirely; one with both gets both, as MyPaint does.
+    let dabs_per_second = file.setting("dabs_per_second").base.clamp(0.0, 300.0);
+
+    // --- smudge -------------------------------------------------------------
+    //
+    // MyPaint samples the canvas under the dab and mixes it into the colour it
+    // deposits; Umber does the same, a frame or two behind because its read is
+    // asynchronous. `smudge_radius_log` is a natural log like `radius_
+    // logarithmic`, and is a multiplier on the dab radius rather than a radius
+    // in pixels — reading it as pixels would make every blender canvas-wide.
+    let smudge = file.setting("smudge").base.clamp(0.0, 1.0);
+    let smudge_length = file.setting("smudge_length").base.clamp(0.0, 0.99);
+    let smudge_radius = file
+        .setting("smudge_radius_log")
+        .base
+        .exp()
+        .clamp(0.25, 8.0);
 
     // --- the rest -----------------------------------------------------------
     let mode = if file.setting("eraser").base >= 0.5 {
@@ -198,6 +215,10 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         opacity_curve,
         stabilization,
         mode,
+        smudge,
+        smudge_length,
+        smudge_radius,
+        dabs_per_second,
     })
 }
 
@@ -212,23 +233,15 @@ pub fn unsupported_features(json: &str) -> Result<Vec<&'static str>, PresetError
     let file: MybFile =
         serde_json::from_str(json).map_err(|e| PresetError::Malformed(None, e.to_string()))?;
     let mut reasons = Vec::new();
-    // Half a smudge still reads as a blending brush; below that the colour
-    // pickup is a texture effect rather than the point of the brush.
-    if file.setting("smudge").base >= 0.5 {
-        reasons.push("smudge");
-    }
+    // `smudge` and `dabs_per_second` used to be listed here. Both are now
+    // rendered — colour pickup through the stroke's own colour scratch, timed
+    // dabs through a time term in the dab loop — which is what let the shipped
+    // library go from 128 brushes to all 196.
     if file.setting("colorize").base >= 0.5 {
         reasons.push("colorize");
     }
     if file.setting("lock_alpha").base >= 0.5 {
         reasons.push("lock_alpha");
-    }
-    // A dab drawn only every so many milliseconds, with no distance term, would
-    // import as a solid line at Umber's default spacing.
-    let per_radius =
-        file.setting("dabs_per_actual_radius").base + file.setting("dabs_per_basic_radius").base;
-    if per_radius <= 0.0 && file.setting("dabs_per_second").base > 0.0 {
-        reasons.push("dabs_per_second only");
     }
     Ok(reasons)
 }
@@ -483,13 +496,47 @@ mod tests {
         assert!(from_myb("{}").is_err(), "a missing version is an error");
     }
 
+    /// Smudge used to be the single biggest reason a brush was refused — 67 of
+    /// the 68 the generator turned away. The engine renders it now, so the
+    /// check must *not* flag it, and the brush must arrive with the settings
+    /// that make it blend rather than with them quietly zeroed.
     #[test]
-    fn smudge_brushes_are_flagged_as_unrenderable() {
+    fn a_smudge_brush_is_imported_rather_than_refused() {
         let smudger = r#"{ "version": 3, "settings": {
             "smudge": { "base_value": 1.0, "inputs": {} },
+            "smudge_length": { "base_value": 0.4, "inputs": {} },
+            "smudge_radius_log": { "base_value": 0.0, "inputs": {} },
             "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
-        assert_eq!(unsupported_features(smudger).unwrap(), vec!["smudge"]);
+        assert!(unsupported_features(smudger).unwrap().is_empty());
+
+        let brush = from_myb(smudger).expect("a smudge brush now imports");
+        assert!(brush.smudges());
+        assert!((brush.smudge - 1.0).abs() < 1e-5);
+        assert!((brush.smudge_length - 0.4).abs() < 1e-5);
+        // exp(0) = 1: the log is a multiplier on the dab radius, not a radius.
+        assert!((brush.smudge_radius - 1.0).abs() < 1e-5);
+
         assert!(unsupported_features(PEN).unwrap().is_empty());
+        assert!(!from_myb(PEN).unwrap().smudges(), "a pen does not blend");
+    }
+
+    /// The other refusal: an airbrush states its rate in dabs per *second* and
+    /// gives no distance term at all, so before the dab loop had a clock these
+    /// imported as a single mark.
+    #[test]
+    fn a_timed_brush_keeps_its_rate() {
+        let airbrush = r#"{ "version": 3, "settings": {
+            "dabs_per_second": { "base_value": 80.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        assert!(unsupported_features(airbrush).unwrap().is_empty());
+
+        let brush = from_myb(airbrush).expect("an airbrush now imports");
+        assert!(brush.is_timed());
+        assert!((brush.dabs_per_second - 80.0).abs() < 1e-5);
+        assert!(
+            !from_myb(PEN).unwrap().is_timed(),
+            "a pen is distance-driven"
+        );
     }
 
     #[test]

@@ -25,6 +25,9 @@ struct Instance {
     @location(1) radius: f32,
     @location(2) hardness: f32,
     @location(3) coverage: f32,
+    // Linear RGB this dab deposits. Read only by `fs_colored`; an ordinary
+    // stroke leaves it equal to the stroke colour and never looks at it.
+    @location(4) color: vec3<f32>,
 };
 
 struct VsOut {
@@ -34,6 +37,7 @@ struct VsOut {
     @location(1) hardness: f32,
     @location(2) coverage: f32,
     @location(3) radius: f32,
+    @location(4) color: vec3<f32>,
 };
 
 @vertex
@@ -59,11 +63,16 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.hardness = inst.hardness;
     out.coverage = inst.coverage;
     out.radius = inst.radius;
+    out.color = inst.color;
     return out;
 }
 
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
+// Coverage of one dab at this fragment, before the stroke's own opacity.
+//
+// Shared by both fragment entry points so the two pipelines cannot drift into
+// stamping different shapes — the tipped/round choice and the antialiasing
+// margin are exactly the sort of thing that gets fixed in one copy only.
+fn dab_coverage(in: VsOut) -> f32 {
     // Sampled unconditionally rather than inside the `use_tip` branch.
     // `textureSample` may not appear in non-uniform control flow, and hoisting
     // it out is cheaper than arguing with the uniformity analysis about a flag
@@ -87,7 +96,38 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // The tip *modulates coverage*; it does not composite. The blend state is
     // still `max`, so a tipped stroke saturates at 1.0 under overlap exactly as
     // a round one does — see the wet-layer section of CLAUDE.md.
-    let cov = select(round, masked, u.use_tip != 0u);
+    return select(round, masked, u.use_tip != 0u) * in.coverage;
+}
 
-    return vec4<f32>(cov * in.coverage, 0.0, 0.0, 1.0);
+// The ordinary path: coverage only, one attachment, one colour for the whole
+// stroke applied later at composite and commit.
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(dab_coverage(in), 0.0, 0.0, 1.0);
+}
+
+struct ColoredOut {
+    @location(0) coverage: vec4<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+// The smudging path: coverage as above, plus the colour this particular dab
+// deposits.
+//
+// The two attachments blend *differently*, which is the whole point. Coverage
+// still takes a `max`, so a smudging stroke crossing itself is no more opaque
+// than one that does not — the wet-layer guarantee is untouched. Colour is
+// premultiplied `over`, so it tends towards the most recent dabs and a smear
+// trails along the stroke the way paint does.
+//
+// A `max` on colour would be meaningless (it would take the brightest channel
+// wherever the stroke overlapped) and an average over the whole stroke would
+// smear the first colour picked up all the way to the end.
+@fragment
+fn fs_colored(in: VsOut) -> ColoredOut {
+    let cov = dab_coverage(in);
+    var out: ColoredOut;
+    out.coverage = vec4<f32>(cov, 0.0, 0.0, 1.0);
+    out.color = vec4<f32>(in.color * cov, cov);
+    return out;
 }

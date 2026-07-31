@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch};
-use umber_render::{CanvasRenderer, CompositeParams, Gpu};
+use umber_render::{CanvasRenderer, CompositeParams, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -116,8 +116,14 @@ impl UmberApp {
         }
 
         let bounds = self.editor.stroke.bounds();
+        let coloured = self.editor.stroke.is_coloured();
         self.editor.stroke.end();
         self.editor.interaction = Interaction::Idle;
+
+        // Any smudge sample still in flight belongs to the stroke that is
+        // ending. Letting one arrive during the next stroke would smear it with
+        // a colour picked up somewhere else entirely.
+        canvas.reset_probes();
 
         let mut enc = gfx
             .gpu
@@ -135,7 +141,7 @@ impl UmberApp {
         let tail: Vec<Dab> = self.editor.stroke.drain_pending().collect();
         if !tail.is_empty() {
             canvas.begin_frame();
-            canvas.draw_dabs(&gfx.gpu.queue, &mut enc, &tail);
+            canvas.draw_dabs(&gfx.gpu.device, &gfx.gpu.queue, &mut enc, &tail, coloured);
         }
 
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
@@ -175,7 +181,7 @@ impl UmberApp {
     fn cancel_stroke(&mut self) {
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
             return;
         };
         if !self.editor.stroke.is_active() {
@@ -185,6 +191,7 @@ impl UmberApp {
         // Unlike a normal finish, these are dropped rather than flushed — the
         // whole point is that nothing from this gesture reaches the canvas.
         self.editor.stroke.clear_pending();
+        canvas.reset_probes();
         self.editor.interaction = Interaction::Idle;
 
         let mut enc = gfx
@@ -521,12 +528,40 @@ impl UmberApp {
             return;
         };
         canvas.begin_frame();
+        let coloured = self.editor.stroke.is_coloured();
         if self.editor.stroke.pending_len() > 0 {
             let dabs: Vec<_> = self.editor.stroke.drain_pending().collect();
-            canvas.draw_dabs(&gfx.gpu.queue, &mut encoder, &dabs);
+            canvas.draw_dabs(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                &mut encoder,
+                &dabs,
+                coloured,
+            );
         }
 
         let layer_draws = self.editor.layer_draws();
+
+        // A smudging brush needs to know what it is passing over. The read is
+        // asynchronous: this records a sample and collects whichever earlier one
+        // has come home, so no frame ever waits on the GPU. The probe is taken
+        // *after* this frame's dabs so a brush scrubbed back and forth picks up
+        // its own wet paint, and before the screen composite so the two share
+        // the encoder.
+        if let Some((point, radius)) = self.editor.stroke.probe() {
+            canvas.probe_canvas(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                &mut encoder,
+                &ProbeParams {
+                    layers: &layer_draws,
+                    active_index: self.editor.layers.active_index() as u32,
+                    stroke: self.editor.stroke_style,
+                    doc_point: point,
+                    radius,
+                },
+            );
+        }
         canvas.composite(
             &gfx.gpu.queue,
             &mut encoder,
@@ -586,6 +621,16 @@ impl UmberApp {
 
         gfx.gpu.queue.submit(Some(encoder.finish()));
         surface_texture.present();
+
+        // The probe's copy is only submitted now, so mapping it has to wait
+        // until here. Collecting is a non-blocking poll: whatever came home
+        // feeds the stroke, and whatever did not is picked up next frame.
+        if coloured && let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id()) {
+            canvas.submit_probes();
+            if let Some(sample) = canvas.take_probe(&gfx.gpu.device) {
+                self.editor.stroke.absorb(sample);
+            }
+        }
 
         // Keep the frames coming while a stroke is live; otherwise the app
         // goes back to sleep until the next input event.
