@@ -840,14 +840,14 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                     .color(p.text_dim),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if edit_bar_link(ui, p, p.text, "Back to painting")
+                    if edit_bar_link(ui, p.text, "Back to painting")
                         .on_hover_text("Leave layout edit mode")
                         .clicked()
                     {
                         ed.layout.set_edit_mode(false);
                     }
                     ui.add_space(12.0);
-                    if edit_bar_link(ui, p, p.text_dim, "Reset layout")
+                    if edit_bar_link(ui, p.text_dim, "Reset layout")
                         .on_hover_text("Put every panel back where it started")
                         .clicked()
                     {
@@ -858,7 +858,7 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         });
 }
 
-fn edit_bar_link(ui: &mut Ui, _p: &Palette, colour: egui::Color32, label: &str) -> egui::Response {
+fn edit_bar_link(ui: &mut Ui, colour: egui::Color32, label: &str) -> egui::Response {
     ui.add(
         egui::Label::new(egui::RichText::new(label).size(text::TINY).color(colour))
             .sense(Sense::click()),

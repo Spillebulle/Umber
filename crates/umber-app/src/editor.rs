@@ -224,9 +224,34 @@ impl Editor {
     ///
     /// `screen` is in physical pixels; the layout works in egui points.
     pub fn layout_owns_pointer(&self, screen: Vec2) -> bool {
+        self.layout.blocks_canvas(self.to_points(screen))
+    }
+
+    /// Physical window pixels to egui points.
+    pub fn to_points(&self, screen: Vec2) -> egui::Pos2 {
         let scale = self.pixels_per_point.max(1e-3);
-        self.layout
-            .blocks_canvas(egui::pos2(screen.x / scale, screen.y / scale))
+        egui::pos2(screen.x / scale, screen.y / scale)
+    }
+
+    /// True when a press at `screen` (physical pixels) belongs to the document.
+    ///
+    /// Derived from the canvas region itself rather than asked of egui.
+    /// `Context::is_pointer_over_egui` cannot answer it: since egui 0.35's
+    /// `CentralPanel` consumes the root `Ui`'s cursor, the "unused" rect it
+    /// tests against is empty by the end of the pass, so it reports the pointer
+    /// as over egui *everywhere* — including the middle of the canvas. That in
+    /// turn makes `egui_wants_pointer_input()` true on every fresh press, which
+    /// swallowed the press that starts a stroke.
+    ///
+    /// `canvas_pivot` and `canvas_size` are the same numbers the composite pass
+    /// is given, so this test and where the dab lands cannot drift apart.
+    pub fn pointer_over_canvas(&self, screen: Vec2) -> bool {
+        let half = self.canvas_size * 0.5;
+        let min = self.canvas_pivot - half;
+        let max = self.canvas_pivot + half;
+        let inside =
+            screen.x >= min.x && screen.x <= max.x && screen.y >= min.y && screen.y <= max.y;
+        inside && !self.layout_owns_pointer(screen)
     }
 
     /// Select a tool, keeping the brush's paint/erase mode in step.
