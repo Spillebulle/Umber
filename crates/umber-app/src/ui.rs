@@ -542,6 +542,10 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 BrushTab::Tip => brush_editor_tip(ui, p, ed),
                 BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
             }
+
+            // The design's footer: name what you have made, or write it back
+            // over the brush you started from.
+            crate::brushlib::save_row(ui, p, ed);
         });
 
     // Clicking the backdrop or pressing Escape dismisses it.

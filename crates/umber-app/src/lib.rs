@@ -5,6 +5,7 @@
 //! and the iOS host can all drive the same code.
 
 mod app;
+mod brushlib;
 mod colorpicker;
 mod controls;
 mod cputext;

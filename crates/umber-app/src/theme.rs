@@ -268,6 +268,11 @@ pub mod metrics {
     pub const SLIDER_ROW: f32 = 16.0;
     pub const SLIDER_RAIL: f32 = 3.0;
     pub const SLIDER_KNOB: f32 = 11.0;
+    /// A brush in the Brushes panel: sample and name on one line.
+    pub const BRUSH_ROW: f32 = 26.0;
+    /// A brush in the library browser, where a second line carries the
+    /// attribution the shipped presets come with.
+    pub const BRUSH_ROW_DETAIL: f32 = 40.0;
 }
 
 /// Install Archivo, the typeface the design specifies.

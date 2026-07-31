@@ -12,6 +12,7 @@
 //! [`egui::Panel`] — an Area does not claim space, so the canvas region, and
 //! therefore the camera pivot, is unaffected by a panel hovering over it.
 
+use crate::brushlib;
 use crate::colorpicker::{self, PickerMode};
 use crate::dock::{DropTarget, Floating, Geometry, HEADER, PanelKind, Side, limits};
 use crate::editor::Editor;
@@ -63,6 +64,11 @@ pub fn sidebars(
             .frame(frame)
             .show(root, |ui| sidebar(ui, p, ed, actions, side, geo));
     }
+
+    // The library's browser and its dialogs. Drawn here rather than from inside
+    // the Brushes panel, which the layout is free to hide — a modal that goes
+    // with its panel cannot be shut and cannot be reopened.
+    brushlib::dialogs(root, p, ed);
 }
 
 fn sidebar(
@@ -392,6 +398,9 @@ fn panel(
             if kind == PanelKind::Colour {
                 picker_mode_switch(ui, p, ed);
             }
+            if kind == PanelKind::Brushes {
+                brushlib::header_controls(ui, p, ed);
+            }
         },
     );
 
@@ -416,7 +425,7 @@ fn panel(
                 .auto_shrink([false, false])
                 .show(ui, |ui| match kind {
                     PanelKind::Colour => colour_body(ui, p, ed),
-                    PanelKind::Brushes => brushes_body(ui, p, ed),
+                    PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
                 });
         },
@@ -589,28 +598,6 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                 .color(p.text),
         );
     });
-}
-
-fn brushes_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
-    let mut pick = None;
-    for (index, preset) in ed.presets.iter().enumerate() {
-        let selected = ed.active_preset == Some(index);
-        if widgets::brush_preset_row(
-            ui,
-            p,
-            &preset.name,
-            preset.brush.opacity,
-            preset.brush.hardness,
-            selected,
-        )
-        .clicked()
-        {
-            pick = Some(index);
-        }
-    }
-    if let Some(index) = pick {
-        ed.apply_preset(index);
-    }
 }
 
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
