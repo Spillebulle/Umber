@@ -7,8 +7,9 @@ decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
 > **Status: early.** The canvas, brush, eraser, layers, colour picker, brush
-> editor and PNG export work on desktop. There is no document format and no
-> mobile packaging yet. See [Roadmap](#roadmap).
+> editor, settings and PNG export work on desktop. Preferences — theme,
+> layout, input and shortcut bindings — persist across runs. There is no
+> document format and no mobile packaging yet. See [Roadmap](#roadmap).
 
 ## Building
 
@@ -62,6 +63,43 @@ neutrals) — under *View*. Colours, type scale and metrics live in
 `crates/umber-app/src/theme.rs`; nothing else hard-codes a colour, so a third
 theme is a table of values.
 
+### Settings
+
+The settings dialog follows the design's shape: a left rail of six panes with
+one open at a time. Four are live — **General** (interface scale), **Pressure**
+(where pressure comes from and how the speed-derived model responds),
+**Themes** and **Shortcuts**. **Input & pen** and **Performance** are in the
+design but have nothing behind them, so they are shown greyed with a tooltip
+saying why rather than opening onto controls that do nothing. The same applies
+inside the panes: the design's "New theme" card, its theme editor's Save and
+Export, the shortcut Import and Export, and the four-way accent choice are all
+drawn dead, because themes are a compiled table of values and there is no theme
+or keymap file format yet. The theme editor's colour rows *are* real — they read
+the palette in use.
+
+**Shortcuts** lists every command, with a search field, and lets you rebind:
+click a key to listen for a new one, press Escape to cancel, add a second key
+for the same command, clear one, or put a command — or the whole table — back to
+its defaults. While a field is listening, key dispatch to the canvas is
+suspended, so pressing `B` to bind it does not also select the brush.
+
+Every shortcut is a chord matched *exactly*, so plain `Z` (zoom tool) and
+`Ctrl` + `Z` (undo) are different bindings rather than one shadowing the other.
+Giving a chord to a second command does not quietly take it off the first:
+following the design, the clash is allowed and then flagged on both rows —
+*flagged, never silently dropped* — leaving you to settle it. `Space` and
+`Escape` cannot be bound; `Space` pans while you draw and `Escape` is what
+cancels a rebind, and a capture field you cannot escape from is a trap.
+
+Settings persist across runs in a plain `key = value` file in the platform
+configuration directory — `%APPDATA%\Umber\config`, `~/.config/umber`,
+`~/Library/Application Support/Umber`; the dialog shows the exact path. Only
+settings that differ from the defaults are written, so a later change to a
+default still reaches you. A missing, older or corrupt file can never stop the
+app starting: every line is parsed independently and anything unreadable falls
+back to its default. Writes happen on a background thread once you stop
+dragging, so no frame ever waits on a disk.
+
 The design's sliders, pill toggles, segmented pickers, tool icons and brush
 previews are painted directly (`widgets.rs`, `colorpicker.rs`) rather than
 restyled out of egui's stock widgets, which have a look of their own that
@@ -74,8 +112,6 @@ Taken from the design but not implemented, roughly by size:
 - **Layout edit mode** — dragging panels out to float, dock zones, tear-off and
   re-docking, drag-to-reorder tools. This is the design's "advanced endgame"
   and is a large project in an immediate-mode UI.
-- **Rebinding** shortcuts. The settings dialog lists them; editing them does
-  not work yet.
 - The brush editor's **Texture** tab. Tip and Dynamics are built.
 - A document format. PNG export works; there is no way to save and reopen a
   layered document.
@@ -108,6 +144,10 @@ them at a different weight and size on each OS.
 | `Ctrl` + `0` / `1` | Fit to window / 100% |
 | `Ctrl` + `Z`, `Ctrl` + `Shift` + `Z` | Undo / redo |
 | Two-finger drag (touch) | Pan and pinch-zoom |
+
+Every row above except the held modifiers — `Space`, `Alt` and the mouse
+gestures — is rebindable in the Shortcuts tab of the settings dialog. On macOS
+`Ctrl` in this table is `Cmd`, and the dialog names it that way.
 
 ## Architecture
 
