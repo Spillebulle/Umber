@@ -19,6 +19,7 @@ use crate::dock::Side;
 use crate::editor::{BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
+use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
@@ -37,6 +38,13 @@ pub struct UiActions {
     pub delete_layer: Option<usize>,
     pub move_layer_up: Option<usize>,
     pub move_layer_down: Option<usize>,
+    /// Make this document active. Every document has GPU storage of its own,
+    /// so the switch is the caller's to carry out.
+    pub pick_tab: Option<usize>,
+    /// Close this document, having already been confirmed if it holds work.
+    pub close_tab: Option<usize>,
+    pub new_document: bool,
+    pub open_file: bool,
 }
 
 pub struct UiOutput {
@@ -61,6 +69,20 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .exact_size(metrics::MENU_BAR)
         .frame(chrome.inner_margin(Margin::symmetric(12, 0)))
         .show(root, |ui| menu_bar(ui, &p, ed, &mut actions));
+
+    // Between the menu bar and the tool options, where the design draws it.
+    // It takes its 30 points out of the window like any other panel, so the
+    // canvas region — and with it the camera pivot every dab is placed against
+    // — shrinks to match without anything here having to say so.
+    let tab_strip = Frame {
+        fill: p.dock,
+        ..Default::default()
+    };
+    let mut tab_actions = tabs::TabActions::default();
+    egui::Panel::top("doc-tabs")
+        .exact_size(tabs::STRIP)
+        .frame(tab_strip)
+        .show(root, |ui| tab_actions = tabs::strip(ui, &p, ed));
 
     egui::Panel::top("options-strip")
         .exact_size(metrics::OPTIONS_STRIP)
@@ -95,8 +117,33 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
 
     panels::sidebars(root, &p, ed, &mut actions, &geo);
 
+    // The strip only reports; acting on it is the caller's, because every
+    // document owns GPU storage that has to be created, switched or freed.
+    actions.pick_tab = tab_actions.pick;
+    actions.new_document |= tab_actions.new_document;
+    if let Some(index) = tab_actions.close {
+        if ed.session.tabs().get(index).is_some_and(|tab| tab.modified) {
+            // Show the document before asking about it: a prompt that offers to
+            // export a canvas you cannot see is asking about the wrong one.
+            actions.pick_tab = Some(index);
+            ed.ui.close_prompt = Some(index);
+        } else {
+            actions.close_tab = Some(index);
+        }
+    }
+
     brush_editor(root, &p, ed);
     crate::settings::show(root, &p, ed);
+
+    match tabs::close_prompt(root, &p, ed) {
+        Some(tabs::CloseChoice::Close) => actions.close_tab = ed.ui.close_prompt.take(),
+        // Export is the one thing that can preserve the work, so the prompt
+        // stays open behind it — exporting is not itself an answer to
+        // "close this?".
+        Some(tabs::CloseChoice::Export) => actions.export = true,
+        Some(tabs::CloseChoice::Cancel) | None => {}
+    }
+    tabs::notice(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
     // beneath egui, so this panel only reports its rect and stays transparent.
@@ -133,22 +180,45 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
 
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("New").clicked() {
+                    actions.new_document = true;
+                    ui.close();
+                }
+                if ui.button("Open…").clicked() {
+                    actions.open_file = true;
+                    ui.close();
+                }
+                // Only offered while there is another document to fall back to;
+                // Umber has nowhere to go with nothing open.
+                if ui
+                    .add_enabled(ed.session.len() > 1, egui::Button::new("Close document"))
+                    .clicked()
+                {
+                    let index = ed.session.active_index();
+                    if ed.session.active_tab().modified {
+                        ed.ui.close_prompt = Some(index);
+                    } else {
+                        actions.close_tab = Some(index);
+                    }
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Clear layer").clicked() {
                     actions.clear = true;
                     ui.close();
                 }
-                if ui.button("Export PNG…").clicked() {
+                if ui.button("Export flat PNG…").clicked() {
                     actions.export = true;
                     ui.close();
                 }
                 ui.separator();
-                // Shown but inert: a document format does not exist yet, and a
-                // menu that lies about what the app can do is worse than one
-                // that admits the gap.
-                ui.add_enabled(false, egui::Button::new("Open…"))
-                    .on_disabled_hover_text("Umber has no document format yet");
+                // Shown but inert: reading other applications' files works, but
+                // Umber has no format of its own to write, and a Save that
+                // cannot save would be worse than the gap it papers over.
                 ui.add_enabled(false, egui::Button::new("Save"))
-                    .on_disabled_hover_text("Umber has no document format yet");
+                    .on_disabled_hover_text(
+                        "Umber has no document format yet — export a flat PNG instead",
+                    );
             });
 
             ui.menu_button("Edit", |ui| {
@@ -202,7 +272,12 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         ui.painter().text(
             bar.center(),
             Align2::CENTER_CENTER,
-            format!("untitled — {} × {}", ed.doc.size.x, ed.doc.size.y),
+            format!(
+                "{} — {} × {}",
+                ed.session.active_title(),
+                ed.doc.size.x,
+                ed.doc.size.y
+            ),
             FontId::proportional(text::CONTROL),
             p.text_dim,
         );
@@ -430,10 +505,17 @@ fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
                 .color(p.accent),
             );
         } else {
+            // The document is named rather than saved: there is no file behind
+            // it, so the line says what it is instead of pretending a path.
+            let tab = ed.session.active_tab();
             ui.label(
-                egui::RichText::new("untitled.umber · panels locked — Window, Customise layout")
-                    .size(text::TINY)
-                    .color(p.text_dim),
+                egui::RichText::new(format!(
+                    "{}{} · panels locked — Window, Customise layout",
+                    tab.title,
+                    if tab.modified { " · unsaved" } else { "" },
+                ))
+                .size(text::TINY)
+                .color(p.text_dim),
             );
         }
 
