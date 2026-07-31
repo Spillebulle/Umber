@@ -32,6 +32,19 @@ pollster = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# Document import (umber-core::docimport). All four are pure Rust with no C
+# build step, which keeps `cargo test -p umber-core` the instant feedback loop
+# it is meant to be — and keeps a mobile cross-build plausible.
+#
+# `zip` carries a compressor and a dozen codecs by default; ORA and KRA only
+# ever use Store and Deflate, so everything else is switched off. `deflate-flate2`
+# rather than the `deflate` meta-feature: the latter also pulls in zopfli, a
+# *compressor* we would never call.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+png = "0.18"
+quick-xml = "0.41"
+psd = "0.3.5"
+
 # Debug builds keep our own crates cheap to recompile, but dependencies
 # (wgpu, naga, egui) are built optimised — an unoptimised wgpu makes the
 # canvas unusable to test against.
