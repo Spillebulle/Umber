@@ -2506,6 +2506,7 @@ name = "umber-app"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "directories",
  "egui",
  "egui-wgpu",
  "egui-winit",

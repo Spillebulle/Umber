@@ -6,8 +6,10 @@
 
 mod app;
 mod colorpicker;
+mod controls;
 mod editor;
 mod icons;
+mod prefs;
 mod settings;
 mod shortcuts;
 mod theme;
