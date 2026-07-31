@@ -1,0 +1,10 @@
+# Shell scripts must keep LF even when checked out on Windows: tools/*.sh is run
+# by sh/bash, and a CRLF shebang line makes the interpreter fail to start.
+*.sh text eol=lf
+
+# Brush and document fixtures are binary; never let autocrlf touch them.
+*.gbr binary
+*.myb text
+*.ora binary
+*.kra binary
+*.psd binary
