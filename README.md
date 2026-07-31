@@ -49,9 +49,38 @@ sudo pacman -S wayland libxkbcommon libx11 libxrandr libxi vulkan-icd-loader
 ## Interface
 
 The workspace follows the **Umber app** screen of the design project: a menu
-bar, a tool options strip, a two-column tool rail, the canvas, and a docked
-column of stacked panels (Colour, Brushes, Layers). The whole layout mirrors
-for left-handed use, so the rail sits under the drawing hand.
+bar, a tool options strip, a two-column tool rail, the canvas, and stacked
+modules (Colour, Brushes, Layers) in a sidebar.
+
+### Layout edit mode
+
+Panels are locked while you paint, and rearranged in a mode of their own —
+**Window → Customise layout**, as the design has it. The canvas is paused for
+as long as the mode is on, which is both what the design says and the reason a
+panel dragged across the canvas cannot leave a stroke behind it.
+
+In that mode every module is draggable by its header. Drop it in either sidebar
+to dock it — a dashed *dock here* block shows where it will land, and a module
+dropped between two others is inserted there. Drop it over the canvas and it
+becomes a floating window that **hovers**: it takes no space from the document,
+so moving one never shifts where a stroke lands. The tool rail is draggable by
+its own grip and snaps to whichever side of the window you release it on.
+`Esc` during a drag puts the module back where it came from.
+
+Sizes are draggable at any time: the boundary between two stacked modules, a
+sidebar's inner edge, and a floating module's bottom-right corner. Everything
+has a minimum, so a module cannot be squashed out of existence.
+
+Modules are hidden by the close mark in their header and brought back from
+**Window → Panels**, which also has **Reset layout**. The arrangement is saved
+between runs (`%APPDATA%\Umber\layout.conf` on Windows,
+`~/.config/umber/layout.conf` on Linux, `~/Library/Application Support/Umber/`
+on macOS); an unreadable file is ignored rather than being an error, and one
+written by a future version is refused rather than misread.
+
+There used to be a global left-handed flag that mirrored the whole workspace.
+It is gone. With every part of the workspace going where you put it — the tool
+rail included — a handedness switch is a worse version of the same feature.
 
 The Colour panel implements three of the design's five picker modes — a hue
 ring with a switchable triangle or square centre, a saturation/value square
@@ -71,9 +100,9 @@ fights the design.
 
 Taken from the design but not implemented, roughly by size:
 
-- **Layout edit mode** — dragging panels out to float, dock zones, tear-off and
-  re-docking, drag-to-reorder tools. This is the design's "advanced endgame"
-  and is a large project in an immediate-mode UI.
+- **Drag-to-reorder tools** in the rail, and **saved workspaces**: the two
+  parts of the design's layout edit mode still outstanding. The rest of it is
+  built — see [Layout edit mode](#layout-edit-mode).
 - **Rebinding** shortcuts. The settings dialog lists them; editing them does
   not work yet.
 - The brush editor's **Texture** tab. Tip and Dynamics are built.
@@ -108,6 +137,8 @@ them at a different weight and size on each OS.
 | `Ctrl` + `0` / `1` | Fit to window / 100% |
 | `Ctrl` + `Z`, `Ctrl` + `Shift` + `Z` | Undo / redo |
 | Two-finger drag (touch) | Pan and pinch-zoom |
+| Drag a panel header (layout edit mode) | Move that module to a sidebar, or over the canvas |
+| `Esc` while dragging | Put the module back where it came from |
 
 ## Architecture
 

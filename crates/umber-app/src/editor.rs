@@ -1,6 +1,7 @@
 //! Editor state — everything that is not a GPU resource or a window.
 
 use crate::colorpicker::{PickerMode, WheelShape};
+use crate::dock::Layout;
 use crate::settings::SettingsTab;
 use crate::theme::ThemeKind;
 use glam::Vec2;
@@ -43,8 +44,6 @@ impl Tool {
 #[derive(Clone, Copy, Debug)]
 pub struct UiState {
     pub theme: ThemeKind,
-    /// Mirrors the workspace so the tool rail sits under the drawing hand.
-    pub left_handed: bool,
     pub pressure_open: bool,
     pub tool: Tool,
     pub picker: PickerMode,
@@ -68,7 +67,6 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             theme: ThemeKind::Graphite,
-            left_handed: false,
             pressure_open: true,
             tool: Tool::Brush,
             picker: PickerMode::Wheel,
@@ -96,11 +94,22 @@ pub struct Editor {
     pub active_preset: Option<usize>,
     pub layers: LayerStack,
     pub ui: UiState,
+    /// Where the dockable modules are. Kept out of [`UiState`] so that stays
+    /// `Copy`; it also has its own lifetime, being loaded from and saved to a
+    /// config file rather than living only for the session.
+    pub layout: Layout,
     /// Centre of the region the document is drawn in, in physical pixels.
-    /// Panels take a bite out of the window, so this is not the window centre.
+    ///
+    /// *Docked* panels take a bite out of the window, so this is not the window
+    /// centre. Floating panels deliberately do not: they hover over the canvas,
+    /// so moving one must not shift where a dab lands.
     pub canvas_pivot: Vec2,
     /// Size of that region, for fit-to-view.
     pub canvas_size: Vec2,
+    /// egui points per physical pixel, from the last frame. Window events
+    /// arrive in physical pixels and the layout works in points, so hit-testing
+    /// a cursor position against a floating panel needs the conversion.
+    pub pixels_per_point: f32,
 
     pub stroke: StrokeBuilder,
     pub history: History,
@@ -153,8 +162,12 @@ impl Default for Editor {
             active_preset: None,
             layers: LayerStack::new(),
             ui: UiState::default(),
+            // Read here rather than in `app.rs` so the window-creation path,
+            // which several things already contend over, stays untouched.
+            layout: Layout::load_or_default(),
             canvas_pivot: Vec2::ZERO,
             canvas_size: Vec2::ONE,
+            pixels_per_point: 1.0,
             stroke: StrokeBuilder::new(),
             history: History::default(),
             pressure: PressureModel::default(),
@@ -198,6 +211,22 @@ impl Editor {
         let pressure = self.pressure.resolve(reported, distance, dt);
 
         InputPoint::new(doc, pressure, now)
+    }
+
+    /// True when the layout, rather than the canvas, owns the pointer.
+    ///
+    /// Docked panels are egui panels, so egui's own "is the pointer over me"
+    /// answers for them. Floating panels and a panel being dragged are not
+    /// covered reliably enough: an [`egui::Area`] is only known to egui's hit
+    /// testing at the position it had *last* frame, and a drag over open canvas
+    /// is over no widget at all. Getting this wrong means a panel dragged
+    /// across the canvas paints a stroke underneath itself.
+    ///
+    /// `screen` is in physical pixels; the layout works in egui points.
+    pub fn layout_owns_pointer(&self, screen: Vec2) -> bool {
+        let scale = self.pixels_per_point.max(1e-3);
+        self.layout
+            .blocks_canvas(egui::pos2(screen.x / scale, screen.y / scale))
     }
 
     /// Select a tool, keeping the brush's paint/erase mode in step.

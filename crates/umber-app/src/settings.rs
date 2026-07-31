@@ -105,20 +105,17 @@ fn themes_tab(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             .color(p.text_dim),
     );
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Left-handed layout")
-                .size(text::SMALL)
-                .color(p.text),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            widgets::toggle(ui, p, &mut ed.ui.left_handed);
-        });
-    });
+    // The left-handed mirror that used to live here is gone. Every part of the
+    // workspace, the tool rail included, now moves by being dragged in layout
+    // edit mode, so a global handedness flag has nothing left to do.
     ui.label(
-        egui::RichText::new("Puts the tool rail under your drawing hand.")
-            .size(10.0)
-            .color(p.text_dim),
+        egui::RichText::new(
+            "Panels, sidebars and the tool rail are arranged by dragging them. \
+             Turn on Window, Customise layout to move them; the same menu resets \
+             the layout if it goes wrong.",
+        )
+        .size(10.0)
+        .color(p.text_dim),
     );
 }
 

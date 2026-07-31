@@ -396,6 +396,7 @@ impl UmberApp {
             .handle_platform_output(&gfx.window, platform_output);
 
         // egui works in points; the canvas works in physical pixels.
+        self.editor.pixels_per_point = pixels_per_point;
         self.editor.canvas_pivot = Vec2::new(
             canvas_rect.center().x * pixels_per_point,
             canvas_rect.center().y * pixels_per_point,
@@ -631,7 +632,16 @@ impl ApplicationHandler for UmberApp {
         if response.repaint {
             gfx.window.request_redraw();
         }
-        let ui_has_pointer = response.consumed || gfx.egui_ctx.egui_wants_pointer_input();
+        // `egui_wants_pointer_input` answers for the docked chrome, but it is
+        // deliberately false while a button is held so a drag that began on the
+        // canvas keeps working. That is wrong for the layout: a panel dragged
+        // across the canvas would otherwise paint a stroke underneath itself,
+        // and a floating panel sits over the canvas rather than beside it.
+        // `layout_owns_pointer` covers both cases from rects we own.
+        let ui_has_pointer = response.consumed
+            || gfx.egui_ctx.egui_wants_pointer_input()
+            || gfx.egui_ctx.is_pointer_over_egui()
+            || self.editor.layout_owns_pointer(self.editor.cursor);
         let pivot = self.editor.canvas_pivot;
 
         match event {

@@ -1,22 +1,28 @@
 //! The Umber workspace.
 //!
 //! Layout follows the "Umber app" screen of the design project: menu bar, tool
-//! options strip, a two-column tool rail, the canvas, and a docked column of
-//! stacked panels (Colour, Brushes, Layers). The whole arrangement mirrors for
-//! left-handed use, which is why the rail and dock sides are chosen rather than
-//! fixed.
+//! options strip, a two-column tool rail, the canvas, and stacked modules
+//! (Colour, Brushes, Layers) in a sidebar.
 //!
-//! The design's layout-edit mode — dragging panels out to float or re-dock
-//! them — is not implemented. See the README for the full list of what was and
-//! was not taken.
+//! Where those modules sit is no longer fixed. They can be dragged between the
+//! two sidebars, reordered within one, torn off to float over the canvas, and
+//! closed; the sidebars and the panels within them resize. That machinery lives
+//! in [`crate::dock`] (the model) and [`crate::panels`] (the drawing) rather
+//! than here, because this file was already long enough.
+//!
+//! There used to be a global "left-handed" flag that mirrored the whole
+//! workspace. It is gone: a mirror is a worse version of "put the panels where
+//! you want them", and the tool rail keeps a side of its own for the one thing
+//! the mirror was actually for.
 
-use crate::colorpicker::{self, PickerMode};
+use crate::dock::Side;
 use crate::editor::{BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
+use crate::panels;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
-use umber_core::{BlendMode, Brush, LayerStack, ResponseCurve, input::PressureSource};
+use umber_core::{Brush, ResponseCurve, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -66,43 +72,52 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .frame(chrome.inner_margin(Margin::symmetric(12, 0)))
         .show(root, |ui| status_bar(ui, &p, ed, &mut actions));
 
-    // Mirrored layout: the rail sits on the drawing-hand side so the hand does
-    // not cover the panels it reaches past.
-    let rail_frame = chrome.inner_margin(Margin::symmetric(0, 8));
-    let dock_frame = Frame {
-        fill: p.dock,
-        ..Default::default()
-    };
+    // Only present in layout edit mode, and claimed before the workspace is
+    // measured so the sidebars sit under it rather than behind it.
+    panels::edit_bar(root, &p, ed);
 
-    if ed.ui.left_handed {
-        egui::Panel::right("tool-rail")
-            .exact_size(metrics::TOOL_RAIL)
-            .frame(rail_frame)
-            .show(root, |ui| tool_rail(ui, &p, ed));
-        egui::Panel::left("dock")
-            .exact_size(metrics::PANEL)
-            .frame(dock_frame)
-            .show(root, |ui| dock(ui, &p, ed, &mut actions));
-    } else {
-        egui::Panel::left("tool-rail")
-            .exact_size(metrics::TOOL_RAIL)
-            .frame(rail_frame)
-            .show(root, |ui| tool_rail(ui, &p, ed));
-        egui::Panel::right("dock")
-            .exact_size(metrics::PANEL)
-            .frame(dock_frame)
-            .show(root, |ui| dock(ui, &p, ed, &mut actions));
+    // Everything below the strips and above the status bar is the layout's to
+    // divide up. Measuring it here, before any of it is claimed, is what lets
+    // the dock model compute every rect up front — so the drop indicator and
+    // the panels it predicts cannot disagree.
+    let workspace = root.available_rect_before_wrap();
+    ed.layout.clamp_floating(workspace);
+    let geo = ed.layout.geometry(workspace, metrics::TOOL_RAIL);
+
+    let rail_frame = chrome.inner_margin(Margin::symmetric(0, 8));
+    match ed.layout.rail_side() {
+        Side::Left => egui::Panel::left("tool-rail"),
+        Side::Right => egui::Panel::right("tool-rail"),
     }
+    .exact_size(metrics::TOOL_RAIL)
+    .frame(rail_frame)
+    .show(root, |ui| tool_rail(ui, &p, ed));
+
+    panels::sidebars(root, &p, ed, &mut actions, &geo);
 
     brush_editor(root, &p, ed);
     crate::settings::show(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
     // beneath egui, so this panel only reports its rect and stays transparent.
+    //
+    // Floating panels are added *after* this deliberately. They are egui
+    // `Area`s, which claim no space, so the canvas rect — and therefore
+    // `Editor::canvas_pivot` and `CompositeParams::pivot` — is the same whether
+    // a panel hovers over the canvas or not. Making them panels instead would
+    // shrink this rect, move the pivot, and land every dab away from the
+    // cursor.
     let canvas_rect = egui::CentralPanel::default()
         .frame(Frame::NONE)
         .show(root, |ui| ui.max_rect())
         .inner;
+
+    panels::floats(root, &p, ed, &mut actions);
+    panels::edit_mode_outline(root, &p, ed, &geo);
+    // Last, so the drop it resolves is tested against a frame in which every
+    // panel has already had its say.
+    panels::drag_overlay(root, &p, ed, &geo);
+    ed.layout.save_if_dirty();
 
     UiOutput {
         actions,
@@ -165,19 +180,12 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
             });
 
             ui.menu_button("Window", |ui| {
-                if ui
-                    .checkbox(&mut ed.ui.left_handed, "Left-handed layout")
-                    .clicked()
-                {
-                    ui.close();
-                }
+                panels::window_menu(ui, ed);
                 ui.separator();
                 if ui.button("Settings…").clicked() {
                     ed.ui.settings_open = true;
                     ui.close();
                 }
-                ui.add_enabled(false, egui::Button::new("Customise layout…"))
-                    .on_disabled_hover_text("Panel docking is not implemented yet");
             });
 
             ui.menu_button("Help", |ui| {
@@ -289,6 +297,12 @@ fn divider(ui: &mut egui::Ui, p: &Palette) {
 }
 
 fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    // The rail moves the same way everything else does — by being dragged in
+    // layout edit mode. It deliberately has no side *setting*: a flag for
+    // "which side is the chrome on" is the left-handed mirror under another
+    // name, and that is the thing this branch removes.
+    panels::rail_grip(ui, p, ed);
+
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
 
@@ -352,219 +366,8 @@ fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
-/// The docked column: Colour, Brushes and Layers stacked.
-fn dock(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            colour_panel(ui, p, ed);
-            dock_rule(ui, p);
-            brushes_panel(ui, p, ed);
-            dock_rule(ui, p);
-            layers_panel(ui, p, ed, actions);
-        });
-}
-
-fn dock_rule(ui: &mut egui::Ui, p: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, p.border);
-}
-
-fn panel_frame() -> Frame {
-    Frame::NONE.inner_margin(Margin {
-        left: metrics::PANEL_PAD,
-        right: metrics::PANEL_PAD,
-        top: 9,
-        bottom: 10,
-    })
-}
-
-fn panel_title(ui: &mut egui::Ui, p: &Palette, title: &str) {
-    ui.label(
-        egui::RichText::new(title)
-            .size(text::SMALL)
-            .color(p.text_strong)
-            .strong(),
-    );
-}
-
-fn colour_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    panel_frame().show(ui, |ui| {
-        ui.horizontal(|ui| {
-            panel_title(ui, p, "Colour");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let response = mode_switch(ui, p, ed.ui.picker.label());
-                if response.clicked() {
-                    ed.ui.picker_menu_open = !ed.ui.picker_menu_open;
-                }
-                let popup = egui::Popup::from_response(&response)
-                    .open(ed.ui.picker_menu_open)
-                    .show(|ui| {
-                        for mode in PickerMode::ALL {
-                            if ui
-                                .selectable_label(ed.ui.picker == mode, mode.label())
-                                .clicked()
-                            {
-                                ed.ui.picker = mode;
-                                ed.ui.picker_menu_open = false;
-                            }
-                        }
-                    });
-                if popup.is_none() {
-                    ed.ui.picker_menu_open = false;
-                }
-            });
-        });
-
-        ui.add_space(6.0);
-
-        let mut shape = ed.ui.wheel_shape;
-        let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut ed.hsv);
-        ed.ui.wheel_shape = shape;
-        if changed {
-            ed.commit_picker();
-        }
-
-        ui.add_space(9.0);
-        ui.horizontal(|ui| {
-            let [r, g, b, _] = ed.color.to_srgb_u8();
-            let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-            ui.painter()
-                .rect_filled(chip, metrics::RADIUS, egui::Color32::from_rgb(r, g, b));
-            ui.label(
-                egui::RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
-                    .monospace()
-                    .size(text::TINY)
-                    .color(p.text),
-            );
-        });
-    });
-}
-
-fn brushes_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    panel_frame().show(ui, |ui| {
-        panel_title(ui, p, "Brushes");
-        ui.add_space(6.0);
-
-        let mut pick = None;
-        for (index, preset) in ed.presets.iter().enumerate() {
-            let selected = ed.active_preset == Some(index);
-            if widgets::brush_preset_row(
-                ui,
-                p,
-                preset.name,
-                preset.brush.opacity,
-                preset.brush.hardness,
-                selected,
-            )
-            .clicked()
-            {
-                pick = Some(index);
-            }
-        }
-        if let Some(index) = pick {
-            ed.apply_preset(index);
-        }
-    });
-}
-
-fn layers_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
-    panel_frame().show(ui, |ui| {
-        let count = ed.layers.len();
-        let active = ed.layers.active_index();
-
-        ui.horizontal(|ui| {
-            panel_title(ui, p, "Layers");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(
-                    ui,
-                    p,
-                    Icon::Trash,
-                    count > 1,
-                    "Delete layer — clears undo history",
-                ) {
-                    actions.delete_layer = Some(active);
-                }
-                if icon_button(ui, p, Icon::ChevronDown, active > 0, "Move layer down") {
-                    actions.move_layer_down = Some(active);
-                }
-                if icon_button(ui, p, Icon::ChevronUp, active + 1 < count, "Move layer up") {
-                    actions.move_layer_up = Some(active);
-                }
-                if icon_button(
-                    ui,
-                    p,
-                    Icon::Plus,
-                    count < LayerStack::MAX,
-                    "Add a layer above the current one",
-                ) {
-                    actions.add_layer = true;
-                }
-            });
-        });
-
-        ui.add_space(7.0);
-
-        // Blend and opacity for the selected layer, on one row.
-        ui.horizontal(|ui| {
-            let layer = ed.layers.active_mut();
-            egui::ComboBox::from_id_salt("layer-blend")
-                .selected_text(
-                    egui::RichText::new(layer.blend.label())
-                        .size(text::TINY)
-                        .color(p.text),
-                )
-                .width(80.0)
-                .show_ui(ui, |ui| {
-                    for mode in BlendMode::ALL {
-                        ui.selectable_value(&mut layer.blend, mode, mode.label());
-                    }
-                });
-            let value = layer.opacity;
-            widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
-            ui.label(
-                egui::RichText::new(format!("{:.0}", value * 100.0))
-                    .monospace()
-                    .size(10.0)
-                    .color(p.text),
-            );
-        });
-
-        ui.add_space(7.0);
-
-        // Stored bottom-first; shown top-first, the way it is drawn.
-        let mut select = None;
-        let mut toggle = None;
-        for index in (0..count).rev() {
-            let Some(layer) = ed.layers.get(index) else {
-                continue;
-            };
-            let row = widgets::layer_row(
-                ui,
-                p,
-                &layer.name,
-                layer.visible,
-                index == active,
-                layer.blend.label(),
-            );
-            if row.eye_clicked {
-                toggle = Some(index);
-            } else if row.clicked {
-                select = Some(index);
-            }
-        }
-        if let Some(index) = toggle
-            && let Some(layer) = ed.layers.get_mut(index)
-        {
-            layer.visible = !layer.visible;
-        }
-        if let Some(index) = select {
-            ed.layers.set_active(index);
-        }
-    });
-}
-
-fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
+/// A bare 18×18 icon that acts as a button. Shared with `panels.rs`.
+pub fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
     let hovered = enabled && response.hovered();
     icons::draw(
@@ -612,62 +415,29 @@ fn text_icon_link(ui: &mut egui::Ui, p: &Palette, icon: Icon, label: &str) -> eg
     response
 }
 
-/// The Colour panel's picker-type switch: a half-filled disc, the mode name,
-/// and a chevron.
-fn mode_switch(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
-    let font = FontId::proportional(9.5);
-    let text_w = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 26.0, 16.0), Sense::click());
-    let colour = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text_dim
-    };
-    let painter = ui.painter();
-    icons::draw(
-        painter,
-        Rect::from_min_size(rect.left_top(), vec2(12.0, 16.0)),
-        Icon::HalfCircle,
-        colour,
-    );
-    painter.text(
-        rect.left_center() + vec2(15.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        colour,
-    );
-    icons::draw(
-        painter,
-        Rect::from_min_size(rect.right_top() - vec2(11.0, 0.0), vec2(11.0, 16.0)),
-        Icon::ChevronDown,
-        colour,
-    );
-    response
-}
-
 fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     ui.horizontal_centered(|ui| {
-        ui.label(
-            egui::RichText::new("untitled.umber")
+        // The design swaps the whole status line while the layout is being
+        // edited. Saying so here is what makes a paused canvas legible rather
+        // than a bug.
+        if ed.layout.edit_mode() {
+            ui.label(
+                egui::RichText::new(
+                    "layout edit — nothing you draw changes; panels are the only \
+                     thing that moves",
+                )
                 .size(text::TINY)
-                .color(p.text_dim),
-        );
+                .color(p.accent),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("untitled.umber · panels locked — Window, Customise layout")
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let hand = if ed.ui.left_handed { "left" } else { "right" };
-            if text_icon_link(ui, p, Icon::Swap, hand)
-                .on_hover_text("Mirror the layout for left-handed use")
-                .clicked()
-            {
-                ed.ui.left_handed = !ed.ui.left_handed;
-            }
-
-            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!(
                     "{} × {} · {:.0}% · {} layer{} · undo {:.0} MB",
