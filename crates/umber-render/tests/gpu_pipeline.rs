@@ -8,7 +8,7 @@
 
 use glam::{UVec2, Vec2};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect};
+use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, StrokeStyle};
 
 const DOC: u32 = 64;
@@ -101,6 +101,10 @@ impl Harness {
 
     fn commit(&mut self, color: Color, opacity: f32, mode: BrushMode) {
         self.commit_to(0, color, opacity, mode);
+    }
+
+    fn set_tip(&mut self, tip: Option<&TipMask>) {
+        self.canvas.set_tip(&self.gpu.device, &self.gpu.queue, tip);
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -352,6 +356,113 @@ fn a_dark_colour_survives_the_round_trip_to_the_layer() {
     let px = h.pixel(32, 32);
     assert_eq!(px[3], 255, "should be fully opaque");
     assert_near(px, [20, 20, 24], 2, "committed dark ink");
+}
+
+// ---------------------------------------------------------------------------
+// Bitmap tips
+// ---------------------------------------------------------------------------
+
+/// A pixel inside a radius-12 dab's bounding square but outside its circle.
+///
+/// The dab at (32, 32) spans 20..44 on both axes, so pixel 21's centre sits at
+/// local (-0.875, -0.875): a distance of 1.24 from the centre, comfortably past
+/// the falloff's outer edge at 1.0, and comfortably inside the square the tip
+/// covers.
+const CORNER: u32 = 21;
+
+#[test]
+fn a_tipped_stamp_still_saturates_under_overlap() {
+    // The tip version of `overlapping_dabs_do_not_compound`, and the reason
+    // that test is worth copying rather than extending: a tip modulates
+    // coverage, it does not composite. If the tip were ever blended in rather
+    // than selected between, the `max` blend would stop saturating and tipped
+    // strokes would go blotchy wherever they cross themselves.
+    let mut h = harness_or_skip!();
+
+    let tip = TipMask::new(2, 2, vec![255; 4]).expect("tip");
+    h.set_tip(Some(&tip));
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 0.5), dab(32.0, 32.0, 12.0, 0.5)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (single coverage), got {alpha} — tipped dabs are compounding"
+    );
+}
+
+#[test]
+fn a_tip_decides_where_paint_lands() {
+    // A two-texel tip, opaque on the left and empty on the right, stretched
+    // over the dab's bounding square. If the tip were ignored, or sampled with
+    // the axes swapped, both sides would come out the same.
+    let mut h = harness_or_skip!();
+
+    let tip = TipMask::new(2, 1, vec![255, 0]).expect("tip");
+    h.set_tip(Some(&tip));
+
+    // Radius 12 at x = 32 spans 20..44, so x = 22 and x = 42 sit well inside
+    // the left and right texels rather than in the interpolated middle.
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel(22, 32)[3],
+        255,
+        "the tip's opaque half should paint"
+    );
+    assert_eq!(h.pixel(42, 32)[3], 0, "the tip's empty half should not");
+}
+
+#[test]
+fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
+    // The clearest evidence the procedural falloff has been replaced rather
+    // than multiplied into: a full tip covers its whole bounding square, where
+    // a round dab of the same radius cannot reach the corners at all.
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel_in(0, CORNER, CORNER)[3],
+        0,
+        "a round dab must not reach its bounding square's corner"
+    );
+
+    let tip = TipMask::new(2, 2, vec![255; 4]).expect("tip");
+    h.set_tip(Some(&tip));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel_in(1, CORNER, CORNER)[3],
+        255,
+        "a full tip must cover the whole square"
+    );
+}
+
+#[test]
+fn clearing_the_tip_restores_the_round_brush() {
+    // Tips are per stroke, so going back to a round brush has to actually go
+    // back — a stale `use_tip` flag would leave every later stroke square.
+    let mut h = harness_or_skip!();
+
+    let tip = TipMask::new(1, 1, vec![255]).expect("tip");
+    h.set_tip(Some(&tip));
+    assert!(h.canvas.has_tip());
+
+    h.set_tip(None);
+    assert!(!h.canvas.has_tip());
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel(32, 32)[3], 255, "the centre should still paint");
+    assert_eq!(
+        h.pixel(CORNER, CORNER)[3],
+        0,
+        "the corner should be round again"
+    );
 }
 
 // ---------------------------------------------------------------------------

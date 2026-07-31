@@ -17,6 +17,7 @@ pub mod input;
 pub mod layer;
 pub mod preset;
 pub mod stroke;
+pub mod tip;
 
 pub use brush::{Brush, BrushMode};
 pub use camera::Camera;
@@ -29,3 +30,4 @@ pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
 pub use stroke::{Dab, StrokeBuilder};
+pub use tip::TipMask;

@@ -92,8 +92,9 @@ Documented in full in the module docs of
   variation. This is the single biggest loss.
 - **Scatter and jitter.** `offset_by_random`, `radius_by_random`,
   `offset_by_speed`. Spray, splatter and "bulk" brushes come out as smooth lines.
-- **Bitmap tips.** MyPaint has none either, but the Krita and GIMP packs do, and
-  the round-only dab is why they are not imported at all yet — see below.
+- **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
+  nothing is lost here. The engine now has them (see below); it is the Krita
+  and GIMP packs they exist for.
 - **Non-pressure inputs.** `speed1`, `speed2`, `random`, `stroke`, `direction`,
   `tilt`. `Brush` has exactly two pressure-driven parameters and nowhere to put
   the rest.
@@ -104,13 +105,53 @@ Documented in full in the module docs of
   approximated. A MyPaint wash and an Umber wash of the same numbers will not
   look the same.
 
+## Bitmap tips
+
+The dab pass can stamp an 8-bit coverage mask instead of its procedural round
+falloff. This is what the stamp-based packs need.
+
+`umber_core::tip::TipMask` is the mask — plain bytes, `0` no paint and `255`
+full, so the engine keeps no GPU types. `CanvasRenderer::set_tip` uploads one to
+an `R8Unorm` texture and flips a flag in the dab uniforms.
+
+Three things about the design are load-bearing:
+
+- **The tip is bound per pass, not per dab.** A stroke has one brush, so one
+  tip covers the whole dab pass and a thousand tipped dabs are still a single
+  draw call. Set it between strokes; changing it mid-stroke would restamp what
+  is already in the scratch under a new shape.
+- **The tip modulates coverage; it does not composite.** The blend state is
+  untouched and still `max`, so a tipped stroke saturates at 1.0 under overlap
+  exactly as a round one does and stroke opacity is still applied once, at
+  commit. `a_tipped_stamp_still_saturates_under_overlap` is the guard, and it is
+  a deliberate copy of `overlapping_dabs_do_not_compound` rather than an
+  extension of it.
+- **The round path is untouched.** The shader samples the tip unconditionally —
+  `textureSample` may not sit in non-uniform control flow — and then `select`s
+  between it and the falloff. With no tip the binding is a 1×1 placeholder whose
+  contents are discarded. Every pre-existing GPU test still passes unchanged,
+  which is the evidence.
+
+`umber_core::brushimport::gbr::from_gbr` decodes a GIMP `.gbr` into a
+`TipMask`, plus the brush name and the spacing the format carries. Everything in
+it is big-endian; a little-endian read reports a billion-pixel brush and is
+caught by the length check rather than producing garbage.
+
 ## Not done yet
 
-- **Bitmap tip masks** in the dab pass, and a `.gbr` / `.gih` importer. This is
-  what would unlock the large stamp-based packs (OpenGameArt, Raghukamath,
-  Krita `.kpp`). It touches the render pipeline, so read the stroke-pipeline
-  section of `CLAUDE.md` first: the tip has to *modulate* coverage, and the
-  `max`-blend wet-layer invariant has to survive it.
+- **Somewhere to keep a tip.** The preset library is a text file and a tip is a
+  bitmap, so a `BrushPreset` cannot yet name one — which is why `.gbr` is
+  absent from `brushimport::read_file`. The library needs to become a directory
+  with the RON alongside a `tips/` folder before a stamp brush can be *saved*,
+  as opposed to loaded and used. Until then a caller decodes a `.gbr` itself and
+  hands the mask to `set_tip`.
+- **A licensed `.gbr` pack.** None of the candidate sources states its licence
+  inside the download, so none is fetched — see `docs/brush-sources.md`. The
+  `.gbr` decoder is tested against files built byte by byte in the test module,
+  not against a real brush.
+- **Elliptical tips.** The tip is stretched over the dab's bounding square, so a
+  non-square mask loses its aspect ratio. The dab carries a single radius and
+  has nowhere to record one.
 - **Grain / paper texture** multiplied into dab coverage.
 - **Elliptical and rotating dabs**, which would recover a quarter of the MyPaint
   set properly rather than approximately.

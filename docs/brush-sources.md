@@ -64,9 +64,16 @@ better.
 ### OpenGameArt — 60 free GIMP/Krita brushes (rubberduck)
 
 - Page: <https://opengameart.org/content/60-free-gimp-krita-brushes>
-- **Skipped for now.** `.gbr` / `.gih`, which are bitmap tips by definition.
-  This is the pack to fetch first once the tip work lands: it is small, the
-  format is simple, and OpenGameArt states the licence per submission.
+- **Skipped.** `.gbr` is now readable — `umber_core::brushimport::gbr` decodes
+  it and the dab pass can stamp it — so the format is no longer the obstacle.
+  The licence is: OpenGameArt states it on the submission page, not inside the
+  archive, so a fetch script cannot verify it from the download, which is
+  exactly the case the rule at the top of this file covers. It is also behind a
+  form rather than a stable archive URL. Somebody who reads the page and
+  satisfies themselves can drop the files in by hand; the project will not
+  claim a licence it cannot check.
+- `.gih` — an animated `.gbr` sequence — is not read at all. Umber stamps one
+  tip per stroke, so there would be nowhere to put the other frames.
 
 ### GDQuest Krita brushes
 

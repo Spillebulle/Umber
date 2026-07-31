@@ -3,7 +3,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
-use umber_core::{BrushMode, Camera, Color, Dab, PixelRect};
+use umber_core::{BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use wgpu::util::DeviceExt;
 
 /// Layer storage format.
@@ -90,7 +90,10 @@ pub struct CompositeParams<'a> {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DabUniforms {
     doc_size: [f32; 2],
-    _pad: [f32; 2],
+    /// Non-zero when a real tip texture is bound. Scalar padding, not a vec2 —
+    /// see the uniform-layout note in CLAUDE.md.
+    use_tip: u32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -192,11 +195,15 @@ pub struct CanvasRenderer {
     sampler: wgpu::Sampler,
 
     dab_pipeline: wgpu::RenderPipeline,
+    dab_layout: wgpu::BindGroupLayout,
     dab_bind_group: wgpu::BindGroup,
-    #[allow(dead_code)]
     dab_uniforms: wgpu::Buffer,
     dab_instances: wgpu::Buffer,
     dabs_this_frame: u32,
+    /// The bitmap tip, or a 1x1 placeholder. Held so it outlives the bind
+    /// group that references it.
+    tip: wgpu::Texture,
+    has_tip: bool,
 
     composite_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
@@ -253,7 +260,8 @@ impl CanvasRenderer {
             label: Some("dab-uniforms"),
             contents: bytemuck::bytes_of(&DabUniforms {
                 doc_size: [doc_size.x as f32, doc_size.y as f32],
-                _pad: [0.0; 2],
+                use_tip: 0,
+                _pad: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -264,18 +272,20 @@ impl CanvasRenderer {
             mapped_at_creation: false,
         });
 
+        // A 1x1 placeholder stands in when no tip is set, so the bind group
+        // layout never varies and there is still exactly one dab pipeline. Its
+        // contents do not matter: with `use_tip` at zero the shader samples it
+        // and discards the result, which is the price of keeping
+        // `textureSample` out of non-uniform control flow.
+        let tip = make_tip_texture(device, 1, 1);
+        let tip_view = tip.create_view(&wgpu::TextureViewDescriptor::default());
+
         let dab_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dab-bgl"),
-            entries: &[uniform_entry(0)],
+            entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
         });
-        let dab_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dab-bg"),
-            layout: &dab_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dab_uniforms.as_entire_binding(),
-            }],
-        });
+        let dab_bind_group =
+            make_dab_bind_group(device, &dab_layout, &dab_uniforms, &tip_view, &sampler);
 
         let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dab-pipeline"),
@@ -508,10 +518,13 @@ impl CanvasRenderer {
             stroke_view,
             sampler,
             dab_pipeline,
+            dab_layout,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
             dabs_this_frame: 0,
+            tip,
+            has_tip: false,
             composite_pipeline,
             composite_layout,
             composite_bind_group,
@@ -591,6 +604,76 @@ impl CanvasRenderer {
             &self.sampler,
         );
         self.layers = grown;
+    }
+
+    /// Set the bitmap tip the dab pass stamps, or `None` for the procedural
+    /// round brush.
+    ///
+    /// The tip is bound for the whole dab pass rather than carried per dab, so
+    /// a thousand tipped dabs are still a single draw call. Change it *between*
+    /// strokes: a stroke has one brush, and swapping mid-pass would restamp the
+    /// dabs already in the scratch under the new shape.
+    ///
+    /// What the tip does is modulate coverage. It is not composited and it does
+    /// not touch the blend state, so overlapping tipped dabs still saturate at
+    /// 1.0 and stroke opacity is still applied once, at commit —
+    /// `a_tipped_stamp_still_saturates_under_overlap` guards that.
+    pub fn set_tip(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tip: Option<&TipMask>) {
+        let (texture, has_tip) = match tip {
+            Some(mask) => {
+                let texture = make_tip_texture(device, mask.width(), mask.height());
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    mask.coverage(),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        // One byte per texel: R8Unorm is all a coverage mask
+                        // needs, matching the stroke scratch it feeds.
+                        bytes_per_row: Some(mask.width()),
+                        rows_per_image: Some(mask.height()),
+                    },
+                    wgpu::Extent3d {
+                        width: mask.width(),
+                        height: mask.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                (texture, true)
+            }
+            None if !self.has_tip => return,
+            None => (make_tip_texture(device, 1, 1), false),
+        };
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.dab_bind_group = make_dab_bind_group(
+            device,
+            &self.dab_layout,
+            &self.dab_uniforms,
+            &view,
+            &self.sampler,
+        );
+        self.tip = texture;
+        self.has_tip = has_tip;
+
+        queue.write_buffer(
+            &self.dab_uniforms,
+            0,
+            bytemuck::bytes_of(&DabUniforms {
+                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
+                use_tip: u32::from(has_tip),
+                _pad: 0.0,
+            }),
+        );
+    }
+
+    /// Whether a bitmap tip is currently bound.
+    pub fn has_tip(&self) -> bool {
+        self.has_tip
     }
 
     /// Reset the per-frame instance cursor. Call once at the top of a frame.
@@ -1130,6 +1213,53 @@ fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, labe
         occlusion_query_set: None,
         multiview_mask: None,
     });
+}
+
+/// Storage for a brush tip: single-channel coverage, matching the stroke
+/// scratch it feeds. Four channels would be four times the bandwidth to say the
+/// same thing.
+fn make_tip_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("umber-brush-tip"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: STROKE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn make_dab_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    tip: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dab-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(tip),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn make_composite_bind_group(

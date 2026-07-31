@@ -6,6 +6,7 @@
 //! [`mypaint`] for the shape those notes take. An importer that quietly
 //! discarded half a brush would be worse than one that refuses the file.
 
+pub mod gbr;
 pub mod mypaint;
 
 use std::path::Path;
@@ -18,6 +19,12 @@ use crate::preset::{self, BrushPreset, PresetError};
 /// `.myb` is JSON and an Umber library is RON, so they are trivially
 /// distinguishable — but a user who renames a file has told us something, and
 /// guessing past that produces confusing failures much later.
+///
+/// `.gbr` is deliberately absent. A GIMP brush is a *bitmap tip*, not a set of
+/// parameters, and the preset library is a text file with nowhere to keep a
+/// bitmap. [`gbr::from_gbr`] decodes one into a [`crate::tip::TipMask`] that
+/// the renderer can stamp; giving the library somewhere to store it is the next
+/// step, and is described in `docs/brushes.md`.
 pub fn read_file(path: &Path) -> Result<Vec<BrushPreset>, PresetError> {
     let extension = path
         .extension()
