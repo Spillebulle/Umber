@@ -394,27 +394,24 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.add_space(14.0);
     theme_editor(ui, p, ed);
 
-    ui.add_space(14.0);
-    controls::section(ui, p, "Layout");
-    ui.scope(|ui| {
-        ui.set_max_width(300.0);
-        // The design words this as a two-way pick rather than a switch, so the
-        // mirrored option can say what it does.
-        let mut handed = ed.ui.left_handed;
-        if widgets::segmented(
-            ui,
-            p,
-            &mut handed,
-            &[(false, "Right-handed"), (true, "Left-handed (mirror)")],
-        ) {
-            ed.ui.left_handed = handed;
-            prefs::mark_dirty();
-        }
-    });
-    controls::note(
-        ui,
-        p,
-        "Mirrors the workspace so the tool rail sits under your drawing hand.",
+    ui.add_space(16.0);
+    ui.label(
+        egui::RichText::new("Layout")
+            .size(text::SMALL)
+            .color(p.text_dim),
+    );
+    ui.add_space(6.0);
+    // The left-handed mirror that used to live here is gone. Every part of the
+    // workspace, the tool rail included, now moves by being dragged in layout
+    // edit mode, so a global handedness flag has nothing left to do.
+    ui.label(
+        egui::RichText::new(
+            "Panels, sidebars and the tool rail are arranged by dragging them. \
+             Turn on Window, Customise layout to move them; the same menu resets \
+             the layout if it goes wrong.",
+        )
+        .size(10.0)
+        .color(p.text_dim),
     );
 }
 

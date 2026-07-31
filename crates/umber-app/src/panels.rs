@@ -1,0 +1,903 @@
+//! Drawing the dockable modules: sidebars, floating panels, splitters and the
+//! drag-and-drop affordances that move panels between them.
+//!
+//! The model this drives lives in [`crate::dock`]; nothing here decides *where*
+//! anything goes, it only paints what the model says and reports interactions
+//! back to it. Keeping the two apart is what lets the fiddly parts — insertion
+//! indices, minimum sizes, the config round trip — be tested without a window.
+//!
+//! Two things here are easy to get wrong and are commented at their call sites:
+//! the hit-test ordering that lets a close button live inside a drag handle,
+//! and the fact that a floating panel is an [`egui::Area`] rather than a
+//! [`egui::Panel`] — an Area does not claim space, so the canvas region, and
+//! therefore the camera pivot, is unaffected by a panel hovering over it.
+
+use crate::colorpicker::{self, PickerMode};
+use crate::dock::{DropTarget, Floating, Geometry, HEADER, PanelKind, Side, limits};
+use crate::editor::Editor;
+use crate::icons::{self, Icon};
+use crate::theme::{Palette, metrics, text};
+use crate::ui::{UiActions, icon_button};
+use crate::widgets;
+use egui::{
+    Align, Align2, CursorIcon, FontId, Frame, Id, LayerId, Layout, Order, Pos2, Rect, Sense,
+    Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
+};
+use umber_core::{BlendMode, LayerStack};
+
+/// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
+/// target is not something anyone can hit.
+const SPLITTER_GRAB: f32 = 7.0;
+
+/// What a panel's chrome reported this frame. The caller applies these, because
+/// the layout cannot be mutated while it is being iterated.
+#[derive(Default)]
+struct PanelEvents {
+    /// Pointer position and the panel's rect at the moment a drag began.
+    grab: Option<(Pos2, Rect)>,
+    close: bool,
+}
+
+/// Draw both sidebars, their panels and their splitters.
+pub fn sidebars(
+    root: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    actions: &mut UiActions,
+    geo: &Geometry,
+) {
+    for side in Side::ALL {
+        let Some(rect) = geo.sidebar[side.index()] else {
+            continue;
+        };
+        let frame = Frame {
+            fill: p.dock,
+            ..Default::default()
+        };
+        let panel = match side {
+            Side::Left => egui::Panel::left("dock-left"),
+            Side::Right => egui::Panel::right("dock-right"),
+        };
+        panel
+            .exact_size(rect.width())
+            .frame(frame)
+            .show(root, |ui| sidebar(ui, p, ed, actions, side, geo));
+    }
+}
+
+fn sidebar(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    actions: &mut UiActions,
+    side: Side,
+    geo: &Geometry,
+) {
+    let slots = &geo.slots[side.index()];
+    // Snapshot the stack: drawing a panel can start a drag, which removes it
+    // from the layout, and the loop must not be reading the Vec when it does.
+    let kinds: Vec<PanelKind> = ed.layout.docked(side).iter().map(|d| d.kind).collect();
+
+    let mut grabbed = None;
+    let mut closed = None;
+    for (index, kind) in kinds.iter().copied().enumerate() {
+        let Some(slot) = slots.get(index).copied() else {
+            continue;
+        };
+        let events = panel(ui, p, ed, actions, kind, slot);
+        if let Some(grab) = events.grab {
+            grabbed = Some((kind, grab));
+        }
+        if events.close {
+            closed = Some(kind);
+        }
+        if index + 1 < kinds.len() {
+            ui.painter()
+                .hline(slot.x_range(), slot.bottom(), Stroke::new(1.0, p.border));
+        }
+    }
+
+    height_splitters(ui, p, ed, side, slots);
+    width_splitter(ui, p, ed, side, geo);
+
+    if let Some(kind) = closed {
+        ed.layout.close(kind);
+    }
+    if let Some((kind, (pointer, rect))) = grabbed {
+        ed.layout.begin_drag(kind, pointer, rect);
+    }
+}
+
+/// The draggable boundaries between stacked panels.
+fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots: &[Rect]) {
+    let heights: Vec<f32> = slots.iter().map(|s| s.height()).collect();
+    // The last slot has nothing below it to push against, so it has no handle.
+    let boundaries = slots.len().saturating_sub(1);
+    for (index, slot) in slots.iter().enumerate().take(boundaries) {
+        let y = slot.bottom();
+        let handle = Rect::from_min_max(
+            pos2(slot.left(), y - SPLITTER_GRAB * 0.5),
+            pos2(slot.right(), y + SPLITTER_GRAB * 0.5),
+        );
+        let response = ui
+            .interact(
+                handle,
+                ui.id().with(("vsplit", side.index(), index)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(CursorIcon::ResizeVertical);
+        if response.dragged() {
+            ed.layout
+                .resize_split(side, index, response.drag_delta().y, &heights);
+        }
+        if response.hovered() || response.dragged() {
+            ui.painter()
+                .hline(handle.x_range(), y, Stroke::new(2.0, p.accent));
+        }
+    }
+}
+
+/// The draggable inner edge that sets the sidebar's width.
+///
+/// The handle sits *inside* the sidebar rather than straddling its edge, so
+/// that grabbing it counts as pointing at the panel and never at the canvas —
+/// otherwise the first pixel of a resize drag would also start a stroke.
+fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &Geometry) {
+    let Some(rect) = geo.sidebar[side.index()] else {
+        return;
+    };
+    let handle = match side {
+        Side::Left => Rect::from_min_max(
+            pos2(rect.right() - SPLITTER_GRAB, rect.top()),
+            rect.right_bottom(),
+        ),
+        Side::Right => Rect::from_min_max(
+            rect.left_top(),
+            pos2(rect.left() + SPLITTER_GRAB, rect.bottom()),
+        ),
+    };
+    let response = ui
+        .interact(
+            handle,
+            ui.id().with(("hsplit", side.index())),
+            Sense::drag(),
+        )
+        .on_hover_cursor(CursorIcon::ResizeHorizontal);
+
+    if response.dragged()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let width = match side {
+            Side::Left => pointer.x - rect.left(),
+            Side::Right => rect.right() - pointer.x,
+        };
+        ed.layout.set_width(side, width);
+    }
+
+    let x = match side {
+        Side::Left => rect.right() - 0.5,
+        Side::Right => rect.left() + 0.5,
+    };
+    let colour = if response.hovered() || response.dragged() {
+        p.accent
+    } else {
+        p.border
+    };
+    let weight = if response.hovered() || response.dragged() {
+        2.0
+    } else {
+        1.0
+    };
+    ui.painter()
+        .vline(x, rect.y_range(), Stroke::new(weight, colour));
+}
+
+/// Draw every floating panel, back to front.
+pub fn floats(root: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    let list: Vec<Floating> = ed.layout.floating().to_vec();
+    let ctx = root.ctx().clone();
+
+    let mut grabbed = None;
+    let mut closed = None;
+    let mut raised = None;
+    let mut resized = None;
+
+    for f in list {
+        // An Area, not a Panel: an Area floats over everything and claims no
+        // space, which is exactly what "hovers over the canvas" has to mean.
+        // A Panel would shrink the central region and move the camera pivot
+        // with it, and strokes would land away from the cursor.
+        let area = egui::Area::new(Id::new(("float-panel", f.kind)))
+            .order(Order::Middle)
+            .fixed_pos(f.rect.min)
+            .movable(false)
+            .constrain(false);
+
+        let inner = area.show(&ctx, |ui| {
+            // Claim the whole rect so the Area's own bounds match the panel.
+            // Without this the Area is only as big as whatever was allocated,
+            // and egui's layer hit testing lets clicks through the panel.
+            let backdrop = ui.allocate_rect(f.rect, Sense::hover());
+
+            let painter = ui.painter();
+            painter.rect_filled(f.rect, metrics::RADIUS_LARGE, p.popover);
+            painter.rect_stroke(
+                f.rect,
+                metrics::RADIUS_LARGE,
+                Stroke::new(1.0, p.popover_border),
+                StrokeKind::Inside,
+            );
+
+            let events = panel(ui, p, ed, actions, f.kind, f.rect);
+
+            // Corner grip. Registered after the body, so it wins the hit test
+            // against whatever the panel happens to put underneath it.
+            let grip = Rect::from_min_max(
+                f.rect.right_bottom() - vec2(16.0, 16.0),
+                f.rect.right_bottom(),
+            );
+            let handle = ui
+                .interact(grip, ui.id().with(("resize", f.kind)), Sense::drag())
+                .on_hover_cursor(CursorIcon::ResizeNwSe);
+            if handle.dragged() {
+                let size = (f.rect.size() + handle.drag_delta()).clamp(
+                    vec2(limits::FLOAT_MIN_WIDTH, limits::FLOAT_MIN_HEIGHT),
+                    vec2(limits::FLOAT_MAX_WIDTH, limits::FLOAT_MAX_HEIGHT),
+                );
+                resized = Some((f.kind, Rect::from_min_size(f.rect.min, size)));
+            }
+            icons::draw(
+                ui.painter(),
+                grip.shrink(3.0),
+                Icon::Corner,
+                if handle.hovered() || handle.dragged() {
+                    p.text_strong
+                } else {
+                    p.text_dim
+                },
+            );
+
+            (events, backdrop)
+        });
+
+        let (events, backdrop) = inner.inner;
+        if let Some(grab) = events.grab {
+            grabbed = Some((f.kind, grab));
+        }
+        if events.close {
+            closed = Some(f.kind);
+        }
+        // Any press inside the panel raises it. Checking the whole rect rather
+        // than a click on the backdrop means clicking a slider raises the panel
+        // too, which is what a user expects of overlapping windows.
+        if backdrop.contains_pointer() && ctx.input(|i| i.pointer.any_pressed()) {
+            raised = Some((f.kind, inner.response.layer_id));
+        }
+    }
+
+    if let Some((kind, rect)) = resized {
+        ed.layout.set_float_rect(kind, rect);
+    }
+    if let Some((kind, layer)) = raised {
+        ed.layout.raise(kind);
+        ctx.move_to_top(layer);
+    }
+    if let Some(kind) = closed {
+        ed.layout.close(kind);
+    }
+    if let Some((kind, (pointer, rect))) = grabbed {
+        ed.layout.begin_drag(kind, pointer, rect);
+    }
+}
+
+/// One panel: header strip, then its body, drawn into `rect`.
+fn panel(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    actions: &mut UiActions,
+    kind: PanelKind,
+    rect: Rect,
+) -> PanelEvents {
+    let mut events = PanelEvents::default();
+    let pad = f32::from(metrics::PANEL_PAD);
+
+    let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER + 8.0));
+
+    // The whole header is the drag handle — but only in edit mode, as the
+    // design has it. Outside it the header is inert, so reaching for a slider
+    // can never tear its panel off mid-stroke.
+    //
+    // It is registered *first* on purpose: egui breaks hit-test ties in favour
+    // of the last widget added, so the close button and the picker-mode switch
+    // placed below still take their own clicks even though they sit inside
+    // this rect.
+    let editing = ed.layout.edit_mode();
+    let grip = ui.interact(
+        header,
+        ui.id().with(("panel-header", kind)),
+        if editing {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let grip = if editing {
+        grip.on_hover_cursor(if ed.layout.is_dragging() {
+            CursorIcon::Grabbing
+        } else {
+            CursorIcon::Grab
+        })
+    } else {
+        grip
+    };
+    if grip.drag_started()
+        && let Some(pointer) = grip.interact_pointer_pos()
+    {
+        events.grab = Some((pointer, rect));
+    }
+
+    let painter = ui.painter();
+    if editing && grip.hovered() && !ed.layout.is_dragging() {
+        painter.rect_filled(header, 0.0, p.control.gamma_multiply(0.5));
+    }
+    let dots = Rect::from_center_size(
+        pos2(rect.left() + pad + 4.0, header.center().y),
+        vec2(10.0, 14.0),
+    );
+    // The grip lights up in edit mode and recedes outside it, which is the
+    // design's cue that the panel has become movable.
+    icons::draw(
+        painter,
+        dots,
+        Icon::Grip,
+        if editing {
+            p.accent
+        } else {
+            p.text_dim.gamma_multiply(0.5)
+        },
+    );
+    painter.text(
+        pos2(dots.right() + 6.0, header.center().y),
+        Align2::LEFT_CENTER,
+        kind.title(),
+        FontId::proportional(text::SMALL),
+        p.text_strong,
+    );
+
+    // Header controls, right-aligned. Added after the drag handle, so they win.
+    let controls = Rect::from_min_max(
+        pos2(rect.center().x, header.top()),
+        pos2(rect.right() - pad, header.bottom()),
+    );
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt(("panel-controls", kind))
+            .max_rect(controls)
+            .layout(Layout::right_to_left(Align::Center)),
+        |ui| {
+            // Hiding a panel is an edit-mode action too, so a stray click on
+            // the corner of a panel cannot make it vanish mid-painting.
+            if editing
+                && icon_button(
+                    ui,
+                    p,
+                    Icon::Close,
+                    true,
+                    "Hide this panel — bring it back from the Window menu",
+                )
+            {
+                events.close = true;
+            }
+            if kind == PanelKind::Colour {
+                picker_mode_switch(ui, p, ed);
+            }
+        },
+    );
+
+    // Body. Clipped and scrollable, because a panel dragged down to its minimum
+    // height still has to show something rather than spilling over its
+    // neighbour.
+    let body = Rect::from_min_max(
+        pos2(rect.left() + pad, header.bottom()),
+        pos2(rect.right() - pad, rect.bottom() - 6.0),
+    );
+    if body.height() < 8.0 || body.width() < 8.0 {
+        return events;
+    }
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt(("panel-body", kind))
+            .max_rect(body),
+        |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(body));
+            egui::ScrollArea::vertical()
+                .id_salt(("panel-scroll", kind))
+                .auto_shrink([false, false])
+                .show(ui, |ui| match kind {
+                    PanelKind::Colour => colour_body(ui, p, ed),
+                    PanelKind::Brushes => brushes_body(ui, p, ed),
+                    PanelKind::Layers => layers_body(ui, p, ed, actions),
+                });
+        },
+    );
+
+    events
+}
+
+/// A dashed outline round a rounded rect.
+///
+/// egui strokes rects solid; the design's dock affordances are dashed, and a
+/// dashed border is what distinguishes "this is where it will go" from a real
+/// piece of chrome. Corners are approximated by insetting the four runs, which
+/// at these radii is not visible.
+fn dashed_rect(painter: &egui::Painter, rect: Rect, radius: f32, stroke: Stroke) {
+    let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let runs = [
+        [
+            pos2(rect.left() + r, rect.top()),
+            pos2(rect.right() - r, rect.top()),
+        ],
+        [
+            pos2(rect.right(), rect.top() + r),
+            pos2(rect.right(), rect.bottom() - r),
+        ],
+        [
+            pos2(rect.right() - r, rect.bottom()),
+            pos2(rect.left() + r, rect.bottom()),
+        ],
+        [
+            pos2(rect.left(), rect.bottom() - r),
+            pos2(rect.left(), rect.top() + r),
+        ],
+    ];
+    for run in runs {
+        painter.extend(egui::Shape::dashed_line(&run, stroke, 5.0, 4.0));
+    }
+}
+
+/// The dashed outline the design puts round a sidebar while the layout is being
+/// edited, so it reads as a container you can drop into.
+pub fn edit_mode_outline(root: &mut Ui, p: &Palette, ed: &Editor, geo: &Geometry) {
+    if !ed.layout.edit_mode() {
+        return;
+    }
+    let painter = root.ctx().layer_painter(LayerId::new(
+        Order::Foreground,
+        Id::new("dock-edit-outline"),
+    ));
+    for side in Side::ALL {
+        if let Some(rect) = geo.sidebar[side.index()] {
+            dashed_rect(
+                &painter,
+                rect.shrink(4.0),
+                8.0,
+                Stroke::new(1.5, p.accent_dim),
+            );
+        }
+    }
+}
+
+/// The overlay a drag draws, and the point at which a drop is resolved.
+///
+/// Called last, after every panel has had its chance to interact, so the
+/// geometry the drop is tested against is this frame's.
+pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry) {
+    let ctx = root.ctx().clone();
+    if !ed.layout.is_dragging() {
+        return;
+    }
+
+    if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
+        ed.layout.drag_to(pointer);
+    }
+    let Some(drag) = ed.layout.drag() else { return };
+    let target = geo.drop_target(drag.pointer);
+
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dock-drag")));
+    match target {
+        DropTarget::Dock { side, index } => {
+            // The design's dock indicator: a dashed accent block reading "dock
+            // here". It is drawn *at the insertion point* rather than always at
+            // the top of the sidebar, because unlike the design's model this
+            // one can insert between two panels, and an indicator that lied
+            // about where the panel lands would be worse than none.
+            let zone = geo.drop_zone(side);
+            let (a, b) = geo.insertion_line(side, index);
+            let block = Rect::from_min_max(
+                pos2(zone.left() + 8.0, a.y.min(zone.bottom() - 40.0)),
+                pos2(b.x - 8.0, (a.y + 110.0).min(zone.bottom() - 8.0)),
+            );
+            painter.rect_filled(block, 8.0, p.accent.gamma_multiply(0.09));
+            dashed_rect(&painter, block, 8.0, Stroke::new(2.0, p.accent));
+            painter.line_segment([a, b], Stroke::new(2.0, p.accent));
+            if block.height() > 34.0 {
+                painter.text(
+                    block.center(),
+                    Align2::CENTER_CENTER,
+                    "dock here",
+                    FontId::proportional(text::TINY),
+                    p.accent,
+                );
+            }
+        }
+        DropTarget::Float => {
+            let rect = drag.float_rect();
+            painter.rect_filled(rect, metrics::RADIUS_LARGE, p.popover.gamma_multiply(0.85));
+            painter.rect_stroke(
+                rect,
+                metrics::RADIUS_LARGE,
+                Stroke::new(1.0, p.accent),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    // The panel itself is not drawn while it is in the air — only its header,
+    // as a label under the cursor. Re-running a whole panel body into a moving
+    // rect would re-enter every widget's id in a new place each frame, which
+    // egui reasonably objects to.
+    let tab = Rect::from_min_size(
+        drag.pointer - drag.grab,
+        vec2(drag.float_size.x, HEADER + 8.0),
+    );
+    painter.rect_filled(tab, metrics::RADIUS_LARGE, p.popover);
+    painter.rect_stroke(
+        tab,
+        metrics::RADIUS_LARGE,
+        Stroke::new(1.0, p.accent),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        pos2(tab.left() + f32::from(metrics::PANEL_PAD), tab.center().y),
+        Align2::LEFT_CENTER,
+        drag.kind.title(),
+        FontId::proportional(text::SMALL),
+        p.text_strong,
+    );
+
+    ctx.set_cursor_icon(CursorIcon::Grabbing);
+
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ed.layout.cancel_drag();
+    } else if !ctx.input(|i| i.pointer.any_down()) {
+        ed.layout.end_drag(target);
+    }
+    ctx.request_repaint();
+}
+
+// --- panel bodies ---------------------------------------------------------
+
+fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    let mut shape = ed.ui.wheel_shape;
+    let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut ed.hsv);
+    ed.ui.wheel_shape = shape;
+    if changed {
+        ed.commit_picker();
+    }
+
+    ui.add_space(9.0);
+    ui.horizontal(|ui| {
+        let [r, g, b, _] = ed.color.to_srgb_u8();
+        let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+        ui.painter()
+            .rect_filled(chip, metrics::RADIUS, egui::Color32::from_rgb(r, g, b));
+        ui.label(
+            egui::RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
+                .monospace()
+                .size(text::TINY)
+                .color(p.text),
+        );
+    });
+}
+
+fn brushes_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    let mut pick = None;
+    for (index, preset) in ed.presets.iter().enumerate() {
+        let selected = ed.active_preset == Some(index);
+        if widgets::brush_preset_row(
+            ui,
+            p,
+            &preset.name,
+            preset.brush.opacity,
+            preset.brush.hardness,
+            selected,
+        )
+        .clicked()
+        {
+            pick = Some(index);
+        }
+    }
+    if let Some(index) = pick {
+        ed.apply_preset(index);
+    }
+}
+
+fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    let count = ed.layers.len();
+    let active = ed.layers.active_index();
+
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icon_button(
+                ui,
+                p,
+                Icon::Trash,
+                count > 1,
+                "Delete layer — clears undo history",
+            ) {
+                actions.delete_layer = Some(active);
+            }
+            if icon_button(ui, p, Icon::ChevronDown, active > 0, "Move layer down") {
+                actions.move_layer_down = Some(active);
+            }
+            if icon_button(ui, p, Icon::ChevronUp, active + 1 < count, "Move layer up") {
+                actions.move_layer_up = Some(active);
+            }
+            if icon_button(
+                ui,
+                p,
+                Icon::Plus,
+                count < LayerStack::MAX,
+                "Add a layer above the current one",
+            ) {
+                actions.add_layer = true;
+            }
+        });
+    });
+
+    ui.add_space(4.0);
+
+    // Blend and opacity for the selected layer, on one row.
+    ui.horizontal(|ui| {
+        let layer = ed.layers.active_mut();
+        egui::ComboBox::from_id_salt("layer-blend")
+            .selected_text(
+                egui::RichText::new(layer.blend.label())
+                    .size(text::TINY)
+                    .color(p.text),
+            )
+            .width(80.0)
+            .show_ui(ui, |ui| {
+                for mode in BlendMode::ALL {
+                    ui.selectable_value(&mut layer.blend, mode, mode.label());
+                }
+            });
+        let value = layer.opacity;
+        widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
+        ui.label(
+            egui::RichText::new(format!("{:.0}", value * 100.0))
+                .monospace()
+                .size(10.0)
+                .color(p.text),
+        );
+    });
+
+    ui.add_space(7.0);
+
+    // Stored bottom-first; shown top-first, the way it is drawn.
+    let mut select = None;
+    let mut toggle = None;
+    for index in (0..count).rev() {
+        let Some(layer) = ed.layers.get(index) else {
+            continue;
+        };
+        let row = widgets::layer_row(
+            ui,
+            p,
+            &layer.name,
+            layer.visible,
+            index == active,
+            layer.blend.label(),
+        );
+        if row.eye_clicked {
+            toggle = Some(index);
+        } else if row.clicked {
+            select = Some(index);
+        }
+    }
+    if let Some(index) = toggle
+        && let Some(layer) = ed.layers.get_mut(index)
+    {
+        layer.visible = !layer.visible;
+    }
+    if let Some(index) = select {
+        ed.layers.set_active(index);
+    }
+}
+
+/// The Colour panel's picker-type switch: a half-filled disc, the mode name,
+/// and a chevron.
+fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    let label = ed.ui.picker.label();
+    let font = FontId::proportional(9.5);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 26.0, 16.0), Sense::click());
+    let colour = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+    let painter = ui.painter();
+    icons::draw(
+        painter,
+        Rect::from_min_size(rect.left_top(), vec2(12.0, 16.0)),
+        Icon::HalfCircle,
+        colour,
+    );
+    painter.text(
+        rect.left_center() + vec2(15.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        colour,
+    );
+    icons::draw(
+        painter,
+        Rect::from_min_size(rect.right_top() - vec2(11.0, 0.0), vec2(11.0, 16.0)),
+        Icon::ChevronDown,
+        colour,
+    );
+
+    if response.clicked() {
+        ed.ui.picker_menu_open = !ed.ui.picker_menu_open;
+    }
+    let popup = egui::Popup::from_response(&response)
+        .open(ed.ui.picker_menu_open)
+        .show(|ui| {
+            for mode in PickerMode::ALL {
+                if ui
+                    .selectable_label(ed.ui.picker == mode, mode.label())
+                    .clicked()
+                {
+                    ed.ui.picker = mode;
+                    ed.ui.picker_menu_open = false;
+                }
+            }
+        });
+    if popup.is_none() {
+        ed.ui.picker_menu_open = false;
+    }
+}
+
+/// The tool rail's own drag handle, shown only in layout edit mode.
+///
+/// Dragging it past the middle of the window moves the rail to that edge. This
+/// is all that survives of the left-handed mirror, and deliberately as a drag
+/// rather than a setting: a "which side" flag is that mirror wearing a
+/// different label.
+pub fn rail_grip(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    if !ed.layout.edit_mode() {
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::drag());
+    let response = response
+        .on_hover_cursor(CursorIcon::Grab)
+        .on_hover_text("Drag the rail to the other side of the window");
+
+    icons::draw(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), vec2(14.0, 14.0)),
+        Icon::Grip,
+        if response.dragged() {
+            p.text_strong
+        } else {
+            p.accent
+        },
+    );
+
+    if response.drag_stopped()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let middle = ui.ctx().viewport_rect().center().x;
+        let side = if pointer.x < middle {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        ed.layout.set_rail_side(side);
+    }
+    ui.add_space(4.0);
+}
+
+/// The design's layout-edit strip: what the mode is, and the way out of it.
+///
+/// Sits under the options strip, where the design places it, and exists only
+/// while the mode is on — a permanent bar explaining a mode you are not in
+/// would be noise.
+pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
+    if !ed.layout.edit_mode() {
+        return;
+    }
+    let frame = Frame {
+        fill: p.control_active,
+        stroke: Stroke::new(1.0, p.accent_dim),
+        inner_margin: egui::Margin::symmetric(12, 0),
+        ..Default::default()
+    };
+    egui::Panel::top("layout-edit-bar")
+        .exact_size(HEADER + 8.0)
+        .frame(frame)
+        .show(root, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("LAYOUT EDIT")
+                        .size(text::TINY)
+                        .color(p.accent)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "drag a panel by its header — a sidebar re-docks it, anywhere \
+                         else floats · drag an edge to resize · close hides",
+                    )
+                    .size(text::TINY)
+                    .color(p.text_dim),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if edit_bar_link(ui, p.text, "Back to painting")
+                        .on_hover_text("Leave layout edit mode")
+                        .clicked()
+                    {
+                        ed.layout.set_edit_mode(false);
+                    }
+                    ui.add_space(12.0);
+                    if edit_bar_link(ui, p.text_dim, "Reset layout")
+                        .on_hover_text("Put every panel back where it started")
+                        .clicked()
+                    {
+                        ed.layout.reset();
+                    }
+                });
+            });
+        });
+}
+
+fn edit_bar_link(ui: &mut Ui, colour: egui::Color32, label: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(egui::RichText::new(label).size(text::TINY).color(colour))
+            .sense(Sense::click()),
+    )
+}
+
+/// The Window menu's layout section: the edit mode, which panels are shown,
+/// which side the rail is on, and the way back from a wrecked arrangement.
+pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
+    let mut editing = ed.layout.edit_mode();
+    if ui
+        .checkbox(&mut editing, "Customise layout…")
+        .on_hover_text("Makes the panels draggable. The canvas is paused meanwhile.")
+        .clicked()
+    {
+        ed.layout.set_edit_mode(editing);
+        ui.close();
+    }
+
+    ui.menu_button("Panels", |ui| {
+        for kind in PanelKind::ALL {
+            let mut open = ed.layout.is_open(kind);
+            if ui.checkbox(&mut open, kind.title()).clicked() {
+                if open {
+                    ed.layout.open(kind);
+                } else {
+                    ed.layout.close(kind);
+                }
+                ui.close();
+            }
+        }
+    });
+
+    if ui
+        .button("Reset layout")
+        .on_hover_text("Put every panel back where it started")
+        .clicked()
+    {
+        ed.layout.reset();
+        ui.close();
+    }
+}

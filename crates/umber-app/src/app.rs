@@ -401,6 +401,7 @@ impl UmberApp {
             .handle_platform_output(&gfx.window, platform_output);
 
         // egui works in points; the canvas works in physical pixels.
+        self.editor.pixels_per_point = pixels_per_point;
         self.editor.canvas_pivot = Vec2::new(
             canvas_rect.center().x * pixels_per_point,
             canvas_rect.center().y * pixels_per_point,
@@ -688,7 +689,34 @@ impl ApplicationHandler for UmberApp {
         if response.repaint {
             gfx.window.request_redraw();
         }
-        let ui_has_pointer = response.consumed || gfx.egui_ctx.egui_wants_pointer_input();
+        // Who owns the pointer, in three parts.
+        //
+        // This used to ask egui, via `response.consumed` and
+        // `egui_wants_pointer_input()`. Both are built on
+        // `Context::is_pointer_over_egui`, which since egui 0.35 answers *true
+        // everywhere*: `CentralPanel` now consumes the root `Ui`'s cursor, so
+        // the unused rect it tests against is empty by the end of the pass.
+        // With it true, `egui_wants_pointer_input()` is true on every fresh
+        // press — and the press that begins a stroke was being swallowed.
+        //
+        // So decide it here instead:
+        //
+        // * `egui_is_using_pointer` — a slider or scrollbar has the drag. This
+        //   is the one part of egui's answer that does not depend on the broken
+        //   test.
+        // * a non-background layer under the cursor — a menu, a popup, or a
+        //   floating panel, all of which are `Area`s and all of which sit over
+        //   the canvas rather than beside it.
+        // * `pointer_over_canvas` — the canvas region itself, minus whatever
+        //   the layout has claimed, computed from the same rect the composite
+        //   pass is given.
+        let over_area = gfx
+            .egui_ctx
+            .layer_id_at(self.editor.to_points(self.editor.cursor))
+            .is_some_and(|layer| layer.order != egui::Order::Background);
+        let ui_has_pointer = gfx.egui_ctx.egui_is_using_pointer()
+            || over_area
+            || !self.editor.pointer_over_canvas(self.editor.cursor);
         let pivot = self.editor.canvas_pivot;
 
         match event {

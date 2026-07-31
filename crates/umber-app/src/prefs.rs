@@ -48,7 +48,6 @@ pub const MAX_SCALE: f32 = 2.0;
 pub struct Prefs {
     pub theme: ThemeKind,
     pub accent: Accent,
-    pub left_handed: bool,
     /// egui's zoom factor: everything drawn in points scales by this.
     pub interface_scale: f32,
     pub pressure_source: PressureSource,
@@ -64,7 +63,6 @@ impl Default for Prefs {
         Self {
             theme: ThemeKind::Graphite,
             accent: Accent::Umber,
-            left_handed: false,
             interface_scale: 1.0,
             pressure_source: pressure.source,
             pressure_max_speed: pressure.max_speed,
@@ -204,7 +202,6 @@ pub fn to_text(prefs: &Prefs) -> String {
     out.push_str(&format!("version = {VERSION}\n"));
     out.push_str(&format!("theme = {}\n", theme_id(prefs.theme)));
     out.push_str(&format!("accent = {}\n", accent_id(prefs.accent)));
-    out.push_str(&format!("left_handed = {}\n", prefs.left_handed));
     out.push_str(&format!("interface_scale = {:.3}\n", prefs.interface_scale));
     out.push_str(&format!(
         "pressure_source = {}\n",
@@ -267,11 +264,6 @@ pub fn from_text(text: &str) -> Prefs {
             "theme" => {
                 if let Some(t) = theme_from_id(value) {
                     prefs.theme = t;
-                }
-            }
-            "left_handed" => {
-                if let Some(b) = parse_bool(value) {
-                    prefs.left_handed = b;
                 }
             }
             "interface_scale" => {
@@ -362,14 +354,6 @@ fn parse_shortcuts(lines: &[&str]) -> Vec<Binding> {
     out
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
 /// Parse a number and clamp it into range.
 ///
 /// Clamping rather than rejecting is deliberate: a hand-edited scale of 40
@@ -445,7 +429,6 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
     Prefs {
         theme: ed.ui.theme,
         accent: ed.ui.accent,
-        left_handed: ed.ui.left_handed,
         interface_scale: ctx.zoom_factor(),
         pressure_source: ed.pressure.source,
         pressure_max_speed: ed.pressure.max_speed,
@@ -458,7 +441,6 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
 pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.theme = prefs.theme;
     ed.ui.accent = prefs.accent;
-    ed.ui.left_handed = prefs.left_handed;
     ed.pressure.source = prefs.pressure_source;
     ed.pressure.max_speed = prefs.pressure_max_speed;
     ed.pressure.responsiveness = prefs.pressure_response;
@@ -525,7 +507,6 @@ mod tests {
         let prefs = Prefs::default();
         let editor = Editor::default();
         assert_eq!(prefs.theme, editor.ui.theme);
-        assert_eq!(prefs.left_handed, editor.ui.left_handed);
         assert_eq!(prefs.pressure_source, editor.pressure.source);
         assert_eq!(prefs.pressure_max_speed, editor.pressure.max_speed);
         assert_eq!(prefs.pressure_response, editor.pressure.responsiveness);
@@ -537,7 +518,6 @@ mod tests {
         let mut prefs = Prefs {
             theme: ThemeKind::Paper,
             accent: Accent::Clay,
-            left_handed: true,
             interface_scale: 1.25,
             pressure_source: PressureSource::Simulated,
             pressure_max_speed: 1800.0,
@@ -556,7 +536,6 @@ mod tests {
         let back = from_text(&to_text(&prefs));
         assert_eq!(back.theme, prefs.theme);
         assert_eq!(back.accent, prefs.accent);
-        assert_eq!(back.left_handed, prefs.left_handed);
         assert_eq!(back.interface_scale, prefs.interface_scale);
         assert_eq!(back.pressure_source, prefs.pressure_source);
         assert_eq!(back.pressure_max_speed, prefs.pressure_max_speed);
@@ -625,14 +604,13 @@ mod tests {
         let prefs = from_text(concat!(
             "theme = paper\n",
             "\u{0}\u{0}\u{0} binary rubbish from a truncated write\n",
-            "left_handed = perhaps\n",
+            "theme = no such theme\n",
             "interface_scale = \n",
             "pressure_response = NaN\n",
             "= = =\n",
             "shortcut\n",
         ));
         assert_eq!(prefs.theme, ThemeKind::Paper, "the good line still applies");
-        assert!(!prefs.left_handed);
         assert_eq!(prefs.interface_scale, 1.0);
         assert_eq!(prefs.pressure_response, Prefs::default().pressure_response);
         assert_eq!(prefs.shortcuts, shortcuts::defaults());

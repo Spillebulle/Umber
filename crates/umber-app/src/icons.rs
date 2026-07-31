@@ -33,9 +33,11 @@ pub enum Icon {
     EyeOff,
     // Chrome
     Close,
-    Swap,
     Pencil,
     Gear,
+    // Layout
+    Grip,
+    Corner,
     // Picker
     HalfCircle,
 }
@@ -129,13 +131,6 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(at(17.5, 6.5), at(6.5, 17.5));
         }
 
-        Icon::Swap => {
-            line(at(5.0, 9.0), at(19.0, 9.0));
-            line(at(19.0, 9.0), at(15.5, 5.8));
-            line(at(19.0, 15.0), at(5.0, 15.0));
-            line(at(5.0, 15.0), at(8.5, 18.2));
-        }
-
         Icon::Pencil => {
             path(vec![
                 at(5.0, 19.0),
@@ -158,6 +153,23 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                     at(12.0 + c * 9.2, 12.0 + s * 9.2),
                 );
             }
+        }
+
+        Icon::Grip => {
+            // Two columns of dots — the universal "drag me" mark. Drawn as
+            // filled circles rather than the `⠿` braille glyph a text font
+            // would have to carry.
+            for row in 0..3 {
+                let y = 8.0 + row as f32 * 4.0;
+                painter.circle_filled(at(10.0, y), 1.1 * scale, colour);
+                painter.circle_filled(at(14.0, y), 1.1 * scale, colour);
+            }
+        }
+
+        Icon::Corner => {
+            // Resize grip: stepped diagonals in the bottom-right corner.
+            line(at(20.0, 10.0), at(10.0, 20.0));
+            line(at(20.0, 15.0), at(15.0, 20.0));
         }
 
         Icon::HalfCircle => {
