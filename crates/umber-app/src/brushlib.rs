@@ -1033,9 +1033,20 @@ fn import(state: &mut State, ed: &mut Editor) {
 
     let mut added: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    let mut dropped: Vec<&'static str> = Vec::new();
     for path in &paths {
+        // Asked before the read, so a file that fails is reported once, as a
+        // failure, rather than also being complained about for what it dropped.
+        let losses = umber_core::brushimport::dropped_features(path);
         match write(state, ed, |library| library.import_file(path)) {
-            Some(presets) => added.extend(presets.into_iter().map(|preset| preset.name)),
+            Some(presets) => {
+                added.extend(presets.into_iter().map(|preset| preset.name));
+                for loss in losses {
+                    if !dropped.contains(&loss) {
+                        dropped.push(loss);
+                    }
+                }
+            }
             // `write` has already put the reason in the notice; it is collected
             // here so that twenty dropped files report as twenty results rather
             // than as whichever one happened to be last.
@@ -1046,7 +1057,7 @@ fn import(state: &mut State, ed: &mut Editor) {
         }
     }
 
-    state.notice = Some(import_notice(&paths, &added, &failures));
+    state.notice = Some(import_notice(&paths, &added, &failures, &dropped));
     // Anything that arrived is worth looking at, and it will not be in whatever
     // collection happened to be showing.
     if !added.is_empty() {
@@ -1055,24 +1066,49 @@ fn import(state: &mut State, ed: &mut Editor) {
     }
 }
 
-/// Say what actually arrived.
+/// Say what actually arrived — and what did not survive the trip.
 ///
 /// One file can hold a whole library and several files can each fail
-/// differently, so both the count and the reasons matter.
-fn import_notice(paths: &[PathBuf], added: &[String], failures: &[String]) -> Notice {
+/// differently, so both the count and the reasons matter. `dropped` names the
+/// features Umber cannot render: those brushes *are* imported, because an
+/// approximation of your own brush beats a refusal, but they will not paint
+/// quite like the originals and saying so is the difference between an
+/// approximation and a bug report.
+fn import_notice(
+    paths: &[PathBuf],
+    added: &[String],
+    failures: &[String],
+    dropped: &[&str],
+) -> Notice {
     let summary = match (added.len(), paths.len()) {
         (0, _) => String::new(),
         (1, 1) => format!("Imported \"{}\" from {}.", added[0], file_label(&paths[0])),
         (n, 1) => format!("Imported {n} brushes from {}.", file_label(&paths[0])),
         (n, f) => format!("Imported {n} brushes from {f} files."),
     };
+    let losses = match dropped.len() {
+        0 => String::new(),
+        _ => format!(
+            " Umber has no {}, so {} will paint differently.",
+            join_words(dropped),
+            if added.len() == 1 {
+                "it"
+            } else {
+                "some of them"
+            },
+        ),
+    };
     let trailer = match failures.len() {
         0 => {
             return {
                 if summary.is_empty() {
                     Notice::bad("Those files held no brushes.")
-                } else {
+                } else if losses.is_empty() {
                     Notice::good(summary)
+                } else {
+                    // Not an error — the brushes are there — but not the plain
+                    // success a green line would claim either.
+                    Notice::bad(format!("{summary}{losses}"))
                 }
             };
         }
@@ -1082,8 +1118,17 @@ fn import_notice(paths: &[PathBuf], added: &[String], failures: &[String]) -> No
     Notice::bad(if summary.is_empty() {
         trailer
     } else {
-        format!("{summary} {trailer}")
+        format!("{summary}{losses} {trailer}")
     })
+}
+
+/// `smudge`, `smudge and tilt`, `smudge, tilt and direction`.
+fn join_words(words: &[&str]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn file_label(path: &Path) -> String {
@@ -1659,7 +1704,12 @@ mod tests {
     #[test]
     fn an_import_says_how_many_brushes_arrived_and_from_where() {
         let one = PathBuf::from("packs/charcoal.myb");
-        let notice = import_notice(std::slice::from_ref(&one), &["Charcoal".to_owned()], &[]);
+        let notice = import_notice(
+            std::slice::from_ref(&one),
+            &["Charcoal".to_owned()],
+            &[],
+            &[],
+        );
         assert!(!notice.bad);
         assert!(notice.text.contains("Charcoal"), "{}", notice.text);
         assert!(notice.text.contains("charcoal.myb"), "{}", notice.text);
@@ -1667,6 +1717,7 @@ mod tests {
         let many = import_notice(
             std::slice::from_ref(&one),
             &["A".to_owned(), "B".to_owned()],
+            &[],
             &[],
         );
         assert!(many.text.starts_with("Imported 2 brushes"), "{}", many.text);
@@ -1676,6 +1727,7 @@ mod tests {
             &[one.clone(), PathBuf::from("nope.kpp")],
             &["A".to_owned()],
             &["nope.kpp is not a brush file Umber can read".to_owned()],
+            &[],
         );
         assert!(mixed.bad);
         assert!(mixed.text.contains("nope.kpp"), "{}", mixed.text);
@@ -1688,8 +1740,47 @@ mod tests {
             &[PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
             &[],
             &["a failed".to_owned(), "b failed".to_owned(), "c".to_owned()],
+            &[],
         );
         assert!(notice.bad);
         assert!(notice.text.contains("2 more failed"), "{}", notice.text);
+    }
+
+    /// The brush arrives, and is *said* to be an approximation. Shipping it
+    /// silently is the failure this guards: the user would find out by painting
+    /// with it and concluding the importer is broken.
+    #[test]
+    fn an_import_that_lost_something_says_so_without_calling_it_a_failure() {
+        let path = PathBuf::from("packs/smudger.myb");
+        let notice = import_notice(
+            std::slice::from_ref(&path),
+            &["Smudger".to_owned()],
+            &[],
+            &["smudge"],
+        );
+        assert!(notice.text.contains("Imported"), "{}", notice.text);
+        assert!(notice.text.contains("smudge"), "{}", notice.text);
+        assert!(notice.text.contains("paint differently"), "{}", notice.text);
+
+        // Losses survive alongside a real failure rather than one hiding the
+        // other — they are answers to different questions.
+        let both = import_notice(
+            &[path, PathBuf::from("nope.kpp")],
+            &["Smudger".to_owned()],
+            &["nope.kpp could not be read".to_owned()],
+            &["smudge"],
+        );
+        assert!(both.text.contains("smudge"), "{}", both.text);
+        assert!(both.text.contains("nope.kpp"), "{}", both.text);
+    }
+
+    #[test]
+    fn several_lost_features_read_as_a_sentence() {
+        assert_eq!(join_words(&["smudge"]), "smudge");
+        assert_eq!(join_words(&["smudge", "tilt"]), "smudge and tilt");
+        assert_eq!(
+            join_words(&["smudge", "tilt", "direction"]),
+            "smudge, tilt and direction"
+        );
     }
 }

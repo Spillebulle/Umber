@@ -56,6 +56,34 @@ pub fn read_file(path: &Path) -> Result<Vec<BrushPreset>, PresetError> {
     }
 }
 
+/// What reading this file will have to throw away, named.
+///
+/// The shipped library is built by a script that *refuses* a brush depending on
+/// anything Umber cannot render, so nothing dishonest is ever shipped. A brush
+/// the user imports themselves cannot be refused on the same grounds — it is
+/// theirs, and a usable approximation beats a rejection — but it must not
+/// arrive pretending to be the brush it came from. This is what lets the caller
+/// say which part did not survive.
+///
+/// Deliberately best-effort: an unreadable file returns nothing here and fails
+/// properly in [`read_file`], so a file is never reported on twice.
+pub fn dropped_features(path: &Path) -> Vec<&'static str> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "myb" => preset::read_to_string(path)
+            .ok()
+            .and_then(|text| mypaint::unsupported_features(&text).ok())
+            .unwrap_or_default(),
+        // An Umber library holds Umber brushes; there is nothing in it that
+        // Umber cannot render.
+        _ => Vec::new(),
+    }
+}
+
 /// Turn a brush file's stem into something worth showing in a picker.
 ///
 /// Brush packs name files for the filesystem — `8B_Pencil#1`, `coarse_bulk_1`,

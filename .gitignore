@@ -27,3 +27,7 @@ xcuserdata/
 
 # Agent worktrees. Git worktrees of this same repository; never content.
 .claude/worktrees/
+
+# Editor safe-backup copies. They are stale duplicates of a real source
+# file and compile as one, which is a confusing way to find out.
+*safeBackup*

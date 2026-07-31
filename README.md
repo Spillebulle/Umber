@@ -7,9 +7,11 @@ decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
 > **Status: early.** The canvas, brush, eraser, layers, colour picker, brush
-> editor, settings and PNG export work on desktop. Preferences — theme,
-> layout, input and shortcut bindings — persist across runs. There is no
-> document format and no mobile packaging yet. See [Roadmap](#roadmap).
+> editor, brush library, settings and PNG export work on desktop, and documents
+> written by Krita, Photoshop and any OpenRaster application can be opened.
+> Preferences — theme, layout, input and shortcut bindings — persist across
+> runs. Umber has no document format of its own and no mobile packaging yet.
+> See [Roadmap](#roadmap).
 
 ## Building
 
@@ -50,8 +52,8 @@ sudo pacman -S wayland libxkbcommon libx11 libxrandr libxi vulkan-icd-loader
 ## Interface
 
 The workspace follows the **Umber app** screen of the design project: a menu
-bar, a tool options strip, a two-column tool rail, the canvas, and stacked
-modules (Colour, Brushes, Layers) in a sidebar.
+bar, a document tab strip, a tool options strip, a two-column tool rail, the
+canvas, and stacked modules (Colour, Brushes, Layers) in a sidebar.
 
 ### Layout edit mode
 
@@ -101,10 +103,10 @@ one open at a time. Four are live — **General** (interface scale), **Pressure*
 design but have nothing behind them, so they are shown greyed with a tooltip
 saying why rather than opening onto controls that do nothing. The same applies
 inside the panes: the design's "New theme" card, its theme editor's Save and
-Export, the shortcut Import and Export, and the four-way accent choice are all
-drawn dead, because themes are a compiled table of values and there is no theme
-or keymap file format yet. The theme editor's colour rows *are* real — they read
-the palette in use.
+Export, and the shortcut Import and Export are drawn dead, because themes are a
+compiled table of values and there is no theme or keymap file format yet. The
+theme editor's colour rows *are* real — they read the palette in use, and the
+design's four-way **accent** choice is live and persists.
 
 **Shortcuts** lists every command, with a search field, and lets you rebind:
 click a key to listen for a new one, press Escape to cancel, add a second key
@@ -134,6 +136,61 @@ previews are painted directly (`widgets.rs`, `colorpicker.rs`) rather than
 restyled out of egui's stock widgets, which have a look of their own that
 fights the design.
 
+### Brushes
+
+Umber ships **133 presets** in eight collections. Five are its own; the other
+128 are converted from [mypaint-brushes
+2.0.2](https://github.com/mypaint/mypaint-brushes), which is CC0, and each one
+carries its author and licence through the conversion and shows them in the
+library. Of the 196 brushes in that set, 68 were refused rather than
+approximated — 67 of those because they depend on smudging, which picks colour
+up off the canvas, and Umber's brush engine does not do that yet. A preset that
+would have painted differently from the original is not worth shipping under
+the original's name.
+
+The Brushes panel is the design's: a shortlist with the header's `＋`. Behind
+the second mark is the **library browser**, which the design does not have — a
+column that works for five brushes does not work for 133, so the browser adds a
+search field, a collection picker, and per-brush rename and delete. Brushes you
+save are marked with a dot and are the only ones those two controls apply to.
+
+Editing a brush changes it live, so the editor's footer offers to **save** what
+you have made, either under a new name or over the brush you started from. Your
+library is a `brushes.ron` beside the settings file, rewritten on every change.
+If it cannot be read, everything that writes is disabled and the reason is
+shown, rather than quietly starting your collection again over the top of it.
+
+**Importing** reads MyPaint `.myb` brushes and Umber's own `.ron` libraries.
+A `.myb` that leans on something Umber cannot render — smudging, most often —
+is still imported, because an approximation of a brush you chose beats a
+refusal, but the notice names what was dropped. The generated library holds
+itself to the stricter rule and refuses those outright, since nothing shipped
+under an author's name should paint unlike their brush.
+
+### Documents
+
+**File → Open**, or a file dropped on the window, reads documents written by
+other applications: **OpenRaster** (`.ora`), **Krita** (`.kra`), **Photoshop**
+(`.psd`) and flat **PNG**. Layers, names, opacity, visibility and blend modes
+come across where they have an Umber equivalent. Anything lost on the way in —
+a flattened group, a dropped mask, a blend mode with no counterpart — is named
+in a notice when the document opens, not left in the log.
+
+Clip Studio (`.clip`), MediBang (`.mdp`), Procreate, `.xcf` and layered TIFF
+are refused by name — `docs/document-import.md` records why each one was left
+out. The governing rule is that an import producing subtly wrong pixels is
+worse than one that refuses: a refusal sends you to export an ORA, while a
+wrong import wastes an afternoon before you notice the colours moved.
+
+Several documents are open at once, in the design's tab strip. Each has its own
+layers, history and camera, and its own GPU storage — switching tabs moves that
+state wholesale rather than reloading anything. Closing a document with unsaved
+work asks first, and shows you the document before it asks.
+
+There is still no way to *write* a layered file: PNG export is flat, and Save
+is drawn disabled with a tooltip saying so. Reading someone else's format never
+needed a format of our own; writing one does.
+
 ### Not built yet
 
 Taken from the design but not implemented, roughly by size:
@@ -142,10 +199,11 @@ Taken from the design but not implemented, roughly by size:
   parts of the design's layout edit mode still outstanding. The rest of it is
   built — see [Layout edit mode](#layout-edit-mode).
 - The brush editor's **Texture** tab. Tip and Dynamics are built.
-- A document format. PNG export works; there is no way to save and reopen a
-  layered document.
-- Document tabs (single-document only), the Navigator overlay, Palette and
-  Harmony colour modes, and per-brush blend modes.
+- A document format of Umber's own. Other applications' files open (see
+  [Documents](#documents)) and PNG export works, but nothing can be saved and
+  reopened with its layers intact.
+- The Navigator overlay, Palette and Harmony colour modes, and per-brush blend
+  modes.
 - The design shows a sixteen-tool rail; Umber has four. The missing twelve are
   not drawn rather than shown as buttons that do nothing.
 
@@ -292,7 +350,8 @@ rather than removing it.
 
 Next, roughly in order:
 
-- A document format — saving and reopening a layered file
+- A document format — saving and reopening a layered file. Reading other
+  applications' files already works; this is the writing half.
 - Structural undo, so layer add/delete/reorder joins the history
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding

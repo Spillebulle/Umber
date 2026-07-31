@@ -98,6 +98,65 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
 
+### Documents
+
+Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
+the per-document state — document, layers, history, camera — and switching tabs
+moves that block in and out of `Editor` wholesale.
+
+- **Nothing above the `--- documents ---` line in `editor.rs` is per-document.**
+  That is what keeps a tab switch to four moves instead of an audit of every
+  field. Adding per-document state means adding it to `DocumentState` too, or it
+  will leak between tabs.
+- **Each document owns a `CanvasRenderer`**, because each owns a layer texture
+  array. `Graphics::add_canvas` clones the pipeline handles out of the first
+  renderer — do not let it recompile the shaders per document. Closing a tab
+  must drop the renderer, or the textures are never given back.
+- **`resumed` rebuilds storage for every open document, not just the active
+  one.** That path is Android's: the surface dies on suspend and the session
+  survives it. Pixels do not survive, and never have; a document with no
+  renderer would be a blank window with no way out.
+
+### Importing other applications' files
+
+`umber-core::docimport` reads `.ora`, `.kra`, `.psd` and `.png`.
+
+- **An import that loses something must say so.** Every loss appends an
+  `ImportWarning` and the UI shows them; the rule is that subtly wrong pixels
+  are worse than a refusal, because a refusal sends the artist to export an ORA
+  while a wrong import wastes an afternoon.
+- **The shipped brush library and a user's own import hold to different
+  standards, deliberately.** `examples/build-brush-library.rs` *refuses* a
+  MyPaint brush that needs anything Umber cannot render — nothing shipped under
+  an author's name should paint unlike their brush. An interactive import
+  approximates instead and names what it dropped, via
+  `brushimport::dropped_features`. Do not make either behave like the other.
+- **`ImportedLayer::pixels` is canvas-sized RGBA8, sRGB-encoded with alpha
+  premultiplied in linear space** — exactly what a layer texture holds, so it
+  goes straight to `write_texture`. Premultiplying in sRGB is the classic way to
+  get haloed edges here.
+- **`psd` 0.3.5's `Layer::visible()` returns its own opposite.** Adobe's flag is
+  *hidden*; the crate reads it as *visible*. `photoshop.rs` inverts it, and a
+  test pins that. Do not "fix" the inversion.
+
+### The brush library
+
+- **`Editor::presets` is the merged list** — everything shipped, then everything
+  the user saved — and `apply_preset` selects by *index* into it. `resync`
+  rebuilds it and re-finds the selection **by id**, because an index does not
+  survive a delete.
+- **Key dispatch happens at the winit level, before egui sees a keystroke**, so
+  every text field outside the canvas has to suspend it via
+  `shortcuts::set_capturing`. Without that, typing "brush" into a search box
+  selects the brush, then the eraser, on the way past.
+- **The library's modals are drawn from `panels::sidebars`, not from the
+  Brushes panel body.** The layout can hide that panel, and a modal that goes
+  with its panel cannot be shut and cannot be reopened.
+- Nothing on the drawing path allocates per frame: the grouping and credit lines
+  are built once per change, search folds case in place, and rows scrolled out
+  of view skip painting. At 133 presets the naive version of each shows up in a
+  frame time.
+
 ### Uniform layout
 
 The Rust `#[repr(C)]` struct and the WGSL `struct` must agree byte for byte, and
@@ -144,11 +203,14 @@ project (Claude Design project `3bfca321-22c2-4bf2-bbc9-80fab57f1e65`, read via
 the `DesignSync` tool). That page supersedes the earlier "Umber Explorations"
 page — go by it.
 
-The design is the full endgame app; a good deal of it is deliberately not built
-(layout edit mode, brush editor, settings dialog, document tabs, navigator,
-sixteen tools). The README lists what and why. **Do not add UI for features that
-do not work** — a disabled control with an explanatory tooltip is better than a
-live one that lies.
+Most of the design is built: layout edit mode, the brush editor and library, the
+settings dialog, document tabs and the splash. What is not — the navigator, the
+brush editor's Texture tab, Palette and Harmony picker modes, twelve of the
+sixteen tools, drag-to-reorder in the rail, saved workspaces — is listed with
+its reason in the README. **Do not add UI for features that do not work** — a
+disabled control with an explanatory tooltip is better than a live one that
+lies, and a control that is simply not drawn is better than either where the
+design shows a whole row of them.
 
 - **Never hard-code a colour.** Everything comes from `theme::Palette`, which is
   what makes the second theme a table of values rather than an edit sweep.
