@@ -35,6 +35,10 @@ pub enum Icon {
     Close,
     Pencil,
     Gear,
+    Check,
+    // Brush library
+    Grid,
+    Import,
     // Layout
     Grip,
     Corner,
@@ -153,6 +157,37 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                     at(12.0 + c * 9.2, 12.0 + s * 9.2),
                 );
             }
+        }
+
+        Icon::Check => path(vec![at(5.0, 12.5), at(10.0, 17.5), at(19.0, 6.5)]),
+
+        Icon::Grid => {
+            // Four cells: "show me the whole set", against the single column
+            // the Brushes panel has room for. Drawn as closed paths rather than
+            // stroked rects so the corner radius matches the rest of the set.
+            for (x, y) in [(4.5, 4.5), (13.0, 4.5), (4.5, 13.0), (13.0, 13.0)] {
+                path(vec![
+                    at(x, y),
+                    at(x + 6.5, y),
+                    at(x + 6.5, y + 6.5),
+                    at(x, y + 6.5),
+                    at(x, y),
+                ]);
+            }
+        }
+
+        Icon::Import => {
+            // An arrow dropping into an open tray. The tray is what separates
+            // this from a plain download mark: the file is coming *into* a
+            // collection that already exists.
+            line(at(12.0, 3.5), at(12.0, 14.5));
+            path(vec![at(8.0, 10.5), at(12.0, 14.5), at(16.0, 10.5)]);
+            path(vec![
+                at(5.0, 15.0),
+                at(5.0, 20.0),
+                at(19.0, 20.0),
+                at(19.0, 15.0),
+            ]);
         }
 
         Icon::Grip => {

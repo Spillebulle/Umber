@@ -316,29 +316,59 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
     );
 }
 
+/// What one brush row shows.
+///
+/// A struct rather than eight positional arguments: the library draws the same
+/// row in two shapes — a compact one in the 264 px panel and a taller one in
+/// the browser, where a second line carries the attribution — and at that width
+/// a call site of bare booleans stops being readable.
+pub struct BrushRow<'a> {
+    pub name: &'a str,
+    /// The line under the name: author and licence. Empty in the panel, which
+    /// has no room for it and puts the credit in a tooltip instead.
+    pub detail: &'a str,
+    pub opacity: f32,
+    pub hardness: f32,
+    pub selected: bool,
+    /// One the user saved, as opposed to one Umber ships. Marked with a dot
+    /// rather than a word, because the panel is 264 px wide.
+    pub user: bool,
+    pub height: f32,
+    /// Width kept clear at the right for controls the caller draws over the
+    /// row — rename and delete in the browser. Reserved always, so a name does
+    /// not reflow the moment the pointer arrives.
+    pub trailing: f32,
+}
+
 /// A brush preset: a tapered stroke sample, then the name.
 ///
 /// The sample is drawn from the preset's own opacity and hardness, so the rows
 /// differ the way the brushes do rather than all showing the same smear.
-pub fn brush_preset_row(
-    ui: &mut Ui,
-    p: &Palette,
-    name: &str,
-    opacity: f32,
-    hardness: f32,
-    selected: bool,
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), row.height), Sense::click());
+
+    // The library is 133 presets deep and both lists are scrolled, so most
+    // rows on most frames are off screen. Each sample is two dozen circles;
+    // painting the invisible ones is the one part of this that would show up
+    // in a frame time.
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
 
     let painter = ui.painter();
-    if selected {
+    if row.selected {
         painter.rect_filled(rect, metrics::RADIUS, p.control_active);
     } else if response.hovered() {
         painter.rect_filled(rect, metrics::RADIUS, p.control);
     }
 
     // Tapered sample: a row of circles whose radius and alpha rise then fall.
-    let sample = Rect::from_min_size(rect.left_top() + vec2(7.0, 6.0), vec2(64.0, 14.0));
+    let sample_h = (row.height - 12.0).clamp(10.0, 16.0);
+    let sample = Rect::from_center_size(
+        pos2(rect.left() + 7.0 + 32.0, rect.center().y),
+        vec2(64.0, sample_h),
+    );
     const STEPS: usize = 26;
     for i in 0..STEPS {
         let t = i as f32 / (STEPS - 1) as f32;
@@ -353,7 +383,7 @@ pub fn brush_preset_row(
             continue;
         }
         // Softer brushes read as a wider, fainter smear.
-        let alpha = opacity * taper.powf(1.0 + (1.0 - hardness) * 1.5);
+        let alpha = row.opacity * taper.powf(1.0 + (1.0 - row.hardness) * 1.5);
         painter.circle_filled(
             pos2(sample.left() + sample.width() * t, sample.center().y),
             radius,
@@ -361,15 +391,78 @@ pub fn brush_preset_row(
         );
     }
 
-    painter.text(
-        pos2(sample.right() + 9.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        name,
-        FontId::proportional(text::TINY),
-        if selected { p.text_strong } else { p.text },
-    );
+    // A dot marks the rows that are yours — the ones the browser will let you
+    // rename and delete.
+    let mut right = rect.right() - 7.0 - row.trailing;
+    if row.user {
+        painter.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, p.accent);
+        right -= 12.0;
+    }
+
+    let ink = if row.selected { p.text_strong } else { p.text };
+    let left = sample.right() + 9.0;
+    let width = (right - left).max(0.0);
+    if row.detail.is_empty() {
+        painter.text(
+            pos2(left, rect.center().y),
+            Align2::LEFT_CENTER,
+            elide(painter, row.name, text::TINY, width),
+            FontId::proportional(text::TINY),
+            ink,
+        );
+    } else {
+        painter.text(
+            pos2(left, rect.center().y - 7.0),
+            Align2::LEFT_CENTER,
+            elide(painter, row.name, text::CONTROL, width),
+            FontId::proportional(text::CONTROL),
+            ink,
+        );
+        painter.text(
+            pos2(left, rect.center().y + 8.0),
+            Align2::LEFT_CENTER,
+            elide(painter, row.detail, 9.5, width),
+            FontId::proportional(9.5),
+            p.text_dim,
+        );
+    }
 
     response
+}
+
+/// Cut a run of text down to what fits, ending in an ellipsis.
+///
+/// An `egui::Label` would truncate for us, but these rows are painted rather
+/// than laid out — that is what lets the whole row be one click target — so the
+/// measuring has to happen here. Binary search rather than a linear walk keeps
+/// it at a handful of layout calls for a name that does not fit, and none at
+/// all for one that does.
+pub fn elide(painter: &egui::Painter, s: &str, size: f32, width: f32) -> String {
+    let font = FontId::proportional(size);
+    let measure = |t: &str| {
+        painter
+            .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    };
+    if width <= 0.0 {
+        return String::new();
+    }
+    if measure(s) <= width {
+        return s.to_owned();
+    }
+    // Character boundaries, so a multi-byte name is never cut mid-glyph.
+    let cuts: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    let (mut lo, mut hi) = (0usize, cuts.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&format!("{}…", &s[..cuts[mid.min(cuts.len() - 1)]])) <= width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", &s[..cuts[lo.min(cuts.len() - 1)]])
 }
 
 pub struct LayerRowResponse {
