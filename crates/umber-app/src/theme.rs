@@ -158,6 +158,37 @@ pub mod metrics {
     pub const SLIDER_KNOB: f32 = 11.0;
 }
 
+/// Install Archivo, the typeface the design specifies.
+///
+/// The file is a *variable* font. `ab_glyph`, which egui rasterises with, does
+/// not apply variation axes, so what we get is the default master — Regular.
+/// That is enough here because egui's `strong()` changes colour rather than
+/// weight, so no bold face is ever asked for. If a genuinely bold face is
+/// needed later it has to be a second, separately instanced file.
+///
+/// Archivo is bundled under the SIL Open Font License; see `assets/fonts/`.
+pub fn install_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "archivo".to_owned(),
+        std::sync::Arc::new(FontData::from_static(include_bytes!(
+            "../../../assets/fonts/Archivo[wdth,wght].ttf"
+        ))),
+    );
+
+    // Insert ahead of egui's default face rather than replacing the list: the
+    // fallbacks still cover anything Archivo lacks.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "archivo".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
 /// Push the palette into egui's own styling, so stock widgets (menus, scroll
 /// bars, tooltips) match the hand-drawn ones instead of sitting in egui's
 /// default blue-grey.

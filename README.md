@@ -6,8 +6,9 @@ Umber is being written for one goal above all others: **latency**. Every design
 decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
-> **Status: early.** The canvas, brush, eraser and layers work on desktop.
-> File saving and mobile packaging do not exist yet. See [Roadmap](#roadmap).
+> **Status: early.** The canvas, brush, eraser, layers, colour picker, brush
+> editor and PNG export work on desktop. There is no document format and no
+> mobile packaging yet. See [Roadmap](#roadmap).
 
 ## Building
 
@@ -73,16 +74,25 @@ Taken from the design but not implemented, roughly by size:
 - **Layout edit mode** — dragging panels out to float, dock zones, tear-off and
   re-docking, drag-to-reorder tools. This is the design's "advanced endgame"
   and is a large project in an immediate-mode UI.
-- **Settings dialog** — theme cards, shortcut editor.
+- **Rebinding** shortcuts. The settings dialog lists them; editing them does
+  not work yet.
 - The brush editor's **Texture** tab. Tip and Dynamics are built.
+- A document format. PNG export works; there is no way to save and reopen a
+  layered document.
 - Document tabs (single-document only), the Navigator overlay, Palette and
   Harmony colour modes, and per-brush blend modes.
 - The design shows a sixteen-tool rail; Umber has four. The missing twelve are
   not drawn rather than shown as buttons that do nothing.
 
-The design specifies **Archivo** for UI text. That font is not bundled, so
-egui's default face is used; typography is the one part of the design that is
-approximated rather than matched.
+**Archivo**, the typeface the design specifies, is bundled under the SIL Open
+Font License — see `assets/fonts/`. It is a variable font and `ab_glyph` does
+not apply variation axes, so what renders is the Regular master; egui's
+`strong()` changes colour rather than weight, so no bold face is ever asked for.
+
+Icons are **drawn as vectors** (`icons.rs`) rather than taken from a font.
+Unicode symbols would have been simpler, but Archivo carries none of them, so
+they would silently become blank boxes — and platform fallback would render
+them at a different weight and size on each OS.
 
 ## Controls
 
@@ -91,6 +101,7 @@ approximated rather than matched.
 | Left drag | Use the selected tool |
 | `B` / `E` / `H` / `Z` | Brush / eraser / pan / zoom |
 | `X` | Swap foreground and background colours |
+| `Alt` + click | Pick the colour under the cursor |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
 | Wheel | Zoom at cursor |
@@ -210,7 +221,7 @@ rather than removing it.
 
 Next, roughly in order:
 
-- Saving and loading documents
+- A document format — saving and reopening a layered file
 - Structural undo, so layer add/delete/reorder joins the history
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding

@@ -12,8 +12,9 @@
 
 use crate::colorpicker::{self, PickerMode};
 use crate::editor::{BrushTab, Editor, Tool};
-use crate::theme::{Palette, ThemeKind, metrics, text};
-use crate::widgets::{self, ToolIcon};
+use crate::icons::{self, Icon};
+use crate::theme::{Palette, metrics, text};
+use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
 use umber_core::{BlendMode, Brush, LayerStack, ResponseCurve, input::PressureSource};
 
@@ -21,6 +22,7 @@ use umber_core::{BlendMode, Brush, LayerStack, ResponseCurve, input::PressureSou
 #[derive(Default, Clone, Copy)]
 pub struct UiActions {
     pub clear: bool,
+    pub export: bool,
     pub undo: bool,
     pub redo: bool,
     pub fit_view: bool,
@@ -93,6 +95,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     }
 
     brush_editor(root, &p, ed);
+    crate::settings::show(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU
     // beneath egui, so this panel only reports its rect and stays transparent.
@@ -119,13 +122,18 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.clear = true;
                     ui.close();
                 }
+                if ui.button("Export PNG…").clicked() {
+                    actions.export = true;
+                    ui.close();
+                }
                 ui.separator();
-                // Shown but inert: saving is not built. A menu that lies about
-                // what the app can do is worse than one that admits the gap.
+                // Shown but inert: a document format does not exist yet, and a
+                // menu that lies about what the app can do is worse than one
+                // that admits the gap.
                 ui.add_enabled(false, egui::Button::new("Open…"))
-                    .on_disabled_hover_text("Not implemented yet");
+                    .on_disabled_hover_text("Umber has no document format yet");
                 ui.add_enabled(false, egui::Button::new("Save"))
-                    .on_disabled_hover_text("Not implemented yet");
+                    .on_disabled_hover_text("Umber has no document format yet");
             });
 
             ui.menu_button("Edit", |ui| {
@@ -154,16 +162,6 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.reset_zoom = true;
                     ui.close();
                 }
-                ui.separator();
-                for kind in ThemeKind::ALL {
-                    if ui
-                        .selectable_label(ed.ui.theme == kind, kind.label())
-                        .clicked()
-                    {
-                        ed.ui.theme = kind;
-                        ui.close();
-                    }
-                }
             });
 
             ui.menu_button("Window", |ui| {
@@ -174,6 +172,10 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Settings…").clicked() {
+                    ed.ui.settings_open = true;
+                    ui.close();
+                }
                 ui.add_enabled(false, egui::Button::new("Customise layout…"))
                     .on_disabled_hover_text("Panel docking is not implemented yet");
             });
@@ -198,6 +200,10 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if icon_button(ui, p, Icon::Gear, true, "Settings") {
+                ed.ui.settings_open = true;
+            }
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!("{:.0} fps", ed.average_fps()))
                     .size(text::TINY)
@@ -213,13 +219,14 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
 /// the two a painter reaches for constantly.
 fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.horizontal_centered(|ui| {
-        let (glyph, name) = match ed.ui.tool {
-            Tool::Brush => ("✎", "Brush"),
-            Tool::Eraser => ("◻", "Eraser"),
-            Tool::Pan => ("✥", "Pan"),
-            Tool::Zoom => ("⌕", "Zoom"),
+        let (icon, name) = match ed.ui.tool {
+            Tool::Brush => (Icon::Brush, "Brush"),
+            Tool::Eraser => (Icon::Eraser, "Eraser"),
+            Tool::Pan => (Icon::Pan, "Pan"),
+            Tool::Zoom => (Icon::Zoom, "Zoom"),
         };
-        ui.label(egui::RichText::new(glyph).size(13.0).color(p.accent));
+        let (glyph_rect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+        icons::draw(ui.painter(), glyph_rect, icon, p.accent);
         ui.label(
             egui::RichText::new(name)
                 .size(text::SMALL)
@@ -266,15 +273,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new("✎ Edit brush…")
-                            .size(text::SMALL)
-                            .color(p.text_dim),
-                    )
-                    .sense(Sense::click()),
-                )
+            if text_icon_link(ui, p, Icon::Pencil, "Edit brush…")
                 .on_hover_text("Open the brush editor")
                 .clicked()
             {
@@ -297,10 +296,10 @@ fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         // tools where the design shows sixteen; the rest are simply not drawn,
         // rather than shown as buttons that do nothing.
         let tools = [
-            (Tool::Brush, ToolIcon::Brush, "Brush (B)"),
-            (Tool::Eraser, ToolIcon::Eraser, "Eraser (E)"),
-            (Tool::Pan, ToolIcon::Pan, "Pan (H, or hold Space)"),
-            (Tool::Zoom, ToolIcon::Zoom, "Zoom (Z)"),
+            (Tool::Brush, Icon::Brush, "Brush (B)"),
+            (Tool::Eraser, Icon::Eraser, "Eraser (E)"),
+            (Tool::Pan, Icon::Pan, "Pan (H, or hold Space)"),
+            (Tool::Zoom, Icon::Zoom, "Zoom (Z)"),
         ];
         let mut picked = None;
         for pair in tools.chunks(2) {
@@ -394,11 +393,7 @@ fn colour_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ui.horizontal(|ui| {
             panel_title(ui, p, "Colour");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = format!("◐ {} ▾", ed.ui.picker.label());
-                let response = ui.add(
-                    egui::Label::new(egui::RichText::new(label).size(9.5).color(p.text_dim))
-                        .sense(Sense::click()),
-                );
+                let response = mode_switch(ui, p, ed.ui.picker.label());
                 if response.clicked() {
                     ed.ui.picker_menu_open = !ed.ui.picker_menu_open;
                 }
@@ -481,19 +476,25 @@ fn layers_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
         ui.horizontal(|ui| {
             panel_title(ui, p, "Layers");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, p, "🗑", count > 1, "Delete layer — clears undo history") {
+                if icon_button(
+                    ui,
+                    p,
+                    Icon::Trash,
+                    count > 1,
+                    "Delete layer — clears undo history",
+                ) {
                     actions.delete_layer = Some(active);
                 }
-                if icon_button(ui, p, "▾", active > 0, "Move layer down") {
+                if icon_button(ui, p, Icon::ChevronDown, active > 0, "Move layer down") {
                     actions.move_layer_down = Some(active);
                 }
-                if icon_button(ui, p, "▴", active + 1 < count, "Move layer up") {
+                if icon_button(ui, p, Icon::ChevronUp, active + 1 < count, "Move layer up") {
                     actions.move_layer_up = Some(active);
                 }
                 if icon_button(
                     ui,
                     p,
-                    "＋",
+                    Icon::Plus,
                     count < LayerStack::MAX,
                     "Add a layer above the current one",
                 ) {
@@ -563,14 +564,13 @@ fn layers_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
     });
 }
 
-fn icon_button(ui: &mut egui::Ui, p: &Palette, glyph: &str, enabled: bool, tip: &str) -> bool {
+fn icon_button(ui: &mut egui::Ui, p: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
     let hovered = enabled && response.hovered();
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        glyph,
-        FontId::proportional(text::SMALL),
+    icons::draw(
+        ui.painter(),
+        rect,
+        icon,
         if !enabled {
             p.text_dim.gamma_multiply(0.4)
         } else if hovered {
@@ -582,6 +582,74 @@ fn icon_button(ui: &mut egui::Ui, p: &Palette, glyph: &str, enabled: bool, tip: 
     enabled && response.on_hover_text(tip).clicked()
 }
 
+/// An icon followed by a label, behaving as one clickable unit.
+fn text_icon_link(ui: &mut egui::Ui, p: &Palette, icon: Icon, label: &str) -> egui::Response {
+    let font = FontId::proportional(text::SMALL);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 20.0, 18.0), Sense::click());
+    let colour = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+    icons::draw(
+        ui.painter(),
+        Rect::from_min_size(rect.left_top(), vec2(16.0, 18.0)),
+        icon,
+        colour,
+    );
+    ui.painter().text(
+        rect.right_center(),
+        Align2::RIGHT_CENTER,
+        label,
+        font,
+        colour,
+    );
+    response
+}
+
+/// The Colour panel's picker-type switch: a half-filled disc, the mode name,
+/// and a chevron.
+fn mode_switch(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
+    let font = FontId::proportional(9.5);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 26.0, 16.0), Sense::click());
+    let colour = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+    let painter = ui.painter();
+    icons::draw(
+        painter,
+        Rect::from_min_size(rect.left_top(), vec2(12.0, 16.0)),
+        Icon::HalfCircle,
+        colour,
+    );
+    painter.text(
+        rect.left_center() + vec2(15.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        colour,
+    );
+    icons::draw(
+        painter,
+        Rect::from_min_size(rect.right_top() - vec2(11.0, 0.0), vec2(11.0, 16.0)),
+        Icon::ChevronDown,
+        colour,
+    );
+    response
+}
+
 fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     ui.horizontal_centered(|ui| {
         ui.label(
@@ -591,16 +659,8 @@ fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let hand = if ed.ui.left_handed {
-                "⇋ left"
-            } else {
-                "⇋ right"
-            };
-            if ui
-                .add(
-                    egui::Label::new(egui::RichText::new(hand).size(text::TINY).color(p.accent))
-                        .sense(Sense::click()),
-                )
+            let hand = if ed.ui.left_handed { "left" } else { "right" };
+            if text_icon_link(ui, p, Icon::Swap, hand)
                 .on_hover_text("Mirror the layout for left-handed use")
                 .clicked()
             {
@@ -693,17 +753,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new("✕")
-                                    .size(text::CONTROL)
-                                    .color(p.text_dim),
-                            )
-                            .sense(Sense::click()),
-                        )
-                        .clicked()
-                    {
+                    if icon_button(ui, p, Icon::Close, true, "Close") {
                         ed.ui.brush_editor_open = false;
                     }
                 });

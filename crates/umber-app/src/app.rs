@@ -1,11 +1,12 @@
 //! Window lifecycle, input translation and the frame loop.
 
 use crate::editor::{Editor, Interaction, Tool};
+use crate::shortcuts::{self, Action};
 use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
-use umber_core::{Brush, Camera, Dab, InputPoint, PixelPatch};
+use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -28,7 +29,6 @@ struct Graphics {
     egui_renderer: egui_wgpu::Renderer,
 }
 
-#[derive(Default)]
 pub struct UmberApp {
     gfx: Option<Graphics>,
     editor: Editor,
@@ -37,6 +37,20 @@ pub struct UmberApp {
     /// Theme currently pushed into egui's style, so restyling only happens on
     /// an actual change.
     applied_theme: Option<ThemeKind>,
+    bindings: Vec<shortcuts::Binding>,
+}
+
+impl Default for UmberApp {
+    fn default() -> Self {
+        Self {
+            gfx: None,
+            editor: Editor::default(),
+            modifiers: ModifiersState::default(),
+            last_frame: None,
+            applied_theme: None,
+            bindings: shortcuts::defaults(),
+        }
+    }
 }
 
 impl UmberApp {
@@ -237,6 +251,8 @@ impl UmberApp {
     }
 
     fn handle_keys(&mut self, key: KeyCode, pressed: bool) -> bool {
+        // Space is a held modifier with press *and* release meaning, which a
+        // press-resolved binding table cannot express, so it stays separate.
         if key == KeyCode::Space {
             self.editor.space_down = pressed;
             return true;
@@ -245,33 +261,78 @@ impl UmberApp {
             return false;
         }
 
-        let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
-        let shift = self.modifiers.shift_key();
+        let Some(action) = shortcuts::resolve(&self.bindings, key, self.modifiers) else {
+            return false;
+        };
 
-        match key {
-            KeyCode::KeyZ if ctrl && shift => self.redo(),
-            KeyCode::KeyZ if ctrl => self.undo(),
-            KeyCode::KeyY if ctrl => self.redo(),
-            KeyCode::Digit0 if ctrl => {
-                self.editor.camera = Camera::fit(self.editor.doc.size_vec2(), self.viewport());
-            }
-            KeyCode::Digit1 if ctrl => self.editor.camera.zoom = 1.0,
-            KeyCode::KeyB => self.editor.set_tool(Tool::Brush),
-            KeyCode::KeyE => self.editor.set_tool(Tool::Eraser),
-            KeyCode::KeyH => self.editor.set_tool(Tool::Pan),
-            KeyCode::KeyZ => self.editor.set_tool(Tool::Zoom),
-            KeyCode::KeyX => self.editor.swap_colors(),
-            KeyCode::BracketLeft => {
+        match action {
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+            Action::BrushTool => self.editor.set_tool(Tool::Brush),
+            Action::EraserTool => self.editor.set_tool(Tool::Eraser),
+            Action::PanTool => self.editor.set_tool(Tool::Pan),
+            Action::ZoomTool => self.editor.set_tool(Tool::Zoom),
+            Action::SwapColours => self.editor.swap_colors(),
+            Action::SizeDown => {
                 self.editor.brush.size =
                     (self.editor.brush.size / 1.15).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE);
             }
-            KeyCode::BracketRight => {
+            Action::SizeUp => {
                 self.editor.brush.size =
                     (self.editor.brush.size * 1.15).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE);
             }
-            _ => return false,
+            Action::FitView => self.editor.fit_view(),
+            Action::ActualSize => self.editor.camera.zoom = 1.0,
         }
         true
+    }
+
+    /// Take the colour under the cursor as the painting colour.
+    fn pick_colour_at_cursor(&mut self) {
+        let doc = self.editor.screen_to_doc(self.editor.cursor);
+        let size = self.editor.doc.size;
+        if doc.x < 0.0 || doc.y < 0.0 || doc.x >= size.x as f32 || doc.y >= size.y as f32 {
+            return;
+        }
+
+        let layers = self.editor.layer_draws();
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let px = gfx
+            .canvas
+            .pick_colour(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc);
+
+        // Transparent means there is nothing to pick; taking it would silently
+        // set the brush to black.
+        if px[3] == 0 {
+            return;
+        }
+        self.editor
+            .set_color(Color::from_srgb_u8(px[0], px[1], px[2], 255));
+    }
+
+    /// Flatten the visible stack and write it to a PNG the user picks.
+    fn export_png(&mut self) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export PNG")
+            .add_filter("PNG image", &["png"])
+            .set_file_name("untitled.png")
+            .save_file()
+        else {
+            return;
+        };
+
+        let layers = self.editor.layer_draws();
+        let pixels = gfx
+            .canvas
+            .export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
+
+        let size = self.editor.doc.size;
+        match write_png(&path, size.x, size.y, &pixels) {
+            Ok(()) => log::info!("exported {}", path.display()),
+            Err(e) => log::error!("could not write {}: {e}", path.display()),
+        }
     }
 
     /// Two-finger pinch: pan by the midpoint delta, zoom by the spread ratio.
@@ -393,6 +454,7 @@ impl UmberApp {
                 active_index: self.editor.layers.active_index() as u32,
                 stroke: self.editor.stroke_style,
                 backdrop: theme::Palette::of(self.editor.ui.theme).backdrop_display(),
+                export: false,
             },
         );
 
@@ -455,6 +517,9 @@ impl UmberApp {
         }
         if actions.clear {
             self.clear_active_layer();
+        }
+        if actions.export {
+            self.export_png();
         }
         if actions.add_layer {
             self.add_layer();
@@ -520,6 +585,7 @@ impl ApplicationHandler for UmberApp {
         gpu.queue.submit(Some(enc.finish()));
 
         let egui_ctx = egui::Context::default();
+        theme::install_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui_ctx.viewport_id(),
@@ -636,7 +702,11 @@ impl ApplicationHandler for UmberApp {
                         Interaction::Idle
                     };
                 } else if button == MouseButton::Left {
-                    if pressed && !ui_has_pointer {
+                    if pressed && !ui_has_pointer && self.modifiers.alt_key() {
+                        // Alt is the eyedropper in every paint app; honouring it
+                        // whatever tool is selected is what people expect.
+                        self.pick_colour_at_cursor();
+                    } else if pressed && !ui_has_pointer {
                         let pos = self.editor.cursor;
                         self.editor.last_cursor = pos;
                         match self.editor.ui.tool {
@@ -732,4 +802,21 @@ impl ApplicationHandler for UmberApp {
             _ => {}
         }
     }
+}
+
+/// Write straight-alpha RGBA8 out as a PNG.
+fn write_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // The composite shader gamma-encodes on the way out, so the bytes are sRGB.
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    encoder.write_header()?.write_image_data(pixels)?;
+    Ok(())
 }

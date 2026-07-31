@@ -145,8 +145,8 @@ fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> boo
         p,
         &mut picked,
         &[
-            (WheelShape::Triangle, "▲ Triangle"),
-            (WheelShape::Square, "■ Square"),
+            (WheelShape::Triangle, "Triangle"),
+            (WheelShape::Square, "Square"),
         ],
     ) {
         *shape = picked;

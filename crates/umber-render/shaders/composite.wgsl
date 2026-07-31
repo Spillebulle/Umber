@@ -29,6 +29,18 @@ struct View {
     stroke_mode: u32,     // 0 = paint, 1 = erase
     active_index: u32,    // stack position receiving the stroke
     checker: f32,         // checker square size, screen px
+    // 1 when rendering for export: no checkerboard, no surround, and straight
+    // alpha out. Sharing the pass with the on-screen path is deliberate —
+    // a separate export shader would be a second copy of the blend maths to
+    // keep in step, and exports that differ from the screen are a classic bug.
+    // Named with a prefix because `export` is a reserved word in WGSL.
+    is_export: u32,
+    // Three scalars, not a vec3<u32>: a vec3 carries 16-byte alignment, which
+    // would push it to the next 16-byte boundary and leave the struct 16 bytes
+    // longer than the Rust side. Scalars are 4-aligned and pack as intended.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
     // Per stack position, bottom first: (opacity, blend mode, slot, visible).
     // Packed as floats to dodge std140's array-stride rules; every value is a
     // small integer or a 0..1 float, so the round trip is exact.
@@ -114,6 +126,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = doc / v.doc_size;
 
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+        if (v.is_export == 1u) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
         return vec4<f32>(v.backdrop.rgb, 1.0);
     }
 
@@ -151,6 +166,15 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
         // Scaling a premultiplied colour by opacity is correct as-is.
         acc = composite_over(acc, lay * opacity, mode);
+    }
+
+    if (v.is_export == 1u) {
+        // PNG wants straight alpha, so undo the premultiply. Fully transparent
+        // pixels have no colour to recover and would divide by zero.
+        if (acc.a <= 0.0) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+        return vec4<f32>(linear_to_srgb(acc.rgb / acc.a), acc.a);
     }
 
     let ch = (floor(screen.x / v.checker) + floor(screen.y / v.checker)) % 2.0;

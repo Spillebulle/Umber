@@ -7,6 +7,9 @@
 mod app;
 mod colorpicker;
 mod editor;
+mod icons;
+mod settings;
+mod shortcuts;
 mod theme;
 mod ui;
 mod widgets;

@@ -82,6 +82,8 @@ pub struct CompositeParams<'a> {
     pub stroke: StrokeStyle,
     /// Surround colour, display-space RGB.
     pub backdrop: [f32; 3],
+    /// Render for file output rather than for the screen.
+    pub export: bool,
 }
 
 #[repr(C)]
@@ -104,6 +106,8 @@ struct ViewUniforms {
     stroke_mode: u32,
     active_index: u32,
     checker: f32,
+    is_export: u32,
+    _pad: [u32; 3],
     /// (opacity, blend, slot, visible) per stack position.
     layers: [[f32; 4]; MAX_LAYERS],
 }
@@ -695,6 +699,8 @@ impl CanvasRenderer {
                 stroke_mode: mode_index(params.stroke.mode),
                 active_index: params.active_index,
                 checker: 8.0,
+                is_export: if params.export { 1 } else { 0 },
+                _pad: [0; 3],
                 layers: packed,
             }),
         );
@@ -795,6 +801,212 @@ impl CanvasRenderer {
         for view in &self.layers.slot_views {
             clear_view(encoder, view, "clear-layer");
         }
+    }
+
+    /// Flatten the visible stack to straight-alpha sRGB bytes, document-sized.
+    ///
+    /// Runs the same composite pass the screen uses, with its export flag set,
+    /// so what lands in the file is what the canvas showed. A separate export
+    /// path would be a second copy of the blend maths to keep in step.
+    pub fn export_rgba(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[LayerDraw],
+    ) -> Vec<u8> {
+        let (w, h) = (self.doc_size.x, self.doc_size.y);
+
+        // Non-sRGB: the shader does its own gamma encode.
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-export"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Zoom 1 with the pivot at the document centre makes screen and
+        // document coordinates identical, so the render is 1:1.
+        let camera = Camera {
+            center: Vec2::new(w as f32 * 0.5, h as f32 * 0.5),
+            zoom: 1.0,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("export"),
+        });
+        self.composite(
+            queue,
+            &mut encoder,
+            &view,
+            &CompositeParams {
+                camera: &camera,
+                pivot: camera.center,
+                layers,
+                // No stroke in flight: exporting mid-stroke should write what
+                // is committed, not a half-finished dab.
+                active_index: 0,
+                stroke: StrokeStyle {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+                backdrop: [0.0, 0.0, 0.0],
+                export: true,
+            },
+        );
+
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (w * 4).div_ceil(align) * align;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export-readback"),
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        let mapped = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            out.extend_from_slice(&mapped[start..start + (w * 4) as usize]);
+        }
+        drop(mapped);
+        staging.unmap();
+        out
+    }
+
+    /// Sample the flattened stack at one document pixel.
+    ///
+    /// Renders a 1×1 target rather than the whole document: an eyedropper only
+    /// needs one pixel, and flattening 2048² to read four bytes would stall for
+    /// milliseconds on every click. Uses the same composite pass as the screen,
+    /// so the sampled colour is the one the user is looking at rather than the
+    /// contents of whichever layer happens to be selected.
+    ///
+    /// Returns straight-alpha sRGB. A fully transparent pixel yields alpha 0,
+    /// which the caller should treat as "nothing there" rather than as black.
+    pub fn pick_colour(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[LayerDraw],
+        doc_point: Vec2,
+    ) -> [u8; 4] {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-pick"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // The lone fragment sits at screen (0.5, 0.5); with zoom 1 and the
+        // pivot there, that maps exactly to `doc_point`.
+        let camera = Camera {
+            center: doc_point,
+            zoom: 1.0,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pick"),
+        });
+        self.composite(
+            queue,
+            &mut encoder,
+            &view,
+            &CompositeParams {
+                camera: &camera,
+                pivot: Vec2::splat(0.5),
+                layers,
+                active_index: 0,
+                stroke: StrokeStyle {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+                backdrop: [0.0, 0.0, 0.0],
+                export: true,
+            },
+        );
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pick-readback"),
+            size: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped = slice.get_mapped_range();
+        let px = [mapped[0], mapped[1], mapped[2], mapped[3]];
+        drop(mapped);
+        staging.unmap();
+        px
     }
 
     /// Read a rectangle of one layer back to the CPU, for the undo stack.

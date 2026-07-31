@@ -98,6 +98,15 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
 
+### Uniform layout
+
+The Rust `#[repr(C)]` struct and the WGSL `struct` must agree byte for byte, and
+WGSL's alignment rules are not C's. In particular **`vec3<T>` is 16-byte
+aligned**, so a `vec3<u32>` pad does not match a Rust `[u32; 3]` — it shunts
+everything after it to the next boundary and the buffer comes out 16 bytes
+short. Use scalars for padding. A mismatch shows up as a wgpu validation error
+naming both sizes, which is at least easy to read.
+
 ### Colour space
 
 Linear RGBA everywhere inside the engine — blending in sRGB darkens midtones.
@@ -145,6 +154,11 @@ live one that lies.
   what makes the second theme a table of values rather than an edit sweep.
 - **`theme::metrics` holds the design's fixed sizes.** Use them instead of
   re-typing 264.0 or 36.0 at the call site.
+- **Never put a Unicode symbol in the UI.** Archivo carries none of them, so
+  they render as blank boxes. Add a variant to `icons::Icon` and draw it.
+- **Shortcuts live in `shortcuts.rs`, not in a `match`.** The settings dialog
+  enumerates them, which a match arm cannot do. `resolve` compares ctrl/shift/alt
+  exactly — that is what stops plain `Z` (zoom tool) also firing on `Ctrl+Z`.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
@@ -178,6 +192,11 @@ live one that lies.
 device with no surface, stamps dabs, commits, and reads pixels back. These tests
 catch shader and blend-state bugs that no CPU test can. They **skip** rather
 than fail when no adapter exists, so they stay meaningful on CI runners.
+
+`export_rgba` and `pick_colour` both reuse the *screen* composite pass with an
+export flag rather than having their own shader. A second copy of the blend
+maths would be a second thing to keep in step, and an export that differs from
+the screen is a classic bug. Keep it that way.
 
 When changing rendering, add a test there. `overlapping_dabs_do_not_compound` is
 the model: it asserts a specific pixel value that only holds if the wet-layer

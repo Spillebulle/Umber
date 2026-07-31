@@ -1,6 +1,7 @@
 //! Editor state — everything that is not a GPU resource or a window.
 
 use crate::colorpicker::{PickerMode, WheelShape};
+use crate::settings::SettingsTab;
 use crate::theme::ThemeKind;
 use glam::Vec2;
 use std::collections::HashMap;
@@ -52,6 +53,8 @@ pub struct UiState {
     pub picker_menu_open: bool,
     pub brush_editor_open: bool,
     pub brush_tab: BrushTab,
+    pub settings_open: bool,
+    pub settings_tab: SettingsTab,
 }
 
 /// Tabs of the brush editor dialog.
@@ -73,6 +76,8 @@ impl Default for UiState {
             picker_menu_open: false,
             brush_editor_open: false,
             brush_tab: BrushTab::Tip,
+            settings_open: false,
+            settings_tab: SettingsTab::Themes,
         }
     }
 }

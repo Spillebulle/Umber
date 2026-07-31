@@ -5,6 +5,7 @@
 //! toggles, segmented pickers. These are painted directly rather than fought
 //! with via styling.
 
+use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
@@ -405,12 +406,10 @@ pub fn layer_row(
     let eye = Rect::from_min_size(rect.left_top() + vec2(5.0, 6.0), vec2(18.0, 18.0));
     let eye_response = ui.interact(eye, ui.id().with(("eye", name)), Sense::click());
 
-    let painter = ui.painter();
-    painter.text(
-        eye.center(),
-        Align2::CENTER_CENTER,
-        if visible { "◉" } else { "○" },
-        FontId::proportional(text::SMALL),
+    icons::draw(
+        ui.painter(),
+        eye,
+        if visible { Icon::Eye } else { Icon::EyeOff },
         if visible { p.text } else { p.text_dim },
     );
 
@@ -527,26 +526,12 @@ pub fn curve_editor(ui: &mut Ui, p: &Palette, curve: &mut ResponseCurve, size: f
     changed
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolIcon {
-    Brush,
-    Eraser,
-    Pan,
-    Zoom,
-}
-
 /// A 36×36 icon button for the tool rail.
 ///
 /// Icons are painted rather than loaded: the design specifies them as a handful
 /// of SVG primitives, and drawing those directly avoids shipping an image
 /// atlas or a font just for four glyphs.
-pub fn tool_button(
-    ui: &mut Ui,
-    p: &Palette,
-    icon: ToolIcon,
-    active: bool,
-    tooltip: &str,
-) -> Response {
+pub fn tool_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip: &str) -> Response {
     let size = metrics::TOOL_BUTTON;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
 
@@ -563,50 +548,7 @@ pub fn tool_button(
     }
 
     let colour = if active { p.accent } else { p.text_muted };
-    draw_icon(painter, rect, icon, colour);
+    icons::draw(painter, rect.shrink(7.0), icon, colour);
 
     response.on_hover_text(tooltip)
-}
-
-/// Icons are authored against an 18×18 viewBox, matching the design's SVGs,
-/// and drawn at 1:1 inside the 36×36 button.
-fn draw_icon(painter: &egui::Painter, rect: Rect, icon: ToolIcon, colour: Color32) {
-    const BOX: f32 = 18.0;
-    let origin = rect.center() - Vec2::splat(BOX * 0.5);
-    let at = |x: f32, y: f32| origin + vec2(x, y);
-    let stroke = Stroke::new(2.0, colour);
-
-    match icon {
-        ToolIcon::Brush => {
-            painter.line_segment([at(4.0, 14.0), at(13.0, 5.0)], stroke);
-            painter.circle_filled(at(4.0, 14.0), 2.4, colour);
-        }
-        ToolIcon::Eraser => {
-            // A rounded rect rotated 35° about the centre. Painted as four
-            // segments; the design's 2 px corner radius is below the threshold
-            // where it reads at this size.
-            let (cx, cy) = (9.0, 9.0);
-            let angle = 35.0f32.to_radians();
-            let (sin, cos) = angle.sin_cos();
-            let corners = [(5.0, 4.0), (13.0, 4.0), (13.0, 14.0), (5.0, 14.0)];
-            let pts: Vec<_> = corners
-                .iter()
-                .map(|(x, y)| {
-                    let (dx, dy) = (x - cx, y - cy);
-                    at(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
-                })
-                .collect();
-            for i in 0..4 {
-                painter.line_segment([pts[i], pts[(i + 1) % 4]], stroke);
-            }
-        }
-        ToolIcon::Pan => {
-            painter.line_segment([at(9.0, 3.0), at(9.0, 15.0)], stroke);
-            painter.line_segment([at(3.0, 9.0), at(15.0, 9.0)], stroke);
-        }
-        ToolIcon::Zoom => {
-            painter.circle_stroke(at(8.0, 8.0), 4.5, stroke);
-            painter.line_segment([at(11.5, 11.5), at(15.0, 15.0)], stroke);
-        }
-    }
 }

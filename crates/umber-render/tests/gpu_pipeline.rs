@@ -167,6 +167,7 @@ impl Harness {
                 pivot: Vec2::splat(DOC as f32 * 0.5),
                 layers,
                 backdrop: [0.0, 0.0, 0.0],
+                export: false,
                 // No stroke in flight for these tests; zero opacity keeps the
                 // scratch surface out of the result whatever it contains.
                 active_index: 0,
@@ -585,4 +586,65 @@ fn stack_order_decides_what_covers_what() {
         3,
         "red over blue",
     );
+}
+
+#[test]
+fn export_flattens_to_straight_alpha() {
+    // Also guards the uniform layout: the export flag pushed the View struct
+    // past a 16-byte boundary once already, and a mismatch there is a
+    // validation error rather than a wrong pixel.
+    let mut h = harness_or_skip!();
+    let ink = Color::from_srgb_u8(200, 120, 40, 255);
+    h.fill(0, ink);
+
+    let pixels = h.canvas.export_rgba(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &[layer(0, 1.0, BlendMode::Normal)],
+    );
+    assert_eq!(pixels.len(), (DOC * DOC * 4) as usize);
+
+    let at = |x: u32, y: u32| {
+        let i = ((y * DOC + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+
+    let centre = at(32, 32);
+    assert_eq!(centre[3], 255, "painted area should be opaque");
+    assert_near(centre, [200, 120, 40], 3, "exported ink");
+}
+
+#[test]
+fn export_leaves_unpainted_pixels_transparent() {
+    // The screen composites over a checkerboard; the file must not bake that
+    // in, or every export would come out on a grey plaid background.
+    let mut h = harness_or_skip!();
+    h.stamp(&[dab(32.0, 32.0, 6.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let pixels = h.canvas.export_rgba(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &[layer(0, 1.0, BlendMode::Normal)],
+    );
+    let corner = ((2 * DOC + 2) * 4) as usize;
+    assert_eq!(pixels[corner + 3], 0, "corner should be transparent");
+}
+
+#[test]
+fn picking_reads_the_flattened_stack_not_one_layer() {
+    // An eyedropper should return what the user can see, so a layer above must
+    // win over the one below it.
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::from_srgb_u8(20, 200, 20, 255));
+    h.fill(1, Color::from_srgb_u8(200, 20, 20, 255));
+
+    let stack = [
+        layer(0, 1.0, BlendMode::Normal),
+        layer(1, 1.0, BlendMode::Normal),
+    ];
+    let px = h
+        .canvas
+        .pick_colour(&h.gpu.device, &h.gpu.queue, &stack, Vec2::new(32.5, 32.5));
+    assert_near(px, [200, 20, 20], 3, "picked colour");
 }
