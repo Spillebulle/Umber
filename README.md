@@ -45,11 +45,38 @@ On Arch:
 sudo pacman -S wayland libxkbcommon libx11 libxrandr libxi vulkan-icd-loader
 ```
 
+## Interface
+
+The workspace follows the "Graphite" direction from the Umber design project
+(screen `1b`, evolved in `2a`): a menu bar, a 48 px tool rail, the canvas, a
+264 px tabbed panel, and a status bar. The whole layout mirrors for left-handed
+use, so the rail sits under the drawing hand.
+
+Two themes ship — **Graphite** (near-black, the default) and **Paper** (warm
+neutrals) — under *View*. Colours, type scale and metrics live in
+`crates/umber-app/src/theme.rs`; nothing else hard-codes a colour, so a third
+theme is a table of values.
+
+The design's sliders, pill toggles and segmented pickers are painted directly
+(`widgets.rs`) rather than restyled out of egui's stock widgets, which have a
+look of their own that fights the design.
+
+**Taken from the design but not built yet**, in rough order of how much work
+each is: the bespoke colour picker (egui's stock picker stands in), the brush
+editor dialog, alternative colour-picker systems, the splash screen, settings
+and shortcut dialogs, and — the big one — dockable, tear-off and floating
+panels. The docking explorations (`1d`, `2c`, `3c`, `4a`) are a large project in
+an immediate-mode UI and are not attempted.
+
+The design specifies **Archivo** for UI text. That font is not bundled, so egui's
+default face is used; typography is the one part of the design that is
+approximated rather than matched.
+
 ## Controls
 
 | Input | Action |
 |---|---|
-| Left drag | Paint |
+| Left drag | Use the selected tool |
 | `B` / `E` | Brush / eraser |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |

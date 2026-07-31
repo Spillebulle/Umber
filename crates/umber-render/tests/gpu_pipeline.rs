@@ -7,6 +7,7 @@
 //! without a GPU doesn't produce noise.
 
 use glam::{UVec2, Vec2};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, StrokeStyle};
 
@@ -17,15 +18,36 @@ const DOC: u32 = 64;
 /// expected colour below would be wrong.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// One device for the whole binary.
+///
+/// Creating a device per test meant a dozen-odd concurrent Vulkan devices on
+/// one adapter, each blocking on `poll` waiting for its own submission. They
+/// starve each other and the run never finishes — a hang, not a failure, which
+/// is the worst way for CI to break.
+fn shared_gpu() -> Option<&'static Gpu> {
+    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+    GPU.get_or_init(|| {
+        let instance = Gpu::create_instance();
+        pollster::block_on(Gpu::new(instance, None)).ok()
+    })
+    .as_ref()
+}
+
 struct Harness {
-    gpu: Gpu,
+    /// Serialises GPU access. Held for the lifetime of the harness.
+    _guard: MutexGuard<'static, ()>,
+    gpu: &'static Gpu,
     canvas: CanvasRenderer,
 }
 
 impl Harness {
     fn new() -> Option<Self> {
-        let instance = Gpu::create_instance();
-        let gpu = pollster::block_on(Gpu::new(instance, None)).ok()?;
+        static SERIAL: Mutex<()> = Mutex::new(());
+        // Recover from poisoning: one failing test should not cascade into
+        // every later one reporting a mutex error instead of its own result.
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let gpu = shared_gpu()?;
         let canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT);
 
         let mut enc = gpu
@@ -35,7 +57,11 @@ impl Harness {
         canvas.clear_stroke(&mut enc);
         gpu.queue.submit(Some(enc.finish()));
 
-        Some(Self { gpu, canvas })
+        Some(Self {
+            _guard: guard,
+            gpu,
+            canvas,
+        })
     }
 
     fn encoder(&self) -> wgpu::CommandEncoder {
@@ -138,8 +164,9 @@ impl Harness {
             &view,
             &CompositeParams {
                 camera: &camera,
-                viewport: Vec2::splat(DOC as f32),
+                pivot: Vec2::splat(DOC as f32 * 0.5),
                 layers,
+                backdrop: [0.0, 0.0, 0.0],
                 // No stroke in flight for these tests; zero opacity keeps the
                 // scratch surface out of the result whatever it contains.
                 active_index: 0,

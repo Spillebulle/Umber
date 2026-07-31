@@ -1,10 +1,11 @@
 //! Editor state — everything that is not a GPU resource or a window.
 
+use crate::theme::ThemeKind;
 use glam::Vec2;
 use std::collections::HashMap;
 use std::time::Instant;
 use umber_core::{
-    Brush, Camera, Color, Document, History, InputPoint, LayerStack, StrokeBuilder,
+    Brush, BrushMode, Camera, Color, Document, History, InputPoint, LayerStack, StrokeBuilder,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -15,6 +16,55 @@ pub enum Interaction {
     Idle,
     Drawing,
     Panning,
+    Zooming,
+}
+
+/// The selected tool. Brush and eraser paint; pan and zoom navigate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Brush,
+    Eraser,
+    Pan,
+    Zoom,
+}
+
+impl Tool {
+    pub fn paints(self) -> bool {
+        matches!(self, Self::Brush | Self::Eraser)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelTab {
+    Brush,
+    Layers,
+}
+
+/// Presentation state — what the interface looks like, not what the document
+/// contains. Kept apart from the document so it can be persisted separately
+/// later without dragging artwork into a preferences file.
+#[derive(Clone, Copy, Debug)]
+pub struct UiState {
+    pub theme: ThemeKind,
+    /// Mirrors the workspace so the tool rail sits under the drawing hand.
+    pub left_handed: bool,
+    pub tab: PanelTab,
+    pub pressure_open: bool,
+    pub tool: Tool,
+    pub picker_open: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            theme: ThemeKind::Graphite,
+            left_handed: false,
+            tab: PanelTab::Brush,
+            pressure_open: true,
+            tool: Tool::Brush,
+            picker_open: false,
+        }
+    }
 }
 
 pub struct Editor {
@@ -23,6 +73,12 @@ pub struct Editor {
     pub brush: Brush,
     pub color: Color,
     pub layers: LayerStack,
+    pub ui: UiState,
+    /// Centre of the region the document is drawn in, in physical pixels.
+    /// Panels take a bite out of the window, so this is not the window centre.
+    pub canvas_pivot: Vec2,
+    /// Size of that region, for fit-to-view.
+    pub canvas_size: Vec2,
 
     pub stroke: StrokeBuilder,
     pub history: History,
@@ -34,6 +90,8 @@ pub struct Editor {
     pub last_cursor: Vec2,
     /// Space held — temporary pan modifier.
     pub space_down: bool,
+    /// Where a zoom-tool drag started; zooming keeps this point pinned.
+    pub zoom_anchor: Vec2,
 
     /// Brush settings captured at stroke start. The user can change the colour
     /// mid-stroke via the UI; the stroke must still commit with what it began
@@ -68,6 +126,9 @@ impl Default for Editor {
             brush: Brush::default(),
             color: Color::from_srgb_u8(20, 20, 24, 255),
             layers: LayerStack::new(),
+            ui: UiState::default(),
+            canvas_pivot: Vec2::ZERO,
+            canvas_size: Vec2::ONE,
             stroke: StrokeBuilder::new(),
             history: History::default(),
             pressure: PressureModel::default(),
@@ -75,6 +136,7 @@ impl Default for Editor {
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
             space_down: false,
+            zoom_anchor: Vec2::ZERO,
             stroke_style: StrokeStyle::default(),
             stroke_slot: 0,
             touches: HashMap::new(),
@@ -93,23 +155,37 @@ impl Editor {
         self.start.elapsed().as_secs_f64()
     }
 
-    pub fn screen_to_doc(&self, screen: Vec2, viewport: Vec2) -> Vec2 {
-        self.camera.screen_to_doc(screen, viewport)
+    pub fn screen_to_doc(&self, screen: Vec2) -> Vec2 {
+        self.camera.screen_to_doc(screen, self.canvas_pivot)
     }
 
     /// Build an input sample, resolving pressure through the current model.
-    pub fn sample(&mut self, screen: Vec2, viewport: Vec2, reported: Option<f32>) -> InputPoint {
+    pub fn sample(&mut self, screen: Vec2, reported: Option<f32>) -> InputPoint {
         let now = self.now();
         let dt = (now - self.last_sample_time).max(0.0);
         self.last_sample_time = now;
 
-        let doc = self.screen_to_doc(screen, viewport);
+        let doc = self.screen_to_doc(screen);
         // Speed is measured in document pixels so simulated pressure behaves
         // the same at every zoom level.
-        let distance = (doc - self.screen_to_doc(self.last_cursor, viewport)).length();
+        let distance = (doc - self.screen_to_doc(self.last_cursor)).length();
         let pressure = self.pressure.resolve(reported, distance, dt);
 
         InputPoint::new(doc, pressure, now)
+    }
+
+    /// Select a tool, keeping the brush's paint/erase mode in step.
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.ui.tool = tool;
+        match tool {
+            Tool::Brush => self.brush.mode = BrushMode::Paint,
+            Tool::Eraser => self.brush.mode = BrushMode::Erase,
+            Tool::Pan | Tool::Zoom => {}
+        }
+    }
+
+    pub fn fit_view(&mut self) {
+        self.camera = Camera::fit(self.doc.size_vec2(), self.canvas_size);
     }
 
     pub fn begin_stroke(&mut self, point: InputPoint) {

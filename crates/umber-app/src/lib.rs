@@ -6,7 +6,9 @@
 
 mod app;
 mod editor;
+mod theme;
 mod ui;
+mod widgets;
 
 pub use app::UmberApp;
 pub use editor::Editor;

@@ -1,6 +1,7 @@
 //! Window lifecycle, input translation and the frame loop.
 
-use crate::editor::{Editor, Interaction};
+use crate::editor::{Editor, Interaction, Tool};
+use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
@@ -33,6 +34,9 @@ pub struct UmberApp {
     editor: Editor,
     modifiers: ModifiersState,
     last_frame: Option<std::time::Instant>,
+    /// Theme currently pushed into egui's style, so restyling only happens on
+    /// an actual change.
+    applied_theme: Option<ThemeKind>,
 }
 
 impl UmberApp {
@@ -297,14 +301,24 @@ impl UmberApp {
         }
         self.last_frame = Some(now);
 
+        // Restyling walks the whole style struct, so only do it when the theme
+        // actually changed rather than every frame.
+        if self.applied_theme != Some(self.editor.ui.theme) {
+            theme::apply(&gfx.egui_ctx, &theme::Palette::of(self.editor.ui.theme));
+            self.applied_theme = Some(self.editor.ui.theme);
+        }
+
         // --- UI ---
-        // `Context::run` discards the closure's return value, so the panel's
-        // actions are captured out of it instead.
+        // `Context::run_ui` discards the closure's return value, so the panel's
+        // output is captured out of it instead.
         let editor = &mut self.editor;
         let mut actions = ui::UiActions::default();
+        let mut canvas_rect = egui::Rect::ZERO;
         let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
         let full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
-            actions = ui::draw(ui, editor);
+            let out = ui::draw(ui, editor);
+            actions = out.actions;
+            canvas_rect = out.canvas_rect;
         });
 
         let egui::FullOutput {
@@ -316,6 +330,16 @@ impl UmberApp {
         } = full_output;
         gfx.egui_state
             .handle_platform_output(&gfx.window, platform_output);
+
+        // egui works in points; the canvas works in physical pixels.
+        self.editor.canvas_pivot = Vec2::new(
+            canvas_rect.center().x * pixels_per_point,
+            canvas_rect.center().y * pixels_per_point,
+        );
+        self.editor.canvas_size = Vec2::new(
+            canvas_rect.width() * pixels_per_point,
+            canvas_rect.height() * pixels_per_point,
+        );
 
         let surface_texture = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -354,7 +378,6 @@ impl UmberApp {
             gfx.canvas.draw_dabs(&gfx.gpu.queue, &mut encoder, &dabs);
         }
 
-        let viewport = Vec2::new(gfx.config.width as f32, gfx.config.height as f32);
         let layer_draws = self.editor.layer_draws();
         gfx.canvas.composite(
             &gfx.gpu.queue,
@@ -362,10 +385,11 @@ impl UmberApp {
             &view,
             &CompositeParams {
                 camera: &self.editor.camera,
-                viewport,
+                pivot: self.editor.canvas_pivot,
                 layers: &layer_draws,
                 active_index: self.editor.layers.active_index() as u32,
                 stroke: self.editor.stroke_style,
+                backdrop: theme::Palette::of(self.editor.ui.theme).backdrop_display(),
             },
         );
 
@@ -442,7 +466,7 @@ impl UmberApp {
             self.editor.layers.move_down(index);
         }
         if actions.fit_view {
-            self.editor.camera = Camera::fit(self.editor.doc.size_vec2(), viewport);
+            self.editor.fit_view();
         }
         if actions.reset_zoom {
             self.editor.camera.zoom = 1.0;
@@ -507,10 +531,11 @@ impl ApplicationHandler for UmberApp {
             egui_wgpu::RendererOptions::default(),
         );
 
-        self.editor.camera = Camera::fit(
-            self.editor.doc.size_vec2(),
-            Vec2::new(config.width as f32, config.height as f32),
-        );
+        // Provisional: the real canvas region is not known until the first
+        // frame has laid the panels out, which corrects both of these.
+        self.editor.canvas_size = Vec2::new(config.width as f32, config.height as f32);
+        self.editor.canvas_pivot = self.editor.canvas_size * 0.5;
+        self.editor.fit_view();
 
         self.gfx = Some(Graphics {
             window,
@@ -538,7 +563,7 @@ impl ApplicationHandler for UmberApp {
             gfx.window.request_redraw();
         }
         let ui_has_pointer = response.consumed || gfx.egui_ctx.egui_wants_pointer_input();
-        let viewport = Vec2::new(gfx.config.width as f32, gfx.config.height as f32);
+        let pivot = self.editor.canvas_pivot;
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -570,29 +595,38 @@ impl ApplicationHandler for UmberApp {
 
                 match self.editor.interaction {
                     Interaction::Drawing => {
-                        let point = self.editor.sample(pos, viewport, None);
+                        let point = self.editor.sample(pos, None);
                         self.editor.stroke.extend(point);
-                        if let Some(g) = self.gfx.as_ref() {
-                            g.window.request_redraw();
-                        }
                     }
                     Interaction::Panning => {
                         let delta = pos - self.editor.last_cursor;
                         self.editor.camera.pan_by_screen(delta);
-                        if let Some(g) = self.gfx.as_ref() {
-                            g.window.request_redraw();
-                        }
+                    }
+                    Interaction::Zooming => {
+                        // Horizontal drag zooms about where the drag started,
+                        // which is the convention every other paint app uses.
+                        let dx = pos.x - self.editor.last_cursor.x;
+                        let factor = 1.008f32.powf(dx);
+                        let anchor = self.editor.zoom_anchor;
+                        self.editor.camera.zoom_at(anchor, factor, pivot);
                     }
                     Interaction::Idle => {}
+                }
+                if self.editor.interaction != Interaction::Idle
+                    && let Some(g) = self.gfx.as_ref()
+                {
+                    g.window.request_redraw();
                 }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
-                let pan_button = button == MouseButton::Middle
+                // Middle-drag and space-drag always pan, whatever tool is
+                // selected — muscle memory should not depend on the rail.
+                let pan_override = button == MouseButton::Middle
                     || (button == MouseButton::Left && self.editor.space_down);
 
-                if pan_button {
+                if pan_override {
                     self.editor.interaction = if pressed {
                         Interaction::Panning
                     } else {
@@ -602,10 +636,22 @@ impl ApplicationHandler for UmberApp {
                     if pressed && !ui_has_pointer {
                         let pos = self.editor.cursor;
                         self.editor.last_cursor = pos;
-                        let point = self.editor.sample(pos, viewport, None);
-                        self.start_stroke(point);
+                        match self.editor.ui.tool {
+                            Tool::Brush | Tool::Eraser => {
+                                let point = self.editor.sample(pos, None);
+                                self.start_stroke(point);
+                            }
+                            Tool::Pan => self.editor.interaction = Interaction::Panning,
+                            Tool::Zoom => {
+                                self.editor.zoom_anchor = pos;
+                                self.editor.interaction = Interaction::Zooming;
+                            }
+                        }
                     } else if !pressed {
-                        self.finish_stroke();
+                        match self.editor.interaction {
+                            Interaction::Drawing => self.finish_stroke(),
+                            _ => self.editor.interaction = Interaction::Idle,
+                        }
                     }
                 }
                 if let Some(g) = self.gfx.as_ref() {
@@ -624,7 +670,7 @@ impl ApplicationHandler for UmberApp {
                 let factor = 1.12f32.powf(steps);
                 self.editor
                     .camera
-                    .zoom_at(self.editor.cursor, factor, viewport);
+                    .zoom_at(self.editor.cursor, factor, pivot);
                 if let Some(g) = self.gfx.as_ref() {
                     g.window.request_redraw();
                 }
@@ -642,7 +688,7 @@ impl ApplicationHandler for UmberApp {
                         if self.editor.touches.len() == 1 && !ui_has_pointer {
                             self.editor.cursor = pos;
                             self.editor.last_cursor = pos;
-                            let point = self.editor.sample(pos, viewport, reported);
+                            let point = self.editor.sample(pos, reported);
                             self.start_stroke(point);
                             self.editor.drawing_touch = Some(touch.id);
                         } else {
@@ -658,7 +704,7 @@ impl ApplicationHandler for UmberApp {
                         if self.editor.drawing_touch == Some(touch.id) {
                             self.editor.last_cursor = self.editor.cursor;
                             self.editor.cursor = pos;
-                            let point = self.editor.sample(pos, viewport, reported);
+                            let point = self.editor.sample(pos, reported);
                             self.editor.stroke.extend(point);
                         } else {
                             self.update_pinch();

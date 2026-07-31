@@ -128,6 +128,27 @@ until commit, so reading it there yields exactly the pre-stroke pixels, and by
 then the damaged rect is known. `read_layer_rect` blocks on the GPU, which is
 acceptable once per stroke but must never move into the drawing loop.
 
+## Interface
+
+Layout and tokens come from the "Graphite" screens of the Umber design project.
+
+- **Never hard-code a colour.** Everything comes from `theme::Palette`, which is
+  what makes the second theme a table of values rather than an edit sweep.
+- **`theme::metrics` holds the design's fixed sizes.** Use them instead of
+  re-typing 264.0 or 36.0 at the call site.
+- The design's sliders, toggles and segmented pickers are **painted** in
+  `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
+  the framework; add to `widgets.rs` instead.
+- **The canvas does not fill the window.** `Camera` takes a `pivot` — the centre
+  of the panel-free region — and `CompositeParams::pivot` must be the same
+  value, or strokes land away from the cursor. Both come from
+  `Editor::canvas_pivot`, set from the central panel's rect each frame.
+- egui works in **points**, the canvas in **physical pixels**. Convert with
+  `pixels_per_point` at the boundary.
+- egui keeps separate light and dark styles; `theme::apply` writes both and sets
+  the preference, otherwise switching themes leaves egui's internals in the old
+  mode.
+
 ## Testing
 
 `umber-render/tests/gpu_pipeline.rs` runs real GPU work headlessly: it creates a
@@ -138,6 +159,12 @@ than fail when no adapter exists, so they stay meaningful on CI runners.
 When changing rendering, add a test there. `overlapping_dabs_do_not_compound` is
 the model: it asserts a specific pixel value that only holds if the wet-layer
 design is intact.
+
+**All GPU tests share one device and run serialised**, via the `OnceLock` and
+`Mutex` in `Harness::new`. Do not "optimise" that away: a device per test meant
+seventeen concurrent Vulkan devices each blocking on `poll` for its own
+submission, which starved them into a hang — the run never finished rather than
+failing. Sharing one device is also ~10× faster.
 
 `composite_pixel` runs the real composite pass into an offscreen target, which
 is the only way to test layer opacity and blend modes. Two things to copy when

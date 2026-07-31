@@ -71,12 +71,17 @@ impl Default for StrokeStyle {
 /// Everything the composite pass needs for a frame.
 pub struct CompositeParams<'a> {
     pub camera: &'a Camera,
-    pub viewport: Vec2,
+    /// Screen point the camera's centre sits on, in physical pixels. This is
+    /// the middle of the *canvas region*, not the window — panels take a bite
+    /// out of the window and the document should sit in what remains.
+    pub pivot: Vec2,
     /// Bottom-to-top.
     pub layers: &'a [LayerDraw],
     /// Stack position (not slot) receiving the in-progress stroke.
     pub active_index: u32,
     pub stroke: StrokeStyle,
+    /// Surround colour, display-space RGB.
+    pub backdrop: [f32; 3],
 }
 
 #[repr(C)]
@@ -92,8 +97,9 @@ struct ViewUniforms {
     scale: [f32; 2],
     offset: [f32; 2],
     doc_size: [f32; 2],
-    viewport: [f32; 2],
+    pivot: [f32; 2],
     stroke_color: [f32; 4],
+    backdrop: [f32; 4],
     layer_count: u32,
     stroke_mode: u32,
     active_index: u32,
@@ -648,7 +654,10 @@ impl CanvasRenderer {
         params: &CompositeParams<'_>,
     ) {
         let scale = 1.0 / params.camera.zoom;
-        let offset = params.camera.center - params.viewport * 0.5 * scale;
+        // Solving `doc = screen * scale + offset` for the pivot mapping to the
+        // camera centre. Must stay in step with `Camera::screen_to_doc`, which
+        // the input path uses — if they disagree, strokes land off the cursor.
+        let offset = params.camera.center - params.pivot * scale;
 
         let mut packed = [[0.0f32; 4]; MAX_LAYERS];
         let count = params.layers.len().min(MAX_LAYERS);
@@ -669,12 +678,18 @@ impl CanvasRenderer {
                 scale: [scale, scale],
                 offset: [offset.x, offset.y],
                 doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                viewport: [params.viewport.x, params.viewport.y],
+                pivot: [params.pivot.x, params.pivot.y],
                 stroke_color: [
                     color.r,
                     color.g,
                     color.b,
                     params.stroke.opacity.clamp(0.0, 1.0),
+                ],
+                backdrop: [
+                    params.backdrop[0],
+                    params.backdrop[1],
+                    params.backdrop[2],
+                    1.0,
                 ],
                 layer_count: count as u32,
                 stroke_mode: mode_index(params.stroke.mode),

@@ -17,9 +17,14 @@ struct View {
     scale: vec2<f32>,
     offset: vec2<f32>,
     doc_size: vec2<f32>,
-    viewport: vec2<f32>,
+    // Screen point the camera centre sits on — the middle of the canvas
+    // region, not of the window, since panels take a bite out of it.
+    pivot: vec2<f32>,
     // Linear RGB; .a carries the stroke opacity.
     stroke_color: vec4<f32>,
+    // Surround colour in *display* space, written straight out so it matches
+    // the egui panels exactly.
+    backdrop: vec4<f32>,
     layer_count: u32,
     stroke_mode: u32,     // 0 = paint, 1 = erase
     active_index: u32,    // stack position receiving the stroke
@@ -108,10 +113,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let doc = screen * v.scale + v.offset;
     let uv = doc / v.doc_size;
 
-    // Backdrop outside the canvas. Written straight to the surface, so these
-    // are already-encoded display values rather than linear ones.
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
-        return vec4<f32>(0.13, 0.13, 0.15, 1.0);
+        return vec4<f32>(v.backdrop.rgb, 1.0);
     }
 
     // textureSampleLevel rather than textureSample: sampling inside a loop and
