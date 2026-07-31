@@ -156,7 +156,10 @@ save are marked with a dot and are the only ones those two controls apply to.
 
 Editing a brush changes it live, so the editor's footer offers to **save** what
 you have made, either under a new name or over the brush you started from. Your
-library is a `brushes.ron` beside the settings file, rewritten on every change.
+library is a `brushes.ron` in the platform *data* directory — `%APPDATA%\Umber\
+data`, `~/.local/share/umber`, `~/Library/Application Support/Umber` — kept
+apart from the shipped library so that an update, which replaces that one
+wholesale, cannot take your brushes with it.
 If it cannot be read, everything that writes is disabled and the reason is
 shown, rather than quietly starting your collection again over the top of it.
 
