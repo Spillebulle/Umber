@@ -29,11 +29,88 @@ impl ThemeKind {
     }
 }
 
+/// The four accents the design offers.
+///
+/// Only the hue changes; every other token in [`Palette`] is shared, which is
+/// what keeps this a preference rather than four more themes to maintain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Accent {
+    /// The design's default, and the colour the application is named for.
+    #[default]
+    Umber,
+    Sage,
+    Steel,
+    Clay,
+}
+
+impl Accent {
+    pub const ALL: [Accent; 4] = [Self::Umber, Self::Sage, Self::Steel, Self::Clay];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Umber => "Umber",
+            Self::Sage => "Sage",
+            Self::Steel => "Steel",
+            Self::Clay => "Clay",
+        }
+    }
+
+    /// The design's swatch, as shown in the settings page.
+    ///
+    /// These are the dark-theme values. On Paper the accent is darkened for
+    /// contrast against a light surface — see [`Accent::ink`].
+    pub fn swatch(self) -> Color32 {
+        match self {
+            Self::Umber => Color32::from_rgb(0xC0, 0x8A, 0x4E),
+            Self::Sage => Color32::from_rgb(0x8F, 0xA3, 0x6B),
+            Self::Steel => Color32::from_rgb(0x7E, 0x96, 0xBA),
+            Self::Clay => Color32::from_rgb(0xB8, 0x78, 0x78),
+        }
+    }
+
+    /// The accent as it should read against a given theme's surface.
+    ///
+    /// Umber's two values are the design's own hand-picked pair and are used
+    /// verbatim. The other three exist only as a single dark swatch, so the
+    /// light variant is derived — darkened towards black far enough to clear
+    /// text contrast on Paper, which is the same relationship Umber's two
+    /// authored values already have (`#C08A4E` to `#9C622F`).
+    fn ink(self, kind: ThemeKind) -> Color32 {
+        match (self, kind) {
+            (Self::Umber, ThemeKind::Graphite) => Color32::from_rgb(0xC0, 0x8A, 0x4E),
+            (Self::Umber, ThemeKind::Paper) => Color32::from_rgb(0x9C, 0x62, 0x2F),
+            (_, ThemeKind::Graphite) => self.swatch(),
+            (_, ThemeKind::Paper) => mix(self.swatch(), Color32::BLACK, 0.30),
+        }
+    }
+}
+
+/// Linear mix of two sRGB bytes, `t` of the way from `a` to `b`.
+///
+/// Deliberately a plain byte lerp rather than a perceptual blend: it is only
+/// used to derive muted variants of a colour that sits beside its own source,
+/// where the cheap version is indistinguishable, and it stays `const`-friendly
+/// arithmetic with no `powf` — which in this codebase has produced NaN before.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub accent: Color32,
     /// Muted accent — dashed outlines, subtle tints.
     pub accent_dim: Color32,
+    /// Conflict and caution. Warm enough to read as "look at this" without the
+    /// alarm of a true red, which the design reserves for nothing at all.
+    pub warning: Color32,
+    /// Filled background behind a warning badge.
+    pub warning_bg: Color32,
+    pub warning_border: Color32,
     /// Behind the document — the darkest surface.
     pub backdrop: Color32,
     /// Panel interiors and inset wells.
@@ -64,6 +141,9 @@ impl Palette {
         Self {
             accent: Color32::from_rgb(0xC0, 0x8A, 0x4E),
             accent_dim: Color32::from_rgb(0x6B, 0x4E, 0x2E),
+            warning: Color32::from_rgb(0xD0, 0x87, 0x70),
+            warning_bg: Color32::from_rgb(0x2A, 0x1D, 0x18),
+            warning_border: Color32::from_rgb(0x6E, 0x40, 0x34),
             backdrop: Color32::from_rgb(0x0D, 0x0E, 0x10),
             window: Color32::from_rgb(0x11, 0x12, 0x14),
             dock: Color32::from_rgb(0x14, 0x15, 0x17),
@@ -87,6 +167,12 @@ impl Palette {
         Self {
             accent: Color32::from_rgb(0x9C, 0x62, 0x2F),
             accent_dim: Color32::from_rgb(0xC9, 0xB8, 0xA2),
+            // The design specifies the conflict colours for Graphite only.
+            // These are the light-surface analogues: the same hue, taken dark
+            // enough to read as ink on paper and light enough to sit under it.
+            warning: Color32::from_rgb(0x9E, 0x4E, 0x33),
+            warning_bg: Color32::from_rgb(0xF7, 0xE9, 0xE2),
+            warning_border: Color32::from_rgb(0xDF, 0xC1, 0xB0),
             backdrop: Color32::from_rgb(0xE4, 0xE0, 0xD9),
             window: Color32::from_rgb(0xEF, 0xEC, 0xE7),
             dock: Color32::from_rgb(0xF2, 0xEF, 0xEA),
@@ -106,11 +192,37 @@ impl Palette {
         }
     }
 
+    /// The theme in its authored accent.
     pub fn of(kind: ThemeKind) -> Self {
-        match kind {
+        Self::with_accent(kind, Accent::Umber)
+    }
+
+    /// The theme, re-hued to one of the design's four accents.
+    ///
+    /// Kept as a second constructor rather than a parameter on [`Palette::of`]
+    /// so that the dozens of existing `of(kind)` call sites stay as they are —
+    /// every one of them wants whatever the user chose, and threading an accent
+    /// through them all would only move the lookup outwards.
+    ///
+    /// `accent_dim` is derived rather than tabulated for the alternates: it is
+    /// the accent taken most of the way to the theme's own recessive surface,
+    /// which is the relationship the two authored Umber values already have.
+    /// Umber itself keeps its hand-picked pair, so the default is exactly the
+    /// design's and only the three alternates are computed.
+    pub fn with_accent(kind: ThemeKind, accent: Accent) -> Self {
+        let mut palette = match kind {
             ThemeKind::Graphite => Self::graphite(),
             ThemeKind::Paper => Self::paper(),
+        };
+        if accent == Accent::Umber {
+            return palette;
         }
+        palette.accent = accent.ink(kind);
+        palette.accent_dim = match kind {
+            ThemeKind::Graphite => mix(palette.accent, palette.backdrop, 0.49),
+            ThemeKind::Paper => mix(palette.accent, palette.window, 0.60),
+        };
+        palette
     }
 
     /// The document's surround, for the canvas shader.
@@ -276,4 +388,75 @@ fn style_from(style: &mut egui::Style, palette: &Palette) {
     style.spacing.item_spacing = egui::vec2(6.0, 6.0);
     style.spacing.button_padding = egui::vec2(9.0, 4.0);
     style.spacing.menu_margin = egui::Margin::same(6);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accent mechanism must not perturb the default. If re-hueing ever
+    /// starts running for Umber, this catches it before the whole interface
+    /// shifts colour by a couple of units.
+    #[test]
+    fn the_default_accent_is_the_designs_authored_pair() {
+        for kind in ThemeKind::ALL {
+            let plain = Palette::of(kind);
+            let explicit = Palette::with_accent(kind, Accent::Umber);
+            assert_eq!(plain.accent, explicit.accent);
+            assert_eq!(plain.accent_dim, explicit.accent_dim);
+        }
+        assert_eq!(
+            Palette::of(ThemeKind::Graphite).accent,
+            Color32::from_rgb(0xC0, 0x8A, 0x4E),
+        );
+        assert_eq!(
+            Palette::of(ThemeKind::Graphite).accent_dim,
+            Color32::from_rgb(0x6B, 0x4E, 0x2E),
+        );
+    }
+
+    #[test]
+    fn every_accent_changes_the_hue_in_both_themes() {
+        for kind in ThemeKind::ALL {
+            let base = Palette::with_accent(kind, Accent::Umber).accent;
+            for accent in Accent::ALL.into_iter().filter(|a| *a != Accent::Umber) {
+                let p = Palette::with_accent(kind, accent);
+                assert_ne!(p.accent, base, "{accent:?} on {kind:?} did not re-hue");
+                assert_ne!(p.accent, p.accent_dim, "{accent:?} on {kind:?} has no dim");
+            }
+        }
+    }
+
+    /// A derived `accent_dim` has to stay on the recessive side of its accent,
+    /// or the "muted" tint would come out louder than the thing it mutes.
+    #[test]
+    fn a_derived_dim_recedes_towards_its_own_surface() {
+        let luma = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        for accent in Accent::ALL {
+            let dark = Palette::with_accent(ThemeKind::Graphite, accent);
+            assert!(
+                luma(dark.accent_dim) < luma(dark.accent),
+                "{accent:?} dim is not darker on Graphite",
+            );
+            let light = Palette::with_accent(ThemeKind::Paper, accent);
+            assert!(
+                luma(light.accent_dim) > luma(light.accent),
+                "{accent:?} dim is not lighter on Paper",
+            );
+        }
+    }
+
+    /// Warning ink must contrast with the surface it is drawn on, in both
+    /// themes — the whole point of the token is to be noticed.
+    #[test]
+    fn warning_ink_contrasts_with_its_own_fill() {
+        let luma = |c: Color32| c.r() as i32 + c.g() as i32 + c.b() as i32;
+        for kind in ThemeKind::ALL {
+            let p = Palette::of(kind);
+            assert!(
+                (luma(p.warning) - luma(p.warning_bg)).abs() > 200,
+                "{kind:?} warning ink is too close to its fill",
+            );
+        }
+    }
 }
