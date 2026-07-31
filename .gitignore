@@ -24,3 +24,6 @@ xcuserdata/
 .idea/
 *.swp
 .DS_Store
+
+# Agent worktrees. Git worktrees of this same repository; never content.
+.claude/worktrees/

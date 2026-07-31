@@ -2,7 +2,7 @@
 
 use crate::colorpicker::{PickerMode, WheelShape};
 use crate::settings::SettingsTab;
-use crate::theme::ThemeKind;
+use crate::theme::{Accent, ThemeKind};
 use glam::Vec2;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -43,6 +43,10 @@ impl Tool {
 #[derive(Clone, Copy, Debug)]
 pub struct UiState {
     pub theme: ThemeKind,
+    /// Which of the design's four accents re-hues the palette. Separate from
+    /// `theme` because it is orthogonal to it — either accent works on either
+    /// surface, so folding them together would mean four more themes.
+    pub accent: Accent,
     /// Mirrors the workspace so the tool rail sits under the drawing hand.
     pub left_handed: bool,
     pub pressure_open: bool,
@@ -68,6 +72,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             theme: ThemeKind::Graphite,
+            accent: Accent::Umber,
             left_handed: false,
             pressure_open: true,
             tool: Tool::Brush,

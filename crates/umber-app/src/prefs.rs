@@ -25,7 +25,7 @@
 
 use crate::editor::Editor;
 use crate::shortcuts::{self, Action, Binding, Chord};
-use crate::theme::ThemeKind;
+use crate::theme::{Accent, ThemeKind};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +47,7 @@ pub const MAX_SCALE: f32 = 2.0;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub theme: ThemeKind,
+    pub accent: Accent,
     pub left_handed: bool,
     /// egui's zoom factor: everything drawn in points scales by this.
     pub interface_scale: f32,
@@ -62,6 +63,7 @@ impl Default for Prefs {
         let pressure = umber_core::input::PressureModel::default();
         Self {
             theme: ThemeKind::Graphite,
+            accent: Accent::Umber,
             left_handed: false,
             interface_scale: 1.0,
             pressure_source: pressure.source,
@@ -201,6 +203,7 @@ pub fn to_text(prefs: &Prefs) -> String {
     out.push_str("# so an unknown or malformed setting costs only itself.\n");
     out.push_str(&format!("version = {VERSION}\n"));
     out.push_str(&format!("theme = {}\n", theme_id(prefs.theme)));
+    out.push_str(&format!("accent = {}\n", accent_id(prefs.accent)));
     out.push_str(&format!("left_handed = {}\n", prefs.left_handed));
     out.push_str(&format!("interface_scale = {:.3}\n", prefs.interface_scale));
     out.push_str(&format!(
@@ -256,6 +259,11 @@ pub fn from_text(text: &str) -> Prefs {
         // so one bad line never spreads.
         match key {
             "version" => {}
+            "accent" => {
+                if let Some(a) = accent_from_id(value) {
+                    prefs.accent = a;
+                }
+            }
             "theme" => {
                 if let Some(t) = theme_from_id(value) {
                     prefs.theme = t;
@@ -388,6 +396,20 @@ fn theme_id(kind: ThemeKind) -> &'static str {
     }
 }
 
+/// Stable names for the accents, for the same reason as `theme_id`.
+fn accent_id(accent: Accent) -> &'static str {
+    match accent {
+        Accent::Umber => "umber",
+        Accent::Sage => "sage",
+        Accent::Steel => "steel",
+        Accent::Clay => "clay",
+    }
+}
+
+fn accent_from_id(id: &str) -> Option<Accent> {
+    Accent::ALL.into_iter().find(|a| accent_id(*a) == id)
+}
+
 fn theme_from_id(id: &str) -> Option<ThemeKind> {
     ThemeKind::ALL.into_iter().find(|k| theme_id(*k) == id)
 }
@@ -422,6 +444,7 @@ fn pressure_from_id(id: &str) -> Option<PressureSource> {
 pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
     Prefs {
         theme: ed.ui.theme,
+        accent: ed.ui.accent,
         left_handed: ed.ui.left_handed,
         interface_scale: ctx.zoom_factor(),
         pressure_source: ed.pressure.source,
@@ -434,6 +457,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
 /// Push stored preferences into the running app.
 pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.theme = prefs.theme;
+    ed.ui.accent = prefs.accent;
     ed.ui.left_handed = prefs.left_handed;
     ed.pressure.source = prefs.pressure_source;
     ed.pressure.max_speed = prefs.pressure_max_speed;
@@ -512,6 +536,7 @@ mod tests {
     fn a_full_round_trip_preserves_everything() {
         let mut prefs = Prefs {
             theme: ThemeKind::Paper,
+            accent: Accent::Clay,
             left_handed: true,
             interface_scale: 1.25,
             pressure_source: PressureSource::Simulated,
@@ -530,6 +555,7 @@ mod tests {
 
         let back = from_text(&to_text(&prefs));
         assert_eq!(back.theme, prefs.theme);
+        assert_eq!(back.accent, prefs.accent);
         assert_eq!(back.left_handed, prefs.left_handed);
         assert_eq!(back.interface_scale, prefs.interface_scale);
         assert_eq!(back.pressure_source, prefs.pressure_source);

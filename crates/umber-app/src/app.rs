@@ -370,7 +370,10 @@ impl UmberApp {
         // Restyling walks the whole style struct, so only do it when the theme
         // actually changed rather than every frame.
         if self.applied_theme != Some(self.editor.ui.theme) {
-            theme::apply(&gfx.egui_ctx, &theme::Palette::of(self.editor.ui.theme));
+            theme::apply(
+                &gfx.egui_ctx,
+                &theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent),
+            );
             self.applied_theme = Some(self.editor.ui.theme);
         }
 
@@ -455,7 +458,8 @@ impl UmberApp {
                 layers: &layer_draws,
                 active_index: self.editor.layers.active_index() as u32,
                 stroke: self.editor.stroke_style,
-                backdrop: theme::Palette::of(self.editor.ui.theme).backdrop_display(),
+                backdrop: theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent)
+                    .backdrop_display(),
                 export: false,
             },
         );
@@ -581,7 +585,10 @@ impl ApplicationHandler for UmberApp {
         // splash paints it from the CPU — the only way to reach a window that
         // has no GPU surface yet. Each stage is shown *before* the work it
         // names, so the bar never claims progress that has not happened.
-        let mut splash = Splash::new(window.clone(), theme::Palette::of(self.editor.ui.theme));
+        let mut splash = Splash::new(
+            window.clone(),
+            theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent),
+        );
         splash.show(splash::Stage::Adapter);
 
         let instance = Gpu::create_instance();

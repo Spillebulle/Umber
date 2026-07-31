@@ -75,7 +75,7 @@ impl Accent {
     /// light variant is derived — darkened towards black far enough to clear
     /// text contrast on Paper, which is the same relationship Umber's two
     /// authored values already have (`#C08A4E` to `#9C622F`).
-    fn ink(self, kind: ThemeKind) -> Color32 {
+    pub fn ink(self, kind: ThemeKind) -> Color32 {
         match (self, kind) {
             (Self::Umber, ThemeKind::Graphite) => Color32::from_rgb(0xC0, 0x8A, 0x4E),
             (Self::Umber, ThemeKind::Paper) => Color32::from_rgb(0x9C, 0x62, 0x2F),

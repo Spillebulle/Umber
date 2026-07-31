@@ -19,7 +19,7 @@ use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::prefs;
 use crate::shortcuts::{self, Action, Binding};
-use crate::theme::{Palette, ThemeKind, metrics, text};
+use crate::theme::{Accent, Palette, ThemeKind, metrics, text};
 use crate::widgets;
 use egui::{Align2, Color32, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
 use umber_core::input::PressureSource;
@@ -392,7 +392,7 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 
     ui.add_space(14.0);
-    theme_editor(ui, p);
+    theme_editor(ui, p, ed);
 
     ui.add_space(14.0);
     controls::section(ui, p, "Layout");
@@ -542,7 +542,7 @@ fn new_theme_card(ui: &mut egui::Ui, p: &Palette) {
 /// Every row is a real token out of the palette in use, so it tells the truth
 /// about the running theme; none of them can be edited, because a palette is
 /// compiled in and there is nowhere to put a change.
-fn theme_editor(ui: &mut egui::Ui, p: &Palette) {
+fn theme_editor(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     Frame::NONE
         .fill(p.window)
         .stroke(Stroke::new(1.0, p.border))
@@ -605,7 +605,7 @@ fn theme_editor(ui: &mut egui::Ui, p: &Palette) {
                     }
 
                     ui.add_space(8.0);
-                    accent_choice(ui, p);
+                    accent_choice(ui, p, ed);
                 });
         });
 }
@@ -643,21 +643,11 @@ fn swatch_row(ui: &mut egui::Ui, p: &Palette, name: &str, colour: Color32) {
     });
 }
 
-/// The design's four accent options, drawn dead.
+/// The design's four accent options.
 ///
-/// The accent is a field of `theme::Palette`, and every palette is a `const fn`
-/// with the accent baked in — there is no seam to put a chosen accent through
-/// without changing that module. Shown so the pane matches the design and the
-/// tooltip can say exactly what is missing.
-fn accent_choice(ui: &mut egui::Ui, p: &Palette) {
-    /// The design's palette: amber (the default), sage, slate and clay.
-    const ACCENTS: [(Color32, &str); 4] = [
-        (Color32::from_rgb(0xC0, 0x8A, 0x4E), "Amber"),
-        (Color32::from_rgb(0x8F, 0xA3, 0x6B), "Sage"),
-        (Color32::from_rgb(0x7E, 0x96, 0xBA), "Slate"),
-        (Color32::from_rgb(0xB8, 0x78, 0x78), "Clay"),
-    ];
-
+/// Live: `Palette::with_accent` re-hues a theme without duplicating it, so this
+/// is one field rather than four more palettes to keep in step.
+fn accent_choice(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Accent")
@@ -665,19 +655,24 @@ fn accent_choice(ui: &mut egui::Ui, p: &Palette) {
                 .color(p.text_muted),
         );
         ui.add_space(6.0);
-        for (colour, name) in ACCENTS {
-            let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(18.0), Sense::hover());
-            let in_use = colour == p.accent;
+        for accent in Accent::ALL {
+            let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(18.0), Sense::click());
+            let chosen = accent == ed.ui.accent;
             let painter = ui.painter();
-            painter.circle_filled(rect.center(), 8.0, colour.gamma_multiply(0.45));
-            if in_use {
-                painter.circle_stroke(rect.center(), 8.0, Stroke::new(1.5, p.text_dim));
+            // The swatch shows the accent as it will look on the theme being
+            // used, not the design's dark-theme value: on Paper the accents are
+            // darkened, and a swatch that ignored that would advertise a colour
+            // the interface never shows.
+            painter.circle_filled(rect.center(), 8.0, accent.ink(ed.ui.theme));
+            if chosen {
+                painter.circle_stroke(rect.center(), 10.0, Stroke::new(1.5, p.text_strong));
+            } else if response.hovered() {
+                painter.circle_stroke(rect.center(), 10.0, Stroke::new(1.0, p.text_dim));
             }
-            let _ = response.on_hover_text(format!(
-                "{name}. Each theme's accent is compiled into its palette; choosing \
-                 one at run time needs the palette to carry the choice, which it \
-                 does not yet."
-            ));
+            if response.clicked() {
+                ed.ui.accent = accent;
+            }
+            let _ = response.on_hover_text(accent.label());
         }
     });
 }

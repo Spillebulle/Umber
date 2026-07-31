@@ -43,7 +43,7 @@ pub struct UiOutput {
 /// nests inside a `Ui` rather than attaching to the `Context`, which is why
 /// this takes a `&mut Ui`.
 pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
-    let p = Palette::of(ed.ui.theme);
+    let p = Palette::with_accent(ed.ui.theme, ed.ui.accent);
     let mut actions = UiActions::default();
 
     let chrome = Frame {

@@ -395,18 +395,26 @@ pub fn conflict_badge(ui: &mut Ui, p: &Palette, message: &str) {
     let font = FontId::proportional(9.5);
     let width = ui
         .painter()
-        .layout_no_wrap(message.to_owned(), font.clone(), p.accent)
+        .layout_no_wrap(message.to_owned(), font.clone(), p.warning)
         .size()
         .x;
     let (rect, _) = ui.allocate_exact_size(vec2(width + 12.0, 16.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, p.control_active);
+    // The warning tokens, not the accent: a clash is not a selection, and
+    // borrowing the accent for it made every flagged row read as chosen.
+    painter.rect_filled(rect, 3.0, p.warning_bg);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, p.warning_border),
+        egui::StrokeKind::Inside,
+    );
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         message,
         font,
-        p.accent,
+        p.warning,
     );
 }
 
