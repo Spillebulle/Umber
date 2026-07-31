@@ -1,9 +1,11 @@
 //! Brush parameters.
 
+use serde::{Deserialize, Serialize};
+
 use crate::curve::ResponseCurve;
 
 /// What a stroke does to the layer underneath it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrushMode {
     /// Composite the stroke colour over the layer.
     Paint,
@@ -16,7 +18,13 @@ pub enum BrushMode {
 /// Sizes are in **document** pixels, so brush appearance is independent of
 /// zoom — painting at 12% zoom lays down exactly the pixels you would get at
 /// 100%.
-#[derive(Clone, Copy, Debug)]
+///
+/// Every field carries `#[serde(default)]` through the container attribute, so
+/// a hand-written preset in the brush library may name only the parameters it
+/// cares about and pick up the defaults for the rest. That also means a library
+/// written by an older Umber still loads when a field is added here.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Brush {
     /// Diameter at full pressure.
     pub size: f32,
@@ -92,100 +100,9 @@ impl Brush {
     }
 }
 
-/// A named brush the user can pick from the Brushes panel.
-#[derive(Clone, Debug)]
-pub struct BrushPreset {
-    pub name: &'static str,
-    pub brush: Brush,
-}
-
-impl BrushPreset {
-    /// The starting set. Chosen to span the parameter space rather than to be
-    /// exhaustive — a hard edge, a soft edge, a dense wash and a sparse one —
-    /// so the sliders' effects are visible by comparison.
-    pub fn defaults() -> Vec<Self> {
-        vec![
-            Self {
-                name: "Soft round",
-                brush: Brush {
-                    size: 40.0,
-                    hardness: 0.0,
-                    opacity: 0.85,
-                    spacing: 0.06,
-                    ..Brush::default()
-                },
-            },
-            Self {
-                name: "Hard round",
-                brush: Brush {
-                    size: 18.0,
-                    hardness: 1.0,
-                    opacity: 1.0,
-                    spacing: 0.08,
-                    ..Brush::default()
-                },
-            },
-            Self {
-                name: "Ink",
-                brush: Brush {
-                    size: 8.0,
-                    hardness: 0.9,
-                    opacity: 1.0,
-                    spacing: 0.04,
-                    stabilization: 0.6,
-                    min_size_ratio: 0.15,
-                    size_curve: ResponseCurve::EASE_IN,
-                    ..Brush::default()
-                },
-            },
-            Self {
-                name: "Airbrush",
-                brush: Brush {
-                    size: 90.0,
-                    hardness: 0.0,
-                    opacity: 0.18,
-                    spacing: 0.03,
-                    pressure_opacity: true,
-                    opacity_curve: ResponseCurve::EASE_IN,
-                    ..Brush::default()
-                },
-            },
-            Self {
-                name: "Marker",
-                brush: Brush {
-                    size: 28.0,
-                    hardness: 0.75,
-                    opacity: 0.6,
-                    spacing: 0.05,
-                    pressure_size: false,
-                    ..Brush::default()
-                },
-            },
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn presets_are_within_their_own_limits() {
-        for preset in BrushPreset::defaults() {
-            let b = preset.brush;
-            assert!(
-                (Brush::MIN_SIZE..=Brush::MAX_SIZE).contains(&b.size),
-                "{} has an out-of-range size",
-                preset.name
-            );
-            assert!(
-                b.step_at(0.0) > 0.0,
-                "{} would spin the dab loop",
-                preset.name
-            );
-            assert!((0.0..=1.0).contains(&b.opacity), "{} opacity", preset.name);
-        }
-    }
 
     #[test]
     fn pressure_scales_radius_between_min_and_full() {

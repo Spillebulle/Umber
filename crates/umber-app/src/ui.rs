@@ -452,7 +452,7 @@ fn brushes_panel(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             if widgets::brush_preset_row(
                 ui,
                 p,
-                preset.name,
+                &preset.name,
                 preset.brush.opacity,
                 preset.brush.hardness,
                 selected,
@@ -731,8 +731,8 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let name = ed
         .active_preset
         .and_then(|i| ed.presets.get(i))
-        .map(|preset| preset.name)
-        .unwrap_or("Brush");
+        .map(|preset| preset.name.clone())
+        .unwrap_or_else(|| "Brush".to_string());
 
     let response = egui::Modal::new(egui::Id::new("brush-editor"))
         .frame(

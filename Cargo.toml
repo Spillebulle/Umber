@@ -32,6 +32,15 @@ pollster = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# Brush library data. These are plain-data crates with no GPU or windowing
+# reach, so `umber-core` can depend on them without breaking the layering:
+# RON is the on-disk brush library, serde_json reads MyPaint `.myb` files, and
+# `directories` only knows where a platform keeps user data.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ron = "0.12"
+directories = "6"
+
 # Debug builds keep our own crates cheap to recompile, but dependencies
 # (wgpu, naga, egui) are built optimised — an unoptimised wgpu makes the
 # canvas unusable to test against.

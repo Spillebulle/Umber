@@ -149,7 +149,7 @@ impl Default for Editor {
             color: Color::from_srgb_u8(20, 20, 24, 255),
             secondary: Color::WHITE,
             hsv: Color::from_srgb_u8(20, 20, 24, 255).to_hsv(),
-            presets: BrushPreset::defaults(),
+            presets: umber_core::preset::builtin().to_vec(),
             active_preset: None,
             layers: LayerStack::new(),
             ui: UiState::default(),

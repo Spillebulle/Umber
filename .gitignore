@@ -2,6 +2,12 @@
 **/*.rs.bk
 *.pdb
 
+# Downloaded brush packs. `tools/fetch-brushes.ps1` puts them here; they are
+# other people's work, they are large, and git keeps everything forever — so
+# only the licence record and the generated library are committed.
+/assets/brushes/*
+!/assets/brushes/LICENSES.md
+
 # Android
 /platform/android/.gradle
 /platform/android/build
