@@ -527,6 +527,8 @@ impl UmberApp {
                     size,
                     layers: &layers,
                     active: self.editor.layers.active_index(),
+                    background: self.editor.doc.background,
+                    dpi: self.editor.doc.dpi,
                     merged: &merged,
                 },
             )
