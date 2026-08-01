@@ -575,9 +575,10 @@ the failure direction, which is a *stale* tip.
 | `.kpp` | Krita paintop preset | one brush | `brushimport::kpp` |
 | `.bundle` | Krita resource bundle | **a whole pack** | `brushimport::bundle` |
 | `.abr` | Photoshop 1, 2, 6.1, 6.2 | one per sampled stamp | `brushimport::abr` |
+| `.sut`, `.sutg` | Clip Studio Paint | one, or **a whole group** | `brushimport::clipstudio` |
 | `.ron` | an Umber library | as many as it holds | `preset::parse_library` |
 
-Two of those are containers, so `read_file` returns a `Vec` and the import
+Three of those are containers, so `read_file` returns a `Vec` and the import
 notice has to report "twenty brushes arrived" as readily as "one did".
 
 Every reader is pinned by fixtures **built byte by byte in its own test
@@ -817,6 +818,77 @@ multiplied into it — `select(round, masked, use_tip)` in `dab.wgsl` — so
 hardness has nothing left to shape. A round brush shows none of this. Almost
 every brush is round, and a permanent row saying so would be a control that
 never does anything.
+
+### Importing a Clip Studio sub-tool (`.sut`, `.sutg`)
+
+A `.sut` is an **ordinary SQLite database**, and so is a `.sutg`. Four tables
+either way — `Manager`, `Node`, `Variant`, `MaterialFile` — which is why one
+reader serves both: a single sub-tool is the degenerate group, one node with no
+children. The nodes are a linked list rather than a table order, so the palette's
+own order comes off `NodeFirstChildUuid` and `NodeNextUuid`; each names *two*
+settings blocks and the second, `NodeInitVariantID`, is the "reset to defaults"
+copy that holds almost nothing.
+
+**The schema is not fixed.** The two sample files declare 187 and 214 columns in
+`Variant`, interleaved rather than appended, because the larger group holds a
+fill tool and the fill, selection and shape tools share the table. Every column
+is therefore looked up by name; a reader that counted them would take a brush's
+rotation out of its neighbour's fill tolerance. A sub-tool with no `BrushSize`
+at all is not a brush and is skipped, which sorts the fill tools out by the data
+rather than by a tool-type number this build might not recognise.
+
+**No SQLite dependency.** `umber_core::sqlite` is a read-only page and record
+walker of a few hundred lines: a header, table b-trees, overflow chains, varints
+and the serial-type encoding. `rusqlite` with `bundled` would put a C toolchain
+in the build, which is the same problem `ureq` avoids by taking `rustls` — and
+one that would only show up when a release was cut, since the desktop build
+everybody develops against has a C compiler. Its module docs carry the argument
+and the list of what it deliberately will not do.
+
+**The tip comes out of a thumbnail, and that is the honest limit.**
+`MaterialFile.FileData` is a USTAR tar; the full-resolution pixels inside it are
+in Clip Studio's own C2F container (magic `\x89C2F\r\n\x1a\n`, chunks of
+`[u32 le size][tag][payload][u32 checksum]`) whose data chunks carry a flag
+saying they are compressed by a codec documented nowhere. Beside them sits
+`thumbnail/thumbnail.png`, a real PNG of the real material with a longest side
+of 300 — plenty for a mask that is scaled to the dab anyway. Coverage is
+`alpha × (1 − luminance)` and has to be both terms: a brush tip is black on
+transparent, so its alpha is the mark, and a paper texture is opaque grey, so
+its luminance is. Either alone turns the other kind into a blank rectangle. The
+loss of resolution is named all the same. Build-up is then **measured** off the
+mask by `tip::stroke_coverage`, the same function that decides it for the
+shipped library — Clip Studio composites every dab as GIMP and Krita do.
+
+**Effect sources are read for pressure and randomness only.** Every setting
+carries a bitmask of which inputs drive it, a floor per input and a control-point
+curve. Bit 4 is pen pressure: it is set on the size effector of every
+pressure-sensitive brush in the samples and nothing else. Bit 7 is the per-dab
+random draw: it is the only bit ever set on the hue, saturation and brightness
+effectors — which is what colour jitter is — and it is set on exactly the brushes
+whose rotation randomness is not left at its default. Bits 5, 6 and 8 are pen
+tilt, pen bearing and stroke speed in an order the files to hand cannot settle,
+so they are named and dropped. Umber *has* a speed input, and wiring tilt into it
+would give a brush behaviour that looked deliberate and was wrong — which is the
+one thing the import rules refuse.
+
+What else carries: hardness, opacity, stabilisation (`FlickerReduction`), the
+dab's flatness (`BrushThickness`, as `1 / thickness`, since `Brush::size` names
+the long axis either way) and its angle, the fixed dab interval, the spray as
+scatter, the paper's strength and tile size, and the underlying-colour mixing as
+one smudge amount. Clip Studio splits mixing into how much paint the brush
+carries and how dense it is, so the stronger of "carries none" and "is dense" is
+what survives — which puts a pure blender at 1.0 and an oil brush at its density,
+and says it approximated either way.
+
+An automatic dab interval is the one thing deliberately **not** reported. Umber
+picks a spacing too, so an automatic one arrives as an automatic one; and every
+brush in both sample files is set that way, so a note about it would appear on
+every import ever made and train the reader to skip the list that carries the
+losses that matter.
+
+No `.sut` pack is fetched and no sample file is committed: the fixtures are built
+in the test module like every other reader's, and the reader was run against real
+files once during development.
 
 ## Build-up
 
