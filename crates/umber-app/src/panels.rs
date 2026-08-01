@@ -1322,11 +1322,12 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
         ui.close();
     }
 
-    // The library, and the plain checkboxes underneath it. Two ways in on
-    // purpose: the library is how you find a module you have never used or have
-    // removed and forgotten the name of, and it hands the module to the pointer;
-    // the checkboxes are how you flick a familiar one off and on again without
-    // being put into a mode. Both end at `Layout::open` and `Layout::close`.
+    // The one way in. There used to be a "Panels" submenu of checkboxes beside
+    // this, from before the library existed; two lists of the same modules, one
+    // of which showed a picture and a description and the other a tick, is a
+    // choice nobody should have to make. The library shows what each module is
+    // and hands it to the pointer; the cross in a module's header, in layout
+    // edit mode, takes it back out.
     if ui
         .button("Modules…")
         .on_hover_text("Every module there is, what each one does, and a way to add it")
@@ -1335,20 +1336,6 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
         ed.ui.module_library_open = true;
         ui.close();
     }
-
-    ui.menu_button("Panels", |ui| {
-        for kind in PanelKind::ALL {
-            let mut open = ed.layout.is_open(kind);
-            if ui.checkbox(&mut open, kind.title()).clicked() {
-                if open {
-                    ed.layout.open(kind);
-                } else {
-                    ed.layout.close(kind);
-                }
-                ui.close();
-            }
-        }
-    });
 
     if ui
         .button("Reset layout")

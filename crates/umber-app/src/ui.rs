@@ -326,6 +326,15 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.redo = true;
                     ui.close();
                 }
+                ui.separator();
+                // Under Edit rather than Window, which is where Windows and
+                // most Linux desktops put preferences. Window is about the
+                // arrangement of the workspace; these are settings for the
+                // application.
+                if ui.button("Settings…").clicked() {
+                    ed.ui.settings_open = true;
+                    ui.close();
+                }
             });
 
             ui.menu_button("View", |ui| {
@@ -341,11 +350,6 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
 
             ui.menu_button("Window", |ui| {
                 panels::window_menu(ui, ed);
-                ui.separator();
-                if ui.button("Settings…").clicked() {
-                    ed.ui.settings_open = true;
-                    ui.close();
-                }
             });
 
             ui.menu_button("Help", |ui| {
