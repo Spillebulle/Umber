@@ -62,9 +62,23 @@
                     Advertise="yes" />
         </File>
       </Component>
-      <Component Id="Documents">
+      <!--
+        One component per file, rather than one holding all three.
+
+        A component with no Guid gets one generated, and Windows Installer will
+        only allow that when the component holds a single unversioned file that
+        is its own keypath. Three files in one component is refused outright
+        (WIX0367). Splitting them is also what the component rules ask for in
+        any case: a component is the unit that gets installed, repaired and
+        removed, and these three have no reason to share a fate.
+      -->
+      <Component Id="Readme">
         <File Source="$(var.DocDir)\README.md" />
+      </Component>
+      <Component Id="Changelog">
         <File Source="$(var.DocDir)\CHANGELOG.md" />
+      </Component>
+      <Component Id="Licence">
         <File Source="$(var.DocDir)\LICENSE" Name="LICENSE.txt" />
       </Component>
     </ComponentGroup>
