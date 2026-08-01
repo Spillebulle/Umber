@@ -537,6 +537,14 @@ brush engine. Do not describe desktop pen pressure as working.
 
 ## Conventions
 
+- **Commit after every change, and say in the message what changed and why.**
+  One commit per coherent change, not one per session's work: a commit that
+  bundles a merge resolution with a behaviour fix hides the fix, and the diff
+  nobody can isolate is the one nobody can revert. The subject line says what
+  the change *does*; the body says what was wrong before, or what a reader
+  would otherwise have to reconstruct — the same standard the comments here are
+  held to. Most of this file's invariants were learned from a bug, and the
+  commit is the first place that reasoning lands.
 - British spelling in user-facing strings and docs ("colour", "stabilisation").
 - Comments explain *why*, especially where a simpler-looking alternative is
   wrong — most of this file's invariants are also recorded at their call sites.
