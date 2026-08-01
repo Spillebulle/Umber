@@ -290,6 +290,12 @@ pub mod metrics {
     /// One entry in the History module: a marker and a line of text, tighter
     /// than a brush row because it carries no picture.
     pub const HISTORY_ROW: f32 = 20.0;
+    /// The module library dialog. One card per module, each a picture beside
+    /// two lines of text.
+    pub const MODULE_LIBRARY_WIDTH: f32 = 470.0;
+    /// The schematic of a module on one of those cards, in the proportions of
+    /// the dock itself so it reads as the thing it stands for.
+    pub const MODULE_PREVIEW: [f32; 2] = [78.0, 58.0];
     /// The brush editor dialog. Wider than the other modals because the design
     /// lays its Tip section out as two columns and its Dynamics section as a
     /// row of curve panels, and neither survives being narrowed.

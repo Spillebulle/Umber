@@ -22,6 +22,12 @@
 //! remaining slots is exactly the index the drop will use — there is no
 //! "does this index count the panel I am holding?" case to get wrong, and the
 //! drop indicator cannot disagree with the result.
+//!
+//! That is also what makes *adding* a module a drag rather than a placement.
+//! [`Layout::add_dragging`] puts a closed module straight into the pointer's
+//! hand, so the same drop that moves an existing panel decides where the new
+//! one lands, and the same Escape abandons it. Its origin is "closed", so
+//! cancelling an add undoes the add.
 
 use crate::theme::metrics;
 use egui::{Pos2, Rect, Vec2, pos2, vec2};
@@ -80,6 +86,31 @@ impl PanelKind {
             Self::Brushes => "Brushes",
             Self::Layers => "Layers",
             Self::History => "History",
+        }
+    }
+
+    /// One line saying what the module is for, shown in the module library
+    /// beside its picture.
+    ///
+    /// Here rather than in `panels.rs` because the description belongs to the
+    /// identity: there is exactly one of each module, so there is exactly one
+    /// thing each is for. Adding a kind and forgetting the sentence is then a
+    /// missing match arm rather than a card with a blank half.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Colour => {
+                "Choose the painting colour — a hue ring, a saturation square \
+                 or RGB sliders."
+            }
+            Self::Brushes => {
+                "The brushes in reach, and the way in to the whole library and \
+                 to importing more."
+            }
+            Self::Layers => "The layer stack: order, visibility, opacity and blend mode.",
+            Self::History => {
+                "Every stroke on this document, and a click to go back to any \
+                 of them."
+            }
         }
     }
 
@@ -173,6 +204,10 @@ enum Origin {
         weight: f32,
     },
     Float(Rect),
+    /// It was not in the layout at all — the drag is an *add*, from the module
+    /// library. Cancelling one therefore abandons the add rather than putting
+    /// the panel anywhere.
+    Closed,
 }
 
 /// A drag in progress. The panel itself has already been removed from the
@@ -187,6 +222,14 @@ pub struct Drag {
     pub float_size: Vec2,
     /// Latest pointer position, in window points.
     pub pointer: Pos2,
+    /// Started by a *click* rather than by a press — adding a module from the
+    /// library. The button that began it is already up, so such a drag cannot
+    /// end on a release; it ends on the next press instead. See
+    /// [`Layout::drag_should_drop`].
+    pub sticky: bool,
+    /// Sticky drags only: whether the pointer has been seen up since the drag
+    /// began.
+    armed: bool,
     origin: Origin,
 }
 
@@ -703,6 +746,8 @@ impl Layout {
                 stack.insert(index, Docked { kind, weight });
             }
             Origin::Float(rect) => self.floating.push(Floating { kind, rect }),
+            // It came from nowhere, so it goes back to nowhere.
+            Origin::Closed => {}
         }
     }
 
@@ -722,7 +767,7 @@ impl Layout {
         // its docked width but a sane height reads better than either extreme.
         let float_size = match origin {
             Origin::Float(rect) => rect.size(),
-            Origin::Dock { .. } => vec2(
+            Origin::Dock { .. } | Origin::Closed => vec2(
                 panel_rect
                     .width()
                     .clamp(limits::FLOAT_MIN_WIDTH, limits::FLOAT_MAX_WIDTH),
@@ -736,9 +781,82 @@ impl Layout {
             grab: (pointer - panel_rect.left_top()).min(float_size - vec2(24.0, 0.0)),
             float_size,
             pointer,
+            sticky: false,
+            armed: false,
             origin,
         });
         self.dirty = true;
+    }
+
+    /// Add a module by picking it up: it enters the layout already in the
+    /// pointer's hand, and the drop chooses where it lands.
+    ///
+    /// This is what "add it, then put it where you want" means here. The
+    /// alternative — dropping it at the bottom of a sidebar and leaving the
+    /// user to find and move it — is [`Layout::open`], which the Window menu's
+    /// checkboxes still use because a checkbox that flung the pointer into a
+    /// drag would be a surprise.
+    ///
+    /// Edit mode is switched on rather than required: a module in mid-air is
+    /// only meaningful in the mode where panels move, and the design pauses the
+    /// canvas for exactly as long as one is. Returns false when the drag could
+    /// not be started, which is only when one already is.
+    pub fn add_dragging(&mut self, kind: PanelKind, pointer: Pos2) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
+        self.edit_mode = true;
+        // Already-open modules are lifted from wherever they are rather than
+        // duplicated — there is exactly one of each, which is the whole of why
+        // the kind is the identity.
+        let origin = self.take(kind).unwrap_or(Origin::Closed);
+        let float_size = match origin {
+            Origin::Float(rect) => rect.size(),
+            // A module that has never been placed has no size of its own. The
+            // dock's own width and a little over half a sidebar's height is
+            // what it would get by being docked, which is where most of them
+            // end up.
+            Origin::Dock { .. } | Origin::Closed => vec2(
+                metrics::PANEL.clamp(limits::FLOAT_MIN_WIDTH, limits::FLOAT_MAX_WIDTH),
+                260.0_f32.clamp(limits::FLOAT_MIN_HEIGHT, limits::FLOAT_MAX_HEIGHT),
+            ),
+        };
+        self.drag = Some(Drag {
+            kind,
+            // Held by the middle of its header, since there is no panel under
+            // the pointer for the grab to be measured against.
+            grab: vec2(float_size.x * 0.5, metrics::PANEL_HEADER * 0.5),
+            float_size,
+            pointer,
+            sticky: true,
+            armed: false,
+            origin,
+        });
+        self.dirty = true;
+        true
+    }
+
+    /// Whether the drag in progress should be dropped, given this frame's
+    /// pointer state.
+    ///
+    /// An ordinary drag ends when the button that began it is let go. One
+    /// started by a *click* cannot: that button is already up by the time the
+    /// drag exists, and testing "no button down" would drop the module on the
+    /// button that added it, on the very next frame. A sticky drag ends on the
+    /// next press instead — and only after a frame in which the pointer was
+    /// idle, because a click fast enough to press and release inside one frame
+    /// reports both at once and would otherwise do exactly the same thing.
+    pub fn drag_should_drop(&mut self, any_down: bool, any_pressed: bool) -> bool {
+        let Some(drag) = &mut self.drag else {
+            return false;
+        };
+        if !drag.sticky {
+            return !any_down;
+        }
+        if !any_down && !any_pressed {
+            drag.armed = true;
+        }
+        drag.armed && any_pressed
     }
 
     pub fn drag_to(&mut self, pointer: Pos2) {
@@ -754,7 +872,7 @@ impl Layout {
             DropTarget::Dock { side, index } => {
                 let weight = match drag.origin {
                     Origin::Dock { weight, .. } => weight,
-                    Origin::Float(_) => drag.kind.default_weight(),
+                    Origin::Float(_) | Origin::Closed => drag.kind.default_weight(),
                 };
                 let stack = &mut self.sides[side.index()];
                 let index = index.min(stack.len());
@@ -1470,6 +1588,78 @@ mod tests {
         let mut layout = layout;
         layout.open(PanelKind::History);
         assert!(layout.is_open(PanelKind::History));
+    }
+
+    /// Adding from the library leaves the module in the pointer's hand, in the
+    /// mode where it can be put down.
+    #[test]
+    fn adding_a_module_picks_it_up_ready_to_be_dropped() {
+        let mut layout = Layout::default();
+        assert!(!layout.edit_mode());
+
+        assert!(layout.add_dragging(PanelKind::History, pos2(600.0, 400.0)));
+        assert!(layout.edit_mode(), "a module in the air needs the mode");
+        assert!(layout.is_dragging());
+        let drag = layout.drag().expect("a drag");
+        assert_eq!(drag.kind, PanelKind::History);
+        assert!(drag.sticky, "the button that added it is already up");
+        assert!(
+            !layout.is_open(PanelKind::History),
+            "it is in the air, not in the layout",
+        );
+
+        // A second request while one is in flight is refused rather than
+        // replacing the module the user is already holding.
+        assert!(!layout.add_dragging(PanelKind::Colour, pos2(10.0, 10.0)));
+
+        layout.drag_to(pos2(200.0, 500.0));
+        layout.end_drag(DropTarget::Float);
+        assert_eq!(layout.floating().len(), 1);
+        assert_eq!(layout.floating()[0].kind, PanelKind::History);
+    }
+
+    /// Escape during the pick-up abandons the add, rather than dropping the
+    /// module somewhere the user never chose.
+    #[test]
+    fn cancelling_an_add_leaves_the_layout_as_it_was() {
+        let mut layout = Layout::default();
+        layout.set_edit_mode(true);
+        let before = layout.to_config();
+
+        layout.add_dragging(PanelKind::History, pos2(600.0, 400.0));
+        layout.cancel_drag();
+
+        assert!(!layout.is_open(PanelKind::History));
+        assert_eq!(layout.to_config(), before);
+    }
+
+    /// A sticky drag cannot end on a release — the release that started it has
+    /// already happened. It ends on the next press, and not before the pointer
+    /// has been seen up, or a click fast enough to press and release inside one
+    /// frame would drop the module on the button that added it.
+    #[test]
+    fn a_picked_up_module_waits_for_the_click_that_puts_it_down() {
+        let mut layout = Layout::default();
+        layout.add_dragging(PanelKind::History, pos2(600.0, 400.0));
+
+        // The same frame the library was clicked on: press and release both
+        // reported, and nothing must be dropped.
+        assert!(!layout.drag_should_drop(false, true));
+        // Pointer idle over the canvas.
+        assert!(!layout.drag_should_drop(false, false));
+        // And now a real press.
+        assert!(layout.drag_should_drop(true, true));
+
+        // An ordinary drag is unchanged: it ends when the button comes up.
+        let mut layout = Layout::default();
+        layout.set_edit_mode(true);
+        layout.begin_drag(
+            PanelKind::Colour,
+            pos2(1200.0, 200.0),
+            rect(1176.0, 180.0, 264.0, 340.0),
+        );
+        assert!(!layout.drag_should_drop(true, false));
+        assert!(layout.drag_should_drop(false, false));
     }
 
     #[test]
