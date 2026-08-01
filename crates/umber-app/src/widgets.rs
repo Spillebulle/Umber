@@ -110,6 +110,24 @@ pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
     response
 }
 
+/// Dim label on the left, [`toggle`] pushed to the right edge.
+///
+/// Here rather than beside its callers because two modules now draw one, and a
+/// second copy is how the pill ends up a different size in the Colour panel
+/// than in the brush editor.
+pub fn toggle_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            toggle(ui, p, value);
+        });
+    });
+}
+
 /// A row of mutually exclusive choices inside an inset well.
 pub fn segmented<T: PartialEq + Copy>(
     ui: &mut Ui,

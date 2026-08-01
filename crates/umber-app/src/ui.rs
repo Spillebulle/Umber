@@ -760,19 +760,6 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
     .clicked()
 }
 
-fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, value: &mut bool) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(label)
-                .size(text::SMALL)
-                .color(p.text_dim),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            widgets::toggle(ui, p, value);
-        });
-    });
-}
-
 /// The brush editor, matching the design's dialog.
 ///
 /// Holds every brush parameter that is not on the options strip, so the strip
@@ -1000,7 +987,7 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         if !has_angle(ed) {
             ui.disable();
         }
-        toggle_row(
+        widgets::toggle_row(
             ui,
             p,
             "Angle follows the stroke",
@@ -1573,7 +1560,7 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
 
-    toggle_row(ui, p, "Build up", &mut ed.brush.build_up);
+    widgets::toggle_row(ui, p, "Build up", &mut ed.brush.build_up);
     caption(
         ui,
         p,
@@ -1758,7 +1745,7 @@ fn curve_column(
     curve: &mut ResponseCurve,
     min: Option<(&str, &mut f32)>,
 ) {
-    toggle_row(ui, p, label, enabled);
+    widgets::toggle_row(ui, p, label, enabled);
 
     ui.add_space(6.0);
 
