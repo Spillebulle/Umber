@@ -480,16 +480,40 @@ until commit, so reading it there yields exactly the pre-stroke pixels, and by
 then the damaged rect is known. `read_layer_rect` blocks on the GPU, which is
 acceptable once per stroke but must never move into the drawing loop.
 
-- **Every entry is an `Edit` — a patch and an `EditKind`** — and the label
-  travels with it across an undo. Recomputing it on the far side would renumber
-  the list as it is stepped through, and it is read off the *snapshotted* stroke
-  style, so switching tool mid-stroke cannot change what the stroke that is
-  ending turns out to have been.
+- **Every entry is an `Edit` — a patch, an `EditKind` and a `Timestamp`** — and
+  both the kind and the time travel with it across an undo, via `Edit::made_at`.
+  Recomputing either on the far side would renumber and re-time the list as it
+  is stepped through, and the kind is read off the *snapshotted* stroke style,
+  so switching tool mid-stroke cannot change what the stroke that is ending
+  turns out to have been.
 - **`EditKind` has a variant only for something the engine can restore.** It is
   Paint and Erase because an entry exists only where a patch was captured.
   Adding "Clear layer" or "Delete layer" means making those undoable *first*; a
   row naming an action that clicking it will not undo is worse than one the list
-  stays quiet about, and the History module's footnote exists to say so.
+  stays quiet about, and the History module's footnote exists to say so. The
+  same bound governs the icons: `panels::edit_icon` is exhaustive over
+  `EditKind` deliberately, so a new variant cannot be added without deciding
+  what it looks like — and an icon set richer than the enum would be a promise
+  about what the engine records.
+- **The time is wall-clock, and may be absent.** `Instant` means nothing outside
+  the run that produced it and these go into a file, so `umber_core::time`
+  carries a `Timestamp` in Unix milliseconds. `Edit::at` is an `Option`, and
+  `None` — an entry out of a document written before histories carried times —
+  draws an *empty* column. A time invented at import would be
+  indistinguishable from a recorded one.
+- **`History::gap_at` is a gap, not an age.** What the list shows is how long
+  passed between one mark and the next, which is a property of the pair and does
+  not change as the afternoon wears on; an age would need the panel repainted
+  every second to stay true. It returns `None` where the clock ran backwards:
+  `Timestamp::since` refuses to report a negative interval as a duration,
+  because an NTP correction is not something an artist spent.
+- **There is no date crate, and the tooltip says UTC.** Hinnant's
+  `civil_from_days` is twenty testable lines and is pinned across 1970, 2000 and
+  2100 and against an independent calendar for every day of forty years. A crate
+  would not buy the thing that would justify one — *local* time — because
+  `time`'s local-offset refuses to answer in a multi-threaded process, and Umber
+  is one. Labelling the zone is what makes UTC honest rather than two hours
+  wrong.
 - **The two stacks read as one timeline** — everything applied, oldest first,
   then everything undone in the order redoing would put it back. `kind_at`
   indexes it without allocating, and `position` is the count of applied edits,

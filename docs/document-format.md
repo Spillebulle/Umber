@@ -211,6 +211,28 @@ Nothing here reaches the GPU. The patches have been in memory since they were
 captured at commit time, so a save's blocking readbacks are exactly what they
 were before.
 
+### When each edit was made
+
+Every manifest entry carries an optional `at`: milliseconds since the Unix
+epoch, UTC. That is what lets a reopened document's History list still say how
+long the artist spent between one mark and the next, rather than losing the
+shape of an afternoon the moment the file is closed.
+
+A number rather than a formatted date, because parsing a date is a place to be
+wrong and every consumer of the field wants the integer anyway. UTC because a
+local time would have to name a zone, and reading it back on a different machine
+would then mean carrying a time-zone database to interpret it.
+
+Optional in *both* directions, and that is the whole compatibility story. An
+entry with no recorded time — one that came out of a document written before
+this existed and is on its way back into one — omits the field entirely, so such
+a history is written byte for byte as it was before. And a manifest that never
+had the field reads back as "not known" rather than failing to parse, which
+would have cost the document its whole history over a column the picture does
+not depend on. The History module draws an empty cell for it; a time invented at
+import — the file's modification date, say — would be indistinguishable from a
+recorded one, and that is the failure worth avoiding.
+
 ### Why this does not bump `umber-version`
 
 The bar is that a revision storing something an older build would drop
@@ -223,6 +245,16 @@ do not need would be a plainly worse trade than the one it avoids.
 A separate `history::VERSION` governs the manifest's own layout instead, and a
 manifest from a newer one is **discarded**, not refused: the document still
 opens, exactly as it would have before histories were saved at all.
+
+That number answers to the same bar, one level down: it moves for a revision an
+older build would **misread**, and not for one it can simply ignore. Adding the
+per-entry timestamp did not move it. Serde skips a field it has never heard of,
+so a build predating it restores every patch and every position exactly as
+before and merely shows no times; bumping would instead have made that build
+throw the whole history away — all the pixels, to avoid losing the clock. The
+test `a_manifest_from_a_newer_revision_is_discarded_and_not_refused` pins the
+behaviour a genuine bump would rely on, so that raising the number stays a safe
+thing to do when something eventually earns it.
 
 ## The background, and why it is a real layer in the file
 
@@ -314,8 +346,9 @@ Written, read back, and asserted on in `docformat`'s tests:
 - Which layer was selected.
 - Empty layers, and layers painted in one corner.
 - The undo history: both stacks, the position within the timeline, how many
-  older entries the budget had already dropped, and every patch byte for byte —
-  on the layer it was recorded against, whatever slot that layer ends up with.
+  older entries the budget had already dropped, when each edit was made, and
+  every patch byte for byte — on the layer it was recorded against, whatever
+  slot that layer ends up with.
 
 ## What is not saved
 
