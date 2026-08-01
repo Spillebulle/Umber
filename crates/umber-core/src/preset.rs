@@ -969,6 +969,79 @@ mod tests {
         assert_eq!(preset.brush.mode, BrushMode::Erase);
     }
 
+    /// The modulation table is a fixed array behind a hand-written
+    /// `Serialize`/`Deserialize` pair, so it writes only its live entries. Both
+    /// halves need a round trip: the empty case, which must cost `[]` rather
+    /// than twelve inert rows in every one of 201 presets, and a filled one,
+    /// which must come back identical.
+    #[test]
+    fn a_modulated_brush_survives_the_library() {
+        use crate::dynamics::{DabInput, DabTarget, Modulation, Modulations};
+
+        let scratch = Scratch::new("modulated");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let modulations: Modulations = [
+            Modulation {
+                target: DabTarget::Ratio,
+                input: DabInput::Random,
+                low: -1.5,
+                high: 1.5,
+                curve: ResponseCurve::EASE_IN,
+            },
+            Modulation {
+                target: DabTarget::Size,
+                input: DabInput::Speed,
+                low: 0.0,
+                high: -0.6,
+                curve: ResponseCurve::LINEAR,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        let id = library
+            .save(
+                BrushPreset::unsaved(
+                    "Flick",
+                    Brush {
+                        modulations,
+                        ..Brush::default()
+                    },
+                ),
+                None,
+            )
+            .expect("save");
+
+        let text = std::fs::read_to_string(scratch.path().join("brushes.ron")).expect("read");
+        assert!(text.contains("Random"), "the table was not written: {text}");
+
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        let back = reloaded.get(&id).expect("saved brush is there");
+        assert_eq!(back.brush.modulations, modulations);
+    }
+
+    /// A library written before the table existed names none of its fields and
+    /// has to load with an empty one rather than failing.
+    #[test]
+    fn a_library_from_before_the_modulation_table_still_loads() {
+        let old = r#"(
+            version: 1,
+            presets: [(
+                id: "user/old",
+                name: "Old",
+                category: "Inks & pens",
+                brush: (size: 12.0),
+            )],
+        )"#;
+        let presets = parse_library(old).expect("an older library still parses");
+        assert_eq!(presets[0].brush.size, 12.0);
+        assert!(presets[0].brush.modulations.is_empty());
+        // And the fields added alongside it take their defaults rather than
+        // zero, which for the stroke ramp would be a division by nothing.
+        assert_eq!(presets[0].brush.stroke_span, Brush::default().stroke_span);
+        assert_eq!(presets[0].brush.speed_offset, 0.0);
+    }
+
     #[test]
     fn saving_over_an_id_replaces_rather_than_duplicates() {
         let scratch = Scratch::new("replace");

@@ -339,6 +339,44 @@ genuinely reaches zero.
   mapping on top of a base of zero, so reading `base_value` alone silently drops
   it. See `docs/brushes.md`.
 
+### Inputs other than pressure
+
+`umber_core::dynamics` is the general form of the above: a fixed-capacity table
+of `(target, input, curve, range)` on every `Brush`, evaluated once per dab.
+Speed, stroke position, direction and a per-dab random draw reach size, opacity,
+hardness, scatter, ellipticity, angle, colour pickup and the dab's own colour.
+
+- **The table is fixed-capacity because `Brush` is `Copy`,** and it serialises
+  as a plain sequence of only its live entries — so an empty one costs `[]` and
+  a library written before it existed still loads. A curve per input per target
+  would be 60 curves on every brush to carry a median of two.
+- **An empty table is the fast path and must stay one.** `StrokeBuilder` skips
+  the speed filters, the stroke ramp and the whole evaluation when nothing reads
+  them, and every branch is guarded by the setting that reads it — not by a
+  blanket "is anything modulated".
+- **The random draw is guarded, like every other one.** The RNG is a single
+  stream; an unconditional draw for a feature a brush does not use reshuffles
+  the numbers every other feature gets. One draw per dab, shared by every entry
+  that reads `Random` — which is also exactly what libmypaint's `random_input`
+  is. `a_modulation_that_reads_no_randomness_leaves_the_rng_alone` pins it.
+- **A modulation's units are MyPaint's, not Umber's**, and they compose
+  differently per target: size is a *log* offset so it multiplies the radius,
+  opacity is a *factor* because MyPaint multiplies two settings to reach it, and
+  the rest add. `Modulated` documents each.
+- **`Brush::colours_dabs` — not `smudges` — decides
+  `StrokeStyle::per_dab_color`.** A colour modulation puts a stroke on the
+  per-dab colour path just as pickup does, and the flag has to agree with what
+  `draw_dabs` was told, for the whole stroke.
+- **`mypaint.rs`'s `piecewise` is libmypaint's `mypaint_mapping_calculate`, line
+  for line, extrapolating end segments included.** It does not hold end values.
+  Extrapolation is bounded because `DabInput::normalise` clamps the input to its
+  domain; remove that clamp and one bad timestamp is a dab the size of the
+  canvas.
+- **Everything in a `.myb` goes through `MybFile::eval`.** Reading a
+  `base_value` directly is what shipped three brushes invisible and thirteen at
+  the wrong size. An input Umber cannot produce is *evaluated at its neutral*,
+  not skipped — that is what MyPaint renders on the same machine.
+
 ### Colour pickup
 
 A smudging brush needs to know what the canvas holds under it, every frame of a
@@ -421,14 +459,16 @@ design shows a whole row of them.
 - Watch for `powf` on a value that can go slightly negative — `sin(PI)` in f32
   is just below zero, and a negative base with a fractional exponent is NaN,
   which ecolor's `gamma_multiply` asserts on. This has already bitten once.
-- **The brush editor's sections are Tip, Dynamics, Scatter, Texture and
-  Blending.** The design names six; Wet edges has no engine behind it and is not
-  drawn at all, Stabiliser is one slider and rides on Tip, and Blending is a
-  name of our own because colour pickup needed a home and none of the design's
-  is one. Texture holds the paper *and* build-up, because both are about a mark
-  made of many faint stamps rather than one solid one. Between them they expose
-  every field of `Brush` — adding one means adding a control, or the library can
-  use a brush nobody can make.
+- **The brush editor's sections are Tip, Dynamics, Inputs, Scatter, Texture and
+  Blending.** The design names six and this is six, but not the same six: **Wet
+  edges** alone still has no engine behind it and is not drawn at all, and
+  Stabiliser is one slider that rides on Tip. Blending and Inputs are names of
+  our own — colour pickup needed a home and none of the design's is one, and the
+  modulation table is a *list* where Dynamics is three pressure curves, so
+  Dynamics is pressure and Inputs is everything else. Texture holds the paper
+  *and* build-up, because both are about a mark made of many faint stamps rather
+  than one solid one. Between them they expose every field of `Brush` — adding
+  one means adding a control, or the library can use a brush nobody can make.
 - **The brush list's samples are stamped from the brush**, not drawn from two of
   its numbers. `widgets::brush_sample` is a miniature dab loop under a pressure
   ramp; it seeds its RNG identically on every row, so two rows differ because

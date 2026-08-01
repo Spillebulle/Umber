@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::curve::ResponseCurve;
+use crate::dynamics::{DabInput, DabTarget, Modulations};
 
 /// What a stroke does to the layer underneath it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +218,32 @@ pub struct Brush {
     /// Which shipped paper the grain comes from. Meaningless while
     /// [`Brush::grain`] is zero.
     pub grain_pattern: GrainPattern,
+    /// How far each dab leads the pointer along its own direction of travel,
+    /// in seconds of the current speed. MyPaint's `offset_by_speed`.
+    ///
+    /// Not scatter: the offset is *directed*, so a fast flick throws the mark
+    /// ahead of (or, negative, behind) the cursor while a slow one sits on it.
+    /// That is a trailing brush, and reading it as a spray — which is the
+    /// obvious-looking approximation — turns a smear into confetti.
+    pub speed_offset: f32,
+    /// How far the pointer travels, in dab radii, before the `Stroke` input
+    /// reaches 1. MyPaint's `exp(stroke_duration_logarithmic)`.
+    ///
+    /// Only consulted when something reads [`DabInput::Stroke`]. It is stated
+    /// in radii rather than pixels for the same reason scatter is: a brush
+    /// scaled up should behave like itself, not run through its cycle sooner.
+    pub stroke_span: f32,
+    /// Extra travel, as a multiple of [`Brush::stroke_span`], that the `Stroke`
+    /// input sits at 1 before wrapping back to 0. MyPaint's `stroke_holdtime`;
+    /// its own ceiling of 10 means "never wrap".
+    pub stroke_hold: f32,
+    /// Inputs other than pressure, routed onto whatever they drive.
+    ///
+    /// Empty for every hand-written preset and for most imports, which is the
+    /// fast path: [`crate::stroke::StrokeBuilder`] skips the whole evaluation
+    /// and does not touch the RNG. See [`crate::dynamics`] for why this is a
+    /// small fixed table rather than a curve per input per target.
+    pub modulations: Modulations,
 }
 
 impl Default for Brush {
@@ -253,6 +280,12 @@ impl Default for Brush {
             grain: 0.0,
             grain_scale: 256.0,
             grain_pattern: GrainPattern::Tooth,
+            speed_offset: 0.0,
+            // MyPaint's own default, exp(4): about 55 radii of travel for a
+            // full cycle of the stroke input.
+            stroke_span: 54.598_15,
+            stroke_hold: 0.0,
+            modulations: Modulations::EMPTY,
         }
     }
 }
@@ -328,8 +361,38 @@ impl Brush {
     /// The threshold is not zero: a smudge of a few thousandths is a rounding
     /// artefact of the import, and turning the whole per-dab colour path on for
     /// it would cost a scratch target to render something indistinguishable.
+    ///
+    /// A brush whose pickup is stated *entirely* as a modulation still smudges
+    /// even though the field reads zero — 42 of the shipped 196 put the whole
+    /// of it on pressure, and reading the field alone made every one of them a
+    /// brush that deposits flat paint however hard you lean on it.
     pub fn smudges(&self) -> bool {
-        self.smudge > 0.004
+        self.smudge > 0.004 || self.modulations.drives(DabTarget::Smudge)
+    }
+
+    /// Whether individual dabs may carry a colour of their own — either picked
+    /// up off the canvas or shifted by a colour modulation.
+    ///
+    /// This is what decides whether the stroke needs its second scratch target,
+    /// so it must stay false for the overwhelming majority of brushes.
+    pub fn colours_dabs(&self) -> bool {
+        self.smudges() || self.modulations.tints()
+    }
+
+    /// Whether anything but pressure varies this brush along a stroke.
+    pub fn is_modulated(&self) -> bool {
+        !self.modulations.is_empty()
+    }
+
+    /// Whether the dab's position depends on how fast the pointer is moving.
+    pub fn leads_with_speed(&self) -> bool {
+        self.speed_offset.abs() > 1e-4
+    }
+
+    /// Whether anything reads the `Stroke` input, and therefore whether
+    /// [`Brush::stroke_span`] means anything for this brush.
+    pub fn uses_stroke_position(&self) -> bool {
+        self.modulations.uses(DabInput::Stroke)
     }
 
     /// Whether the brush keeps depositing paint while the pen is stationary.
@@ -352,7 +415,11 @@ impl Brush {
     /// way, since shape is two more floats on an instance that was going to be
     /// uploaded regardless.
     pub fn is_shaped(&self) -> bool {
-        self.dab_ratio > 1.01 || self.scatter > 0.0 || self.radius_jitter > 0.0
+        self.dab_ratio > 1.01
+            || self.scatter > 0.0
+            || self.radius_jitter > 0.0
+            || self.modulations.drives(DabTarget::Ratio)
+            || self.modulations.drives(DabTarget::Scatter)
     }
 
     /// Whether the dab's angle is worth showing the user.
@@ -360,7 +427,7 @@ impl Brush {
     /// A circle has no angle, so an Angle slider on a round brush is a control
     /// that does nothing — which is worse than one that is visibly disabled.
     pub fn dab_has_angle(&self) -> bool {
-        self.dab_ratio > 1.01
+        self.dab_ratio > 1.01 || self.modulations.drives(DabTarget::Ratio)
     }
 }
 

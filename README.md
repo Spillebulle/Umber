@@ -227,8 +227,18 @@ shipped brushes soften their edge under a light hand, and 38 change how much
 they scatter — 16 of them stating *no* constant scatter at all, so before this
 they imported as perfectly smooth lines wearing the name of something granular.
 
-**The brush editor reaches all of it.** Tip, Dynamics, Scatter, Texture and
-Blending: every field a brush has, colour pickup and dab shape and jitter and
+**And pressure is not the only thing driving them.** MyPaint states every brush
+setting as a base value plus one mapping per input, and Umber now reads the
+whole sum: how fast you are moving, how far into the mark you are, which way it
+is heading, and a throw of the dice per dab, onto size, opacity, hardness,
+scatter, ellipticity, angle, colour pickup and the colour itself. 132 of the 196
+shipped brushes use at least one, and three of them used to arrive
+*invisible* — they state their opacity entirely as a mapping, and only the base
+value was being read. A stroke thins as it is flicked, a bristle clump changes
+shape stamp to stamp, and a brush that mixes when you lean on it mixes.
+
+**The brush editor reaches all of it.** Tip, Dynamics, Inputs, Scatter, Texture
+and Blending: every field a brush has, colour pickup and dab shape and jitter and
 airbrush rate and paper included. The samples in the brush list are stamped from each preset's own
 settings under a pressure ramp rather than drawn from its opacity and hardness,
 so in a list two hundred entries long a spray looks like a spray.
@@ -295,11 +305,12 @@ Taken from the design but not implemented, roughly by size:
 - **Drag-to-reorder tools** in the rail, and **saved workspaces**: the two
   parts of the design's layout edit mode still outstanding. The rest of it is
   built — see [Layout edit mode](#layout-edit-mode).
-- The brush editor's **Wet edges** section. Tip, Dynamics, Scatter, Texture and
-  Blending are built; that one has no engine behind it, so it is not drawn
-  rather than drawn empty.
+- The brush editor's **Wet edges** section. Tip, Dynamics, Inputs, Scatter,
+  Texture and Blending are built; that one has no engine behind it, so it is not
+  drawn rather than drawn empty.
 - The Navigator overlay, Palette and Harmony colour modes, and per-brush blend
-  modes.
+  modes. Also MyPaint's `lock_alpha`, `colorize` and `custom_input`, and stylus
+  tilt — `docs/brushes.md` costs each one and says why it is not built.
 - **Autosave and recovery.** Saving works and does not lose work when it fails;
   it does not yet protect you from not having done it.
 - The design shows a sixteen-tool rail; Umber has four. The missing twelve are

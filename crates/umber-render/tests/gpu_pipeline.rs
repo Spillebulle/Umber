@@ -9,7 +9,8 @@
 use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
-    BlendMode, Brush, BrushMode, Camera, Color, Dab, InputPoint, PixelRect, StrokeBuilder, TipMask,
+    BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget, InputPoint, Modulation,
+    PixelRect, ResponseCurve, StrokeBuilder, TipMask,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
@@ -1761,4 +1762,136 @@ fn picking_reads_the_flattened_stack_not_one_layer() {
         .canvas
         .pick_colour(&h.gpu.device, &h.gpu.queue, &stack, Vec2::new(32.5, 32.5));
     assert_near(px, [200, 20, 20], 3, "picked colour");
+}
+
+/// A brush driven by something other than pressure, all the way from the input
+/// samples to the committed pixels.
+///
+/// The engine half is covered by unit tests in `umber-core`; what this adds is
+/// that the dabs a modulated stroke produces are still ordinary dab instances,
+/// so the wet-layer guarantee holds for them. It would be easy to reach for a
+/// second blend state the day per-dab shape started varying.
+#[test]
+fn a_modulated_stroke_still_saturates_under_overlap() {
+    let mut h = harness_or_skip!();
+
+    let brush = Brush {
+        size: 24.0,
+        spacing: 0.1,
+        stabilization: 0.0,
+        pressure_size: false,
+        pressure_opacity: false,
+        dab_ratio: 3.0,
+        modulations: [
+            Modulation {
+                target: DabTarget::Ratio,
+                input: DabInput::Random,
+                low: -2.0,
+                high: 2.0,
+                curve: ResponseCurve::LINEAR,
+            },
+            Modulation {
+                target: DabTarget::Size,
+                input: DabInput::Speed,
+                low: -0.3,
+                high: 0.3,
+                curve: ResponseCurve::LINEAR,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    // Scrubbed back and forth over the same spot, which is the case that
+    // compounds if the `max` blend is ever lost.
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        brush,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(32.0, 32.0), 1.0, 0.0),
+    );
+    let mut dabs: Vec<Dab> = Vec::new();
+    for (i, x) in [20.0, 44.0, 20.0, 44.0].into_iter().enumerate() {
+        s.extend(InputPoint::new(
+            Vec2::new(x, 32.0),
+            1.0,
+            (i + 1) as f64 * 0.05,
+        ));
+        dabs.extend(s.drain_pending());
+    }
+    assert!(
+        dabs.len() > 10,
+        "expected a stroke, got {} dabs",
+        dabs.len()
+    );
+    // The dabs really did change shape, or the test proves nothing.
+    let lo = dabs.iter().map(|d| d.aspect).fold(f32::MAX, f32::min);
+    let hi = dabs.iter().map(|d| d.aspect).fold(f32::MIN, f32::max);
+    assert!(hi - lo > 1.0, "aspect did not vary: {lo}..{hi}");
+    assert!(lo >= 1.0, "a dab turned inside out at aspect {lo}");
+
+    h.stamp(&dabs);
+    h.commit(Color::WHITE, 0.5, BrushMode::Paint);
+
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (one stroke at half opacity), got {alpha} — a modulated \
+         stroke is compounding"
+    );
+}
+
+/// Colour dynamics ride the per-dab colour path smudging already built, so the
+/// evidence that they reach the canvas is that two points along one stroke
+/// commit at different brightnesses. With the colour scratch ignored the whole
+/// mark would come out the flat palette colour.
+#[test]
+fn a_colour_modulated_stroke_commits_a_different_colour_per_dab() {
+    let mut h = harness_or_skip!();
+
+    let brush = Brush {
+        size: 8.0,
+        spacing: 0.5,
+        stabilization: 0.0,
+        pressure_size: false,
+        modulations: [Modulation {
+            target: DabTarget::Value,
+            input: DabInput::Random,
+            low: -0.45,
+            high: 0.45,
+            curve: ResponseCurve::LINEAR,
+        }]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    assert!(brush.colours_dabs(), "this brush needs the colour scratch");
+
+    let mut s = StrokeBuilder::new();
+    let mid = [0.216, 0.216, 0.216]; // linear for sRGB 128
+    s.begin(brush, mid, InputPoint::new(Vec2::new(4.0, 32.0), 1.0, 0.0));
+    s.extend(InputPoint::new(Vec2::new(60.0, 32.0), 1.0, 0.1));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    assert!(dabs.len() > 10);
+
+    h.stamp_colored(&dabs, true);
+    // Black as the stroke colour: anything but black proves the colour scratch
+    // was read, and a *range* of values proves it was read per dab.
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let mut lo = u8::MAX;
+    let mut hi = u8::MIN;
+    for x in (6..58).step_by(2) {
+        let px = h.pixel(x, 32);
+        if px[3] > 200 {
+            lo = lo.min(px[0]);
+            hi = hi.max(px[0]);
+        }
+    }
+    assert!(hi > lo, "the whole stroke committed one colour ({lo})");
+    assert!(
+        hi - lo > 40,
+        "brightness barely varied along the stroke: {lo}..{hi}"
+    );
 }
