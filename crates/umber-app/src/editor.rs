@@ -65,6 +65,9 @@ pub struct UiState {
     pub brush_tab: BrushTab,
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
+    /// The module library — every dockable module, and the way to put one back
+    /// after it has been removed from the layout.
+    pub module_library_open: bool,
     /// Tab whose close is waiting on confirmation, if any.
     pub close_prompt: Option<usize>,
     /// Which row of the brush editor's Inputs list is open for editing.
@@ -114,6 +117,7 @@ impl Default for UiState {
             brush_tab: BrushTab::Tip,
             settings_open: false,
             settings_tab: SettingsTab::Themes,
+            module_library_open: false,
             close_prompt: None,
             modulation: 0,
         }

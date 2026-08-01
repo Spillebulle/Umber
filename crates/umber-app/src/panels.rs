@@ -74,6 +74,10 @@ pub fn sidebars(
     // the Brushes panel, which the layout is free to hide — a modal that goes
     // with its panel cannot be shut and cannot be reopened.
     brushlib::dialogs(root, p, ed);
+    // The module library, for the same reason and one more: it is how a module
+    // that has been removed from the layout comes back, so tying it to a panel
+    // would tie the way back to the thing that has gone.
+    module_library(root, p, ed);
 }
 
 fn sidebar(
@@ -396,17 +400,9 @@ fn panel(
             .max_rect(controls)
             .layout(Layout::right_to_left(Align::Center)),
         |ui| {
-            // Hiding a panel is an edit-mode action too, so a stray click on
-            // the corner of a panel cannot make it vanish mid-painting.
-            if editing
-                && icon_button(
-                    ui,
-                    p,
-                    Icon::Close,
-                    true,
-                    "Hide this panel — bring it back from the Window menu",
-                )
-            {
+            // Removing a module is an edit-mode action, so a stray click on the
+            // corner of a panel cannot make it vanish mid-painting.
+            if editing && remove_button(ui, p) {
                 events.close = true;
             }
             if kind == PanelKind::Colour {
@@ -441,11 +437,39 @@ fn panel(
                     PanelKind::Colour => colour_body(ui, p, ed),
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
+                    PanelKind::History => history_body(ui, p, ed, actions),
                 });
         },
     );
 
     events
+}
+
+/// The edit-mode control that takes a module out of the layout.
+///
+/// Its own function rather than [`icon_button`] because it is the one control
+/// in a header that destroys something, and it says so by lighting up in the
+/// warning colour instead of in the ordinary hover ink. It is nothing worse
+/// than reversible — the module library puts any module back — which is why the
+/// tooltip names the way back rather than asking for a confirmation.
+fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, metrics::RADIUS, p.warning_bg);
+    }
+    icons::draw(
+        ui.painter(),
+        rect.shrink(3.0),
+        Icon::Close,
+        if hovered { p.warning } else { p.text_dim },
+    );
+    // No arrow glyph in the tooltip: Archivo carries none, and a blank box
+    // pointing at the way back would be worse than spelling out the menu.
+    response
+        .on_hover_text("Remove this module from the layout — Window, Modules puts it back")
+        .clicked()
 }
 
 /// A dashed outline round a rounded rect.
@@ -578,12 +602,28 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
         FontId::proportional(text::SMALL),
         p.text_strong,
     );
+    // A module picked up from the library is not being held down, so it has to
+    // say what will put it down. Without this the only cue is that it follows
+    // the pointer, which reads as a stuck drag rather than as a placement.
+    if drag.sticky {
+        painter.text(
+            pos2(tab.right() - f32::from(metrics::PANEL_PAD), tab.center().y),
+            Align2::RIGHT_CENTER,
+            "click to place",
+            FontId::proportional(text::TINY),
+            p.accent,
+        );
+    }
 
     ctx.set_cursor_icon(CursorIcon::Grabbing);
 
+    // Which pointer event ends the drag is the model's to decide: one begun by
+    // a press ends on the release, one begun by a click on the next press. See
+    // `Layout::drag_should_drop`.
+    let (down, pressed) = ctx.input(|i| (i.pointer.any_down(), i.pointer.any_pressed()));
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         ed.layout.cancel_drag();
-    } else if !ctx.input(|i| i.pointer.any_down()) {
+    } else if ed.layout.drag_should_drop(down, pressed) {
         ed.layout.end_drag(target);
     }
     ctx.request_repaint();
@@ -723,6 +763,135 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     }
 }
 
+/// The History module: what has been painted on this document, and a click to
+/// go back to any point in it.
+///
+/// What it deliberately does *not* show is anything it cannot restore. Umber's
+/// history covers painting only — adding, deleting or reordering a layer is not
+/// recorded, and deleting one clears the list outright — so a row appears only
+/// where a patch was captured, and the note at the foot says so rather than
+/// leaving the gap to be discovered. A list that named a structural action it
+/// could not undo would be worse than one that admits its own edges.
+fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
+    let position = ed.history.position();
+    let count = ed.history.len();
+
+    // Keep the current entry in view when the position moves under the list —
+    // a jump of eight entries otherwise scrolls nothing and appears to have
+    // done nothing. Held in egui's temporary store rather than in `UiState`,
+    // which is per-application where this is per-list.
+    let memo = Id::new("history-follow");
+    let follow = ui.ctx().data(|d| d.get_temp::<usize>(memo)) != Some(position);
+
+    let mut jump = None;
+
+    // Row zero is the document with none of the edits applied, and it is the
+    // only way back to a blank start, so it is a row like any other rather than
+    // a caption. Once the budget has aged entries out it is no longer the
+    // beginning of the document, and it says so — see `History::dropped`.
+    let dropped = ed.history.dropped();
+    let base = if dropped > 0 {
+        "Earlier edits discarded"
+    } else {
+        "Opened"
+    };
+    let at_start = position == 0;
+    if history_row(ui, p, base, true, at_start, at_start && follow).clicked() {
+        jump = Some(0);
+    }
+
+    for index in 0..count {
+        let Some(kind) = ed.history.kind_at(index) else {
+            continue;
+        };
+        // Applied entries read as ink, undone ones as the ghost they are: a
+        // click on one of those is a redo.
+        let applied = index < position;
+        let current = position == index + 1;
+        if history_row(ui, p, kind.label(), applied, current, current && follow).clicked() {
+            jump = Some(index + 1);
+        }
+    }
+
+    if let Some(target) = jump {
+        actions.history_jump = Some(target);
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(memo, position));
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(if count == 0 {
+            "Nothing painted on this document yet. Strokes are recorded here; \
+             layers are not."
+        } else {
+            "Strokes only. Adding, deleting or reordering a layer is not \
+             recorded, and deleting one clears this list."
+        })
+        .size(9.5)
+        .color(p.text_dim)
+        .line_height(Some(12.0)),
+    );
+}
+
+/// One entry in that list: a marker, then what the edit was.
+///
+/// Nothing here allocates and nothing off screen is painted. The list is as
+/// long as the session is, and both of those show up in a frame time before
+/// anything else about it does.
+fn history_row(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &'static str,
+    applied: bool,
+    current: bool,
+    scroll_here: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), metrics::HISTORY_ROW),
+        Sense::click(),
+    );
+    if scroll_here {
+        response.scroll_to_me(Some(Align::Center));
+    }
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    if current {
+        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+    } else if response.hovered() {
+        painter.rect_filled(rect, metrics::RADIUS, p.control);
+    }
+
+    // The marker is the cursor: filled and accented where the document stands,
+    // hollow behind it, and hollow and dim ahead of it.
+    let ink = match (current, applied) {
+        (true, _) => p.accent,
+        (false, true) => p.text,
+        (false, false) => p.text_dim.gamma_multiply(0.55),
+    };
+    let dot = pos2(rect.left() + 8.0, rect.center().y);
+    if current {
+        painter.circle_filled(dot, 3.5, ink);
+    } else {
+        painter.circle_stroke(dot, 3.0, Stroke::new(1.0, ink));
+    }
+    painter.text(
+        pos2(dot.x + 9.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(text::SMALL),
+        ink,
+    );
+
+    response.on_hover_text(if applied {
+        "Go back to this point"
+    } else {
+        "Put this back"
+    })
+}
+
 /// The Colour panel's picker-type switch: a half-filled disc, the mode name,
 /// and a chevron.
 fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
@@ -778,6 +947,254 @@ fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         });
     if popup.is_none() {
         ed.ui.picker_menu_open = false;
+    }
+}
+
+// --- the module library ----------------------------------------------------
+
+/// Every module there is: a picture of it, what it is for, and a way to put it
+/// into the layout.
+///
+/// Drawn from [`sidebars`], not from a panel body — the layout can hide any
+/// panel, and this is precisely the dialog that brings a hidden one back, so
+/// tying it to one would tie the way back to the thing that has gone.
+///
+/// Adding does not place the module: it puts it in the pointer's hand, in
+/// layout edit mode, and lets the drop decide where it goes. That is the same
+/// gesture that moves a module already in the layout, so there is one way to
+/// say where a panel lives rather than two, and Escape abandons the add exactly
+/// as it abandons a move.
+fn module_library(root: &mut Ui, p: &Palette, ed: &mut Editor) {
+    if !ed.ui.module_library_open {
+        return;
+    }
+
+    let mut picked = None;
+    let response = egui::Modal::new(Id::new("module-library"))
+        .frame(
+            Frame::NONE
+                .fill(p.popover)
+                .stroke(Stroke::new(1.0, p.popover_border))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(18)),
+        )
+        .show(root.ctx(), |ui| {
+            ui.set_width(metrics::MODULE_LIBRARY_WIDTH);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Modules")
+                        .size(text::CONTROL)
+                        .color(p.text_strong)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, p, Icon::Close, true, "Close") {
+                        ed.ui.module_library_open = false;
+                    }
+                });
+            });
+            crate::controls::note(
+                ui,
+                p,
+                "The panels the workspace is made of. Adding one hands it to \
+                 the pointer — drop it in a sidebar to dock it, or anywhere \
+                 else to leave it floating over the canvas.",
+            );
+            ui.add_space(10.0);
+
+            for kind in PanelKind::ALL {
+                if module_card(ui, p, ed, kind) {
+                    picked = Some(kind);
+                }
+                ui.add_space(6.0);
+            }
+        });
+
+    if response.should_close() {
+        ed.ui.module_library_open = false;
+    }
+
+    if let Some(kind) = picked {
+        // Under the cursor, which is where the user is looking. With no pointer
+        // — a keyboard-driven click — the middle of the window is the only
+        // honest answer, and the module is visibly in hand there too.
+        let pointer = root
+            .ctx()
+            .pointer_hover_pos()
+            .unwrap_or_else(|| root.ctx().viewport_rect().center());
+        if ed.layout.add_dragging(kind, pointer) {
+            // Out of the way, or the module would be dragged across the dialog
+            // that produced it.
+            ed.ui.module_library_open = false;
+        }
+    }
+}
+
+/// One module's card. Returns true when the user asked for it.
+fn module_card(ui: &mut Ui, p: &Palette, ed: &Editor, kind: PanelKind) -> bool {
+    let open = ed.layout.is_open(kind);
+    let mut add = false;
+    Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(metrics::RADIUS_LARGE)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let [w, h] = metrics::MODULE_PREVIEW;
+                let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                module_preview(ui.painter(), p, rect, kind);
+
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    // Room kept for the button, so a long description does not
+                    // push it off the card.
+                    ui.set_width((ui.available_width() - 76.0).max(80.0));
+                    ui.label(
+                        egui::RichText::new(kind.title())
+                            .size(text::SMALL)
+                            .color(p.text_strong)
+                            .strong(),
+                    );
+                    crate::controls::note(ui, p, kind.description());
+                });
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // An open module is not offered again — there is exactly
+                    // one of each, which is what makes the kind its identity.
+                    // The control says why it is dead rather than vanishing,
+                    // so the card does not change shape as panels come and go.
+                    if crate::controls::text_button(ui, p, "Add", !open, !open)
+                        .on_hover_text(if open {
+                            "Already in your layout. Drag it by its header in \
+                             layout edit mode to move it."
+                        } else {
+                            "Pick it up, then click where you want it"
+                        })
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                });
+            });
+        });
+    add
+}
+
+/// A schematic of one module, painted rather than screenshotted.
+///
+/// This project paints its widgets rather than shipping pictures of them, and a
+/// bitmap of a panel would be a second thing to keep in step with the panel —
+/// stale the first time the Colour module gains a control, and wrong in the
+/// other theme immediately. A schematic in the palette's own tokens is never
+/// either: it says which module this is by its *shape*, which is what the eye
+/// is matching against the sidebar anyway.
+fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelKind) {
+    painter.rect_filled(rect, metrics::RADIUS, p.chrome);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.border),
+        StrokeKind::Inside,
+    );
+
+    // Every module wears the same header, because in the dock every module
+    // does: it is the strip they are all dragged by.
+    let header = Rect::from_min_size(rect.min, vec2(rect.width(), 9.0));
+    painter.rect_filled(header, 0.0, p.control);
+    painter.hline(rect.x_range(), header.bottom(), Stroke::new(1.0, p.border));
+    for k in 0..2 {
+        painter.circle_filled(
+            pos2(rect.left() + 5.0 + k as f32 * 3.0, header.center().y),
+            0.8,
+            p.accent,
+        );
+    }
+    painter.rect_filled(
+        Rect::from_min_size(
+            pos2(rect.left() + 13.0, header.center().y - 1.0),
+            vec2(18.0, 2.0),
+        ),
+        1.0,
+        p.text_dim,
+    );
+
+    let body = Rect::from_min_max(pos2(rect.left() + 6.0, header.bottom() + 5.0), rect.max)
+        .shrink2(vec2(0.0, 5.0));
+    if body.width() < 8.0 || body.height() < 8.0 {
+        return;
+    }
+    let ink = p.text_dim;
+    let bar = |y: f32, from: f32, to: f32, colour: egui::Color32| {
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(body.left() + from, y - 1.0),
+                pos2(body.left() + to, y + 1.0),
+            ),
+            1.0,
+            colour,
+        );
+    };
+
+    match kind {
+        // The hue ring with its square centre, and the swatch under it.
+        PanelKind::Colour => {
+            let r = (body.height() * 0.42).min(body.width() * 0.28);
+            let centre = pos2(body.left() + r + 2.0, body.top() + r + 1.0);
+            painter.circle_stroke(centre, r, Stroke::new(2.5, p.accent));
+            painter.rect_filled(
+                Rect::from_center_size(centre, vec2(r, r)),
+                1.0,
+                p.text_dim.gamma_multiply(0.7),
+            );
+            for k in 0..3 {
+                bar(
+                    body.bottom() - 2.0,
+                    0.0 + k as f32 * 14.0,
+                    10.0 + k as f32 * 14.0,
+                    ink,
+                );
+            }
+        }
+        // A short list of brushes, each a stroke sample beside a name.
+        PanelKind::Brushes => {
+            for k in 0..3 {
+                let y = body.top() + 5.0 + k as f32 * 10.0;
+                painter.rect_filled(
+                    Rect::from_min_size(pos2(body.left(), y - 2.0), vec2(16.0, 4.0)),
+                    2.0,
+                    if k == 0 { p.accent } else { ink },
+                );
+                bar(y, 20.0, 20.0 + 26.0 - k as f32 * 5.0, ink);
+            }
+        }
+        // A stack, with a thumbnail on every row and one of them selected.
+        PanelKind::Layers => {
+            for k in 0..3 {
+                let y = body.top() + 5.0 + k as f32 * 10.0;
+                let cell = Rect::from_min_size(pos2(body.left(), y - 3.5), vec2(7.0, 7.0));
+                painter.rect_stroke(
+                    cell,
+                    1.0,
+                    Stroke::new(1.0, if k == 1 { p.accent } else { ink }),
+                    StrokeKind::Inside,
+                );
+                bar(y, 11.0, 11.0 + 30.0 - k as f32 * 6.0, ink);
+            }
+        }
+        // A timeline: a marker per entry, filled where the document stands.
+        PanelKind::History => {
+            for k in 0..4 {
+                let y = body.top() + 4.0 + k as f32 * 8.0;
+                let dot = pos2(body.left() + 3.0, y);
+                if k == 2 {
+                    painter.circle_filled(dot, 2.5, p.accent);
+                } else {
+                    painter.circle_stroke(dot, 2.0, Stroke::new(1.0, ink));
+                }
+                bar(y, 9.0, if k == 2 { 40.0 } else { 30.0 }, ink);
+            }
+        }
     }
 }
 
@@ -851,7 +1268,7 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui.label(
                     egui::RichText::new(
                         "drag a panel by its header — a sidebar re-docks it, anywhere \
-                         else floats · drag an edge to resize · close hides",
+                         else floats · drag an edge to resize · the cross removes",
                     )
                     .size(text::TINY)
                     .color(p.text_dim),
@@ -862,6 +1279,16 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                         .clicked()
                     {
                         ed.layout.set_edit_mode(false);
+                    }
+                    ui.add_space(12.0);
+                    // The way back from having removed one, next to the mode
+                    // that removes them. The Window menu has it too, but that
+                    // is two clicks away from the bar that explains the mode.
+                    if edit_bar_link(ui, p.text_dim, "Add a module")
+                        .on_hover_text("Every module there is, and what each one does")
+                        .clicked()
+                    {
+                        ed.ui.module_library_open = true;
                     }
                     ui.add_space(12.0);
                     if edit_bar_link(ui, p.text_dim, "Reset layout")
@@ -892,6 +1319,20 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
         .clicked()
     {
         ed.layout.set_edit_mode(editing);
+        ui.close();
+    }
+
+    // The library, and the plain checkboxes underneath it. Two ways in on
+    // purpose: the library is how you find a module you have never used or have
+    // removed and forgotten the name of, and it hands the module to the pointer;
+    // the checkboxes are how you flick a familiar one off and on again without
+    // being put into a mode. Both end at `Layout::open` and `Layout::close`.
+    if ui
+        .button("Modules…")
+        .on_hover_text("Every module there is, what each one does, and a way to add it")
+        .clicked()
+    {
+        ed.ui.module_library_open = true;
         ui.close();
     }
 
