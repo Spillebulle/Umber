@@ -1,21 +1,22 @@
 //! The Umber workspace.
 //!
 //! Layout follows the "Umber app" screen of the design project: menu bar, tool
-//! options strip, a two-column tool rail, the canvas, and stacked modules
-//! (Colour, Brushes, Layers) in a sidebar.
+//! options strip, the canvas, and the modules — the tool rail, Colour, Brushes
+//! and Layers — in columns either side of it.
 //!
 //! Where those modules sit is no longer fixed. They can be dragged between the
-//! two sidebars, reordered within one, torn off to float over the canvas, and
-//! closed; the sidebars and the panels within them resize. That machinery lives
-//! in [`crate::dock`] (the model) and [`crate::panels`] (the drawing) rather
-//! than here, because this file was already long enough.
+//! two edges, stacked in a column, put in a column of their own, torn off to
+//! float over the canvas, and closed; the columns and the panels within them
+//! resize. That machinery lives in [`crate::dock`] (the model) and
+//! [`crate::panels`] (the drawing) rather than here, because this file was
+//! already long enough — including the tool rail, which used to be a strip of
+//! chrome laid out here and is now a module like any other.
 //!
 //! There used to be a global "left-handed" flag that mirrored the whole
-//! workspace. It is gone: a mirror is a worse version of "put the panels where
-//! you want them", and the tool rail keeps a side of its own for the one thing
-//! the mirror was actually for.
+//! workspace. It is gone, and so is the tool rail's own side setting that
+//! outlived it: both were worse versions of "put the panels where you want
+//! them".
 
-use crate::dock::Side;
 use crate::editor::{BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
@@ -148,16 +149,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // the panels it predicts cannot disagree.
     let workspace = root.available_rect_before_wrap();
     ed.layout.clamp_floating(workspace);
-    let geo = ed.layout.geometry(workspace, metrics::TOOL_RAIL);
-
-    let rail_frame = chrome.inner_margin(Margin::symmetric(metrics::TOOL_RAIL_PAD, 8));
-    match ed.layout.rail_side() {
-        Side::Left => egui::Panel::left("tool-rail"),
-        Side::Right => egui::Panel::right("tool-rail"),
-    }
-    .exact_size(metrics::TOOL_RAIL)
-    .frame(rail_frame)
-    .show(root, |ui| tool_rail(ui, &p, ed));
+    let geo = ed.layout.geometry(workspace);
 
     panels::sidebars(root, &p, ed, &mut actions, &geo);
 
@@ -691,105 +683,6 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 fn divider(ui: &mut egui::Ui, p: &Palette) {
     let (rect, _) = ui.allocate_exact_size(vec2(1.0, 16.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, p.border);
-}
-
-fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    // The rail moves the same way everything else does — by being dragged in
-    // layout edit mode. It deliberately has no side *setting*: a flag for
-    // "which side is the chrome on" is the left-handed mirror under another
-    // name, and that is the thing this branch removes.
-    panels::rail_grip(ui, p, ed);
-
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
-
-        // Two columns, as the design lays out its tool grid. Umber has four
-        // tools where the design shows sixteen; the rest are simply not drawn,
-        // rather than shown as buttons that do nothing.
-        //
-        // The keys come from the binding table rather than being written in:
-        // these tooltips were a second copy of it, and rebinding the brush left
-        // this one still promising `B`.
-        let tools = [
-            (
-                Tool::Brush,
-                Icon::Brush,
-                shortcuts::labelled("Brush", Action::BrushTool),
-            ),
-            (
-                Tool::Eraser,
-                Icon::Eraser,
-                shortcuts::labelled("Eraser", Action::EraserTool),
-            ),
-            (
-                Tool::Pan,
-                Icon::Pan,
-                format!(
-                    "{}, or hold Space",
-                    shortcuts::labelled("Pan", Action::PanTool)
-                ),
-            ),
-            (
-                Tool::Zoom,
-                Icon::Zoom,
-                shortcuts::labelled("Zoom", Action::ZoomTool),
-            ),
-        ];
-        let mut picked = None;
-        for pair in tools.chunks(2) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = metrics::TOOL_GAP;
-                for (tool, icon, tip) in pair {
-                    if widgets::tool_button(ui, p, *icon, ed.ui.tool == *tool, tip).clicked() {
-                        picked = Some(*tool);
-                    }
-                }
-            });
-        }
-        if let Some(tool) = picked {
-            ed.set_tool(tool);
-        }
-
-        ui.add_space(6.0);
-        let (line, _) = ui.allocate_exact_size(vec2(44.0, 1.0), Sense::hover());
-        ui.painter().rect_filled(line, 0.0, p.border);
-        ui.add_space(6.0);
-
-        // Overlapping foreground/background wells, click to swap.
-        let (well, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
-        let fg = Rect::from_min_size(well.left_top(), vec2(24.0, 24.0));
-        let bg = Rect::from_min_size(well.left_top() + vec2(10.0, 10.0), vec2(24.0, 24.0));
-        let to32 = |c: umber_core::Color| {
-            let [r, g, b, _] = c.to_srgb_u8();
-            egui::Color32::from_rgb(r, g, b)
-        };
-        let painter = ui.painter();
-        for (rect, colour) in [(bg, ed.secondary), (fg, ed.color)] {
-            painter.rect_filled(rect, metrics::RADIUS, to32(colour));
-            painter.rect_stroke(
-                rect,
-                metrics::RADIUS,
-                Stroke::new(1.0, p.popover_border),
-                egui::StrokeKind::Outside,
-            );
-        }
-        let swap = shortcuts::labelled("Swap colours", Action::SwapColours);
-        if response.on_hover_text(&swap).clicked() {
-            ed.swap_colors();
-        }
-
-        ui.add_space(4.0);
-        // The design writes "X swap" under the wells. The key is the bound one,
-        // for the same reason the tooltips above use it — and the caption goes
-        // altogether when the command has no key, rather than naming none.
-        if let Some(chord) = shortcuts::first_chord(Action::SwapColours) {
-            ui.label(
-                egui::RichText::new(format!("{chord} swap"))
-                    .size(9.0)
-                    .color(p.text_dim.gamma_multiply(0.8)),
-            );
-        }
-    });
 }
 
 /// A bare 18×18 icon that acts as a button. Shared with `panels.rs`.

@@ -196,9 +196,12 @@ remembers which one you left it on.
 
 Panels are **locked while you paint** and rearranged in a mode of their own:
 **Window → Customise layout**. In that mode every module is draggable by its
-header — drop it in either sidebar to dock it, or over the canvas to leave it
-floating, where it takes no space from the document. The tool rail moves too,
-and snaps to whichever side you release it on. `Esc` puts a module back.
+header — drop it into a docked column to stack it there, on a column's edge to
+start a new column beside it, or over the canvas to leave it floating, where it
+takes no space from the document. Several columns fit on each side, so Colour
+can hold the far right at full height with Brushes beside it. The tool rail is a
+module like any other: move it, resize it, float it or close it. `Esc` puts a
+module back.
 
 **Window → Modules** is every module there is, with a picture of each and a
 sentence saying what it is for. Adding one hands it to the pointer and you click

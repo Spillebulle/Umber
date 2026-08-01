@@ -746,6 +746,34 @@ sizes, the config round trip and the drop rules be tested without a window.
   the workspace holds, and the alternative (bumping `umber-layout`) discards
   every arrangement anybody has made. Adding a kind therefore needs no version
   bump; adding one to `DEFAULT_DOCK` would.
+- **`PanelKind::Tools` is the one exception to that, and only because a pre-
+  columns file names the rail.** The tool rail used to be chrome — always
+  present, with a side of its own — so an old config records `rail <side>`.
+  `from_config` reads that as a Tools column at that edge, the outermost, which
+  is where the rail was drawn; so a fresh install and an upgraded one agree
+  without the version moving. The writer no longer emits `rail`, and its
+  absence is what tells a later load that a *removed* Tools module was meant.
+  `a_config_written_before_the_rail_was_a_module_still_has_a_rail` and
+  `a_removed_tool_rail_stays_removed_across_a_save` are the pair.
+- **A column's minimum width is the widest `PanelKind::min_width` in it**, not
+  one number for every column. The rail's whole point is being narrow and every
+  other module is unusable there, so `metrics::TOOL_RAIL` is the Tools floor and
+  `limits::SIDEBAR_MIN_WIDTH` everybody else's — and dropping Colour into the
+  rail's column widens it rather than leaving a picker three buttons across.
+- **A side is a list of `Column`s, ordered from the window edge inwards**, and a
+  column is exactly what a whole sidebar used to be: a stack with a width. Index
+  0 is against the window on *either* edge, so nothing downstream has to ask
+  which way round a side counts. That shape is also what kept the config's
+  version header still: a file written before columns names none, and every
+  `dock` line for a side falls into the one column that side implicitly has. The
+  `width` line is read and no longer written, and it is the whole of the
+  migration — `a_config_written_before_columns_loads_as_one_column_a_side` pins
+  it. **Do not bump `umber-layout` for a change an old file can be read into.**
+- **A column emptied by a drag is kept until the drop resolves.** Removing it on
+  the spot slides every column outside it sideways under the pointer, and
+  renumbers the very column indices the drop target is being computed against.
+  `Layout::prune` runs *after* the insert, from everything that ends a drag and
+  from `close`. `a_column_emptied_by_a_drag_survives_until_the_drop` guards it.
 - **Adding a module hands it to the pointer.** `Layout::add_dragging` lifts it
   straight into a drag with `Origin::Closed`, so the same drop that moves an
   existing panel places the new one and `Esc` abandons the add. Do not "simplify"

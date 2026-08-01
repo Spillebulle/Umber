@@ -269,18 +269,18 @@ pub mod metrics {
     /// Horizontal padding inside the chrome strips above — the design's
     /// `padding: 0 12px`.
     pub const STRIP_PAD: i8 = 12;
-    pub const TOOL_RAIL: f32 = 76.0;
+    /// The tool rail's width, now that the rail is a dockable module rather
+    /// than a strip of chrome: the design's 76-point rail plus what a panel
+    /// costs around it — [`PANEL_PAD`] either side of the body, and room for
+    /// the body's scroll bar.
+    ///
+    /// It is both the width a Tools column starts at and the narrowest it may
+    /// be dragged, because below it the design's two-column tool grid wraps to
+    /// one and the rail stops reading as a rail.
+    pub const TOOL_RAIL: f32 = 100.0;
     pub const TOOL_BUTTON: f32 = 32.0;
     /// Gap between the rail's two columns.
     pub const TOOL_GAP: f32 = 2.0;
-    /// Padding either side of the rail's two-column grid.
-    ///
-    /// Whatever the rail has left over once the grid is in it:
-    /// `(76 − (32 + 2 + 32)) / 2`. It was zero, which put the tool buttons hard
-    /// against the edge of the window — the `vertical_centered` around them
-    /// cannot help, because the row inside it takes the full width and lays its
-    /// buttons out from the left.
-    pub const TOOL_RAIL_PAD: i8 = 5;
     pub const PANEL: f32 = 264.0;
     /// A docked panel's header: the design's 8 px padding around an 11 px line,
     /// and the strip the whole panel is dragged by.
@@ -513,19 +513,19 @@ mod tests {
         }
     }
 
-    /// The rail's padding is whatever its grid does not use, so the three
-    /// numbers have to keep adding up. Widening the rail or the buttons without
-    /// touching the padding would put the grid off-centre — which is the state
-    /// this replaced, where the padding was zero and the buttons sat against the
-    /// window edge.
+    /// The rail is a panel now, so its width has to cover the design's
+    /// two-column tool grid *and* what a panel puts around a body: the padding
+    /// either side and the scroll bar. Widening the buttons without widening
+    /// the rail would wrap the grid to one column — which is what the grid
+    /// falls back to when it has to, and not the shape it should ship in.
     #[test]
-    fn the_tool_grid_fits_the_rail_it_sits_in() {
+    fn the_tool_grid_fits_the_panel_it_sits_in() {
         let grid = metrics::TOOL_BUTTON * 2.0 + metrics::TOOL_GAP;
-        let padding = metrics::TOOL_RAIL_PAD as f32 * 2.0;
-        assert_eq!(
-            grid + padding,
-            metrics::TOOL_RAIL,
-            "a {grid}-point grid and {padding} points of padding do not fill a              {}-point rail",
+        let padding = metrics::PANEL_PAD as f32 * 2.0;
+        assert!(
+            grid + padding <= metrics::TOOL_RAIL,
+            "a {grid}-point grid and {padding} points of panel padding do not fit \
+             a {}-point rail",
             metrics::TOOL_RAIL,
         );
     }

@@ -14,9 +14,10 @@
 
 use crate::brushlib;
 use crate::colorpicker::{self, PickerMode};
-use crate::dock::{DropTarget, Floating, Geometry, PanelKind, Side, limits};
-use crate::editor::Editor;
+use crate::dock::{ColumnGeometry, DropTarget, Floating, Geometry, PanelKind, Side, limits};
+use crate::editor::{Editor, Tool};
 use crate::icons::{self, Icon};
+use crate::shortcuts::{self, Action};
 use crate::theme::{Palette, metrics, text};
 use crate::ui::{UiActions, icon_button};
 use crate::widgets;
@@ -40,7 +41,12 @@ pub(crate) struct PanelEvents {
     close: bool,
 }
 
-/// Draw both sidebars, their panels and their splitters.
+/// Draw every docked column, its panels and its splitters.
+///
+/// One `egui::Panel` per column, claimed in the model's own order — outermost
+/// first — so what egui lays out and what [`Geometry`] predicted are the same
+/// rects. Whatever is left when the loop finishes is the central panel, and
+/// therefore the canvas.
 pub fn sidebars(
     root: &mut Ui,
     p: &Palette,
@@ -49,26 +55,30 @@ pub fn sidebars(
     geo: &Geometry,
 ) {
     for side in Side::ALL {
-        let Some(rect) = geo.sidebar[side.index()] else {
-            continue;
-        };
-        let frame = Frame {
-            fill: p.dock,
-            ..Default::default()
-        };
-        let panel = match side {
-            Side::Left => egui::Panel::left("dock-left"),
-            Side::Right => egui::Panel::right("dock-right"),
-        };
-        panel
-            .exact_size(rect.width())
-            .frame(frame)
-            // `width_splitter` draws this edge itself, and lights it up in the
-            // accent while it is being dragged. egui's separator lands on the
-            // same pixel and is painted afterwards, so leaving it on put a dim
-            // rule over the highlight and the resize affordance never showed.
-            .show_separator_line(false)
-            .show(root, |ui| sidebar(ui, p, ed, actions, side, geo));
+        for (column, at) in geo.columns(side).iter().enumerate() {
+            let frame = Frame {
+                fill: p.dock,
+                ..Default::default()
+            };
+            // The id has to name the column as well as the side: two panels
+            // sharing one would fight over the same stored state and the outer
+            // one would take the inner one's width.
+            let id = Id::new(("dock", side.index(), column));
+            let panel = match side {
+                Side::Left => egui::Panel::left(id),
+                Side::Right => egui::Panel::right(id),
+            };
+            panel
+                .exact_size(at.rect.width())
+                .frame(frame)
+                // `width_splitter` draws this edge itself, and lights it up in
+                // the accent while it is being dragged. egui's separator lands
+                // on the same pixel and is painted afterwards, so leaving it on
+                // put a dim rule over the highlight and the resize affordance
+                // never showed.
+                .show_separator_line(false)
+                .show(root, |ui| sidebar(ui, p, ed, actions, side, column, at));
+        }
     }
 
     // The library's browser and its dialogs. Drawn here rather than from inside
@@ -87,12 +97,18 @@ fn sidebar(
     ed: &mut Editor,
     actions: &mut UiActions,
     side: Side,
-    geo: &Geometry,
+    column: usize,
+    at: &ColumnGeometry,
 ) {
-    let slots = &geo.slots[side.index()];
+    let slots = &at.slots;
     // Snapshot the stack: drawing a panel can start a drag, which removes it
     // from the layout, and the loop must not be reading the Vec when it does.
-    let kinds: Vec<PanelKind> = ed.layout.docked(side).iter().map(|d| d.kind).collect();
+    let kinds: Vec<PanelKind> = ed
+        .layout
+        .docked(side, column)
+        .iter()
+        .map(|d| d.kind)
+        .collect();
 
     let mut grabbed = None;
     let mut closed = None;
@@ -113,8 +129,8 @@ fn sidebar(
         }
     }
 
-    height_splitters(ui, p, ed, side, slots);
-    width_splitter(ui, p, ed, side, geo);
+    height_splitters(ui, p, ed, side, column, slots);
+    width_splitter(ui, p, ed, side, column, at.rect);
 
     if let Some(kind) = closed {
         ed.layout.close(kind);
@@ -125,7 +141,14 @@ fn sidebar(
 }
 
 /// The draggable boundaries between stacked panels.
-fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots: &[Rect]) {
+fn height_splitters(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    side: Side,
+    column: usize,
+    slots: &[Rect],
+) {
     let heights: Vec<f32> = slots.iter().map(|s| s.height()).collect();
     // The last slot has nothing below it to push against, so it has no handle.
     let boundaries = slots.len().saturating_sub(1);
@@ -138,13 +161,13 @@ fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots
         let response = ui
             .interact(
                 handle,
-                ui.id().with(("vsplit", side.index(), index)),
+                ui.id().with(("vsplit", side.index(), column, index)),
                 Sense::drag(),
             )
             .on_hover_cursor(CursorIcon::ResizeVertical);
         if response.dragged() {
             ed.layout
-                .resize_split(side, index, response.drag_delta().y, &heights);
+                .resize_split(side, column, index, response.drag_delta().y, &heights);
         }
         if response.hovered() || response.dragged() {
             ui.painter()
@@ -153,15 +176,21 @@ fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots
     }
 }
 
-/// The draggable inner edge that sets the sidebar's width.
+/// The draggable inner edge that sets one column's width.
 ///
-/// The handle sits *inside* the sidebar rather than straddling its edge, so
-/// that grabbing it counts as pointing at the panel and never at the canvas —
-/// otherwise the first pixel of a resize drag would also start a stroke.
-fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &Geometry) {
-    let Some(rect) = geo.sidebar[side.index()] else {
-        return;
-    };
+/// The handle sits *inside* the column rather than straddling its edge, so that
+/// grabbing it counts as pointing at the panel and never at the canvas —
+/// otherwise the first pixel of a resize drag would also start a stroke. That
+/// is also what keeps two neighbouring columns' handles apart: each is inside
+/// its own column, at the edge facing the canvas.
+fn width_splitter(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    side: Side,
+    column: usize,
+    rect: Rect,
+) {
     let handle = match side {
         Side::Left => Rect::from_min_max(
             pos2(rect.right() - SPLITTER_GRAB, rect.top()),
@@ -175,7 +204,7 @@ fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &G
     let response = ui
         .interact(
             handle,
-            ui.id().with(("hsplit", side.index())),
+            ui.id().with(("hsplit", side.index(), column)),
             Sense::drag(),
         )
         .on_hover_cursor(CursorIcon::ResizeHorizontal);
@@ -187,7 +216,7 @@ fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &G
             Side::Left => pointer.x - rect.left(),
             Side::Right => rect.right() - pointer.x,
         };
-        ed.layout.set_width(side, width);
+        ed.layout.set_width(side, column, width);
     }
 
     let x = match side {
@@ -440,6 +469,7 @@ pub(crate) fn panel(
                 .id_salt(("panel-scroll", kind))
                 .auto_shrink([false, false])
                 .show(ui, |ui| match kind {
+                    PanelKind::Tools => tools_body(ui, p, ed),
                     PanelKind::Colour => colour_body(ui, p, ed),
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
@@ -509,8 +539,13 @@ fn dashed_rect(painter: &egui::Painter, rect: Rect, radius: f32, stroke: Stroke)
     }
 }
 
-/// The dashed outline the design puts round a sidebar while the layout is being
-/// edited, so it reads as a container you can drop into.
+/// The dashed outline the design puts round a docked column while the layout is
+/// being edited, so it reads as a container you can drop into.
+///
+/// One per column rather than one per side: two columns side by side are two
+/// containers, and an outline round the pair would say the boundary between
+/// them is not a place anything can go, which is exactly where a new column
+/// lands.
 pub fn edit_mode_outline(root: &mut Ui, p: &Palette, ed: &Editor, geo: &Geometry) {
     if !ed.layout.edit_mode() {
         return;
@@ -520,10 +555,10 @@ pub fn edit_mode_outline(root: &mut Ui, p: &Palette, ed: &Editor, geo: &Geometry
         Id::new("dock-edit-outline"),
     ));
     for side in Side::ALL {
-        if let Some(rect) = geo.sidebar[side.index()] {
+        for column in geo.columns(side) {
             dashed_rect(
                 &painter,
-                rect.shrink(4.0),
+                column.rect.shrink(4.0),
                 8.0,
                 Stroke::new(1.5, p.accent_dim),
             );
@@ -549,14 +584,21 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
 
     let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dock-drag")));
     match target {
-        DropTarget::Dock { side, index } => {
+        DropTarget::Dock {
+            side,
+            column,
+            index,
+        } => {
             // The design's dock indicator: a dashed accent block reading "dock
             // here". It is drawn *at the insertion point* rather than always at
             // the top of the sidebar, because unlike the design's model this
             // one can insert between two panels, and an indicator that lied
             // about where the panel lands would be worse than none.
-            let zone = geo.drop_zone(side);
-            let (a, b) = geo.insertion_line(side, index);
+            let zone = geo
+                .columns(side)
+                .get(column)
+                .map_or_else(|| geo.drop_zone(side), |c| c.rect);
+            let (a, b) = geo.insertion_line(side, column, index);
             let block = Rect::from_min_max(
                 pos2(zone.left() + 8.0, a.y.min(zone.bottom() - 40.0)),
                 pos2(b.x - 8.0, (a.y + 110.0).min(zone.bottom() - 8.0)),
@@ -569,6 +611,23 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
                     block.center(),
                     Align2::CENTER_CENTER,
                     "dock here",
+                    FontId::proportional(text::TINY),
+                    p.accent,
+                );
+            }
+        }
+        // A column of its own, at the boundary the pointer is nearest. Full
+        // height, because that is what the column will be — the block a stack
+        // drop draws would say "somewhere in this list" and mean the opposite.
+        DropTarget::NewColumn { side, column } => {
+            let strip = geo.new_column_strip(side, column);
+            painter.rect_filled(strip, 8.0, p.accent.gamma_multiply(0.09));
+            dashed_rect(&painter, strip, 8.0, Stroke::new(2.0, p.accent));
+            if strip.height() > 34.0 && strip.width() > 60.0 {
+                painter.text(
+                    strip.center(),
+                    Align2::CENTER_CENTER,
+                    "new column",
                     FontId::proportional(text::TINY),
                     p.accent,
                 );
@@ -636,6 +695,116 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
 }
 
 // --- panel bodies ---------------------------------------------------------
+
+/// The Tools module: the design's tool grid, and the painting and background
+/// colours under it.
+///
+/// This was a strip of chrome with a side of its own and its own drag handle
+/// until it became a module. Two things follow from the move and are the whole
+/// of what changed inside it. Its width is the column's rather than a constant,
+/// so the grid **wraps** — at [`metrics::TOOL_RAIL`] that is the design's two
+/// columns, and it is whatever fits at any other width, rather than two
+/// columns overflowing a narrow panel. And each row is centred by hand: a
+/// `horizontal` inside a centred vertical still takes the full width and lays
+/// its buttons out from the left, so a column dragged wider than the grid would
+/// otherwise leave them against its edge.
+fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
+
+        // Umber has four tools where the design shows sixteen; the rest are
+        // simply not drawn, rather than shown as buttons that do nothing.
+        //
+        // The keys come from the binding table rather than being written in:
+        // these tooltips were a second copy of it, and rebinding the brush left
+        // this one still promising `B`.
+        let tools = [
+            (
+                Tool::Brush,
+                Icon::Brush,
+                shortcuts::labelled("Brush", Action::BrushTool),
+            ),
+            (
+                Tool::Eraser,
+                Icon::Eraser,
+                shortcuts::labelled("Eraser", Action::EraserTool),
+            ),
+            (
+                Tool::Pan,
+                Icon::Pan,
+                format!(
+                    "{}, or hold Space",
+                    shortcuts::labelled("Pan", Action::PanTool)
+                ),
+            ),
+            (
+                Tool::Zoom,
+                Icon::Zoom,
+                shortcuts::labelled("Zoom", Action::ZoomTool),
+            ),
+        ];
+
+        let step = metrics::TOOL_BUTTON + metrics::TOOL_GAP;
+        let per_row = (((ui.available_width() + metrics::TOOL_GAP) / step) as usize).max(1);
+        let mut picked = None;
+        for row in tools.chunks(per_row) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = metrics::TOOL_GAP;
+                let used = row.len() as f32 * step - metrics::TOOL_GAP;
+                ui.add_space(((ui.available_width() - used) * 0.5).max(0.0));
+                for (tool, icon, tip) in row {
+                    if widgets::tool_button(ui, p, *icon, ed.ui.tool == *tool, tip).clicked() {
+                        picked = Some(*tool);
+                    }
+                }
+            });
+        }
+        if let Some(tool) = picked {
+            ed.set_tool(tool);
+        }
+
+        ui.add_space(6.0);
+        let (line, _) =
+            ui.allocate_exact_size(vec2(ui.available_width().min(44.0), 1.0), Sense::hover());
+        ui.painter().rect_filled(line, 0.0, p.border);
+        ui.add_space(6.0);
+
+        // Overlapping foreground/background wells, click to swap.
+        let (well, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+        let fg = Rect::from_min_size(well.left_top(), vec2(24.0, 24.0));
+        let bg = Rect::from_min_size(well.left_top() + vec2(10.0, 10.0), vec2(24.0, 24.0));
+        let to32 = |c: umber_core::Color| {
+            let [r, g, b, _] = c.to_srgb_u8();
+            egui::Color32::from_rgb(r, g, b)
+        };
+        let painter = ui.painter();
+        for (rect, colour) in [(bg, ed.secondary), (fg, ed.color)] {
+            painter.rect_filled(rect, metrics::RADIUS, to32(colour));
+            painter.rect_stroke(
+                rect,
+                metrics::RADIUS,
+                Stroke::new(1.0, p.popover_border),
+                StrokeKind::Outside,
+            );
+        }
+        let swap = shortcuts::labelled("Swap colours", Action::SwapColours);
+        if response.on_hover_text(&swap).clicked() {
+            ed.swap_colors();
+        }
+
+        ui.add_space(4.0);
+        // The design writes "X swap" under the wells. The key is the bound one,
+        // for the same reason the tooltips above use it — and the caption goes
+        // altogether when the command has no key, rather than naming none.
+        if let Some(chord) = shortcuts::first_chord(Action::SwapColours) {
+            ui.label(
+                egui::RichText::new(format!("{chord} swap"))
+                    .size(9.0)
+                    .color(p.text_dim.gamma_multiply(0.8)),
+            );
+        }
+    });
+}
 
 fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut shape = ed.ui.wheel_shape;
@@ -1296,6 +1465,22 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
     };
 
     match kind {
+        // The tool grid, with one button picked out, and the colour wells.
+        PanelKind::Tools => {
+            for k in 0..4 {
+                let cell = Rect::from_min_size(
+                    pos2(
+                        body.left() + (k % 2) as f32 * 9.0,
+                        body.top() + 2.0 + (k / 2) as f32 * 9.0,
+                    ),
+                    vec2(7.0, 7.0),
+                );
+                painter.rect_filled(cell, 1.5, if k == 0 { p.accent } else { ink });
+            }
+            let well = pos2(body.left() + 3.5, body.bottom() - 5.0);
+            painter.circle_stroke(well, 3.5, Stroke::new(1.0, ink));
+            painter.circle_filled(well + vec2(4.0, 2.0), 3.0, p.accent);
+        }
         // The hue ring with its square centre, and the swatch under it.
         PanelKind::Colour => {
             let r = (body.height() * 0.42).min(body.width() * 0.28);
@@ -1357,46 +1542,6 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
     }
 }
 
-/// The tool rail's own drag handle, shown only in layout edit mode.
-///
-/// Dragging it past the middle of the window moves the rail to that edge. This
-/// is all that survives of the left-handed mirror, and deliberately as a drag
-/// rather than a setting: a "which side" flag is that mirror wearing a
-/// different label.
-pub fn rail_grip(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
-    if !ed.layout.edit_mode() {
-        return;
-    }
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::drag());
-    let response = response
-        .on_hover_cursor(CursorIcon::Grab)
-        .on_hover_text("Drag the rail to the other side of the window");
-
-    icons::draw(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), vec2(14.0, 14.0)),
-        Icon::Grip,
-        if response.dragged() {
-            p.text_strong
-        } else {
-            p.accent
-        },
-    );
-
-    if response.drag_stopped()
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        let middle = ui.ctx().viewport_rect().center().x;
-        let side = if pointer.x < middle {
-            Side::Left
-        } else {
-            Side::Right
-        };
-        ed.layout.set_rail_side(side);
-    }
-    ui.add_space(4.0);
-}
-
 /// The design's layout-edit strip: what the mode is, and the way out of it.
 ///
 /// Sits under the options strip, where the design places it, and exists only
@@ -1426,8 +1571,9 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "drag a panel by its header — a sidebar re-docks it, anywhere \
-                         else floats · drag an edge to resize · the cross removes",
+                        "drag a panel by its header — a column re-docks it, a column's \
+                         edge starts a new one, anywhere else floats · drag an edge to \
+                         resize · the cross removes",
                     )
                     .size(text::TINY)
                     .color(p.text_dim),
