@@ -71,6 +71,14 @@ Invariants that are easy to break:
   paints. This was a real bug; `erasing_removes_coverage` guards it.
 - **The dab pass loads rather than clears.** The scratch accumulates across
   frames for the whole stroke; only new dabs are drawn each frame.
+- **A smudging stroke writes a *second* scratch target, holding a colour per
+  dab.** Coverage keeps its `max` blend — the anti-compounding guarantee above
+  is untouched — while colour blends `over`, so the smear trails along the
+  stroke instead of averaging everything the brush picked up. Two dab pipelines
+  exist for this; the ordinary one writes a single attachment and is the fast
+  path. `StrokeStyle::per_dab_color` must match what `draw_dabs` was told, for
+  the whole stroke: turning it on midway leaves the earlier dabs with no colour
+  recorded, and they commit as the flat palette colour while the rest smudge.
 - **`finish_stroke` must flush `StrokeBuilder::pending` before committing.**
   Pointer events outpace frames, so a stroke always ends with dabs that have not
   reached the GPU. Leaving them behind strands coverage in the scratch: it
@@ -154,7 +162,7 @@ moves that block in and out of `Editor` wholesale.
   with its panel cannot be shut and cannot be reopened.
 - Nothing on the drawing path allocates per frame: the grouping and credit lines
   are built once per change, search folds case in place, and rows scrolled out
-  of view skip painting. At 133 presets the naive version of each shows up in a
+  of view skip painting. At 201 presets the naive version of each shows up in a
   frame time.
 
 ### Uniform layout
@@ -185,6 +193,32 @@ and the UI will be wrong again.
 
 `Camera` converts between them. `zoom_at` keeps the document point under the
 cursor pinned — without that correction the canvas slides away as you zoom.
+
+### Colour pickup
+
+A smudging brush needs to know what the canvas holds under it, every frame of a
+stroke. `read_layer_rect` and `pick_colour` both block on the GPU and must never
+be called from the drawing loop, so `probe_canvas` is the non-blocking version:
+it records a small composite into a rotation of staging buffers, and
+`take_probe` collects whichever came home a frame or two later.
+
+- **The probe reuses the composite pass**, with the in-progress stroke included.
+  That is what lets a blender pick up its own wet paint when scrubbed back and
+  forth, and it means there is no second copy of the blend maths to keep in step
+  — the same reason `export_rgba` and `pick_colour` reuse it.
+- **The lag is not a defect.** A smudge is a trailing average by construction,
+  and `smudge_length` delays it far more than the readback does.
+- **The composite's export path returns sRGB with straight alpha.** Decode to
+  linear before averaging: the mean of two gamma-encoded values is not the
+  encoding of their mean, so averaging the bytes makes a brush crossing an edge
+  pick up a colour lighter than either side.
+- **Reset the probes when a stroke ends.** A sample belonging to the previous
+  stroke arriving during the next one smears a colour picked up somewhere else.
+- **Classify brushes with `umber_core::style`, and read the name before the
+  settings.** Sorting on `smudge >= 0.5` looks obvious and is wrong: every
+  MyPaint oil paint mixes with what is under it, so that rule put 68 of 196
+  brushes in "Blenders" and emptied the paints. Erasing is the only setting that
+  overrides a name.
 
 ### Undo
 

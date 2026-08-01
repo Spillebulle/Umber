@@ -138,19 +138,21 @@ fights the design.
 
 ### Brushes
 
-Umber ships **133 presets** in eight collections. Five are its own; the other
-128 are converted from [mypaint-brushes
-2.0.2](https://github.com/mypaint/mypaint-brushes), which is CC0, and each one
-carries its author and licence through the conversion and shows them in the
-library. Of the 196 brushes in that set, 68 were refused rather than
-approximated — 67 of those because they depend on smudging, which picks colour
-up off the canvas, and Umber's brush engine does not do that yet. A preset that
-would have painted differently from the original is not worth shipping under
-the original's name.
+Umber ships **201 presets**. Five are its own; the other 196 are the whole of
+[mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes), which is
+CC0, each carrying its author and licence through the conversion and showing
+them in the library.
+
+They are grouped by **style** — pencils, inks, markers, charcoal, paint,
+watercolour, airbrush, blenders, erasers, texture, foliage, effects — rather
+than by which pack or artist they came from. A pack arrives sorted by author,
+which is the right way to credit it and the wrong way to browse it: nobody
+reaches for a brush by remembering who drew it, and author-grouping put the
+pencils in six different places. The author is still shown on every row.
 
 The Brushes panel is the design's: a shortlist with the header's `＋`. Behind
 the second mark is the **library browser**, which the design does not have — a
-column that works for five brushes does not work for 133, so the browser adds a
+column that works for five brushes does not work for 201, so the browser adds a
 search field, a collection picker, and per-brush rename and delete. Brushes you
 save are marked with a dot and are the only ones those two controls apply to.
 
@@ -163,12 +165,23 @@ wholesale, cannot take your brushes with it.
 If it cannot be read, everything that writes is disabled and the reason is
 shown, rather than quietly starting your collection again over the top of it.
 
-**Importing** reads MyPaint `.myb` brushes and Umber's own `.ron` libraries.
-A `.myb` that leans on something Umber cannot render — smudging, most often —
-is still imported, because an approximation of a brush you chose beats a
-refusal, but the notice names what was dropped. The generated library holds
-itself to the stricter rule and refuses those outright, since nothing shipped
-under an author's name should paint unlike their brush.
+**Importing** reads MyPaint `.myb` brushes and Umber's own `.ron` libraries, and
+files them by style like everything else. A `.myb` that leans on something Umber
+still cannot render — `colorize`, `lock_alpha` — is imported anyway, because an
+approximation of a brush you chose beats a refusal, but the notice names what
+was dropped. The generated library holds itself to the stricter rule and refuses
+those outright, since nothing shipped under an author's name should paint unlike
+their brush.
+
+**Blenders work.** A brush with MyPaint's `smudge` picks colour up off the
+canvas and carries it, and because the sample is taken through the same
+composite pass the screen uses, scrubbing back and forth blends a brush's own
+wet paint rather than only what was already on the layer. The read is
+asynchronous — a blocking one every frame is exactly what this project exists to
+avoid — so the colour lags a frame or two, which is invisible against
+`smudge_length`, MyPaint's own and much longer delay. Airbrushes work too: a
+brush can deposit paint on a clock rather than only by distance travelled, so
+holding the pen still keeps spraying.
 
 ### Documents
 
@@ -359,7 +372,12 @@ Next, roughly in order:
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop
-- Textured and shaped brushes, tilt support
+- **Elliptical dabs**, and scatter. These are now the largest gap between an
+  imported brush and its original: about a quarter of the MyPaint set is
+  elliptical and imports as a round brush with no line-weight variation, and
+  the spray and "bulk" brushes come out as smooth lines. Bitmap tips and colour
+  pickup are built; these two are what is left.
+- Tilt support
 - Stroke prediction to hide remaining latency
 
 ## Licence

@@ -1,6 +1,6 @@
 //! The brush library, in front of the user.
 //!
-//! `umber-core` already held all of this: 133 shipped presets with their
+//! `umber-core` already held all of this: 201 shipped presets with their
 //! attribution ([`preset::builtin`]), a user library that writes itself to disk
 //! on every change ([`UserLibrary`]), and importers for MyPaint `.myb` and
 //! Umber `.ron`. None of it was reachable from the interface, which listed the
@@ -16,7 +16,7 @@
 //! - **Nothing allocates per frame on the drawing path.** The grouping, and the
 //!   credit line each row shows, are built once per change to the library;
 //!   searching walks borrowed data and folds case in place; the rows skip
-//!   painting when they are scrolled out of view. At 133 presets the naive
+//!   painting when they are scrolled out of view. At 201 presets the naive
 //!   version of any of those is visible in a frame time.
 //! - **State lives in egui's temporary store**, keyed by an `Id`, exactly the
 //!   way `settings.rs` keeps what its shortcut table is in the middle of. It is
@@ -29,7 +29,7 @@
 //! The design draws a Brushes panel of five presets: a header with a `＋`, a
 //! column of rows, and a link to the brush editor. All three are here. The
 //! search field, the collection picker and the browser are not in the design,
-//! because a column that works for five brushes does not work for 133 — see the
+//! because a column that works for five brushes does not work for 201 — see the
 //! README.
 
 use crate::controls;
@@ -231,7 +231,7 @@ struct Index {
     groups: Vec<Group>,
     /// The credit line for each preset, parallel to `Editor::presets`.
     ///
-    /// Formatted here rather than in the row, because the row runs 133 times a
+    /// Formatted here rather than in the row, because the row runs 201 times a
     /// frame and this runs when the library changes.
     details: Vec<String>,
     /// `Editor::presets.len()` when this was built — the staleness check.
@@ -302,7 +302,7 @@ fn rank(group: &Group, shipped: usize) -> usize {
 /// Walk the presets in `scope` that match `query`, in display order.
 ///
 /// An iterator over borrowed data rather than a filtered `Vec`: this runs on
-/// every frame of both lists, and building 133 entries a frame to draw fifteen
+/// every frame of both lists, and building 201 entries a frame to draw fifteen
 /// visible rows is exactly the waste immediate mode invites.
 fn visit<'a>(
     index: &'a Index,
@@ -330,7 +330,7 @@ fn matches(preset: &BrushPreset, query: &str) -> bool {
 
 /// Case-insensitive substring, without lowering a copy of the haystack.
 ///
-/// `to_lowercase` on every name on every frame is 133 allocations to answer a
+/// `to_lowercase` on every name on every frame is 201 allocations to answer a
 /// question about fifteen visible rows. The fold is ASCII-only, which suits the
 /// data: the non-ASCII in the shipped library is inside author names ("Ramón
 /// Miranda"), where the accented bytes are identical either way and match
@@ -455,7 +455,7 @@ fn suspend_shortcuts(state: &mut State, ctx: &egui::Context, settings_open: bool
 /// The two marks in the Brushes panel's header: browse, and save.
 ///
 /// The design puts a `＋` there. The second mark is this module's addition —
-/// with 133 presets the panel is a shortlist rather than the library, and
+/// with 201 presets the panel is a shortlist rather than the library, and
 /// something has to open the rest of it.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
@@ -640,7 +640,7 @@ enum Request {
 struct ListOut {
     picked: Option<usize>,
     /// Where the row named by `editing` landed, so the overlays can be drawn
-    /// over it without the list threading a rect out for all 133 rows.
+    /// over it without the list threading a rect out for all 201 rows.
     editing_rect: Option<Rect>,
     request: Option<Request>,
 }
