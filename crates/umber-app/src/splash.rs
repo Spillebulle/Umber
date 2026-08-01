@@ -261,64 +261,7 @@ pub fn render(
     // of the wrong theme in front of a light interface.
     buf.fill(palette.backdrop);
 
-    // --- the brand group, centred ---
-    let mark = design::MARK * scale;
-    let wordmark_px = design::WORDMARK * scale;
-    let tagline_px = design::TAGLINE * scale;
-
-    let wordmark = Font::new(
-        wordmark_px,
-        design::WORDMARK_WEIGHT,
-        design::WORDMARK_TRACKING * scale,
-    );
-    let tagline = Font::new(tagline_px, 400.0, design::TAGLINE_TRACKING * scale);
-
-    let wordmark_w = wordmark.as_ref().map_or(0.0, |f| f.width("UMBER"));
-    let row_w = mark + design::MARK_GAP * scale + wordmark_w;
-    // The design gives the wordmark `line-height:1`, so the row is as tall as
-    // the type size, and the mark is centred against that rather than the other
-    // way round.
-    let row_h = wordmark_px.max(mark);
-    let tagline_h = tagline_px * 1.2;
-    let group_h = row_h + design::TAGLINE_GAP * scale + tagline_h;
-
-    let group_top = (h - group_h) * 0.5;
-    let row_left = (w - row_w) * 0.5;
-
-    let mark_top = group_top + (row_h - mark) * 0.5;
-    buf.rounded_rect(
-        row_left,
-        mark_top,
-        row_left + mark,
-        mark_top + mark,
-        // The splash's own corner ratio: the design draws this instance at
-        // 52 px with an 8 px radius, which is not the ratio the 15 px menu-bar
-        // mark uses. See `logo::SPLASH_CORNER_RATIO`.
-        mark * logo::SPLASH_CORNER_RATIO,
-        palette.accent,
-    );
-
-    if let Some(font) = &wordmark {
-        // Cap height rather than the em box: the design aligns the wordmark
-        // optically with the square beside it, and capitals are what the eye
-        // lines up.
-        let baseline = group_top + (row_h + font.cap_height()) * 0.5;
-        let x = row_left + mark + design::MARK_GAP * scale;
-        font.draw("UMBER", x, baseline, |px, py, coverage| {
-            buf.blend(px, py, palette.text_strong, coverage);
-        });
-    }
-
-    if let Some(font) = &tagline {
-        let baseline = group_top + row_h + design::TAGLINE_GAP * scale + font.cap_height();
-        let x = (w - font.width(TAGLINE)) * 0.5;
-        // The design's #6e7176 is dimmer than any token here; `text_dim` is the
-        // nearest, and is the token these supporting lines would use in the
-        // workspace anyway.
-        font.draw(TAGLINE, x, baseline, |px, py, coverage| {
-            buf.blend(px, py, palette.text_dim, coverage);
-        });
-    }
+    brand(&mut buf, w, h, scale, palette, Some(TAGLINE));
 
     // --- the progress block, pinned near the bottom ---
     let status_px = design::STATUS * scale;
@@ -373,6 +316,113 @@ pub fn render(
     }
 
     buf.pixels
+}
+
+/// The brand group alone, on the theme's backdrop: the splash with its start-up
+/// furniture taken off.
+///
+/// This is what `docshot` puts at the head of the README, and the two omissions
+/// are the whole reason it is not just [`render`] at a wide aspect. The progress
+/// bar reports work that is not happening in a still picture, and the tagline
+/// carries `CARGO_PKG_VERSION` — a *committed* image saying `v0.0.1` is wrong
+/// from the next release onwards, and nothing would catch it. What is left is
+/// the mark and the wordmark at exactly the geometry [`design`] gives them.
+pub fn banner(width: usize, height: usize, scale: f32, palette: &Palette) -> Vec<u32> {
+    let mut buf = Buffer::new(width, height);
+    buf.fill(palette.backdrop);
+    brand(&mut buf, width as f32, height as f32, scale, palette, None);
+    buf.pixels
+}
+
+/// Width and height of the mark-and-wordmark row at `scale`, in pixels.
+///
+/// A caller that has to *choose* the field the group sits in — the banner, which
+/// has no window to fill — needs the group's size before it can pick one. Kept
+/// beside the drawing rather than duplicated at the call site, so a banner
+/// cannot come to disagree with the splash about how wide "UMBER" is.
+pub fn row_extent(scale: f32) -> (f32, f32) {
+    let mark = design::MARK * scale;
+    let wordmark_px = design::WORDMARK * scale;
+    let font = Font::new(
+        wordmark_px,
+        design::WORDMARK_WEIGHT,
+        design::WORDMARK_TRACKING * scale,
+    );
+    let wordmark_w = font.as_ref().map_or(0.0, |f| f.width("UMBER"));
+    (
+        mark + design::MARK_GAP * scale + wordmark_w,
+        wordmark_px.max(mark),
+    )
+}
+
+/// The mark, the wordmark and — when one is given — the tagline, centred in a
+/// `w × h` field.
+///
+/// Split out of [`render`] so [`banner`] draws the same group from the same
+/// numbers. The alternative was a second copy of the layout, which would be one
+/// more thing to move whenever the design moved the mark or the gap, and no test
+/// would notice the day it stopped matching.
+fn brand(buf: &mut Buffer, w: f32, h: f32, scale: f32, palette: &Palette, tagline: Option<&str>) {
+    let mark = design::MARK * scale;
+    let wordmark_px = design::WORDMARK * scale;
+    let tagline_px = design::TAGLINE * scale;
+
+    let wordmark = Font::new(
+        wordmark_px,
+        design::WORDMARK_WEIGHT,
+        design::WORDMARK_TRACKING * scale,
+    );
+    let wordmark_w = wordmark.as_ref().map_or(0.0, |f| f.width("UMBER"));
+    let row_w = mark + design::MARK_GAP * scale + wordmark_w;
+    // The design gives the wordmark `line-height:1`, so the row is as tall as
+    // the type size, and the mark is centred against that rather than the other
+    // way round.
+    let row_h = wordmark_px.max(mark);
+    // With no tagline the group *is* the row. Reserving the space anyway would
+    // push the row off centre by half a tagline for the sake of nothing.
+    let group_h = match tagline {
+        Some(_) => row_h + design::TAGLINE_GAP * scale + tagline_px * 1.2,
+        None => row_h,
+    };
+
+    let group_top = (h - group_h) * 0.5;
+    let row_left = (w - row_w) * 0.5;
+
+    let mark_top = group_top + (row_h - mark) * 0.5;
+    buf.rounded_rect(
+        row_left,
+        mark_top,
+        row_left + mark,
+        mark_top + mark,
+        // The splash's own corner ratio: the design draws this instance at
+        // 52 px with an 8 px radius, which is not the ratio the 15 px menu-bar
+        // mark uses. See `logo::SPLASH_CORNER_RATIO`.
+        mark * logo::SPLASH_CORNER_RATIO,
+        palette.accent,
+    );
+
+    if let Some(font) = &wordmark {
+        // Cap height rather than the em box: the design aligns the wordmark
+        // optically with the square beside it, and capitals are what the eye
+        // lines up.
+        let baseline = group_top + (row_h + font.cap_height()) * 0.5;
+        let x = row_left + mark + design::MARK_GAP * scale;
+        font.draw("UMBER", x, baseline, |px, py, coverage| {
+            buf.blend(px, py, palette.text_strong, coverage);
+        });
+    }
+
+    let Some(line) = tagline else { return };
+    if let Some(font) = Font::new(tagline_px, 400.0, design::TAGLINE_TRACKING * scale) {
+        let baseline = group_top + row_h + design::TAGLINE_GAP * scale + font.cap_height();
+        let x = (w - font.width(line)) * 0.5;
+        // The design's #6e7176 is dimmer than any token here; `text_dim` is the
+        // nearest, and is the token these supporting lines would use in the
+        // workspace anyway.
+        font.draw(line, x, baseline, |px, py, coverage| {
+            buf.blend(px, py, palette.text_dim, coverage);
+        });
+    }
 }
 
 /// A plain CPU framebuffer in softbuffer's `0RGB` layout.
@@ -598,6 +648,81 @@ mod tests {
             );
             assert_eq!(px.len(), W * H);
         }
+    }
+
+    /// The banner is the splash's brand group and nothing else. These three pin
+    /// each half of that: the group is there, and neither piece of start-up
+    /// furniture came with it.
+    #[test]
+    fn the_banner_carries_the_mark_and_the_wordmark() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let px = banner(600, 220, 1.0, &palette);
+        assert!(
+            px.iter().any(|&p| p == pack(palette.accent)),
+            "no accent pixel — the mark is missing"
+        );
+        let lit = px
+            .iter()
+            .filter(|&&p| p == pack(palette.text_strong))
+            .count();
+        assert!(
+            lit > 500,
+            "only {lit} wordmark pixels — is Archivo loading?"
+        );
+    }
+
+    #[test]
+    fn the_banner_has_no_progress_bar() {
+        // `rail` is the bar's track and is used nowhere else on the splash, so
+        // its absence is the whole assertion.
+        let palette = Palette::of(ThemeKind::Graphite);
+        let px = banner(600, 220, 1.0, &palette);
+        assert!(!px.iter().any(|&p| p == pack(palette.rail)));
+    }
+
+    #[test]
+    fn the_banner_omits_the_version() {
+        // The tagline and the status line are the only `text_dim` on the splash,
+        // and the tagline is where `CARGO_PKG_VERSION` appears. A committed
+        // picture carrying a version number is wrong from the next release on.
+        let palette = Palette::of(ThemeKind::Graphite);
+        let px = banner(600, 220, 1.0, &palette);
+        assert_eq!(
+            px.iter().filter(|&&p| p == pack(palette.text_dim)).count(),
+            0
+        );
+    }
+
+    /// The row the banner sizes its field from has to be the row the banner
+    /// actually draws, or the margins come out lopsided.
+    #[test]
+    fn the_reported_row_is_the_row_that_is_drawn() {
+        let palette = Palette::of(ThemeKind::Graphite);
+        let scale = 2.0;
+        let (row_w, row_h) = row_extent(scale);
+        let (w, h) = ((row_w + 80.0) as usize, (row_h + 80.0) as usize);
+        let px = banner(w, h, scale, &palette);
+
+        // Columns holding anything other than the backdrop, which for a banner
+        // is exactly the group.
+        let backdrop = pack(palette.backdrop);
+        let mut left = w;
+        let mut right = 0;
+        for y in 0..h {
+            for x in 0..w {
+                if px[y * w + x] != backdrop {
+                    left = left.min(x);
+                    right = right.max(x);
+                }
+            }
+        }
+        let drawn = (right + 1 - left) as f32;
+        // Within a pixel or two: the mark's antialiased edge and the wordmark's
+        // side bearings both round.
+        assert!(
+            (drawn - row_w).abs() <= 3.0,
+            "reported {row_w}, drew {drawn}"
+        );
     }
 
     /// Write the splash out as PNGs so its layout can actually be looked at.
