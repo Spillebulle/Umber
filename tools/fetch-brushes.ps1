@@ -363,9 +363,13 @@ $licenceFile = Join-Path $BrushRoot 'LICENSES.md'
 # glyph everywhere it is rendered. (This script itself is saved *with* a BOM,
 # which is the opposite problem — 5.1 reads an unmarked .ps1 as the system
 # codepage, which mangles the accented author names below.)
+#
+# The trailing newline is not cosmetic either: the `.sh` twin writes one, and
+# the two scripts producing byte-identical output is how "keep them in step"
+# is actually checked.
 [System.IO.File]::WriteAllText(
     $licenceFile,
-    ($lines -join "`n"),
+    ($lines -join "`n") + "`n",
     (New-Object System.Text.UTF8Encoding $false)
 )
 Write-Host "wrote $licenceFile"

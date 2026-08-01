@@ -155,14 +155,17 @@ echo "$PACKS" | while IFS='|' read -r id name url home root licence licfile lici
             continue
         fi
 
-        ok=1
+        # The marker loop runs in a subshell — it is the right-hand side of a
+        # pipe — so it cannot set a variable the rest of this sees. It leaves a
+        # file behind instead.
         echo "$markers" | tr '~' '\n' | while IFS= read -r marker; do
-            [ -z "$marker" ] && continue
-            grep -qF "$marker" "$work/licence.txt" || echo "missing" >>"$work/bad"
+            if [ -n "$marker" ] && ! grep -qF "$marker" "$work/licence.txt"; then
+                echo "$marker" >>"$work/missing"
+            fi
         done
-        [ -f "$work/bad" ] && ok=0
-        if [ "$ok" -eq 0 ]; then
-            echo "  $licfile does not state the expected licence; refusing to keep it" >&2
+        if [ -f "$work/missing" ]; then
+            echo "  $licfile does not state $(tr '\n' ';' <"$work/missing")" >&2
+            echo "  refusing to keep it" >&2
             rm -rf "$work"
             continue
         fi
@@ -172,17 +175,17 @@ echo "$PACKS" | while IFS='|' read -r id name url home root licence licfile lici
     rm -rf "$target"
     mkdir -p "$target"
 
-    kept=0
     echo "$keep" | tr '~' '\n' | while IFS= read -r pattern; do
-        [ -z "$pattern" ] && continue
-        # Settings only. In the MyPaint pack the previews are CC-BY where the
-        # settings are CC0, so they are never copied.
-        find "$extracted" -type f -path "$extracted/$pattern" ! -name '*_prev.png' |
-            while IFS= read -r file; do
-                rel=${file#"$extracted"/}
-                mkdir -p "$target/$(dirname "$rel")"
-                cp "$file" "$target/$rel"
-            done
+        if [ -n "$pattern" ]; then
+            # Settings only. In the MyPaint pack the previews are CC-BY where
+            # the settings are CC0, so they are never copied.
+            find "$extracted" -type f -path "$extracted/$pattern" ! -name '*_prev.png' |
+                while IFS= read -r file; do
+                    rel=${file#"$extracted"/}
+                    mkdir -p "$target/$(dirname "$rel")"
+                    cp "$file" "$target/$rel"
+                done
+        fi
     done
     kept=$(find "$target" -type f | wc -l | tr -d ' ')
     echo "  kept $kept files in assets/brushes/$id"

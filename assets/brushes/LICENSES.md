@@ -71,3 +71,4 @@ in full where it applies.
   top of `docs/brush-sources.md`, made once, for this source only.
 - **Authors:** rubberduck
 - **Format:** .gbr and .gih (GIMP)
+
