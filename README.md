@@ -167,6 +167,14 @@ Several documents are open at once, in tabs, each with its own layers, history
 and view. **Export flat PNG** means what it says — one image, for showing
 people. Save is what keeps the layers.
 
+**A saved document carries its undo history**, so one reopened tomorrow can
+still be stepped back through, redo included. It rides as private entries every
+other OpenRaster reader walks straight past, so the file is still an ordinary
+`.ora`. The limit is the newest 32 MB of edits: on a sketching session that is
+under half a megabyte and free, and on an afternoon of full-canvas painting it
+is the difference between a 9.7 MB file and a 41.5 MB one. **Settings → General**
+switches it off, with the trade stated in megabytes rather than in adverbs.
+
 ## The workspace
 
 <!-- PICKERS -->

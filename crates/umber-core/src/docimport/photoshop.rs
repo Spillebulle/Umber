@@ -193,6 +193,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         active: None,
         background: Background::Transparent,
         dpi: None,
+        history: None,
         warnings,
     })
 }
@@ -212,6 +213,7 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
         active: None,
         background: Background::Transparent,
         dpi: None,
+        history: None,
         warnings,
     }
 }

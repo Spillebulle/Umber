@@ -127,7 +127,9 @@ layer would otherwise preview wrongly and then jump on release.
   canvas means different pixels on the new one. Every entry carries what it
   was, and the two stacks read as one timeline, which is what the History
   module lists; a jump to a point in it is that many single steps, because
-  there are no snapshots to jump to.
+  there are no snapshots to jump to. A save writes the newest 32 MB of it into
+  the document, keyed by stack position rather than by slot, and refuses to
+  restore a history that does not match the stack that loaded.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 

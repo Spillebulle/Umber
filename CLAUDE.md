@@ -197,13 +197,44 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   every time it is saved and reopened.
   `saving_and_reopening_does_not_move_a_pixel` drives every reachable
   (colour, alpha) pair through both.
-- **Three `umber-` attributes are the extension mechanism**, and every other ORA
+- **The `umber-` attributes are the extension mechanism**, and every other ORA
   reader ignores them, which is what keeps the file a plain `.ora`.
   `umber-blend` exists because Add's nearest SVG name (`svg:plus`) is only
   approximate — without it, reopening Umber's own file reports a loss that did
   not happen. `umber-version` is bumped only when a revision stores something an
   older build would drop silently, and an older build then **refuses** the file
   rather than opening it with pieces missing.
+- **The undo history is written too**, under `umber/`, pointed at by
+  `umber-history`. `docformat::history` has the argument; the rules it lives by:
+  - **A slot is never written down.** `PixelPatch::slot` is a texture slice and
+    slots are recycled, which is why deleting a layer clears the history — a
+    slot in a file read into another session's allocation is that bug made
+    permanent. Entries name a **stack position**; `SaveHistory::new` maps slot
+    to position at save time and refuses the whole history if any patch cannot
+    be placed, and `ImportedDocument::open` maps it back — which is why that
+    returns an `Opened` rather than a tuple, because the stack and the history
+    have to be built together.
+  - **Anything that does not line up exactly is dropped, whole.** The manifest
+    fingerprints the canvas and the layer names, compared against the layers
+    that actually *loaded* — a skipped layer shifts every position after it. The
+    entries are a sequence in which each restores the pixels the next expects,
+    so one missing from the middle is not a shorter history but a wrong one.
+    A history replayed into the wrong layer is far worse than no saved history.
+  - **The file has its own budget**, `BUDGET_BYTES` of *encoded* patches against
+    512 MB raw in memory, oldest dropped first, encoded newest-first and stopped
+    at the limit so a session far over pays for nothing it will not keep.
+    Patches are PNG at `Compression::Fast`: measured, that beats the ZIP's own
+    Deflate on size everywhere but a sketch and on time by 10×. Re-measure with
+    `examples/measure-history.rs` before changing any of it.
+  - **This did not bump `umber-version`**, and the argument is in
+    `docformat`'s module docs. An older build ignores an entry it has never
+    heard of and opens with an empty history — exactly what every build before
+    this did. `history::VERSION` governs the manifest, and an unreadable one is
+    *discarded* rather than refused.
+  - **It is a preference, `ui.save_history`.** A full-canvas session saturates
+    the budget and takes a 9.7 MB document to 41.5 MB; that is a trade the user
+    has to be able to refuse. Nothing here touches the GPU — the patches have
+    been in memory since commit time.
 - **`mergedimage.png` is the caller's, not `docformat`'s.** Flattening means
   blend modes, and the blend maths lives in the composite shader. A software
   copy here would be a second implementation to keep in step, and a file whose
@@ -470,7 +501,13 @@ acceptable once per stroke but must never move into the drawing loop.
   is why nothing on the drawing path may reach it.
 - **Evictions are counted, not forgotten.** `dropped` is what lets the list
   admit it no longer reaches the start of the document instead of drawing the
-  oldest surviving entry as though it were the beginning.
+  oldest surviving entry as though it were the beginning. It survives a save,
+  because a history that did not reach the beginning when it was written does
+  not reach it now either.
+- **`restore` rebuilds the whole timeline from one read out of a file** —
+  entries in timeline order, the position within them, and `dropped` — and still
+  answers to the in-memory budget, so a file written by a build with a larger
+  one cannot hand this process more than it allows. See "The document format".
 
 ## Interface
 

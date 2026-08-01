@@ -79,6 +79,8 @@ pub struct Prefs {
     /// works in sliders should not be handed the wheel again every morning.
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
+    /// Whether a saved document carries its undo history.
+    pub save_history: bool,
     /// The complete binding table, already merged with the defaults.
     pub shortcuts: Vec<Binding>,
 }
@@ -99,6 +101,7 @@ impl Default for Prefs {
             wheel_rotates: true,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
+            save_history: true,
             shortcuts: shortcuts::defaults(),
         }
     }
@@ -258,6 +261,7 @@ pub fn to_text(prefs: &Prefs) -> String {
         "wheel_shape = {}\n",
         wheel_shape_id(prefs.wheel_shape)
     ));
+    out.push_str(&format!("save_history = {}\n", prefs.save_history));
 
     // Only actions that differ from the factory table are written. An action
     // left out keeps its defaults, which is what lets a later version add a
@@ -352,6 +356,11 @@ pub fn from_text(text: &str) -> Prefs {
             "wheel_shape" => {
                 if let Some(v) = wheel_shape_from_id(value) {
                     prefs.wheel_shape = v;
+                }
+            }
+            "save_history" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.save_history = v;
                 }
             }
             "shortcut" => shortcut_lines.push(value),
@@ -549,6 +558,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_rotates: ed.ui.wheel_rotates,
         picker: ed.ui.picker,
         wheel_shape: ed.ui.wheel_shape,
+        save_history: ed.ui.save_history,
         shortcuts: shortcuts::published(),
     }
 }
@@ -565,6 +575,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_rotates = prefs.wheel_rotates;
     ed.ui.picker = prefs.picker;
     ed.ui.wheel_shape = prefs.wheel_shape;
+    ed.ui.save_history = prefs.save_history;
     shortcuts::publish(prefs.shortcuts.clone());
 
     // Setting the zoom factor when it has not changed still marks egui's fonts
@@ -636,6 +647,7 @@ mod tests {
         assert_eq!(prefs.wheel_rotates, editor.ui.wheel_rotates);
         assert_eq!(prefs.picker, editor.ui.picker);
         assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
+        assert_eq!(prefs.save_history, editor.ui.save_history);
         assert_eq!(prefs.shortcuts, shortcuts::defaults());
     }
 
@@ -722,6 +734,25 @@ mod tests {
         assert!(!prefs.update_notice_seen);
     }
 
+    /// Saving the history makes documents materially larger, so a refusal has
+    /// to survive a restart — and a line that cannot be read has to leave the
+    /// setting on, which is the direction that costs disk rather than work.
+    #[test]
+    fn turning_the_saved_history_off_survives_a_restart() {
+        let prefs = Prefs {
+            save_history: false,
+            ..Prefs::default()
+        };
+        assert!(!from_text(&to_text(&prefs)).save_history);
+        assert!(
+            from_text(
+                "save_history = sometimes
+"
+            )
+            .save_history
+        );
+    }
+
     #[test]
     fn a_full_round_trip_preserves_everything() {
         let mut prefs = Prefs {
@@ -736,6 +767,7 @@ mod tests {
             wheel_rotates: false,
             picker: PickerMode::Sliders,
             wheel_shape: WheelShape::Square,
+            save_history: false,
             shortcuts: shortcuts::defaults(),
         };
         let at = shortcuts::slot_of(&prefs.shortcuts, Action::BrushTool, 0);
@@ -759,6 +791,7 @@ mod tests {
         assert_eq!(back.wheel_rotates, prefs.wheel_rotates);
         assert_eq!(back.picker, prefs.picker);
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
+        assert_eq!(back.save_history, prefs.save_history);
         // Compared per action rather than as one list: editing a binding
         // appends it, so the live table is in interaction order while a loaded
         // one is in `Action::ALL` order. What has to survive is which chords

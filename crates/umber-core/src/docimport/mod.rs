@@ -6,7 +6,7 @@
 //! for warning in &doc.warnings {
 //!     eprintln!("{warning}");
 //! }
-//! let (document, stack, uploads) = doc.into_stack();
+//! let opened = doc.open();
 //! # Ok::<(), umber_core::docimport::ImportError>(())
 //! ```
 //!
@@ -35,6 +35,7 @@
 mod blend;
 mod container;
 mod flat;
+mod history;
 mod krita;
 mod lzf;
 mod openraster;
@@ -50,7 +51,10 @@ use std::path::Path;
 use glam::UVec2;
 
 use crate::document::{Background, Document};
+use crate::history::{Edit, History, PixelPatch};
 use crate::layer::{BlendMode, LayerStack};
+
+pub use history::{ImportedEdit, ImportedHistory};
 
 /// Formats [`import`] can read.
 ///
@@ -183,6 +187,13 @@ pub struct ImportedDocument {
     /// identical either way — and a warning on every PSD and PNG would be noise
     /// in the one list that has to stay worth reading.
     pub dpi: Option<f32>,
+    /// The undo history the document was saved with, if it had one.
+    ///
+    /// `None` for every format but Umber's own — no other application records
+    /// one in a file — and `None` too for an Umber document written before
+    /// histories were saved, or one whose history could not be trusted against
+    /// the stack that loaded. See [`history`].
+    pub history: Option<ImportedHistory>,
     /// Everything the import could not represent. Empty means nothing was lost.
     pub warnings: Vec<ImportWarning>,
 }
@@ -191,6 +202,19 @@ pub struct ImportedDocument {
 pub struct LayerUpload {
     pub slot: u32,
     pub pixels: Vec<u8>,
+}
+
+/// Everything a document needs to be opened: the engine state built from an
+/// import, ready for the caller to give it GPU storage.
+///
+/// A struct rather than a tuple because there are now four of them and the
+/// history's absence has to be readable at the call site.
+pub struct Opened {
+    pub document: Document,
+    pub stack: LayerStack,
+    pub uploads: Vec<LayerUpload>,
+    /// Empty unless the file carried one that resolved against `stack`.
+    pub history: History,
 }
 
 impl ImportedDocument {
@@ -206,10 +230,11 @@ impl ImportedDocument {
     /// `LayerStack` deliberately holds no pixel data — it holds slots, and the
     /// pixels live on the GPU. The caller writes each `LayerUpload` into its
     /// slot and the document is open.
-    pub fn into_stack(self) -> (Document, LayerStack, Vec<LayerUpload>) {
+    pub fn open(self) -> Opened {
         let document = self.document();
         let mut stack = LayerStack::new();
         let mut uploads = Vec::with_capacity(self.layers.len());
+        let saved_history = self.history;
 
         // A fresh stack already has one layer, so only the rest are added. The
         // count is guaranteed to fit by `validate`.
@@ -241,7 +266,36 @@ impl ImportedDocument {
             .filter(|i| *i < stack.len())
             .unwrap_or(stack.len() - 1);
         stack.set_active(active);
-        (document, stack, uploads)
+
+        // The one place a saved history's stack positions become texture slots,
+        // and it is here rather than in the reader because the slots do not
+        // exist until the stack above has been built. A position out of range
+        // cannot arrive — `docimport::history` checked every one against the
+        // layers that loaded — but the history is dropped rather than trusted if
+        // one does, because replaying a patch into the wrong layer is the whole
+        // failure this design exists to avoid.
+        let history = saved_history
+            .and_then(|saved| {
+                let mut entries = Vec::with_capacity(saved.entries.len());
+                for edit in saved.entries {
+                    let slot = stack.get(edit.layer)?.slot();
+                    entries.push(Edit::new(
+                        edit.kind,
+                        PixelPatch::new(edit.rect, slot, edit.bytes),
+                    ));
+                }
+                let mut history = History::default();
+                history.restore(entries, saved.position, saved.dropped);
+                Some(history)
+            })
+            .unwrap_or_default();
+
+        Opened {
+            document,
+            stack,
+            uploads,
+            history,
+        }
     }
 
     /// Largest canvas edge an import will accept.
@@ -255,7 +309,7 @@ impl ImportedDocument {
     /// Total layer bytes an import will accept, across the whole stack.
     pub const MAX_TOTAL_BYTES: u64 = 2 << 30;
 
-    /// Check what [`into_stack`](Self::into_stack) relies on.
+    /// Check what [`open`](Self::open) relies on.
     ///
     /// Every reader guards its own bounds before decoding, but a reader that
     /// grew a flattening fallback could still hand back something the stack
@@ -314,6 +368,15 @@ pub enum ImportWarning {
     DocumentFlattened { reason: String },
     /// Pixels were taken to be sRGB when the file said otherwise.
     ColourProfileAssumed { detail: String },
+    /// The document carried an undo history that could not be trusted against
+    /// the stack that loaded, so none of it was restored.
+    ///
+    /// Only ever raised where the file actually claimed to have one — a
+    /// document with no history says nothing, which is what keeps this list
+    /// worth reading. The whole history goes or none of it does: the entries are
+    /// a sequence in which each restores the pixels the next one expects, so one
+    /// missing from the middle is not a shorter history but a wrong one.
+    HistoryDropped { reason: String },
 }
 
 impl fmt::Display for ImportWarning {
@@ -359,6 +422,10 @@ impl fmt::Display for ImportWarning {
             Self::ColourProfileAssumed { detail } => write!(
                 f,
                 "Colours were read as sRGB ({detail}); they may not match the original exactly."
+            ),
+            Self::HistoryDropped { reason } => write!(
+                f,
+                "The saved undo history was not restored ({reason}), so the document opens with an empty one. Nothing in the picture was lost."
             ),
         }
     }
@@ -530,9 +597,15 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            history: None,
             warnings: vec![],
         };
-        let (document, stack, uploads) = doc.into_stack();
+        let Opened {
+            document,
+            stack,
+            uploads,
+            ..
+        } = doc.open();
 
         assert_eq!(document.size, size);
         assert_eq!(stack.len(), 3);
@@ -557,14 +630,15 @@ mod tests {
             active,
             background: Background::Transparent,
             dpi: None,
+            history: None,
             warnings: vec![],
         };
 
-        assert_eq!(build(Some(0)).into_stack().1.active_index(), 0);
+        assert_eq!(build(Some(0)).open().stack.active_index(), 0);
         // Out of range means the file disagrees with itself — a layer that
         // failed to load, say. The top layer is the safe answer, not a panic.
-        assert_eq!(build(Some(9)).into_stack().1.active_index(), 2);
-        assert_eq!(build(None).into_stack().1.active_index(), 2);
+        assert_eq!(build(Some(9)).open().stack.active_index(), 2);
+        assert_eq!(build(None).open().stack.active_index(), 2);
     }
 
     #[test]
@@ -579,9 +653,10 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            history: None,
             warnings: vec![],
         };
-        let (_, stack, uploads) = doc.into_stack();
+        let Opened { stack, uploads, .. } = doc.open();
         assert_eq!(stack.len(), 1);
         assert_eq!(uploads.len(), 1);
     }
@@ -644,7 +719,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(doc.format, SourceFormat::OpenRaster);
-        let (document, stack, uploads) = doc.into_stack();
+        let Opened {
+            document,
+            stack,
+            uploads,
+            ..
+        } = doc.open();
         assert_eq!(document.size, UVec2::new(2, 2));
         assert_eq!(stack.layers()[0].name, "Paper");
         assert_eq!(uploads.len(), 2);
@@ -667,6 +747,7 @@ mod tests {
             active: None,
             background: Background::Transparent,
             dpi: None,
+            history: None,
             warnings: vec![],
         };
         assert!(matches!(

@@ -78,6 +78,16 @@ pub struct UiState {
     /// the entry is the brush's — a copy would need writing back and would go
     /// stale the moment a row above it was deleted.
     pub modulation: usize,
+    /// Whether a save carries the undo history into the document.
+    ///
+    /// A preference rather than a fixed policy because it is the one setting
+    /// here that trades file size for a feature: a bounded slice of the history
+    /// goes into the archive, which on a heavy painting session is tens of
+    /// megabytes beside a document that might otherwise be a few. On by
+    /// default, because a history nobody knows to switch on is one nobody gets,
+    /// and because the cost is bounded at both ends — see
+    /// `umber_core::docformat::history`.
+    pub save_history: bool,
 }
 
 /// Tabs of the brush editor dialog.
@@ -123,6 +133,7 @@ impl Default for UiState {
             about_open: false,
             close_prompt: None,
             modulation: 0,
+            save_history: true,
         }
     }
 }

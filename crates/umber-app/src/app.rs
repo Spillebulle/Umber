@@ -587,6 +587,21 @@ impl UmberApp {
                 })
                 .collect();
 
+            // The undo history, resolved against the stack it belongs to. No
+            // GPU work: the patches have been in memory since they were
+            // captured at commit time, so this adds nothing to the blocking
+            // readbacks above. `SaveHistory::new` refuses outright if any patch
+            // names a slot no layer holds, which cannot happen from here —
+            // deleting a layer clears the history — and is checked anyway
+            // because a patch replayed into the wrong layer is far worse than
+            // no saved history at all.
+            let history = self
+                .editor
+                .ui
+                .save_history
+                .then(|| docformat::SaveHistory::new(&self.editor.history, &self.editor.layers))
+                .flatten();
+
             docformat::save(
                 &path,
                 &SaveDocument {
@@ -596,6 +611,7 @@ impl UmberApp {
                     background: self.editor.doc.background,
                     dpi: self.editor.doc.dpi,
                     merged: &merged,
+                    history,
                 },
             )
         };
@@ -1163,7 +1179,16 @@ impl UmberApp {
 
         let format = imported.format.label();
         let notes = tabs::summarise(&imported.warnings);
-        let (doc, layers, uploads) = imported.into_stack();
+        let umber_core::docimport::Opened {
+            document: doc,
+            stack: layers,
+            uploads,
+            // Empty unless the file carried one that resolved against the stack
+            // above, and the two are built together for that reason: the
+            // patches name stack positions in the file and texture slots here,
+            // and the slots do not exist until the stack does.
+            history,
+        } = imported.open();
         let size = doc.size;
         let slots = layers.slot_capacity_needed();
 
@@ -1172,7 +1197,7 @@ impl UmberApp {
                 camera: umber_core::Camera::fit(doc.size_vec2(), self.editor.canvas_size),
                 doc,
                 layers,
-                history: umber_core::History::default(),
+                history,
             },
             name.clone(),
             Some(path.to_path_buf()),

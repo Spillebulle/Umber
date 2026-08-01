@@ -12,6 +12,7 @@
 //!     background: umber_core::Background::WHITE,
 //!     dpi: 72.0,
 //!     merged: &merged,
+//!     history: None,
 //! };
 //! let warnings = umber_core::docformat::save(Path::new("sketch.ora"), &doc)?;
 //! # Ok::<(), umber_core::docformat::SaveError>(())
@@ -37,7 +38,7 @@
 //!
 //! # What Umber adds, and how it stays an ORA
 //!
-//! Four things Umber knows have nowhere to go in baseline ORA, so they are
+//! Five things Umber knows have nowhere to go in baseline ORA, so they are
 //! written as extra attributes. XML readers ignore attributes they do not
 //! recognise, so a file carrying them is still an ordinary `.ora` everywhere
 //! else; the `umber-` prefix keeps them out of the way of anything the
@@ -55,6 +56,8 @@
 //!   would report an approximation that never happened.
 //! * **[`BACKGROUND_ATTR`]** on the bottom `<layer>`, when the document has a
 //!   background colour. See below — it is the *hint*, not the storage.
+//! * **[`HISTORY_ATTR`]** on `<image>`, naming the entry that describes a saved
+//!   undo history. See [`history`], and "The undo history" below.
 //!
 //! Resolution is **not** one of them. ORA's `<image>` already carries `xres`
 //! and `yres`, which is what [`SaveDocument::dpi`] is written to and read from;
@@ -107,11 +110,24 @@
 //! On the bytes a layer texture can actually contain the two round-trip
 //! exactly, so saving and reopening moves nothing.
 //!
-//! # What is not saved
+//! # The undo history
 //!
-//! Undo history and the camera. Neither belongs in an interchange format, and
-//! an undo stack pinned to a texture slot would be meaningless in a file. A
-//! reopened document starts with an empty history, framed to fit.
+//! Also written, when the caller supplies one: the patches go into the archive
+//! under `umber/`, named by a manifest and pointed at by [`HISTORY_ATTR`], so a
+//! document reopened tomorrow can still be undone. [`history`] has the whole
+//! argument — how a texture slot is turned into something that survives being
+//! written down, what the file's own size budget is, and why none of it bumps
+//! [`VERSION`].
+//!
+//! It is optional at both ends. A caller that passes `None` writes exactly the
+//! file it always did, and a reader that finds no history opens the document
+//! with an empty one, as every reader before this could.
+//!
+//! # What is still not saved
+//!
+//! The camera. A reopened document is framed to fit, like any other.
+
+pub mod history;
 
 use std::io::Write;
 use std::path::Path;
@@ -124,6 +140,8 @@ use crate::color::Color;
 use crate::docimport::srgb;
 use crate::document::Background;
 use crate::layer::{BlendMode, LayerStack};
+
+pub use history::{HISTORY_ATTR, SaveHistory};
 
 /// Extension Umber saves with, without the dot.
 pub const EXTENSION: &str = "ora";
@@ -141,6 +159,15 @@ pub const EXTENSION: &str = "ora";
 /// becomes an editable layer — and that does not meet the bar for refusing to
 /// open somebody's document. Resolution did not either: it rides on ORA's own
 /// `xres`/`yres`, and a build that ignores it renders an identical picture.
+///
+/// Neither did the **undo history**, and it is the clearest case of all: an
+/// older build ignores an archive entry it has never heard of and opens the
+/// document with an empty history — which is precisely what every build before
+/// this one did with every file. Nothing about the picture is lost, and nothing
+/// is dropped silently that could not have been. Refusing to open somebody's
+/// painting because it carries a history they do not need would be a plainly
+/// worse trade. [`history::VERSION`] governs that layout instead, and an
+/// unreadable one is discarded rather than refused.
 pub const VERSION: u32 = 1;
 
 /// `<image>` attribute naming [`VERSION`].
@@ -210,6 +237,13 @@ pub struct SaveDocument<'a> {
     /// and a saved file whose preview disagreed with the screen is exactly the
     /// bug that arrangement produces.
     pub merged: &'a [u8],
+    /// The undo history, resolved against the stack by
+    /// [`SaveHistory::new`] — `None` writes the file exactly as it was written
+    /// before histories were saved at all.
+    ///
+    /// `None` is also what a history that could not be resolved becomes, and
+    /// what the preference for not saving one produces. See [`history`].
+    pub history: Option<SaveHistory<'a>>,
 }
 
 /// Something a save could not carry across in full.
@@ -408,8 +442,20 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         entries.push(background_xml(colour));
     }
 
+    // The undo history, if the caller kept one. Under `umber/`, which every
+    // other OpenRaster reader walks straight past — and written before
+    // `stack.xml`, because the attribute that points at it must only appear
+    // when something actually went in.
+    // The names as `stack.xml` will hold them, not as the editor holds them —
+    // the manifest fingerprints the stack the reader will rebuild.
+    let names: Vec<String> = doc.layers.iter().map(|l| clean_name(l.name)).collect();
+    let saved_history = match &doc.history {
+        Some(h) if !h.is_empty() => history::write(&mut zip, doc.size, &names, h)?,
+        _ => false,
+    };
+
     zip.start_file("stack.xml", deflated())?;
-    zip.write_all(stack_xml(doc.size, doc.dpi, &entries).as_bytes())?;
+    zip.write_all(stack_xml(doc.size, doc.dpi, saved_history, &entries).as_bytes())?;
 
     // Both are required of a conforming writer, and both are what gives a file
     // manager something to show.
@@ -475,16 +521,23 @@ pub fn background_from_id(id: &str) -> Option<Color> {
 
 // --- the XML ---------------------------------------------------------------
 
-fn stack_xml(size: UVec2, dpi: f32, layers: &[String]) -> String {
+fn stack_xml(size: UVec2, dpi: f32, saved_history: bool, layers: &[String]) -> String {
     // `xres`/`yres` are OpenRaster's own, in whole pixels per inch, and every
     // reader that cares about print already looks for them — which is exactly
     // why there is no `umber-dpi` beside them. Umber has one resolution rather
     // than one per axis, so both get the same number.
     let res = crate::document::sane_dpi(dpi).round() as u32;
+    // Named rather than spelled as a flag, so a later revision can move the
+    // manifest without every existing file becoming ambiguous.
+    let history = if saved_history {
+        format!(" {HISTORY_ATTR}=\"{}\"", history::MANIFEST)
+    } else {
+        String::new()
+    };
     let mut out = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
     out.push_str(&format!(
         "<image w=\"{}\" h=\"{}\" xres=\"{res}\" yres=\"{res}\" \
-         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\">\n \
+         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\"{history}>\n \
          <stack>\n",
         size.x, size.y
     ));
@@ -544,13 +597,23 @@ fn background_xml(colour: Color) -> String {
 }
 
 /// Escape a layer name for an attribute value.
+fn attribute(raw: &str) -> String {
+    quick_xml::escape::escape(clean_name(raw)).into_owned()
+}
+
+/// A layer name as the file will hold it.
 ///
 /// Control characters are dropped rather than escaped: they are not legal in
 /// XML 1.0 at all, so a name carrying one — pasted from somewhere odd — would
 /// make the file unreadable by every parser including Umber's.
-fn attribute(raw: &str) -> String {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    quick_xml::escape::escape(&cleaned).into_owned()
+///
+/// Public within the module because the history manifest fingerprints the stack
+/// by name, and it has to record the names the *file* will come back with. Left
+/// to `attribute` alone, a document with an odd character in a layer name would
+/// write a fingerprint that could never match on the way in, and silently lose
+/// its history every time it was saved.
+pub(crate) fn clean_name(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
 }
 
 // --- the pixels ------------------------------------------------------------
@@ -770,6 +833,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &merged,
+            history: None,
         });
 
         assert_eq!(doc.size, size);
@@ -807,6 +871,7 @@ mod tests {
             background: Background::opaque(paper),
             dpi: 300.0,
             merged: &pixels,
+            history: None,
         });
 
         assert_eq!(doc.background, Background::opaque(paper));
@@ -843,6 +908,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         })
         .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -874,6 +940,7 @@ mod tests {
             background: Background::opaque(Color::from_srgb_u8(20, 120, 200, 255)),
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         })
         .unwrap();
 
@@ -910,6 +977,7 @@ mod tests {
             background: Background::Transparent,
             dpi: 150.0,
             merged: &pixels,
+            history: None,
         })
         .unwrap();
 
@@ -938,6 +1006,7 @@ mod tests {
             background: Background::WHITE,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         });
         assert_eq!(doc.layers.len(), LayerStack::MAX);
         assert_eq!(doc.background, Background::WHITE);
@@ -982,6 +1051,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &merged,
+            history: None,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
     }
@@ -1004,6 +1074,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &merged,
+            history: None,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
     }
@@ -1021,6 +1092,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &painted,
+            history: None,
         });
 
         assert_eq!(doc.layers.len(), 2, "the empty layer was dropped");
@@ -1049,6 +1121,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         };
 
         let (bytes, warnings) = encode(&doc).unwrap();
@@ -1082,6 +1155,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         });
         assert_eq!(doc.layers[0].name, "<ink> & \"paper\"");
     }
@@ -1098,6 +1172,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         })
         .unwrap();
 
@@ -1131,6 +1206,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         })
         .unwrap();
 
@@ -1182,6 +1258,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &pixels,
+            history: None,
         })
         .unwrap_err();
         assert!(matches!(err, SaveError::TooManyLayers { .. }), "{err:?}");
@@ -1200,6 +1277,7 @@ mod tests {
             background: Background::Transparent,
             dpi: Document::DEFAULT_DPI,
             merged: &full,
+            history: None,
         })
         .unwrap_err();
         assert!(matches!(err, SaveError::WrongSize { .. }), "{err:?}");
@@ -1231,6 +1309,7 @@ mod tests {
                 background: Background::Transparent,
                 dpi: Document::DEFAULT_DPI,
                 merged: &pixels,
+                history: None,
             },
         )
         .unwrap();

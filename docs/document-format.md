@@ -48,13 +48,16 @@ data/layer001.png           …down to the bottom
 data/background.png         the document background, when it has one — see below
 mergedimage.png             the flattened composite, required by the spec
 Thumbnails/thumbnail.png    at most 256 px on its long edge, also required
+umber/history/index.json    the saved undo history, when there is one — see below
+umber/history/0000.png      …and one PNG per recorded edit
 ```
 
 `stack.xml` for a two-layer document:
 
 ```xml
 <?xml version='1.0' encoding='UTF-8'?>
-<image w="2048" h="2048" xres="300" yres="300" version="0.0.3" umber-version="1">
+<image w="2048" h="2048" xres="300" yres="300" version="0.0.3" umber-version="1"
+        umber-history="umber/history/index.json">
  <stack>
   <layer name="Ink" src="data/layer000.png" x="0" y="0" opacity="1.0000"
          visibility="visible" composite-op="svg:multiply" umber-selected="true"/>
@@ -82,9 +85,9 @@ which is what a save actually spends its time on. A layer nobody has painted on
 is written as a single transparent pixel rather than as nothing, so that it
 survives rather than disappearing from the stack.
 
-## Umber's four extra attributes
+## Umber's five extra attributes
 
-Four things Umber knows have nowhere to go in baseline ORA. They are written as
+Five things Umber knows have nowhere to go in baseline ORA. They are written as
 extra attributes, which every XML reader ignores if it does not recognise them,
 so the file remains an ordinary `.ora` everywhere else. The `umber-` prefix keeps
 them clear of anything the specification may add later.
@@ -95,6 +98,7 @@ them clear of anything the specification may add later.
 | `umber-selected` | one `<layer>` | The layer that was being painted on. |
 | `umber-blend` | a `<layer>` | Umber's own mode name, where the SVG one is inexact. |
 | `umber-background` | the bottom `<layer>` | That layer *is* the document background, and this is its colour. |
+| `umber-history` | `<image>` | Names the entry describing a saved undo history. |
 
 **Resolution is deliberately not one of them.** ORA's `<image>` already carries
 `xres` and `yres`, in whole pixels per inch, and that is where a document's DPI
@@ -120,6 +124,105 @@ running build's is **refused**, before a pixel is decoded, with a message saying
 so and pointing at the two ways out: update Umber, or open it in another
 OpenRaster application — which still works, because the file is still an ORA.
 Additions an older build can safely ignore do not need a bump.
+
+## The undo history
+
+A history that dies with the session means a document reopened tomorrow cannot
+be stepped back through, however carefully it was built up. Nothing about the
+format prevents carrying one: an ORA is a ZIP, and a ZIP may hold entries nobody
+else reads. So the patches go in under `umber/`, described by a manifest and
+pointed at by `umber-history`. Every other reader — Krita, GIMP, MyPaint — walks
+straight past all of it, which is what keeps the file a plain `.ora`.
+
+Three things had to be got right.
+
+**A texture slot is not a layer.** `PixelPatch::slot` is a slice of the layer
+texture array, and slots are **recycled** when a layer is deleted — which is
+exactly why deleting one clears the history. A slot written into a file and read
+back into a different session's allocation is that same bug, made permanent. So
+a slot is never written: each entry names a **stack position**, bottom first,
+which is the order the file itself is in and the order the reader rebuilds.
+`SaveHistory::new` makes that mapping once, at save time, and refuses the whole
+history if any patch names a slot no layer holds; `ImportedDocument::open` turns
+the positions back into whatever slots the reopened stack allocated.
+
+**Anything that does not line up exactly is dropped.** The manifest carries the
+canvas size and the layer names in order, as a fingerprint of the stack the
+positions index into, and the reader compares them against the layers that
+actually *loaded* rather than against what `stack.xml` described — a layer that
+failed to decode shifts every position after it. A mismatched canvas, a renamed
+layer, a missing or wrong-sized patch, or a manifest from a later revision each
+drop the whole history and append an `ImportWarning`. There is no half-restored
+state: the entries are a sequence in which each restores the pixels the next one
+expects, so one missing from the middle is not a shorter history but a wrong
+one. A history that replays into the wrong layer is far worse than no saved
+history.
+
+**Size is the whole problem.** Memory allows 512 MB of raw RGBA; writing that
+verbatim would produce multi-gigabyte documents from an ordinary session. The
+file gets its own budget — 32 MB of *encoded* patch data, oldest dropped first,
+which is the direction the in-memory budget already ages entries out in — and
+the encoder runs newest-first and stops there, so a session far over it pays
+neither the time nor the space for what it will not keep. Patches are stored as
+PNG at `Compression::Fast`, the same encoder the layer images use, because PNG
+filters each row against the one above before it deflates:
+
+| session (2048² canvas) | raw patches | Deflate | PNG (fast) |
+|---|---|---|---|
+| 120 full-canvas strokes | 221 MB | 68 MB (3.3×), 4.2 s | 42 MB (5.2×), 0.35 s |
+| the same, heavily grained | 237 MB | 108 MB (2.2×), 5.6 s | 93 MB (2.6×), 0.41 s |
+| 300 small sketching strokes | 7.5 MB | 0.33 MB (23×), 0.02 s | 0.38 MB (20×), 0.00 s |
+
+Deflate is what the ZIP would have done for nothing, so it is the alternative
+worth measuring, and it loses on size everywhere but the sketch — where the
+difference is 50 kB — and on time by an order of magnitude everywhere.
+`cargo run --release -p umber-core --example measure-history` is where those
+numbers came from, and it is checked in so they can be re-measured rather than
+trusted.
+
+What it costs end to end, on a one-layer 2048² document:
+
+| session | file | save | open |
+|---|---|---|---|
+| 300 small strokes | 2.67 → 3.09 MB | 0.09 → 0.08 s | 0.03 → 0.04 s |
+| 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 → 0.15 s | 0.04 → 0.10 s |
+| 120 full-canvas strokes | 9.68 → 41.53 MB | 0.12 → 0.39 s | 0.04 → 0.28 s |
+
+Opening is in there because the patches have to be decoded before the document
+appears, and that is time the artist spends waiting. The budget kept the newest
+62 of those 120 strokes, 26 of 120 heavily grained ones, and all 300 of the
+sketching session with room to spare.
+
+The last row is the budget saturating, and it is why this is a **preference**
+rather than a policy: an afternoon of full-canvas painting makes the document
+four times the size, and somebody synchronising their work to a network drive is
+entitled to refuse that. Settings, General has the switch. It is on by default,
+because the common case is the first row and because a feature nobody knows to
+switch on is one nobody gets.
+
+The patch PNGs hold layer-texture bytes **unconverted** — sRGB-encoded with
+alpha premultiplied — rather than the straight alpha the layer images are
+converted to. That conversion exists so other applications can read them;
+nothing else reads these, so converting would be two passes over a hundred
+megabytes to arrive back where it started, and it would put a rounding step
+between undo and the pixels it restores.
+
+Nothing here reaches the GPU. The patches have been in memory since they were
+captured at commit time, so a save's blocking readbacks are exactly what they
+were before.
+
+### Why this does not bump `umber-version`
+
+The bar is that a revision storing something an older build would drop
+*silently* must be refused by it. An older Umber ignores an archive entry it has
+never heard of and opens the document with an empty history — which is precisely
+what every build before this one did with every file. Nothing about the picture
+is lost. Refusing to open somebody's painting because it carries a history they
+do not need would be a plainly worse trade than the one it avoids.
+
+A separate `history::VERSION` governs the manifest's own layout instead, and a
+manifest from a newer one is **discarded**, not refused: the document still
+opens, exactly as it would have before histories were saved at all.
 
 ## The background, and why it is a real layer in the file
 
@@ -210,11 +313,12 @@ Written, read back, and asserted on in `docformat`'s tests:
   opacity, blend mode, and every pixel byte for byte.
 - Which layer was selected.
 - Empty layers, and layers painted in one corner.
+- The undo history: both stacks, the position within the timeline, how many
+  older entries the budget had already dropped, and every patch byte for byte —
+  on the layer it was recorded against, whatever slot that layer ends up with.
 
 ## What is not saved
 
-- **Undo history.** It is a list of rectangles keyed by texture slot; in a file
-  it would be meaningless. A reopened document starts with an empty history.
 - **The camera.** A reopened document is framed to fit, like any other.
 - **Layer groups, masks, adjustment layers, per-layer blend options.** Umber has
   none of these yet. When it grows them, `umber-version` is the mechanism.
@@ -258,6 +362,9 @@ verbatim.
 - Closing a document with unsaved work offers **Save**, Export PNG, Discard and
   Cancel. Save closes the tab only if a file was actually written: a cancelled
   file dialog is not permission to discard.
+- **Settings → General → Save the undo history in the document** turns the
+  history off. Its note states the trade in megabytes; see above for where those
+  numbers come from.
 
 Both shortcuts are in the same table as every other one (`shortcuts.rs`) and can
 be rebound in the settings dialog.
@@ -283,3 +390,8 @@ drawing path.
 - **`.ora` is the only extension offered.** Krita's `.kra` and Photoshop's
   `.psd` are read but not written, and there is no reason to write them: both
   applications read ORA.
+- **A saved history does not survive a layer being added, deleted or reordered
+  after it was written.** The manifest fingerprints the stack by name and order,
+  so a document whose layers have moved drops its history on the way in — which
+  is the safe direction, and the same limitation the in-memory history already
+  has, for the same reason. Structural undo is what fixes both.

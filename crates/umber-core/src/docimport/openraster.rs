@@ -17,9 +17,9 @@
 //! # Umber's own documents come through here
 //!
 //! [`crate::docformat`] writes ORA, so this is also the reader for Umber's own
-//! saved files. Four extra attributes carry what baseline ORA has nowhere to
-//! put — `umber-version`, `umber-selected`, `umber-blend` and
-//! `umber-background`, all documented there — and they are read here rather
+//! saved files. Five extra attributes carry what baseline ORA has nowhere to
+//! put — `umber-version`, `umber-selected`, `umber-blend`, `umber-background`
+//! and `umber-history`, all documented there — and they are read here rather
 //! than in a second reader, because two readers for one format is two things to
 //! keep in step. A file written by anything else simply has none of them.
 //!
@@ -37,7 +37,7 @@ use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
-    srgb,
+    history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
@@ -73,7 +73,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 
     let stack_xml = container::read_entry(&mut zip, "stack.xml", FORMAT)?;
     let mut warnings = Vec::new();
-    let (size, dpi, mut specs) = parse_stack(&stack_xml, &mut warnings)?;
+    let (size, dpi, manifest, mut specs) = parse_stack(&stack_xml, &mut warnings)?;
 
     // The background is a layer in the file and a property here, so it comes
     // out of the list before anything counts or decodes it. Removed rather than
@@ -116,6 +116,15 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         return flattened_fallback(&mut zip, size, dpi, warnings);
     }
 
+    // The undo history, when the document says it has one. Read last, and
+    // against the layers that actually *loaded* rather than against the specs:
+    // a layer skipped above shifts every stack position after it, and the
+    // positions are the whole of how a patch finds its layer again.
+    let history = manifest.and_then(|path| {
+        let names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
+        history::read(&mut zip, &path, size, &names, &mut warnings)
+    });
+
     Ok(ImportedDocument {
         format: FORMAT,
         size,
@@ -123,6 +132,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         active,
         background,
         dpi,
+        history,
         warnings,
     })
 }
@@ -134,11 +144,14 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 /// and gets reversed at the end — Umber's `LayerStack` is bottom first. Getting
 /// this backwards inverts the whole image and is not obvious on a symmetrical
 /// test file, so `layers_arrive_bottom_first` pins it down.
+///
+/// The third value is `umber-history` — the entry naming the saved undo
+/// history's manifest, when there is one.
 #[allow(clippy::type_complexity)]
 fn parse_stack(
     xml: &[u8],
     warnings: &mut Vec<ImportWarning>,
-) -> Result<(UVec2, Option<f32>, Vec<LayerSpec>), ImportError> {
+) -> Result<(UVec2, Option<f32>, Option<String>, Vec<LayerSpec>), ImportError> {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
 
@@ -157,6 +170,7 @@ fn parse_stack(
     let mut groups: Vec<Group> = Vec::new();
     let mut size: Option<UVec2> = None;
     let mut dpi: Option<f32> = None;
+    let mut manifest: Option<String> = None;
     let mut specs: Vec<LayerSpec> = Vec::new();
     let mut depth = 0usize;
 
@@ -182,6 +196,13 @@ fn parse_stack(
                         // nothing here can represent — is read by its
                         // horizontal, rather than by an average nobody wrote.
                         dpi = attrs.parse::<f32>("xres").filter(|v| *v > 0.0);
+                        // The saved undo history is found through this
+                        // attribute and not by looking for the entry: every
+                        // writer of an ORA rewrites `stack.xml`, so an
+                        // application that copied Umber's private entries
+                        // across while rearranging the stack cannot leave a
+                        // history pointing at layers that have moved.
+                        manifest = attrs.string(docformat::HISTORY_ATTR);
 
                         // Checked before a single pixel is decoded, so a file
                         // from a future Umber costs nothing to refuse.
@@ -291,7 +312,7 @@ fn parse_stack(
     let size = size.ok_or_else(|| malformed("stack.xml has no <image> element".into()))?;
     // Top first in the file, bottom first in the stack.
     specs.reverse();
-    Ok((size, dpi, specs))
+    Ok((size, dpi, manifest, specs))
 }
 
 fn load_layer(
@@ -378,6 +399,9 @@ fn flattened_fallback(
         // carrying the property across as well would paint it a second time.
         background: Background::Transparent,
         dpi,
+        // A document whose layers could not be read has no stack for a history
+        // to name, so there is nothing a patch could safely be replayed into.
+        history: None,
         warnings,
     })
 }
