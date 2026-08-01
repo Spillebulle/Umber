@@ -9,8 +9,8 @@
 use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
-    Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget, InputPoint,
-    Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
+    Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
+    InputPoint, Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
@@ -116,11 +116,14 @@ impl Harness {
     }
 
     fn commit_to(&mut self, slot: u32, color: Color, opacity: f32, mode: BrushMode) {
+        // The canvas's own size rather than `DOC`, so a test that has resized
+        // still commits the whole scratch rather than its top-left corner.
+        let size = self.canvas.doc_size();
         let rect = PixelRect {
             x: 0,
             y: 0,
-            width: DOC,
-            height: DOC,
+            width: size.x,
+            height: size.y,
         };
         let mut enc = self.encoder();
         self.canvas.commit_stroke(
@@ -1590,6 +1593,116 @@ fn export_carries_the_background_without_a_path_of_its_own() {
         at(&white, centre),
         at(&clear, centre),
         "the painted pixel must not move when the background does"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resizing the canvas
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resizing_the_canvas_carries_the_artwork_to_its_anchor() {
+    let mut h = harness_or_skip!();
+    h.stamp(&[dab(16.0, 16.0, 5.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel(16, 16)[3],
+        255,
+        "the mark should be where it landed"
+    );
+
+    // 64 -> 128 held at the centre offsets everything by 32.
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(128),
+        Anchor::Centre,
+    );
+    assert_eq!(h.canvas.doc_size(), UVec2::splat(128));
+
+    assert_eq!(
+        h.pixel_in(0, 48, 48)[3],
+        255,
+        "the mark must move with the canvas it was painted on"
+    );
+    assert_eq!(
+        h.pixel_in(0, 16, 16)[3],
+        0,
+        "where it used to be is now new canvas"
+    );
+    assert_eq!(
+        h.pixel_in(0, 120, 120)[3],
+        0,
+        "new canvas must start clear rather than holding whatever was allocated"
+    );
+}
+
+#[test]
+fn cropping_a_canvas_keeps_the_anchored_corner() {
+    let mut h = harness_or_skip!();
+    h.stamp(&[dab(8.0, 8.0, 4.0, 1.0), dab(56.0, 56.0, 4.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    // Held at the top left, the far mark is the one that falls off the edge.
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(32),
+        Anchor::TopLeft,
+    );
+    assert_eq!(h.canvas.doc_size(), UVec2::splat(32));
+    assert_eq!(h.pixel_in(0, 8, 8)[3], 255, "the near mark should survive");
+}
+
+#[test]
+fn every_layer_moves_together_when_the_canvas_does() {
+    // The anchor moves the *picture*, so the copy is one transfer across every
+    // slice. A per-slice loop that got an origin wrong would show up as one
+    // layer sliding relative to another, which is the worst kind of quiet.
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    h.stamp(&[dab(20.0, 20.0, 5.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::new(96, 96),
+        Anchor::BottomRight,
+    );
+
+    // Held at the bottom right, growing by 32 on each axis offsets by 32.
+    assert_near(
+        h.pixel_in(0, 52, 52),
+        [200, 40, 40],
+        2,
+        "slot 0 after resize",
+    );
+    assert_eq!(h.pixel_in(1, 52, 52)[3], 255, "slot 1 moved with slot 0");
+}
+
+#[test]
+fn a_stroke_painted_after_a_resize_lands_where_it_is_aimed() {
+    // The dab pass turns document pixels into clip space with the canvas size
+    // out of its own uniform block. A resize that reallocated the textures but
+    // left that number behind would put every later dab at the wrong place and
+    // the wrong scale — and the layer would still look plausible.
+    let mut h = harness_or_skip!();
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(128),
+        Anchor::TopLeft,
+    );
+
+    h.stamp(&[dab(100.0, 100.0, 5.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel_in(0, 100, 100)[3], 255, "the dab missed its mark");
+    assert_eq!(
+        h.pixel_in(0, 60, 60)[3],
+        0,
+        "and it should not be elsewhere"
     );
 }
 
