@@ -1751,10 +1751,13 @@ impl ApplicationHandler<Wake> for UmberApp {
                         self.editor.camera.pan_by_screen(delta);
                     }
                     Interaction::Zooming => {
-                        // Horizontal drag zooms about where the drag started,
-                        // which is the convention every other paint app uses.
-                        let dx = pos.x - self.editor.last_cursor.x;
-                        let factor = 1.008f32.powf(dx);
+                        // Zooms about where the drag started, which is the
+                        // convention every other paint app uses. Right and up
+                        // zoom in; how the two axes combine into one factor is
+                        // `Camera::zoom_drag_factor`'s, so it can be reasoned
+                        // about and tested without a pointer.
+                        let delta = pos - self.editor.last_cursor;
+                        let factor = umber_core::Camera::zoom_drag_factor(delta);
                         let anchor = self.editor.zoom_anchor;
                         self.editor.camera.zoom_at(anchor, factor, pivot);
                     }
