@@ -124,10 +124,29 @@ pub fn config_path() -> Option<PathBuf> {
 /// The path as the settings page shows it, or a plain explanation when there
 /// is none. Never a silent blank.
 pub fn config_path_label() -> String {
+    if let Some(label) = LABEL.get() {
+        return label.clone();
+    }
     match config_path() {
         Some(path) => path.display().to_string(),
         None => "unavailable — this system has no configuration directory".to_string(),
     }
+}
+
+/// What the settings footer shows instead of the real path.
+///
+/// Set only by `docshot`, and the reason is that [`config_path`] names the
+/// account the process is running as. A committed picture of the settings dialog
+/// would otherwise carry a developer's home directory into the README, and would
+/// come back different for every contributor who regenerated it — a diff nobody
+/// could review, over a detail nobody meant to publish. Nothing in the
+/// application calls this, and `set_config_path_label` is the only way in.
+static LABEL: OnceLock<String> = OnceLock::new();
+
+/// Show `label` in place of the real preferences path, for pictures of the
+/// dialog. Takes effect once and cannot be undone.
+pub fn set_config_path_label(label: &str) {
+    let _ = LABEL.set(label.to_owned());
 }
 
 // ---------------------------------------------------------------------------
