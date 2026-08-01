@@ -559,7 +559,14 @@ impl UserLibrary {
     pub fn import_file(&mut self, path: &Path) -> Result<Vec<BrushPreset>, PresetError> {
         let found = brushimport::read_file(path)?;
         let mut added = Vec::with_capacity(found.len());
-        for brushimport::Imported { mut preset, tip } in found {
+        // `dropped` is deliberately not consulted here: the library keeps what
+        // the reader could make of a file, and saying what did not survive is
+        // the caller's job — it has the whole selection in hand and can report
+        // twenty files as one sentence.
+        for brushimport::Imported {
+            mut preset, tip, ..
+        } in found
+        {
             // Importing the same pack twice must not overwrite a copy the user
             // has since edited, so a colliding id is reallocated rather than
             // replaced. This is the one place ids are not stable across a

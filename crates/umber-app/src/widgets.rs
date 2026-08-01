@@ -326,7 +326,7 @@ pub struct BrushRow<'a> {
     /// has no room for it and puts the credit in a tooltip instead.
     pub detail: &'a str,
     /// The brush itself, rather than the two numbers the sample used to be
-    /// drawn from. The library is 201 presets deep and the sample is how you
+    /// drawn from. The library is 222 presets deep and the sample is how you
     /// choose between them, so it has to show what actually separates them.
     pub brush: &'a Brush,
     /// The stamp this brush lays down, if it has one.
@@ -360,7 +360,7 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), row.height), Sense::click());
 
-    // The library is 201 presets deep and both lists are scrolled, so most
+    // The library is 222 presets deep and both lists are scrolled, so most
     // rows on most frames are off screen. Each sample is a few dozen stamps;
     // painting the invisible ones is the one part of this that would show up
     // in a frame time.

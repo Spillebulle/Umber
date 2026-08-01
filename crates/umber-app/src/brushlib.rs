@@ -2,9 +2,10 @@
 //!
 //! `umber-core` already held all of this: 201 shipped presets with their
 //! attribution ([`preset::builtin`]), a user library that writes itself to disk
-//! on every change ([`UserLibrary`]), and importers for MyPaint `.myb`, GIMP
-//! `.gbr` and Umber `.ron`. None of it was reachable from the interface, which
-//! listed the presets and offered nothing else. This module is the reach.
+//! on every change ([`UserLibrary`]), and importers for MyPaint, GIMP, Krita,
+//! Photoshop and Umber's own `.ron`. None of it was reachable from the
+//! interface, which listed the presets and offered nothing else. This module is
+//! the reach.
 //!
 //! Five things here are worth knowing before changing them:
 //!
@@ -16,7 +17,7 @@
 //! - **Nothing allocates per frame on the drawing path.** The grouping, and the
 //!   credit line each row shows, are built once per change to the library;
 //!   searching walks borrowed data and folds case in place; the rows skip
-//!   painting when they are scrolled out of view. At 201 presets the naive
+//!   painting when they are scrolled out of view. At 222 presets the naive
 //!   version of any of those is visible in a frame time.
 //! - **State lives in egui's temporary store**, keyed by an `Id`, exactly the
 //!   way `settings.rs` keeps what its shortcut table is in the middle of. It is
@@ -460,7 +461,7 @@ fn write<T>(
 /// The two marks in the Brushes panel's header: browse, and save.
 ///
 /// The design puts a `＋` there. The second mark is this module's addition —
-/// with 201 presets the panel is a shortlist rather than the library, and
+/// with 222 presets the panel is a shortlist rather than the library, and
 /// something has to open the rest of it.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
@@ -545,7 +546,7 @@ fn panel_links(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let writable = state.writable();
     if link(ui, p, Icon::Import, "Import brushes…", writable)
         .on_hover_text(if writable {
-            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
+            "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
         } else {
             state.why_not()
         })
@@ -1052,11 +1053,21 @@ fn import(state: &mut State, ed: &mut Editor) {
     if !state.writable() {
         return;
     }
+    // Every extension `umber_core::brushimport::read_file` claims, in one
+    // filter first so that a folder of mixed formats — which is what a brush
+    // pack actually is — can be selected in one go.
     let Some(paths) = rfd::FileDialog::new()
         .set_title("Import brushes")
-        .add_filter("Brush files", &["myb", "gbr", "ron"])
+        .add_filter(
+            "Brush files",
+            &[
+                "myb", "gbr", "gpb", "gih", "vbr", "kpp", "bundle", "abr", "ron",
+            ],
+        )
         .add_filter("MyPaint brush", &["myb"])
-        .add_filter("GIMP brush", &["gbr"])
+        .add_filter("GIMP brush", &["gbr", "gpb", "gih", "vbr"])
+        .add_filter("Krita brush", &["kpp", "bundle"])
+        .add_filter("Photoshop brush", &["abr"])
         .add_filter("Umber brush library", &["ron"])
         // Deliberately present, and deliberately last: picking the wrong kind
         // of file gives a sentence naming it and the reason, which is a better
@@ -1131,10 +1142,14 @@ fn import_notice(
         (n, 1) => format!("Imported {n} brushes from {}.", file_label(&paths[0])),
         (n, f) => format!("Imported {n} brushes from {f} files."),
     };
+    // "Umber has no …" was the wording until a container could report six
+    // losses at once, several of which are things Umber *does* have and simply
+    // could not find — a tip stored outside the file, say. This frame is true
+    // of every entry any reader produces.
     let losses = match dropped.len() {
         0 => String::new(),
         _ => format!(
-            " Umber has no {}, so {} will paint differently.",
+            " Umber could not bring across {}, so {} will paint differently.",
             join_words(dropped),
             if added.len() == 1 {
                 "it"
@@ -1334,7 +1349,7 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
-                            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
+                            "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
                         } else {
                             why_not.as_str()
                         })
@@ -1703,7 +1718,7 @@ mod tests {
         assert!(!matches(&p, "charcoal"));
     }
 
-    /// The whole point of the grouping: 201 presets under one heading is the
+    /// The whole point of the grouping: 222 presets under one heading is the
     /// flat list this replaces.
     #[test]
     fn collections_run_yours_first_then_styles_in_their_declared_order() {

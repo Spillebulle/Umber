@@ -1,9 +1,10 @@
 #!/bin/sh
-# Download the vetted CC0 brush packs into assets/brushes/.
+# Download the vetted brush packs into assets/brushes/.
 #
 # The POSIX twin of tools/fetch-brushes.ps1 — read that one for why the packs
-# are fetched rather than vendored, and why the previews are dropped. Both
-# scripts must produce the same tree; if you change one, change the other.
+# are fetched rather than vendored, why the previews are dropped, and why one
+# pack is a deliberate exception to the licence rule. Both scripts must produce
+# the same tree; if you change one, change the other.
 #
 #   sh tools/fetch-brushes.sh
 #   cargo run -p umber-core --example build-brush-library
@@ -16,9 +17,28 @@ FORCE=0
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BRUSH_ROOT="$REPO_ROOT/assets/brushes"
 
-# Pack table: id | name | url | home | archive root | licence | licence file | authors | format
-# One line per pack, fields separated by '|'.
-PACKS='mypaint|MyPaint default brushes 2.0.2|https://github.com/mypaint/mypaint-brushes/archive/refs/tags/v2.0.2.zip|https://github.com/mypaint/mypaint-brushes|mypaint-brushes-2.0.2|CC0-1.0|Licenses.dep5|Martin Renold and the MyPaint Development Team; Ramón Miranda; Marcelo "Tanda" Cerviño; David Revoy; Guillaume Loussarévian; Brien Dieterle|.myb (MyPaint, JSON)'
+# Pack table, one line per pack, fields separated by '|'. Within a field, '~'
+# separates a list. A '-' means "not applicable".
+#
+#  1 id
+#  2 name
+#  3 url
+#  4 home page
+#  5 archive root, or '.' for a flat archive
+#  6 SPDX licence
+#  7 licence file inside the archive, or '-' when the licence is only on a page
+#  8 nested archive holding that file, or '-'
+#  9 strings that must all appear in it, '~'-separated
+# 10 SHA-256 of the archive, or '-'
+# 11 page the licence is declared on, or '-' — see the .ps1 for what this means
+# 12 authors
+# 13 format
+# 14 paths to keep, '~'-separated
+PACKS='mypaint|MyPaint default brushes 2.0.2|https://github.com/mypaint/mypaint-brushes/archive/refs/tags/v2.0.2.zip|https://github.com/mypaint/mypaint-brushes|mypaint-brushes-2.0.2|CC0-1.0|Licenses.dep5|-|Files: brushes/*~License: CC0-1.0|-|-|Martin Renold and the MyPaint Development Team; Ramón Miranda; Marcelo "Tanda" Cerviño; David Revoy; Guillaume Loussarévian; Brien Dieterle|.myb (MyPaint, JSON)|brushes/*.myb~COPYING~Licenses.dep5~Licenses.md~AUTHORS
+deevad|David Revoy — Krita brush bundle 2025-01|https://www.peppercarrot.com/extras/resources/deevad-bundle_25.01.zip|https://www.davidrevoy.com/article1060/krita-brushes-2025-01-bundle|.|CC0-1.0|meta.xml|Deevad_25.01.bundle|<meta:license>CC-0</meta:license>~David Revoy|4c628a9418fcde63abacafdcb143881f2cbbf907275cb4f72335545841cf8173|-|David Revoy (Deevad)|.bundle (Krita resource bundle)|*.bundle
+raghukamath|Raghavendra Kamath — Krita brush presets v2.1|https://gitlab.com/raghukamath/krita-brush-presets/-/archive/v2.1/krita-brush-presets-v2.1.zip|https://gitlab.com/raghukamath/krita-brush-presets|krita-brush-presets-v2.1|CC0-1.0|LICENSE|-|CC0 1.0 Universal|-|-|Raghavendra Kamath|.bundle (Krita resource bundle)|bundles/*.bundle~LICENSE~README.md
+gdquest|GDQuest — Free Krita brushes for game artists|https://github.com/GDQuest/krita-free-brushes/archive/c68b0cc9ea4f10c3ce239ac7329fc13461aec8ed.zip|https://github.com/GDQuest/krita-free-brushes|krita-free-brushes-c68b0cc9ea4f10c3ce239ac7329fc13461aec8ed|CC-BY-4.0|README.md|-|License: CC-Attribution-4.0~GDquest|-|-|GDquest (Nathan Lovato)|.kpp (Krita) with .gbr and .gih tips|paintoppresets/*.kpp~brushes/*~README.md
+rubberduck|rubberduck — 60 free GIMP/Krita brushes|https://opengameart.org/sites/default/files/60-free-gimp-and-krita-brushes.zip|https://opengameart.org/content/60-free-gimp-krita-brushes|.|CC0-1.0|-|-|-|212069242a44ac19c44894df25e93c36dc546d7d84008454cc2d0f22acddaee6|https://opengameart.org/content/60-free-gimp-krita-brushes|rubberduck|.gbr and .gih (GIMP)|*.gbr~*.gih'
 
 unpack() {
     # $1 archive, $2 destination
@@ -32,7 +52,19 @@ unpack() {
     fi
 }
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        echo ''
+    fi
+}
+
 mkdir -p "$BRUSH_ROOT"
+
+TODAY=$(date +%Y-%m-%d)
 
 # The header of the licence record; each pack appends its own section below.
 cat >"$BRUSH_ROOT/LICENSES.md" <<'EOF'
@@ -48,9 +80,14 @@ Preview thumbnails (`*_prev.png`) are deliberately **not** downloaded. In the
 MyPaint pack the brush settings are CC0 but some previews are CC-BY, and not
 having the files is the surest way not to ship them.
 
+**Read the "Licence" line of each entry.** Most say *verified inside the
+download*, which is the rule `docs/brush-sources.md` is written against. One
+says *declared on the submission page*, which is weaker, and is spelled out
+in full where it applies.
+
 EOF
 
-echo "$PACKS" | while IFS='|' read -r id name url home root licence licfile authors format; do
+echo "$PACKS" | while IFS='|' read -r id name url home root licence licfile licin markers sha declared authors format keep; do
     echo "$name"
     target="$BRUSH_ROOT/$id"
     if [ -d "$target" ] && [ "$FORCE" -eq 0 ]; then
@@ -62,51 +99,129 @@ echo "$PACKS" | while IFS='|' read -r id name url home root licence licfile auth
     trap 'rm -rf "$work"' EXIT
 
     echo "  downloading $url"
-    curl -sSL --fail -o "$work/pack.zip" "$url"
-    unpack "$work/pack.zip" "$work"
+    if ! curl -sSL --fail -o "$work/pack.zip" "$url"; then
+        echo "  download failed" >&2
+        rm -rf "$work"
+        continue
+    fi
 
-    extracted="$work/$root"
+    if [ "$sha" != "-" ]; then
+        got=$(sha256_of "$work/pack.zip")
+        if [ -z "$got" ]; then
+            echo "  no sha256sum or shasum on this system; refusing to keep a pinned pack" >&2
+            rm -rf "$work"
+            continue
+        fi
+        if [ "$got" != "$sha" ]; then
+            echo "  SHA-256 is $got, expected $sha; refusing to keep it" >&2
+            rm -rf "$work"
+            continue
+        fi
+        echo "  SHA-256 matches the pin"
+    fi
+
+    mkdir -p "$work/unpacked"
+    unpack "$work/pack.zip" "$work/unpacked"
+    if [ "$root" = "." ]; then
+        extracted="$work/unpacked"
+    else
+        extracted="$work/unpacked/$root"
+    fi
     if [ ! -d "$extracted" ]; then
         echo "  archive did not contain '$root'; skipping" >&2
+        rm -rf "$work"
         continue
     fi
 
     # The licence check, against the archive's own file rather than a note here.
-    if [ ! -f "$extracted/$licfile" ]; then
-        echo "  no $licfile in the download; refusing to keep it" >&2
-        continue
+    # A pack with `declared` set has no such file and is a recorded exception;
+    # see the .ps1 and docs/brush-sources.md.
+    if [ "$declared" != "-" ]; then
+        echo "  no licence file inside this archive; accepting the statement on $declared" >&2
+        echo "  (see docs/brush-sources.md — this is a deliberate, recorded exception)" >&2
+    else
+        if [ "$licin" != "-" ]; then
+            nested=$(find "$extracted" -name "$licin" -type f | head -n 1)
+            if [ -z "$nested" ] || ! unzip -p "$nested" "$licfile" >"$work/licence.txt" 2>/dev/null; then
+                echo "  no $licfile inside $licin; refusing to keep it" >&2
+                rm -rf "$work"
+                continue
+            fi
+        elif [ -f "$extracted/$licfile" ]; then
+            cp "$extracted/$licfile" "$work/licence.txt"
+        else
+            echo "  no $licfile in the download; refusing to keep it" >&2
+            rm -rf "$work"
+            continue
+        fi
+
+        # The marker loop runs in a subshell — it is the right-hand side of a
+        # pipe — so it cannot set a variable the rest of this sees. It leaves a
+        # file behind instead.
+        echo "$markers" | tr '~' '\n' | while IFS= read -r marker; do
+            if [ -n "$marker" ] && ! grep -qF "$marker" "$work/licence.txt"; then
+                echo "$marker" >>"$work/missing"
+            fi
+        done
+        if [ -f "$work/missing" ]; then
+            echo "  $licfile does not state $(tr '\n' ';' <"$work/missing")" >&2
+            echo "  refusing to keep it" >&2
+            rm -rf "$work"
+            continue
+        fi
+        echo "  licence verified: $licence"
     fi
-    if ! grep -q 'Files: brushes/\*' "$extracted/$licfile" ||
-        ! grep -q "License: $licence" "$extracted/$licfile"; then
-        echo "  $licfile does not state $licence for the brushes; refusing to keep it" >&2
-        continue
-    fi
-    echo "  licence verified: $licence"
 
     rm -rf "$target"
-    mkdir -p "$target/brushes"
+    mkdir -p "$target"
 
-    # Settings only. The previews are CC-BY where the settings are CC0.
-    (cd "$extracted" && find brushes -name '*.myb' -print) | while read -r rel; do
-        mkdir -p "$target/$(dirname "$rel")"
-        cp "$extracted/$rel" "$target/$rel"
+    echo "$keep" | tr '~' '\n' | while IFS= read -r pattern; do
+        if [ -n "$pattern" ]; then
+            # Settings only. In the MyPaint pack the previews are CC-BY where
+            # the settings are CC0, so they are never copied.
+            find "$extracted" -type f -path "$extracted/$pattern" ! -name '*_prev.png' |
+                while IFS= read -r file; do
+                    rel=${file#"$extracted"/}
+                    mkdir -p "$target/$(dirname "$rel")"
+                    cp "$file" "$target/$rel"
+                done
+        fi
     done
-    for f in COPYING Licenses.dep5 Licenses.md AUTHORS; do
-        [ -f "$extracted/$f" ] && cp "$extracted/$f" "$target/$f"
-    done
-    echo "  kept $(find "$target" -name '*.myb' | wc -l | tr -d ' ') brushes in assets/brushes/$id"
+    kept=$(find "$target" -type f | wc -l | tr -d ' ')
+    echo "  kept $kept files in assets/brushes/$id"
 
-    cat >>"$BRUSH_ROOT/LICENSES.md" <<EOF
-## $name
-
-- **Directory:** \`assets/brushes/$id/\`
-- **Source:** <$home>
-- **Downloaded from:** <$url>
-- **Licence:** $licence, verified against \`$licfile\` in the download itself
-- **Authors:** $authors
-- **Format:** $format
-
-EOF
+    {
+        echo "## $name"
+        echo
+        echo "- **Directory:** \`assets/brushes/$id/\`"
+        echo "- **Source:** <$home>"
+        echo "- **Downloaded from:** <$url>"
+        [ "$sha" != "-" ] && echo "- **SHA-256 of the archive:** \`$sha\`"
+        if [ "$declared" != "-" ]; then
+            echo "- **Licence:** $licence — **declared on the submission page, not inside the download.**"
+            echo "  <$declared> lists the author as \`$authors\` and, under"
+            echo '  "License(s)", a single Creative Commons Zero mark linking to'
+            echo '  <http://creativecommons.org/publicdomain/zero/1.0/>. The archive itself'
+            echo '  carries no licence file, so this could not be checked mechanically; the'
+            echo "  page was read by hand on $TODAY, and the SHA-256 above ties that reading"
+            echo '  to exactly these bytes. This is a deliberate exception to the rule at the'
+            echo '  top of `docs/brush-sources.md`, made once, for this source only.'
+        elif [ "$licin" != "-" ]; then
+            echo "- **Licence:** $licence, verified against \`$licfile\` inside \`$licin\` in the download itself"
+        else
+            echo "- **Licence:** $licence, verified against \`$licfile\` in the download itself"
+        fi
+        echo "- **Authors:** $authors"
+        echo "- **Format:** $format"
+        echo
+        case "$licence" in
+            CC-BY*)
+                echo '  Attribution is **required**: every preset generated from this pack carries'
+                echo '  a `Credit`, and the brush browser prints it on the row.'
+                echo
+                ;;
+        esac
+    } >>"$BRUSH_ROOT/LICENSES.md"
     echo "recorded the licence in $BRUSH_ROOT/LICENSES.md"
 
     rm -rf "$work"

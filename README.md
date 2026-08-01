@@ -138,10 +138,11 @@ fights the design.
 
 ### Brushes
 
-Umber ships **201 presets**. Five are its own; the other 196 are the whole of
-[mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes), which is
-CC0, each carrying its author and licence through the conversion and showing
-them in the library.
+Umber ships **222 presets**. Five are its own; 196 are the whole of
+[mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes), and the
+rest are the procedural brushes out of three CC0 and CC-BY Krita packs. Every
+one carries its author and licence through the conversion and shows them in the
+library.
 
 They are grouped by **style** — pencils, inks, markers, charcoal, paint,
 watercolour, airbrush, blenders, erasers, texture, foliage, effects — rather
@@ -152,9 +153,10 @@ pencils in six different places. The author is still shown on every row.
 
 The Brushes panel is the design's: a shortlist with the header's `＋`. Behind
 the second mark is the **library browser**, which the design does not have — a
-column that works for five brushes does not work for 201, so the browser adds a
-search field, a collection picker, and per-brush rename and delete. Brushes you
-save are marked with a dot and are the only ones those two controls apply to.
+column that works for five brushes does not work for two hundred, so the
+browser adds a search field, a collection picker, and per-brush rename and
+delete. Brushes you save are marked with a dot and are the only ones those two
+controls apply to.
 
 Editing a brush changes it live, so the editor's footer offers to **save** what
 you have made, either under a new name or over the brush you started from. Your
@@ -173,16 +175,38 @@ machines. A `brushes.ron` from an earlier version is moved in on first run and
 **left where it was** as well — a migration that deletes the only copy of your
 collection has to be right first time.
 
-**Importing** reads MyPaint `.myb` brushes, GIMP `.gbr` stamps and Umber's own
-`.ron` libraries, and files them by style like everything else. A `.gbr` arrives
-as a working brush — its picture, its spacing and its proportions — and goes
-straight into your hand, since a stamp is unrecognisable in a list and obvious
-the moment it makes a mark. A `.myb` that leans on something Umber still cannot
-render — `colorize`, `lock_alpha` — is imported anyway, because an approximation
-of a brush you chose beats a refusal, but the notice names what was dropped; a
-coloured `.gbr` says the same about arriving as its silhouette. The generated
-library holds itself to the stricter rule and refuses those outright, since
-nothing shipped under an author's name should paint unlike their brush.
+**Importing** reads eight formats and files them by style like everything else:
+
+| | |
+|---|---|
+| `.myb` | MyPaint |
+| `.gbr`, `.gpb` | GIMP and Krita stamps |
+| `.gih` | GIMP animated brushes — one preset per cell |
+| `.vbr` | GIMP parametric brushes, reproduced *exactly* |
+| `.kpp`, `.bundle` | Krita presets and whole resource bundles |
+| `.abr` | Photoshop 1, 2, 6.1 and 6.2 |
+| `.ron` | an Umber library |
+
+A stamp arrives as a working brush — its picture, its spacing and its
+proportions — and goes straight into your hand, since a stamp is unrecognisable
+in a list and obvious the moment it makes a mark. A `.bundle` brings a whole
+pack at once, tips and all, along with the author and licence its `meta.xml`
+states.
+
+Anything that leans on something Umber cannot render is imported anyway, because
+an approximation of a brush you chose beats a refusal — but the notice names
+what was dropped: a coloured stamp arriving as its silhouette, a brush pipe
+losing its sequence, a Krita preset whose paper texture or masking brush has
+nowhere to go. Only a file written by one of Krita's *other paint engines* is
+refused outright, and by name, because a round dab wearing `deformbrush`'s name
+would be invention rather than approximation. The generated library holds itself
+to the stricter rule and refuses anything with a loss at all, since nothing
+shipped under an author's name should paint unlike their brush.
+
+**Five packs are fetched**, four of them new: MyPaint's, David Revoy's 2025-01
+Krita bundle, Raghavendra Kamath's, GDQuest's — CC-BY, so every one of those
+carries its credit — and rubberduck's 60 GIMP stamps. That is 269 stamps and 116
+Krita presets you can import today, and 21 more brushes in the shipped library.
 
 **A stamp brush can build up.** A sparse photographic texture stamp is not a
 solid disc: GIMP and Krita composite every dab, so the mark is the *overlap* of
@@ -198,10 +222,15 @@ The default is unchanged and stays exactly what it was.
 **One shipped brush carries a bitmap tip**, which is one more than before: the
 shipped library can now embed masks alongside its presets. It is Umber's own —
 a sparse chalk stipple, drawn by `examples/build-bitmaps.rs`, deliberately faint
-enough that it needs build-up to paint at full strength. Third-party stamp packs
-still wait on the licence rule: Umber will not claim a licence it cannot verify
-from a pack's own files. `docs/brush-sources.md` records the measurement and
-every pack considered.
+enough that it needs build-up to paint at full strength.
+
+**No third-party pack's stamps ship**, though every one of them imports. The
+obstacle is no longer the engine: build-up answers the half-strength problem
+that used to decide it. It is size and licence. One pack's 269 masks are 10.7 MB
+of PNG against a 200 KB library, and Umber will not claim a licence it cannot
+verify from a pack's own files. `docs/brush-sources.md` records the
+measurements, every pack considered, and the one place that rule was
+deliberately bent.
 
 **Paper grain.** An optional tiling texture bitten into dab coverage, which is
 what makes a pencil catch on the tooth of the paper. It is anchored to the
@@ -482,11 +511,18 @@ Next, roughly in order:
   its own right.
 - Scatter that reacts to pen speed
 - Per-brush blend modes
-- A third-party stamp pack to ship. Bitmap tips work end to end — import a
-  `.gbr`, save it, reload it, paint with it — and the shipped library can carry
-  masks of its own, which it now does. What is still missing is somebody else's
-  pack: the build-up problem is solved, so the remaining obstacles are the
-  licence rule and the curation work `docs/brush-sources.md` lists.
+- **A third-party stamp pack in the shipped library.** Bitmap tips work end to
+  end — import a `.gbr`, a `.gih` or a Krita bundle, save it, reload it, paint
+  with it — the shipped library can carry masks, which it now does for one brush
+  of Umber's own, and five packs are fetched. The build-up problem that used to
+  decide this is solved. What is left is size and the licence rule: one pack's
+  stamps are 10.7 MB of PNG against a 200 KB library. `docs/brush-sources.md`
+  has the measurements and the curation work.
+- **A cell chosen per dab**, which is what would make a `.gih` one brush rather
+  than five. The dab pass binds one tip per pass, deliberately; this needs it to
+  bind a small array and the dab instance to carry an index into it.
+- Krita's other paint engines — `spraybrush`, `hairybrush`, `deformbrush` and
+  the rest. A preset written by one is refused by name rather than approximated.
 - A paper texture of your own. Three ship; `GrainPattern` is a closed enum
   because `Brush` is `Copy`, and reading a fourth off disk needs a variant that
   names a file.
