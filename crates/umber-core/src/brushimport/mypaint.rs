@@ -117,7 +117,7 @@
 //! extrapolation of the end segments included — see [`piecewise`] for why that
 //! detail is worth a paragraph of its own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -852,8 +852,16 @@ fn default_base(name: &str) -> f32 {
 struct MybSetting {
     #[serde(default)]
     base_value: f32,
+    /// A `BTreeMap` rather than a `HashMap`, and that is load-bearing rather
+    /// than tidy. [`MybFile::eval`] *sums* one mapping per input, and
+    /// floating-point addition is not associative — so with Rust's randomly
+    /// seeded hasher the same brush evaluated in two processes differed in the
+    /// last bit. That made `builtin-brushes.ron` irreproducible: regenerating
+    /// with nothing at all behind it still rewrote a hundred lines, which is
+    /// exactly the noise that stops a generated file's diff being worth
+    /// reading. Ordering by the input's name fixes the order of the sum.
     #[serde(default)]
-    inputs: HashMap<String, Vec<(f32, f32)>>,
+    inputs: BTreeMap<String, Vec<(f32, f32)>>,
 }
 
 /// Evaluate MyPaint's piecewise-linear mapping, line for line with
@@ -984,6 +992,35 @@ mod tests {
         // 2.2 dabs per radius is 1 / (2 * 2.2) of a diameter.
         assert!((b.spacing - 0.2273).abs() < 0.001, "spacing {}", b.spacing);
         assert_eq!(b.mode, BrushMode::Paint);
+    }
+
+    /// The shipped library is generated once and committed, so the generator
+    /// has to produce the same bytes twice. It did not: `eval` sums one mapping
+    /// per input, floating-point addition is not associative, and iterating a
+    /// `HashMap` visits the inputs in an order that Rust reseeds every process
+    /// — so a regeneration with no change behind it rewrote a hundred lines in
+    /// the last decimal place. A test cannot see the seed change from inside
+    /// one process, so what is pinned here is the property that fixes it: the
+    /// inputs are visited in a fixed order.
+    #[test]
+    fn a_settings_inputs_are_summed_in_a_fixed_order() {
+        let file: MybFile = serde_json::from_str(
+            r#"{"version": 3, "settings": { "radius_logarithmic": {
+                "base_value": 1.0, "inputs": {
+                    "speed1": [[0.0, 0.1], [4.0, 0.2]],
+                    "pressure": [[0.0, 0.0], [1.0, 0.5]],
+                    "random": [[0.0, -0.1], [1.0, 0.1]],
+                    "stroke": [[0.0, 0.0], [1.0, 0.3]] } } } }"#,
+        )
+        .expect("parse");
+        let order: Vec<&str> = file.settings["radius_logarithmic"]
+            .inputs
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted, "the inputs must iterate in a settled order");
     }
 
     #[test]
