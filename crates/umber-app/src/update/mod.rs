@@ -149,6 +149,26 @@ impl Updates {
         matches!(self.status, Status::Checking | Status::Downloading)
     }
 
+    /// Why Umber does not ask GitHub at all on this installation, if it does not.
+    ///
+    /// The Flatpak is the one case, for two reasons that agree. Its sandbox is
+    /// granted no network — `packaging/linux/io.github.spillebulle.umber.yml`
+    /// deliberately carries no `--share=network`, because a painting
+    /// application has no other use for one — so a request could only ever time
+    /// out and report a failure that is really a design decision. And it would
+    /// be answering a question Flatpak already answers: `flatpak update`, and
+    /// every graphical software centre, keep the bundle current without Umber's
+    /// help. Opening the sandbox so Umber can duplicate that is the wrong
+    /// trade.
+    pub fn check_unavailable(&self) -> Option<&'static str> {
+        matches!(self.kind, InstallKind::Managed(install::Manager::Flatpak)).then_some(
+            "Flatpak keeps this copy up to date — run `flatpak update \
+             io.github.spillebulle.umber`, or leave it to your software centre. \
+             Umber's sandbox is granted no network access, so it does not check \
+             for itself.",
+        )
+    }
+
     /// The asset this machine would install, for a release that has one.
     ///
     /// `None` covers three different situations that all have the same answer —
@@ -199,7 +219,11 @@ impl Updates {
     /// user who switched the check off last time is not asked again on the way
     /// past.
     pub fn start_if_due(&mut self) {
-        if self.started || !self.check_on_startup || !self.notice_seen {
+        if self.started
+            || !self.check_on_startup
+            || !self.notice_seen
+            || self.check_unavailable().is_some()
+        {
             return;
         }
         self.started = true;
@@ -211,7 +235,7 @@ impl Updates {
     /// Safe to call from a button: a second call while one is in flight is
     /// ignored rather than starting a second request.
     pub fn check(&mut self) {
-        if self.busy() {
+        if self.busy() || self.check_unavailable().is_some() {
             return;
         }
         self.status = Status::Checking;
@@ -445,6 +469,37 @@ mod tests {
         updates.request_quit();
         assert!(updates.take_quit_request());
         assert!(!updates.take_quit_request(), "and not a second time");
+    }
+
+    #[test]
+    fn a_flatpak_never_asks_github_anything() {
+        // Its sandbox has no network, and Flatpak already keeps it current. A
+        // check here could only report a failure that is really a decision.
+        let mut updates = Updates {
+            kind: InstallKind::Managed(install::Manager::Flatpak),
+            notice_seen: true,
+            ..Updates::default()
+        };
+        assert!(updates.check_unavailable().is_some());
+        updates.start_if_due();
+        assert_eq!(*updates.status(), Status::Idle);
+        updates.check();
+        assert_eq!(*updates.status(), Status::Idle, "not even when asked");
+
+        // Every other kind still checks. Compared on `check_unavailable` rather
+        // than by starting one, because starting one is a network request.
+        for kind in [
+            InstallKind::Portable,
+            InstallKind::Msi,
+            InstallKind::Managed(install::Manager::Dpkg),
+            InstallKind::Unknown,
+        ] {
+            let updates = Updates {
+                kind: kind.clone(),
+                ..Updates::default()
+            };
+            assert_eq!(updates.check_unavailable(), None, "{kind:?}");
+        }
     }
 
     #[test]

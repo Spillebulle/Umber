@@ -609,6 +609,12 @@ must not learn about HTTP, the same boundary that keeps them testable.
   months later, which is the worst shape this bug takes. The MSI is the one
   managed case Umber still updates, because Windows supplies the mechanism:
   hand `msiexec` a package. Never edit Program Files directly.
+- **The Flatpak does not check at all**, and that is not an oversight. Its
+  sandbox is granted no network — `packaging/linux/io.github.spillebulle.umber.yml`
+  carries no `--share=network` on purpose — so a request could only time out and
+  report a decision as a failure, and Flatpak's own updater already does the
+  job. `Updates::check_unavailable` is the switch, and the manifest comment is
+  the other half of it.
 - **`install::detect` is a pure function of a `Probe`.** The path, the
   environment and a "does this exist" predicate are injected, which is what lets
   the Linux and macOS answers be tested on a Windows machine — the only way they

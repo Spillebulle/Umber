@@ -256,6 +256,9 @@ fn dialog(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let status = ed.updates.status().clone();
     let obstacle = ed.updates.kind().cannot_update();
+    // An installation that never asks GitHub at all — the Flatpak, whose
+    // sandbox has no network and whose updates are Flatpak's own job.
+    let unavailable = ed.updates.check_unavailable();
     let mut check = false;
     let mut install = false;
     let mut quit = false;
@@ -271,15 +274,25 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // A second check while one is running would start a second request
-            // for the same answer, so the button goes dead for as long as it
-            // takes — which on a slow connection is the only feedback there is.
-            if tabs::button(ui, p, "Check now", false) && !ed.updates.busy() {
-                check = true;
+            // No button where there is nothing behind it. A "Check now" that
+            // could only ever time out is the live control that lies.
+            if unavailable.is_none() {
+                // A second check while one is running would start a second
+                // request for the same answer, so the button goes dead for as
+                // long as it takes — which on a slow connection is the only
+                // feedback there is.
+                if tabs::button(ui, p, "Check now", false) && !ed.updates.busy() {
+                    check = true;
+                }
             }
         });
     });
     ui.add_space(8.0);
+
+    if let Some(reason) = unavailable {
+        note(ui, p, reason);
+        return;
+    }
 
     match &status {
         Status::Idle => note(

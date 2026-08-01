@@ -49,14 +49,17 @@ Whether Umber can then install the update depends on how it was installed:
 | Portable zip or tarball | Replaced in place; the new build runs next start |
 | AppImage | The one file is replaced |
 | Windows `.msi` | The new installer is downloaded and handed to `msiexec` |
-| `.deb`, `.rpm`, Arch, Flatpak | Named, with the command to run — never overwritten |
+| `.deb`, `.rpm`, Arch | Named, with the command to run — never overwritten |
+| Flatpak | Not checked at all; Flatpak keeps it current itself |
 
-The last row is the important one. Those files belong to a package manager that
-keeps its own record of them, so writing over them is usually not permitted,
-makes that record false, and is undone by the next system upgrade. Umber says
-which manager owns the copy and what to type, and points at the releases page.
-It does the same for anything it cannot identify: a button that lies about what
-it is about to do is worse than one that is not there.
+The last two rows are the important ones. Those files belong to a package
+manager that keeps its own record of them, so writing over them is usually not
+permitted, makes that record false, and is undone by the next system upgrade.
+Umber says which manager owns the copy and what to type, and points at the
+releases page. It does the same for anything it cannot identify: a button that
+lies about what it is about to do is worse than one that is not there. The
+Flatpak goes further and never asks at all — its sandbox is given no network,
+deliberately, and Flatpak's own updater already does the job.
 
 **Releases are not signed.** A download is fetched over HTTPS from an address
 the release API gave, and checked against the size that API reported. That
