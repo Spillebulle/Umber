@@ -17,7 +17,7 @@
 //! - **Nothing allocates per frame on the drawing path.** The grouping, and the
 //!   credit line each row shows, are built once per change to the library;
 //!   searching walks borrowed data and folds case in place; the rows skip
-//!   painting when they are scrolled out of view. At 201 presets the naive
+//!   painting when they are scrolled out of view. At 222 presets the naive
 //!   version of any of those is visible in a frame time.
 //! - **State lives in egui's temporary store**, keyed by an `Id`, exactly the
 //!   way `settings.rs` keeps what its shortcut table is in the middle of. It is
@@ -461,7 +461,7 @@ fn write<T>(
 /// The two marks in the Brushes panel's header: browse, and save.
 ///
 /// The design puts a `＋` there. The second mark is this module's addition —
-/// with 201 presets the panel is a shortlist rather than the library, and
+/// with 222 presets the panel is a shortlist rather than the library, and
 /// something has to open the rest of it.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
@@ -1709,7 +1709,7 @@ mod tests {
         assert!(!matches(&p, "charcoal"));
     }
 
-    /// The whole point of the grouping: 201 presets under one heading is the
+    /// The whole point of the grouping: 222 presets under one heading is the
     /// flat list this replaces.
     #[test]
     fn collections_run_yours_first_then_styles_in_their_declared_order() {

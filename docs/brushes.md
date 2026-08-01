@@ -85,7 +85,16 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-**All 196** MyPaint brushes, plus Umber's own five: 201 presets, every one CC0.
+**222 presets**: Umber's own five, all 196 MyPaint brushes, and 21 out of four
+more packs — David Revoy's 2025-01 Krita bundle, Raghavendra Kamath's v2.1,
+GDQuest's, and rubberduck's 60 GIMP stamps. All CC0 except GDQuest's, which is
+CC-BY and therefore carries its credit.
+
+Those 21 are the Krita brushes whose dab is *generated* rather than stamped, so
+they convert exactly. The rest of what those packs hold — 269 stamps and about
+90 more presets — needs a bitmap tip, and the shipped library has nowhere to put
+one. `docs/brush-sources.md` has the counts, the measurements and the reason.
+Every one of them imports.
 
 It was 128 for a while. The 68 missing were refused by the generator rather than
 lost by accident, and both reasons were engine gaps rather than import gaps:
@@ -97,9 +106,19 @@ lost by accident, and both reasons were engine gaps rather than import gaps:
 
 (One was refused on both counts, hence 68 rather than 69.)
 
-`umber_core::brushimport::mypaint::unsupported_features` is still the check, and
-it still lists `colorize` and `lock_alpha`, which nothing in this pack uses. It
-is deliberately separate from the importer: a user who asks for a specific file
+The generator's check is now `Imported::dropped`, which every reader fills in
+per brush, and a non-empty list is a refusal. `mypaint::unsupported_features`
+feeds it for a `.myb` and still lists `colorize` and `lock_alpha`, which nothing
+in that pack uses.
+
+Per **brush**, not per file, and that distinction is the whole reason the field
+exists: `brushimport::dropped_features` answers the same question for a whole
+file, which is what the import notice wants — twenty files should not produce
+twenty notices — but a `.bundle` of forty-six brushes reports the union of
+everything any of them dropped, and the generator has to be able to keep the
+thirty that dropped nothing.
+
+The two checks are deliberately separate. A user who asks for a specific file
 should get whatever the importer can make of it, with a note saying what was
 dropped. The generator is the fussy one, because it decides what Umber *claims*
 to support.
@@ -117,20 +136,30 @@ pack ever need it.
 
 Twelve collections, in the order the picker lists them:
 
+Counted over the 217 the generator converts; Umber's own five are on top of
+these and sort the same way.
+
 | Collection | Count |
 |---|---|
-| Pencils & sketching | 12 |
-| Inks & pens | 30 |
-| Markers | 6 |
+| Pencils & sketching | 14 |
+| Inks & pens | 32 |
+| Markers | 5 |
 | Charcoal, chalk & pastel | 6 |
-| Paint & brushes | 45 |
+| Paint & brushes | 50 |
 | Watercolour & wet media | 22 |
-| Airbrush & spray | 11 |
+| Airbrush & spray | 13 |
 | Blenders & smudge | 23 |
-| Erasers | 8 |
-| Texture & grain | 11 |
+| Erasers | 9 |
+| Texture & grain | 13 |
 | Foliage & fur | 8 |
-| Effects & experimental | 19 |
+| Effects & experimental | 22 |
+
+Adding the stamp packs meant teaching `RULES` the words they use. They name a
+brush after the mark — "Cracks", "Vegetation", "Exploding Sparks", "Waterfall" —
+rather than after a medium, so without those rules rubberduck's pack arrives as
+269 brushes in "Paint & brushes". None of the 196 MyPaint brushes moved
+collection as a result, which is the check that the new rules are additions
+rather than a reshuffle.
 
 The generator prints this table on every run, because a classifier is a
 judgement and judgements have to be looked at rather than asserted. The first
@@ -139,7 +168,7 @@ in "Blenders" — MyPaint's oil paints all mix with what is under them, so the
 setting says far less than it appears to. Erasing is the only setting that now
 overrides a name; see the module docs for the rest of the ordering.
 
-## What conversion keeps
+## What a MyPaint `.myb` conversion keeps
 
 `.myb` is JSON. MyPaint evaluates each setting as
 
@@ -194,7 +223,7 @@ to map `elliptical_dab_ratio` map it to a constant zero. The importer measures
 the span of a mapping's output, which is what makes the counts above mean
 anything.
 
-## What conversion loses
+## What a MyPaint `.myb` conversion loses
 
 Documented in full in the module docs of
 `crates/umber-core/src/brushimport/mypaint.rs`. The short version, worst first:
@@ -274,17 +303,38 @@ on the first frame of every stroke, which is the one moment this project exists
 to keep short. `a_second_brush_with_a_different_tip_replaces_the_first` guards
 the failure direction, which is a *stale* tip.
 
-## Importing a GIMP brush
+## What Umber reads
+
+| Extension | From | Yields | Reader |
+|---|---|---|---|
+| `.myb` | MyPaint | one brush | `brushimport::mypaint` |
+| `.gbr`, `.gpb` | GIMP, Krita | one stamp | `brushimport::gbr` |
+| `.gih` | GIMP animated brush | **one per cell** | `brushimport::gih` |
+| `.vbr` | GIMP parametric brush | one brush, exactly | `brushimport::vbr` |
+| `.kpp` | Krita paintop preset | one brush | `brushimport::kpp` |
+| `.bundle` | Krita resource bundle | **a whole pack** | `brushimport::bundle` |
+| `.abr` | Photoshop 1, 2, 6.1, 6.2 | one per sampled stamp | `brushimport::abr` |
+| `.ron` | an Umber library | as many as it holds | `preset::parse_library` |
+
+Two of those are containers, so `read_file` returns a `Vec` and the import
+notice has to report "twenty brushes arrived" as readily as "one did".
+
+Every reader is pinned by fixtures **built byte by byte in its own test
+module**, not by a vendored file, so `cargo test` means something on a checkout
+where no pack was ever fetched. Each was also run against the real archives once
+— see `docs/brush-sources.md` for the counts, and the commit for what that
+turned up, which was mostly things a hand-built fixture cannot show you.
+
+### Importing a GIMP brush
 
 `umber_core::brushimport::gbr::from_gbr` decodes a `.gbr` into a `TipMask`, plus
 the brush name and the spacing the format carries. Everything in it is
 big-endian; a little-endian read reports a billion-pixel brush and is caught by
 the length check rather than producing garbage.
 
-`read_file` accepts `.gbr` alongside `.myb` and `.ron`, so **Import brushes…**
-in the Brushes panel reads one, saves the mask into `tips/`, and selects the
-brush — importing a brush is asking to paint with it, and a stamp is
-unrecognisable in a list and obvious the moment it makes a mark.
+**Import brushes…** in the Brushes panel reads one, saves the mask into `tips/`,
+and selects the brush — importing a brush is asking to paint with it, and a
+stamp is unrecognisable in a list and obvious the moment it makes a mark.
 
 `gbr::to_brush` decides the rest of the `Brush`, which the format does not carry:
 
@@ -305,7 +355,113 @@ which for the near-square masks packs actually contain is a few per cent.
 
 A 4-byte `.gbr` is a coloured stamp and imports as its silhouette — the stroke
 scratch is one coverage channel by design. `brushimport::dropped_features` says
-so, the same way a `.myb` that leans on `colorize` does.
+so, the same way a `.myb` that leans on `colorize` does. A `.gpb` — GIMP's
+obsolete pixmap brush — is a `.gbr` with a whole colour *pattern* stapled to the
+end of it, and reads through the same path with the same note.
+
+Knowing where a `.gbr` **ends** is load-bearing rather than tidy: a `.gih` is
+made of whole `.gbr` files concatenated, so a length misjudged by one byte makes
+rubbish of every cell after the first.
+
+### Importing a GIMP brush pipe (`.gih`)
+
+A pipe is a *sequence* of stamps plus a rule for choosing between them, and it
+is what a large part of the free stamp collections is actually made of — 43 of
+the 60 files in rubberduck's pack are `.gih`, not `.gbr`.
+
+**Umber binds one tip per stroke**, so a pipe cannot arrive as one brush that
+rotates through five stamps. Of the three ways out — one preset per cell, a cell
+chosen per dab, or one representative cell and a note — the importer takes the
+first, because it is the only one that loses no *pixels*: every stamp the artist
+drew arrives, named `Bark 1` … `Bark 5`, and can be painted with. What it loses
+is the **sequencing**, and the import says so.
+
+Choosing per dab is the better answer and needs the dab pass to hold an array of
+tips and an index per instance — see "Not done yet".
+
+### Importing a GIMP parametric brush (`.vbr`)
+
+The one GIMP format Umber reproduces **exactly**. A `.vbr` is not a picture: it
+is a shape, a radius, a hardness, an aspect ratio and an angle, and every one of
+those has a field on `Brush` already. Nothing is resampled and nothing is
+approximated, so the tests can assert exact values.
+
+Only two things are dropped, and the file names them in words, so the import
+knows precisely when it is approximating: GIMP's **square** and **diamond**
+shapes, and its 3-to-20-point **stars**. Umber's dab is an ellipse — `dab.wgsl`
+tests `length(local) <= 1` — so those arrive round.
+
+### Importing a Krita preset (`.kpp`) and bundle (`.bundle`)
+
+A `.kpp` is a **PNG** — the thumbnail Krita shows in its chooser — with the
+settings in a text chunk keyed `preset`. Three things about it are easy to get
+wrong, and all three were got wrong first:
+
+- **All three of PNG's text chunks turn up.** Of Revoy's 46 presets, 33 use
+  `zTXt`, 11 use `iTXt` and the rest `tEXt`, with no pattern to it. A reader
+  that knows only one silently rejects a quarter of a real pack.
+- **`Pressure<Name>` is not "pressure drives this".** It is Krita's historical
+  spelling of "the `<Name>` dynamic is switched on"; *which* input drives it is
+  in `<Name>Sensor`. Read the obvious way, every speed- and angle-driven
+  dynamic becomes a pressure one.
+- **A Krita PNG brush is inverted relative to a `.gbr`.** White is no paint and
+  black is full — the opposite of `TipMask`'s convention. Read the `.gbr` way it
+  gives a solid square with a hole in it.
+
+| Krita | Umber |
+|---|---|
+| `brush_definition` `MaskGenerator@diameter` × the size curve's peak | `size` |
+| `MaskGenerator@ratio` | `dab_ratio`, **reciprocated** — Krita scales the short axis |
+| `MaskGenerator@hfade` | `hardness`, **inverted** — fade is softness |
+| `Brush@angle`, in **radians** | `dab_angle` |
+| `Brush@spacing` | `spacing` |
+| `OpacityValue` × `FlowValue` × the opacity curve's peak | `opacity` |
+| `Pressure<X>` + `<X>Sensor` + `<X>commonCurve` | `pressure_*`, `min_*_ratio`, `*_curve` |
+| `RotationSensor` `id="drawingangle"` / `"fuzzy"` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
+| `ScatterValue` | `scatter` |
+| `EraserMode`, `CompositeOp` | `mode` |
+| `isAirbrushing` + `rate` | `dabs_per_second` |
+| `SmudgeRateValue`, `SmudgeRadiusValue` (colorsmudge) | `smudge`, `smudge_radius` |
+
+**Only two of Krita's paint engines are accepted**: `paintbrush` and
+`colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an
+outline, `hairybrush` simulates bristles, `spraybrush` scatters particles — they
+are *different programs*, not settings, and a round dab wearing their name would
+be pure invention. They are refused by name, and inside a bundle one refusal
+does not take the other forty-five with it.
+
+The tip is either a generated ellipse — which Umber draws exactly — or a
+predefined brush naming a file. A preset with `embedded_resources` carries that
+file base64-encoded in `<resources>`; a preset in a bundle finds it in
+`brushes/`; a **loose** `.kpp` finds it in a sibling `brushes/`, which is the
+layout every pack distributed as a directory uses and the difference between 14
+and 22 of GDQuest's brushes arriving as stamps. When none of those works the
+brush arrives round and the import *names the file it wanted*, because a stamp
+brush quietly painting round is the failure the whole reader is written against.
+
+A `.bundle` is a ZIP holding all of that plus `meta.xml`, which is where the
+author and the licence live — and therefore where a `Credit` comes from.
+`docs/brush-sources.md` explains why that matters more than it sounds.
+
+### Importing a Photoshop brush (`.abr`)
+
+Four incompatible layouts share the extension — 1, 2, 6.1 and 6.2 — and all are
+big-endian. The reference is GIMP's own `app/core/gimpbrush-load.c`, which is
+GPL-3.0 like Umber and is the only description of the format checked against
+real files for twenty years.
+
+**Sampled brushes only, deliberately, exactly as GIMP does it.** A Photoshop
+brush is either a bitmap or a set of parameters, and in versions 6 and 10 those
+parameters are not with the brush at all: they are in a separate `8BIMdesc`
+section written in Photoshop's *descriptor* format, a nested self-describing
+structure with a dozen type codes that would be a second format implemented
+inside the first, for numbers Umber has four of. So a `.abr` brings its stamps
+and nothing else; spacing, angle, roundness and scatter come out as Umber's
+defaults, which for a stamp brush is what the `.gbr` reader does anyway. The
+import says both — how many computed brushes were skipped, and that the settings
+were left behind.
+
+No `.abr` pack is fetched: see `docs/brush-sources.md`.
 
 In the brush editor's **Tip** tab a stamp brush shows the mask, its size in
 pixels, and a way back to the round dab. **Hardness is drawn dead there**, with
@@ -317,19 +473,21 @@ never does anything.
 
 ## Not done yet
 
-- **A licensed `.gbr` pack to ship.** The machinery is complete — a stamp brush
-  can be imported, saved, reloaded and painted with — but nothing ships with
-  one. The one CC0 pack whose licence *is* stated inside the download is a raw
-  photographic-texture resource whose brushes rely on GIMP's per-dab build-up,
-  which Umber's `max` coverage cannot reproduce; see `docs/brush-sources.md` for
-  the measurement. The `.gbr` decoder is tested against files built byte by byte
-  in the test module rather than against a real brush.
-- **Tips in the *shipped* library.** `BrushPreset::tip` resolves against the
-  user's library only. Shipping a stamp would additionally need the masks
-  embedded in the binary — a generated `assets/tips/` and an `include_bytes!`
-  table beside `builtin-brushes.ron` — and a rule in the generator for which of
-  a pack's tips are dense enough to reproduce faithfully. Neither is built,
-  because there is nothing yet to point them at.
+- **Tips in the *shipped* library**, which is now the only thing between four
+  fetched packs and 269 more brushes in the picker. `BrushPreset::tip` resolves
+  against the user's library only. Shipping a stamp needs the masks in the
+  binary — a generated `assets/tips/` and an `include_bytes!` table beside
+  `builtin-brushes.ron` — and a rule for which of a pack's tips reproduce
+  faithfully. The measurements that decide the second are in
+  `docs/brush-sources.md`, and they also say why the first is not free: one
+  pack's stamps are 10.7 MB of PNG against a 200 KB library.
+- **Picking a cell per dab**, which is what would make a `.gih` a brush rather
+  than five. The dab pass binds one tip per pass — that is what keeps a thousand
+  tipped dabs a single draw call — so it would need the tip binding to become a
+  small array and the dab instance to carry an index into it, chosen by the same
+  seeded RNG that already drives scatter and angle jitter. Every pipe in the
+  wild picks at random, so `sel0:` would not have to be honoured in full. Until
+  then a pipe arrives as one preset per cell and says so.
 - **A stamp brush's row in the library looks round.** `widgets::brush_row`
   paints its sample from opacity and hardness, which is what a procedural dab
   is made of. The brush editor shows the mask; the list does not.
@@ -338,18 +496,22 @@ never does anything.
   non-square mask loses its aspect ratio. The dab carries a single radius and
   has nowhere to record one.
 - **Ellipticity driven by an input**, and scatter driven by pen speed — see
-  "What conversion loses" above for why each was left alone rather than
+  "What a MyPaint `.myb` conversion loses" above for why each was left alone
   approximated.
 - **`lock_alpha`, `colorize` and `change_color_*`.** No brush in the shipped
   pack sets any of them to a live value, so nothing in the library is waiting on
   them. They are worth building as painting features in their own right —
   `lock_alpha` especially — not as import fidelity.
 - **Per-brush blend modes.**
-- **A `.kpp` importer.** Krita presets are PNG files with the settings in a
-  text chunk, and most of them lean on a bitmap tip. The tip half is now here;
-  the settings half is not.
-- **`.gih` animated brushes**, a `.gbr` sequence. One tip is bound per stroke,
-  so there is nowhere to put the other frames.
+- **Krita's other paint engines** — `spraybrush`, `hairybrush`, `deformbrush`,
+  `experimentbrush`, `hatchingbrush`, `roundmarker`. A `.kpp` written by one is
+  refused by name rather than approximated; between them they account for 13 of
+  the 116 presets in the fetched Krita packs.
+- **Krita's masking brush, paper texture, mirrored dabs and impasto**, and its
+  brush-tip randomness and density. All are reported when a preset asks for one.
+- **Photoshop's brush descriptors.** A `.abr` brings its stamps; its spacing,
+  angle, roundness and scatter are in a nested binary descriptor section that
+  would be a second format inside the first.
 
 ## What a user can set
 
