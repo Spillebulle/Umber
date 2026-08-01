@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata. Software centres on Linux read this rather than the
+  .desktop file, and AppImage tooling embeds it. Kept deliberately short: every
+  claim here is one a user can check by running the thing, so anything Umber
+  does not actually do must not appear.
+-->
+<component type="desktop-application">
+  <id>io.github.spillebulle.umber</id>
+  <launchable type="desktop-id">umber.desktop</launchable>
+
+  <name>Umber</name>
+  <summary>GPU-accelerated painting application built for latency</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      Umber is a painting application written in Rust, designed so that the
+      path between a pen moving and pixels changing is as short as possible.
+      Strokes are composited on the GPU with a wet-layer scheme, so overlapping
+      dabs never compound and a stroke crossing itself is no darker than one
+      that does not.
+    </p>
+    <p>
+      It ships 221 brush presets, including the whole of the MyPaint 2.0.2
+      library, and reads brushes written for MyPaint, GIMP, Krita and
+      Photoshop. Documents are saved as OpenRaster, and files written by Krita,
+      Photoshop and any OpenRaster application can be opened.
+    </p>
+    <p>This is an early release. Notable limits:</p>
+    <ul>
+      <li>Graphics tablet pressure is not read on desktop.</li>
+      <li>Saving blocks briefly, and there is no autosave or crash recovery.</li>
+    </ul>
+  </description>
+
+  <categories>
+    <category>Graphics</category>
+    <category>2DGraphics</category>
+    <category>RasterGraphics</category>
+  </categories>
+
+  <url type="homepage">https://github.com/Spillebulle/umber</url>
+  <url type="bugtracker">https://github.com/Spillebulle/umber/issues</url>
+
+  <provides>
+    <binary>umber</binary>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.0.1" date="2026-08-01">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

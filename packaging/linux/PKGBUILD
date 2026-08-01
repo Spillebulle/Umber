@@ -1,0 +1,58 @@
+# Maintainer: Spillebulle <spillebulle@gmail.com>
+#
+# Arch package, built from the release binary rather than from source.
+#
+# `-bin` because that is what Arch calls a package of somebody else's compiled
+# artefact, and calling it `umber` would claim a from-source build that this is
+# not. A source PKGBUILD would be a better citizen and is a reasonable thing to
+# add later; it needs the release tarball to be a source tarball, which the
+# workflow does not currently produce.
+#
+# The workflow fills in pkgver and the checksum before running makepkg, so the
+# placeholders below are what a local rehearsal edits. See
+# `.github/workflows/release.yml`.
+
+pkgname=umber-bin
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="GPU-accelerated painting application built for latency"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Spillebulle/umber"
+license=('GPL-3.0-or-later')
+provides=('umber')
+conflicts=('umber')
+options=('!strip' '!debug')
+
+# Opened at runtime by winit and wgpu rather than recorded in the ELF, so
+# namcap's automatic scan will not find them.
+depends=('libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon'
+         'wayland' 'vulkan-icd-loader' 'gcc-libs')
+
+# Filled in by the workflow: the archive built for this architecture.
+source_x86_64=("umber-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("umber-${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    local stage="${srcdir}/umber-${pkgver}-${CARCH}-unknown-linux-gnu"
+    # The tarball's directory is named after the Rust target triple, which is
+    # not $CARCH for aarch64 on every host; find it rather than spell it.
+    [ -d "$stage" ] || stage=$(find "$srcdir" -maxdepth 1 -type d -name 'umber-*' | head -1)
+
+    install -Dm755 "${stage}/umber" "${pkgdir}/usr/bin/umber"
+    install -Dm644 "${stage}/packaging/umber.desktop" \
+        "${pkgdir}/usr/share/applications/umber.desktop"
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.metainfo.xml" \
+        "${pkgdir}/usr/share/metainfo/io.github.spillebulle.umber.metainfo.xml"
+    for size in 16 32 48 64 128 256; do
+        install -Dm644 "${stage}/icons/umber-${size}.png" \
+            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/umber.png"
+    done
+    install -Dm644 "${stage}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 "${stage}/README.md" \
+        "${pkgdir}/usr/share/doc/umber/README.md"
+    install -Dm644 "${stage}/CHANGELOG.md" \
+        "${pkgdir}/usr/share/doc/umber/CHANGELOG.md"
+}

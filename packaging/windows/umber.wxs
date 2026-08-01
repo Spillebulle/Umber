@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The Windows installer, built with WiX 5 (`dotnet tool install --global wix`).
+
+  Deliberately small. Umber is one executable with everything — brushes, fonts,
+  papers, icons — compiled into it, so there is nothing to lay out beside it and
+  no runtime to chain in. An installer that only has to place one file should
+  look like one.
+
+  Two values come from the command line so nothing here has to be edited to cut
+  a release: `Version` and `BinDir`. See `.github/workflows/release.yml`.
+
+  The UpgradeCode must never change: it is what tells Windows that 0.0.2 is the
+  same product as 0.0.1 and should replace it rather than install alongside it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="Umber"
+           Manufacturer="Umber contributors"
+           Version="$(var.Version)"
+           UpgradeCode="f3fbcac2-a3ac-4cf2-99fc-1dfa05429952"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <SummaryInformation Description="Umber — GPU-accelerated painting application" />
+
+    <!-- Refuse to install over a newer build rather than quietly downgrading. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Umber is already installed. Uninstall it first if you meant to go back." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="UmberIcon" SourceFile="$(var.AssetDir)\umber.ico" />
+    <Property Id="ARPPRODUCTICON" Value="UmberIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Spillebulle/umber" />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.AssetDir)\licence.rtf" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Umber" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="Umber" Level="1">
+      <ComponentGroupRef Id="Files" />
+    </Feature>
+
+    <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
+      <Component Id="Executable" Guid="aaa698ce-4d5d-41c6-8f1e-5098c7fffb1b">
+        <File Id="UmberExe" Source="$(var.BinDir)\umber.exe" KeyPath="yes">
+          <!-- Under the executable, so the shortcut is removed with it. -->
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="Umber"
+                    Icon="UmberIcon"
+                    Advertise="yes" />
+        </File>
+      </Component>
+      <Component Id="Documents">
+        <File Source="$(var.DocDir)\README.md" />
+        <File Source="$(var.DocDir)\CHANGELOG.md" />
+        <File Source="$(var.DocDir)\LICENSE" Name="LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+
+  </Package>
+</Wix>

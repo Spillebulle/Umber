@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Umber
+GenericName=Painting application
+Comment=GPU-accelerated painting application built for latency
+Exec=umber %f
+Icon=umber
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/openraster;image/x-krita;image/vnd.adobe.photoshop;image/png;
+Keywords=paint;draw;brush;canvas;sketch;
+StartupNotify=true
+StartupWMClass=umber
