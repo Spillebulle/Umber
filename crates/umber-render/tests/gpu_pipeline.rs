@@ -830,6 +830,75 @@ fn a_tip_decides_where_paint_lands() {
 }
 
 #[test]
+fn a_stamp_gets_the_same_shape_dynamics_a_round_dab_does() {
+    // Scatter, size jitter and angle jitter are per-dab fields on an instance
+    // the vertex shader shapes *before* it samples the tip, so a stamp brush
+    // gets all three for free — but "for free" is exactly the kind of claim
+    // that stops being true. A spatter brush that laid every stamp on the line
+    // at one size would be a texture with a ruler through it.
+    //
+    // Asserted first as dabs landing off the line and off the nominal size,
+    // then — the part that matters — as the scratch being *empty* once the
+    // stroke has been committed over the rect the builder reported. That is the
+    // end-to-end form of "the damaged rect is wide enough": anything the rect
+    // missed is still sitting in the scratch, and the next commit would bake it
+    // in wearing the next stroke's colour. A tip reaches into its quad's
+    // corners, so a rotated, scattered stamp is the hardest case there is.
+    let mut h = harness_or_skip!();
+    h.set_tip(Some(TipMask::new(2, 2, vec![255; 4]).expect("tip")));
+
+    let spatter = Brush {
+        size: 8.0,
+        spacing: 0.5,
+        stabilization: 0.0,
+        pressure_size: false,
+        scatter: 2.5,
+        radius_jitter: 0.4,
+        dab_angle_jitter: 360.0,
+        ..Default::default()
+    };
+
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        spatter,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(20.0, 32.0), 1.0, 0.0),
+    );
+    s.extend(InputPoint::new(Vec2::new(44.0, 32.0), 1.0, 0.1));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    let bounds = s.bounds();
+
+    // 4 px radius on the line, so nothing unscattered can reach 8 px off it.
+    let off_line = dabs
+        .iter()
+        .any(|d| (d.pos[1] - 32.0).abs() > 8.0 || (d.radius - 4.0).abs() > 0.5);
+    assert!(off_line, "the stamp is not being scattered or jittered");
+
+    h.stamp(&dabs);
+    let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        StrokeStyle {
+            color: Color::WHITE,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Nothing may be left in the scratch: whatever it still held would redraw
+    // as a preview and be baked into the next stroke.
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    let leftover = (0..DOC)
+        .flat_map(|y| (0..DOC).map(move |x| (x, y)))
+        .any(|(x, y)| h.pixel_in(1, x, y)[3] != 0);
+    assert!(!leftover, "the spatter left coverage outside its own rect");
+}
+
+#[test]
 fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
     // The clearest evidence the procedural falloff has been replaced rather
     // than multiplied into: a full tip covers its whole bounding square, where
