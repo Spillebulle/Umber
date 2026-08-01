@@ -46,6 +46,7 @@ use egui::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::preset::{self, BrushPreset, PresetError, UserLibrary};
+use umber_core::style;
 
 /// The design's settings dialog is 1000×640; the browser is smaller because it
 /// shows one list rather than six panes. Clamped to the window, because a modal
@@ -258,9 +259,11 @@ impl Index {
                 }),
             }
         }
-        // Yours first, then Umber's, then everyone else's alphabetically. A
-        // library you cannot add to is a reference; the brushes you made are
-        // the ones you are reaching for.
+        // Yours first, then the styles in the order `umber_core::style`
+        // declares them — roughly the order a painter works in, drawing media
+        // through paint to the things done to paint already down. A library you
+        // cannot add to is a reference; the brushes you made are the ones you
+        // are reaching for, so they stay at the top.
         groups.sort_by(|a, b| {
             rank(a, shipped)
                 .cmp(&rank(b, shipped))
@@ -287,14 +290,13 @@ fn collection_of(preset: &BrushPreset) -> &str {
     }
 }
 
-fn rank(group: &Group, shipped: usize) -> u8 {
+/// Sort key for a collection: yours first, then styles in their declared order,
+/// then anything an imported library brought its own name for.
+fn rank(group: &Group, shipped: usize) -> usize {
     if group.members.iter().all(|i| *i >= shipped) {
-        0
-    } else if group.name == "Umber" {
-        1
-    } else {
-        2
+        return 0;
     }
+    1 + style::order_of(&group.name)
 }
 
 /// Walk the presets in `scope` that match `query`, in display order.
@@ -1652,23 +1654,32 @@ mod tests {
 
     #[test]
     fn a_search_matches_the_collection_as_well_as_the_name() {
-        let p = preset("mypaint/x", "Bulk 1", "MyPaint — David Revoy");
-        assert!(matches(&p, "revoy"));
+        let p = preset("mypaint/x", "Bulk 1", style::Style::TEXTURE);
+        assert!(matches(&p, "texture"));
         assert!(matches(&p, "bulk"));
         assert!(!matches(&p, "charcoal"));
     }
 
-    /// The whole point of the grouping: 133 presets under one heading is the
+    /// The whole point of the grouping: 201 presets under one heading is the
     /// flat list this replaces.
     #[test]
-    fn collections_put_the_users_own_first_and_umbers_next() {
+    fn collections_run_yours_first_then_styles_in_their_declared_order() {
         let shipped = preset::builtin().len();
         let mut presets = preset::builtin().to_vec();
         presets.push(preset("user/mine", "Mine", "My brushes"));
         let index = Index::build(&presets);
 
         assert_eq!(index.groups[0].name, "My brushes");
-        assert_eq!(index.groups[1].name, "Umber");
+        // Then `Style::ALL` order, which is roughly the order a painter works
+        // in — not alphabetical, which would open the library on "Airbrush".
+        let styles: Vec<&str> = index.groups[1..].iter().map(|g| g.name.as_str()).collect();
+        let expected: Vec<&str> = style::Style::ALL
+            .iter()
+            .copied()
+            .filter(|s| styles.contains(s))
+            .collect();
+        assert_eq!(styles, expected);
+
         assert!(index.is_user(shipped));
         assert!(!index.is_user(shipped - 1));
         assert_eq!(index.total, presets.len());
@@ -1676,6 +1687,20 @@ mod tests {
         // quietly hide brushes.
         let members: usize = index.groups.iter().map(|g| g.members.len()).sum();
         assert_eq!(members, presets.len());
+    }
+
+    /// A library grouped by author put the pencils in six places. This is the
+    /// guard against sliding back into that: no collection may be a person.
+    #[test]
+    fn no_shipped_collection_is_named_after_whoever_drew_it() {
+        for preset in preset::builtin() {
+            assert!(
+                style::Style::ALL.contains(&preset.category.as_str()),
+                "{:?} is in {:?}, which is not a style",
+                preset.name,
+                preset.category
+            );
+        }
     }
 
     #[test]

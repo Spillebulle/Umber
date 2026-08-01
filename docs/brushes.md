@@ -38,20 +38,59 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-128 MyPaint brushes plus Umber's own five, all CC0. 68 of the pack's 196 were
-refused by the generator, not lost by accident:
+**All 196** MyPaint brushes, plus Umber's own five: 201 presets, every one CC0.
 
-| Refused | Count | Why |
+It was 128 for a while. The 68 missing were refused by the generator rather than
+lost by accident, and both reasons were engine gaps rather than import gaps:
+
+| Was refused | Count | Now |
 |---|---|---|
-| `smudge >= 0.5` | 67 | Umber's dab pass writes coverage into a scratch texture and never reads the layer, so a brush cannot pick colour up off the canvas. Imported, a blender would paint solid colour under a name that promises the opposite. |
-| time-based dabs only | 2 | `dabs_per_second` with no distance term. Umber's dab loop is driven by distance travelled, so the brush would import as a solid line. |
+| `smudge >= 0.5` | 67 | The stroke carries a colour per dab and samples the canvas asynchronously. See the colour-pickup section of `CLAUDE.md`. |
+| time-based dabs only | 2 | The dab loop has a time term, so an airbrush keeps depositing while the pen is held still. |
 
-(One brush is refused on both counts, hence 68 rather than 69.)
+(One was refused on both counts, hence 68 rather than 69.)
 
-`umber_core::brushimport::mypaint::unsupported_features` is the check, and it is
-deliberately separate from the importer: a user who asks for a specific file
-should get whatever the importer can make of it. The generator is the fussy one,
-because it decides what Umber *claims* to support.
+`umber_core::brushimport::mypaint::unsupported_features` is still the check, and
+it still lists `colorize` and `lock_alpha`, which nothing in this pack uses. It
+is deliberately separate from the importer: a user who asks for a specific file
+should get whatever the importer can make of it, with a note saying what was
+dropped. The generator is the fussy one, because it decides what Umber *claims*
+to support.
+
+## How the library is grouped
+
+By **style**, not by pack — `umber_core::style`. A pack arrives sorted by
+whoever drew it, which is the right way to credit it and the wrong way to browse
+it: nobody reaches for a brush by remembering the artist, and author-grouping
+put the pencils in six different collections.
+
+Authorship is not lost. It travels on the brush in `BrushPreset::credit` and the
+browser prints it under every name, which is also what satisfies CC-BY should a
+pack ever need it.
+
+Twelve collections, in the order the picker lists them:
+
+| Collection | Count |
+|---|---|
+| Pencils & sketching | 12 |
+| Inks & pens | 30 |
+| Markers | 6 |
+| Charcoal, chalk & pastel | 6 |
+| Paint & brushes | 45 |
+| Watercolour & wet media | 22 |
+| Airbrush & spray | 11 |
+| Blenders & smudge | 23 |
+| Erasers | 8 |
+| Texture & grain | 11 |
+| Foliage & fur | 8 |
+| Effects & experimental | 19 |
+
+The generator prints this table on every run, because a classifier is a
+judgement and judgements have to be looked at rather than asserted. The first
+attempt sorted on `smudge >= 0.5` before consulting the name and put 68 brushes
+in "Blenders" — MyPaint's oil paints all mix with what is under them, so the
+setting says far less than it appears to. Erasing is the only setting that now
+overrides a name; see the module docs for the rest of the ordering.
 
 ## What conversion keeps
 

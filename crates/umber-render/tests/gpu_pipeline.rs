@@ -9,7 +9,7 @@
 use glam::{UVec2, Vec2};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect, TipMask};
-use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, StrokeStyle};
+use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, ProbeParams, StrokeStyle};
 
 const DOC: u32 = 64;
 
@@ -834,6 +834,71 @@ fn export_leaves_unpainted_pixels_transparent() {
     );
     let corner = ((2 * DOC + 2) * 4) as usize;
     assert_eq!(pixels[corner + 3], 0, "corner should be transparent");
+}
+
+/// Drive the smudge probe the way `app.rs` does — record, submit, collect —
+/// and give the GPU as long as it needs, since the whole point of the thing is
+/// that it does not block.
+fn probe_until_ready(h: &mut Harness, stack: &[LayerDraw], at: Vec2, radius: f32) -> [f32; 4] {
+    for _ in 0..64 {
+        let mut enc = h.encoder();
+        h.canvas.probe_canvas(
+            &h.gpu.device,
+            &h.gpu.queue,
+            &mut enc,
+            &ProbeParams {
+                layers: stack,
+                active_index: 0,
+                stroke: StrokeStyle {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+                doc_point: at,
+                radius,
+            },
+        );
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.submit_probes();
+        if let Some(sample) = h.canvas.take_probe(&h.gpu.device) {
+            return sample;
+        }
+    }
+    panic!("the probe never came home");
+}
+
+#[test]
+fn the_smudge_probe_reads_what_is_under_the_brush() {
+    // The asynchronous readback, end to end. A blender is only as good as this:
+    // if it never resolves the brush paints its palette colour forever, and if
+    // the decode is wrong every smudge is the wrong colour.
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::from_srgb_u8(200, 20, 20, 255));
+
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+    let sample = probe_until_ready(&mut h, &stack, Vec2::new(32.0, 32.0), 6.0);
+
+    assert!(sample[3] > 0.9, "should have found solid paint: {sample:?}");
+    // Linear, not sRGB: sRGB 200 is linear ~0.578. Asserting ~0.78 here would
+    // be the classic averaging-gamma-encoded-bytes mistake.
+    let expected = Color::from_srgb_u8(200, 20, 20, 255);
+    assert!(
+        (sample[0] - expected.r).abs() < 0.02 && (sample[1] - expected.g).abs() < 0.02,
+        "expected linear {:?}, got {sample:?}",
+        [expected.r, expected.g, expected.b]
+    );
+}
+
+#[test]
+fn the_probe_reports_bare_canvas_as_nothing_to_pick_up() {
+    // Alpha is what stops a blender dragged off the edge of a painting from
+    // smearing black back onto it — `StrokeBuilder::absorb` ignores a sample
+    // with no coverage, and can only do that if the probe reports it honestly.
+    let mut h = harness_or_skip!();
+
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+    let sample = probe_until_ready(&mut h, &stack, Vec2::new(32.0, 32.0), 6.0);
+
+    assert_eq!(sample[3], 0.0, "empty canvas should report no coverage");
 }
 
 #[test]

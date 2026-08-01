@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use umber_core::brushimport::{display_name, mypaint};
 use umber_core::preset::{self, BrushPreset, Credit, slug};
+use umber_core::style;
 
 /// Where each pack lives after a fetch, and what to say about it.
 struct Pack {
@@ -31,13 +32,14 @@ struct Pack {
     id_prefix: &'static str,
     licence: &'static str,
     source: &'static str,
-    /// Per-subdirectory author and picker category. MyPaint's pack is sorted
-    /// into one directory per artist, and its `Licenses.dep5` attributes them
-    /// individually, so the credit has to be per-directory rather than
-    /// per-pack.
-    authors: &'static [(&'static str, &'static str, &'static str)],
+    /// Per-subdirectory author. MyPaint's pack is sorted into one directory
+    /// per artist, and its `Licenses.dep5` attributes them individually, so the
+    /// credit has to be per-directory rather than per-pack.
+    ///
+    /// No category here: what a brush *is* comes from `umber_core::style`,
+    /// which reads the brush, not the folder it arrived in.
+    authors: &'static [(&'static str, &'static str)],
     fallback_author: &'static str,
-    fallback_category: &'static str,
 }
 
 const PACKS: &[Pack] = &[Pack {
@@ -45,30 +47,17 @@ const PACKS: &[Pack] = &[Pack {
     id_prefix: "mypaint",
     licence: "CC0-1.0",
     source: "https://github.com/mypaint/mypaint-brushes",
-    // (subdirectory, author, category) — taken from the pack's Licenses.dep5.
+    // (subdirectory, author) — taken from the pack's Licenses.dep5.
     authors: &[
-        ("classic", "MyPaint Development Team", "MyPaint — classic"),
-        (
-            "experimental",
-            "MyPaint Development Team",
-            "MyPaint — experimental",
-        ),
-        ("deevad", "David Revoy", "MyPaint — David Revoy"),
-        ("ramon", "Ramón Miranda", "MyPaint — Ramón Miranda"),
-        (
-            "tanda",
-            "Marcelo \"Tanda\" Cerviño",
-            "MyPaint — Marcelo Cerviño",
-        ),
-        (
-            "kaerhon_v1",
-            "Guillaume Loussarévian",
-            "MyPaint — Guillaume Loussarévian",
-        ),
-        ("Dieterle", "Brien Dieterle", "MyPaint — Brien Dieterle"),
+        ("classic", "MyPaint Development Team"),
+        ("experimental", "MyPaint Development Team"),
+        ("deevad", "David Revoy"),
+        ("ramon", "Ramón Miranda"),
+        ("tanda", "Marcelo \"Tanda\" Cerviño"),
+        ("kaerhon_v1", "Guillaume Loussarévian"),
+        ("Dieterle", "Brien Dieterle"),
     ],
     fallback_author: "MyPaint Development Team",
-    fallback_category: "MyPaint",
 }];
 
 fn main() {
@@ -142,19 +131,25 @@ fn main() {
                 }
             };
 
-            let (author, category) = pack
+            let author = pack
                 .authors
                 .iter()
-                .find(|(sub, _, _)| *sub == group)
-                .map(|(_, author, category)| (*author, *category))
-                .unwrap_or((pack.fallback_author, pack.fallback_category));
+                .find(|(sub, _)| *sub == group)
+                .map(|(_, author)| *author)
+                .unwrap_or(pack.fallback_author);
+
+            // Grouped by the mark it makes, not by who drew it. The pack's own
+            // directory layout is still the source of *credit*, which travels
+            // on the brush and is shown on every row of the browser.
+            let name = display_name(&stem);
+            let category = style::classify(&name, &brush);
 
             presets.push(BrushPreset {
                 // The pack's own directory layout is part of the id: two
                 // artists both shipping a "Charcoal" is normal, and the ids
                 // have to stay distinct without renaming either.
                 id: format!("{}/{}/{}", pack.id_prefix, slug(&group), slug(&stem)),
-                name: display_name(&stem),
+                name,
                 category: category.to_string(),
                 credit: Some(Credit {
                     author: author.to_string(),
@@ -184,6 +179,25 @@ fn main() {
     fs::write(&out, format!("{header}{body}\n")).expect("write the library");
 
     println!("{} brushes -> {}", presets.len(), out.display());
+
+    // Printed so the classification can actually be checked. A rule that sends
+    // half the library into one collection is not something a test catches —
+    // it is a judgement, and judgements need to be looked at.
+    println!("\nby collection:");
+    for category in style::Style::ALL {
+        let members: Vec<&str> = presets
+            .iter()
+            .filter(|p| p.category == category)
+            .map(|p| p.name.as_str())
+            .collect();
+        println!(
+            "  {:26} {:3}  {}",
+            category,
+            members.len(),
+            members.join(", ")
+        );
+    }
+
     for (reason, names) in &skipped {
         println!("skipped {} for {reason}:", names.len());
         println!("  {}", names.join(", "));

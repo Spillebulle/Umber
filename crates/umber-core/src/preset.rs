@@ -121,10 +121,14 @@ fn umber_defaults() -> Vec<BrushPreset> {
         licence: "CC0-1.0".to_string(),
         source: "https://github.com/Spillebulle/umber".to_string(),
     };
+    // Sorted by style like everything else, rather than into a collection of
+    // their own. A taxonomy with one group that means "ours" is not a taxonomy;
+    // the `umber/` id prefix is what marks these as the defaults, and the
+    // browser shows the credit on every row.
     let make = |id: &str, name: &str, brush: Brush| BrushPreset {
         id: format!("umber/{id}"),
         name: name.to_string(),
-        category: "Umber".to_string(),
+        category: crate::style::classify(name, &brush).to_string(),
         credit: Some(credit.clone()),
         brush,
     };

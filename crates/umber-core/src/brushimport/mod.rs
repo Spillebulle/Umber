@@ -40,10 +40,14 @@ pub fn read_file(path: &Path) -> Result<Vec<BrushPreset>, PresetError> {
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default();
             let name = display_name(&stem);
+            // Filed by style, the same way the shipped library is, so a brush
+            // you import lands among its own kind instead of in a bin called
+            // "Imported" that grows without order.
+            let category = crate::style::classify(&name, &brush).to_string();
             Ok(vec![BrushPreset {
                 id: format!("mypaint/{}", preset::slug(&name)),
                 name,
-                category: "Imported".to_string(),
+                category,
                 credit: None,
                 brush,
             }])

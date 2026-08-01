@@ -18,6 +18,7 @@ pub mod input;
 pub mod layer;
 pub mod preset;
 pub mod stroke;
+pub mod style;
 pub mod tip;
 
 pub use brush::{Brush, BrushMode};
