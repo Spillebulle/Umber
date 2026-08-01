@@ -506,6 +506,11 @@ never does anything.
 - **A stamp brush's row in the library looks round.** `widgets::brush_row`
   paints its sample from opacity and hardness, which is what a procedural dab
   is made of. The brush editor shows the mask; the list does not.
+- **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
+  miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
+  ellipticity is thrown per dab draws its row as though it were not. Fixing it
+  properly means the sample driving a real stroke builder — which would also
+  give it speed and stroke position, neither of which a static row has.
 - **Grain / paper texture** multiplied into dab coverage.
 - **Elliptical tips.** The tip is stretched over the dab's bounding square, so a
   non-square mask loses its aspect ratio. The dab carries a single radius and
