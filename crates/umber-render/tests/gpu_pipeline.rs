@@ -1510,6 +1510,19 @@ fn probe_until_ready(h: &mut Harness, stack: &[LayerDraw], at: Vec2, radius: f32
         );
         h.gpu.queue.submit(Some(enc.finish()));
         h.canvas.submit_probes();
+        // Block until the copy submitted above has actually run.
+        //
+        // `take_probe` polls *without* blocking, which is exactly right on the
+        // drawing path — the whole design of the probe is that no frame waits
+        // on the GPU — and useless in a loop that has nothing else to do. On a
+        // discrete adapter the sample happens to be ready by the next
+        // iteration; on a software one, which is what a CI runner without a
+        // GPU has, sixty-four non-blocking polls go by in well under a
+        // millisecond and the map is never serviced. That is a slow adapter,
+        // not a broken probe: the application would simply keep the previous
+        // sample for another frame or two, which the smudge is built to
+        // tolerate.
+        let _ = h.gpu.device.poll(wgpu::PollType::wait_indefinitely());
         if let Some(sample) = h.canvas.take_probe(&h.gpu.device) {
             return sample;
         }
