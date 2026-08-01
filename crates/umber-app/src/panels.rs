@@ -400,17 +400,9 @@ fn panel(
             .max_rect(controls)
             .layout(Layout::right_to_left(Align::Center)),
         |ui| {
-            // Hiding a panel is an edit-mode action too, so a stray click on
-            // the corner of a panel cannot make it vanish mid-painting.
-            if editing
-                && icon_button(
-                    ui,
-                    p,
-                    Icon::Close,
-                    true,
-                    "Hide this panel — bring it back from the Window menu",
-                )
-            {
+            // Removing a module is an edit-mode action, so a stray click on the
+            // corner of a panel cannot make it vanish mid-painting.
+            if editing && remove_button(ui, p) {
                 events.close = true;
             }
             if kind == PanelKind::Colour {
@@ -451,6 +443,33 @@ fn panel(
     );
 
     events
+}
+
+/// The edit-mode control that takes a module out of the layout.
+///
+/// Its own function rather than [`icon_button`] because it is the one control
+/// in a header that destroys something, and it says so by lighting up in the
+/// warning colour instead of in the ordinary hover ink. It is nothing worse
+/// than reversible — the module library puts any module back — which is why the
+/// tooltip names the way back rather than asking for a confirmation.
+fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, metrics::RADIUS, p.warning_bg);
+    }
+    icons::draw(
+        ui.painter(),
+        rect.shrink(3.0),
+        Icon::Close,
+        if hovered { p.warning } else { p.text_dim },
+    );
+    // No arrow glyph in the tooltip: Archivo carries none, and a blank box
+    // pointing at the way back would be worse than spelling out the menu.
+    response
+        .on_hover_text("Remove this module from the layout — Window, Modules puts it back")
+        .clicked()
 }
 
 /// A dashed outline round a rounded rect.
@@ -1248,7 +1267,7 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui.label(
                     egui::RichText::new(
                         "drag a panel by its header — a sidebar re-docks it, anywhere \
-                         else floats · drag an edge to resize · close hides",
+                         else floats · drag an edge to resize · the cross removes",
                     )
                     .size(text::TINY)
                     .color(p.text_dim),

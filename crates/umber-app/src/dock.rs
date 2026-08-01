@@ -1590,6 +1590,24 @@ mod tests {
         assert!(layout.is_open(PanelKind::History));
     }
 
+    /// The edit-mode remove control. Whatever else it does, a removed module
+    /// must be able to come back — which is what the module library is for.
+    #[test]
+    fn a_removed_module_can_be_added_back() {
+        let mut layout = Layout::default();
+        layout.close(PanelKind::Layers);
+        assert!(!layout.is_open(PanelKind::Layers));
+        assert_eq!(layout.docked(Side::Right).len(), 2);
+
+        layout.add_dragging(PanelKind::Layers, pos2(600.0, 400.0));
+        layout.end_drag(DropTarget::Dock {
+            side: Side::Right,
+            index: 2,
+        });
+        assert!(layout.is_open(PanelKind::Layers));
+        assert_eq!(layout.docked(Side::Right).len(), 3);
+    }
+
     /// Adding from the library leaves the module in the pointer's hand, in the
     /// mode where it can be put down.
     #[test]
