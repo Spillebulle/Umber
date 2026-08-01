@@ -150,7 +150,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     ed.layout.clamp_floating(workspace);
     let geo = ed.layout.geometry(workspace, metrics::TOOL_RAIL);
 
-    let rail_frame = chrome.inner_margin(Margin::symmetric(0, 8));
+    let rail_frame = chrome.inner_margin(Margin::symmetric(metrics::TOOL_RAIL_PAD, 8));
     match ed.layout.rail_side() {
         Side::Left => egui::Panel::left("tool-rail"),
         Side::Right => egui::Panel::right("tool-rail"),
@@ -564,7 +564,7 @@ fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     panels::rail_grip(ui, p, ed);
 
     ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+        ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
 
         // Two columns, as the design lays out its tool grid. Umber has four
         // tools where the design shows sixteen; the rest are simply not drawn,
@@ -601,7 +601,7 @@ fn tool_rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         let mut picked = None;
         for pair in tools.chunks(2) {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().item_spacing.x = metrics::TOOL_GAP;
                 for (tool, icon, tip) in pair {
                     if widgets::tool_button(ui, p, *icon, ed.ui.tool == *tool, tip).clicked() {
                         picked = Some(*tool);
