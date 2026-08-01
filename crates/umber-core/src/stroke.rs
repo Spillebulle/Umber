@@ -15,6 +15,11 @@
 //! is deliberately *not* folded into [`Dab::coverage`].
 
 use crate::brush::Brush;
+use crate::color::Color;
+use crate::dynamics::{
+    DabInput, DabInputs, Modulated, SLOW_SPEED_SLOWNESS, SPEED_GAMMA_LOG, SPEED_SLOWNESS,
+    speed_input,
+};
 use crate::geom::Rect;
 use crate::input::InputPoint;
 use bytemuck::{Pod, Zeroable};
@@ -28,6 +33,25 @@ use glam::Vec2;
 /// is the lesser wrong: nobody can tell how much airbrush landed while the
 /// application was not responding, but everybody notices the hang.
 const MAX_TIMED_DABS_PER_SAMPLE: u32 = 64;
+
+/// How far, in document pixels, a speed-driven offset may throw a dab off the
+/// pointer.
+///
+/// `offset_by_speed` multiplies the smoothed velocity, and a velocity is a
+/// division by a reported time interval. libmypaint carries a comment about
+/// individual dabs landing "far far away" on Windows for exactly this reason:
+/// two samples a microsecond apart report a speed of millions. The cap is
+/// generous enough that no plausible flick reaches it and small enough that a
+/// spike cannot damage — and therefore snapshot for undo — the whole canvas.
+const MAX_SPEED_OFFSET: f32 = 512.0;
+
+/// Time constant, in seconds, for the velocity that drives `offset_by_speed`.
+///
+/// libmypaint derives it from `offset_by_speed_slowness`, whose default of 1.0
+/// gives `exp(0.01) - 1`. Only ten brushes in the pack use the offset at all
+/// and none of them moves the slowness far, so it is a constant here rather
+/// than a field and a slider nobody would ever touch.
+const SPEED_OFFSET_SLOWNESS: f32 = 0.010_05;
 
 /// A tiny xorshift, for scattering dabs.
 ///
@@ -56,9 +80,14 @@ impl Rng {
         self.0
     }
 
+    /// Uniform in `0.0..1.0`, which is the range MyPaint's `random` input has.
+    fn unit(&mut self) -> f32 {
+        self.next_u32() as f32 / u32::MAX as f32
+    }
+
     /// Uniform in `-1.0..1.0`.
     fn signed(&mut self) -> f32 {
-        (self.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0
+        self.unit() * 2.0 - 1.0
     }
 
     /// Roughly normal, mean 0, standard deviation 1.
@@ -159,6 +188,19 @@ pub struct StrokeBuilder {
     /// Starts pointing along +x so the very first dab of a stroke, laid before
     /// any direction exists, is not stamped at a random angle.
     heading: Vec2,
+    /// Pointer speed in document pixels per second, smoothed over
+    /// [`SPEED_SLOWNESS`] and [`SLOW_SPEED_SLOWNESS`] respectively. Two
+    /// separate filters because MyPaint's `speed1` and `speed2` are the same
+    /// measurement at two time constants, and brushes use them for different
+    /// things: the fast one for a flick, the slow one for the pace of a gesture.
+    speed: f32,
+    slow_speed: f32,
+    /// Smoothed velocity *vector*, for [`Brush::speed_offset`]. Separate from
+    /// `speed` because that one is a magnitude and this one has to point.
+    velocity: Vec2,
+    /// How far into the stroke we are, in the `0..1` the `Stroke` input reports
+    /// — advanced by travel measured in dab radii, and wrapped.
+    stroke_pos: f32,
 }
 
 // Written out rather than derived: a derived `Default` would zero `bounds`,
@@ -186,6 +228,10 @@ impl StrokeBuilder {
             rng: Rng::new(1),
             stroke_count: 0,
             heading: Vec2::X,
+            speed: 0.0,
+            slow_speed: 0.0,
+            velocity: Vec2::ZERO,
+            stroke_pos: 0.0,
         }
     }
 
@@ -198,7 +244,7 @@ impl StrokeBuilder {
     /// The renderer asks once per frame to decide which dab pipeline to use, so
     /// an ordinary stroke never allocates or writes the colour scratch.
     pub fn is_coloured(&self) -> bool {
-        self.brush.smudges()
+        self.brush.colours_dabs()
     }
 
     /// Where the next canvas sample should be taken, and how wide.
@@ -270,6 +316,13 @@ impl StrokeBuilder {
         // the same way is exactly what scatter is supposed to avoid.
         self.rng = Rng::new(self.stroke_count.wrapping_mul(0x9E37_79B9));
         self.heading = Vec2::X;
+        // A stroke starts from rest and at its own beginning. Carrying the
+        // previous stroke's speed over would make the first dabs of a new mark
+        // wear the last one's dynamics.
+        self.speed = 0.0;
+        self.slow_speed = 0.0;
+        self.velocity = Vec2::ZERO;
+        self.stroke_pos = 0.0;
         self.smoothed = point.pos;
         self.residual = 0.0;
         self.time_residual = 0.0;
@@ -305,10 +358,15 @@ impl StrokeBuilder {
         let seg = to - from;
         let len = seg.length();
 
+        let elapsed = (point.time - last.time).max(0.0) as f32;
+        // Speed and stroke position describe the travel that has just
+        // happened, so they are advanced before this sample's dabs are laid
+        // rather than after them — which is also the order libmypaint uses.
+        self.advance_inputs(seg, len, elapsed);
+
         // A timed brush deposits paint for as long as the pen is down, whether
         // or not it has moved, so its dabs are counted before the early return
         // that a stationary pen would otherwise take.
-        let elapsed = (point.time - last.time).max(0.0) as f32;
         if self.brush.is_timed() && elapsed > 0.0 {
             self.emit_timed(elapsed, point.pressure, from, seg);
         }
@@ -379,9 +437,90 @@ impl StrokeBuilder {
         }
     }
 
+    /// Update the inputs that are derived from motion rather than reported.
+    ///
+    /// Every branch is guarded by the setting that reads it. Two exponential
+    /// filters per pointer sample is not much, but pointer samples are the
+    /// densest thing on the drawing path and a brush that reads neither speed
+    /// nor stroke position — which is most of them — should pay for neither.
+    fn advance_inputs(&mut self, seg: Vec2, len: f32, elapsed: f32) {
+        if elapsed <= 0.0 || !len.is_finite() {
+            return;
+        }
+        if self.brush.is_modulated() || self.brush.leads_with_speed() {
+            let raw = len / elapsed;
+            // libmypaint's own `1 - exp_decay(T, dt)`, so a brush tuned against
+            // its filter behaves the same here at any report rate.
+            self.speed += (raw - self.speed) * (1.0 - (-elapsed / SPEED_SLOWNESS).exp());
+            self.slow_speed +=
+                (raw - self.slow_speed) * (1.0 - (-elapsed / SLOW_SPEED_SLOWNESS).exp());
+        }
+        if self.brush.leads_with_speed() {
+            let v = seg / elapsed;
+            let fac = 1.0 - (-elapsed / SPEED_OFFSET_SLOWNESS).exp();
+            self.velocity += (v - self.velocity) * fac;
+        }
+        if self.brush.uses_stroke_position() {
+            // Measured in dab radii rather than pixels, so a brush scaled up
+            // runs through its cycle over a proportionally longer mark instead
+            // of finishing it in the first inch.
+            let base_radius = (self.brush.size * 0.5).max(0.5);
+            let span = self.brush.stroke_span.max(0.01);
+            let wrap = 1.0 + self.brush.stroke_hold.max(0.0);
+            let next = self.stroke_pos + len / base_radius / span;
+            self.stroke_pos = if next < wrap {
+                next
+            } else if wrap > 10.9 {
+                // MyPaint reads a hold time at its ceiling as "never wrap":
+                // the input reaches 1 and stays there for the rest of the mark.
+                1.0
+            } else {
+                next % wrap
+            };
+        }
+    }
+
+    /// The inputs a dab sees, in MyPaint's units.
+    ///
+    /// The random draw happens here and **only** when something reads it, which
+    /// is the same discipline every other random feature follows: the RNG is a
+    /// single stream, so an unconditional draw for a feature a brush does not
+    /// use would reshuffle the numbers every other feature gets. One draw per
+    /// dab shared by every entry, exactly as libmypaint's `random_input` is.
+    fn dab_inputs(&mut self, pressure: f32) -> Modulated {
+        if !self.brush.is_modulated() {
+            return Modulated::NONE;
+        }
+        let random = if self.brush.modulations.uses(DabInput::Random) {
+            self.rng.unit()
+        } else {
+            0.0
+        };
+        let inputs = DabInputs {
+            pressure,
+            speed: speed_input(self.speed, SPEED_GAMMA_LOG),
+            slow_speed: speed_input(self.slow_speed, SPEED_GAMMA_LOG),
+            stroke: self.stroke_pos.min(1.0),
+            // Undirected, like MyPaint's: a line pulled left and the same line
+            // pulled right are the same stroke as far as a brush is concerned.
+            direction: self.heading.y.atan2(self.heading.x).to_degrees().rem_euclid(180.0),
+            random,
+        };
+        self.brush.modulations.evaluate(&inputs)
+    }
+
     fn emit(&mut self, pos: Vec2, pressure: f32) {
+        let m = self.dab_inputs(pressure);
+
         let mut radius = self.brush.radius_at(pressure);
-        let coverage = self.brush.coverage_at(pressure);
+        // `radius_logarithmic` is a log, so a mapping on it is an offset in log
+        // space and composes by multiplying the radius. Adding it in pixels
+        // would make the same setting mean something different on a 4 px pen
+        // and a 400 px wash.
+        if m.size_log != 0.0 {
+            radius = (radius * m.size_log.exp()).clamp(0.05, Brush::MAX_SIZE);
+        }
+        let coverage = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
 
         // Jitter in log space, so the variation is symmetric about the nominal
         // radius and cannot produce a negative one however large the setting.
@@ -396,10 +535,24 @@ impl StrokeBuilder {
         // across the tooth of the paper under a light hand and bites into it
         // under a heavy one, so the amount is pressure's to decide.
         let mut centre = pos;
-        let scatter = self.brush.scatter_at(pressure);
+        let scatter = (self.brush.scatter_at(pressure) + m.scatter).max(0.0);
         if scatter > 0.0 {
             let spread = radius * scatter;
             centre += Vec2::new(self.rng.gaussian(), self.rng.gaussian()) * spread;
+        }
+
+        // MyPaint's `offset_by_speed`: a *directed* lead along the smoothed
+        // velocity, a tenth of a second's worth of it per unit. Reading it as
+        // scatter is the obvious approximation and is wrong in kind — it turns
+        // a brush that trails behind a fast flick into one that sprays.
+        if self.brush.leads_with_speed() {
+            let lead = self.velocity * self.brush.speed_offset * 0.1;
+            let len = lead.length();
+            centre += if len > MAX_SPEED_OFFSET {
+                lead * (MAX_SPEED_OFFSET / len)
+            } else {
+                lead
+            };
         }
 
         let mut angle = if self.brush.dab_angle_follows_stroke {
@@ -415,14 +568,18 @@ impl StrokeBuilder {
         if self.brush.dab_angle_jitter > 0.0 {
             angle += self.rng.signed() * self.brush.dab_angle_jitter.to_radians() * 0.5;
         }
+        angle += m.angle.to_radians();
 
         self.pending.push(Dab {
             pos: [centre.x, centre.y],
             radius,
-            hardness: self.brush.hardness_at(pressure),
+            hardness: (self.brush.hardness_at(pressure) + m.hardness).clamp(0.0, 1.0),
             coverage,
-            color: self.dab_color(),
-            aspect: self.brush.dab_ratio.max(1.0),
+            color: self.dab_color(&m),
+            // Below 1.0 the long and short axes swap, so a modulation that
+            // dips under a round dab would turn the ellipse a quarter turn
+            // rather than flattening it back out.
+            aspect: (self.brush.dab_ratio + m.ratio).max(1.0),
             angle,
         });
 
@@ -435,18 +592,50 @@ impl StrokeBuilder {
     }
 
     /// The colour this dab deposits: the palette colour, pulled towards
-    /// whatever the brush has picked up.
-    fn dab_color(&self) -> [f32; 3] {
-        let (Some(held), true) = (self.smudge, self.brush.smudges()) else {
-            return self.paint;
+    /// whatever the brush has picked up, then shifted by whatever the colour
+    /// modulations ask for.
+    ///
+    /// Pickup first and the shift second, which is libmypaint's order: a brush
+    /// that both blends and jitters is jittering the mixture, not jittering its
+    /// own colour and then losing the jitter in the mix.
+    fn dab_color(&self, m: &Modulated) -> [f32; 3] {
+        let mixed = match (self.smudge, self.brush.smudges()) {
+            (Some(held), true) => {
+                let t = (self.brush.smudge + m.smudge).clamp(0.0, 1.0);
+                [
+                    self.paint[0] + (held[0] - self.paint[0]) * t,
+                    self.paint[1] + (held[1] - self.paint[1]) * t,
+                    self.paint[2] + (held[2] - self.paint[2]) * t,
+                ]
+            }
+            _ => self.paint,
         };
-        let t = self.brush.smudge.clamp(0.0, 1.0);
-        [
-            self.paint[0] + (held[0] - self.paint[0]) * t,
-            self.paint[1] + (held[1] - self.paint[1]) * t,
-            self.paint[2] + (held[2] - self.paint[2]) * t,
-        ]
+        if !m.tints() {
+            return mixed;
+        }
+        tint(mixed, m)
     }
+}
+
+/// Shift a linear-RGB colour in HSV, the way MyPaint's `change_color_*` do.
+///
+/// Over **sRGB** components, because [`Color::to_hsv`] is defined that way and
+/// for the same reason: a hue rotation is a perceptual operation, and one run
+/// over linear values bunches badly in the shadows. MyPaint delinearises with a
+/// plain 2.2 power before doing the same thing; the exact transfer function is
+/// the only difference, and it is smaller than the shift itself.
+///
+/// Saturation is *scaled* rather than offset — `s += s * v * amount` is
+/// libmypaint's own form — so a grey stays grey however hard the brush jitters.
+/// Hue wraps; value clamps.
+fn tint(rgb: [f32; 3], m: &Modulated) -> [f32; 3] {
+    let mut hsv = Color::new(rgb[0], rgb[1], rgb[2], 1.0).to_hsv();
+    // MyPaint states hue in turns, so 0.5 is the opposite side of the wheel.
+    hsv.h = (hsv.h + m.hue * 360.0).rem_euclid(360.0);
+    hsv.s = (hsv.s + hsv.s * hsv.v * m.saturation).clamp(0.0, 1.0);
+    hsv.v = (hsv.v + m.value).clamp(0.0, 1.0);
+    let c = hsv.to_color(1.0);
+    [c.r, c.g, c.b]
 }
 
 #[cfg(test)]
