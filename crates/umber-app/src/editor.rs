@@ -346,10 +346,18 @@ impl Editor {
         self.brush.mode = mode;
         // A name pointing at a mask that is not here paints round rather than
         // refusing — see `BrushPreset::tip`.
-        self.tip = preset
-            .tip
-            .as_ref()
-            .and_then(|name| self.tips.get(name).cloned());
+        //
+        // The user's library first, then the masks Umber ships. Both hand back
+        // an `Arc<TipMask>` that is stable for as long as it is reachable,
+        // which is what `CanvasRenderer::set_tip`'s identity check needs; the
+        // order only decides a name collision, and the user's own file winning
+        // is the answer that cannot surprise anybody.
+        self.tip = preset.tip.as_ref().and_then(|name| {
+            self.tips
+                .get(name)
+                .cloned()
+                .or_else(|| umber_core::tip::builtin(name).cloned())
+        });
         self.active_preset = Some(index);
     }
 

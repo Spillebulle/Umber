@@ -13,6 +13,48 @@ pub enum BrushMode {
     Erase,
 }
 
+/// Which of the shipped paper textures a brush bites into.
+///
+/// An enum rather than a name, because [`Brush`] is `Copy` and a `String` would
+/// end that — the same constraint that makes [`ResponseCurve`] a fixed array of
+/// samples rather than a `Vec` of control points. Umber ships three papers and
+/// nothing reads a fourth from disk, so a closed set is not a limitation the
+/// user can feel; when a user's own paper becomes a feature, this grows a
+/// variant that names one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrainPattern {
+    /// Hot-pressed paper: a fine, even tooth. What a pencil catches on.
+    #[default]
+    Tooth,
+    /// Cotton canvas: a woven grid under a slow blotch.
+    Canvas,
+    /// Cold-pressed rough: coarse hollows a dry brush skips across entirely.
+    Grit,
+}
+
+impl GrainPattern {
+    /// Every pattern, in the order the editor lists them.
+    pub const ALL: [GrainPattern; 3] = [Self::Tooth, Self::Canvas, Self::Grit];
+
+    /// The key into [`crate::tip::patterns`].
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Tooth => "tooth",
+            Self::Canvas => "canvas",
+            Self::Grit => "grit",
+        }
+    }
+
+    /// What the brush editor calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tooth => "Tooth",
+            Self::Canvas => "Canvas",
+            Self::Grit => "Rough",
+        }
+    }
+}
+
 /// A round brush.
 ///
 /// Sizes are in **document** pixels, so brush appearance is independent of
@@ -172,6 +214,9 @@ pub struct Brush {
     /// reason the grain is anchored to the document: paper does not get coarser
     /// when you pick up a bigger pencil.
     pub grain_scale: f32,
+    /// Which shipped paper the grain comes from. Meaningless while
+    /// [`Brush::grain`] is zero.
+    pub grain_pattern: GrainPattern,
 }
 
 impl Default for Brush {
@@ -207,6 +252,7 @@ impl Default for Brush {
             build_up: false,
             grain: 0.0,
             grain_scale: 256.0,
+            grain_pattern: GrainPattern::Tooth,
         }
     }
 }

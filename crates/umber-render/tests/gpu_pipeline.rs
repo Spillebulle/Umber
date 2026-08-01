@@ -149,6 +149,15 @@ impl Harness {
             .set_tip(&self.gpu.device, &self.gpu.queue, tip.map(Arc::new));
     }
 
+    /// The paper, as `(tile, strength, tile size in document pixels)`.
+    fn set_grain(&mut self, grain: Option<(TipMask, f32, f32)>) {
+        self.canvas.set_grain(
+            &self.gpu.device,
+            &self.gpu.queue,
+            grain.map(|(tile, strength, scale)| (Arc::new(tile), strength, scale)),
+        );
+    }
+
     /// Paint a slot solid with `color` around the sample point.
     fn fill(&mut self, slot: u32, color: Color) {
         self.stamp(&[dab(32.0, 32.0, 48.0, 1.0)]);
@@ -997,6 +1006,138 @@ fn a_second_brush_with_a_different_tip_replaces_the_first() {
         "the second tip's empty half painted — the first tip is still bound"
     );
     assert_eq!(h.pixel_in(1, 42, 32)[3], 255);
+}
+
+// ---------------------------------------------------------------------------
+// Paper grain
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grain_off_is_the_exact_identity() {
+    // The claim the whole design rests on: a brush that asks for no paper must
+    // paint precisely what it painted before the paper existed. The shader
+    // computes `mix(1.0, tile, strength)`, so at strength zero the tile is
+    // multiplied out exactly rather than nearly — and this binds a *black* tile
+    // to prove the multiply really is by one and not by something close to it.
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let plain = h.pixel(32, 32);
+
+    h.set_grain(Some((
+        TipMask::new(2, 2, vec![0; 4]).expect("tile"),
+        0.0,
+        64.0,
+    )));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        plain,
+        "a black paper at zero strength changed the mark"
+    );
+}
+
+#[test]
+fn grain_bites_coverage_out_of_a_dab() {
+    // A tile that is solid on its left half and empty on its right, one tile per
+    // 32 document pixels. At full strength the empty half must take the paint
+    // away entirely and the solid half must leave it alone.
+    //
+    // Eight texels rather than two: the sampler filters linearly, so a two-texel
+    // tile is a gradient from end to end with no flat region to assert on. Four
+    // solid texels give a plateau over u = 1/16 .. 7/16, which at this scale is
+    // document x 34..46 in each tile.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(8, 1, vec![255, 255, 255, 255, 0, 0, 0, 0]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(48.0, 32.0, 20.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel(40, 32)[3],
+        255,
+        "the paper's solid half should paint"
+    );
+    assert_eq!(h.pixel(56, 32)[3], 0, "its empty half should not");
+}
+
+#[test]
+fn grain_is_anchored_to_the_paper_and_not_to_the_dab() {
+    // What makes it *paper*. Two dabs at different places must land on different
+    // parts of the tile, so the same brush pulled across a sheet catches and
+    // skips rather than stamping the same texture over and over.
+    //
+    // Tile of 32 document pixels, solid over x = 34..46 of each tile and empty
+    // over 50..62. Two identical dabs, one sitting in each: if the grain were
+    // anchored to the dab, they would be indistinguishable.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(8, 1, vec![255, 255, 255, 255, 0, 0, 0, 0]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(40.0, 32.0, 5.0, 1.0), dab(56.0, 32.0, 5.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel(40, 32)[3],
+        255,
+        "a dab over the tile's solid stretch should paint"
+    );
+    assert_eq!(
+        h.pixel(56, 32)[3],
+        0,
+        "an identical dab half a tile along should not — the grain is travelling \
+         with the brush"
+    );
+}
+
+#[test]
+fn a_grained_stroke_still_saturates_under_overlap() {
+    // The wet-layer guarantee has to survive the paper, exactly as it survived
+    // the tip. Grain modulates coverage; it does not touch the blend state.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(1, 1, vec![255]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 0.5), dab(32.0, 32.0, 12.0, 0.5)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (single coverage), got {alpha} — grained dabs are compounding"
+    );
+}
+
+#[test]
+fn a_grained_stroke_may_still_build_up() {
+    // The two combine, and they have to: paper is what makes a build-up brush
+    // interesting. A half-strength paper bites each dab down to 0.5 and the
+    // stroke then composites towards solid, where a `max` would stop at 0.5.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(1, 1, vec![128]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+
+    let d = dab(32.0, 32.0, 12.0, 1.0);
+    h.stamp(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    assert!(
+        h.pixel(32, 32)[3].abs_diff(128) <= 4,
+        "a max stroke should stop at the paper's own value, got {}",
+        h.pixel(32, 32)[3]
+    );
+
+    h.stamp_building(&[d; 8]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert!(
+        h.pixel_in(1, 32, 32)[3] >= 250,
+        "eight dabs through half-strength paper should build to solid, got {}",
+        h.pixel_in(1, 32, 32)[3]
+    );
 }
 
 // ---------------------------------------------------------------------------

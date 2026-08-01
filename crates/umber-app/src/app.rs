@@ -244,6 +244,16 @@ impl UmberApp {
             // by identity and returns without touching the GPU.
             canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
 
+            // The paper, on the same footing and for the same reasons: one
+            // binding per pass, changed only between strokes. Read off the
+            // *snapshotted* brush, so changing the Texture sliders mid-stroke
+            // cannot re-texture the half already painted.
+            let grain = self.editor.stroke.grain().and_then(|(strength, scale)| {
+                let key = self.editor.brush.grain_pattern.key();
+                umber_core::tip::pattern(key).map(|tile| (tile.clone(), strength, scale))
+            });
+            canvas.set_grain(&gfx.gpu.device, &gfx.gpu.queue, grain);
+
             let mut enc = gfx
                 .gpu
                 .device

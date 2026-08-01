@@ -350,6 +350,7 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         // MyPaint has no paper texture. The `.gbr` packs do.
         grain: 0.0,
         grain_scale: Brush::default().grain_scale,
+        grain_pattern: Brush::default().grain_pattern,
     })
 }
 

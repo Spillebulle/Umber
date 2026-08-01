@@ -17,12 +17,14 @@ pub mod geom;
 pub mod history;
 pub mod input;
 pub mod layer;
+mod pattern_table;
 pub mod preset;
 pub mod stroke;
 pub mod style;
 pub mod tip;
+mod tip_table;
 
-pub use brush::{Brush, BrushMode};
+pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::Camera;
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;

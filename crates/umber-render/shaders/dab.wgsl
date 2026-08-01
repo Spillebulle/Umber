@@ -19,6 +19,14 @@ struct DabUniforms {
     // placeholder. A scalar, not a vec3 pad: WGSL aligns vec3 to 16 bytes and
     // the Rust struct would come out short.
     use_tip: u32,
+    // How hard the paper bites, 0..1. Zero is the exact identity: coverage is
+    // multiplied by `mix(1.0, grain, strength)`, which at zero is a multiply by
+    // one and nothing else.
+    grain_strength: f32,
+    // Side of one tile of `grain`, in **document** pixels. Document rather than
+    // dab, because paper does not move when the brush does — that is the whole
+    // effect. A second pass over the same stretch lands in the same pits.
+    grain_scale: f32,
     _pad: f32,
 };
 
@@ -27,6 +35,13 @@ struct DabUniforms {
 // pass, so N dabs are still a single draw call.
 @group(0) @binding(1) var tip: texture_2d<f32>;
 @group(0) @binding(2) var tip_sampler: sampler;
+// Paper grain, R8Unorm, tiling. A 1x1 white placeholder when the brush asks for
+// none, exactly as the tip has — so the bind group layout never varies and
+// there is still one set of dab pipelines.
+@group(0) @binding(3) var grain: texture_2d<f32>;
+// Its own sampler, because this one **repeats** where the tip's clamps. A tip
+// stretched to its dab must not wrap; a paper tile must.
+@group(0) @binding(4) var grain_sampler: sampler;
 
 struct Instance {
     @location(0) pos: vec2<f32>,
@@ -53,6 +68,10 @@ struct VsOut {
     // two pixels across needs the same softening a two-pixel round brush does.
     @location(3) radius: f32,
     @location(4) color: vec3<f32>,
+    // Document position, for the grain. It has to be interpolated rather than
+    // derived from `local`, because the grain is anchored to the paper and
+    // `local` is anchored to the dab.
+    @location(5) doc: vec2<f32>,
 };
 
 @vertex
@@ -110,6 +129,7 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     // x. With no tip this is `short` exactly, since `aspect` is at least 1.
     out.radius = min(inst.radius * u.tip_scale.x, short * u.tip_scale.y);
     out.color = inst.color;
+    out.doc = doc;
     return out;
 }
 
@@ -139,10 +159,19 @@ fn dab_coverage(in: VsOut) -> f32 {
     let inner = clamp(in.hardness, 0.0, 1.0 - aa);
     let round = 1.0 - smoothstep(inner, 1.0, d);
 
+    // Paper. Sampled unconditionally for the same uniformity reason the tip is,
+    // and with the same 1x1 white placeholder standing in when there is none.
+    // `mix(1.0, g, 0.0)` is exactly 1.0, so a brush with no grain pays one
+    // multiply by one — `grain_off_is_the_exact_identity` pins that.
+    let tile = textureSample(grain, grain_sampler, in.doc / max(u.grain_scale, 1.0)).r;
+    let paper = mix(1.0, tile, u.grain_strength);
+
     // The tip *modulates coverage*; it does not composite. The blend state is
-    // still `max`, so a tipped stroke saturates at 1.0 under overlap exactly as
-    // a round one does — see the wet-layer section of CLAUDE.md.
-    return select(round, masked, u.use_tip != 0u) * in.coverage;
+    // unchanged by either the tip or the paper, so a tipped, grained stroke
+    // saturates at 1.0 under overlap exactly as a plain one does — unless the
+    // brush asked to build up, which is a blend choice and not this one. See
+    // the wet-layer section of CLAUDE.md.
+    return select(round, masked, u.use_tip != 0u) * in.coverage * paper;
 }
 
 // The ordinary path: coverage only, one attachment, one colour for the whole

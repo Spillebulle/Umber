@@ -15,6 +15,8 @@
 //! directory rather than the single RON file it used to be.
 
 use crate::preset::PresetError;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 /// An 8-bit coverage mask, row-major from the top-left.
 ///
@@ -183,6 +185,68 @@ impl TipMask {
         };
         Self::new(info.width, info.height, coverage)
     }
+}
+
+/// Every mask Umber ships, by name, decoded once.
+///
+/// The shipped library is an embedded RON and a bitmap does not go in a text
+/// file, so the masks are embedded separately and named from
+/// [`crate::BrushPreset::tip`] exactly as a user's own are. Naming rather than
+/// embedding-per-preset is what lets two shipped brushes cut from one stamp
+/// share a file and a single GPU upload.
+///
+/// The `Arc`s are stable for the life of the process, which
+/// `CanvasRenderer::set_tip` depends on: it compares tips by pointer identity to
+/// decide whether the GPU upload can be skipped, and a fresh `Arc` per lookup
+/// would put a texture allocation on the first frame of every stroke.
+///
+/// A shipped file that will not decode is dropped rather than fatal —
+/// `every_shipped_tip_decodes_and_makes_a_mark` is what stops one reaching a
+/// release — because a brush that paints round is a far better outcome than a
+/// binary that will not start.
+pub fn builtin_tips() -> &'static BTreeMap<&'static str, Arc<TipMask>> {
+    static TIPS: OnceLock<BTreeMap<&'static str, Arc<TipMask>>> = OnceLock::new();
+    TIPS.get_or_init(|| {
+        crate::tip_table::TIPS
+            .iter()
+            .filter_map(|(name, bytes)| {
+                TipMask::from_png(bytes)
+                    .ok()
+                    .map(|mask| (*name, Arc::new(mask)))
+            })
+            .collect()
+    })
+}
+
+/// The shipped mask a [`crate::BrushPreset::tip`] names, if it is one of ours.
+pub fn builtin(name: &str) -> Option<&'static Arc<TipMask>> {
+    builtin_tips().get(name)
+}
+
+/// Every paper grain Umber ships, by name, decoded once.
+///
+/// The same mechanism as [`builtin_tips`] and the same `Arc` stability
+/// guarantee, because the grain is uploaded and compared the same way. These
+/// are **tiles**: seamless by construction, since the grain is anchored to the
+/// document and repeats across it, and a seam would draw a grid over every
+/// stroke.
+pub fn patterns() -> &'static BTreeMap<&'static str, Arc<TipMask>> {
+    static PATTERNS: OnceLock<BTreeMap<&'static str, Arc<TipMask>>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        crate::pattern_table::PATTERNS
+            .iter()
+            .filter_map(|(name, bytes)| {
+                TipMask::from_png(bytes)
+                    .ok()
+                    .map(|mask| (*name, Arc::new(mask)))
+            })
+            .collect()
+    })
+}
+
+/// The tile a [`crate::brush::GrainPattern`] names.
+pub fn pattern(name: &str) -> Option<&'static Arc<TipMask>> {
+    patterns().get(name)
 }
 
 /// What a straight stroke of one tip reaches, under each of the two coverage
@@ -382,6 +446,100 @@ mod tests {
         // path relies on.
         let square = TipMask::new(2, 2, vec![1, 2, 3, 4]).expect("build");
         assert_eq!(square.aspect(), (1.0, 1.0));
+    }
+
+    /// A shipped tip that will not decode is a brush that paints round, which
+    /// is a quiet failure. The table is generated from a directory listing, so
+    /// the way to get one is to commit a file that is not a greyscale PNG.
+    #[test]
+    fn every_shipped_tip_decodes_and_makes_a_mark() {
+        assert_eq!(
+            builtin_tips().len(),
+            crate::tip_table::TIPS.len(),
+            "a shipped tip failed to decode"
+        );
+        assert!(!builtin_tips().is_empty(), "the table should not be empty");
+
+        for (name, mask) in builtin_tips() {
+            assert!(
+                stroke_coverage(mask, 0.1).is_usable(),
+                "{name} is too faint to accumulate — it would paint nothing"
+            );
+        }
+    }
+
+    /// Every shipped stamp has to paint at the strength it was drawn at, which
+    /// after the build-up work is a measurable claim rather than a hope.
+    #[test]
+    fn a_shipped_stamp_paints_at_the_strength_it_was_drawn_at() {
+        let stamped: Vec<_> = crate::preset::builtin()
+            .iter()
+            .filter(|p| p.tip.is_some())
+            .collect();
+        assert!(
+            !stamped.is_empty(),
+            "the shipped library carries no stamp brush, so the mechanism is untested"
+        );
+
+        for preset in stamped {
+            let name = preset.tip.as_deref().expect("tip");
+            let mask = builtin(name)
+                .unwrap_or_else(|| panic!("{} names a tip nobody ships: {name}", preset.name));
+            let measured = stroke_coverage(mask, preset.brush.spacing);
+            assert_eq!(
+                preset.brush.build_up,
+                measured.needs_build_up(),
+                "{} is shipped with build_up = {} but measures {measured:?}",
+                preset.name,
+                preset.brush.build_up
+            );
+        }
+    }
+
+    /// The grain is anchored to the document and repeats across it, so a seam
+    /// would draw a grid over every stroke that used it.
+    ///
+    /// Tested as a statistic rather than as an equality: the tiles are noise, so
+    /// neighbouring texels differ everywhere. What must not happen is for the
+    /// pair *across* the seam to differ by more than pairs inside the tile do.
+    #[test]
+    fn every_shipped_pattern_tiles_without_a_seam() {
+        assert_eq!(
+            patterns().len(),
+            crate::pattern_table::PATTERNS.len(),
+            "a shipped pattern failed to decode"
+        );
+
+        for (name, tile) in patterns() {
+            let (w, h) = (tile.width(), tile.height());
+            let step = |a: u8, b: u8| a.abs_diff(b) as f32;
+
+            let interior: f32 = (0..h)
+                .map(|y| step(tile.at(w / 2, y), tile.at(w / 2 + 1, y)))
+                .sum::<f32>()
+                / h as f32;
+            let seam: f32 = (0..h)
+                .map(|y| step(tile.at(w - 1, y), tile.at(0, y)))
+                .sum::<f32>()
+                / h as f32;
+            assert!(
+                seam <= interior * 2.0 + 1.0,
+                "{name} has a vertical seam: {seam:.2} across it, {interior:.2} inside"
+            );
+
+            let interior: f32 = (0..w)
+                .map(|x| step(tile.at(x, h / 2), tile.at(x, h / 2 + 1)))
+                .sum::<f32>()
+                / w as f32;
+            let seam: f32 = (0..w)
+                .map(|x| step(tile.at(x, h - 1), tile.at(x, 0)))
+                .sum::<f32>()
+                / w as f32;
+            assert!(
+                seam <= interior * 2.0 + 1.0,
+                "{name} has a horizontal seam: {seam:.2} across it, {interior:.2} inside"
+            );
+        }
     }
 
     /// The measurement `docs/brush-sources.md` turns on, in a form small enough

@@ -151,11 +151,18 @@ fn umber_defaults() -> Vec<BrushPreset> {
         category: crate::style::classify(name, &brush).to_string(),
         credit: Some(credit.clone()),
         brush,
-        // Umber ships no bitmap tips. The rule in `docs/brush-sources.md` is
-        // that a pack whose licence cannot be verified from its own files does
-        // not ship, and the stamp packs that clear it need engine work Umber
-        // has not done — see `docs/brushes.md`.
         tip: None,
+    };
+    // A shipped brush that carries a bitmap tip, resolved out of
+    // `crate::tip::builtin` rather than the user's library. Only one so far:
+    // no third-party stamp pack has yet cleared the licence rule in
+    // `docs/brush-sources.md`, so the one Umber ships is one Umber drew —
+    // `examples/build-bitmaps.rs` generates it, and it is deliberately sparse,
+    // because a stamp that paints the same under either coverage rule would
+    // demonstrate nothing.
+    let stamped = |id: &str, name: &str, tip: &str, brush: Brush| BrushPreset {
+        tip: Some(tip.to_string()),
+        ..make(id, name, brush)
     };
     vec![
         make(
@@ -216,6 +223,35 @@ fn umber_defaults() -> Vec<BrushPreset> {
                 opacity: 0.6,
                 spacing: 0.05,
                 pressure_size: false,
+                ..Brush::default()
+            },
+        ),
+        stamped(
+            "stipple-chalk",
+            "Stipple chalk",
+            "umber-stipple",
+            Brush {
+                size: 48.0,
+                opacity: 0.9,
+                // Close spacing: the stamp is a speckle, and it is the overlap
+                // of many of them that makes a stroke rather than a row of
+                // blobs.
+                spacing: 0.06,
+                pressure_size: false,
+                pressure_opacity: true,
+                // The stamp's brightest texel is around a half, so under a
+                // `max` this brush would paint at half strength however hard it
+                // was pressed. Measured, not assumed —
+                // `a_shipped_stamp_paints_at_the_strength_it_was_drawn_at`.
+                build_up: true,
+                // Every stamp lands the same way up unless it is told not to,
+                // and a repeated speckle that does is a texture with a grid in
+                // it.
+                dab_angle_jitter: 360.0,
+                dab_ratio: 1.0,
+                grain: 0.35,
+                grain_scale: 180.0,
+                grain_pattern: crate::brush::GrainPattern::Grit,
                 ..Brush::default()
             },
         ),
