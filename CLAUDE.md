@@ -243,9 +243,68 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   halfway must not replace the artist's last good file with a truncated archive.
 - **`read_layer_rect` blocks and a save calls it once per layer.** That is
   acceptable on an explicit Save and nowhere else; it must not migrate towards
-  the drawing loop, and an autosave will have to solve it first.
+  the drawing loop. The autosave does *not* use it — see "Autosave".
 - **Save must close a tab only when a file was actually written.** A cancelled
   file dialog is not permission to discard a document.
+- **`docformat::write_encoded` is the one atomic write.** `save` is `encode`
+  plus that; the autosave needs the halves apart because it puts one archive in
+  two places. A second temp-and-rename would be a second thing to get right.
+
+### Autosave
+
+`umber-app/src/autosave.rs`. The same file, on a timer, by a route that never
+stalls a frame — because the blocking readback a Save uses is exactly wrong
+when nobody asked for it.
+
+- **Nothing starts unless the pointer is up and no stroke is live.** That is
+  the whole of how an autosave cannot drop a stroke, and it makes "every five
+  minutes" mean "at the first quiet moment after five minutes" — which is what
+  a painter would choose anyway. `Autosave::next_due` is where it is decided
+  and it takes the `Session` rather than a list built by the caller, because it
+  runs **every frame** and the drawing path allocates nothing.
+- **The pixels come through `CanvasRenderer::begin_capture`, never
+  `read_layer_rect`.** One layer in flight at a time, one reused staging
+  buffer, four megabytes read out per frame. All three bounds were measured and
+  each is load-bearing: recording every copy at once cost 27 ms in one frame,
+  and reading a whole 16 MB layer in one go cost 5 ms. As it stands the worst
+  frame is about a millisecond. `a_capture_of_a_large_document_never_costs_a_
+  frame` pins it.
+- **A cancelled capture is marked, not dropped**, for the reason `reset_probes`
+  gives. Both halves have to be told — the renderer gives its buffer back, the
+  scheduler stops waiting — which is what `app.rs`'s `stop_autosave_of` is for.
+  Miss the scheduler half and *no* document is ever autosaved again, since only
+  one capture runs at a time.
+- **The metadata is snapshotted when the capture begins.** The readback spans
+  frames and the encode spans a thread; a layer renamed in between would
+  otherwise produce a file whose names and pixels came from different instants.
+- **Autosaving to the document's own path overwrites it without asking.** That
+  is what an autosave is. The tab's dot only comes off if `Tab::revision` still
+  matches the number taken when the capture began — claiming work was safe when
+  it was not is worse than claiming nothing.
+- **The undo history is not written.** Up to 32 MB of PNG-encoded patches, every
+  five minutes, unattended. An autosave exists so the painting is not lost, not
+  so the afternoon can be replayed.
+- **Expiry can only reach inside one directory, structurally.** `Reaper` is the
+  only thing in Umber that deletes a document, and "the callers only pass
+  internal paths" is not good enough — a later change makes that false in
+  silence. So: one canonicalised root; every candidate canonicalised
+  independently; the candidate's *parent* required to equal the root, so it
+  cannot descend; `symlink_metadata` first, so a link out of the directory is
+  refused before it is even resolved; no recursion; and only names an autosave
+  writes. The sweep is run against the directory an internal copy was just
+  written to, so there is no second statement of where that is.
+  `a_reaper_refuses_a_path_outside_its_root` and
+  `expiry_after_a_write_takes_the_old_copies_and_leaves_the_painters_file` are
+  the two that matter. **Do not add a call to `remove_file` that goes round
+  it.**
+- **A failure says so once and carries on.** A broken autosave must never
+  become a dialog that reappears over somebody's canvas every five minutes, and
+  it must never stop somebody painting.
+- **The window's close is refused until every unsaved document is accounted
+  for.** `WindowEvent::CloseRequested` used to exit on the spot. The prompt
+  names each document rather than counting them, and recomputes the list every
+  frame so one saved while it is up stops being named. `Editor::quit_requested`
+  is a flag because `ui::draw` has no `ActiveEventLoop`.
 
 ### Importing other applications' files
 
@@ -636,10 +695,12 @@ device with no surface, stamps dabs, commits, and reads pixels back. These tests
 catch shader and blend-state bugs that no CPU test can. They **skip** rather
 than fail when no adapter exists, so they stay meaningful on CI runners.
 
-`export_rgba` and `pick_colour` both reuse the *screen* composite pass with an
-export flag rather than having their own shader. A second copy of the blend
-maths would be a second thing to keep in step, and an export that differs from
-the screen is a classic bug. Keep it that way.
+`export_rgba`, `pick_colour` and the autosave's capture all reuse the *screen*
+composite pass with an export flag rather than having their own shader. A second
+copy of the blend maths would be a second thing to keep in step, and an export
+that differs from the screen is a classic bug. Keep it that way —
+`render_export` is the shared half, and `a_capture_reads_back_exactly_what_the_
+blocking_path_does` is what stops the two drifting.
 
 When changing rendering, add a test there. `overlapping_dabs_do_not_compound` is
 the model: it asserts a specific pixel value that only holds if the wet-layer

@@ -216,6 +216,25 @@ Settings are a plain `key = value` file you can read, in
 `~/Library/Application Support/Umber`; the dialog shows the exact path. A
 missing, older or corrupt file can never stop Umber starting.
 
+### Autosave
+
+Umber writes your open documents out every five minutes. It waits for a gap
+between strokes, so it never interrupts one, and it never pauses the canvas —
+the pixels come off the graphics card a little at a time and the file is
+written on a thread.
+
+A document you have saved somewhere is written back to that file, replacing it.
+A document you have never saved goes to a folder of Umber's own; so does a copy
+of everything else, as a second chance. **Settings → General** has the switch,
+the interval, and a button that opens that folder.
+
+Those internal copies are deleted once they are a month old — you can change
+that, or turn it off. Nothing Umber deletes is ever a file you chose the place
+for.
+
+Closing the window with unsaved work asks first, and names every document at
+risk.
+
 ## Controls
 
 | Input | Action |
@@ -245,10 +264,10 @@ Settings → Pressure. A native tablet path is on the roadmap.
 ## What is not there yet
 
 - **Selections, text, shapes and transforms.** The tool rail has four tools.
-- **Autosave and recovery.** Saving works and does not lose work when it fails;
-  it does not yet protect you from not having done it.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
   been built or run. Do not believe anyone who says otherwise.
+- **Automatic crash recovery.** Autosave keeps copies and Settings will open the
+  folder, but nothing offers one back to you the next time Umber starts.
 - **Structural undo.** Undo covers painting; adding, deleting or reordering a
   layer is not recorded, and deleting a layer clears the history.
 - **Native desktop pen pressure**, as above.

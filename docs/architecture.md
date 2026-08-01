@@ -174,10 +174,17 @@ Next, roughly in order:
   guarantee; until then About says exactly what is and is not promised.
 - Structural undo, so layer add/delete/reorder joins the history — and stops
   the History module having to explain that it lists strokes and not layers
-- Getting the save off the drawing thread. It reads every layer back from the
-  GPU with a blocking call, so a large document pauses for a moment — the one
-  place left where Umber does the thing it exists not to do.
-- Autosave and crash recovery, now that there is a format to write them in
+- Getting the *explicit* save off the drawing thread. It still reads every
+  layer back with a blocking call, so a large document pauses for a moment —
+  the one place left where Umber does the thing it exists not to do. The
+  machinery to fix it now exists: `CanvasRenderer::begin_capture` reads a whole
+  document without stalling a frame, which is how autosave works, and Save
+  could use the same path once it has an answer for what the interface shows
+  while it waits.
+- Crash recovery — noticing an internal autosave newer than the file it belongs
+  to, and offering it on the next start. The copies are written; nothing reads
+  them back automatically, so today a recovery means opening one out of the
+  folder by hand.
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop
