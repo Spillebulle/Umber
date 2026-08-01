@@ -28,6 +28,24 @@ struct DabUniforms {
     // effect. A second pass over the same stretch lands in the same pits.
     grain_scale: f32,
     _pad: f32,
+    // The selection's bounding rectangle, in document pixels: where the
+    // `selection` texture is mapped to. The mask covers only its own bounds
+    // rather than the whole canvas, because a lasso round one eye should not
+    // cost a texture the size of the portrait.
+    //
+    // `sel_size` is (1, 1) with no selection, so the divide below is never by
+    // zero even though the result is discarded.
+    sel_min: vec2<f32>,
+    sel_size: vec2<f32>,
+    // Non-zero when `selection` holds a real mask. Unlike the tip and the
+    // paper, a placeholder cannot stand in for "no selection": a 1x1 texture
+    // sampled outside its own rectangle is zero, which would mean *nothing*
+    // may be painted. Hence a flag, read through a `select` rather than a
+    // branch — see `selection_mask`.
+    use_selection: u32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: DabUniforms;
@@ -42,6 +60,11 @@ struct DabUniforms {
 // Its own sampler, because this one **repeats** where the tip's clamps. A tip
 // stretched to its dab must not wrap; a paper tile must.
 @group(0) @binding(4) var grain_sampler: sampler;
+// The selection mask, R8Unorm coverage over `sel_min`..`sel_min + sel_size`.
+// A 1x1 placeholder when nothing is selected, in which case `use_selection` is
+// zero and it is never read. Sampled through `tip_sampler`, which clamps: a
+// mask must not wrap, for the same reason a tip must not.
+@group(0) @binding(5) var selection: texture_2d<f32>;
 
 struct Instance {
     @location(0) pos: vec2<f32>,
@@ -133,6 +156,32 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     return out;
 }
 
+// How much of this fragment the selection lets through, 1.0 everywhere when
+// nothing is selected.
+//
+// **This is the only place a selection clips painting**, and that is the whole
+// design. The scratch texture then holds coverage that is already clipped, so
+// `composite.wgsl` and `commit.wgsl` are untouched — which matters because
+// those two implement the same blending maths and a stroke that clipped
+// differently in one of them would visibly jump at pointer-up. Clipping the
+// coverage on the way in cannot produce that bug, because there is one copy of
+// it.
+//
+// Sampled unconditionally, like the tip and the paper: `textureSample` may not
+// appear in non-uniform control flow, and the placeholder read costs a cache
+// hit. With `use_selection` at zero this returns exactly 1.0, so a document
+// with no selection pays one multiply by one.
+fn selection_mask(doc: vec2<f32>) -> f32 {
+    let suv = (doc - u.sel_min) / u.sel_size;
+    let m = textureSample(selection, tip_sampler, suv).r;
+    // Outside the mask's own rectangle is outside the selection. Clamping
+    // would smear the boundary texels across the rest of the canvas instead,
+    // which for a rectangle selection means the whole row and column beyond it
+    // stay paintable.
+    let inside = all(suv >= vec2<f32>(0.0)) && all(suv <= vec2<f32>(1.0));
+    return select(1.0, select(0.0, m, inside), u.use_selection != 0u);
+}
+
 // Coverage of one dab at this fragment, before the stroke's own opacity.
 //
 // Shared by both fragment entry points so the two pipelines cannot drift into
@@ -171,7 +220,13 @@ fn dab_coverage(in: VsOut) -> f32 {
     // saturates at 1.0 under overlap exactly as a plain one does — unless the
     // brush asked to build up, which is a blend choice and not this one. See
     // the wet-layer section of CLAUDE.md.
-    return select(round, masked, u.use_tip != 0u) * in.coverage * paper;
+    //
+    // The selection multiplies last, for the same reason the paper does: it
+    // modulates coverage rather than compositing, so an eraser inside a
+    // selection erases exactly what a brush inside it would paint, and a
+    // building-up stroke accumulates the clipped coverage rather than
+    // accumulating and then being clipped once.
+    return select(round, masked, u.use_tip != 0u) * in.coverage * paper * selection_mask(in.doc);
 }
 
 // The ordinary path: coverage only, one attachment, one colour for the whole
