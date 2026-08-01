@@ -325,10 +325,23 @@ impl Modulation {
 /// Fixed capacity so [`crate::Brush`] stays `Copy`, and serialised as a plain
 /// sequence of the live entries so an empty one costs `[]` in the library file
 /// and an old library with no such field loads unchanged.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Modulations {
     entries: [Modulation; Self::MAX],
     len: u8,
+}
+
+/// Only the live entries count.
+///
+/// A derived `PartialEq` would compare the unused tail as well, and the tail is
+/// whatever was last there — [`Modulations::remove`] shifts entries down and
+/// leaves a copy behind. Two brushes that behave identically would then compare
+/// unequal depending on their editing history, which is the sort of thing that
+/// makes an "unsaved changes" prompt appear for no reason.
+impl PartialEq for Modulations {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 impl Default for Modulations {
@@ -708,6 +721,24 @@ mod tests {
         .collect();
         let back: Modulations = ron::from_str(&ron::to_string(&t).expect("serialise")).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn only_the_live_entries_decide_whether_two_tables_are_equal() {
+        // `remove` shifts entries down and leaves a copy in the tail. A derived
+        // `PartialEq` would see that copy and call two identical brushes
+        // different, on the strength of one of them having been edited.
+        let mut a: Modulations = [
+            m(DabTarget::Size, DabInput::Speed, 0.0, 1.0),
+            m(DabTarget::Ratio, DabInput::Random, 0.0, 2.0),
+        ]
+        .into_iter()
+        .collect();
+        a.remove(1);
+        let b: Modulations = [m(DabTarget::Size, DabInput::Speed, 0.0, 1.0)]
+            .into_iter()
+            .collect();
+        assert_eq!(a, b);
     }
 
     #[test]
