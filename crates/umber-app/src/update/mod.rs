@@ -32,7 +32,7 @@ pub mod version;
 
 pub use apply::{Applied, sweep_previous_binary};
 pub use install::InstallKind;
-pub use release::{REPOSITORY, Release};
+pub use release::{RELEASES_PAGE, REPOSITORY, Release};
 pub use version::Version;
 
 use install::{Arch, Os, Probe};
@@ -431,7 +431,7 @@ mod tests {
     fn switching_the_check_off_keeps_it_off() {
         let mut updates = Updates {
             check_on_startup: false,
-            notice_seen: true,
+            notice_seen: false,
             ..Updates::default()
         };
         updates.start_if_due();
@@ -458,7 +458,7 @@ mod tests {
         let release = Release {
             version: Version::parse("9.9.9").expect("parses"),
             tag: "v9.9.9".into(),
-            page: release::RELEASES_PAGE.into(),
+            page: RELEASES_PAGE.into(),
             notes: String::new(),
             assets: vec![Asset {
                 name: "umber-9.9.9-x86_64-unknown-linux-gnu.tar.gz".into(),

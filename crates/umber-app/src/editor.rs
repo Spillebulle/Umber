@@ -65,6 +65,8 @@ pub struct UiState {
     pub brush_tab: BrushTab,
     pub settings_open: bool,
     pub settings_tab: SettingsTab,
+    /// Help, About. The update prompts raise themselves and are not here.
+    pub about_open: bool,
     /// Tab whose close is waiting on confirmation, if any.
     pub close_prompt: Option<usize>,
     /// Which row of the brush editor's Inputs list is open for editing.
@@ -114,6 +116,7 @@ impl Default for UiState {
             brush_tab: BrushTab::Tip,
             settings_open: false,
             settings_tab: SettingsTab::Themes,
+            about_open: false,
             close_prompt: None,
             modulation: 0,
         }

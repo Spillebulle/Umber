@@ -66,12 +66,11 @@ const WINDOW_ICON: u32 = 64;
 /// it rather than a stretched one — the mark is a square, and stretching a brand
 /// element is worse than ignoring the extra space.
 ///
-/// Currently unused inside this crate: the splash draws the mark on the CPU
-/// because it runs before egui exists, and the menu bar still inlines its own
-/// `rect_filled`. This is the shared entry point that call site should move to,
-/// and it is deliberately kept rather than deleted — it is the only place the
-/// mark's geometry is stated for an egui painter.
-#[allow(dead_code, reason = "the menu bar has not been moved onto it yet")]
+/// Drawn by the About dialog, which is the first thing to want the mark at a
+/// size worth looking at. The splash rasterises it on the CPU instead, because
+/// it runs before egui exists, and the menu bar still inlines its own
+/// `rect_filled` — that call site should move here too. This is the only place
+/// the mark's geometry is stated for an egui painter.
 pub fn draw_mark(painter: &Painter, rect: Rect, palette: &Palette) {
     let side = rect.width().min(rect.height());
     if side <= 0.0 {

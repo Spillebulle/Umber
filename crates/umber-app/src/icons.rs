@@ -39,6 +39,11 @@ pub enum Icon {
     // Brush library
     Grid,
     Import,
+    // About and updates
+    /// An arrow leaving a box: this opens somewhere outside Umber.
+    Link,
+    /// An arrow onto a line: fetch this.
+    Download,
     // Layout
     Grip,
     Corner,
@@ -188,6 +193,30 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 at(19.0, 20.0),
                 at(19.0, 15.0),
             ]);
+        }
+
+        Icon::Link => {
+            // A box with its top-right corner open, and an arrow leaving
+            // through it. The gap is what stops this reading as "add to a
+            // frame": the arrow has to be seen to be going *out*.
+            path(vec![
+                at(13.0, 5.0),
+                at(5.0, 5.0),
+                at(5.0, 19.0),
+                at(19.0, 19.0),
+                at(19.0, 11.0),
+            ]);
+            line(at(11.5, 12.5), at(19.0, 5.0));
+            path(vec![at(13.0, 5.0), at(19.0, 5.0), at(19.0, 11.0)]);
+        }
+
+        Icon::Download => {
+            // Distinct from `Import`, which drops into an open tray: this is a
+            // plain arrow onto a closed line, because what it fetches is one
+            // file rather than an addition to a collection.
+            line(at(12.0, 4.0), at(12.0, 15.0));
+            path(vec![at(7.5, 10.5), at(12.0, 15.0), at(16.5, 10.5)]);
+            line(at(5.0, 19.5), at(19.0, 19.5));
         }
 
         Icon::Grip => {
