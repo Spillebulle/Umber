@@ -172,7 +172,7 @@ jobs:
   flatpak:
     name: build Flatpak
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -181,13 +181,27 @@ jobs:
           name: x86_64-unknown-linux-gnu
           path: dist
 
+      # The builder comes from Flathub rather than from apt.
+      #
+      # A distribution's flatpak-builder ages independently of the runtime it
+      # is asked to build against, and the two fall out of step: Ubuntu
+      # 22.04's 1.2 only knows how to run `appstream-compose`, which the 24.08
+      # SDK no longer ships — it has `appstreamcli` instead — so the build died
+      # at `execvp appstream-compose: No such file or directory`. Ubuntu
+      # 24.04's 1.4.2 does know `appstreamcli compose`, so a runner bump would
+      # have worked today and broken again at the next runtime.
+      #
+      # `org.flatpak.Builder` is Flathub's own packaging of the builder and
+      # carries the tooling it needs, so this stops being a question about
+      # whichever runner image is current.
       - name: Install flatpak
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder desktop-file-utils
+          sudo apt-get install -y flatpak
           flatpak remote-add --if-not-exists --user \
             flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y --noninteractive flathub \
+            org.flatpak.Builder \
             org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
 
       - name: Build
@@ -199,11 +213,13 @@ jobs:
             packaging/linux/umber-linux.tar.gz
           mkdir -p out
           cd packaging/linux
-          flatpak-builder --user --disable-rofiles-fuse --force-clean \
-            --repo=repo build-dir io.github.spillebulle.umber.yml
+          flatpak run org.flatpak.Builder --user --disable-rofiles-fuse \
+            --force-clean --repo=repo build-dir \
+            io.github.spillebulle.umber.yml
           flatpak build-bundle repo \
             "../../out/umber-${version}-x86_64.flatpak" \
-            io.github.spillebulle.umber --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+            io.github.spillebulle.umber \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
 
       - uses: actions/upload-artifact@v4
         with:
