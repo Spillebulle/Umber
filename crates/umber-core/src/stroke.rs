@@ -29,17 +29,63 @@ use glam::Vec2;
 /// application was not responding, but everybody notices the hang.
 const MAX_TIMED_DABS_PER_SAMPLE: u32 = 64;
 
+/// A tiny xorshift, for scattering dabs.
+///
+/// Deliberately not the `rand` crate. This wants a few numbers per dab with no
+/// statistical claims beyond "does not visibly repeat", and `umber-core` has
+/// four dependencies; adding one for eight lines would be the wrong trade.
+///
+/// Not seeded from the clock, either: a stroke that scatters differently every
+/// time it is replayed would make the renderer's output depend on when it ran,
+/// and every pixel test in the suite would become flaky. The seed advances per
+/// stroke instead, so two strokes differ but one stroke is reproducible.
+#[derive(Debug, Clone, Copy)]
+struct Rng(u32);
+
+impl Rng {
+    fn new(seed: u32) -> Self {
+        // Zero is a fixed point of xorshift — it would return zero forever, and
+        // a "random" scatter of exactly zero is the bug that hides itself.
+        Self(seed | 1)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+
+    /// Uniform in `-1.0..1.0`.
+    fn signed(&mut self) -> f32 {
+        (self.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// Roughly normal, mean 0, standard deviation 1.
+    ///
+    /// Three uniforms summed, which is the cheap central-limit trick: close
+    /// enough to a bell for scattering paint, bounded at ±3 so a single dab can
+    /// never fly to the far side of the canvas, and no `ln` or `sqrt` per dab.
+    fn gaussian(&mut self) -> f32 {
+        self.signed() + self.signed() + self.signed()
+    }
+}
+
 /// One stamp, laid out for direct upload as GPU instance data.
 ///
-/// Exactly 32 bytes, which is both a power-of-two stride — instance fetches
-/// never straddle a cache line — and, as it happens, precisely what the fields
-/// need once the colour is included. Per-dab colour therefore costs no instance
-/// bandwidth at all; it went into what used to be padding.
+/// 40 bytes. It was 32 — a power-of-two stride, so an instance fetch never
+/// straddled a cache line — until dabs stopped being circles. Shape is worth
+/// the eight bytes and then some: a frame of fast drawing is a few hundred
+/// dabs, so the whole instance upload is single-digit kilobytes either way,
+/// while a brush that cannot be anything but round is 64% of the library
+/// misrepresented.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Dab {
     /// Centre in document pixels.
     pub pos: [f32; 2],
+    /// Semi-axis along [`Dab::angle`] — the **long** one whenever `aspect`
+    /// exceeds 1.0.
     pub radius: f32,
     pub hardness: f32,
     /// Per-dab coverage, *excluding* stroke opacity.
@@ -51,16 +97,25 @@ pub struct Dab {
     /// uniform instead. It differs only along a smudging stroke, which is the
     /// entire reason it exists.
     pub color: [f32; 3],
+    /// Long axis over short axis. 1.0 is a circle.
+    pub aspect: f32,
+    /// Direction of the long axis, in **radians**. Converted from the degrees
+    /// `Brush` holds once here, rather than in the shader for every fragment.
+    pub angle: f32,
 }
 
 impl Dab {
-    fn new(pos: Vec2, radius: f32, hardness: f32, coverage: f32, color: [f32; 3]) -> Self {
+    /// A plain round dab. Kept for the callers — tests, mostly — that do not
+    /// care about shape.
+    pub fn round(pos: Vec2, radius: f32, hardness: f32, coverage: f32) -> Self {
         Self {
             pos: [pos.x, pos.y],
             radius,
             hardness,
             coverage,
-            color,
+            color: [0.0; 3],
+            aspect: 1.0,
+            angle: 0.0,
         }
     }
 }
@@ -94,6 +149,16 @@ pub struct StrokeBuilder {
     /// nothing up yet paints its palette colour rather than black — starting it
     /// at zero would put a dark head on every smudged stroke.
     smudge: Option<[f32; 3]>,
+    /// Scatter and radius jitter. Re-seeded per stroke, so one stroke redraws
+    /// identically while two strokes differ.
+    rng: Rng,
+    /// How many strokes have been begun, which is the seed. Wrapping is fine —
+    /// it only has to differ between neighbouring strokes.
+    stroke_count: u32,
+    /// Unit vector along the stroke, for brushes whose dab turns to follow it.
+    /// Starts pointing along +x so the very first dab of a stroke, laid before
+    /// any direction exists, is not stamped at a random angle.
+    heading: Vec2,
 }
 
 // Written out rather than derived: a derived `Default` would zero `bounds`,
@@ -118,6 +183,9 @@ impl StrokeBuilder {
             bounds: Rect::empty(),
             paint: [0.0; 3],
             smudge: None,
+            rng: Rng::new(1),
+            stroke_count: 0,
+            heading: Vec2::X,
         }
     }
 
@@ -196,6 +264,12 @@ impl StrokeBuilder {
         self.paint = paint;
         self.smudge = None;
         self.active = true;
+        self.stroke_count = self.stroke_count.wrapping_add(1);
+        // Mixed rather than used raw: consecutive small seeds give xorshift
+        // visibly similar first outputs, and two strokes in a row scattering
+        // the same way is exactly what scatter is supposed to avoid.
+        self.rng = Rng::new(self.stroke_count.wrapping_mul(0x9E37_79B9));
+        self.heading = Vec2::X;
         self.smoothed = point.pos;
         self.residual = 0.0;
         self.time_residual = 0.0;
@@ -247,6 +321,7 @@ impl StrokeBuilder {
             return;
         }
         let dir = seg / len;
+        self.heading = dir;
 
         // Walk the segment, dropping a dab every `step` document pixels. `step`
         // is recomputed per dab because pressure (and therefore size) varies
@@ -305,16 +380,48 @@ impl StrokeBuilder {
     }
 
     fn emit(&mut self, pos: Vec2, pressure: f32) {
-        let radius = self.brush.radius_at(pressure);
+        let mut radius = self.brush.radius_at(pressure);
         let coverage = self.brush.coverage_at(pressure);
-        self.pending.push(Dab::new(
-            pos,
+
+        // Jitter in log space, so the variation is symmetric about the nominal
+        // radius and cannot produce a negative one however large the setting.
+        if self.brush.radius_jitter > 0.0 {
+            radius *= (self.rng.gaussian() * self.brush.radius_jitter).exp();
+            radius = radius.clamp(0.05, Brush::MAX_SIZE);
+        }
+
+        // Scatter is stated in radii, so a big brush sprays wider than a small
+        // one — which is what keeps a spray can looking like itself at any size.
+        let mut centre = pos;
+        if self.brush.scatter > 0.0 {
+            let spread = radius * self.brush.scatter;
+            centre += Vec2::new(self.rng.gaussian(), self.rng.gaussian()) * spread;
+        }
+
+        let angle = if self.brush.dab_angle_follows_stroke {
+            // A rake keeps its bristles across the line of travel. `heading` is
+            // whatever the last segment was, so the dab turns through a curve.
+            self.heading.y.atan2(self.heading.x) + self.brush.dab_angle.to_radians()
+        } else {
+            self.brush.dab_angle.to_radians()
+        };
+
+        self.pending.push(Dab {
+            pos: [centre.x, centre.y],
             radius,
-            self.brush.hardness,
+            hardness: self.brush.hardness,
             coverage,
-            self.dab_color(),
-        ));
-        self.bounds.union_circle(pos, radius);
+            color: self.dab_color(),
+            aspect: self.brush.dab_ratio.max(1.0),
+            angle,
+        });
+
+        // Bounded by the circumscribing circle of the *scattered* dab. The long
+        // axis is `radius` whatever the aspect, so this covers the ellipse at
+        // every angle without having to work out where it actually points —
+        // and an under-tight bound here is a stroke whose edge is not committed
+        // and reappears as a ghost on the next stroke.
+        self.bounds.union_circle(centre, radius);
     }
 
     /// The colour this dab deposits: the palette colour, pulled towards
@@ -688,6 +795,197 @@ mod tests {
         // A quarter second in ten reports is still a quarter second of paint.
         let n = s.pending_len();
         assert!((9..=11).contains(&n), "expected ~10 timed dabs, got {n}");
+    }
+
+    fn scattered(scatter: f32, jitter: f32) -> Brush {
+        Brush {
+            size: 20.0,
+            spacing: 0.1,
+            stabilization: 0.0,
+            pressure_size: false,
+            scatter,
+            radius_jitter: jitter,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unscattered_brush_lays_every_dab_exactly_on_the_line() {
+        // The default path, and the one every pixel test in the suite depends
+        // on: no scatter means no randomness at all, not "randomness with a
+        // small amplitude".
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            unsmoothed(20.0, 0.1),
+            WHITE,
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(100.0, 0.0), 1.0, 0.1));
+        for dab in s.drain_pending() {
+            assert_eq!(dab.pos[1], 0.0, "a dab left the line");
+            assert_eq!(dab.aspect, 1.0);
+        }
+    }
+
+    #[test]
+    fn scatter_moves_dabs_off_the_line_in_proportion_to_the_radius() {
+        // A spray can has to spray. Stated in radii, so a big brush sprays
+        // wider than a small one and the brush looks like itself at any size.
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            scattered(1.0, 0.0),
+            WHITE,
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert!(dabs.len() > 20);
+
+        let off_line = dabs.iter().filter(|d| d.pos[1].abs() > 0.5).count();
+        assert!(
+            off_line > dabs.len() / 2,
+            "only {off_line} of {} dabs scattered",
+            dabs.len()
+        );
+        // Bounded: three summed uniforms cannot exceed 3 sigma, so no dab can
+        // fly to the far side of the canvas.
+        let radius = 10.0;
+        for d in &dabs {
+            assert!(d.pos[1].abs() < radius * 3.5, "dab flew to {:?}", d.pos);
+        }
+    }
+
+    #[test]
+    fn the_damaged_rect_covers_where_the_dabs_actually_landed() {
+        // Scatter moves dabs off the path, and the committed rectangle is
+        // computed from these bounds. Too tight and the edge of a spray is
+        // never baked in: it redraws as a live preview and is then committed by
+        // the *next* stroke, in that stroke's colour. Exactly the ghosting the
+        // pending-tail bug produced.
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            scattered(2.0, 0.5),
+            WHITE,
+            InputPoint::new(vec2(500.0, 500.0), 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(600.0, 500.0), 1.0, 0.1));
+
+        let bounds = s.bounds();
+        for d in s.drain_pending() {
+            let (x, y, r) = (d.pos[0], d.pos[1], d.radius);
+            assert!(
+                bounds.min.x <= x - r
+                    && bounds.max.x >= x + r
+                    && bounds.min.y <= y - r
+                    && bounds.max.y >= y + r,
+                "dab at {:?} r{r} escapes {bounds:?}",
+                d.pos
+            );
+        }
+    }
+
+    #[test]
+    fn radius_jitter_varies_the_size_without_ever_going_negative() {
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            scattered(0.0, 0.8),
+            WHITE,
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+
+        let mut varied = false;
+        for d in &dabs {
+            assert!(d.radius > 0.0, "non-positive radius {}", d.radius);
+            if (d.radius - 10.0).abs() > 0.5 {
+                varied = true;
+            }
+        }
+        assert!(varied, "jitter produced no variation at all");
+    }
+
+    #[test]
+    fn one_stroke_redraws_identically_but_two_strokes_differ() {
+        // Seeded per stroke rather than from the clock. Without this every
+        // pixel test that involves a scattering brush becomes flaky, and a
+        // stroke would land differently each time it was replayed.
+        let mut s = StrokeBuilder::new();
+        let run = |s: &mut StrokeBuilder| {
+            s.begin(
+                scattered(1.5, 0.0),
+                WHITE,
+                InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+            );
+            s.extend(InputPoint::new(vec2(100.0, 0.0), 1.0, 0.1));
+            let out: Vec<[f32; 2]> = s.drain_pending().map(|d| d.pos).collect();
+            s.end();
+            out
+        };
+        let first = run(&mut s);
+        let second = run(&mut s);
+        assert_ne!(first, second, "two strokes scattered identically");
+
+        // A fresh builder replays the sequence exactly.
+        let mut t = StrokeBuilder::new();
+        assert_eq!(run(&mut t), first, "the first stroke is not reproducible");
+    }
+
+    #[test]
+    fn a_following_dab_turns_with_the_stroke() {
+        let rake = Brush {
+            size: 20.0,
+            spacing: 0.5,
+            stabilization: 0.0,
+            pressure_size: false,
+            dab_ratio: 5.0,
+            dab_angle_follows_stroke: true,
+            ..Default::default()
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(rake, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.drain_pending();
+
+        s.extend(InputPoint::new(vec2(50.0, 0.0), 1.0, 0.1));
+        let east = s.drain_pending().next().expect("a dab").angle;
+        assert!(
+            east.abs() < 1e-3,
+            "travelling +x should be angle 0, got {east}"
+        );
+
+        s.extend(InputPoint::new(vec2(50.0, 50.0), 1.0, 0.2));
+        let south = s.drain_pending().next().expect("a dab").angle;
+        assert!(
+            (south - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
+            "travelling +y should be a quarter turn, got {south}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_angle_dab_holds_its_angle_through_a_turn() {
+        // The nib, as against the rake above. This is what produces
+        // calligraphic thick-and-thin, and it is the whole difference.
+        let nib = Brush {
+            size: 20.0,
+            spacing: 0.5,
+            stabilization: 0.0,
+            pressure_size: false,
+            dab_ratio: 5.0,
+            dab_angle: 30.0,
+            ..Default::default()
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(nib, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(50.0, 0.0), 1.0, 0.1));
+        s.extend(InputPoint::new(vec2(50.0, 50.0), 1.0, 0.2));
+        let want = 30f32.to_radians();
+        for d in s.drain_pending() {
+            assert!(
+                (d.angle - want).abs() < 1e-4,
+                "angle drifted to {}",
+                d.angle
+            );
+        }
     }
 
     #[test]

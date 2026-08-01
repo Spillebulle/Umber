@@ -80,7 +80,7 @@ const STROKE_COLOR_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
 
 /// Instance layout, shared by both dab pipelines so they cannot disagree about
 /// what a `Dab` looks like in memory.
-const DAB_ATTRS: [wgpu::VertexAttribute; 5] = [
+const DAB_ATTRS: [wgpu::VertexAttribute; 7] = [
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Float32x2,
         offset: 0,
@@ -106,6 +106,16 @@ const DAB_ATTRS: [wgpu::VertexAttribute; 5] = [
         offset: 20,
         shader_location: 4,
     },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 32,
+        shader_location: 5,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 36,
+        shader_location: 6,
+    },
 ];
 
 const DAB_VERTEX_LAYOUT: &[wgpu::VertexBufferLayout] = &[wgpu::VertexBufferLayout {
@@ -119,7 +129,18 @@ const DAB_VERTEX_LAYOUT: &[wgpu::VertexBufferLayout] = &[wgpu::VertexBufferLayou
 /// Small on purpose: it is averaged to a single colour, so it only has to be
 /// wide enough that one stray pixel cannot dominate what the brush picks up.
 const PROBE_SIZE: u32 = 8;
-const PROBE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Format of every target that is not the window: PNG export, the eyedropper's
+/// one pixel, and the smudge probe.
+///
+/// It must have a **pipeline of its own**. A render pipeline is compiled
+/// against its target's format, and the surface is whatever the swapchain
+/// offers — `Bgra8Unorm` on a good deal of Windows hardware. Compositing into
+/// one of these with the screen's pipeline is a validation error that kills the
+/// process, and it is invisible on any machine whose surface happens to be
+/// `Rgba8Unorm`.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+const PROBE_FORMAT: wgpu::TextureFormat = OFFSCREEN_FORMAT;
 /// Rows in a texture-to-buffer copy must be a multiple of 256 bytes, and eight
 /// RGBA pixels are 32 — so each row is padded and the reader strides over it.
 const PROBE_ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -390,6 +411,10 @@ struct Shared {
     dab_layout: wgpu::BindGroupLayout,
 
     composite_pipeline: wgpu::RenderPipeline,
+    /// The same pass compiled for [`OFFSCREEN_FORMAT`], for export, the
+    /// eyedropper and the smudge probe. See that constant for why the screen's
+    /// pipeline cannot be reused.
+    composite_offscreen_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
 
     commit_layout: wgpu::BindGroupLayout,
@@ -526,33 +551,41 @@ impl Shared {
                 texture_entry(4),
             ],
         });
-        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("composite-pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("composite-pl"),
-                    bind_group_layouts: &[Some(&composite_layout)],
-                    immediate_size: 0,
-                }),
-            ),
-            vertex: wgpu::VertexState {
-                module: &composite_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &composite_shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(surface_format.into())],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+        let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite-pl"),
+            bind_group_layouts: &[Some(&composite_layout)],
+            immediate_size: 0,
         });
+        // One composite *shader*, two pipelines, differing only in target
+        // format. The blend maths — the thing that must never be duplicated —
+        // is shared; what cannot be shared is the format a pipeline is compiled
+        // against, and the window's is whatever the swapchain hands us.
+        let make_composite = |label: &str, format: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&composite_pl),
+                vertex: wgpu::VertexState {
+                    module: &composite_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &composite_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(format.into())],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let composite_pipeline = make_composite("composite-pipeline", surface_format);
+        let composite_offscreen_pipeline =
+            make_composite("composite-offscreen-pipeline", OFFSCREEN_FORMAT);
 
         // ---- commit pass ----------------------------------------------------
         let commit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -636,6 +669,7 @@ impl Shared {
             dab_colored_pipeline,
             dab_layout,
             composite_pipeline,
+            composite_offscreen_pipeline,
             composite_layout,
             commit_layout,
             commit_pipeline,
@@ -1123,7 +1157,14 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.shared.composite_pipeline);
+        // `export` means both "straight alpha, no checkerboard" and "this is
+        // not the window", and the two always travel together: every offscreen
+        // target Umber composites into is `OFFSCREEN_FORMAT`.
+        pass.set_pipeline(if params.export {
+            &self.shared.composite_offscreen_pipeline
+        } else {
+            &self.shared.composite_pipeline
+        });
         pass.set_bind_group(0, &self.composite_bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
@@ -1236,7 +1277,7 @@ impl CanvasRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: OFFSCREEN_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -1345,7 +1386,7 @@ impl CanvasRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: OFFSCREEN_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });

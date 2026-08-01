@@ -28,14 +28,21 @@ struct Instance {
     // Linear RGB this dab deposits. Read only by `fs_colored`; an ordinary
     // stroke leaves it equal to the stroke colour and never looks at it.
     @location(4) color: vec3<f32>,
+    @location(5) aspect: f32,
+    @location(6) angle: f32,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
-    // Position within the dab, -1..1 on each axis.
+    // Position within the dab, -1..1 on each axis — already in the dab's own
+    // frame, so an ellipse is a unit circle here and the fragment shader does
+    // not need to know the shape at all.
     @location(0) local: vec2<f32>,
     @location(1) hardness: f32,
     @location(2) coverage: f32,
+    // The *short* semi-axis, in document pixels. Only used to size the
+    // antialiasing margin, and the short axis is the demanding one: a chisel
+    // two pixels across needs the same softening a two-pixel round brush does.
     @location(3) radius: f32,
     @location(4) color: vec3<f32>,
 };
@@ -49,7 +56,25 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
         vec2<f32>( 1.0,  1.0),
     );
     let corner = corners[vi];
-    let doc = inst.pos + corner * inst.radius;
+
+    // Build the quad as the dab's own bounding box, squashed across the long
+    // axis and then rotated into place. Two consequences worth keeping:
+    //
+    //   - `corner` stays the fragment's position in the dab's own frame, so
+    //     `length(local) <= 1` is still "inside", and the falloff below is
+    //     unchanged from when every dab was a circle.
+    //   - a thin chisel rasterises a thin quad rather than the square that
+    //     would contain it, so a 20:1 brush does not shade twenty times the
+    //     fragments it covers.
+    let short = inst.radius / max(inst.aspect, 1.0);
+    let scaled = vec2<f32>(corner.x * inst.radius, corner.y * short);
+    let ca = cos(inst.angle);
+    let sa = sin(inst.angle);
+    let rotated = vec2<f32>(
+        scaled.x * ca - scaled.y * sa,
+        scaled.x * sa + scaled.y * ca,
+    );
+    let doc = inst.pos + rotated;
 
     // Document space is y-down with the origin top-left; clip space is y-up.
     let ndc = vec2<f32>(
@@ -62,7 +87,7 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.local = corner;
     out.hardness = inst.hardness;
     out.coverage = inst.coverage;
-    out.radius = inst.radius;
+    out.radius = short;
     out.color = inst.color;
     return out;
 }

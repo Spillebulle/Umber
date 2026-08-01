@@ -239,16 +239,22 @@ impl Harness {
 }
 
 fn dab(x: f32, y: f32, radius: f32, coverage: f32) -> Dab {
-    coloured_dab(x, y, radius, coverage, [0.0; 3])
+    Dab::round(Vec2::new(x, y), radius, 0.95, coverage)
 }
 
 fn coloured_dab(x: f32, y: f32, radius: f32, coverage: f32, color: [f32; 3]) -> Dab {
     Dab {
-        pos: [x, y],
-        radius,
-        hardness: 0.95,
-        coverage,
         color,
+        ..Dab::round(Vec2::new(x, y), radius, 0.95, coverage)
+    }
+}
+
+/// An elliptical dab: `aspect` long-over-short, `angle` in radians.
+fn shaped_dab(x: f32, y: f32, radius: f32, aspect: f32, angle: f32) -> Dab {
+    Dab {
+        aspect,
+        angle,
+        ..Dab::round(Vec2::new(x, y), radius, 0.95, 1.0)
     }
 }
 
@@ -387,6 +393,48 @@ fn an_ordinary_stroke_ignores_the_colour_scratch_entirely() {
         [0, 255, 0],
         4,
         "stroke colour, not the dab's",
+    );
+}
+
+#[test]
+fn an_elliptical_dab_is_wide_along_its_angle_and_narrow_across_it() {
+    // A chisel has to be a chisel. `size` describes the *long* axis whatever
+    // the aspect, so raising the ratio narrows the dab rather than growing it —
+    // which is what lets a flat brush cover the same ground as the round one it
+    // was derived from.
+    let mut h = harness_or_skip!();
+
+    // 4:1, long axis along +x. Semi-axes are then 24 px by 6 px.
+    h.stamp(&[shaped_dab(32.0, 32.0, 24.0, 4.0, 0.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel(32, 32)[3], 255, "centre should be solid");
+    assert_eq!(h.pixel(50, 32)[3], 255, "18 px along should be inside");
+    assert_eq!(h.pixel(32, 36)[3], 255, "4 px across is still inside the 6");
+    assert_eq!(h.pixel(32, 42)[3], 0, "10 px across is past the short axis");
+    assert_eq!(h.pixel(56, 32)[3], 0, "24 px along is past the long one");
+}
+
+#[test]
+fn rotating_a_dab_rotates_the_ellipse() {
+    // The same dab turned a quarter turn: what was wide is now tall. A rake
+    // that ignored its angle would look identical whichever way it travelled.
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[shaped_dab(
+        32.0,
+        32.0,
+        24.0,
+        4.0,
+        std::f32::consts::FRAC_PI_2,
+    )]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel(32, 50)[3], 255, "18 px down should now be inside");
+    assert_eq!(
+        h.pixel(42, 32)[3],
+        0,
+        "10 px sideways is now past the short axis"
     );
 }
 
@@ -899,6 +947,101 @@ fn the_probe_reports_bare_canvas_as_nothing_to_pick_up() {
     let sample = probe_until_ready(&mut h, &stack, Vec2::new(32.0, 32.0), 6.0);
 
     assert_eq!(sample[3], 0.0, "empty canvas should report no coverage");
+}
+
+/// Every offscreen pass must work when the *window* is a different format.
+///
+/// This is the shape of a real crash. A render pipeline is compiled against its
+/// target's format; export, the eyedropper and the smudge probe all render into
+/// `Rgba8Unorm` while the swapchain on a great deal of Windows hardware is
+/// `Bgra8Unorm`. Using the screen's pipeline for them is a validation error that
+/// takes the process down — and it is completely invisible on a machine whose
+/// surface happens to match, which is why every other test here missed it.
+#[test]
+fn offscreen_passes_work_when_the_surface_is_bgra() {
+    let Some(gpu) = shared_gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Deliberately not TARGET_FORMAT: the whole point is a mismatch.
+    let mut canvas = CanvasRenderer::new(
+        &gpu.device,
+        UVec2::new(DOC, DOC),
+        wgpu::TextureFormat::Bgra8Unorm,
+    );
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.clear_all_layers(&mut enc);
+    canvas.clear_stroke(&mut enc);
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &[dab(32.0, 32.0, 20.0, 1.0)],
+        false,
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.commit_stroke(
+        &gpu.queue,
+        &mut enc,
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: DOC,
+            height: DOC,
+        },
+        StrokeStyle {
+            color: Color::from_srgb_u8(200, 20, 20, 255),
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            per_dab_color: false,
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+
+    // The eyedropper.
+    let px = canvas.pick_colour(&gpu.device, &gpu.queue, &stack, Vec2::new(32.5, 32.5));
+    assert_near(px, [200, 20, 20], 3, "picked colour on a BGRA surface");
+
+    // PNG export.
+    let bytes = canvas.export_rgba(&gpu.device, &gpu.queue, &stack);
+    assert_eq!(bytes.len(), (DOC * DOC * 4) as usize);
+
+    // And the smudge probe, which is what runs every frame of a blending
+    // stroke and therefore turns this from latent into fatal.
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.probe_canvas(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &ProbeParams {
+            layers: &stack,
+            active_index: 0,
+            stroke: StrokeStyle {
+                opacity: 0.0,
+                ..Default::default()
+            },
+            doc_point: Vec2::new(32.0, 32.0),
+            radius: 6.0,
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+    canvas.submit_probes();
+    let _ = canvas.take_probe(&gpu.device);
 }
 
 #[test]

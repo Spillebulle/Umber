@@ -31,15 +31,15 @@
 //! | `slow_tracking` | `stabilization` | ordering preserved, feel differs |
 //! | `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius` | the sample lags a frame or two |
 //! | `dabs_per_second` | `dabs_per_second` | direct |
+//! | `elliptical_dab_ratio`, `elliptical_dab_angle` | `dab_ratio`, `dab_angle`, `dab_angle_follows_stroke` | a `direction` input becomes "follows the stroke" |
+//! | `offset_by_random` | `scatter` | |
+//! | `radius_by_random` | `radius_jitter` | |
 //!
 //! Dropped, and where that shows:
 //!
-//! - **`elliptical_dab_ratio` / `elliptical_dab_angle`** — Umber's dab is a
-//!   circle. Flat, chisel and calligraphy brushes import as round ones and lose
-//!   their line-weight variation entirely. This is the largest single loss;
-//!   about a quarter of the MyPaint set is elliptical.
-//! - **`offset_by_random`, `radius_by_random`, `offset_by_speed`** — no scatter
-//!   or jitter, so spray, splatter and "bulk" brushes come out as smooth lines.
+//! - **`offset_by_speed`** — scatter that grows with how fast the pen is
+//!   moving. The constant part of a brush's scatter is imported; the part that
+//!   reacts to speed is not, so a fast flick spreads less than it should.
 //! - **`colorize`, `change_color_*`** — the dab pass modulates a colour, it does
 //!   not recolour what is under it, so a brush that shifts the hue of the paint
 //!   beneath has no equivalent.
@@ -187,6 +187,30 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         .exp()
         .clamp(0.25, 8.0);
 
+    // --- dab shape ----------------------------------------------------------
+    //
+    // MyPaint's dab is an ellipse whose *long* axis is the radius and whose
+    // short axis is `radius / elliptical_dab_ratio`, tilted by
+    // `elliptical_dab_angle` degrees. Umber's is the same, so these carry
+    // across directly. The ratio is documented as >= 1.0 and a few brushes
+    // state slightly less, which would turn the dab inside out.
+    let dab_ratio = file.setting("elliptical_dab_ratio").base.clamp(1.0, 20.0);
+    let angle = file.setting("elliptical_dab_angle");
+    let dab_angle = angle.base.rem_euclid(360.0);
+
+    // A brush whose angle is driven by the `direction` input turns to follow
+    // the stroke — a rake or a fan. One with a fixed angle is a broad nib, and
+    // holding its angle through a curve is what makes calligraphy thick and
+    // thin. Reading a rake as a nib, or the reverse, is immediately visible.
+    let dab_angle_follows_stroke = angle.has_direction;
+
+    // `offset_by_random` is a standard deviation in "basic radius" units, and
+    // `radius_by_random` one in log-radius — both exactly what `Brush` holds.
+    // These are what make a spray can spray and a charcoal catch on the paper;
+    // without them those brushes import as smooth, even lines.
+    let scatter = file.setting("offset_by_random").base.clamp(0.0, 8.0);
+    let radius_jitter = file.setting("radius_by_random").base.clamp(0.0, 3.0);
+
     // --- the rest -----------------------------------------------------------
     let mode = if file.setting("eraser").base >= 0.5 {
         BrushMode::Erase
@@ -219,6 +243,11 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         smudge_length,
         smudge_radius,
         dabs_per_second,
+        dab_ratio,
+        dab_angle,
+        dab_angle_follows_stroke,
+        scatter,
+        radius_jitter,
     })
 }
 
@@ -271,11 +300,16 @@ impl MybFile {
                     .inputs
                     .get("pressure")
                     .is_some_and(|points| points.len() >= 2),
+                has_direction: s
+                    .inputs
+                    .get("direction")
+                    .is_some_and(|points| points.len() >= 2),
                 pressure: s.inputs.get("pressure").map(Vec::as_slice).unwrap_or(&[]),
             },
             None => Setting {
                 base: 0.0,
                 has_pressure: false,
+                has_direction: false,
                 pressure: &[],
             },
         }
@@ -293,6 +327,9 @@ struct MybSetting {
 struct Setting<'a> {
     base: f32,
     has_pressure: bool,
+    /// Whether the setting is driven by stroke direction, which is how MyPaint
+    /// spells "this dab turns to follow the line".
+    has_direction: bool,
     /// Piecewise-linear control points, x ascending, in MyPaint's input units —
     /// for pressure that is already 0..1.
     pressure: &'a [(f32, f32)],
@@ -518,6 +555,65 @@ mod tests {
 
         assert!(unsupported_features(PEN).unwrap().is_empty());
         assert!(!from_myb(PEN).unwrap().smudges(), "a pen does not blend");
+    }
+
+    /// A chisel is not a circle. `elliptical_dab_ratio` is the single most
+    /// common thing a MyPaint brush has that a round dab cannot express — 78 of
+    /// the pack's 196 use it — and until the dab could be an ellipse, every one
+    /// of them imported as a round brush with no line-weight variation at all.
+    #[test]
+    fn an_elliptical_brush_keeps_its_shape_and_its_angle() {
+        let chisel = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 4.0, "inputs": {} },
+            "elliptical_dab_angle": { "base_value": 45.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(chisel).expect("imports");
+        assert!(brush.is_shaped());
+        assert!((brush.dab_ratio - 4.0).abs() < 1e-5);
+        assert!((brush.dab_angle - 45.0).abs() < 1e-5);
+        // No `direction` input, so it holds its angle through a curve — that is
+        // what makes a broad nib produce calligraphic thick-and-thin.
+        assert!(!brush.dab_angle_follows_stroke);
+
+        assert!(!from_myb(PEN).unwrap().is_shaped(), "a pen is round");
+    }
+
+    /// The other half of the same setting. A rake keeps its bristles across the
+    /// line of travel; a nib does not. Reading one as the other is immediately
+    /// visible in a curve.
+    #[test]
+    fn a_direction_input_makes_the_dab_follow_the_stroke() {
+        let rake = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 6.0, "inputs": {} },
+            "elliptical_dab_angle": { "base_value": 0.0,
+                "inputs": { "direction": [[0.0, 0.0], [180.0, 180.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        assert!(from_myb(rake).unwrap().dab_angle_follows_stroke);
+    }
+
+    /// Scatter is what makes a spray can spray. Without it those brushes are
+    /// smooth lines wearing the name of something granular.
+    #[test]
+    fn a_scattering_brush_keeps_its_randomness() {
+        let spray = r#"{ "version": 3, "settings": {
+            "offset_by_random": { "base_value": 2.5, "inputs": {} },
+            "radius_by_random": { "base_value": 0.6, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(spray).expect("imports");
+        assert!(brush.is_shaped());
+        assert!((brush.scatter - 2.5).abs() < 1e-5);
+        assert!((brush.radius_jitter - 0.6).abs() < 1e-5);
+    }
+
+    /// MyPaint documents the ratio as >= 1.0 and a few brushes state less.
+    /// Below 1.0 the long and short axes swap, so the dab would come out
+    /// perpendicular to the angle the file asked for.
+    #[test]
+    fn a_ratio_below_one_is_clamped_rather_than_inverting_the_dab() {
+        let odd = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 0.25, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        assert_eq!(from_myb(odd).unwrap().dab_ratio, 1.0);
     }
 
     /// The other refusal: an airbrush states its rate in dabs per *second* and

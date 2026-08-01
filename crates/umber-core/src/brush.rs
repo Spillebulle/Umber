@@ -71,6 +71,34 @@ pub struct Brush {
     /// are airbrushes, and they are supposed to keep depositing paint while the
     /// pen is held still. Without it they import as a solid line.
     pub dabs_per_second: f32,
+    /// Long axis divided by short axis. `1.0` is a circle; `4.0` is a chisel
+    /// four times as long as it is wide.
+    ///
+    /// [`Brush::size`] always describes the **long** axis, so raising this
+    /// narrows the dab rather than growing it — which is what makes a flat
+    /// brush cover the same ground as the round one it was derived from.
+    pub dab_ratio: f32,
+    /// Direction of the long axis in degrees, measured from the document's
+    /// +x axis. Meaningless while `dab_ratio` is 1.0.
+    pub dab_angle: f32,
+    /// Whether the long axis turns to follow the stroke.
+    ///
+    /// The difference between a rake and a nib, and it is not cosmetic: a
+    /// broad-nib pen holds one angle whatever direction you pull it, which is
+    /// what produces calligraphic thick-and-thin, while a fan or rake brush
+    /// keeps its bristles across the direction of travel. Both are common and
+    /// neither looks remotely like the other.
+    pub dab_angle_follows_stroke: bool,
+    /// Random offset applied to each dab's position, in multiples of the dab
+    /// radius, as a standard deviation. `0.0` lays dabs exactly on the stroke.
+    ///
+    /// This is what makes a spray can spray and a charcoal stick catch on the
+    /// tooth of the paper. Without it those brushes are smooth lines.
+    pub scatter: f32,
+    /// Random variation in each dab's radius, as a standard deviation applied
+    /// in **log** space — so `0.7` means "typically within a factor of two",
+    /// symmetrically, and no amount of it can produce a negative radius.
+    pub radius_jitter: f32,
 }
 
 impl Default for Brush {
@@ -91,6 +119,11 @@ impl Default for Brush {
             smudge_length: 0.5,
             smudge_radius: 1.0,
             dabs_per_second: 0.0,
+            dab_ratio: 1.0,
+            dab_angle: 0.0,
+            dab_angle_follows_stroke: false,
+            scatter: 0.0,
+            radius_jitter: 0.0,
         }
     }
 }
@@ -139,6 +172,15 @@ impl Brush {
     /// Whether the brush keeps depositing paint while the pen is stationary.
     pub fn is_timed(&self) -> bool {
         self.dabs_per_second > 0.0
+    }
+
+    /// Whether the dab is anything other than a plain circle laid on the line.
+    ///
+    /// Only useful for describing a brush — the dab path costs the same either
+    /// way, since shape is two more floats on an instance that was going to be
+    /// uploaded regardless.
+    pub fn is_shaped(&self) -> bool {
+        self.dab_ratio > 1.01 || self.scatter > 0.0 || self.radius_jitter > 0.0
     }
 }
 
