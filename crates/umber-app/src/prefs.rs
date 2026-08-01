@@ -23,6 +23,7 @@
 //! failing the whole document, which is exactly the tolerance the three cases
 //! above require.
 
+use crate::colorpicker::{PickerMode, WheelShape};
 use crate::editor::Editor;
 use crate::shortcuts::{self, Action, Binding, Chord};
 use crate::theme::{Accent, ThemeKind};
@@ -70,6 +71,14 @@ pub struct Prefs {
     /// dialog changes it — it is a choice about the workspace that should still
     /// be true tomorrow.
     pub wheel_rotates: bool,
+    /// Which of the three pickers the Colour panel shows, and — when it is the
+    /// wheel — what sits inside the hue ring.
+    ///
+    /// Set on the panel rather than in the settings dialog, like
+    /// [`Prefs::wheel_rotates`], and kept for the same reason: somebody who
+    /// works in sliders should not be handed the wheel again every morning.
+    pub picker: PickerMode,
+    pub wheel_shape: WheelShape,
     /// The complete binding table, already merged with the defaults.
     pub shortcuts: Vec<Binding>,
 }
@@ -88,6 +97,8 @@ impl Default for Prefs {
             update_notice_seen: false,
             // What the picker has always done, and what the design draws.
             wheel_rotates: true,
+            picker: PickerMode::Wheel,
+            wheel_shape: WheelShape::Triangle,
             shortcuts: shortcuts::defaults(),
         }
     }
@@ -241,10 +252,11 @@ pub fn to_text(prefs: &Prefs) -> String {
         "update_notice_seen = {}\n",
         prefs.update_notice_seen
     ));
+    out.push_str(&format!("wheel_rotates = {}\n", prefs.wheel_rotates));
+    out.push_str(&format!("picker = {}\n", picker_id(prefs.picker)));
     out.push_str(&format!(
-        "wheel_rotates = {}
-",
-        prefs.wheel_rotates
+        "wheel_shape = {}\n",
+        wheel_shape_id(prefs.wheel_shape)
     ));
 
     // Only actions that differ from the factory table are written. An action
@@ -330,6 +342,16 @@ pub fn from_text(text: &str) -> Prefs {
             "wheel_rotates" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.wheel_rotates = v;
+                }
+            }
+            "picker" => {
+                if let Some(v) = picker_from_id(value) {
+                    prefs.picker = v;
+                }
+            }
+            "wheel_shape" => {
+                if let Some(v) = wheel_shape_from_id(value) {
+                    prefs.wheel_shape = v;
                 }
             }
             "shortcut" => shortcut_lines.push(value),
@@ -457,6 +479,36 @@ fn theme_from_id(id: &str) -> Option<ThemeKind> {
     ThemeKind::ALL.into_iter().find(|k| theme_id(*k) == id)
 }
 
+/// Stable names for the picker modes, for the same reason as `theme_id`.
+///
+/// Deliberately not `PickerMode::label` lower-cased: the label is what the
+/// interface shows and is free to be reworded, while this is what a file
+/// written a year ago still says.
+fn picker_id(mode: PickerMode) -> &'static str {
+    match mode {
+        PickerMode::Wheel => "wheel",
+        PickerMode::Square => "square",
+        PickerMode::Sliders => "sliders",
+    }
+}
+
+fn picker_from_id(id: &str) -> Option<PickerMode> {
+    PickerMode::ALL.into_iter().find(|m| picker_id(*m) == id)
+}
+
+fn wheel_shape_id(shape: WheelShape) -> &'static str {
+    match shape {
+        WheelShape::Triangle => "triangle",
+        WheelShape::Square => "square",
+    }
+}
+
+fn wheel_shape_from_id(id: &str) -> Option<WheelShape> {
+    WheelShape::ALL
+        .into_iter()
+        .find(|s| wheel_shape_id(*s) == id)
+}
+
 fn pressure_id(source: PressureSource) -> &'static str {
     match source {
         PressureSource::Device => "device",
@@ -495,6 +547,8 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         check_updates: ed.updates.check_on_startup,
         update_notice_seen: ed.updates.notice_seen,
         wheel_rotates: ed.ui.wheel_rotates,
+        picker: ed.ui.picker,
+        wheel_shape: ed.ui.wheel_shape,
         shortcuts: shortcuts::published(),
     }
 }
@@ -509,6 +563,8 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.updates.check_on_startup = prefs.check_updates;
     ed.updates.notice_seen = prefs.update_notice_seen;
     ed.ui.wheel_rotates = prefs.wheel_rotates;
+    ed.ui.picker = prefs.picker;
+    ed.ui.wheel_shape = prefs.wheel_shape;
     shortcuts::publish(prefs.shortcuts.clone());
 
     // Setting the zoom factor when it has not changed still marks egui's fonts
@@ -578,6 +634,8 @@ mod tests {
         assert_eq!(prefs.check_updates, editor.updates.check_on_startup);
         assert_eq!(prefs.update_notice_seen, editor.updates.notice_seen);
         assert_eq!(prefs.wheel_rotates, editor.ui.wheel_rotates);
+        assert_eq!(prefs.picker, editor.ui.picker);
+        assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
         assert_eq!(prefs.shortcuts, shortcuts::defaults());
     }
 
@@ -603,6 +661,33 @@ mod tests {
             "reading the file must reach the picker, not just the Prefs struct"
         );
         assert!(!capture(&ctx, &editor).wheel_rotates, "and back out again");
+    }
+
+    /// The picker's own names, which the file is written in, must not be the
+    /// interface's — a label is free to be reworded and a stored id is not.
+    #[test]
+    fn the_pickers_choice_of_picker_survives_a_restart() {
+        for mode in PickerMode::ALL {
+            for shape in WheelShape::ALL {
+                let prefs = Prefs {
+                    picker: mode,
+                    wheel_shape: shape,
+                    ..Prefs::default()
+                };
+                let back = from_text(&to_text(&prefs));
+                assert_eq!(back.picker, mode);
+                assert_eq!(back.wheel_shape, shape);
+            }
+        }
+        // Square is a mode *and* a wheel centre, and they are separate keys —
+        // one must never be read as the other.
+        let prefs = from_text("picker = triangle\nwheel_shape = sliders\n");
+        assert_eq!(
+            prefs.picker,
+            PickerMode::Wheel,
+            "a bad id keeps the default"
+        );
+        assert_eq!(prefs.wheel_shape, WheelShape::Triangle);
     }
 
     #[test]
@@ -649,6 +734,8 @@ mod tests {
             check_updates: false,
             update_notice_seen: true,
             wheel_rotates: false,
+            picker: PickerMode::Sliders,
+            wheel_shape: WheelShape::Square,
             shortcuts: shortcuts::defaults(),
         };
         let at = shortcuts::slot_of(&prefs.shortcuts, Action::BrushTool, 0);
@@ -670,6 +757,8 @@ mod tests {
         assert_eq!(back.check_updates, prefs.check_updates);
         assert_eq!(back.update_notice_seen, prefs.update_notice_seen);
         assert_eq!(back.wheel_rotates, prefs.wheel_rotates);
+        assert_eq!(back.picker, prefs.picker);
+        assert_eq!(back.wheel_shape, prefs.wheel_shape);
         // Compared per action rather than as one list: editing a binding
         // appends it, so the live table is in interaction order while a loaded
         // one is in `Action::ALL` order. What has to survive is which chords

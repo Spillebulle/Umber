@@ -635,14 +635,15 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut shape = ed.ui.wheel_shape;
     let mut rotates = ed.ui.wheel_rotates;
     let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut rotates, &mut ed.hsv);
-    ed.ui.wheel_shape = shape;
-    // Kept between runs, though its control is here rather than in the settings
-    // dialog — it is a choice about the workspace, and where it is set does not
-    // decide whether it should still be true tomorrow. Compared rather than
-    // asked of the toggle, because `show` reports a change of *colour*, and
-    // marking the preferences dirty on every drag of the wheel would queue a
-    // file write per frame.
-    if rotates != ed.ui.wheel_rotates {
+    // Both are kept between runs, though their controls are here rather than in
+    // the settings dialog — they are choices about the workspace, and where one
+    // is set does not decide whether it should still be true tomorrow.
+    //
+    // Compared before and after rather than asked of the controls, because
+    // `show` reports a change of *colour*: keying off its return would queue a
+    // preferences write for every frame of a drag around the hue ring.
+    if shape != ed.ui.wheel_shape || rotates != ed.ui.wheel_rotates {
+        ed.ui.wheel_shape = shape;
         ed.ui.wheel_rotates = rotates;
         crate::prefs::mark_dirty();
     }
@@ -949,6 +950,9 @@ fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                     .selectable_label(ed.ui.picker == mode, mode.label())
                     .clicked()
                 {
+                    if ed.ui.picker != mode {
+                        crate::prefs::mark_dirty();
+                    }
                     ed.ui.picker = mode;
                     ed.ui.picker_menu_open = false;
                 }

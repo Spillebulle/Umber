@@ -38,6 +38,10 @@ pub enum WheelShape {
     Square,
 }
 
+impl WheelShape {
+    pub const ALL: [WheelShape; 2] = [Self::Triangle, Self::Square];
+}
+
 const RING_SEGMENTS: usize = 96;
 const RING_THICKNESS: f32 = 20.0;
 
