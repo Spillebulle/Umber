@@ -32,6 +32,21 @@ use winit::window::{Window, WindowId};
 /// composes with the wheel and the pinch instead of snapping away from them.
 const ZOOM_KEY_STEP: f32 = 1.25;
 
+/// Screen points the canvas moves for one notch of the wheel.
+///
+/// Points rather than pixels, so a scroll covers the same amount of the screen
+/// on a HiDPI display as on an ordinary one.
+const WHEEL_PAN_POINTS: f32 = 48.0;
+
+/// What one notch of Ctrl and the wheel multiplies the zoom by.
+const WHEEL_ZOOM_STEP: f32 = 1.12;
+
+/// Pixels a trackpad reports for one notch's worth of scrolling.
+///
+/// Only the zoom needs this: it works in notches, and a trackpad reports a
+/// distance. Panning uses the distance as it stands.
+const WHEEL_PIXELS_PER_NOTCH: f32 = 60.0;
+
 /// Everything tied to a live window and GPU surface.
 ///
 /// Kept in an `Option` on [`UmberApp`] because Android destroys and recreates
@@ -1785,14 +1800,48 @@ impl ApplicationHandler<Wake> for UmberApp {
                 if ui_has_pointer {
                     return;
                 }
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                // Panning wants a distance and zooming wants a count of
+                // notches. A wheel reports the second and a trackpad the first,
+                // so both are worked out and each branch takes the one it means
+                // — a trackpad's own pixels give it the fine-grained pan it is
+                // for, rather than a distance rounded through a notch count.
+                let scale = self.editor.pixels_per_point.max(1e-3);
+                let (notches, pixels) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (Vec2::new(x, y), Vec2::new(x, y) * WHEEL_PAN_POINTS * scale)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let px = Vec2::new(p.x as f32, p.y as f32);
+                        (px / WHEEL_PIXELS_PER_NOTCH, px)
+                    }
                 };
-                let factor = 1.12f32.powf(steps);
-                self.editor
-                    .camera
-                    .zoom_at(self.editor.cursor, factor, pivot);
+
+                if self.modifiers.control_key() || self.modifiers.super_key() {
+                    // Zoom keeps the wheel, one modifier along. It is where
+                    // every browser and document viewer puts it, and it is the
+                    // only one of the three that has somewhere to anchor: the
+                    // pointer.
+                    let factor = WHEEL_ZOOM_STEP.powf(notches.y);
+                    self.editor
+                        .camera
+                        .zoom_at(self.editor.cursor, factor, pivot);
+                } else {
+                    // Scrolling up shows what is above, which means the picture
+                    // moves *down* — `pan_by_screen` takes the movement of the
+                    // canvas, so the sign is already right. Shift swaps the
+                    // axis without swapping that convention, so a roll upwards
+                    // goes left.
+                    //
+                    // A horizontal wheel is honoured whether Shift is held or
+                    // not, and reversed: rolling right is asking to see what is
+                    // to the right, so the canvas goes left.
+                    let by = if self.modifiers.shift_key() {
+                        Vec2::new(pixels.y, 0.0)
+                    } else {
+                        Vec2::new(-pixels.x, pixels.y)
+                    };
+                    self.editor.camera.pan_by_screen(by);
+                }
                 if let Some(g) = self.gfx.as_ref() {
                     g.window.request_redraw();
                 }

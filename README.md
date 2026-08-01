@@ -260,7 +260,10 @@ risk.
 | `Alt` + click | Pick the colour under the cursor |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
-| Wheel | Zoom at cursor |
+| Wheel | Scroll the canvas up and down |
+| `Shift` + wheel | Scroll it side to side |
+| `Ctrl` + wheel | Zoom at cursor |
+| `Ctrl` + `+` / `-` | Zoom in / out |
 | `Ctrl` + `0` / `1` | Fit to window / 100% |
 | `Ctrl` + `Z`, `Ctrl` + `Shift` + `Z` | Undo / redo |
 | `Ctrl` + `S`, `Ctrl` + `Shift` + `S` | Save / save as… |
