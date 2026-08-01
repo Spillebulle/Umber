@@ -25,7 +25,7 @@ use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use std::sync::Arc;
-use umber_core::{Brush, ResponseCurve, TipMask, input::PressureSource};
+use umber_core::{Brush, GrainPattern, ResponseCurve, TipMask, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -824,6 +824,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     (BrushTab::Tip, "Tip"),
                     (BrushTab::Dynamics, "Dynamics"),
                     (BrushTab::Scatter, "Scatter"),
+                    (BrushTab::Texture, "Texture"),
                     (BrushTab::Blending, "Blending"),
                 ],
             );
@@ -833,6 +834,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 BrushTab::Tip => brush_editor_tip(ui, p, ed),
                 BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
                 BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
+                BrushTab::Texture => brush_editor_texture(ui, p, ed),
                 BrushTab::Blending => brush_editor_blending(ui, p, ed),
             }
 
@@ -845,6 +847,16 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if response.should_close() {
         ed.ui.brush_editor_open = false;
     }
+}
+
+/// Whether turning the dab would change anything.
+///
+/// An ellipse has an angle; so does a stamp, whatever its roundness, because a
+/// bitmap is not rotationally symmetric. [`Brush::dab_has_angle`] can only
+/// answer the first half — `BrushPreset::tip` is a name the editor resolves —
+/// so the two are combined here rather than in the engine.
+fn has_angle(ed: &Editor) -> bool {
+    ed.brush.dab_has_angle() || ed.tip.is_some()
 }
 
 /// A percentage readout, which most of these sliders share.
@@ -949,8 +961,11 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
     ui.columns(2, |c| {
         // A circle has no angle. Rather than let the slider lie, it is disabled
-        // until the dab is elliptical and says why.
-        let round = !ed.brush.dab_has_angle();
+        // until the dab is elliptical and says why — but a *stamp* has an angle
+        // whatever its roundness, because a bitmap is not rotationally
+        // symmetric. `Brush` cannot answer that: the tip is a name it resolves
+        // through the library, so the question is the editor's to ask.
+        let round = !has_angle(ed);
         c[0].scope(|ui| {
             if round {
                 ui.disable();
@@ -977,7 +992,7 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 
     ui.scope(|ui| {
-        if !ed.brush.dab_has_angle() {
+        if !has_angle(ed) {
             ui.disable();
         }
         toggle_row(
@@ -990,11 +1005,12 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     caption(
         ui,
         p,
-        if ed.brush.dab_has_angle() {
+        if has_angle(ed) {
             "A rake keeps its bristles across the line of travel; a broad nib \
              holds one angle through a curve."
         } else {
-            "Angle needs an elliptical dab — lower Roundness first."
+            "Angle needs an elliptical dab or a bitmap tip — lower Roundness \
+             first."
         },
     );
     ui.add_space(2.0);
@@ -1058,11 +1074,11 @@ fn bitmap_tip_row(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> bool {
     !cleared
 }
 
-/// Largest preview texture uploaded for a tip.
+/// Widest a mask is downsampled to for the editor's 48-point thumbnail.
 ///
-/// A stamp can be 2048² and the thumbnail is 48 points across, so the mask is
-/// box-averaged down first. Nearest sampling would be cheaper and wrong: a
-/// sparse spatter tip would show as an empty square about half the time.
+/// A stamp can be 2048 texels across, so it is box-averaged down first —
+/// nearest sampling would show a sparse spatter tip as an empty square about
+/// half the time.
 const TIP_PREVIEW_TEXELS: u32 = 96;
 
 fn tip_preview(ui: &mut egui::Ui, p: &Palette, mask: &Arc<TipMask>) {
@@ -1076,7 +1092,7 @@ fn tip_preview(ui: &mut egui::Ui, p: &Palette, mask: &Arc<TipMask>) {
         _ => {
             let texture = ui.ctx().load_texture(
                 "brush-tip",
-                tip_image(mask, p.text_strong),
+                widgets::tip_image(mask, p.text_strong, TIP_PREVIEW_TEXELS),
                 egui::TextureOptions::LINEAR,
             );
             ui.ctx()
@@ -1094,42 +1110,6 @@ fn tip_preview(ui: &mut egui::Ui, p: &Palette, mask: &Arc<TipMask>) {
         Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
-}
-
-/// Box-average the mask down to a thumbnail, tinted with the palette's ink.
-///
-/// Coverage becomes alpha rather than luminance, so a stamp reads the same way
-/// on either theme and an empty texel is the panel behind it rather than black.
-fn tip_image(mask: &TipMask, ink: egui::Color32) -> egui::ColorImage {
-    let scale = (mask.width().max(mask.height()).div_ceil(TIP_PREVIEW_TEXELS)).max(1);
-    let (w, h) = (
-        mask.width().div_ceil(scale).max(1),
-        mask.height().div_ceil(scale).max(1),
-    );
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let mut sum = 0u32;
-            let mut n = 0u32;
-            for sy in y * scale..((y + 1) * scale).min(mask.height()) {
-                for sx in x * scale..((x + 1) * scale).min(mask.width()) {
-                    sum += u32::from(mask.at(sx, sy));
-                    n += 1;
-                }
-            }
-            // `n` is zero only for a cell entirely past the mask's edge, which
-            // the ceiling division above cannot produce — the guard is there
-            // so an off-by-one here can never be a division by zero.
-            let coverage = sum.checked_div(n).unwrap_or(0) as u8;
-            pixels.push(egui::Color32::from_rgba_unmultiplied(
-                ink.r(),
-                ink.g(),
-                ink.b(),
-                coverage,
-            ));
-        }
-    }
-    egui::ColorImage::new([w as usize, h as usize], pixels)
 }
 
 fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
@@ -1223,7 +1203,7 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 
     ui.columns(2, |c| {
-        let round = !ed.brush.dab_has_angle();
+        let round = !has_angle(ed);
         c[0].scope(|ui| {
             if round {
                 ui.disable();
@@ -1257,6 +1237,129 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         p,
         "Scatter is measured in dab radii, so a spray looks like itself at any \
          size. Angle jitter needs an elliptical dab to show.",
+    );
+}
+
+/// The design's Texture section: the paper, and whether the mark builds up.
+///
+/// Two settings that look unrelated and belong together. Both are about a mark
+/// made of many faint stamps rather than one solid one: grain is what makes it
+/// faint, and build-up is what lets going over it again make it darker. A
+/// textured brush without build-up paints one pass and then stops responding,
+/// which is the surprise this section exists to avoid.
+fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 12.0;
+
+    toggle_row(ui, p, "Build up", &mut ed.brush.build_up);
+    caption(
+        ui,
+        p,
+        if ed.brush.build_up {
+            "Each dab composites over the last, so a stroke deepens where it \
+             overlaps itself and a faint stamp builds to solid. This is how \
+             GIMP and Krita paint, and what a texture stamp needs."
+        } else {
+            "Overlapping dabs saturate instead of accumulating, so a stroke is \
+             as even where it crosses itself as anywhere else. Right for a \
+             solid dab; a faint stamp can never paint stronger than its own \
+             brightest texel."
+        },
+    );
+
+    ui.add_space(4.0);
+    widgets::slider_row(
+        ui,
+        p,
+        "Paper",
+        &mut ed.brush.grain,
+        0.0..=1.0,
+        false,
+        percent,
+    );
+
+    // The tile and its size only mean anything once the paper is biting, and
+    // `has_grain()` is the same threshold the renderer uses to decide whether to
+    // bind a tile at all — so a live control here is one whose effect is really
+    // rendered.
+    let grained = ed.brush.has_grain();
+    ui.scope(|ui| {
+        if !grained {
+            ui.disable();
+        }
+        ui.spacing_mut().item_spacing.y = 12.0;
+
+        let mut pattern = ed.brush.grain_pattern;
+        let options: Vec<(GrainPattern, &str)> =
+            GrainPattern::ALL.iter().map(|g| (*g, g.label())).collect();
+        if widgets::segmented(ui, p, &mut pattern, &options) {
+            ed.brush.grain_pattern = pattern;
+        }
+
+        ui.horizontal(|ui| {
+            paper_preview(ui, p, ed.brush.grain_pattern);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                widgets::slider_row(
+                    ui,
+                    p,
+                    "Tile size",
+                    &mut ed.brush.grain_scale,
+                    Brush::MIN_GRAIN_SCALE..=Brush::MAX_GRAIN_SCALE,
+                    true,
+                    |v| format!("{v:.0} px"),
+                );
+            });
+        });
+    });
+
+    caption(
+        ui,
+        p,
+        if grained {
+            "The paper is fixed to the document, not to the brush, so a second \
+             stroke lands in the same pits as the first. Tile size is in \
+             document pixels: paper does not get coarser when you pick up a \
+             bigger pencil."
+        } else {
+            "Raise Paper to let the texture bite into the mark. At zero the dab \
+             is exactly what it would be with no paper at all."
+        },
+    );
+}
+
+/// A thumbnail of one paper tile.
+///
+/// Cached in egui's temporary store and keyed by the pattern, exactly as
+/// [`tip_preview`] is: the modal redraws every frame and this would otherwise
+/// upload a texture on each of them.
+fn paper_preview(ui: &mut egui::Ui, p: &Palette, pattern: GrainPattern) {
+    let Some(tile) = umber_core::tip::pattern(pattern.key()) else {
+        return;
+    };
+    let id = egui::Id::new("brush-paper-preview");
+    let cached: Option<(GrainPattern, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
+    let texture = match cached {
+        Some((held, texture)) if held == pattern => texture,
+        _ => {
+            let texture = ui.ctx().load_texture(
+                "brush-paper",
+                widgets::tip_image(tile, p.text_strong, TIP_PREVIEW_TEXELS),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(id, (pattern, texture.clone())));
+            texture
+        }
+    };
+
+    let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS, p.chrome);
+    painter.image(
+        texture.id(),
+        rect.shrink(2.0),
+        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
     );
 }
 
