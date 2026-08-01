@@ -51,15 +51,54 @@ better.
 ### David Revoy — Krita brush bundles (2023-01 … 2025-01)
 
 - Page: <https://www.davidrevoy.com/article1060/krita-brushes-2025-01-bundle>
-- **Skipped for now.** Two reasons, either sufficient: the bundles are `.kpp`
-  presets built around bitmap tips, which Umber's round-only dab pass cannot
-  render; and they run to roughly 100 MB, which is not something to put through
-  a repository's history for a format we cannot read.
+- **Skipped for now.** The bundles are `.kpp` presets, and Umber has no `.kpp`
+  reader — the bitmap tips inside them are no longer the obstacle, but the
+  settings format still is. They also run to roughly 100 MB.
 
 ### Raghukamath — Krita brush presets v2
 
 - Source: <https://gitlab.com/raghukamath/krita-brush-presets>
-- **Skipped for now.** `.bundle` / `.kpp`, same bitmap-tip problem.
+- **Skipped for now.** `.bundle` / `.kpp`, same missing reader.
+
+### Vasco Alexander Basque — Gimp Brushcollection — CC0-1.0
+
+- Source: <https://github.com/vascoalexander/gimp-brush-collection>
+- Format: `.gbr`, 1022 brushes in twelve folders, 158 MB
+- Licence evidence: **passes.** `README.md` in the repository — and therefore in
+  any archive of it — carries the Creative Commons chooser's own wording,
+  "Gimp Brushcollection by Vasco Alexander Basque is marked with CC0 1.0", plus
+  "All Brushes in this Package are created by me. You can use this resource for
+  whatever you want without any restrictions." That is a licence statement
+  inside the download, which is what the rule at the top of this file asks for.
+- **Not shipped anyway.** Three reasons, and the first is the one that decides
+  it:
+
+  1. **Umber cannot paint them the way GIMP does.** These are photographic
+     texture stamps, sparse and faint — the ones sampled run from 2 % to 5 %
+     mean coverage. GIMP composites every dab, so a stroke at the pack's own
+     spacing builds up to solid. Umber takes a `max` of coverage across the
+     whole stroke and applies opacity once at commit (the wet-layer design in
+     `CLAUDE.md`), so it cannot build up at all. Stamping `Organic/Organic_000`
+     along a line at the file's spacing reaches **1.00** coverage compositing
+     and **0.48** taking a max — a stroke half as strong as the author's. That
+     is the same standard the generator already holds MyPaint brushes to:
+     nothing shipped under an author's name should paint unlike their brush.
+     Note the standard for a brush the *user* imports is deliberately the
+     opposite — an approximation of a brush you chose beats a refusal — and
+     these import perfectly well.
+  2. **It is raw material, and says so.** The README calls it "a 'raw' resource
+     (not adjusted or proofed) meant to help people creating their own custom
+     brushes". Every brush has an empty name field and a spacing of 0, so a
+     shipped set would be 12 of 1022 files called "Aqua 000" and "Spot 004".
+  3. **158 MB and no tags.** The fetch script pins MyPaint at `v2.0.2`; this
+     repository has no releases, so a reproducible fetch would have to pin the
+     commit (`16b7899`, 2024-08-27) and still download the whole thing to keep
+     a dozen files.
+
+  Reasons 2 and 3 are answerable — curate the dense folders (`Opaque` and `Spot`
+  average 91 and 97 mean coverage and would reproduce faithfully), name them by
+  folder, pin the commit. Reason 1 is answerable only by giving the dab pass a
+  build-up mode, which is a change to the wet-layer design and not a brush job.
 
 ### OpenGameArt — 60 free GIMP/Krita brushes (rubberduck)
 
@@ -78,8 +117,8 @@ better.
 ### GDQuest Krita brushes
 
 - CC-BY-4.0, so allowed only with a credits entry. `BrushPreset::credit` exists
-  precisely to carry that. **Skipped for now** on the same bitmap-tip grounds,
-  not on licensing ones.
+  precisely to carry that. **Skipped for now** because they are `.kpp`, not on
+  licensing grounds.
 
 ### CC0 paper and grain textures (ambientCG, Poly Haven, Texture Ninja)
 
@@ -98,3 +137,12 @@ better.
 
 The test `every_shipped_preset_is_usable_and_attributed` fails if any shipped
 preset has no credit, which is the backstop for step 2.
+
+**A pack of bitmap tips needs a fourth step that does not exist yet.** The
+shipped library is a single embedded RON, so there is nowhere in it for a
+bitmap: `BrushPreset::tip` resolves against the *user's* library only. Shipping
+stamps means the generator also writing the masks to
+`crates/umber-core/assets/tips/` and an `include_bytes!` table beside them, and
+deciding — measurably, not by eye — which of a pack's tips reproduce faithfully
+under a `max`-coverage stroke. See the Gimp Brushcollection entry above for why
+that measurement is the part that matters.

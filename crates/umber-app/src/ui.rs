@@ -23,7 +23,8 @@ use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
-use umber_core::{Brush, ResponseCurve, input::PressureSource};
+use std::sync::Arc;
+use umber_core::{Brush, ResponseCurve, TipMask, input::PressureSource};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -638,6 +639,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 
 fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
+    let stamped = bitmap_tip_row(ui, p, ed);
     widgets::slider_row(
         ui,
         p,
@@ -647,15 +649,27 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         true,
         |v| format!("{v:.0} px"),
     );
-    widgets::slider_row(
-        ui,
-        p,
-        "Hardness",
-        &mut ed.brush.hardness,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
-    );
+    // A tip *replaces* the procedural falloff rather than being multiplied into
+    // it, so hardness has nothing left to shape. Drawn dead with the reason
+    // underneath rather than removed: a control that disappears when you pick a
+    // brush reads as a bug.
+    ui.scope(|ui| {
+        if stamped {
+            ui.disable();
+        }
+        widgets::slider_row(
+            ui,
+            p,
+            "Hardness",
+            &mut ed.brush.hardness,
+            0.0..=1.0,
+            false,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+    });
+    if stamped {
+        crate::controls::note(ui, p, "The stamp decides this brush's edge.");
+    }
     widgets::slider_row(
         ui,
         p,
@@ -683,6 +697,132 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         false,
         |v| format!("{:.0}%", v * 100.0),
     );
+}
+
+/// The bitmap tip, when the brush has one. Returns whether it does.
+///
+/// Only drawn for a stamp brush. Almost every brush is round, and a permanent
+/// row saying so would be a control that never does anything — the way in is
+/// **Import brushes…** in the Brushes panel, which reads `.gbr`.
+fn bitmap_tip_row(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> bool {
+    let Some(mask) = ed.tip.clone() else {
+        return false;
+    };
+
+    let mut cleared = false;
+    Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(metrics::RADIUS)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                tip_preview(ui, p, &mask);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Bitmap tip")
+                            .size(text::SMALL)
+                            .color(p.text_strong),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{} × {} px", mask.width(), mask.height()))
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::controls::text_button(ui, p, "Use a round tip", false, true)
+                        .on_hover_text(
+                            "Paint with the procedural round dab instead. \
+                             Save the brush to keep the change.",
+                        )
+                        .clicked()
+                    {
+                        cleared = true;
+                    }
+                });
+            });
+        });
+
+    if cleared {
+        ed.clear_tip();
+    }
+    !cleared
+}
+
+/// Largest preview texture uploaded for a tip.
+///
+/// A stamp can be 2048² and the thumbnail is 48 points across, so the mask is
+/// box-averaged down first. Nearest sampling would be cheaper and wrong: a
+/// sparse spatter tip would show as an empty square about half the time.
+const TIP_PREVIEW_TEXELS: u32 = 96;
+
+fn tip_preview(ui: &mut egui::Ui, p: &Palette, mask: &Arc<TipMask>) {
+    // Kept in egui's temporary store and compared by `Arc` identity, so
+    // switching brush rebuilds it and holding the editor open does not. The
+    // naive version uploads a texture on every one of the modal's frames.
+    let id = egui::Id::new("brush-tip-preview");
+    let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
+    let texture = match cached {
+        Some((held, texture)) if Arc::ptr_eq(&held, mask) => texture,
+        _ => {
+            let texture = ui.ctx().load_texture(
+                "brush-tip",
+                tip_image(mask, p.text_strong),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(id, (Arc::clone(mask), texture.clone())));
+            texture
+        }
+    };
+
+    let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS, p.chrome);
+    painter.image(
+        texture.id(),
+        rect.shrink(2.0),
+        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// Box-average the mask down to a thumbnail, tinted with the palette's ink.
+///
+/// Coverage becomes alpha rather than luminance, so a stamp reads the same way
+/// on either theme and an empty texel is the panel behind it rather than black.
+fn tip_image(mask: &TipMask, ink: egui::Color32) -> egui::ColorImage {
+    let scale = (mask.width().max(mask.height()).div_ceil(TIP_PREVIEW_TEXELS)).max(1);
+    let (w, h) = (
+        mask.width().div_ceil(scale).max(1),
+        mask.height().div_ceil(scale).max(1),
+    );
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for sy in y * scale..((y + 1) * scale).min(mask.height()) {
+                for sx in x * scale..((x + 1) * scale).min(mask.width()) {
+                    sum += u32::from(mask.at(sx, sy));
+                    n += 1;
+                }
+            }
+            // `n` is zero only for a cell entirely past the mask's edge, which
+            // the ceiling division above cannot produce — the guard is there
+            // so an off-by-one here can never be a division by zero.
+            let coverage = sum.checked_div(n).unwrap_or(0) as u8;
+            pixels.push(egui::Color32::from_rgba_unmultiplied(
+                ink.r(),
+                ink.g(),
+                ink.b(),
+                coverage,
+            ));
+        }
+    }
+    egui::ColorImage::new([w as usize, h as usize], pixels)
 }
 
 fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {

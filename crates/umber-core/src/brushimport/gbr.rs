@@ -31,6 +31,7 @@
 //!   header. Umber stamps one tip per stroke, so there is nowhere to put the
 //!   other frames.
 
+use crate::brush::Brush;
 use crate::preset::PresetError;
 use crate::tip::TipMask;
 
@@ -83,9 +84,16 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
 
     let spacing = if version >= 2 {
         // GIMP states spacing as a percentage of the brush size, and Umber as a
-        // fraction of the diameter — the same quantity, off by a hundred. The
-        // clamp matches `Brush`: zero spacing would spin the dab loop.
-        Some((be_u32(bytes, 24)? as f32 / 100.0).clamp(0.01, 4.0))
+        // fraction of the diameter — the same quantity, off by a hundred.
+        //
+        // Zero means *unset*, not "stamp every hundredth of a diameter": GIMP's
+        // own control has a minimum of 1, so a zero is a writer that never
+        // filled the field in. Taking it literally turns a 500 px stamp into
+        // five-pixel steps, which is a hundred dabs where the file meant ten.
+        match be_u32(bytes, 24)? {
+            0 => None,
+            percent => Some((percent as f32 / 100.0).clamp(0.01, 4.0)),
+        }
     } else {
         None
     };
@@ -138,6 +146,54 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
         tip: TipMask::new(width, height, coverage)?,
         spacing,
     })
+}
+
+/// Turn a decoded `.gbr` into the brush Umber will paint with, and the mask it
+/// stamps.
+///
+/// The format carries a picture, a spacing and nothing else, so most of a
+/// [`Brush`] comes from the defaults. The three that do not:
+///
+/// - **Size** is the mask's longer side in pixels, so a stamp lands at its
+///   original scale until the user says otherwise. `Brush::size` describes the
+///   long axis, which is exactly what the padded mask's side is.
+/// - **Spacing** is the file's own where it has one. GIMP's default of 10 %
+///   happens to be Umber's default too, so a version 1 file — which records no
+///   spacing at all — is not being guessed at so much as agreed with.
+/// - **Pressure is off.** A `.gbr` has no dynamics; GIMP stamps one at a
+///   constant size unless a separate dynamics preset says otherwise. Leaving
+///   Umber's pressure-to-size mapping on would shrink the stamp to 8 % of
+///   itself at the start of every line, which is not what the file describes.
+///
+/// The mask is padded to a square: the dab stretches a tip over its bounding
+/// box, so an unpadded portrait stamp would come out squashed. See
+/// [`TipMask::padded_to_square`].
+pub fn to_brush(brush: GbrBrush) -> (Brush, TipMask) {
+    let tip = brush.tip.padded_to_square();
+    let default = Brush::default();
+    let parameters = Brush {
+        size: (tip.width() as f32).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
+        spacing: brush.spacing.unwrap_or(default.spacing),
+        pressure_size: false,
+        pressure_opacity: false,
+        ..default
+    };
+    (parameters, tip)
+}
+
+/// What reading this `.gbr` will throw away.
+///
+/// Deliberately best-effort and header-only: a file this cannot parse returns
+/// nothing here and fails properly in [`from_gbr`], so nothing is reported on
+/// twice. See [`crate::brushimport::dropped_features`].
+pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
+    // A coloured stamp arrives as its silhouette — the stroke scratch is a
+    // single coverage channel by design. Worth saying out loud: the brush works,
+    // and it does not look like the picture in the file.
+    match be_u32(bytes, 16) {
+        Ok(4) => vec!["coloured stamps"],
+        _ => Vec::new(),
+    }
 }
 
 fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, PresetError> {
@@ -209,6 +265,44 @@ mod tests {
         let data = [255, 0, 0, 255, 0, 0, 255, 128];
         let brush = from_gbr(&gbr(2, 2, 1, 4, "Colour", &data)).expect("decode");
         assert_eq!(brush.tip.coverage(), [255, 128]);
+    }
+
+    #[test]
+    fn a_spacing_of_zero_means_unset_rather_than_one_hundredth() {
+        // GIMP's own control cannot go below 1, so a zero is a writer that
+        // never filled the field in. Taken literally it turns a 500 px stamp
+        // into five-pixel steps — a hundred dabs where the file meant ten.
+        let mut file = gbr(2, 2, 2, 1, "T", &[1, 2, 3, 4]);
+        file[24..28].copy_from_slice(&0u32.to_be_bytes());
+        let brush = from_gbr(&file).expect("decode");
+        assert_eq!(brush.spacing, None);
+        assert_eq!(to_brush(brush).0.spacing, Brush::default().spacing);
+    }
+
+    #[test]
+    fn a_stamp_becomes_a_square_tip_at_its_own_size() {
+        // Padded rather than stretched: the dab spreads a tip over its bounding
+        // box, so a 4x2 stamp rendered unpadded would come out twice as tall as
+        // the picture in the file.
+        let brush = from_gbr(&gbr(2, 4, 2, 1, "Wide", &[255; 8])).expect("decode");
+        let (parameters, tip) = to_brush(brush);
+        assert_eq!((tip.width(), tip.height()), (4, 4));
+        assert_eq!(parameters.size, 4.0);
+        // 25% spacing, from the header the fixture writes.
+        assert_eq!(parameters.spacing, 0.25);
+        // A `.gbr` carries no dynamics, and GIMP stamps one at a constant size.
+        assert!(!parameters.pressure_size);
+        assert!(!parameters.pressure_opacity);
+    }
+
+    #[test]
+    fn a_coloured_stamp_says_that_its_colour_was_dropped() {
+        let coloured = gbr(2, 1, 1, 4, "T", &[1, 2, 3, 4]);
+        assert_eq!(dropped_features(&coloured), ["coloured stamps"]);
+        assert!(dropped_features(&gbr(2, 1, 1, 1, "T", &[9])).is_empty());
+        // Best effort: a file this cannot parse says nothing, and fails
+        // properly in `from_gbr` instead.
+        assert!(dropped_features(b"short").is_empty());
     }
 
     #[test]

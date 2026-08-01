@@ -158,20 +158,38 @@ save are marked with a dot and are the only ones those two controls apply to.
 
 Editing a brush changes it live, so the editor's footer offers to **save** what
 you have made, either under a new name or over the brush you started from. Your
-library is a `brushes.ron` in the platform *data* directory — `%APPDATA%\Umber\
-data`, `~/.local/share/umber`, `~/Library/Application Support/Umber` — kept
-apart from the shipped library so that an update, which replaces that one
-wholesale, cannot take your brushes with it.
+library is a `brushes` folder in the platform *data* directory —
+`%APPDATA%\Umber\data`, `~/.local/share/umber`, `~/Library/Application
+Support/Umber` — kept apart from the shipped library so that an update, which
+replaces that one wholesale, cannot take your brushes with it.
 If it cannot be read, everything that writes is disabled and the reason is
 shown, rather than quietly starting your collection again over the top of it.
 
-**Importing** reads MyPaint `.myb` brushes and Umber's own `.ron` libraries, and
-files them by style like everything else. A `.myb` that leans on something Umber
-still cannot render — `colorize`, `lock_alpha` — is imported anyway, because an
-approximation of a brush you chose beats a refusal, but the notice names what
-was dropped. The generated library holds itself to the stricter rule and refuses
-those outright, since nothing shipped under an author's name should paint unlike
-their brush.
+A folder rather than the single `brushes.ron` it used to be, because a brush can
+now carry a **bitmap tip** and a bitmap does not go in a text file. The presets
+are still a `brushes.ron`, now inside that folder, with the stamps beside them
+in `tips/` as ordinary greyscale PNGs you can open, replace or copy between
+machines. A `brushes.ron` from an earlier version is moved in on first run and
+**left where it was** as well — a migration that deletes the only copy of your
+collection has to be right first time.
+
+**Importing** reads MyPaint `.myb` brushes, GIMP `.gbr` stamps and Umber's own
+`.ron` libraries, and files them by style like everything else. A `.gbr` arrives
+as a working brush — its picture, its spacing and its proportions — and goes
+straight into your hand, since a stamp is unrecognisable in a list and obvious
+the moment it makes a mark. A `.myb` that leans on something Umber still cannot
+render — `colorize`, `lock_alpha` — is imported anyway, because an approximation
+of a brush you chose beats a refusal, but the notice names what was dropped; a
+coloured `.gbr` says the same about arriving as its silhouette. The generated
+library holds itself to the stricter rule and refuses those outright, since
+nothing shipped under an author's name should paint unlike their brush.
+
+**Nothing shipped carries a bitmap tip yet.** Umber will not claim a licence it
+cannot verify from a pack's own files, and the one CC0 `.gbr` collection that
+clears that bar is raw photographic texture whose brushes rely on GIMP building
+each dab up over the last — which Umber's wet-layer stroke cannot reproduce, and
+which would make them paint about half as strongly as their author intended.
+`docs/brush-sources.md` records the measurement and every other pack considered.
 
 **Blenders work.** A brush with MyPaint's `smudge` picks colour up off the
 canvas and carries it, and because the sample is taken through the same
@@ -372,11 +390,10 @@ Next, roughly in order:
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop
-- **Elliptical dabs**, and scatter. These are now the largest gap between an
-  imported brush and its original: about a quarter of the MyPaint set is
-  elliptical and imports as a round brush with no line-weight variation, and
-  the spray and "bulk" brushes come out as smooth lines. Bitmap tips and colour
-  pickup are built; these two are what is left.
+- A stamp pack to ship. Bitmap tips work end to end — import a `.gbr`, save it,
+  reload it, paint with it — but the library that ships with Umber has no
+  bitmaps in it, and cannot until a pack clears both the licence rule and the
+  build-up problem above.
 - Tilt support
 - Stroke prediction to hide remaining latency
 

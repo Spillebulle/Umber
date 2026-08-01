@@ -7,7 +7,7 @@
 //! without a GPU doesn't produce noise.
 
 use glam::{UVec2, Vec2};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, ProbeParams, StrokeStyle};
 
@@ -116,8 +116,12 @@ impl Harness {
         self.commit_to(0, color, opacity, mode);
     }
 
-    fn set_tip(&mut self, tip: Option<&TipMask>) {
-        self.canvas.set_tip(&self.gpu.device, &self.gpu.queue, tip);
+    /// The `Arc` is made here rather than at the call sites: the renderer
+    /// compares tips by identity, and a fresh `Arc` per call is exactly the
+    /// "this is a different brush" case each of these tests means.
+    fn set_tip(&mut self, tip: Option<TipMask>) {
+        self.canvas
+            .set_tip(&self.gpu.device, &self.gpu.queue, tip.map(Arc::new));
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -522,7 +526,7 @@ fn a_tipped_stamp_still_saturates_under_overlap() {
     let mut h = harness_or_skip!();
 
     let tip = TipMask::new(2, 2, vec![255; 4]).expect("tip");
-    h.set_tip(Some(&tip));
+    h.set_tip(Some(tip));
 
     h.stamp(&[dab(32.0, 32.0, 12.0, 0.5), dab(32.0, 32.0, 12.0, 0.5)]);
     h.commit(Color::WHITE, 1.0, BrushMode::Paint);
@@ -542,7 +546,7 @@ fn a_tip_decides_where_paint_lands() {
     let mut h = harness_or_skip!();
 
     let tip = TipMask::new(2, 1, vec![255, 0]).expect("tip");
-    h.set_tip(Some(&tip));
+    h.set_tip(Some(tip));
 
     // Radius 12 at x = 32 spans 20..44, so x = 22 and x = 42 sit well inside
     // the left and right texels rather than in the interpolated middle.
@@ -573,7 +577,7 @@ fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
     );
 
     let tip = TipMask::new(2, 2, vec![255; 4]).expect("tip");
-    h.set_tip(Some(&tip));
+    h.set_tip(Some(tip));
     h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
     h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
     assert_eq!(
@@ -590,7 +594,7 @@ fn clearing_the_tip_restores_the_round_brush() {
     let mut h = harness_or_skip!();
 
     let tip = TipMask::new(1, 1, vec![255]).expect("tip");
-    h.set_tip(Some(&tip));
+    h.set_tip(Some(tip));
     assert!(h.canvas.has_tip());
 
     h.set_tip(None);
@@ -605,6 +609,31 @@ fn clearing_the_tip_restores_the_round_brush() {
         0,
         "the corner should be round again"
     );
+}
+
+#[test]
+fn a_second_brush_with_a_different_tip_replaces_the_first() {
+    // `set_tip` skips the upload when the mask is the same allocation as last
+    // time, which is what keeps a stroke's first frame off the texture-upload
+    // path. The failure mode of that guard is a *stale* tip, so this stamps two
+    // masks that disagree about which half paints and checks the second won.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(TipMask::new(2, 1, vec![255, 0]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(h.pixel(22, 32)[3], 255);
+    assert_eq!(h.pixel(42, 32)[3], 0);
+
+    h.set_tip(Some(TipMask::new(2, 1, vec![0, 255]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(
+        h.pixel_in(1, 22, 32)[3],
+        0,
+        "the second tip's empty half painted — the first tip is still bound"
+    );
+    assert_eq!(h.pixel_in(1, 42, 32)[3], 255);
 }
 
 // ---------------------------------------------------------------------------

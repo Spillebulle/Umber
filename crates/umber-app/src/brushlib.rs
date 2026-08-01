@@ -2,11 +2,11 @@
 //!
 //! `umber-core` already held all of this: 201 shipped presets with their
 //! attribution ([`preset::builtin`]), a user library that writes itself to disk
-//! on every change ([`UserLibrary`]), and importers for MyPaint `.myb` and
-//! Umber `.ron`. None of it was reachable from the interface, which listed the
-//! presets and offered nothing else. This module is the reach.
+//! on every change ([`UserLibrary`]), and importers for MyPaint `.myb`, GIMP
+//! `.gbr` and Umber `.ron`. None of it was reachable from the interface, which
+//! listed the presets and offered nothing else. This module is the reach.
 //!
-//! Four things here are worth knowing before changing them:
+//! Five things here are worth knowing before changing them:
 //!
 //! - **`Editor::presets` is the merged list.** `Editor::apply_preset` selects
 //!   by *index* into it, so a saved brush has to live in that vector to be
@@ -25,6 +25,11 @@
 //!   Every text field here therefore has to suspend it, or typing "brush" into
 //!   the search box selects the brush, then the eraser, on the way past. See
 //!   [`suspend_shortcuts`].
+//! - **[`resync`] carries the bitmap tips across too.** `BrushPreset::tip` is
+//!   the *name* of a mask in the user's library, and the drawing path has no
+//!   business reaching into a library; `Editor::tips` is where
+//!   `Editor::apply_preset` resolves the name, so a preset saved with a stamp
+//!   is only a stamp brush once this has run.
 //!
 //! The design draws a Brushes panel of five presets: a header with a `＋`, a
 //! column of rows, and a link to the brush editor. All three are here. The
@@ -169,9 +174,9 @@ impl State {
         }
     }
 
-    fn path(&self) -> Option<&Path> {
+    fn dir(&self) -> Option<&Path> {
         match &self.store {
-            Store::Ready(library) => Some(library.path()),
+            Store::Ready(library) => Some(library.dir()),
             Store::Broken(_) => None,
         }
     }
@@ -194,9 +199,26 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         return state;
     }
 
+    let mut notice = None;
     let store = match UserLibrary::load() {
         Ok(library) => {
             resync(ed, &library);
+            // Both of these are once-per-launch and worth a sentence. A library
+            // that has just moved, and a mask that would not open, are things
+            // the user can act on — and the second one means a brush they saved
+            // is quietly painting round.
+            if !library.warnings().is_empty() {
+                notice = Some(Notice::bad(format!(
+                    "Some brush tips could not be read, so those brushes paint round: {}",
+                    library.warnings().join("; ")
+                )));
+            } else if library.migrated() {
+                notice = Some(Notice::good(format!(
+                    "Your brushes have moved into {}, so they can carry bitmap tips. \
+                     The old brushes.ron was left where it was.",
+                    library.dir().display()
+                )));
+            }
             Store::Ready(Arc::new(library))
         }
         Err(e) => Store::Broken(e.to_string()),
@@ -210,7 +232,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         saving: None,
         renaming: None,
         confirming: None,
-        notice: None,
+        notice,
         suspending: false,
     }
 }
@@ -395,6 +417,11 @@ fn resync(ed: &mut Editor, library: &UserLibrary) {
     ed.presets.truncate(preset::builtin().len());
     ed.presets.extend(library.presets().iter().cloned());
     ed.active_preset = selected.and_then(|id| ed.presets.iter().position(|p| p.id == id));
+    // The masks come across too, so the drawing path can resolve a preset's tip
+    // without reaching into the library. Cloning the map is cloning a handful of
+    // `Arc`s, not the bitmaps, and it happens when the library changes rather
+    // than per frame.
+    ed.tips = library.tips().clone();
 }
 
 /// Run a write against the user's library and put everything back in step.
@@ -540,7 +567,7 @@ fn panel_links(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let writable = state.writable();
     if link(ui, p, Icon::Import, "Import brushes…", writable)
         .on_hover_text(if writable {
-            "Read MyPaint .myb brushes, or an Umber .ron library"
+            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
         } else {
             state.why_not()
         })
@@ -979,16 +1006,24 @@ fn active_name(ed: &Editor) -> String {
 
 fn save_new(state: &mut State, ed: &mut Editor, name: String) {
     let brush = ed.brush;
+    // A brand-new preset names no tip, so the mask has to travel with it or a
+    // stamp brush would be saved as a round one. Cloned out of the `Arc`: the
+    // library stores a copy of its own and hands out a fresh handle.
+    let tip = ed.tip.as_deref().cloned();
     let label = name.clone();
     let saved = write(state, ed, move |library| {
-        library.save(BrushPreset::unsaved(name, brush))
+        library.save(BrushPreset::unsaved(name, brush), tip)
     });
     if let Some(id) = saved {
         // Select what was just saved. The user has named this brush; leaving
         // the selection on the preset it came from would send the very next
         // edit — and any Update — to the wrong place.
+        //
+        // Applied rather than just pointed at, so `Editor::tip` becomes the
+        // library's copy of the mask. Both are the same picture; using one
+        // handle means the renderer sees no change at the next stroke.
         if let Some(index) = ed.presets.iter().position(|preset| preset.id == id) {
-            ed.active_preset = Some(index);
+            ed.apply_preset(index);
         }
         state.saving = None;
         state.notice = Some(Notice::good(format!("Saved \"{label}\" to your library.")));
@@ -1000,9 +1035,21 @@ fn update(state: &mut State, ed: &mut Editor, id: String) {
         return;
     };
     preset.brush = ed.brush;
+    // The tip is part of what "these settings" means. Taking one off is
+    // clearing the reference; putting a different one on is an import, which
+    // arrives as its own brush. Neither goes through here, so the mask itself
+    // never has to be rewritten.
+    let tip_removed = ed.tip.is_none() && preset.tip.is_some();
+    if tip_removed {
+        preset.tip = None;
+    }
     let label = preset.name.clone();
-    if write(state, ed, move |library| library.save(preset)).is_some() {
-        state.notice = Some(Notice::good(format!("Updated \"{label}\".")));
+    if write(state, ed, move |library| library.save(preset, None)).is_some() {
+        state.notice = Some(Notice::good(if tip_removed {
+            format!("Updated \"{label}\", and took its bitmap tip off.")
+        } else {
+            format!("Updated \"{label}\".")
+        }));
     }
 }
 
@@ -1021,8 +1068,9 @@ fn import(state: &mut State, ed: &mut Editor) {
     }
     let Some(paths) = rfd::FileDialog::new()
         .set_title("Import brushes")
-        .add_filter("Brush files", &["myb", "ron"])
+        .add_filter("Brush files", &["myb", "gbr", "ron"])
         .add_filter("MyPaint brush", &["myb"])
+        .add_filter("GIMP brush", &["gbr"])
         .add_filter("Umber brush library", &["ron"])
         // Deliberately present, and deliberately last: picking the wrong kind
         // of file gives a sentence naming it and the reason, which is a better
@@ -1036,12 +1084,14 @@ fn import(state: &mut State, ed: &mut Editor) {
     let mut added: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut dropped: Vec<&'static str> = Vec::new();
+    let mut first: Option<String> = None;
     for path in &paths {
         // Asked before the read, so a file that fails is reported once, as a
         // failure, rather than also being complained about for what it dropped.
         let losses = umber_core::brushimport::dropped_features(path);
         match write(state, ed, |library| library.import_file(path)) {
             Some(presets) => {
+                first = first.or_else(|| presets.first().map(|preset| preset.id.clone()));
                 added.extend(presets.into_iter().map(|preset| preset.name));
                 for loss in losses {
                     if !dropped.contains(&loss) {
@@ -1065,6 +1115,13 @@ fn import(state: &mut State, ed: &mut Editor) {
     if !added.is_empty() {
         state.scope = Scope::All;
         state.query.clear();
+    }
+    // And put the first of them in the user's hand. Importing a brush is asking
+    // to paint with it; a stamp brush in particular is unrecognisable in a list
+    // and obvious the moment it makes a mark. Selecting it is also what binds
+    // its tip, since `apply_preset` is where a tip reference is resolved.
+    if let Some(index) = first.and_then(|id| ed.presets.iter().position(|p| p.id == id)) {
+        ed.apply_preset(index);
     }
 }
 
@@ -1292,7 +1349,7 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
-                            "Read MyPaint .myb brushes, or an Umber .ron library"
+                            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
                         } else {
                             why_not.as_str()
                         })
@@ -1521,12 +1578,12 @@ fn browser_footer(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) {
 
     let saved = ed.presets.len().saturating_sub(state.index.shipped);
     let path = state
-        .path()
+        .dir()
         .map_or_else(|| "nowhere".to_owned(), |path| path.display().to_string());
     ui.horizontal(|ui| {
         ui.add(
             egui::Label::new(
-                RichText::new(format!("Your brushes are saved to {path}"))
+                RichText::new(format!("Your brushes are saved in {path}"))
                     .size(10.0)
                     .color(p.text_dim),
             )
@@ -1639,6 +1696,7 @@ mod tests {
             category: category.to_owned(),
             credit: None,
             brush: umber_core::Brush::default(),
+            tip: None,
         }
     }
 
