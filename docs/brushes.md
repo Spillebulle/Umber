@@ -70,6 +70,7 @@ panel, and never again.
 ```sh
 pwsh tools/fetch-brushes.ps1     # or: sh tools/fetch-brushes.sh
 cargo run -p umber-core --example build-brush-library
+cargo run -p umber-core --example survey-mypaint   # the tables below
 ```
 
 The first step downloads the packs into `assets/brushes/`, which is git-ignored,
@@ -151,27 +152,69 @@ value = base_value + Σ mapping_i(input_i)
 
 | MyPaint | Umber |
 |---|---|
-| `radius_logarithmic` | `size`, `min_size_ratio`, `size_curve` |
-| `hardness` | `hardness`, `min_hardness_ratio`, `hardness_curve` |
-| `opaque` × `opaque_multiply` | `opacity`, `opacity_curve`, `pressure_opacity` |
+| `radius_logarithmic` | `size`, `min_size_ratio`, `size_curve`, `Size` modulations |
+| `hardness` | `hardness`, `min_hardness_ratio`, `hardness_curve`, `Hardness` modulations |
+| `opaque` × `opaque_multiply` | `opacity`, `opacity_curve`, `pressure_opacity`, `Opacity` modulations |
 | `dabs_per_actual_radius` + `dabs_per_basic_radius` | `spacing` |
 | `eraser` | `mode` |
 | `slow_tracking` | `stabilization` |
-| `elliptical_dab_ratio` | `dab_ratio` |
-| `elliptical_dab_angle` | `dab_angle`, `dab_angle_follows_stroke`, `dab_angle_jitter` |
-| `offset_by_random` | `scatter`, `min_scatter_ratio`, `scatter_curve` |
+| `elliptical_dab_ratio` | `dab_ratio`, `Ratio` modulations |
+| `elliptical_dab_angle` | `dab_angle`, `dab_angle_follows_stroke`, `dab_angle_jitter`, `Angle` modulations |
+| `offset_by_random` | `scatter`, `min_scatter_ratio`, `scatter_curve`, `Scatter` modulations |
+| `offset_by_speed` | `speed_offset` |
 | `radius_by_random` | `radius_jitter` |
-| `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius` |
+| `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius`, `Smudge` modulations |
 | `dabs_per_second` | `dabs_per_second` |
+| `stroke_duration_logarithmic`, `stroke_holdtime` | `stroke_span`, `stroke_hold` |
+| `change_color_h` | `Hue` modulations |
+| `change_color_v` + `change_color_l` | `Value` modulations |
+| `change_color_hsv_s` + `change_color_hsl_s` | `Saturation` modulations |
 
 `radius_logarithmic` is the natural log of the dab radius **in pixels**, and its
 pressure mapping is an offset in log space, so the radius at pressure *p* is
 `exp(base + map(p))`. The classic mis-import is to read the base value as a
 radius: it turns a 2.6 px pen into a 0.96 px one. `classic/pen` has a base of
-0.96 and a pressure mapping to +0.5, so Umber stores a size of 8.61 px, a
-minimum ratio of `exp(-0.5) = 0.607`, and a size curve that reproduces
-MyPaint's radius exactly at all five sample points. There is a test for that:
-`the_imported_radius_matches_mypaint_at_every_sample`.
+0.96, a pressure mapping to +0.5 and a speed mapping to −0.15, so Umber stores a
+size of 7.99 px — the radius at full pressure and typical speed, doubled — a
+minimum ratio of `exp(-0.5) = 0.607`, a size curve, and a `Size ← Speed`
+modulation. Rebuilding the radius from those four reproduces MyPaint's own value
+at every sampled combination of the two inputs, which is what
+`the_imported_radius_matches_mypaint_at_every_sample` asserts.
+
+### Every setting is evaluated, not read
+
+MyPaint's `value = base_value + Σ mapping_i(input_i)` is evaluated in full, with
+each input held at MyPaint's own idea of a typical value. That is one function,
+`MybFile::eval`, and everything goes through it. Three faults disappeared when
+it did:
+
+- **`opaque`'s own mappings were dropped.** Three brushes — `deevad/oil_mop`,
+  `basic_digital_brush`, `basic_digital_knife` — shipped at `opacity: 0.0`,
+  completely invisible, because they state a base of about `2.5e-05` and put the
+  whole of their opacity on a pressure mapping. `classic/long_grass` is the
+  milder shape of the same fault and shipped at 0.748 instead of 1.0.
+- **`brush_radius` mappings were dropped**, and it is a *constant*:
+  libmypaint reads it as `BASEVAL(RADIUS_LOGARITHMIC)`. 13 brushes map it onto
+  the radius, 10 onto hardness and 5 onto spacing, and every one of them
+  imported at the wrong value for want of an evaluation.
+- **Mappings on inputs Umber has no equivalent for were dropped** rather than
+  evaluated at that input's resting value. A brush whose whole tilt mapping sits
+  at −0.3 should arrive 0.3 narrower, because that is what MyPaint draws on a
+  machine with no tilt.
+
+The exact arithmetic matters in two more places, and both were checked against
+libmypaint's source rather than reasoned about:
+
+- **Only the product is clamped.** `opaque = MAX(0, opaque); CLAMP(opaque ×
+  opaque_multiply, 0, 1)`. Neither half is first clamped to the range its editor
+  shows, so a brush whose `opaque` reaches 1.5 really does reach full coverage
+  at two thirds of its multiplier.
+- **A mapping extrapolates its end segments.** `mypaint_mapping_calculate` picks
+  the segment `x` falls in, falling back to the first or last, and carries its
+  slope onwards; it does not hold the end value. `classic/pen` states its speed
+  mapping over `0..1` while the speed input runs to 4, so holding thins the nib
+  by 14% on a flick where MyPaint thins it by 45%. Extrapolation is bounded
+  because the input's *domain* is clamped.
 
 ### Three settings are read as a curve, not as a number
 
@@ -191,51 +234,181 @@ MyPaint's editor writes a two-point mapping for *every* input a brush has ever
 been shown, and most of those are flat. "Has control points" is therefore not
 the same question as "is driven by this input": 24 of the 55 brushes that appear
 to map `elliptical_dab_ratio` map it to a constant zero. The importer measures
-the span of a mapping's output, which is what makes the counts above mean
+the span of a mapping's output, which is what makes the counts below mean
 anything.
+
+## Everything else the brushes ask for
+
+`cargo run -p umber-core --example survey-mypaint` prints this and the tables
+below it, and says so when a brush loses something. It is kept rather than
+thrown away for the same reason the library generator prints its classification:
+a count nobody can re-derive quietly goes stale, and two of this file's own
+figures were wrong before it existed.
+
+Every `(setting, input)` pair the pack uses at least three times, ranked by how
+many brushes have a **non-flat** mapping for it. "Read" means the effect reaches
+the canvas.
+
+| Setting | Input | Brushes | Output span (min / median / max) | Fate |
+|---|---|---:|---|---|
+| `opaque_multiply` | pressure | 194 | 0.11 / 1.00 / 1.67 | read |
+| `radius_logarithmic` | pressure | 113 | 0.15 / 1.25 / 5.17 | read |
+| `hardness` | pressure | 69 | 0.03 / 0.30 / 1.70 | read |
+| `opaque` | pressure | 54 | 0.04 / 1.00 / 2.00 | read |
+| `smudge` | pressure | 42 | 0.17 / 1.00 / 2.00 | read |
+| `elliptical_dab_angle` | direction | 39 | 42.8 / 180 / 360 | read, as "follows the stroke" |
+| `offset_by_random` | pressure | 38 | 0.30 / 1.40 / 8.57 | read |
+| `elliptical_dab_angle` | random | 31 | 1.0 / 360 / 360 | read, as angle jitter |
+| `radius_logarithmic` | speed1 | 31 | 0.04 / 0.40 / 2.06 | read |
+| `custom_input` | random | 19 | 10.6 / 20 / 20 | dropped |
+| `opaque` | speed1 | 19 | 0.05 / 0.14 / 2.00 | read |
+| `elliptical_dab_ratio` | random | 16 | 0.40 / 2.00 / 18.0 | read |
+| `change_color_l` | stroke | 14 | 0.01 / 0.02 / 0.60 | read, as HSV value |
+| `elliptical_dab_ratio` | speed1 | 14 | 0.54 / 2.13 / 14.0 | read |
+| `radius_logarithmic` | speed2 | 14 | 0.04 / 0.42 / 3.02 | read |
+| `custom_input` | pressure | 13 | 1.0 / 1.0 / 1.0 | dropped |
+| `radius_logarithmic` | brush_radius | 13 | 3.51 / 6.86 / 8.00 | folded into the base |
+| `hardness` | speed1 | 12 | 0.02 / 0.08 / 0.40 | read |
+| `radius_logarithmic` | random | 12 | 0.22 / 1.25 / 3.00 | read |
+| `smudge_bucket` | custom | 12 | 127 / 255 / 257 | no equivalent |
+| `smudge_length` | stroke | 12 | 0.52 / 2.00 / 2.00 | base read, mapping dropped |
+| `radius_logarithmic` | stroke | 11 | 0.62 / 1.82 / 4.58 | read |
+| `smudge_length` | pressure | 11 | 0.82 / 0.82 / 1.65 | base read, mapping dropped |
+| `anti_aliasing` | brush_radius | 10 | 0.60 / 3.84 / 3.84 | correctly ignored |
+| `hardness` | brush_radius | 10 | 0.36 / 0.89 / 0.89 | folded into the base |
+| `offset_angle` | custom | 10 | 47.6 / 80 / 80.6 | no equivalent |
+| `smudge` | stroke | 10 | 0.05 / 1.00 / 2.00 | read |
+| `elliptical_dab_ratio` | stroke | 9 | 0.80 / 0.80 / 9.00 | read |
+| `radius_by_random` | custom | 9 | 0.14 / 0.14 / 0.14 | held at neutral |
+| `radius_logarithmic` | custom | 9 | 0.90 / 0.90 / 7.32 | held at neutral |
+| `change_color_v` | random | 8 | 0.08 / 0.20 / 0.60 | read |
+| `elliptical_dab_ratio` | pressure | 8 | 2.39 / 2.70 / 15.0 | read |
+| `opaque` | stroke | 8 | 1.0 / 1.0 / 1.0 | read |
+| `elliptical_dab_angle` | stroke | 7 | 28.6 / 360 / 360 | read |
+| `elliptical_dab_ratio` | tilt_declination | 7 | 4.60 / 9.00 / 11.2 | held at neutral |
+| `offset_by_random` | tilt_declination | 6 | 0.63 / 0.83 / 1.80 | held at neutral |
+| `radius_logarithmic` | tilt_declination | 6 | 0.19 / 1.60 / 1.60 | held at neutral |
+| `change_color_h` | custom, random | 5, 5 | 0.02 / 0.04 / 0.10 | held at neutral; read |
+| `change_color_v` | stroke | 5 | 0.20 / 0.46 / 2.88 | read |
+| `dabs_per_actual_radius` | brush_radius | 5 | 5.78 / 29.6 / 31.4 | folded into the base |
+| `eraser` | pressure | 5 | 0.05 / 0.10 / 0.50 | base read, mapping dropped |
+| `offset_by_random` | speed1, speed2 | 5, 5 | 0.10 / 1.71 / 2.15 | read |
+| `offset_multiplier` | stroke | 5 | 0.31 / 1.09 / 1.41 | no equivalent |
+| `smudge` | speed1 | 5 | 0.02 / 0.15 / 0.20 | read |
+
+Totalled across every setting: `pressure` 576 live mappings, `random` 111,
+`speed1` 104, `stroke` 100, `custom` 74, `direction` 46, `brush_radius` 44,
+`tilt_declination` 28, `speed2` 27, then a long tail. Six of those are read
+directly, `brush_radius` is a constant that is folded in, and the rest are held
+at their neutral — which is not the same as being ignored, because
+`mapping(neutral)` is still added.
+
+Settings with a non-default **base value** and no mapping worth speaking of, in
+brush counts: `dabs_per_actual_radius` 146, `opaque_linearize` 123,
+`anti_aliasing` 100, `opaque` 93, `dabs_per_basic_radius` 75, `smudge` 74,
+`offset_by_random` 66, `stroke_duration_logarithmic` 56,
+`elliptical_dab_ratio` 55, `color_h/s/v` 52 each, `smudge_length` 52,
+`slow_tracking` 51, `stroke_holdtime` 47, `dabs_per_second` 45,
+`radius_by_random` 23, `slow_tracking_per_dab` 22, `smudge_radius_log` 20,
+`paint_mode` 19, `tracking_noise` 17, `stroke_threshold` 14, `eraser` 10,
+`offset_by_speed` 10.
+
+### What that produced
+
+64 of the 196 brushes need no modulation at all and stay on the fast path; 52
+take one, 46 two, and the busiest — `classic/long_grass` — takes nine of the
+table's twelve slots. Nothing in the pack is truncated. By target:
+`Size` 68 entries, `Smudge` 56, `Ratio` 50, `Opacity` 36, `Value` 35,
+`Hardness` 14, `Scatter` 12, `Hue` 11, `Angle` 8, `Saturation` 5.
+
+107 brushes now need the per-dab colour path, against 74 before. That is a real
+cost — a second render target written during the dab pass — and it is what those
+brushes ask for: 42 of them state colour pickup entirely as a pressure mapping,
+which is an oil brush that mixes when you lean on it, and reading the base alone
+made every one of them deposit flat paint for the whole stroke. The scratch
+target is allocated per document rather than per stroke, so nothing is
+allocated when one of these is picked up.
 
 ## What conversion loses
 
 Documented in full in the module docs of
 `crates/umber-core/src/brushimport/mypaint.rs`. The short version, worst first:
 
-- **`elliptical_dab_ratio` driven by an input.** 46 brushes map it and 15 of
-  those state a round base, so they arrive round. This is *deliberately* not
-  approximated by lifting a constant out of the mapping. The inputs it is
-  actually driven by are `random` (16 brushes), `speed1` (14), `stroke` (9),
-  `pressure` (8) and `tilt_declination` (7) — and for three of those five the
-  input sits at its neutral on a desktop with a mouse, which is precisely the
-  case where the base value is what MyPaint itself would render. Substituting
-  the mapping's peak would make those brushes wrong in a new way rather than
-  right. A ratio that varies genuinely needs a sixth shape parameter, and the
-  handful of brushes it would rescue are mostly ones whose range is 0.9 to 1.1.
-- **`radius_by_random` driven by an input** — 9 brushes, all with a round base
-  and all but one driven by `custom` or `attack_angle`, neither of which exists
-  here.
-- **`offset_by_speed`.** Scatter that grows with pen speed. 14 brushes. The
-  constant part of their scatter is imported; the speed-reactive part is not, so
-  a fast flick spreads less than it should.
+- **`custom_input` and everything it drives.** MyPaint's `custom` input is a
+  low-passed copy of a setting that is itself mapped, so supporting it means a
+  second evaluation pass with its own filter. 74 mappings read it — but two
+  thirds of those drive `offset_angle`, `smudge_bucket` and the rest of the
+  Anti-Art offset machinery, which has no equivalent here at all.
+- **The Anti-Art extensions.** `offset_x/y`, `offset_angle*`,
+  `offset_multiplier`, `gridmap_*`, `smudge_bucket`, `smudge_transparency`,
+  `smudge_length_log` — 19 brushes, and they need a dab that can be thrown to a
+  computed place with a colour bucket of its own.
+- **Tilt.** 28 mappings, and desktop reports tilt as `(0, 0)` regardless — see
+  the pressure section of `CLAUDE.md`. Held at neutral, which is what MyPaint
+  renders on the same machine, so nothing is *wrong*; it is simply flat.
 - **`paint_mode`.** MyPaint 2's spectral pigment mixing — a different colour
   model rather than a brush setting. 19 brushes ask for it.
+- **`smudge_length` driven by an input** — 23 mappings. `smudge_length` decides
+  how fast the carried colour decays towards each new canvas sample, and that
+  decay happens when a *probe comes home*, not when a dab is emitted. Making it
+  per-dab would mean deciding which dab a readback belonged to.
+- **`eraser` as a fraction.** MyPaint scales a dab's target alpha by
+  `1 - eraser`, so a brush can erase a bit; `Brush::mode` is a switch. Five
+  brushes map it onto pressure and import as whichever side of 0.5 their base
+  lands.
+- **`colorize`, `lock_alpha`, `posterize`, `restore_color`.** All four change
+  how a dab *composites* rather than what it is, so they belong to the commit
+  shader rather than the importer. No brush in the pack sets any of them to a
+  live value.
+- **The alpha correction on `radius_by_random`.** MyPaint dims a dab that
+  randomness made larger, by the square of the ratio, so a jittered stroke keeps
+  its average density. Umber's `max` coverage has no per-dab density to keep.
 - **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
   nothing is lost here. The engine and the library now have them
   (see below); it is the Krita and GIMP packs they exist for.
-- **Non-pressure inputs.** `speed1`, `speed2`, `stroke`, `tilt_*`, `custom`,
-  `brush_radius`. `Brush` is a `Copy` struct of fixed-size curves, so every
-  input it gains costs a curve on every brush. Two are exceptions, both on
-  `elliptical_dab_angle`: a `direction` mapping is read as "this dab turns to
-  follow the stroke", the difference between a rake and a broad nib, and a
-  `random` one is read as `dab_angle_jitter`. Neither is read as a curve.
-- **Tilt.** 9 brushes map it, and desktop reports it as `(0, 0)` regardless —
-  see the pressure section of `CLAUDE.md`. Supporting the setting without a
-  device to drive it would change nothing on any machine Umber currently runs
-  on.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
   darkens as a stroke crosses itself. Umber takes a `max` of coverage across the
   whole stroke and applies opacity once at commit — that is the wet-layer design
   in `CLAUDE.md`, and it is why `opaque_linearize` is ignored rather than
   approximated. A MyPaint wash and an Umber wash of the same numbers will not
   look the same.
+
+Three things look like faults and are not:
+
+- **`color_h` / `color_s` / `color_v`** are non-default in 52 brushes, and the
+  values are simply whatever colour was on the canvas when the file was saved —
+  the same triple repeats verbatim across a dozen unrelated brushes. MyPaint
+  only applies them when `restore_color` is set, which two brushes do. Ignoring
+  them is correct.
+- **`opaque_linearize`** is non-default in 123 brushes. It is MyPaint reducing
+  per-dab alpha so that dabs compounding at the brush's spacing reach the
+  requested opacity. Umber's `max` coverage reaches exactly `opacity` already.
+- **`anti_aliasing`** is non-default in 100 brushes. It is a minimum edge
+  fadeout in pixels, and Umber's dab shader applies one unconditionally, sized
+  from the dab's short axis. Nothing is lost.
+
+### Approximations, stated
+
+- **`change_color_l` and `change_color_hsl_s` are applied in HSV, not HSL.**
+  They are not the same axis — a fully saturated hue is L 0.5 and V 1 — so the
+  *amount* of a lightness shift is approximate while its direction and its
+  timing are exact. 14 brushes drift lightness along the stroke and this is what
+  makes that visible at all.
+- **Several mappings on one setting compose by addition, as MyPaint does — but
+  opacity composes by multiplication**, because MyPaint reaches opacity by
+  multiplying two settings rather than adding to one. Exact for one mapping,
+  approximate for two.
+- **The `stroke` input's ramp is measured against `Brush::size / 2`**, where
+  MyPaint measures against `exp(base radius_logarithmic)`. For a brush that
+  doubles under pressure the cycle is about twice as long here.
+- **`speed1_gamma`, `speed1_slowness` and their `speed2` twins are constants**,
+  at MyPaint's defaults. Every brush in the pack leaves all four there.
+- **`offset_by_speed_slowness` is a constant**, at the 10 ms MyPaint's default
+  gives. Only ten brushes use the offset at all.
+- **A dab's random draw is uniform where MyPaint's `offset_by_random` and
+  `radius_by_random` are gaussian.** Those two keep their own gaussian; the
+  `random` *input* is uniform in both, and one draw per dab is shared by every
+  entry that reads it, exactly as libmypaint's `random_input` is.
 
 ## Bitmap tips
 
@@ -337,14 +510,23 @@ never does anything.
 - **Elliptical tips.** The tip is stretched over the dab's bounding square, so a
   non-square mask loses its aspect ratio. The dab carries a single radius and
   has nowhere to record one.
-- **Ellipticity driven by an input**, and scatter driven by pen speed — see
-  "What conversion loses" above for why each was left alone rather than
-  approximated.
-- **`lock_alpha`, `colorize` and `change_color_*`.** No brush in the shipped
-  pack sets any of them to a live value, so nothing in the library is waiting on
-  them. They are worth building as painting features in their own right —
-  `lock_alpha` especially — not as import fidelity.
-- **Per-brush blend modes.**
+- **`lock_alpha`, `colorize` and `posterize`.** All three change how a dab
+  *composites*, so they belong to `commit.wgsl` — and every change there has to
+  be made identically in `composite.wgsl` or the stroke jumps at pointer-up.
+  `lock_alpha` additionally needs the layer's own alpha read as a mask, which
+  the stroke scratch has no channel for. No brush in the shipped pack sets any
+  of them to a live value, so nothing in the library is waiting on them; they
+  are worth building as painting features in their own right, `lock_alpha`
+  especially, rather than as import fidelity.
+- **Per-brush blend modes.** `Brush::mode` is `Paint | Erase`. Widening it to
+  the layer stack's `BlendMode` would mean the commit pass choosing among eight
+  blend states rather than two, the same eight added to the preview half of
+  `composite.wgsl`, and a control in the brush editor — perhaps two days, most
+  of it in keeping the two shaders in step. Nothing in the shipped library needs
+  it, so it is worth doing when a *user* asks rather than to close an import
+  gap.
+- **`custom_input`**, and with it the last third of MyPaint's own mappings. See
+  "What conversion loses".
 - **A `.kpp` importer.** Krita presets are PNG files with the settings in a
   text chunk, and most of them lean on a bitmap tip. The tip half is now here;
   the settings half is not.
@@ -353,14 +535,15 @@ never does anything.
 
 ## What a user can set
 
-The brush editor has four sections, following the design's naming where it has
+The brush editor has five sections, following the design's naming where it has
 a name for the thing:
 
 | Section | Holds |
 |---|---|
 | Tip | size, hardness, opacity, spacing, airbrush rate, roundness, angle, angle-follows-stroke, stabilisation |
 | Dynamics | pressure source, and pressure → size / opacity / hardness with their curves and floors |
-| Scatter | scatter, size jitter, angle jitter, pressure → scatter |
+| Inputs | the modulation table — target, input, both ends of its range and its curve — plus the stroke ramp and hold |
+| Scatter | scatter, size jitter, angle jitter, speed lead, pressure → scatter |
 | Blending | colour pickup, smear length, pickup radius |
 
 That is every field of `Brush` except `mode`, which is the tool choice (Brush
@@ -368,10 +551,24 @@ or Eraser) rather than a brush setting, and is on the tool rail.
 
 Two of the design's six sections are not drawn at all rather than drawn empty:
 **Texture** has no engine behind it (see above) and **Wet edges** has none
-either. **Stabiliser** is one slider and rides on Tip. Colour pickup needed a
-home and none of the design's names is one, so **Blending** is a name of our
-own — filing it under "Wet edges" would have borrowed a term that means
-something else in every application that has it.
+either. **Stabiliser** is one slider and rides on Tip. Two of the five are names
+of our own, and both were needed because the design has no word for the thing:
+
+- **Blending**, for colour pickup. Filing it under "Wet edges" would have
+  borrowed a term that means something else in every application that has it.
+- **Inputs**, for the modulation table. It could not go on Dynamics: that
+  section is three curves that all answer "what does pressing harder do", and
+  this is a *list* of arbitrary length whose rows each pick their own target and
+  their own driver. No amount of column arithmetic makes those the same shape,
+  and the two names have to draw exactly that distinction — Dynamics is
+  pressure, Inputs is everything else.
+
+The stroke ramp is drawn **dead**, with the reason under it, whenever nothing on
+the brush reads stroke position. Speed lead sits on Scatter with the other
+things that move a dab off the line rather than on Inputs with the modulations,
+because it is a property of the brush and not a row in the table — and it is
+spelled "Speed lead" rather than as scatter because a lead trails and a spray
+does not.
 
 Roundness is shown rather than `dab_ratio`, because that is the design's word
 and every other paint application's; the two are reciprocals. Angle and angle
