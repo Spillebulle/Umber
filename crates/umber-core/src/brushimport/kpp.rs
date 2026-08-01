@@ -31,8 +31,41 @@
 //! - **`Pressure<Name>` is *not* "pressure drives this".** It is Krita's
 //!   historical spelling of "the `<Name>` dynamic is switched on"; which input
 //!   drives it is in `<Name>Sensor`. Reading it the obvious way turns every
-//!   speed- and angle-driven dynamic into a pressure one.
+//!   speed- and angle-driven dynamic into a pressure one — and it gates the
+//!   setting's **value** as well as its curve. Krita writes `ScatterValue` at
+//!   its default of 1 into every preset whether or not scattering is on, so a
+//!   reader that consults the value alone sprays 93 of the 119 presets in the
+//!   fetched packs.
 //! - **`angle` is in radians** in `brush_definition`, and in degrees nowhere.
+//!
+//! # Fade is hardness, not softness
+//!
+//! `MaskGenerator@hfade` is the fraction of the radius that stays **fully
+//! opaque**, so `hfade="1"` is a hard-edged disc and `hfade="0"` the softest
+//! dab the generator draws. That is the same quantity `dab.wgsl` calls
+//! hardness, and it carries across unchanged.
+//!
+//! This read `1 - hfade` for a while, on the reasonable-sounding grounds that a
+//! setting called "fade" ought to be softness. It is not, and reasoning was the
+//! wrong way to settle it. A `.kpp` is a PNG whose image is *Krita's own
+//! preview of the brush*, so the packs answer the question directly:
+//!
+//! | Preset | generator | `hfade` | Krita's preview |
+//! |---|---|---|---|
+//! | GDQuest "Ink Brush" | `default` | 1 | a crisp black line |
+//! | Raghukamath "Inkbrush" | `default` | 1 | a crisp black line |
+//! | GDQuest "Ink Rough" | `default` | 0.78 | crisp, faintly feathered |
+//! | Raghukamath "Basic Render" | `default` | 0.67 | plainly soft |
+//! | Deevad "Basic Oval Brush" | `default` | 0.89 | hard-edged |
+//! | Deevad "Eraser Kneaded Soft" | `gauss` | 0 | a wide feathered fade |
+//! | Deevad "Pencil H Sketch" | `gauss` | 0.15 | soft, faint sketch lines |
+//!
+//! Every one of those was imported inside out. Three mask generators share the
+//! attribute and all three run the same way round: `default`
+//! (`KisCircleMaskGenerator`) fades from `hfade` of the radius outwards,
+//! `gauss` blurs by `1 - hfade`, and `soft` (`KisCurveMaskGenerator`) ignores
+//! `hfade` entirely and states its falloff in `softness_curve`, which
+//! [`hardness_from_curve`] reads.
 //!
 //! # The tip
 //!
@@ -57,6 +90,10 @@
 //!   round dab wearing their name would be pure invention. They are refused by
 //!   name rather than approximated.
 //! - **Masking brushes** — a second brush multiplied into the first.
+//! - **Edge sharpening.** Krita's Sharpness thresholds the finished mask into a
+//!   hard, aliased edge; `dab.wgsl` antialiases unconditionally and has nothing
+//!   to switch off. It is the whole of a pixel-art brush, so it is named rather
+//!   than ignored.
 //! - **Paper texture**, **mirrored dabs**, **paint thickness (impasto)**.
 //! - **Square and star mask generators**, exactly as [`super::vbr`] drops them.
 //! - **Brush-tip randomness and density**, which perturb the generated mask
@@ -167,6 +204,16 @@ pub fn from_kpp_in(
     if preset.flag("PressurePaintThickness") {
         dropped.push("paint thickness");
     }
+    // Krita's Sharpness thresholds the finished mask into a hard, aliased edge.
+    // That is not a hardness — `dab.wgsl` antialiases unconditionally, sized
+    // from the dab's short axis — and it is the whole of a pixel-art brush:
+    // GDQuest's "PixelArt OnePixel" is a one-pixel dab that is *only* one pixel
+    // because of this. Naming it is what keeps such a brush out of the shipped
+    // library rather than shipping a soft blob under its author's name.
+    if preset.flag("PressureSharpness") && preset.number("SharpnessValue").is_some_and(|v| v > 0.0)
+    {
+        dropped.push("edge sharpening");
+    }
 
     // --- the tip ------------------------------------------------------------
     let mut missing_tip = None;
@@ -231,9 +278,17 @@ pub fn from_kpp_in(
         BrushMode::Paint
     };
 
-    let dabs_per_second = if preset.flag("PaintOpSettings/isAirbrushing") {
+    // Krita has spelled the airbrush option two ways. `PaintOpSettings/` is the
+    // older one and `AirbrushOption/` the current; both are in the fetched
+    // packs — 45 presets use the first, 52 the second — so knowing only one
+    // silently imports an airbrush as a distance-driven brush. GDQuest's
+    // "Airbrush", which asks for 1000 dabs a second, was exactly that.
+    let airbrushing =
+        preset.flag("PaintOpSettings/isAirbrushing") || preset.flag("AirbrushOption/isAirbrushing");
+    let dabs_per_second = if airbrushing {
         preset
             .number("PaintOpSettings/rate")
+            .or_else(|| preset.number("AirbrushOption/rate"))
             .unwrap_or(0.0)
             .clamp(0.0, 300.0)
     } else {
@@ -303,7 +358,19 @@ pub fn from_kpp_in(
         dab_angle: tip_spec.angle,
         dab_angle_follows_stroke,
         dab_angle_jitter,
-        scatter: scatter.peak * preset.number("ScatterValue").unwrap_or(0.0),
+        // `ScatterValue` only means anything when Krita's scatter option is
+        // switched on: `KisScatterOption::apply` returns the unscattered
+        // position when `!isChecked()`, and `isChecked()` is `PressureScatter`
+        // — the same "`Pressure<Name>` is the enable flag" rule the module docs
+        // open with, which was being applied to the *curve* and not to the
+        // value. Krita leaves `ScatterValue` at its default of 1 in a preset
+        // that never scatters, so reading it unconditionally turned twenty of
+        // the twenty-one shipped Krita brushes into sprays.
+        scatter: if preset.flag("PressureScatter") {
+            scatter.peak * preset.number("ScatterValue").unwrap_or(0.0)
+        } else {
+            0.0
+        },
         min_scatter_ratio,
         scatter_curve,
         pressure_scatter,
@@ -663,6 +730,34 @@ fn piecewise(points: &[(f32, f32)], x: f32) -> f32 {
     last.1
 }
 
+/// Krita's `softness_curve`, read as an Umber hardness.
+///
+/// `id="soft"` is `KisCurveMaskGenerator`, whose shape is a curve from the
+/// centre of the dab (`x = 0`) to its edge (`x = 1`) giving the coverage there.
+/// Umber's dab is `1 - smoothstep(hardness, 1, d)`, whose half-coverage radius
+/// is `(hardness + 1) / 2` — so measuring where the curve crosses a half and
+/// inverting that gives the same quantity `hfade` gives for the other two
+/// generators, and the two paths stay comparable.
+///
+/// A curve that never reaches a half is softer than any hardness can express;
+/// zero — the softest dab Umber draws — is the honest floor for it, and
+/// GDQuest's airbrush, whose curve peaks at 0.4 in the middle, is exactly that
+/// brush.
+fn hardness_from_curve(text: &str) -> Option<f32> {
+    let points = curve_points(text)?;
+    let mut half = 0.0f32;
+    // 64 steps across the radius: finer than the difference between two
+    // adjacent hardnesses anyone can see, and it avoids having to reason about
+    // a curve whose control points are not sorted.
+    for i in 0..=64 {
+        let x = i as f32 / 64.0;
+        if piecewise(&points, x) >= 0.5 {
+            half = x;
+        }
+    }
+    Some((2.0 * half - 1.0).clamp(0.0, 1.0))
+}
+
 // ---------------------------------------------------------------------------
 // brush_definition
 // ---------------------------------------------------------------------------
@@ -717,7 +812,12 @@ impl TipSpec {
                     seen = true;
                     out.file = attrs.get("filename").filter(|f| !f.is_empty()).cloned();
                     out.scale = attrs.number("scale").unwrap_or(1.0).clamp(0.01, 100.0);
-                    out.spacing = attrs.number("spacing").map(|s| s.clamp(0.01, 4.0));
+                    // Krita's own spacing slider runs to 10, and one shipped
+                    // preset — Raghukamath's "Dots" — sits at 5.12. A ceiling
+                    // of 4 pulled its dots 20% closer together than its author
+                    // spaced them, which for a brush that *is* its spacing is
+                    // the whole brush.
+                    out.spacing = attrs.number("spacing").map(|s| s.clamp(0.01, 10.0));
                     // Radians. Krita's rotation runs the same way round as
                     // Umber's, so only the units differ.
                     out.angle = attrs
@@ -745,9 +845,21 @@ impl TipSpec {
                         out.diameter = out.diameter.map(|d| d * ratio);
                         out.angle = (out.angle + 90.0).rem_euclid(360.0);
                     }
-                    // `fade` is softness: 0 is a hard edge, 1 is entirely
-                    // diffuse. Umber's hardness is the other way up.
-                    out.hardness = attrs.number("hfade").map(|f| (1.0 - f).clamp(0.0, 1.0));
+                    // `fade` is **hardness**, not softness, and this read the
+                    // wrong way round until it was checked against Krita's own
+                    // rendered previews — see the "Fade is hardness" section of
+                    // the module docs, which lists the seven presets that
+                    // settle it. `hfade` is the fraction of the radius that
+                    // stays fully opaque, which is exactly what `dab.wgsl`'s
+                    // `smoothstep(hardness, 1.0, d)` means by hardness.
+                    //
+                    // `id="soft"` is a different generator whose shape is in
+                    // `softness_curve`; `hfade` is a leftover field there and
+                    // says nothing, so the curve wins where there is one.
+                    out.hardness = attrs
+                        .get("softness_curve")
+                        .and_then(|c| hardness_from_curve(c))
+                        .or_else(|| attrs.number("hfade").map(|f| f.clamp(0.0, 1.0)));
                     if attrs.number("spikes").is_some_and(|s| s > 2.5) {
                         out.dropped.push("star-shaped brushes");
                     }
@@ -1011,6 +1123,13 @@ mod tests {
         format!("<param name=\"{name}\" type=\"string\"><![CDATA[{value}]]></param>")
     }
 
+    /// The other spelling: `type="internal"` writes the value as element text
+    /// rather than wrapping it in CDATA, and every `Pressure<Name>` flag in a
+    /// real preset is written this way.
+    fn internal(name: &str, value: impl std::fmt::Display) -> String {
+        format!("<param type=\"internal\" name=\"{name}\">{value}</param>")
+    }
+
     /// Revoy's "Basic Oval Brush", trimmed to what this importer reads.
     fn oval() -> String {
         format!(
@@ -1042,8 +1161,10 @@ mod tests {
         // Krita's ratio scales the short axis, so it is the reciprocal of
         // Umber's. Reading it straight through would make a chisel a circle.
         assert!((preset.brush.dab_ratio - 1.0 / 0.65).abs() < 1e-4);
-        // `hfade` is softness, and Umber's hardness is the other way up.
-        assert!((preset.brush.hardness - 0.11).abs() < 1e-5);
+        // `hfade` is the opaque fraction of the radius, which is exactly what
+        // `dab.wgsl` means by hardness. Revoy's oval brush draws a hard-edged
+        // stroke in Krita's own preview of it; `1 - hfade` made it a cloud.
+        assert!((preset.brush.hardness - 0.89).abs() < 1e-5);
         // Radians in the file, degrees in the brush.
         assert!(
             (preset.brush.dab_angle - 343.0).abs() < 0.5,
@@ -1358,6 +1479,196 @@ mod tests {
         assert!(from_kpp(&kpp("<Preset name=\"X\"/>")).is_err());
         assert!(from_kpp(&kpp("not xml at all <<<")).is_err());
         assert!(dropped_features(b"rubbish").is_empty());
+    }
+
+    /// A `brush_definition` around one mask generator, with everything the
+    /// reader needs and nothing else.
+    fn with_generator(generator: &str) -> Vec<u8> {
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}</Preset>",
+            param(
+                "brush_definition",
+                &format!(
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\" \
+                     density=\"1\" randomness=\"0\">{generator}</Brush>"
+                )
+            ),
+        );
+        kpp(&xml)
+    }
+
+    /// The polarity, pinned against the numbers the shipped packs actually
+    /// carry. Every value below is copied out of a real preset, and every one
+    /// of them was imported inside out until this was checked against Krita's
+    /// own preview images — see the module docs for the table.
+    #[test]
+    fn fade_is_hardness_and_not_softness() {
+        let hardness = |generator: &str| {
+            from_kpp(&with_generator(generator))
+                .expect("decode")
+                .brush
+                .hardness
+        };
+
+        // GDQuest "Ink Brush" and Raghukamath "Inkbrush": both draw a crisp
+        // black line, and both used to import at hardness 0.0 — a cloud.
+        assert!(
+            (hardness(
+                "<MaskGenerator id=\"default\" type=\"circle\" diameter=\"30\" \
+                 ratio=\"1\" hfade=\"1\" vfade=\"1\" spikes=\"2\"/>"
+            ) - 1.0)
+                .abs()
+                < 1e-5
+        );
+        // Deevad "Eraser Kneaded Soft": a wide feathered fade, and the name
+        // says so. It used to import at hardness 1.0.
+        assert!(
+            hardness(
+                "<MaskGenerator id=\"gauss\" type=\"circle\" diameter=\"250\" \
+                 ratio=\"1\" hfade=\"0\" vfade=\"0\" spikes=\"2\"/>"
+            ) < 1e-5
+        );
+        // Raghukamath "Basic Render": plainly soft in its preview, and between
+        // the two extremes rather than at one of them.
+        let render = hardness(
+            "<MaskGenerator id=\"default\" type=\"circle\" diameter=\"95.81\" \
+             ratio=\"1\" hfade=\"0.67\" vfade=\"0.67\" spikes=\"2\"/>",
+        );
+        assert!((render - 0.67).abs() < 1e-5, "{render}");
+    }
+
+    /// `id="soft"` is a different generator: its shape is the `softness_curve`
+    /// and its `hfade` is a leftover the editor wrote and never reads. Reading
+    /// the field would make GDQuest's airbrush — whose curve never exceeds 0.4
+    /// even at the centre — a hard disc.
+    #[test]
+    fn a_softness_curve_beats_the_fade_field_beside_it() {
+        // GDQuest "Airbrush", verbatim.
+        let airbrush = from_kpp(&with_generator(
+            "<MaskGenerator id=\"soft\" type=\"circle\" diameter=\"440\" ratio=\"1\" \
+             hfade=\"0\" vfade=\"0\" spikes=\"2\" \
+             softness_curve=\"0,0.39911;0.429719,0.118523;1,0;\"/>",
+        ))
+        .expect("decode");
+        assert!(
+            airbrush.brush.hardness < 1e-5,
+            "{}",
+            airbrush.brush.hardness
+        );
+
+        // Raghukamath "Basic": full coverage in the middle falling to nothing
+        // at the rim, with `hfade="1"` sitting beside it saying "hard".
+        let basic = from_kpp(&with_generator(
+            "<MaskGenerator id=\"soft\" type=\"circle\" diameter=\"20\" ratio=\"1\" \
+             hfade=\"1\" vfade=\"1\" spikes=\"2\" \
+             softness_curve=\"0,1;0.562249,0.721362;1,0;\"/>",
+        ))
+        .expect("decode");
+        assert!(
+            basic.brush.hardness > 0.2 && basic.brush.hardness < 0.6,
+            "{}",
+            basic.brush.hardness
+        );
+    }
+
+    /// `ScatterValue` sits at Krita's default of 1 in a preset that never
+    /// scatters, so the enable flag is the whole of the answer. Reading the
+    /// value alone gave GDQuest's "Ink Brush" a five-radius spray.
+    #[test]
+    fn scatter_needs_kritas_own_switch_as_well_as_its_value() {
+        let with = |on: bool, value: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+                     </Brush>"
+                ),
+                param("ScatterValue", value),
+                param("ScatterSensor", "<params id=\"pressure\"/>"),
+                internal("PressureScatter", on),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush
+        };
+        // GDQuest "Ink Brush": switched off, value left at 5.
+        assert_eq!(with(false, "5").scatter, 0.0);
+        // Raghukamath "Dots": switched on, and it really does scatter.
+        assert!((with(true, "0.1").scatter - 0.1).abs() < 1e-5);
+    }
+
+    /// Krita has spelled the airbrush option two ways and both are in the
+    /// fetched packs. Knowing one silently imports an airbrush as an ordinary
+    /// distance-driven brush.
+    #[test]
+    fn both_of_kritas_airbrush_spellings_are_read() {
+        let with = |prefix: &str, rate: &str| {
+            let switch = internal(&format!("{prefix}/isAirbrushing"), true);
+            let speed = param(&format!("{prefix}/rate"), rate);
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{switch}{speed}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+                     </Brush>"
+                ),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush.dabs_per_second
+        };
+        assert_eq!(with("PaintOpSettings", "50"), 50.0);
+        // GDQuest "Airbrush" asks for 1000 a second; the ceiling is Umber's.
+        assert_eq!(with("AirbrushOption", "1000"), 300.0);
+    }
+
+    /// Krita's Sharpness thresholds the mask into a hard, aliased edge, which
+    /// is the whole of a pixel-art brush and something Umber cannot do. It has
+    /// to be *named*, or such a preset ships as a soft blob under its author's
+    /// name.
+    #[test]
+    fn edge_sharpening_is_named_rather_than_quietly_dropped() {
+        let with = |on: bool, value: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"1\" type=\"circle\" ratio=\"1\" hfade=\"1\" \
+                     id=\"gauss\"/></Brush>"
+                ),
+                internal("PressureSharpness", on),
+                param("SharpnessValue", value),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+        // GDQuest "PixelArt OnePixel".
+        assert!(with(true, "1").contains(&"edge sharpening"));
+        // Switched on with nothing behind it changes no pixel.
+        assert!(!with(true, "0").contains(&"edge sharpening"));
+        assert!(!with(false, "1").contains(&"edge sharpening"));
+    }
+
+    /// Raghukamath's "Dots" spaces its dabs 5.12 diameters apart, and the
+    /// spacing *is* the brush. A ceiling of 4 pulled them 20% closer.
+    #[test]
+    fn kritas_whole_spacing_range_survives() {
+        let brush = from_kpp(&with_generator(
+            "<MaskGenerator id=\"gauss\" type=\"circle\" diameter=\"26.89\" \
+             ratio=\"1\" hfade=\"1\" vfade=\"1\" spikes=\"2\"/>",
+        ))
+        .expect("decode");
+        assert_eq!(brush.brush.spacing, 0.1);
+
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"5.12\" angle=\"0\">\
+                 <MaskGenerator diameter=\"26.89\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+                 </Brush>"
+            ),
+        );
+        assert_eq!(from_kpp(&kpp(&xml)).expect("decode").brush.spacing, 5.12);
     }
 
     #[test]
