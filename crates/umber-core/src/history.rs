@@ -30,6 +30,8 @@ pub enum EditKind {
 }
 
 impl EditKind {
+    pub const ALL: [EditKind; 2] = [Self::Paint, Self::Erase];
+
     /// Which kind a stroke in `mode` records.
     ///
     /// Here rather than at the call site because the answer belongs with the
@@ -170,20 +172,25 @@ impl History {
         self.undo.len()
     }
 
-    /// What the edit at `index` in the timeline was, for a list to name.
+    /// The edit at `index` in the timeline, whichever stack is holding it.
     ///
     /// Indexing rather than an iterator so a list can draw row `i` without
     /// holding a borrow across the loop, and so nothing here allocates.
-    pub fn kind_at(&self, index: usize) -> Option<EditKind> {
+    pub fn entry_at(&self, index: usize) -> Option<&Edit> {
         if let Some(edit) = self.undo.get(index) {
-            return Some(edit.kind);
+            return Some(edit);
         }
         // The redo stack is newest-first — popping it is the next redo — so
         // reading it as a continuation of the timeline means reading it
         // backwards.
         let from_end = index.checked_sub(self.undo.len())?;
         let index = self.redo.len().checked_sub(from_end + 1)?;
-        self.redo.get(index).map(|edit| edit.kind)
+        self.redo.get(index)
+    }
+
+    /// What the edit at `index` in the timeline was, for a list to name.
+    pub fn kind_at(&self, index: usize) -> Option<EditKind> {
+        self.entry_at(index).map(|edit| edit.kind)
     }
 
     /// How many entries the budget has discarded, which is how far short of
@@ -248,6 +255,35 @@ impl History {
         self.redo.clear();
         self.used_bytes = 0;
         self.dropped = 0;
+    }
+
+    /// Replace the whole timeline with one read back out of a document.
+    ///
+    /// `entries` is timeline order — everything applied, oldest first, then
+    /// everything undone in the order redoing would put it back, which is
+    /// exactly what [`History::entry_at`] walks. `position` is how many of them
+    /// are applied, so the document reopens with the cursor where it was left
+    /// rather than at one end of its own history.
+    ///
+    /// `dropped` is carried across rather than reset: a history that did not
+    /// reach the beginning of the document when it was saved does not reach it
+    /// now either, and the list has to be able to say so.
+    ///
+    /// The in-memory budget still applies — a file written by a build with a
+    /// larger one must not be able to hand this process more than it allows.
+    pub fn restore(&mut self, entries: Vec<Edit>, position: usize, dropped: usize) {
+        self.clear();
+        let mut entries = entries;
+        let position = position.min(entries.len());
+        let redone = entries.split_off(position);
+
+        self.used_bytes = entries.iter().chain(&redone).map(Edit::byte_len).sum();
+        self.undo = entries;
+        // Timeline order into stack order: the *next* redo is the entry
+        // immediately after the cursor, and that is what pops off the end.
+        self.redo = redone.into_iter().rev().collect();
+        self.dropped = dropped;
+        self.evict_to_budget();
     }
 
     /// Drop the oldest undo entries until we fit. The most recent history is
@@ -390,6 +426,56 @@ mod tests {
         assert_eq!(h.steps_to(4), Jump::Redo(3));
         assert_eq!(h.steps_to(1), Jump::Stay);
         assert_eq!(h.steps_to(0), Jump::Undo(1));
+    }
+
+    /// A history read back out of a document has to come back as the same
+    /// timeline it was written from — the same entries in the same order, the
+    /// same cursor within them, and both stacks still usable. Restoring only
+    /// the undo half would silently throw away work the artist had undone and
+    /// meant to come back to.
+    #[test]
+    fn a_restored_timeline_reads_exactly_as_the_one_it_came_from() {
+        let mut original = History::default();
+        original.record(Edit::new(EditKind::Paint, patch(4, 4, 1)));
+        original.record(Edit::new(EditKind::Erase, patch(4, 4, 2)));
+        original.record(Edit::new(EditKind::Paint, patch(4, 4, 3)));
+        // Step back one, so the timeline straddles both stacks.
+        let undone = original.take_undo().unwrap();
+        original.push_redo(Edit::new(undone.kind, patch(4, 4, 9)));
+
+        let timeline: Vec<Edit> = (0..original.len())
+            .map(|i| original.entry_at(i).unwrap().clone())
+            .collect();
+
+        let mut restored = History::default();
+        restored.restore(timeline, original.position(), original.dropped());
+
+        assert_eq!(restored.len(), original.len());
+        assert_eq!(restored.position(), original.position());
+        assert_eq!(restored.used_bytes(), original.used_bytes());
+        for i in 0..original.len() {
+            let (a, b) = (original.entry_at(i).unwrap(), restored.entry_at(i).unwrap());
+            assert_eq!(a.kind, b.kind, "entry {i}");
+            assert_eq!(a.patch.rect, b.patch.rect, "entry {i}");
+            assert_eq!(a.patch.slot, b.patch.slot, "entry {i}");
+            assert_eq!(a.patch.bytes, b.patch.bytes, "entry {i}");
+        }
+
+        // And the cursor is where it was: one redo available, two undos.
+        assert_eq!(restored.take_redo().unwrap().patch.bytes[0], 9);
+        assert_eq!(restored.take_undo().unwrap().patch.bytes[0], 2);
+    }
+
+    /// A file written by a build with a larger budget must not be able to hand
+    /// this one more than it allows.
+    #[test]
+    fn restoring_still_answers_to_the_budget() {
+        let entries: Vec<Edit> = (0..8u8).map(|i| edit(16, 16, i)).collect();
+        let mut h = History::with_budget(2500);
+        h.restore(entries, 8, 0);
+        assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
+        assert!(h.dropped() > 0, "the budget dropped nothing");
+        assert_eq!(h.dropped() + h.len(), 8);
     }
 
     /// The list must be able to say that it does not reach the beginning.
