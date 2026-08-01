@@ -268,6 +268,142 @@ fn average_probe(bytes: &[u8]) -> [f32; 4] {
     [rgb[0] / weight, rgb[1] / weight, rgb[2] / weight, alpha / n]
 }
 
+// --- the whole-document capture --------------------------------------------
+
+/// How much of a mapped capture buffer is read per frame.
+///
+/// Reading a mapped staging buffer reads uncached memory: a whole 16 MB layer
+/// measured about 5 ms, which is a third of a 60 Hz frame spent on something
+/// the user did not ask for. Four megabytes is comfortably under a millisecond
+/// and costs only a few more frames — see [`Capture::copy_chunk`].
+const CAPTURE_CHUNK_BYTES: usize = 4 << 20;
+
+/// Where a [`Capture`]'s one staging buffer has got to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepState {
+    /// Free. Nothing is outstanding on the GPU, so the next copy can be
+    /// recorded into it — or the whole capture abandoned.
+    Waiting,
+    /// A copy has been recorded but `map_async` has not been called.
+    Rendering,
+    /// `map_async` is outstanding.
+    Mapping,
+}
+
+/// A whole document on its way to the CPU, one buffer at a time.
+///
+/// The blocking readback [`CanvasRenderer::read_layer_rect`] performs is
+/// acceptable once, at pointer-up, on an explicit Save — and is exactly wrong
+/// on a timer, which is what an autosave is. So this is the smudge probe's idea
+/// at document scale: a copy is recorded into the frame's own encoder,
+/// `map_async` is called after that frame is submitted, and the bytes are
+/// collected on some later frame by a poll that never waits.
+///
+/// **One layer in flight at a time, through one reused buffer.** Recording
+/// every copy at once would cost the same in CPU calls, and would be wrong
+/// twice over: the GPU would move the whole document in a single frame — over a
+/// hundred megabytes on a 2048² stack — and the maps would then come home
+/// together, landing every one of those memcpys in one frame. Both are exactly
+/// the hitch this exists to avoid. Serialised, a frame pays either a recording
+/// (microseconds) or one layer's memcpy, and the staging cost is one buffer
+/// rather than one per layer. The price is that the capture takes a couple of
+/// frames per layer, which for a five-minute timer is no price at all.
+struct Capture {
+    size: UVec2,
+    /// Bytes per row of the copy, rounded up to the copy alignment.
+    padded: u32,
+    /// Which texture-array slices to read, in the order the caller asked for.
+    slots: Vec<u32>,
+    /// The stack as the flattened preview should composite it.
+    draws: Vec<LayerDraw>,
+    /// The one staging buffer, allocated on the first step and reused.
+    buffer: Option<wgpu::Buffer>,
+    /// One of the `PROBE_*` constants, for the reason [`Probe::outcome`] is.
+    outcome: Arc<AtomicU8>,
+    state: StepState,
+    /// The step in flight, or the next to be recorded. `slots.len()` is the
+    /// flattened preview, which goes last.
+    step: usize,
+    /// One entry per step, filled in as each comes home.
+    results: Vec<Option<Vec<u8>>>,
+    /// The step in flight, as far as it has been copied out of the mapped
+    /// buffer. See [`Capture::copy_chunk`].
+    partial: Option<Vec<u8>>,
+    /// The offscreen target the preview is drawn into, held until its copy has
+    /// been submitted.
+    merged_target: Option<wgpu::Texture>,
+    /// The document has gone, or changed shape, so whatever comes home is
+    /// worthless. The buffer stays where it is until its map has settled — see
+    /// [`CanvasRenderer::reset_probes`] for why handing one back early is a
+    /// crash rather than an untidiness.
+    abandoned: bool,
+    /// A map failed, so nothing can be assembled. The job is dropped once the
+    /// buffer has settled.
+    failed: bool,
+}
+
+impl Capture {
+    /// One per layer, plus the flattened preview.
+    fn steps(&self) -> usize {
+        self.slots.len() + 1
+    }
+
+    /// True once every step has its bytes.
+    fn complete(&self) -> bool {
+        self.step >= self.steps()
+    }
+
+    /// True once nothing is outstanding on the GPU, so the job can be dropped.
+    fn settled(&self) -> bool {
+        self.state == StepState::Waiting
+    }
+
+    /// Take the next slice of rows out of the mapped buffer. Returns true once
+    /// the whole step is out of it.
+    ///
+    /// Bounded because reading a mapped staging buffer reads *uncached* memory
+    /// — a 16 MB layer measured about 5 ms on a mid-range discrete card, which
+    /// is a third of a frame at 60 Hz for something the user did not ask for.
+    /// Split into [`CAPTURE_CHUNK_BYTES`] pieces it is under a millisecond, and
+    /// the capture merely takes a few more frames. On a five-minute timer that
+    /// is not a cost at all.
+    ///
+    /// By rows rather than by bytes, because the copy's rows are padded to the
+    /// alignment: chunking by rows makes the padding fall out for free.
+    fn copy_chunk(&mut self) -> bool {
+        let row = (self.size.x * 4) as usize;
+        let height = self.size.y as usize;
+        let buffer = self.buffer.as_ref().expect("a mapped step has its buffer");
+        let mapped = buffer.slice(..).get_mapped_range();
+
+        let out = self
+            .partial
+            .get_or_insert_with(|| Vec::with_capacity(row * height));
+        let from = out.len() / row;
+        let rows = (CAPTURE_CHUNK_BYTES / self.padded as usize).max(1);
+        let to = (from + rows).min(height);
+        for y in from..to {
+            let start = y * self.padded as usize;
+            out.extend_from_slice(&mapped[start..start + row]);
+        }
+        to >= height
+    }
+}
+
+/// Everything a document needs written down, read back without a stall.
+///
+/// `layers` are in **layer-texture form** — sRGB with alpha premultiplied in
+/// linear space — which is what `umber_core::docformat::SaveLayer::pixels`
+/// wants. `merged` is straight-alpha sRGB, as `SaveDocument::merged` wants.
+/// Both come from the same passes the screen uses, so an autosaved file cannot
+/// disagree with what was on screen.
+pub struct DocumentCapture {
+    pub size: UVec2,
+    /// One buffer per slot asked for, in that order.
+    pub layers: Vec<Vec<u8>>,
+    pub merged: Vec<u8>,
+}
+
 /// One layer's contribution to the composite, in stack order.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerDraw {
@@ -562,6 +698,10 @@ pub struct CanvasRenderer {
     /// Staging buffers for the smudge probe, rotated so a stroke never waits on
     /// the GPU to tell it what colour it is passing over.
     probes: Vec<Probe>,
+    /// The autosave's whole-document readback, if one is in flight. At most one
+    /// per document: a second would double the staging cost for a job that is
+    /// already going to be repeated in five minutes.
+    capture: Option<Capture>,
 
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
@@ -964,6 +1104,7 @@ impl CanvasRenderer {
                     stale: false,
                 })
                 .collect(),
+            capture: None,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
@@ -1166,6 +1307,9 @@ impl CanvasRenderer {
         // A sample recorded against the old canvas would be read back as if it
         // belonged to the new one.
         self.reset_probes();
+        // And a capture half-read against the old canvas would be assembled
+        // into a file with layers of two different sizes in it.
+        self.cancel_capture();
 
         self.doc_size = new_size;
         self.dab_state.doc_size = [new_size.x as f32, new_size.y as f32];
@@ -1617,6 +1761,67 @@ impl CanvasRenderer {
         }
     }
 
+    /// A document-sized offscreen target for the export composite.
+    ///
+    /// Non-sRGB, matching the real surface: the shader does its own gamma
+    /// encode, and an sRGB target would encode twice.
+    fn export_target(&self, device: &wgpu::Device) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-export"),
+            size: wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Draw the flattened document 1:1 into `view`.
+    ///
+    /// Factored out of [`Self::export_rgba`] because the autosave's capture
+    /// needs the identical picture and must not block for it. Two spellings of
+    /// "the export composite" is exactly how a saved preview starts disagreeing
+    /// with an exported PNG.
+    fn render_export(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        layers: &[LayerDraw],
+    ) {
+        // Zoom 1 with the pivot at the document centre makes screen and
+        // document coordinates identical, so the render is 1:1.
+        let camera = Camera {
+            center: Vec2::new(self.doc_size.x as f32 * 0.5, self.doc_size.y as f32 * 0.5),
+            zoom: 1.0,
+        };
+        self.composite(
+            queue,
+            encoder,
+            view,
+            &CompositeParams {
+                camera: &camera,
+                pivot: camera.center,
+                layers,
+                // No stroke in flight: exporting mid-stroke should write what
+                // is committed, not a half-finished dab.
+                active_index: 0,
+                stroke: StrokeStyle {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+                backdrop: [0.0, 0.0, 0.0],
+                export: true,
+            },
+        );
+    }
+
     /// Flatten the visible stack to straight-alpha sRGB bytes, document-sized.
     ///
     /// Runs the same composite pass the screen uses, with its export flag set,
@@ -1634,52 +1839,13 @@ impl CanvasRenderer {
     ) -> Vec<u8> {
         let (w, h) = (self.doc_size.x, self.doc_size.y);
 
-        // Non-sRGB: the shader does its own gamma encode.
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("umber-export"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = self.export_target(device);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Zoom 1 with the pivot at the document centre makes screen and
-        // document coordinates identical, so the render is 1:1.
-        let camera = Camera {
-            center: Vec2::new(w as f32 * 0.5, h as f32 * 0.5),
-            zoom: 1.0,
-        };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("export"),
         });
-        self.composite(
-            queue,
-            &mut encoder,
-            &view,
-            &CompositeParams {
-                camera: &camera,
-                pivot: camera.center,
-                layers,
-                // No stroke in flight: exporting mid-stroke should write what
-                // is committed, not a half-finished dab.
-                active_index: 0,
-                stroke: StrokeStyle {
-                    opacity: 0.0,
-                    ..Default::default()
-                },
-                backdrop: [0.0, 0.0, 0.0],
-                export: true,
-            },
-        );
+        self.render_export(queue, &mut encoder, &view, layers);
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = (w * 4).div_ceil(align) * align;
@@ -2051,10 +2217,283 @@ impl CanvasRenderer {
         }
     }
 
+    // --- the whole-document capture ----------------------------------------
+
+    /// True while a capture is in flight, abandoned or otherwise.
+    ///
+    /// Abandoned counts: the staging buffer is still the GPU's until its map
+    /// settles, so a second capture would allocate beside it rather than
+    /// instead of it.
+    pub fn capture_in_flight(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Start reading the whole document back, without blocking.
+    ///
+    /// `slots` are the texture-array slices to read, in stack order; `draws` is
+    /// the same stack the composite pass takes, for the flattened preview.
+    /// Returns false when one is already in flight — the caller's cue to try
+    /// again later rather than to queue a second.
+    ///
+    /// Nothing is copied here. [`Self::drive_capture`] records one step,
+    /// [`Self::submit_capture`] maps it, and [`Self::take_capture`] collects it
+    /// and lets the next step go. See [`Capture`] for why it is spread out.
+    pub fn begin_capture(&mut self, slots: &[u32], draws: &[LayerDraw]) -> bool {
+        if self.capture.is_some() || slots.is_empty() {
+            return false;
+        }
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (self.doc_size.x * 4).div_ceil(align) * align;
+        self.capture = Some(Capture {
+            size: self.doc_size,
+            padded,
+            slots: slots.to_vec(),
+            draws: draws.to_vec(),
+            buffer: None,
+            outcome: Arc::new(AtomicU8::new(PROBE_PENDING)),
+            state: StepState::Waiting,
+            step: 0,
+            // One per layer, and one for the flattened preview the format
+            // requires.
+            results: (0..slots.len() + 1).map(|_| None).collect(),
+            partial: None,
+            merged_target: None,
+            abandoned: false,
+            failed: false,
+        });
+        true
+    }
+
+    /// Record the next step's copy into this frame's encoder, if the staging
+    /// buffer is free.
+    ///
+    /// Costs one `copy_texture_to_buffer` — or, for the last step, one
+    /// composite into an offscreen target and then the copy. Both are
+    /// *recorded*, not executed: nothing on this path waits for the GPU.
+    pub fn drive_capture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        // Taken out because the preview's composite borrows `self` — putting it
+        // back is unconditional, so the job cannot be lost down any path.
+        let Some(mut job) = self.capture.take() else {
+            return;
+        };
+        if job.abandoned || job.failed || job.state != StepState::Waiting || job.complete() {
+            self.capture = Some(job);
+            return;
+        }
+
+        let index = job.step;
+        let height = job.size.y;
+        // Allocated once and reused for every step. A buffer per layer would be
+        // the document's own size in staging memory on top of the copy of it
+        // being assembled.
+        let buffer = job.buffer.take().unwrap_or_else(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("umber-capture"),
+                size: (job.padded * height) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let source = if index < job.slots.len() {
+            let slot = job.slots[index];
+            if slot >= self.layers.capacity {
+                // Cannot happen — `ensure_slots` runs before a layer is ever
+                // painted — but a copy naming a slice the array does not have
+                // is a validation error, and a validation error aborts the
+                // process. An autosave is not worth taking the app down for.
+                log::error!("capture named slot {slot} beyond capacity");
+                job.failed = true;
+                job.buffer = Some(buffer);
+                self.capture = Some(job);
+                return;
+            }
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            }
+        } else {
+            // The flattened preview, from the *same* composite pass the screen
+            // uses — the reason `export_rgba` and `pick_colour` reuse it too.
+            // A second copy of the blend maths here would be a second thing to
+            // keep in step, and a preview that disagreed with the screen is the
+            // bug that arrangement produces.
+            let target = self.export_target(device);
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            self.render_export(queue, encoder, &view, &job.draws);
+            job.merged_target = Some(target);
+            wgpu::TexelCopyTextureInfo {
+                // Held in `job.merged_target` for the rest of this function.
+                texture: job.merged_target.as_ref().expect("just set"),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            }
+        };
+
+        encoder.copy_texture_to_buffer(
+            source,
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(job.padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width: job.size.x,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        job.buffer = Some(buffer);
+        job.state = StepState::Rendering;
+        self.capture = Some(job);
+    }
+
+    /// Map whatever [`Self::drive_capture`] recorded, once the frame holding it
+    /// has been submitted.
+    ///
+    /// Separate from recording for the same reason [`Self::submit_probes`] is:
+    /// `map_async` on a buffer whose copy has not been submitted would map it
+    /// before the GPU has written to it.
+    pub fn submit_capture(&mut self) {
+        let Some(job) = self.capture.as_mut() else {
+            return;
+        };
+        if job.state != StepState::Rendering {
+            return;
+        }
+        let Some(buffer) = job.buffer.as_ref() else {
+            return;
+        };
+        job.state = StepState::Mapping;
+        job.outcome.store(PROBE_PENDING, Ordering::Release);
+        let outcome = job.outcome.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                // Recorded rather than ignored, for the reason the probe's
+                // callback records it: a failed map leaves the buffer unmapped,
+                // and unmapping one that was never mapped is itself an error.
+                let code = if result.is_ok() {
+                    PROBE_MAPPED
+                } else {
+                    PROBE_FAILED
+                };
+                outcome.store(code, Ordering::Release);
+            });
+        // The preview's offscreen target has served its purpose the moment the
+        // copy out of it is submitted; holding it would keep a canvas-sized
+        // texture alive for the rest of the readback.
+        job.merged_target = None;
+    }
+
+    /// Collect the step that has come home, and hand back the document once the
+    /// last of them has.
+    ///
+    /// Polls without blocking, like [`Self::take_probe`]. At most one layer's
+    /// worth of bytes is copied out per call, which is what keeps the cost of
+    /// an autosave to one memcpy in the frames that have one at all.
+    pub fn take_capture(&mut self, device: &wgpu::Device) -> Option<DocumentCapture> {
+        self.capture.as_ref()?;
+        let _ = device.poll(wgpu::PollType::Poll);
+        let job = self.capture.as_mut()?;
+
+        if job.state == StepState::Mapping {
+            match job.outcome.load(Ordering::Acquire) {
+                PROBE_MAPPED => {
+                    // A capture that has been abandoned still has to unmap, but
+                    // there is no point reading sixteen megabytes out of it.
+                    let done = if job.abandoned || job.failed {
+                        job.partial = None;
+                        true
+                    } else {
+                        job.copy_chunk()
+                    };
+                    if done {
+                        job.buffer
+                            .as_ref()
+                            .expect("a mapped step has its buffer")
+                            .unmap();
+                        if let Some(bytes) = job.partial.take() {
+                            job.results[job.step] = Some(bytes);
+                            job.step += 1;
+                        }
+                        job.state = StepState::Waiting;
+                    }
+                }
+                // Nothing to read and nothing to unmap. The whole capture goes:
+                // a document missing one layer is not a shorter document, it is
+                // a wrong one.
+                PROBE_FAILED => {
+                    job.failed = true;
+                    job.state = StepState::Waiting;
+                }
+                // Still in flight. Leaving it alone is the whole point.
+                _ => {}
+            }
+        }
+
+        if job.abandoned || job.failed {
+            if job.settled() {
+                if job.failed {
+                    log::warn!("a document capture could not be read back; nothing was written");
+                }
+                self.capture = None;
+            }
+            return None;
+        }
+        if !job.complete() {
+            return None;
+        }
+
+        let job = self.capture.take().expect("checked above");
+        let size = job.size;
+        let mut buffers: Vec<Vec<u8>> = job
+            .results
+            .into_iter()
+            .map(|r| r.expect("a complete capture has every buffer"))
+            .collect();
+        let merged = buffers.pop().expect("the preview is the last step");
+        Some(DocumentCapture {
+            size,
+            layers: buffers,
+            merged,
+        })
+    }
+
+    /// Disown a capture in flight, because what it is reading is about to stop
+    /// being true — a resize, or the document being closed.
+    ///
+    /// Note what this does *not* do: free the buffer. A `map_async` that is
+    /// still outstanding makes its buffer untouchable, and dropping the job
+    /// here is the same class of mistake [`Self::reset_probes`] documents. The
+    /// job stays until [`Self::take_capture`] finds it settled.
+    pub fn cancel_capture(&mut self) {
+        if let Some(job) = self.capture.as_mut() {
+            job.abandoned = true;
+        }
+    }
+
     /// Read a rectangle of one layer back to the CPU, for the undo stack.
     ///
     /// This blocks until the GPU catches up. That is acceptable because it runs
-    /// once per stroke at pointer-up, never inside the drawing loop.
+    /// once per stroke at pointer-up, never inside the drawing loop. An
+    /// autosave must not use it — see [`Capture`].
     pub fn read_layer_rect(
         &self,
         device: &wgpu::Device,

@@ -23,6 +23,7 @@
 //! failing the whole document, which is exactly the tolerance the three cases
 //! above require.
 
+use crate::autosave;
 use crate::colorpicker::{PickerMode, WheelShape};
 use crate::editor::Editor;
 use crate::shortcuts::{self, Action, Binding, Chord};
@@ -81,6 +82,22 @@ pub struct Prefs {
     pub wheel_shape: WheelShape,
     /// Whether a saved document carries its undo history.
     pub save_history: bool,
+    /// Whether open documents are written out on a timer at all.
+    pub autosave: bool,
+    /// How often, in minutes.
+    pub autosave_interval_minutes: u32,
+    /// How long an autosave's *internal* copy is kept, in hours. Zero is "keep
+    /// for ever".
+    ///
+    /// Hours rather than days because the useful short answers — six hours, a
+    /// day — are not whole days, and a duration in one unit is one number to
+    /// parse rather than a number and a unit that can disagree. The dialog
+    /// still says "30 days" where that is what it means.
+    ///
+    /// It governs the internal copies and **nothing else**. No setting here can
+    /// reach a file the painter chose the location of — see
+    /// [`autosave::Reaper`].
+    pub autosave_expiry_hours: u32,
     /// The complete binding table, already merged with the defaults.
     pub shortcuts: Vec<Binding>,
 }
@@ -102,6 +119,9 @@ impl Default for Prefs {
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             save_history: true,
+            autosave: true,
+            autosave_interval_minutes: autosave::DEFAULT_INTERVAL_MINUTES,
+            autosave_expiry_hours: autosave::DEFAULT_EXPIRY_HOURS,
             shortcuts: shortcuts::defaults(),
         }
     }
@@ -281,6 +301,15 @@ pub fn to_text(prefs: &Prefs) -> String {
         wheel_shape_id(prefs.wheel_shape)
     ));
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
+    out.push_str(&format!("autosave = {}\n", prefs.autosave));
+    out.push_str(&format!(
+        "autosave_interval_minutes = {}\n",
+        prefs.autosave_interval_minutes
+    ));
+    out.push_str(&format!(
+        "autosave_expiry_hours = {}\n",
+        prefs.autosave_expiry_hours
+    ));
 
     // Only actions that differ from the factory table are written. An action
     // left out keeps its defaults, which is what lets a later version add a
@@ -382,6 +411,30 @@ pub fn from_text(text: &str) -> Prefs {
                     prefs.save_history = v;
                 }
             }
+            "autosave" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.autosave = v;
+                }
+            }
+            "autosave_interval_minutes" => {
+                if let Some(v) = parse_u32(
+                    value,
+                    autosave::MIN_INTERVAL_MINUTES,
+                    autosave::MAX_INTERVAL_MINUTES,
+                ) {
+                    prefs.autosave_interval_minutes = v;
+                }
+            }
+            // Clamped, not rejected, like every other number here — but the
+            // floor is zero, which is "keep for ever". A hand-edited value that
+            // does not parse leaves the default in place; it can never turn
+            // into a *shorter* expiry by accident, which is the direction that
+            // would delete something.
+            "autosave_expiry_hours" => {
+                if let Some(v) = parse_u32(value, 0, autosave::MAX_EXPIRY_HOURS) {
+                    prefs.autosave_expiry_hours = v;
+                }
+            }
             "shortcut" => shortcut_lines.push(value),
             // A key from a newer version. Ignoring it is what makes the file
             // safe to share between versions of Umber.
@@ -462,6 +515,11 @@ fn parse_f32(value: &str, lo: f32, hi: f32) -> Option<f32> {
     } else {
         Some(v.clamp(lo, hi))
     }
+}
+
+/// Parse a whole number and clamp it into range, as [`parse_f32`] does.
+fn parse_u32(value: &str, lo: u32, hi: u32) -> Option<u32> {
+    value.parse::<u32>().ok().map(|v| v.clamp(lo, hi))
 }
 
 /// Parse a flag.
@@ -578,6 +636,13 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         picker: ed.ui.picker,
         wheel_shape: ed.ui.wheel_shape,
         save_history: ed.ui.save_history,
+        autosave: ed.autosave.enabled,
+        autosave_interval_minutes: (ed.autosave.interval.as_secs() / 60).max(1) as u32,
+        autosave_expiry_hours: ed
+            .autosave
+            .expiry
+            .map(|d| (d.as_secs() / 3600) as u32)
+            .unwrap_or(0),
         shortcuts: shortcuts::published(),
     }
 }
@@ -595,6 +660,13 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.picker = prefs.picker;
     ed.ui.wheel_shape = prefs.wheel_shape;
     ed.ui.save_history = prefs.save_history;
+    ed.autosave.enabled = prefs.autosave;
+    ed.autosave.interval =
+        std::time::Duration::from_secs(prefs.autosave_interval_minutes.max(1) as u64 * 60);
+    // Zero hours is "keep for ever", which is `None` — not a zero-length
+    // expiry, which would delete every internal copy the moment it was written.
+    ed.autosave.expiry = (prefs.autosave_expiry_hours > 0)
+        .then(|| std::time::Duration::from_secs(prefs.autosave_expiry_hours as u64 * 3600));
     shortcuts::publish(prefs.shortcuts.clone());
 
     // Setting the zoom factor when it has not changed still marks egui's fonts
@@ -667,6 +739,15 @@ mod tests {
         assert_eq!(prefs.picker, editor.ui.picker);
         assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
         assert_eq!(prefs.save_history, editor.ui.save_history);
+        assert_eq!(prefs.autosave, editor.autosave.enabled);
+        assert_eq!(
+            prefs.autosave_interval_minutes as u64 * 60,
+            editor.autosave.interval.as_secs()
+        );
+        assert_eq!(
+            prefs.autosave_expiry_hours as u64 * 3600,
+            editor.autosave.expiry.map(|d| d.as_secs()).unwrap_or(0)
+        );
         assert_eq!(prefs.shortcuts, shortcuts::defaults());
     }
 
@@ -772,6 +853,73 @@ mod tests {
         );
     }
 
+    /// The autosave's settings, and — the part that matters — which way each of
+    /// them fails.
+    #[test]
+    fn a_corrupt_autosave_setting_never_shortens_the_expiry() {
+        let prefs = from_text(concat!(
+            "autosave = sometimes\n",
+            "autosave_interval_minutes = soon\n",
+            "autosave_expiry_hours = -1\n",
+        ));
+        assert!(
+            prefs.autosave,
+            "a line that cannot be read must not stop it"
+        );
+        assert_eq!(
+            prefs.autosave_interval_minutes,
+            autosave::DEFAULT_INTERVAL_MINUTES
+        );
+        // The direction that matters: a value that cannot be read must never
+        // become a *shorter* expiry, because a shorter expiry deletes things.
+        assert_eq!(prefs.autosave_expiry_hours, autosave::DEFAULT_EXPIRY_HOURS);
+    }
+
+    #[test]
+    fn the_autosave_settings_survive_a_restart() {
+        let prefs = Prefs {
+            autosave: false,
+            autosave_interval_minutes: 20,
+            // Zero is "keep for ever", and has to survive as itself rather than
+            // being clamped up to the minimum interval or down to nothing.
+            autosave_expiry_hours: 0,
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert!(!back.autosave);
+        assert_eq!(back.autosave_interval_minutes, 20);
+        assert_eq!(back.autosave_expiry_hours, 0);
+
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        apply(&back, &ctx, &mut editor);
+        assert!(!editor.autosave.enabled);
+        assert_eq!(editor.autosave.interval.as_secs(), 20 * 60);
+        assert_eq!(
+            editor.autosave.expiry, None,
+            "zero hours must be “keep for ever”, not an expiry of zero"
+        );
+        assert_eq!(capture(&ctx, &editor).autosave_expiry_hours, 0);
+    }
+
+    #[test]
+    fn a_hand_edited_interval_is_clamped_rather_than_dropped() {
+        assert_eq!(
+            from_text("autosave_interval_minutes = 0\n").autosave_interval_minutes,
+            autosave::MIN_INTERVAL_MINUTES,
+        );
+        assert_eq!(
+            from_text("autosave_interval_minutes = 99999\n").autosave_interval_minutes,
+            autosave::MAX_INTERVAL_MINUTES,
+        );
+        // Any number of hours the file names is honoured, not snapped to the
+        // ladder the dialog offers.
+        assert_eq!(
+            from_text("autosave_expiry_hours = 100\n").autosave_expiry_hours,
+            100
+        );
+    }
+
     #[test]
     fn a_full_round_trip_preserves_everything() {
         let mut prefs = Prefs {
@@ -787,6 +935,9 @@ mod tests {
             picker: PickerMode::Sliders,
             wheel_shape: WheelShape::Square,
             save_history: false,
+            autosave: false,
+            autosave_interval_minutes: 12,
+            autosave_expiry_hours: 48,
             shortcuts: shortcuts::defaults(),
         };
         let at = shortcuts::slot_of(&prefs.shortcuts, Action::BrushTool, 0);
@@ -811,6 +962,12 @@ mod tests {
         assert_eq!(back.picker, prefs.picker);
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
         assert_eq!(back.save_history, prefs.save_history);
+        assert_eq!(back.autosave, prefs.autosave);
+        assert_eq!(
+            back.autosave_interval_minutes,
+            prefs.autosave_interval_minutes
+        );
+        assert_eq!(back.autosave_expiry_hours, prefs.autosave_expiry_hours);
         // Compared per action rather than as one list: editing a binding
         // appends it, so the live table is in interaction order while a loaded
         // one is in `Action::ALL` order. What has to survive is which chords

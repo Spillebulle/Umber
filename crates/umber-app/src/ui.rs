@@ -69,6 +69,15 @@ pub struct UiActions {
     pub canvas_change: Option<crate::canvasdlg::CanvasChange>,
     pub new_document: bool,
     pub open_file: bool,
+    /// Close the window, every document with unsaved work having been accounted
+    /// for. See [`crate::tabs::quit_prompt`].
+    pub quit: bool,
+    /// Write every document that holds work and then quit — but only if all of
+    /// them are actually written. A cancelled file dialog is not permission to
+    /// discard the rest, exactly as it is not for one tab.
+    pub save_all_and_quit: bool,
+    /// Open the internal autosave location in the system file manager.
+    pub reveal_autosaves: bool,
 }
 
 pub struct UiOutput {
@@ -168,7 +177,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     }
 
     brush_editor(root, &p, ed);
-    crate::settings::show(root, &p, ed);
+    crate::settings::show(root, &p, ed, &mut actions);
     // About, the first-run notice about the update check, and the prompt the
     // check raises. Drawn from here rather than from the Help menu, for the
     // same reason the brush library's modals are drawn from `panels`: a menu
@@ -183,6 +192,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     crate::canvasdlg::show(root, &p, ed, &mut canvas);
     actions.create_document = canvas.create;
     actions.canvas_change = canvas.change;
+
+    // Before the close prompt, and above it: this one is the answer to "the
+    // window is closing", which supersedes any question about a single tab.
+    match tabs::quit_prompt(root, &p, ed) {
+        Some(tabs::QuitChoice::Discard) => actions.quit = true,
+        Some(tabs::QuitChoice::SaveAll) => actions.save_all_and_quit = true,
+        Some(tabs::QuitChoice::Cancel) | None => {}
+    }
 
     match tabs::close_prompt(root, &p, ed) {
         Some(tabs::CloseChoice::Close) => actions.close_tab = ed.ui.close_prompt.take(),

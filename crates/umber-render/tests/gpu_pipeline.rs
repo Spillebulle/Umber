@@ -13,7 +13,8 @@ use umber_core::{
     InputPoint, Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
 };
 use umber_render::{
-    CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
+    CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, Gpu, LayerDraw, ProbeParams,
+    StrokeStyle,
 };
 
 const DOC: u32 = 64;
@@ -2299,5 +2300,267 @@ fn a_colour_modulated_stroke_commits_a_different_colour_per_dab() {
     assert!(
         hi - lo > 40,
         "brightness barely varied along the stroke: {lo}..{hi}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The whole-document capture — the autosave's readback
+// ---------------------------------------------------------------------------
+
+/// Drive a capture the way `app.rs` drives it: one step per frame, recorded
+/// into the frame's own encoder, mapped after that frame is submitted and
+/// collected by a poll that never waits.
+///
+/// Returns the document and the **longest** single frame's main-thread cost,
+/// which is the number that decides whether an autosave is felt.
+fn run_capture(
+    gpu: &Gpu,
+    canvas: &mut CanvasRenderer,
+    slots: &[u32],
+    draws: &[LayerDraw],
+) -> (DocumentCapture, std::time::Duration) {
+    assert!(
+        canvas.begin_capture(slots, draws),
+        "a capture was in flight"
+    );
+    drive_to_completion(gpu, canvas)
+}
+
+/// The frame loop of [`run_capture`], for a capture already begun.
+fn drive_to_completion(
+    gpu: &Gpu,
+    canvas: &mut CanvasRenderer,
+) -> (DocumentCapture, std::time::Duration) {
+    let mut worst = std::time::Duration::ZERO;
+    // Generous: a few frames per step, and a step is one layer. A capture that
+    // has not finished inside this is a bug, not a slow machine.
+    for _ in 0..2000 {
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // Everything the autosave adds to a frame. The `queue.submit` between
+        // the two halves is the frame's own and is excluded on purpose.
+        let started = std::time::Instant::now();
+        canvas.drive_capture(&gpu.device, &gpu.queue, &mut enc);
+        let recording = started.elapsed();
+
+        gpu.queue.submit(Some(enc.finish()));
+
+        let started = std::time::Instant::now();
+        canvas.submit_capture();
+        let taken = canvas.take_capture(&gpu.device);
+        worst = worst.max(recording + started.elapsed());
+
+        if let Some(doc) = taken {
+            return (doc, worst);
+        }
+        // Stand in for the frame this loop is pretending to be. `take_capture`
+        // polls *without* blocking — the whole point — so a loop with nothing
+        // else to do would otherwise spin through every iteration before the
+        // GPU had finished the first copy, and conclude the capture had hung.
+        // Deliberately outside the timing above: it is the test's cost, not the
+        // capture's.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the capture never came home");
+}
+
+#[test]
+fn a_capture_reads_back_exactly_what_the_blocking_path_does() {
+    // The whole point of the non-blocking path is that it produces the *same*
+    // picture. If it can drift from `read_layer_rect` and `export_rgba`, an
+    // autosave becomes a second reading of the canvas and a file that quietly
+    // disagrees with the screen.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    h.stamp(&[dab(20.0, 20.0, 10.0, 1.0)]);
+    h.commit_to(
+        1,
+        Color::from_srgb_u8(30, 60, 220, 255),
+        0.5,
+        BrushMode::Paint,
+    );
+
+    let draws = vec![
+        LayerDraw {
+            slot: 0,
+            opacity: 1.0,
+            blend: 0,
+            visible: true,
+        },
+        LayerDraw {
+            slot: 1,
+            opacity: 1.0,
+            blend: 0,
+            visible: true,
+        },
+    ];
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: DOC,
+        height: DOC,
+    };
+    let expected: Vec<Vec<u8>> = (0..2)
+        .map(|slot| {
+            h.canvas
+                .read_layer_rect(&h.gpu.device, &h.gpu.queue, slot, full)
+        })
+        .collect();
+    let expected_merged = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
+
+    let (captured, _) = run_capture(h.gpu, &mut h.canvas, &[0, 1], &draws);
+
+    assert_eq!(captured.size, UVec2::splat(DOC));
+    assert_eq!(captured.layers.len(), 2);
+    assert_eq!(captured.layers[0], expected[0], "layer 0 differs");
+    assert_eq!(captured.layers[1], expected[1], "layer 1 differs");
+    assert_eq!(
+        captured.merged, expected_merged,
+        "the flattened preview differs from the export"
+    );
+}
+
+#[test]
+fn a_capture_of_a_large_document_never_costs_a_frame() {
+    // The measurement the whole feature rests on. A save's blocking readback is
+    // one `poll(wait)` per layer, which on a full 2048-square stack is tens of
+    // milliseconds of the main thread doing nothing — fine once, at pointer-up,
+    // and exactly wrong on a timer. The capture records a copy, polls without
+    // waiting, and reads the result back four megabytes at a time, so what any
+    // one frame pays is bounded by the chunk rather than by the document.
+    //
+    // The bound is deliberately loose — half a frame, against about a
+    // millisecond measured. It is not a claim about this machine's speed; it is
+    // a claim that nothing on this path waits for the GPU and nothing on it
+    // scales with the size of the document, and either failing would put this
+    // far past it on any adapter, software rasterisers included.
+    let mut h = harness_or_skip!();
+    const BIG: u32 = 2048;
+    const LAYERS: u32 = 8;
+
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(BIG),
+        Anchor::Centre,
+    );
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, LAYERS);
+    let mut enc = h.encoder();
+    h.canvas.clear_all_layers(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let slots: Vec<u32> = (0..LAYERS).collect();
+    let draws: Vec<LayerDraw> = slots
+        .iter()
+        .map(|slot| LayerDraw {
+            slot: *slot,
+            opacity: 1.0,
+            blend: 0,
+            visible: true,
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    let (captured, worst) = run_capture(h.gpu, &mut h.canvas, &slots, &draws);
+    let total = started.elapsed();
+
+    assert_eq!(captured.layers.len(), LAYERS as usize);
+    assert_eq!(
+        captured.layers[0].len(),
+        (BIG * BIG * 4) as usize,
+        "a captured layer must be the whole canvas"
+    );
+    assert_eq!(captured.merged.len(), (BIG * BIG * 4) as usize);
+
+    // Reported whether or not it passes: the number is the point, and it is a
+    // property of the machine rather than of this code.
+    eprintln!(
+        "capture of {BIG}x{BIG}, {LAYERS} layers: worst frame {:.2} ms, \
+         {:.0} ms end to end",
+        worst.as_secs_f64() * 1000.0,
+        total.as_secs_f64() * 1000.0,
+    );
+    assert!(
+        worst < std::time::Duration::from_millis(8),
+        "one frame of the capture cost {:.2} ms — something on this path is \
+         waiting for the GPU, or reading the whole document at once",
+        worst.as_secs_f64() * 1000.0,
+    );
+}
+
+#[test]
+fn a_second_capture_is_refused_while_one_is_in_flight() {
+    // Two at once would double the staging cost of a job that is going to be
+    // repeated in five minutes anyway, and the caller has no way to tell the
+    // two results apart.
+    let mut h = harness_or_skip!();
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+    }];
+    assert!(h.canvas.begin_capture(&[0], &draws));
+    assert!(
+        !h.canvas.begin_capture(&[0], &draws),
+        "a second capture was accepted"
+    );
+    assert!(h.canvas.capture_in_flight());
+
+    drive_to_completion(h.gpu, &mut h.canvas);
+    assert!(!h.canvas.capture_in_flight());
+    assert!(
+        h.canvas.begin_capture(&[0], &draws),
+        "the slot was never freed"
+    );
+}
+
+#[test]
+fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
+    // The failure this avoids is the one `reset_probes` documents: dropping a
+    // buffer whose `map_async` is outstanding, or handing it straight to the
+    // next job, is a validation error — and a validation error aborts the
+    // process. So a cancelled capture stays where it is until the GPU has
+    // finished with it, and then really does go, or the next autosave never
+    // starts.
+    let mut h = harness_or_skip!();
+    let draws = vec![LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+    }];
+    assert!(h.canvas.begin_capture(&[0], &draws));
+
+    let mut enc = h.encoder();
+    h.canvas
+        .drive_capture(&h.gpu.device, &h.gpu.queue, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.submit_capture();
+    h.canvas.cancel_capture();
+
+    for _ in 0..2000 {
+        assert!(
+            h.canvas.take_capture(&h.gpu.device).is_none(),
+            "a cancelled capture must not produce a document"
+        );
+        if !h.canvas.capture_in_flight() {
+            break;
+        }
+        // As in `drive_to_completion`: the poll does not wait, so this loop has
+        // to.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !h.canvas.capture_in_flight(),
+        "the cancelled capture never settled"
+    );
+    assert!(
+        h.canvas.begin_capture(&[0], &draws),
+        "the slot stayed taken"
     );
 }

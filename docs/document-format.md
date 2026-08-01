@@ -407,15 +407,52 @@ holds all of them at once — 16 MB per layer at 2048². That is the price of a
 format that keeps layers. It is paid on an explicit Save and never on the
 drawing path.
 
+## Autosave writes the same file by a different route
+
+An autosave produces a byte-identical archive — same encoder, same atomic
+write — and gets there without ever blocking a frame, because it happens on a
+timer rather than because somebody asked for it. Three things differ, and each
+is argued at its call site in `umber-app/src/autosave.rs`:
+
+- **The pixels come off the GPU asynchronously**, through
+  `CanvasRenderer::begin_capture`: one layer in flight at a time, through one
+  reused staging buffer, read out four megabytes per frame. Measured on a
+  2048-square eight-layer document that adds about a millisecond to the worst
+  frame, against a whole readback of roughly 90 ms.
+- **The encode and both writes happen on a background thread.**
+  `docformat::write_encoded` is `save`'s atomic write split out for it, so one
+  archive reaches two destinations without being encoded twice — and so there
+  is one temp-and-rename implementation rather than two.
+- **The undo history is not written.** `SaveDocument::history` is `None`. It is
+  up to 32 MB of PNG-encoded patches, and re-encoding all of it unattended
+  every five minutes is a cost nobody asked for; an autosave exists so the
+  painting is not lost, not so the afternoon can be replayed.
+
+A document that has a path is written to that path — **overwriting it without
+asking**, which is what an autosave is — and to an internal copy beside it. One
+that has never been saved is written only to the internal copy: Umber has not
+been told where the painter wants it, and putting a file in their documents
+folder uninvited is not an answer.
+
+Deleting expired internal copies is `autosave::Reaper`'s, and it is the only
+thing in Umber that deletes a document. Its containment is structural rather
+than a matter of callers being careful — one canonicalised root, every
+candidate resolved independently, the candidate's parent required to *equal*
+that root, symbolic links refused before they are resolved, and no recursion.
+See its own documentation.
+
 ## Known gaps
 
 - **Saving blocks the frame.** A large document with a full stack takes a
   noticeable moment, and nothing is drawn during it. Moving the readbacks off
   the drawing thread — or making them asynchronous, as colour pickup already is
   — is the fix, and is not done.
-- **No autosave, no recovery file, no backup of the previous version.** The
+- **No backup of the previous version, and no automatic crash recovery.** The
   rename-into-place above protects against a failed write, not against a
-  deliberate save over something you wanted to keep.
+  deliberate save over something you wanted to keep. Autosave writes the same
+  archive to an internal folder as well as to the document's own file, so a
+  recent state is usually recoverable by hand — but nothing reads those copies
+  back on the next start, and there is no "revert to saved".
 - **The layer PNGs are written with fast compression.** A working file that will
   be rewritten in a minute is not worth spending seconds on. An "optimise on
   save" option, or a separate archive export, would be the place for the other
