@@ -119,7 +119,7 @@ Description: GPU-accelerated painting application built for latency
  composited on the GPU with a wet-layer scheme, so overlapping dabs never
  compound.
  .
- It ships 221 brush presets, reads brushes written for MyPaint, GIMP, Krita and
+ It ships 239 brush presets, reads brushes written for MyPaint, GIMP, Krita and
  Photoshop, and saves documents as OpenRaster.
 EOF
 dpkg-deb --build --root-owner-group "$deb" "$outdir/umber_${version}_${arch}.deb" >/dev/null

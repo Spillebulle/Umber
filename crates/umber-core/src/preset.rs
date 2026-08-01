@@ -979,7 +979,7 @@ mod tests {
     /// The modulation table is a fixed array behind a hand-written
     /// `Serialize`/`Deserialize` pair, so it writes only its live entries. Both
     /// halves need a round trip: the empty case, which must cost `[]` rather
-    /// than twelve inert rows in every one of 201 presets, and a filled one,
+    /// than twelve inert rows in every one of 239 presets, and a filled one,
     /// which must come back identical.
     #[test]
     fn a_modulated_brush_survives_the_library() {
