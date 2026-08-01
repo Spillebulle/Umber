@@ -996,7 +996,9 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
     // are a plausible header size, which for text they never are.
     if let Ok(pipe) = gih::from_gih(raw) {
         let mut dropped = Vec::new();
-        if pipe.animated {
+        if pipe.angular {
+            dropped.push(gih::ANGULAR);
+        } else if pipe.animated {
             dropped.push(gih::ANIMATION);
         }
         if pipe.cells.iter().any(|c| c.coloured) {
