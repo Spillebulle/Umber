@@ -258,6 +258,7 @@ risk.
 | `B` / `E` / `H` / `Z` | Brush / eraser / pan / zoom |
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
+| `Alt` + move, nothing held | Resize the brush, against a circle drawn at the size |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
 | Wheel | Scroll the canvas up and down |

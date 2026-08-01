@@ -228,6 +228,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .show(root, |ui| {
             let rect = ui.max_rect();
             canvas_scrollbars(ui, &p, ed, rect);
+            brush_size_preview(ui, &p, ed);
             rect
         })
         .inner;
@@ -310,6 +311,39 @@ fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
             ed.camera.center.x += by;
         }
     }
+}
+
+/// The circle the Alt-held resize draws, showing the size the brush has been
+/// dragged to.
+///
+/// Centred on where the pointer was when Alt went down, not on the pointer:
+/// the drag *is* the size, so a ring that ran along with the hand would be
+/// something to chase rather than something to measure against — and the
+/// canvas underneath the anchor is what the artist is judging the size against.
+///
+/// **Document space scaled to the screen**, because that is what a size is:
+/// [`Brush::size`] is a diameter in document pixels, so a 50-pixel brush at
+/// 200% draws a hundred pixels across — the width of the mark it will actually
+/// leave, at any zoom.
+///
+/// A circle rather than the ellipse an elliptical brush stamps. `size` is the
+/// *long* axis and is the one number this gesture moves; the dab's own outline
+/// turns with `dab_angle`, rolls with the jitter, narrows under pressure and
+/// scatters off the line, so an ellipse here would be a picture of one dab
+/// rather than of the number under the hand.
+fn brush_size_preview(ui: &egui::Ui, p: &Palette, ed: &Editor) {
+    let Some(resize) = ed.brush_resize else {
+        return;
+    };
+    let at = ed.to_points(resize.origin);
+    // Document pixels → physical pixels is the zoom; physical → points is
+    // egui's, and the same conversion every other canvas boundary makes.
+    let radius = ed.brush.size * 0.5 * ed.camera.zoom / ed.pixels_per_point.max(1e-3);
+    let painter = ui.painter();
+    painter.circle_stroke(at, radius, Stroke::new(1.0, p.accent));
+    // The anchor the drag is measured from — and the only thing on screen at
+    // all when a one-pixel brush is being sized at a low zoom.
+    painter.circle_filled(at, 1.0, p.accent);
 }
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {

@@ -546,6 +546,35 @@ impl UmberApp {
         true
     }
 
+    /// Start or stop the brush-size drag — Alt held down with nothing else.
+    ///
+    /// **Alt with a button is the eyedropper, and this is Alt without one.**
+    /// That is the whole of how the two are told apart, and it is why this is
+    /// driven from `ModifiersChanged` while the eyedropper is driven from
+    /// `MouseInput`: a press cancels the gesture (see there), so the click that
+    /// picks a colour is never also a resize, and the resize never eats a
+    /// press. Neither can happen without the other having been decided first.
+    ///
+    /// Refused while anything else is going on. A stroke or a pan is a gesture
+    /// the pointer is already committed to, and changing the brush half way
+    /// through a stroke would not affect the dabs already stamped anyway — the
+    /// stroke paints with the brush it began with.
+    fn set_brush_resize(&mut self, wanted: bool) {
+        let start = wanted
+            && self.editor.interaction == Interaction::Idle
+            && !self.editor.stroke.is_active();
+        if start == self.editor.brush_resize.is_some() {
+            return;
+        }
+        self.editor.brush_resize = start.then_some(crate::editor::BrushResize {
+            origin: self.editor.cursor,
+            from: self.editor.brush.size,
+        });
+        // The circle appearing and — more importantly — disappearing is a frame
+        // nothing else would ask for.
+        self.request_redraw();
+    }
+
     /// Take the colour under the cursor as the painting colour.
     fn pick_colour_at_cursor(&mut self) {
         let doc = self.editor.screen_to_doc(self.editor.cursor);
@@ -1716,7 +1745,20 @@ impl ApplicationHandler<Wake> for UmberApp {
             // itself here too rather than silently doing nothing.
             WindowEvent::DroppedFile(path) => self.open_path(&path),
 
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                let was_alt = self.modifiers.alt_key();
+                self.modifiers = m.state();
+                let alt = self.modifiers.alt_key();
+                if alt != was_alt {
+                    self.set_brush_resize(alt && !ui_has_pointer);
+                }
+            }
+
+            // A modifier released while another window has the keyboard never
+            // reaches us, so Alt can be "held" for ever after an Alt-Tab. The
+            // resize gesture would then still be live — and its circle still on
+            // the canvas — when the window came back.
+            WindowEvent::Focused(false) => self.set_brush_resize(false),
 
             WindowEvent::KeyboardInput { event, .. } => {
                 // Punctuation dispatches on what the user's layout *prints*,
@@ -1761,9 +1803,20 @@ impl ApplicationHandler<Wake> for UmberApp {
                         let anchor = self.editor.zoom_anchor;
                         self.editor.camera.zoom_at(anchor, factor, pivot);
                     }
-                    Interaction::Idle => {}
+                    // Nothing is held, so this is where the Alt-held resize
+                    // lives: the pointer's travel from where Alt went down is
+                    // the size, read absolutely rather than stepped per event.
+                    // Horizontal only, and right is bigger — the axis and the
+                    // direction the zoom tool's drag already uses for "more".
+                    Interaction::Idle => {
+                        if let Some(resize) = self.editor.brush_resize {
+                            self.editor.brush.size =
+                                Brush::size_after_drag(resize.from, pos.x - resize.origin.x);
+                        }
+                    }
                 }
-                if self.editor.interaction != Interaction::Idle
+                if (self.editor.interaction != Interaction::Idle
+                    || self.editor.brush_resize.is_some())
                     && let Some(g) = self.gfx.as_ref()
                 {
                     g.window.request_redraw();
@@ -1772,6 +1825,16 @@ impl ApplicationHandler<Wake> for UmberApp {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // The other half of how the resize and the eyedropper are told
+                // apart: the resize is Alt with *nothing* down, so a press ends
+                // it, and the press itself goes on to be handled as it always
+                // was. Without this an Alt-click would pick a colour with the
+                // resize still live, so the eyedropper would leave a circle on
+                // the canvas and the next flick of the wrist would silently
+                // rescale the brush.
+                if pressed {
+                    self.set_brush_resize(false);
+                }
                 // Middle-drag and space-drag always pan, whatever tool is
                 // selected — muscle memory should not depend on the rail.
                 let pan_override = button == MouseButton::Middle
