@@ -100,20 +100,22 @@ jobs:
           export PATH="$PATH:$HOME/.dotnet/tools"
           wix extension add -g WixToolset.UI.wixext/5.0.2
 
-          # WiX's licence page wants RTF. Wrapping the plain text is enough:
-          # the point is that the text shown is the licence that ships, not
-          # that it is typeset.
+          # WiX's licence page wants RTF. The conversion is a script rather
+          # than a few lines here because the escaping behaved differently in
+          # YAML and in a developer's shell, which is the worst way for a build
+          # step to be wrong; it is now the same code in both places and can be
+          # run locally.
           mkdir -p wixassets
           cp assets/icons/umber.ico wixassets/umber.ico
-          {
-            printf '{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fnil Courier New;}}\\fs16\n'
-            sed -e 's/\\/\\\\/g; s/{/\\{/g; s/}/\\}/g; s/$/\\par/' LICENSE
-            printf '}\n'
-          } > wixassets/licence.rtf
+          sh packaging/windows/make-licence-rtf.sh LICENSE wixassets/licence.rtf
 
+          # `-pdbtype none`: WiX otherwise drops a .wixpdb beside the installer,
+          # and the artefact upload takes everything in dist/ — so the release
+          # would carry debug symbols nobody asked for.
           wix build packaging/windows/umber.wxs \
             -arch ${{ matrix.arch }} \
             -ext WixToolset.UI.wixext \
+            -pdbtype none \
             -d Version="$VERSION" \
             -d BinDir="target/release" \
             -d DocDir="." \

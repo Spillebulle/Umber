@@ -40,3 +40,4 @@ xcuserdata/
 /packaging/linux/build-dir
 /packaging/linux/repo
 /packaging/linux/.flatpak-builder
+/wixassets
