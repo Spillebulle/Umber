@@ -433,9 +433,15 @@ impl Editor {
     /// Select a tool, keeping the brush's paint/erase mode in step.
     pub fn set_tool(&mut self, tool: Tool) {
         self.ui.tool = tool;
-        // A half-drawn outline belongs to the tool that was drawing it.
+        // A half-drawn outline belongs to the tool that was drawing it. Through
+        // `cancel_selection_draft` rather than by clearing the field, because
+        // the interaction has to come back to `Idle` with it: a shortcut can
+        // change tool with the button still down, and an interaction left in
+        // `Selecting` with no draft to answer for it is one that nothing ever
+        // ends — no autosave, and a redraw requested on every mouse move for
+        // the rest of the session.
         if tool != Tool::Select {
-            self.selection_draft = None;
+            self.cancel_selection_draft();
         }
         match tool {
             Tool::Brush => self.brush.mode = BrushMode::Paint,
@@ -767,11 +773,15 @@ impl Editor {
     }
 
     pub fn selection_release(&mut self, doc: Vec2) {
-        if self
-            .selection_draft
-            .as_mut()
-            .is_some_and(|draft| draft.release(doc))
-        {
+        let Some(draft) = self.selection_draft.as_mut() else {
+            // The draft went while the button was down — Escape, or a tool
+            // shortcut. The button coming up is then what ends the gesture,
+            // and leaving the interaction in `Selecting` would leave it with
+            // nothing that could ever end it.
+            self.interaction = Interaction::Idle;
+            return;
+        };
+        if draft.release(doc) {
             self.finish_selection();
         }
     }
