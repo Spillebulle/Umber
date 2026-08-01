@@ -10,7 +10,7 @@ use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use umber_core::{Brush, ResponseCurve, TipMask};
+use umber_core::{Brush, ResponseCurve, ScrollSpan, TipMask};
 
 /// Narrowest anything here will draw itself.
 ///
@@ -298,6 +298,76 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
             p.knob,
         );
     }
+}
+
+/// A canvas scrollbar: a thumb on a track, along one edge of the document
+/// region.
+///
+/// Returns how far the camera should move along this axis, in document units,
+/// or `None` if the bar was not dragged. The geometry is
+/// [`umber_core::ScrollSpan`]'s — this only paints it and turns a drag into a
+/// fraction of the bar.
+///
+/// Unlike the sliders above there is no track fill and no round knob: a
+/// scrollbar's thumb *is* the value, and an accent-coloured bar down the side of
+/// the canvas would read as something selected rather than as somewhere to be.
+pub fn canvas_scrollbar(
+    ui: &mut Ui,
+    p: &Palette,
+    rect: Rect,
+    span: ScrollSpan,
+    vertical: bool,
+) -> Option<f32> {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("canvas-scroll", vertical)),
+        Sense::click_and_drag(),
+    );
+
+    let length = if vertical {
+        rect.height()
+    } else {
+        rect.width()
+    };
+    if length <= MIN_TRACK {
+        return None;
+    }
+
+    let (start, thumb) = span.thumb();
+    let thumb_rect = if vertical {
+        Rect::from_min_size(
+            pos2(rect.left(), rect.top() + length * start),
+            vec2(rect.width(), length * thumb),
+        )
+    } else {
+        Rect::from_min_size(
+            pos2(rect.left() + length * start, rect.top()),
+            vec2(length * thumb, rect.height()),
+        )
+    };
+
+    // The track is left unpainted. The canvas is behind it and the document may
+    // be too, and a filled strip along two edges of the picture is exactly the
+    // furniture a paint application is trying not to put there. Only the thumb
+    // is drawn, and only while it is needed.
+    let ink = if response.dragged() {
+        p.text_muted
+    } else if response.hovered() {
+        p.knob
+    } else {
+        p.rail
+    };
+    let inset = thumb_rect.shrink(2.0);
+    ui.painter()
+        .rect_filled(inset, inset.width().min(inset.height()) * 0.5, ink);
+
+    if response.dragged() {
+        let moved = response.drag_delta();
+        let along = if vertical { moved.y } else { moved.x };
+        // A fraction of the bar, so the thumb keeps up with the pointer exactly.
+        return Some(span.pan_by(along / length));
+    }
+    None
 }
 
 /// Compact label + rail + readout, laid out horizontally for the options strip.

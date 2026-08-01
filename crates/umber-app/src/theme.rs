@@ -289,6 +289,9 @@ pub mod metrics {
     pub const PANEL_PAD: i8 = 12;
     pub const RADIUS: f32 = 5.0;
     pub const RADIUS_LARGE: f32 = 6.0;
+    /// The canvas scrollbars, along the bottom and right of the document
+    /// region. Thin, because they sit over the picture rather than beside it.
+    pub const SCROLLBAR: f32 = 11.0;
     pub const SLIDER_ROW: f32 = 16.0;
     pub const SLIDER_RAIL: f32 = 3.0;
     pub const SLIDER_KNOB: f32 = 11.0;

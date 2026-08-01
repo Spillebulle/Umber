@@ -26,7 +26,7 @@ use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use std::sync::Arc;
 use umber_core::{
-    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, TipMask,
+    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, TipMask,
     input::PressureSource,
 };
 
@@ -225,7 +225,11 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // cursor.
     let canvas_rect = egui::CentralPanel::default()
         .frame(Frame::NONE)
-        .show(root, |ui| ui.max_rect())
+        .show(root, |ui| {
+            let rect = ui.max_rect();
+            canvas_scrollbars(ui, &p, ed, rect);
+            rect
+        })
         .inner;
 
     panels::floats(root, &p, ed, &mut actions);
@@ -250,6 +254,61 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     UiOutput {
         actions,
         canvas_rect,
+    }
+}
+
+/// The canvas scrollbars, along the bottom and the right of the document
+/// region — the right being the left edge of whatever is docked there.
+///
+/// Drawn only where the document actually runs off the view, on the axis it
+/// runs off. That covers both "larger than the window" and "small enough to
+/// fit, but pushed under a panel", which are the same complaint: part of the
+/// picture is somewhere the artist cannot see it.
+///
+/// The geometry is [`ScrollSpan`]'s, in `umber-core`, so what the thumb says
+/// and where the camera is cannot drift apart — the same division `dock.rs` and
+/// `panels.rs` keep.
+fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
+    // The viewport in *document* units, so the spans are worked out from the
+    // region actually being laid out this frame rather than from last frame's
+    // `canvas_size`.
+    let scale = ed.pixels_per_point.max(1e-3);
+    let doc = ed.doc.size_vec2();
+    let zoom = ed.camera.zoom;
+    let across = ScrollSpan::new(doc.x, rect.width() * scale, zoom, ed.camera.center.x);
+    let down = ScrollSpan::new(doc.y, rect.height() * scale, zoom, ed.camera.center.y);
+
+    let (show_x, show_y) = (across.overflows(), down.overflows());
+    ed.scroll_bars = [None, None];
+    if !show_x && !show_y {
+        return;
+    }
+
+    // Neither bar runs under the other: a thumb sliding into the corner where
+    // they cross would be under the one on top of it for its last few pixels.
+    let bar = metrics::SCROLLBAR;
+    let corner_x = rect.right() - if show_y { bar } else { 0.0 };
+    let corner_y = rect.bottom() - if show_x { bar } else { 0.0 };
+
+    if show_y {
+        let at = Rect::from_min_max(
+            pos2(rect.right() - bar, rect.top()),
+            pos2(rect.right(), corner_y),
+        );
+        ed.scroll_bars[1] = Some(at);
+        if let Some(by) = widgets::canvas_scrollbar(ui, p, at, down, true) {
+            ed.camera.center.y += by;
+        }
+    }
+    if show_x {
+        let at = Rect::from_min_max(
+            pos2(rect.left(), rect.bottom() - bar),
+            pos2(corner_x, rect.bottom()),
+        );
+        ed.scroll_bars[0] = Some(at);
+        if let Some(by) = widgets::canvas_scrollbar(ui, p, at, across, false) {
+            ed.camera.center.x += by;
+        }
     }
 }
 

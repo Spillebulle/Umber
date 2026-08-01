@@ -212,6 +212,16 @@ pub struct Editor {
     pub canvas_pivot: Vec2,
     /// Size of that region, for fit-to-view.
     pub canvas_size: Vec2,
+    /// The canvas scrollbars as they were last drawn, in points: horizontal
+    /// then vertical, `None` where the document does not run off that edge.
+    ///
+    /// Recorded because a press on a bar must not also start a stroke, and the
+    /// usual test cannot answer it: these sit *inside* the canvas region and are
+    /// drawn in egui's background layer, so neither `pointer_over_canvas` nor
+    /// the `layer_id_at` check in `app.rs` sees them. Set every frame by
+    /// `ui::draw`, and an array rather than a `Vec` because it is written on the
+    /// drawing path.
+    pub scroll_bars: [Option<egui::Rect>; 2],
     /// egui points per physical pixel, from the last frame. Window events
     /// arrive in physical pixels and the layout works in points, so hit-testing
     /// a cursor position against a floating panel needs the conversion.
@@ -281,6 +291,7 @@ impl Default for Editor {
             layout: Layout::load_or_default(),
             canvas_pivot: Vec2::ZERO,
             canvas_size: Vec2::ONE,
+            scroll_bars: [None, None],
             pixels_per_point: 1.0,
             stroke: StrokeBuilder::new(),
             history: History::default(),
@@ -341,6 +352,17 @@ impl Editor {
         self.layout.blocks_canvas(self.to_points(screen))
     }
 
+    /// True when `screen` (physical pixels) is over one of the canvas
+    /// scrollbars, which sit inside the canvas region and are therefore not
+    /// covered by [`Editor::layout_owns_pointer`].
+    pub fn scrollbar_owns_pointer(&self, screen: Vec2) -> bool {
+        let at = self.to_points(screen);
+        self.scroll_bars
+            .iter()
+            .flatten()
+            .any(|bar| bar.contains(at))
+    }
+
     /// Physical window pixels to egui points.
     pub fn to_points(&self, screen: Vec2) -> egui::Pos2 {
         let scale = self.pixels_per_point.max(1e-3);
@@ -365,7 +387,7 @@ impl Editor {
         let max = self.canvas_pivot + half;
         let inside =
             screen.x >= min.x && screen.x <= max.x && screen.y >= min.y && screen.y <= max.y;
-        inside && !self.layout_owns_pointer(screen)
+        inside && !self.layout_owns_pointer(screen) && !self.scrollbar_owns_pointer(screen)
     }
 
     /// Select a tool, keeping the brush's paint/erase mode in step.

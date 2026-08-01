@@ -635,6 +635,19 @@ design shows a whole row of them.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
+- **The canvas scrollbars are `ScrollSpan`'s geometry and `widgets.rs`'s
+  paint**, the same division `dock.rs` and `panels.rs` keep. `ScrollSpan` lives
+  in `umber-core` because it decides where the picture goes and is testable
+  without a window. Two rules it exists to hold: a bar is drawn when part of the
+  document is outside the view — which covers "larger than the window" *and*
+  "fits, but pushed under a panel" — and the scrollable travel is the document
+  plus one viewport, **not** the union of the document and the view. A travel
+  that grew as the view left the document would change under the pointer
+  mid-drag and the thumb would accelerate away from the hand holding it.
+  `Editor::scroll_bars` records where they landed, because they sit *inside* the
+  canvas region in egui's background layer, so neither `pointer_over_canvas` nor
+  `app.rs`'s `layer_id_at` check would otherwise keep a press on one from
+  starting a stroke.
 - **The canvas does not fill the window.** `Camera` takes a `pivot` — the centre
   of the panel-free region — and `CompositeParams::pivot` must be the same
   value, or strokes land away from the cursor. Both come from

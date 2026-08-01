@@ -27,7 +27,7 @@ pub mod tip;
 mod tip_table;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
-pub use camera::Camera;
+pub use camera::{Camera, ScrollSpan};
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
 pub use docformat::{SaveDocument, SaveError, SaveLayer, SaveWarning};
