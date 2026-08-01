@@ -61,6 +61,12 @@ pub struct UiActions {
     pub pick_tab: Option<usize>,
     /// Close this document, having already been confirmed if it holds work.
     pub close_tab: Option<usize>,
+    /// Open a blank document with exactly these settings — the New document
+    /// dialog's answer. Separate from `new_document`, which is the tab strip's
+    /// `+` and inherits the document in front.
+    pub create_document: Option<umber_core::Document>,
+    /// Change the live document's canvas. See [`crate::canvasdlg`].
+    pub canvas_change: Option<crate::canvasdlg::CanvasChange>,
     pub new_document: bool,
     pub open_file: bool,
 }
@@ -164,6 +170,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     brush_editor(root, &p, ed);
     crate::settings::show(root, &p, ed);
 
+    // Drawn here rather than from a panel body, for the same reason the brush
+    // library's modals are: the layout can hide a panel, and a modal that goes
+    // with one cannot then be shut or reopened.
+    let mut canvas = crate::canvasdlg::Outcome::default();
+    crate::canvasdlg::show(root, &p, ed, &mut canvas);
+    actions.create_document = canvas.create;
+    actions.canvas_change = canvas.change;
+
     match tabs::close_prompt(root, &p, ed) {
         Some(tabs::CloseChoice::Close) => actions.close_tab = ed.ui.close_prompt.take(),
         // The prompt closes now, but the tab only closes if the save succeeds —
@@ -224,12 +238,22 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
 
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    actions.new_document = true;
+                if ui.button("New…").clicked() {
+                    let doc = ed.doc;
+                    ed.canvas_form.open(crate::canvasdlg::Dialog::New, doc);
                     ui.close();
                 }
                 if ui.button("Open…").clicked() {
                     actions.open_file = true;
+                    ui.close();
+                }
+                if ui
+                    .button("Canvas settings…")
+                    .on_hover_text("Size, background and resolution of the document in front.")
+                    .clicked()
+                {
+                    let doc = ed.doc;
+                    ed.canvas_form.open(crate::canvasdlg::Dialog::Settings, doc);
                     ui.close();
                 }
                 ui.separator();

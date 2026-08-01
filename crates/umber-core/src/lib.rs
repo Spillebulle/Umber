@@ -31,7 +31,7 @@ pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
 pub use docformat::{SaveDocument, SaveError, SaveLayer, SaveWarning};
 pub use docimport::{ImportError, ImportedDocument, ImportedLayer};
-pub use document::Document;
+pub use document::{Anchor, Background, CanvasCopy, Document, Unit};
 pub use dynamics::{DabInput, DabTarget, Modulation, Modulations};
 pub use geom::{PixelRect, Rect};
 pub use history::{Edit, EditKind, History, Jump, PixelPatch};

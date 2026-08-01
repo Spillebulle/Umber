@@ -1,5 +1,6 @@
 //! Window lifecycle, input translation and the frame loop.
 
+use crate::canvasdlg;
 use crate::editor::{Editor, Interaction, Tool};
 use crate::logo;
 use crate::session::{DocId, DocumentState};
@@ -13,7 +14,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
-use umber_core::{Brush, Color, Dab, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect};
+use umber_core::{
+    Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
+};
 use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -54,12 +57,16 @@ impl Graphics {
     /// with room for a handful of slices, and a document that already has more
     /// layers than that would otherwise hand the commit and undo paths a slice
     /// index the texture array does not have.
-    fn add_canvas(&mut self, id: DocId, size: UVec2, slots: u32) {
+    fn add_canvas(&mut self, id: DocId, doc: &Document, slots: u32) {
+        let size = doc.size;
         let mut canvas = match self.canvases.values().next() {
             Some(existing) => existing.for_document(&self.gpu.device, size),
             None => CanvasRenderer::new(&self.gpu.device, size, self.config.format),
         };
         canvas.ensure_slots(&self.gpu.device, &self.gpu.queue, slots);
+        // The background belongs to this document, not to whichever one the
+        // pipelines were cloned out of.
+        canvas.set_background(doc.background);
 
         // Fresh textures hold whatever the allocation contained.
         let mut enc = self
@@ -567,6 +574,8 @@ impl UmberApp {
                     size,
                     layers: &layers,
                     active: self.editor.layers.active_index(),
+                    background: self.editor.doc.background,
+                    dpi: self.editor.doc.dpi,
                     merged: &merged,
                 },
             )
@@ -982,6 +991,12 @@ impl UmberApp {
         if actions.new_document {
             self.new_document();
         }
+        if let Some(doc) = actions.create_document {
+            self.create_document(doc);
+        }
+        if let Some(change) = actions.canvas_change {
+            self.apply_canvas(change);
+        }
         if actions.open_file {
             self.open_file();
         }
@@ -1008,12 +1023,40 @@ impl UmberApp {
     }
 
     fn new_document(&mut self) {
+        let doc = self.editor.doc;
+        self.create_document(doc);
+    }
+
+    /// Open a blank document with the settings the New dialog was given.
+    fn create_document(&mut self, doc: Document) {
         self.finish_stroke();
-        let id = self.editor.new_document();
-        let size = self.editor.doc.size;
+        let id = self.editor.create_document(doc);
         let slots = self.editor.layers.slot_capacity_needed();
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.add_canvas(id, size, slots);
+            gfx.add_canvas(id, &doc, slots);
+        }
+        self.request_redraw();
+    }
+
+    /// Apply the Canvas settings dialog's answer to the document in front.
+    ///
+    /// The stroke is finished first: a resize throws the scratch surface away,
+    /// so a stroke still in flight would be lost rather than committed. Then
+    /// the editor takes the new document — which is also what clears the undo
+    /// history when the geometry moves — and the GPU carries the pixels across.
+    fn apply_canvas(&mut self, change: canvasdlg::CanvasChange) {
+        self.finish_stroke();
+        let id = self.editor.session.active_id();
+        let doc = change.doc;
+        let resized = self.editor.apply_canvas(doc);
+
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(canvas) = gfx.canvases.get_mut(&id)
+        {
+            if resized {
+                canvas.resize(&gfx.gpu.device, &gfx.gpu.queue, doc.size, change.anchor);
+            }
+            canvas.set_background(doc.background);
         }
         self.request_redraw();
     }
@@ -1107,7 +1150,7 @@ impl UmberApp {
         );
 
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.add_canvas(id, size, slots);
+            gfx.add_canvas(id, &doc, slots);
             if let Some(canvas) = gfx.canvases.get_mut(&id) {
                 for upload in &uploads {
                     canvas.write_layer_rect(
@@ -1225,6 +1268,10 @@ impl ApplicationHandler for UmberApp {
             &gpu.queue,
             self.editor.layers.slot_capacity_needed(),
         );
+        // This one renderer is built here rather than by `add_canvas`, so it
+        // needs the same call: a renderer starts on transparency until it is
+        // told what its document is on, and a new document is white.
+        canvas.set_background(self.editor.doc.background);
 
         // Start blank rather than showing whatever the allocation held.
         let mut enc = gpu
@@ -1296,9 +1343,9 @@ impl ApplicationHandler for UmberApp {
             );
         }
         if let Some(gfx) = self.gfx.as_mut() {
-            for (id, size, slots) in documents {
+            for (id, doc, slots) in documents {
                 if id != active {
-                    gfx.add_canvas(id, size, slots);
+                    gfx.add_canvas(id, &doc, slots);
                 }
             }
         }

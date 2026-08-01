@@ -5,7 +5,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use umber_core::{BrushMode, Camera, Color, Dab, PixelRect, TipMask};
+use umber_core::{
+    Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, TipMask,
+};
 use wgpu::util::DeviceExt;
 
 /// Layer storage format.
@@ -412,6 +414,10 @@ struct ViewUniforms {
     pivot: [f32; 2],
     stroke_color: [f32; 4],
     backdrop: [f32; 4],
+    /// Premultiplied linear; see the WGSL struct. `vec4` is 16-aligned on both
+    /// sides and sits on a 16-byte boundary here, so this insertion moves
+    /// nothing after it.
+    background: [f32; 4],
     layer_count: u32,
     stroke_mode: u32,
     active_index: u32,
@@ -533,6 +539,15 @@ struct Shared {
 
 pub struct CanvasRenderer {
     doc_size: UVec2,
+    /// The document background, premultiplied linear.
+    ///
+    /// A field rather than a [`CompositeParams`] member because it belongs to
+    /// the *document*, and a renderer already is one document's. That is not
+    /// tidiness: `export_rgba`, `pick_colour` and `probe_canvas` all build
+    /// their own `CompositeParams`, and a per-frame parameter would have to be
+    /// threaded into each of them — three more places for the export to stop
+    /// matching the screen. Held here, they cannot disagree.
+    background: [f32; 4],
     shared: Shared,
 
     layers: LayerStore,
@@ -841,7 +856,8 @@ impl CanvasRenderer {
     ///
     /// The new renderer's textures hold whatever the allocation contained, so
     /// the caller must clear them before the first composite, exactly as it
-    /// does after [`CanvasRenderer::new`].
+    /// does after [`CanvasRenderer::new`] — and set the new document's
+    /// background, which is its own and not this one's.
     pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2) -> Self {
         Self::with_shared(device, doc_size, self.shared.clone())
     }
@@ -849,20 +865,7 @@ impl CanvasRenderer {
     fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared) -> Self {
         let layers = LayerStore::new(device, doc_size, INITIAL_SLOTS);
 
-        let stroke = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("umber-stroke-scratch"),
-            size: wgpu::Extent3d {
-                width: doc_size.x,
-                height: doc_size.y,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: STROKE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+        let stroke = make_stroke_texture(device, doc_size);
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A 1x1 stand-in, exactly as the tip has. Nearly every stroke paints one
@@ -938,6 +941,9 @@ impl CanvasRenderer {
 
         Self {
             doc_size,
+            // Transparent until the caller says otherwise, which is what the
+            // canvas looked like before documents had a background at all.
+            background: Background::Transparent.premultiplied(),
             shared,
             layers,
             stroke,
@@ -979,6 +985,15 @@ impl CanvasRenderer {
 
     pub fn doc_size(&self) -> UVec2 {
         self.doc_size
+    }
+
+    /// Set what lies under this document's layer stack.
+    ///
+    /// Costs a field write: the value reaches the GPU with the rest of the view
+    /// uniforms on the next composite, so changing it mid-frame is free and
+    /// dragging a colour picker over it does not touch a buffer.
+    pub fn set_background(&mut self, background: Background) {
+        self.background = background.premultiplied();
     }
 
     pub fn slot_capacity(&self) -> u32 {
@@ -1046,6 +1061,133 @@ impl CanvasRenderer {
             &self.stroke_color_view,
         );
         self.layers = grown;
+    }
+
+    /// Change the canvas size, carrying the artwork across.
+    ///
+    /// Every one of this document's textures is sized to the canvas, so a
+    /// resize reallocates all of them and copies the surviving rectangle into
+    /// the new ones. Where that rectangle lands is [`CanvasCopy::plan`]'s to
+    /// decide, in `umber-core`, so the app's preview of a resize and what the
+    /// GPU actually does cannot drift apart.
+    ///
+    /// The layer array is copied **whole**, all slices in one transfer: the
+    /// anchor moves the picture, not one layer relative to another, so the
+    /// origin is the same for every slice and the depth of the copy is the slot
+    /// capacity. The new array is cleared first, because the region outside the
+    /// surviving rectangle is freshly allocated memory.
+    ///
+    /// Two things the caller owes this:
+    ///
+    /// * **No stroke in flight.** The scratch is thrown away rather than
+    ///   resampled — a half-painted stroke has no meaning at a new size, and
+    ///   rescaling coverage would soften the mark it is about to commit.
+    /// * **Clear the undo history.** Every `PixelPatch` is a rectangle in the
+    ///   *old* geometry; replaying one after a resize would paste the right
+    ///   bytes into the wrong pixels, or name a rectangle off the edge. This is
+    ///   the same reason deleting a layer clears it, and structural undo is the
+    ///   same real fix.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_size: UVec2,
+        anchor: Anchor,
+    ) {
+        let new_size = new_size.max(UVec2::ONE);
+        if new_size == self.doc_size {
+            return;
+        }
+        let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
+        log::info!(
+            "resizing canvas {} x {} -> {} x {}, {anchor:?}",
+            self.doc_size.x,
+            self.doc_size.y,
+            new_size.x,
+            new_size.y,
+        );
+
+        let resized = LayerStore::new(device, new_size, self.layers.capacity);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("resize-canvas"),
+        });
+        for view in &resized.slot_views {
+            clear_view(&mut enc, view, "clear-resized-slot");
+        }
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: plan.from.x,
+                    y: plan.from.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &resized.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: plan.to.x,
+                    y: plan.to.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: plan.size.x,
+                height: plan.size.y,
+                depth_or_array_layers: self.layers.capacity,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        self.layers = resized;
+
+        // The scratch is the stroke in progress, and there is not one — see the
+        // contract above. Reallocated rather than copied, and it starts clear
+        // like any freshly allocated target.
+        self.stroke = make_stroke_texture(device, new_size);
+        self.stroke_view = self
+            .stroke
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        if self.has_stroke_color {
+            self.stroke_color = make_stroke_color_texture(device, new_size);
+            self.stroke_color_view = self
+                .stroke_color
+                .create_view(&wgpu::TextureViewDescriptor::default());
+        }
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("clear-resized-scratch"),
+        });
+        self.clear_stroke(&mut enc);
+        queue.submit(Some(enc.finish()));
+
+        // A sample recorded against the old canvas would be read back as if it
+        // belonged to the new one.
+        self.reset_probes();
+
+        self.doc_size = new_size;
+        self.dab_state.doc_size = [new_size.x as f32, new_size.y as f32];
+        queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
+
+        self.composite_bind_group = make_composite_bind_group(
+            device,
+            &self.shared.composite_layout,
+            &self.view_uniforms,
+            &self.layers.array_view,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
+        self.commit_bind_group = make_commit_bind_group(
+            device,
+            &self.shared.commit_layout,
+            &self.commit_uniforms,
+            &self.stroke_view,
+            &self.shared.sampler,
+            &self.stroke_color_view,
+        );
     }
 
     /// Set the bitmap tip the dab pass stamps, or `None` for the procedural
@@ -1351,6 +1493,7 @@ impl CanvasRenderer {
                     params.backdrop[2],
                     1.0,
                 ],
+                background: self.background,
                 layer_count: count as u32,
                 stroke_mode: mode_index(params.stroke.mode),
                 active_index: params.active_index,
@@ -1479,6 +1622,10 @@ impl CanvasRenderer {
     /// Runs the same composite pass the screen uses, with its export flag set,
     /// so what lands in the file is what the canvas showed. A separate export
     /// path would be a second copy of the blend maths to keep in step.
+    ///
+    /// The document background is part of that, so a white-backed document
+    /// exports opaque and a transparent one keeps its alpha, without this
+    /// function knowing which it is.
     pub fn export_rgba(
         &self,
         device: &wgpu::Device,
@@ -2142,6 +2289,24 @@ fn make_dab_bind_group(
                 resource: wgpu::BindingResource::Sampler(grain_sampler),
             },
         ],
+    })
+}
+
+/// The stroke's coverage scratch: one channel, canvas-sized.
+fn make_stroke_texture(device: &wgpu::Device, size: UVec2) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("umber-stroke-scratch"),
+        size: wgpu::Extent3d {
+            width: size.x.max(1),
+            height: size.y.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: STROKE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
     })
 }
 

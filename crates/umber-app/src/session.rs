@@ -100,13 +100,14 @@ impl Tab {
         self.parked.as_ref().map(|s| s.doc.size)
     }
 
-    /// Everything needed to rebuild this document's GPU storage: canvas size
-    /// and how many texture-array slices its layers occupy. `None` for the
-    /// active tab, as [`Tab::parked_size`].
-    pub fn parked_storage(&self) -> Option<(UVec2, u32)> {
+    /// Everything needed to rebuild this document's GPU storage: the document
+    /// — which carries its canvas size *and* its background — and how many
+    /// texture-array slices its layers occupy. `None` for the active tab, as
+    /// [`Tab::parked_size`].
+    pub fn parked_storage(&self) -> Option<(Document, u32)> {
         self.parked
             .as_ref()
-            .map(|s| (s.doc.size, s.layers.slot_capacity_needed()))
+            .map(|s| (s.doc, s.layers.slot_capacity_needed()))
     }
 }
 
@@ -354,7 +355,7 @@ mod tests {
 
         assert_eq!(
             session.tabs()[0].parked_storage(),
-            Some((UVec2::splat(8), wanted)),
+            Some((Document::new(8, 8), wanted)),
         );
         assert_eq!(
             session.active_tab().parked_storage(),

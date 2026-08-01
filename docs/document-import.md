@@ -69,6 +69,23 @@ names its profile, and a document in a linear or Rec.2020 profile is imported
 with a warning rather than silently converted. Doing better needs an ICC engine
 Umber does not have.
 
+## Two things every import decides, and one of them is not a loss
+
+**The background.** Umber documents have one; no other application's ORA, KRA or
+PSD states such a thing. So every import here opens on **transparency**, and
+that is a fact about those files rather than a default — inventing a colour
+would be putting paint in a document that does not contain any. The one
+exception is a file Umber itself wrote, where the background rides in as a
+tagged bottom layer and is turned back into the document property.
+
+**The resolution.** ORA states it in `xres`, Krita in `x-res`, and both are
+read. Photoshop and PNG both *can* carry one and neither is read yet; those
+documents open at Umber's default of 72 dpi, and this is deliberately **not**
+an `ImportWarning`. Resolution changes no pixel — the picture is identical
+either way — and a line on every PSD and PNG would be noise in the one list that
+has to stay worth reading. It is visible and editable in the canvas settings
+dialog, which is where somebody who cares will look.
+
 ## OpenRaster (`.ora`) — landed, exact
 
 A ZIP of PNGs plus a `stack.xml`, fully specified at
@@ -78,8 +95,10 @@ It maps onto Umber almost one to one and is the recommended way in from any
 program this document declines — Krita, GIMP, MyPaint, Drawpile and Pinta all
 export it.
 
-What arrives: canvas size, per-layer name, `src` image, `x`/`y` offset, opacity,
-visibility, and `composite-op`.
+What arrives: canvas size, resolution (`xres`), per-layer name, `src` image,
+`x`/`y` offset, opacity, visibility, and `composite-op` — plus, for a file Umber
+wrote, the document background, which is a tagged bottom layer here and a
+document property inside. See `document-format.md`.
 
 What is lost, with a warning each:
 

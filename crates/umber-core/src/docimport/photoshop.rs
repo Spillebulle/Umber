@@ -50,6 +50,7 @@ use super::blend::{self, Fidelity};
 use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb,
 };
+use crate::document::Background;
 use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::Photoshop;
@@ -190,6 +191,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         size,
         layers,
         active: None,
+        background: Background::Transparent,
+        dpi: None,
         warnings,
     })
 }
@@ -207,6 +210,8 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
             pixels,
         }],
         active: None,
+        background: Background::Transparent,
+        dpi: None,
         warnings,
     }
 }

@@ -6,6 +6,7 @@
 use glam::UVec2;
 
 use super::{ImportError, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, srgb};
+use crate::document::Background;
 use crate::layer::BlendMode;
 
 /// A decoded image: straight-alpha, sRGB-encoded RGBA8.
@@ -102,6 +103,8 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
             pixels,
         }],
         active: None,
+        background: Background::Transparent,
+        dpi: None,
         warnings: Vec::new(),
     })
 }

@@ -17,11 +17,18 @@
 //! # Umber's own documents come through here
 //!
 //! [`crate::docformat`] writes ORA, so this is also the reader for Umber's own
-//! saved files. Three extra attributes carry what baseline ORA has nowhere to
-//! put — `umber-version`, `umber-selected` and `umber-blend`, all documented
-//! there — and they are read here rather than in a second reader, because two
-//! readers for one format is two things to keep in step. A file written by
-//! anything else simply has none of them.
+//! saved files. Four extra attributes carry what baseline ORA has nowhere to
+//! put — `umber-version`, `umber-selected`, `umber-blend` and
+//! `umber-background`, all documented there — and they are read here rather
+//! than in a second reader, because two readers for one format is two things to
+//! keep in step. A file written by anything else simply has none of them.
+//!
+//! `umber-background` is the one that changes what this reader *does* rather
+//! than what it concludes: the layer carrying it is the document background,
+//! written as a real layer so that every other application shows the right
+//! picture. Here it is turned back into a document property, and its PNG is
+//! never decoded — the attribute already holds the colour, so skipping it saves
+//! a canvas-sized decode on every open.
 
 use glam::UVec2;
 use quick_xml::events::Event;
@@ -32,7 +39,9 @@ use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
     srgb,
 };
+use crate::color::Color;
 use crate::docformat;
+use crate::document::Background;
 use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
@@ -53,6 +62,9 @@ struct LayerSpec {
     umber_blend: Option<BlendMode>,
     /// `umber-selected`: the layer that was being painted on when it was saved.
     selected: bool,
+    /// `umber-background`: this "layer" is really the document background, and
+    /// this is its colour. The PNG beside it is for other applications.
+    background: Option<Color>,
 }
 
 pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
@@ -61,7 +73,21 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 
     let stack_xml = container::read_entry(&mut zip, "stack.xml", FORMAT)?;
     let mut warnings = Vec::new();
-    let (size, specs) = parse_stack(&stack_xml, &mut warnings)?;
+    let (size, dpi, mut specs) = parse_stack(&stack_xml, &mut warnings)?;
+
+    // The background is a layer in the file and a property here, so it comes
+    // out of the list before anything counts or decodes it. Removed rather than
+    // read past: it must not also arrive as a layer, and the count
+    // `check_bounds` sees has to be the number of layers the stack will really
+    // hold — a document with the full 64 plus a background is one Umber wrote
+    // and must be able to reopen.
+    let mut background = Background::Transparent;
+    if let Some(i) = specs.iter().position(|spec| spec.background.is_some()) {
+        let spec = specs.remove(i);
+        background = spec
+            .background
+            .map_or(Background::Transparent, Background::opaque);
+    }
     check_bounds(FORMAT, size.x, size.y, specs.len())?;
 
     let mut layers = Vec::with_capacity(specs.len());
@@ -87,7 +113,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         // A file whose layer PNGs are unreadable can still be opened through
         // the composite the spec requires every writer to include. Losing the
         // layer structure is a real loss, but less of one than refusing.
-        return flattened_fallback(&mut zip, size, warnings);
+        return flattened_fallback(&mut zip, size, dpi, warnings);
     }
 
     Ok(ImportedDocument {
@@ -95,6 +121,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         size,
         layers,
         active,
+        background,
+        dpi,
         warnings,
     })
 }
@@ -106,10 +134,11 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 /// and gets reversed at the end — Umber's `LayerStack` is bottom first. Getting
 /// this backwards inverts the whole image and is not obvious on a symmetrical
 /// test file, so `layers_arrive_bottom_first` pins it down.
+#[allow(clippy::type_complexity)]
 fn parse_stack(
     xml: &[u8],
     warnings: &mut Vec<ImportWarning>,
-) -> Result<(UVec2, Vec<LayerSpec>), ImportError> {
+) -> Result<(UVec2, Option<f32>, Vec<LayerSpec>), ImportError> {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
 
@@ -127,6 +156,7 @@ fn parse_stack(
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut size: Option<UVec2> = None;
+    let mut dpi: Option<f32> = None;
     let mut specs: Vec<LayerSpec> = Vec::new();
     let mut depth = 0usize;
 
@@ -146,6 +176,12 @@ fn parse_stack(
                         let w = attrs.parse("w").unwrap_or(0);
                         let h = attrs.parse("h").unwrap_or(0);
                         size = Some(UVec2::new(w, h));
+                        // OpenRaster's own resolution attributes, in pixels per
+                        // inch. Umber holds one number, so a file whose `xres`
+                        // and `yres` differ — which the format allows and
+                        // nothing here can represent — is read by its
+                        // horizontal, rather than by an average nobody wrote.
+                        dpi = attrs.parse::<f32>("xres").filter(|v| *v > 0.0);
 
                         // Checked before a single pixel is decoded, so a file
                         // from a future Umber costs nothing to refuse.
@@ -229,6 +265,13 @@ fn parse_stack(
                             // group is flattened away, so it still points at
                             // the right layer.
                             selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
+                            // An unreadable value yields `None`, which leaves
+                            // this as an ordinary layer: the picture is still
+                            // right, where a colour guessed out of a malformed
+                            // attribute would not be.
+                            background: attrs
+                                .get(docformat::BACKGROUND_ATTR)
+                                .and_then(docformat::background_from_id),
                         });
                     }
                     _ => {}
@@ -248,7 +291,7 @@ fn parse_stack(
     let size = size.ok_or_else(|| malformed("stack.xml has no <image> element".into()))?;
     // Top first in the file, bottom first in the stack.
     specs.reverse();
-    Ok((size, specs))
+    Ok((size, dpi, specs))
 }
 
 fn load_layer(
@@ -306,6 +349,7 @@ fn load_layer(
 fn flattened_fallback(
     zip: &mut Zip<'_>,
     canvas: UVec2,
+    dpi: Option<f32>,
     mut warnings: Vec<ImportWarning>,
 ) -> Result<ImportedDocument, ImportError> {
     let merged = container::read_optional_entry(zip, "mergedimage.png", FORMAT)?
@@ -330,6 +374,10 @@ fn flattened_fallback(
             pixels,
         }],
         active: None,
+        // `mergedimage.png` already has the background composited into it, so
+        // carrying the property across as well would paint it a second time.
+        background: Background::Transparent,
+        dpi,
         warnings,
     })
 }

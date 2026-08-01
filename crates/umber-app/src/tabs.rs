@@ -462,7 +462,7 @@ pub fn summarise(warnings: &[ImportWarning]) -> Vec<String> {
     out
 }
 
-fn dialog_frame(p: &Palette) -> Frame {
+pub(crate) fn dialog_frame(p: &Palette) -> Frame {
     Frame::NONE
         .fill(p.popover)
         .stroke(Stroke::new(1.0, p.popover_border))
@@ -471,7 +471,10 @@ fn dialog_frame(p: &Palette) -> Frame {
 }
 
 /// A dialog button. `strong` marks the one that carries out the action.
-fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
+///
+/// Shared with the canvas dialogs rather than copied: two dialog buttons of
+/// slightly different sizes is exactly what a second copy produces.
+pub(crate) fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
     let font = FontId::proportional(text::SMALL);
     let text_w = ui
         .painter()

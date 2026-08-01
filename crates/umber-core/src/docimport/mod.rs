@@ -49,7 +49,7 @@ use std::path::Path;
 
 use glam::UVec2;
 
-use crate::document::Document;
+use crate::document::{Background, Document};
 use crate::layer::{BlendMode, LayerStack};
 
 /// Formats [`import`] can read.
@@ -167,6 +167,22 @@ pub struct ImportedDocument {
     /// reads. `None` means the top layer, which is what a painter expects to
     /// land on when opening someone else's document anyway.
     pub active: Option<usize>,
+    /// What lies under the stack.
+    ///
+    /// [`Background::Transparent`] for every format but Umber's own, and that
+    /// is not a default so much as a fact: no other application's ORA, KRA or
+    /// PSD states a document background, so anything else here would be a
+    /// colour the file does not contain. Umber writes its own as a bottom layer
+    /// *and* an attribute — see [`crate::docformat`] — which is what lets this
+    /// come back without the file becoming unreadable elsewhere.
+    pub background: Background,
+    /// Pixels per inch, when the file says. `None` means it did not, and the
+    /// document opens at [`Document::DEFAULT_DPI`].
+    ///
+    /// Not reported as a loss. Resolution changes no pixel — the picture is
+    /// identical either way — and a warning on every PSD and PNG would be noise
+    /// in the one list that has to stay worth reading.
+    pub dpi: Option<f32>,
     /// Everything the import could not represent. Empty means nothing was lost.
     pub warnings: Vec<ImportWarning>,
 }
@@ -180,6 +196,8 @@ pub struct LayerUpload {
 impl ImportedDocument {
     pub fn document(&self) -> Document {
         Document::new(self.size.x, self.size.y)
+            .with_background(self.background)
+            .with_dpi(self.dpi.unwrap_or(Document::DEFAULT_DPI))
     }
 
     /// Build the engine-side state for this import.
@@ -189,7 +207,7 @@ impl ImportedDocument {
     /// pixels live on the GPU. The caller writes each `LayerUpload` into its
     /// slot and the document is open.
     pub fn into_stack(self) -> (Document, LayerStack, Vec<LayerUpload>) {
-        let document = Document::new(self.size.x, self.size.y);
+        let document = self.document();
         let mut stack = LayerStack::new();
         let mut uploads = Vec::with_capacity(self.layers.len());
 
@@ -510,6 +528,8 @@ mod tests {
                 layer("top", size),
             ],
             active: None,
+            background: Background::Transparent,
+            dpi: None,
             warnings: vec![],
         };
         let (document, stack, uploads) = doc.into_stack();
@@ -535,6 +555,8 @@ mod tests {
             size,
             layers: vec![layer("a", size), layer("b", size), layer("c", size)],
             active,
+            background: Background::Transparent,
+            dpi: None,
             warnings: vec![],
         };
 
@@ -555,6 +577,8 @@ mod tests {
             size,
             layers: vec![layer("only", size)],
             active: None,
+            background: Background::Transparent,
+            dpi: None,
             warnings: vec![],
         };
         let (_, stack, uploads) = doc.into_stack();
@@ -641,6 +665,8 @@ mod tests {
                 .map(|i| layer(&format!("L{i}"), size))
                 .collect(),
             active: None,
+            background: Background::Transparent,
+            dpi: None,
             warnings: vec![],
         };
         assert!(matches!(

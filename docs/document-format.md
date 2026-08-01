@@ -45,6 +45,7 @@ mimetype                    "image/openraster", stored uncompressed, first
 stack.xml                   the layer stack
 data/layer000.png           top layer
 data/layer001.png           …down to the bottom
+data/background.png         the document background, when it has one — see below
 mergedimage.png             the flattened composite, required by the spec
 Thumbnails/thumbnail.png    at most 256 px on its long edge, also required
 ```
@@ -53,15 +54,20 @@ Thumbnails/thumbnail.png    at most 256 px on its long edge, also required
 
 ```xml
 <?xml version='1.0' encoding='UTF-8'?>
-<image w="2048" h="2048" version="0.0.3" umber-version="1">
+<image w="2048" h="2048" xres="300" yres="300" version="0.0.3" umber-version="1">
  <stack>
   <layer name="Ink" src="data/layer000.png" x="0" y="0" opacity="1.0000"
          visibility="visible" composite-op="svg:multiply" umber-selected="true"/>
   <layer name="Paper" src="data/layer001.png" x="0" y="0" opacity="1.0000"
          visibility="visible" composite-op="svg:src-over"/>
+  <layer name="Background" src="data/background.png" x="0" y="0" opacity="1.0000"
+         visibility="visible" composite-op="svg:src-over" umber-background="#ffffff"/>
  </stack>
 </image>
 ```
+
+A document with a transparent background has no `data/background.png` and no
+last row — it writes exactly the file it always did.
 
 **The first layer in a stack is the uppermost**, per the specification, and
 `LayerStack` is bottom first. The writer reverses; the reader reverses back.
@@ -76,9 +82,9 @@ which is what a save actually spends its time on. A layer nobody has painted on
 is written as a single transparent pixel rather than as nothing, so that it
 survives rather than disappearing from the stack.
 
-## Umber's three extra attributes
+## Umber's four extra attributes
 
-Three things Umber knows have nowhere to go in baseline ORA. They are written as
+Four things Umber knows have nowhere to go in baseline ORA. They are written as
 extra attributes, which every XML reader ignores if it does not recognise them,
 so the file remains an ordinary `.ora` everywhere else. The `umber-` prefix keeps
 them clear of anything the specification may add later.
@@ -88,6 +94,16 @@ them clear of anything the specification may add later.
 | `umber-version` | `<image>` | Revision of *these extensions*, not of ORA. |
 | `umber-selected` | one `<layer>` | The layer that was being painted on. |
 | `umber-blend` | a `<layer>` | Umber's own mode name, where the SVG one is inexact. |
+| `umber-background` | the bottom `<layer>` | That layer *is* the document background, and this is its colour. |
+
+**Resolution is deliberately not one of them.** ORA's `<image>` already carries
+`xres` and `yres`, in whole pixels per inch, and that is where a document's DPI
+is written and read. Inventing `umber-dpi` beside a standard attribute would
+mean other applications ignoring a number they already understand. Umber holds
+one resolution rather than one per axis, so both are written with the same
+value; a file whose two differ — which the format allows and nothing here can
+represent — is read by its horizontal, rather than by an average nobody wrote
+down.
 
 `umber-blend` exists for one mode. Umber's **Add** clamps the sum of straight
 colour; ORA's nearest name, `svg:plus`, is Porter-Duff addition on premultiplied
@@ -104,6 +120,60 @@ running build's is **refused**, before a pixel is decoded, with a message saying
 so and pointing at the two ways out: update Umber, or open it in another
 OpenRaster application — which still works, because the file is still an ORA.
 Additions an older build can safely ignore do not need a bump.
+
+## The background, and why it is a real layer in the file
+
+A document's background — transparent, white, black or a colour — is a
+*property*, not a layer. Filling the bottom layer instead is what a painter
+would do by hand, and it is the wrong model here: it cannot be changed
+afterwards without repainting, erasing on that layer punches a hole through to
+the checkerboard, and "transparent" stops being expressible. So it composites
+**under** the stack, inside the one pass the layers already use.
+
+ORA has no word for that, and the obvious extension — an attribute on `<image>`
+naming a colour — has a cost that is easy to miss: **every other application
+would open the document on transparency**. A white painting arriving in Krita on
+a checkerboard is not a dramatic failure, which is exactly what makes it a bad
+one. Nobody notices until they export.
+
+So the colour is written **both** ways:
+
+- A full-canvas opaque `<layer>` named "Background", at the bottom of the stack,
+  carrying the real pixels for everyone else.
+- `umber-background` on that layer, which is how Umber's own reader knows to turn
+  it back into the property rather than into a layer the painter never made.
+
+They cannot drift apart, because the writer produces both from one value. What
+each reader sees:
+
+| | |
+|---|---|
+| This Umber | the attribute; the layer's PNG is never even decoded |
+| An older Umber | one extra opaque layer, and **the same picture** |
+| Krita, GIMP, MyPaint, Pinta | one extra opaque layer, and the same picture |
+
+That last row is the whole argument, and the middle one is why `umber-version`
+is **not** bumped for this. The rule is that a revision storing something an
+older build would drop *silently* must be refused by it — and nothing is dropped
+here. An older build shows every pixel in the right place, with the background
+merely editable. Refusing to open somebody's document would cost more than that
+degradation does.
+
+The honest caveats, both of them consequences rather than defects:
+
+- A document edited and re-saved by another application comes back to Umber with
+  the background as an ordinary layer, because that application will not have
+  kept an attribute it does not understand. The picture is unchanged; the
+  property is not.
+- The file costs one canvas-sized PNG of a solid colour. That is a few kilobytes
+  after deflate — every row after the first filters to zeroes — plus one
+  canvas-sized buffer built while the archive is. Beside the layer readbacks a
+  save already blocks on, it does not register.
+
+Since the background is an extra `<layer>`, a document already at
+`LayerStack::MAX` writes `MAX + 1` of them. The reader takes the background out
+of the list *before* it counts, which is what stops Umber writing a file it
+would then refuse to open.
 
 ## Pixels, and why the round trip is exact
 
@@ -134,7 +204,7 @@ by the time anything is saved.
 
 Written, read back, and asserted on in `docformat`'s tests:
 
-- Canvas size.
+- Canvas size, background and resolution.
 - The whole stack, bottom to top, including its order.
 - Per layer: name (including one full of XML metacharacters), visibility,
   opacity, blend mode, and every pixel byte for byte.
@@ -173,6 +243,11 @@ verbatim.
 
 ## In the application
 
+- **File → New…** and **File → Canvas settings…** are the same four questions —
+  size, background, resolution, and where existing artwork is anchored when the
+  size changes. The first three are what this file carries; the anchor is a
+  one-off instruction to the renderer and is not saved, because it describes a
+  move rather than a document.
 - **File → Save** (`Ctrl+S`) writes to the file the document came from, and asks
   for one the first time.
 - **File → Save as…** (`Ctrl+Shift+S`) always asks.

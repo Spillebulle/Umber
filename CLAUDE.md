@@ -133,6 +133,42 @@ Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
 the per-document state — document, layers, history, camera — and switching tabs
 moves that block in and out of `Editor` wholesale.
 
+`Document` is a canvas size, a `Background` and a resolution.
+
+- **The background composites *under* the stack, inside the same pass**, as one
+  `acc + bg * (1 - acc.a)` after the layer loop and **before** the export
+  branch. Both sides are premultiplied, so it is an add; transparent is all
+  zeroes and therefore the exact identity, and a document without one pays that
+  add and no branch. Being before the export branch is what makes both halves
+  fall out of one line: a white-backed document exports opaque, a transparent
+  one keeps its alpha. `export_rgba`, `pick_colour` and `probe_canvas` reuse
+  that pass, so the flat PNG, the eyedropper and a smudging brush's canvas
+  probe are all right automatically — **do not add a second path**.
+- **It lives on `CanvasRenderer`, not in `CompositeParams`.** It belongs to the
+  document and a renderer already is one document's; as a per-frame parameter
+  it would have to be threaded into the three internal callers that build their
+  own params, which is three more places for an export to stop matching the
+  screen. `Graphics::add_canvas` must therefore call `set_background` — a
+  renderer cloned from another document's does not inherit it.
+- **A background is *only* ever transparent or opaque.** A partly transparent
+  one would have to answer what an export means and buys nothing a bottom layer
+  at reduced opacity does not.
+- **Resizing a document clears its undo history**, for the same reason deleting
+  a layer does: a `PixelPatch` is a rectangle of the *old* canvas, so replaying
+  one would paste the right bytes into the wrong pixels or name a rectangle off
+  the edge. `Editor::apply_canvas` does it, so neither call site can forget.
+  `CanvasRenderer::resize` also needs **no stroke in flight** — it throws the
+  scratch away rather than resampling it.
+- **Where the pixels land is `CanvasCopy::plan`'s, in `umber-core`.** That is
+  what keeps the dialog's preview and what the GPU does from drifting, and it
+  is testable without a device. The layer array is copied whole, every slice in
+  one transfer: the anchor moves the *picture*, not one layer relative to
+  another.
+- **`resize` must rewrite `dab_state.doc_size`.** The dab pass turns document
+  pixels into clip space with that number, so leaving it behind puts every later
+  dab at the wrong place and the wrong scale, on a layer that still looks
+  plausible.
+
 - **Nothing above the `--- documents ---` line in `editor.rs` is per-document.**
   That is what keeps a tab switch to four moves instead of an audit of every
   field. Adding per-document state means adding it to `DocumentState` too, or it
@@ -492,6 +528,18 @@ design shows a whole row of them.
   *and* build-up, because both are about a mark made of many faint stamps rather
   than one solid one. Between them they expose every field of `Brush` — adding
   one means adding a control, or the library can use a brush nobody can make.
+- **The canvas dialogs are one form and two call sites** (`canvasdlg.rs`). New
+  document and Canvas settings ask the same four questions, so they share
+  `CanvasForm` and one body; two dialogs drifting apart is how "New" ends up
+  offering a preset "Canvas settings" cannot express. They are drawn from
+  `ui::draw`, not from a panel body, for the reason the brush library's modals
+  are. The anchor control appears **only** when the size is actually changing —
+  on a New document there is nothing to anchor, and on an unchanged size it
+  would be a live knob that does nothing.
+- **`egui::DragValue` is the one stock widget used on purpose.** The design has
+  no numeric field, and a canvas size is one of the few values here that people
+  type exactly rather than feel for on a rail. Everything else in those dialogs
+  is `widgets.rs`'s.
 - **The brush list's samples are stamped from the brush**, not drawn from two of
   its numbers. `widgets::brush_sample` is a miniature dab loop under a pressure
   ramp; it seeds its RNG identically on every row, so two rows differ because

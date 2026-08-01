@@ -9,6 +9,8 @@
 //!     size: UVec2::new(2048, 2048),
 //!     layers: &layers,
 //!     active: 0,
+//!     background: umber_core::Background::WHITE,
+//!     dpi: 72.0,
 //!     merged: &merged,
 //! };
 //! let warnings = umber_core::docformat::save(Path::new("sketch.ora"), &doc)?;
@@ -35,7 +37,7 @@
 //!
 //! # What Umber adds, and how it stays an ORA
 //!
-//! Three things Umber knows have nowhere to go in baseline ORA, so they are
+//! Four things Umber knows have nowhere to go in baseline ORA, so they are
 //! written as extra attributes. XML readers ignore attributes they do not
 //! recognise, so a file carrying them is still an ordinary `.ora` everywhere
 //! else; the `umber-` prefix keeps them out of the way of anything the
@@ -51,6 +53,50 @@
 //!   premultiplied colour and Umber's Add clamps straight colour, so they part
 //!   company at soft edges. Without the hint, reopening a document Umber wrote
 //!   would report an approximation that never happened.
+//! * **[`BACKGROUND_ATTR`]** on the bottom `<layer>`, when the document has a
+//!   background colour. See below — it is the *hint*, not the storage.
+//!
+//! Resolution is **not** one of them. ORA's `<image>` already carries `xres`
+//! and `yres`, which is what [`SaveDocument::dpi`] is written to and read from;
+//! inventing `umber-dpi` beside a standard attribute would mean other
+//! applications ignoring a number they already understand.
+//!
+//! # The background, and why it is a real layer in the file
+//!
+//! [`Background`] is a document property, not a layer — see
+//! [`crate::document`] for why. ORA has no word for one, and the obvious
+//! extension, an attribute on `<image>` naming a colour, has a cost that is
+//! easy to miss: every other application would open the document on
+//! transparency. A white painting arriving in Krita on a checkerboard is not a
+//! dramatic failure, which is exactly what makes it a bad one — nobody notices
+//! until they export.
+//!
+//! So the colour is written **both** ways. A full-canvas opaque `<layer>` named
+//! "Background" goes in at the bottom of the stack, carrying the real pixels
+//! for everyone else; and it is tagged with [`BACKGROUND_ATTR`], which is how
+//! Umber's own reader knows to turn it back into the property rather than into
+//! a layer the painter never made. Nothing can drift between them, because the
+//! writer produces both from the same value.
+//!
+//! What each reader sees:
+//!
+//! | | |
+//! |---|---|
+//! | This Umber | the attribute; the layer PNG is never even decoded |
+//! | An older Umber | one extra opaque layer, and **the same picture** |
+//! | Krita, GIMP, MyPaint | one extra opaque layer, and the same picture |
+//!
+//! That last row is the whole argument, and the middle one is why [`VERSION`]
+//! is *not* bumped for this: the rule is that a revision storing something an
+//! older build would drop silently must be refused by it, and nothing is
+//! dropped here. An older build shows every pixel, in the right place, with the
+//! background merely editable. Refusing to open the file would cost more than
+//! the degradation does.
+//!
+//! The price is one canvas-sized PNG of a solid colour — a few kilobytes after
+//! deflate, since every row after the first filters to zeroes — and one
+//! canvas-sized buffer built while the archive is. Beside the eight layer
+//! readbacks a save already blocks on, it does not register.
 //!
 //! # Pixels
 //!
@@ -74,7 +120,9 @@ use glam::UVec2;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::color::Color;
 use crate::docimport::srgb;
+use crate::document::Background;
 use crate::layer::{BlendMode, LayerStack};
 
 /// Extension Umber saves with, without the dot.
@@ -85,6 +133,14 @@ pub const EXTENSION: &str = "ora";
 /// Bumped only when a new revision stores something an older Umber would drop
 /// silently — a mask, a group, a layer effect. Additions an older build can
 /// safely ignore do not need it.
+///
+/// The document background did **not** need one, and it is worth saying why,
+/// because it is the closest call so far: it is written as a real bottom layer
+/// as well as an attribute, so an older build opens the file and shows every
+/// pixel in the right place. Nothing is dropped, only degraded — the background
+/// becomes an editable layer — and that does not meet the bar for refusing to
+/// open somebody's document. Resolution did not either: it rides on ORA's own
+/// `xres`/`yres`, and a build that ignores it renders an identical picture.
 pub const VERSION: u32 = 1;
 
 /// `<image>` attribute naming [`VERSION`].
@@ -95,6 +151,22 @@ pub const SELECTED_ATTR: &str = "umber-selected";
 
 /// `<layer>` attribute naming an Umber blend mode outright.
 pub const BLEND_ATTR: &str = "umber-blend";
+
+/// `<layer>` attribute marking the layer that *is* the document background,
+/// spelled as an sRGB hex triple — see the module docs for why the colour is
+/// written twice.
+///
+/// On the layer rather than on `<image>` so the two travel together: a reader
+/// that has the attribute has the layer to skip, and one that has neither has
+/// an ordinary ORA.
+pub const BACKGROUND_ATTR: &str = "umber-background";
+
+/// `src` of the layer holding the document background.
+pub const BACKGROUND_SRC: &str = "data/background.png";
+
+/// Name the background layer carries, which is what other applications show in
+/// their layers panel.
+const BACKGROUND_NAME: &str = "Background";
 
 /// The `version` every OpenRaster file declares. Not Umber's — the format's.
 const ORA_VERSION: &str = "0.0.3";
@@ -121,6 +193,14 @@ pub struct SaveDocument<'a> {
     pub layers: &'a [SaveLayer<'a>],
     /// Index into `layers` of the one being painted on.
     pub active: usize,
+    /// What lies under the stack. A colour becomes an extra bottom layer in the
+    /// file — see the module docs.
+    pub background: Background,
+    /// Pixels per inch, written to ORA's own `xres` and `yres`.
+    ///
+    /// Rounded to a whole number on the way out, which is what those attributes
+    /// mean and what every other writer puts there.
+    pub dpi: f32,
     /// The flattened composite, straight-alpha sRGB, canvas-sized.
     ///
     /// Required by the specification, and supplied by the caller rather than
@@ -319,8 +399,17 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         entries.push(layer_xml(layer, &src, placed.at, op, exact, selected));
     }
 
+    // The background goes in last, so it is the bottom of the stack — and it is
+    // a real layer with real pixels, because every application but this one
+    // would otherwise open the document on transparency. See the module docs.
+    if let Some(colour) = doc.background.colour() {
+        zip.start_file(BACKGROUND_SRC, stored())?;
+        zip.write_all(&encode_png(doc.size, &solid(doc.size, colour))?)?;
+        entries.push(background_xml(colour));
+    }
+
     zip.start_file("stack.xml", deflated())?;
-    zip.write_all(stack_xml(doc.size, &entries).as_bytes())?;
+    zip.write_all(stack_xml(doc.size, doc.dpi, &entries).as_bytes())?;
 
     // Both are required of a conforming writer, and both are what gives a file
     // manager something to show.
@@ -360,12 +449,42 @@ pub fn blend_from_id(id: &str) -> Option<BlendMode> {
     BlendMode::ALL.into_iter().find(|m| blend_id(*m) == id)
 }
 
+/// The background colour as [`BACKGROUND_ATTR`] spells it: `#rrggbb`, sRGB.
+///
+/// sRGB bytes rather than linear floats because that is the only form in which
+/// the value is exactly what a colour picker showed, and because it is the
+/// spelling anybody opening `stack.xml` in a text editor can read.
+pub fn background_id(colour: Color) -> String {
+    let [r, g, b, _] = colour.to_srgb_u8();
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Inverse of [`background_id`].
+///
+/// `None` for anything unrecognised, which leaves the reader treating the layer
+/// as an ordinary layer — the picture is still right, and a colour guessed from
+/// a malformed attribute would not be.
+pub fn background_from_id(id: &str) -> Option<Color> {
+    let hex = id.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::from_srgb_u8(byte(0)?, byte(2)?, byte(4)?, 255))
+}
+
 // --- the XML ---------------------------------------------------------------
 
-fn stack_xml(size: UVec2, layers: &[String]) -> String {
+fn stack_xml(size: UVec2, dpi: f32, layers: &[String]) -> String {
+    // `xres`/`yres` are OpenRaster's own, in whole pixels per inch, and every
+    // reader that cares about print already looks for them — which is exactly
+    // why there is no `umber-dpi` beside them. Umber has one resolution rather
+    // than one per axis, so both get the same number.
+    let res = crate::document::sane_dpi(dpi).round() as u32;
     let mut out = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
     out.push_str(&format!(
-        "<image w=\"{}\" h=\"{}\" version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\">\n \
+        "<image w=\"{}\" h=\"{}\" xres=\"{res}\" yres=\"{res}\" \
+         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\">\n \
          <stack>\n",
         size.x, size.y
     ));
@@ -405,6 +524,25 @@ fn layer_xml(
     out
 }
 
+/// The `<layer>` that carries the document background.
+///
+/// An ordinary, fully opaque, canvas-sized layer as far as anything else is
+/// concerned — which is the point — plus [`BACKGROUND_ATTR`], which is how
+/// Umber's own reader knows to turn it back into a document property instead of
+/// handing the painter a layer they never made.
+///
+/// Never selected: the attribute says it is not a layer, so `umber-selected`
+/// on it would contradict that, and a reader that ignored the attribute would
+/// open the document with the background layer active.
+fn background_xml(colour: Color) -> String {
+    format!(
+        "<layer name=\"{BACKGROUND_NAME}\" src=\"{BACKGROUND_SRC}\" x=\"0\" y=\"0\" \
+         opacity=\"1.0000\" visibility=\"visible\" composite-op=\"svg:src-over\" \
+         {BACKGROUND_ATTR}=\"{}\"/>",
+        background_id(colour)
+    )
+}
+
 /// Escape a layer name for an attribute value.
 ///
 /// Control characters are dropped rather than escaped: they are not legal in
@@ -423,6 +561,22 @@ struct Placed {
     at: (u32, u32),
     /// Straight-alpha sRGB, `size.x * size.y * 4` bytes.
     pixels: Vec<u8>,
+}
+
+/// A canvas of one opaque colour, straight-alpha sRGB.
+///
+/// Not put through [`trim`]: the background covers the whole canvas by
+/// definition, so scanning it for a bounding box would be sixteen megabytes of
+/// reading to conclude "all of it". The bytes are already straight alpha —
+/// there is no premultiply to undo when alpha is 1 everywhere — so the sRGB
+/// conversion `trim` performs is skipped too.
+fn solid(size: UVec2, colour: Color) -> Vec<u8> {
+    let px = colour.with_alpha(1.0).to_srgb_u8();
+    px.iter()
+        .copied()
+        .cycle()
+        .take(size.x as usize * size.y as usize * 4)
+        .collect()
 }
 
 /// Crop a canvas-sized layer to its non-transparent bounding box.
@@ -553,6 +707,7 @@ fn deflated() -> SimpleFileOptions {
 mod tests {
     use super::*;
     use crate::docimport::{self, ImportError};
+    use crate::document::Document;
 
     /// Layer-texture bytes: a solid colour over the whole canvas.
     fn solid(size: UVec2, px: [u8; 4]) -> Vec<u8> {
@@ -612,6 +767,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &merged,
         });
 
@@ -634,6 +791,177 @@ mod tests {
     }
 
     #[test]
+    fn the_canvas_settings_survive_a_round_trip() {
+        // The same idea as `saving_and_reopening_does_not_move_a_pixel`, for
+        // the two things that are not pixels: a document reopened has to be the
+        // document that was saved, background and resolution included.
+        let size = UVec2::new(4, 4);
+        let pixels = empty(size);
+        let paper = Color::from_srgb_u8(247, 243, 233, 255);
+        let layers = vec![layer("Ink", &pixels)];
+
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::opaque(paper),
+            dpi: 300.0,
+            merged: &pixels,
+        });
+
+        assert_eq!(doc.background, Background::opaque(paper));
+        assert_eq!(doc.dpi, Some(300.0));
+        assert_eq!(
+            doc.layers.len(),
+            1,
+            "the background must come back as the background, not as a layer"
+        );
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        // And the same document rebuilt, which is what the editor installs.
+        let reopened = doc.document();
+        assert_eq!(
+            reopened,
+            Document::new(4, 4)
+                .with_background(Background::opaque(paper))
+                .with_dpi(300.0)
+        );
+    }
+
+    #[test]
+    fn a_transparent_document_writes_no_background_layer_at_all() {
+        // The identity case. A document with nothing behind its stack has to
+        // produce exactly the file it always did — an extra layer of nothing
+        // would show up in every other application's layers panel.
+        let size = UVec2::new(4, 4);
+        let pixels = empty(size);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+        })
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        assert!(
+            !zip.file_names().any(|n| n == BACKGROUND_SRC),
+            "a transparent document must not carry a background image"
+        );
+
+        let back = docimport::read_openraster(&bytes).unwrap();
+        assert_eq!(back.background, Background::Transparent);
+        assert_eq!(back.layers.len(), 1);
+    }
+
+    #[test]
+    fn every_other_application_gets_the_background_as_real_pixels() {
+        // The whole reason the colour is written twice. Reading the file the
+        // way an application that has never heard of `umber-background` would
+        // must produce an opaque bottom layer of the right colour — otherwise a
+        // white painting opens in Krita on a checkerboard.
+        let size = UVec2::new(3, 2);
+        let pixels = empty(size);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::opaque(Color::from_srgb_u8(20, 120, 200, 255)),
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+        })
+        .unwrap();
+
+        // Strip the attribute and read it back: that is exactly what a foreign
+        // reader does, since an XML reader ignores what it does not know.
+        let foreign = with_stack_xml(&bytes, |xml| {
+            let start = xml.find(BACKGROUND_ATTR).expect("the attribute");
+            let end = xml[start..].find("/>").expect("the element") + start;
+            format!("{}{}", &xml[..start], &xml[end..])
+        });
+        let back = docimport::read_openraster(&foreign).unwrap();
+
+        assert_eq!(back.background, Background::Transparent, "no attribute");
+        assert_eq!(back.layers.len(), 2, "the background is a layer to them");
+        assert_eq!(back.layers[0].name, "Background", "and it is at the bottom");
+        assert!(
+            back.layers[0].pixels.chunks_exact(4).all(|p| p[3] == 255),
+            "the background layer must be opaque everywhere"
+        );
+        assert_eq!(&back.layers[0].pixels[..4], &[20, 120, 200, 255]);
+    }
+
+    #[test]
+    fn the_resolution_is_openrasters_own_attribute() {
+        // `xres`/`yres` rather than an invented `umber-dpi`: every reader that
+        // cares about print already looks for them.
+        let size = UVec2::new(2, 2);
+        let pixels = empty(size);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: 150.0,
+            merged: &pixels,
+        })
+        .unwrap();
+
+        let xml = read_stack_xml(&bytes);
+        assert!(xml.contains("xres=\"150\""), "{xml}");
+        assert!(xml.contains("yres=\"150\""), "{xml}");
+        assert!(
+            !xml.contains("umber-dpi"),
+            "a standard attribute must not grow a private twin: {xml}"
+        );
+    }
+
+    #[test]
+    fn a_document_with_a_full_stack_and_a_background_still_reopens() {
+        // The background is an extra layer in the file, so a document already
+        // at `LayerStack::MAX` writes MAX + 1 of them. The reader takes the
+        // background out before it counts, which is what stops Umber writing a
+        // file it then refuses to open.
+        let size = UVec2::new(1, 1);
+        let pixels = empty(size);
+        let layers: Vec<SaveLayer> = (0..LayerStack::MAX).map(|_| layer("L", &pixels)).collect();
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::WHITE,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+        });
+        assert_eq!(doc.layers.len(), LayerStack::MAX);
+        assert_eq!(doc.background, Background::WHITE);
+    }
+
+    #[test]
+    fn a_background_colour_survives_its_own_round_trip() {
+        for bytes in [[0, 0, 0], [255, 255, 255], [1, 128, 254], [247, 243, 233]] {
+            let colour = Color::from_srgb_u8(bytes[0], bytes[1], bytes[2], 255);
+            let id = background_id(colour);
+            assert_eq!(id.len(), 7, "{id}");
+            assert_eq!(
+                background_from_id(&id).map(Color::to_srgb_u8),
+                Some([bytes[0], bytes[1], bytes[2], 255]),
+            );
+        }
+        // Anything a hand-edited file might hold. `None` leaves the layer as a
+        // layer, which is still the right picture.
+        for bad in ["", "#", "ffffff", "#fffff", "#gggggg", "#ffffffff"] {
+            assert!(background_from_id(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
     fn partly_transparent_pixels_come_back_byte_for_byte() {
         // The one thing a document format has to get right. These are stored
         // premultiplied and ORA is straight alpha, so every one of them makes
@@ -651,6 +979,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &merged,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
@@ -671,6 +1001,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &merged,
         });
         assert_eq!(doc.layers[0].pixels, pixels);
@@ -686,6 +1018,8 @@ mod tests {
             size,
             layers: &layers,
             active: 1,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &painted,
         });
 
@@ -712,6 +1046,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &pixels,
         };
 
@@ -743,6 +1079,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &pixels,
         });
         assert_eq!(doc.layers[0].name, "<ink> & \"paper\"");
@@ -757,6 +1095,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &pixels,
         })
         .unwrap();
@@ -788,6 +1128,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &pixels,
         })
         .unwrap();
@@ -837,6 +1179,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &pixels,
         })
         .unwrap_err();
@@ -853,6 +1197,8 @@ mod tests {
             size,
             layers: &layers,
             active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
             merged: &full,
         })
         .unwrap_err();
@@ -882,6 +1228,8 @@ mod tests {
                 size,
                 layers: &layers,
                 active: 0,
+                background: Background::Transparent,
+                dpi: Document::DEFAULT_DPI,
                 merged: &pixels,
             },
         )
@@ -893,6 +1241,14 @@ mod tests {
             "the temporary file was left behind"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `stack.xml` out of an archive, as text.
+    fn read_stack_xml(bytes: &[u8]) -> String {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name("stack.xml").unwrap(), &mut body).unwrap();
+        String::from_utf8(body).unwrap()
     }
 
     /// Rebuild an archive with `stack.xml` passed through `f`.
