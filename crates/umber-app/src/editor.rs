@@ -428,16 +428,23 @@ impl Editor {
         self.session.mark_modified();
     }
 
-    /// Every open document and its canvas size, live one included.
+    /// Every open document, its canvas size and how many texture-array slices
+    /// its layers occupy. The live document is included.
     ///
     /// Used to rebuild GPU storage after the surface has been destroyed and
     /// recreated, which on Android happens whenever the app is backgrounded.
-    pub fn open_documents(&self) -> Vec<(DocId, UVec2)> {
-        let live = self.doc.size;
+    /// The slot count has to travel with the size: a renderer is built with
+    /// room for a few slices, and a document with more layers than that would
+    /// come back to a texture array too shallow to commit its strokes into.
+    pub fn open_documents(&self) -> Vec<(DocId, UVec2, u32)> {
+        let live = (self.doc.size, self.layers.slot_capacity_needed());
         self.session
             .tabs()
             .iter()
-            .map(|tab| (tab.id, tab.parked_size().unwrap_or(live)))
+            .map(|tab| {
+                let (size, slots) = tab.parked_storage().unwrap_or(live);
+                (tab.id, size, slots)
+            })
             .collect()
     }
 

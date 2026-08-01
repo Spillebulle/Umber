@@ -88,12 +88,23 @@ impl Gpu {
         height: u32,
     ) -> wgpu::SurfaceConfiguration {
         let caps = surface.get_capabilities(&self.adapter);
+        // Indexed nowhere: a surface the adapter cannot present to reports no
+        // formats at all, and `caps.formats[0]` would then panic during
+        // start-up instead of failing at `configure` with something a bug
+        // report can act on.
         let format = caps
             .formats
             .iter()
             .copied()
             .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .or_else(|| caps.formats.first().copied())
+            .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+        if format.is_srgb() {
+            // Survivable, but worth saying out loud: `composite.wgsl` does the
+            // gamma encode itself, so an sRGB surface encodes it twice and the
+            // whole canvas comes out washed out.
+            log::warn!("surface offers only sRGB formats ({format:?}); colours will be light");
+        }
 
         wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -101,7 +112,11 @@ impl Gpu {
             width: width.max(1),
             height: height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         }
