@@ -251,6 +251,20 @@ pub struct Editor {
     /// Cursor in physical window pixels.
     pub cursor: Vec2,
     pub last_cursor: Vec2,
+    /// True when a pen, rather than a mouse, is driving the pointer.
+    ///
+    /// The signal is which *kind* of event last moved it. A pen reaches winit
+    /// as `WindowEvent::Touch` — Windows delivers it through `WM_POINTER`, and
+    /// winit consumes those messages rather than letting the system promote
+    /// them to legacy mouse ones, so a pen produces no `CursorMoved` at all.
+    /// See the pressure notes in CLAUDE.md, which is the same fact read the
+    /// other way round.
+    ///
+    /// Latched, because the canvas is painted between events and has to know
+    /// what it is drawing a cursor for; and cleared by any real mouse event, so
+    /// that putting the pen down and taking hold of the mouse hands the arrow
+    /// straight back.
+    pub pen_pointer: bool,
     /// Space held — temporary pan modifier.
     pub space_down: bool,
     /// Where a zoom-tool drag started; zooming keeps this point pinned.
@@ -321,6 +335,7 @@ impl Default for Editor {
             interaction: Interaction::Idle,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
+            pen_pointer: false,
             space_down: false,
             zoom_anchor: Vec2::ZERO,
             brush_resize: None,

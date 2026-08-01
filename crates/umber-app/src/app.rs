@@ -1782,6 +1782,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                 let pos = Vec2::new(position.x as f32, position.y as f32);
                 self.editor.last_cursor = self.editor.cursor;
                 self.editor.cursor = pos;
+                // A mouse event, so a mouse is what is driving the pointer:
+                // the pen's dot gives way to the ordinary arrow. A pen sends
+                // none of these — see `Editor::pen_pointer`.
+                self.editor.pen_pointer = false;
 
                 match self.editor.interaction {
                     Interaction::Drawing => {
@@ -1825,6 +1829,8 @@ impl ApplicationHandler<Wake> for UmberApp {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // A button is a mouse's, whatever moved the pointer last.
+                self.editor.pen_pointer = false;
                 // The other half of how the resize and the eyedropper are told
                 // apart: the resize is Alt with *nothing* down, so a press ends
                 // it, and the press itself goes on to be handled as it always
@@ -1942,6 +1948,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                     touch.phase,
                     touch.id
                 );
+                // Whatever else this event turns out to be, it came from a pen
+                // or a finger rather than a mouse — which is what the canvas
+                // draws its own cursor for.
+                self.editor.pen_pointer = true;
 
                 match touch.phase {
                     TouchPhase::Started => {
@@ -1976,15 +1986,38 @@ impl ApplicationHandler<Wake> for UmberApp {
                     TouchPhase::Moved => {
                         // An update for an id that never started is a **hover** —
                         // a pen in range but off the glass, which Windows reports
-                        // as a pointer update with no down flag. It is not a
-                        // contact and must not be recorded as one: a pen that
-                        // hovers and is then carried out of range leaves no
-                        // "up", so the entry would sit there for ever, and the
+                        // as a pointer update with no down flag. Two things are
+                        // true of it and they must not be run together:
+                        //
+                        // It is not a contact and must not be recorded as one: a
+                        // pen that hovers and is then carried out of range leaves
+                        // no "up", so the entry would sit there for ever, and the
                         // next real press — Windows gives each contact session a
                         // fresh pointer id — would look like a second finger and
                         // be taken for a pinch. A finger always starts before it
                         // moves, so nothing is lost by requiring it.
+                        //
+                        // But *where the pen is* is worth having anyway, and used
+                        // to be thrown away with the rest of the event. It is
+                        // where the pen's own dot is drawn, and where Alt reads
+                        // the brush-resize gesture's anchor from — without it
+                        // both sat wherever the mouse was last left. So the
+                        // position is taken, and nothing else is.
+                        //
+                        // `last_cursor` is deliberately left alone. It is the
+                        // previous point of a *gesture* — what the pan and zoom
+                        // drags measure against, and what a stroke's speed and
+                        // therefore its simulated pressure come from — and a
+                        // pen waved about in mid-air is none of those.
                         if !self.editor.touches.contains_key(&touch.id) {
+                            self.editor.cursor = pos;
+                            // A pen sends a few hundred of these a second, so
+                            // the frame is asked for only where the dot it
+                            // moves is actually drawn — over a panel or a menu
+                            // this would be repainting an identical picture.
+                            if self.editor.pointer_over_canvas(pos) {
+                                self.request_redraw();
+                            }
                             return;
                         }
                         self.editor.touches.insert(touch.id, pos);
