@@ -1455,15 +1455,26 @@ impl ApplicationHandler<Wake> for UmberApp {
 
         let attrs = Window::default_attributes()
             .with_title("Umber")
-            // Per-platform, and quietly so: Windows uses it for the title bar
-            // and taskbar button, X11 for the window list. Wayland ignores it
-            // entirely and takes its icon from the `.desktop` file matching the
-            // app id, and on macOS `set_window_icon` is documented as a no-op —
-            // there the icon comes from the `.app` bundle's `Info.plist`. The
-            // executable resource in `crates/umber-desktop/build.rs` is what
-            // gives Explorer and the taskbar an icon before the process starts.
+            // Per-platform, and quietly so: Windows uses it for the title bar,
+            // X11 for the window list. Wayland ignores it entirely and takes
+            // its icon from the `.desktop` file matching the app id, and on
+            // macOS `set_window_icon` is documented as a no-op — there the icon
+            // comes from the `.app` bundle's `Info.plist`. The executable
+            // resource in `crates/umber-desktop/build.rs` is what gives
+            // Explorer and the Start Menu an icon before the process starts.
             .with_window_icon(logo::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
+
+        // Windows keeps a *second* icon per window, `ICON_BIG`, and that is the
+        // one the taskbar and Alt-Tab draw. `with_window_icon` sets only
+        // `ICON_SMALL`; winit's window class carries no icon either, so without
+        // this the taskbar has nothing and Windows substitutes its generic
+        // application icon. See `logo::taskbar_icon`.
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(logo::taskbar_icon())
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attrs)

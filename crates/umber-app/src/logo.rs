@@ -59,6 +59,15 @@ const ICON_MARGIN: f32 = 1.0 / 16.0;
 /// process hands the window manager.
 const WINDOW_ICON: u32 = 64;
 
+/// The size the taskbar icon is rasterised at.
+///
+/// Larger than [`WINDOW_ICON`] because this one is drawn large: the taskbar
+/// button and the Alt-Tab switcher want 32 px at 100% scaling and up from
+/// there, and winit names 256 as a good ceiling for `ICON_BIG`. The mark is a
+/// rounded square whose only detail is the corner radius, so it survives the
+/// downscale without needing a set of hand-tuned sizes the way a glyph would.
+const TASKBAR_ICON: u32 = 256;
+
 /// Draw the mark, filling `rect`.
 ///
 /// Everything is derived from `rect`, so the same call gives the 15 px menu-bar
@@ -126,15 +135,38 @@ pub fn mark_rgba(size: u32, colour: Color32) -> Vec<u8> {
 /// Returns `None` rather than failing: an application that will not start
 /// because it could not build its own icon would be a poor trade.
 pub fn window_icon() -> Option<winit::window::Icon> {
+    icon_at(WINDOW_ICON)
+}
+
+/// The icon Windows draws on the **taskbar button and in Alt-Tab**.
+///
+/// Windows keeps two icons per window and winit sets them through two different
+/// calls: [`window_icon`] goes to `with_window_icon`, which is `ICON_SMALL` and
+/// reaches only the title bar, while this goes to the Windows-only
+/// `with_taskbar_icon`, which is `ICON_BIG`.
+///
+/// Setting only the first is not a smaller version of setting both — it leaves
+/// the taskbar with **nothing**. winit registers its window class with
+/// `hIcon: 0`, so there is no class icon to fall back to either, and Windows
+/// draws its generic application icon instead. That is what Umber shipped with
+/// through 0.0.3: the right mark in the title bar and a blank page on the
+/// taskbar. The executable's own icon resource does not rescue it — that one is
+/// for Explorer, the Start Menu shortcut and the moment before the process
+/// exists, not for a window that is already up.
+pub fn taskbar_icon() -> Option<winit::window::Icon> {
+    icon_at(TASKBAR_ICON)
+}
+
+fn icon_at(size: u32) -> Option<winit::window::Icon> {
     // Fixed to the default theme's accent rather than following the live
     // palette. A taskbar button that changes colour when the user switches
     // theme reads as a different application, and most window managers cache
     // the icon anyway, so the change would be unpredictable as well as unwanted.
-    let rgba = mark_rgba(WINDOW_ICON, Palette::graphite().accent);
-    match winit::window::Icon::from_rgba(rgba, WINDOW_ICON, WINDOW_ICON) {
+    let rgba = mark_rgba(size, Palette::graphite().accent);
+    match winit::window::Icon::from_rgba(rgba, size, size) {
         Ok(icon) => Some(icon),
         Err(e) => {
-            log::warn!("could not build the window icon: {e}");
+            log::warn!("could not build the {size}px window icon: {e}");
             None
         }
     }
