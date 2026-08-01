@@ -12,6 +12,72 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.3 — 2026-08-01
+
+Getting around the canvas, and a crash on large documents. The wheel now
+scrolls, there are scrollbars when part of the picture is off-screen, zoom has
+keyboard shortcuts that work on your own keyboard rather than an American one,
+and a drawing tablet draws.
+
+### A large canvas no longer takes the application down
+
+- **A document bigger than about 8000 pixels square crashed at the end of the
+  first stroke.** Reading pixels back off the graphics card asked for one buffer
+  the size of the whole layer, and a 10000² canvas is 400 MB against a 256 MB
+  limit — which is a fatal error, so the painting went with it. Every readback
+  now comes back a band of rows at a time.
+- The same fault was in the flat PNG export and in the autosave, where it had
+  not fired yet. All three are fixed together.
+- Nothing changes for an ordinary canvas: where the whole document fits, it is
+  read in exactly the one copy it always was.
+
+### Getting around the canvas
+
+- **The wheel scrolls the canvas** up and down, and **Shift and the wheel**
+  scrolls it side to side. Zoom moves to **Ctrl and the wheel**. A horizontal
+  wheel works too, which it did not before.
+- **Scrollbars** appear along the bottom and the right of the canvas whenever
+  part of the document is outside the view — whether it is too big to fit or
+  merely pushed under a panel — and are not drawn at all when it is not.
+- **Ctrl+plus and Ctrl+minus zoom**, and they zoom the *canvas*: they used to
+  scale the whole interface, and Ctrl+0 did both at once, fitting the document
+  and resetting the interface scale in the same press. Interface scale is a
+  slider in Settings and stays there.
+- Trackpad scrolling uses the trackpad's own resolution rather than rounding it
+  into wheel notches.
+
+### Keyboards that are not American
+
+- **Punctuation shortcuts follow the key your keyboard actually prints.** They
+  were bound to US key *positions*, so on a Nordic layout the key marked `+`
+  zoomed out and the key marked `-` did nothing; German, French and Spanish
+  layouts each moved them somewhere else again.
+- Letters and digits deliberately still go by position. One known consequence:
+  on a QWERTZ keyboard the key marked `Z` is where `Y` sits on an American one,
+  which is Umber's second Redo shortcut — so Ctrl+Z there redoes. Not fixed yet.
+
+### Drawing tablets
+
+- **A pen draws.** On Windows a pen arrives by a different route from a mouse
+  and never reports a cursor position through the usual one, so every pen press
+  was tested against wherever the mouse had last been left — usually the menu
+  bar — and thrown away. A pen display did nothing at all on the canvas.
+- Pressure from the pen is used, at the 1024 levels Windows carries, however
+  many the tablet itself distinguishes.
+- A single touch on a panel no longer cancels a stroke the other hand is in the
+  middle of, and a pen hovering above the glass is no longer mistaken for a
+  finger — which used to stop drawing entirely until Umber was restarted.
+
+### Known limits
+
+Everything 0.0.2 said still applies. Also:
+
+- **There is no brush cursor.** Other painting applications show a ring the size
+  of the brush as you hover; Umber shows the ordinary arrow.
+- **Pen pressure is Windows only.** macOS and Linux have no tablet path yet and
+  fall back to full pressure or the speed-derived approximation.
+- Scrollbar drag has not been exercised on a touch screen.
+
 ## 0.0.2 — 2026-08-01
 
 Documents look after themselves now: they autosave, they remember their undo

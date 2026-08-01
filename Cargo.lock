@@ -2767,7 +2767,7 @@ checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "umber-app"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ab_glyph_rasterizer",
  "android_logger",
@@ -2799,7 +2799,7 @@ dependencies = [
 
 [[package]]
 name = "umber-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytemuck",
  "directories",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "umber-desktop"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "env_logger",
  "log",
@@ -2825,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "umber-render"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytemuck",
  "glam",
