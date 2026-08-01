@@ -24,6 +24,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// What one press of the zoom-in shortcut multiplies the camera by.
+///
+/// Deliberately a bigger step than a wheel notch's 1.12: a notch is one of
+/// several the finger rolls through in a gesture, where a keypress is the whole
+/// intent. Multiplicative rather than a ladder of fixed percentages, so it
+/// composes with the wheel and the pinch instead of snapping away from them.
+const ZOOM_KEY_STEP: f32 = 1.25;
+
 /// Everything tied to a live window and GPU surface.
 ///
 /// Kept in an `Option` on [`UmberApp`] because Android destroys and recreates
@@ -478,6 +486,8 @@ impl UmberApp {
             }
             Action::FitView => self.editor.fit_view(),
             Action::ActualSize => self.editor.camera.zoom = 1.0,
+            Action::ZoomIn => self.editor.zoom_by(ZOOM_KEY_STEP),
+            Action::ZoomOut => self.editor.zoom_by(1.0 / ZOOM_KEY_STEP),
         }
         true
     }
@@ -1467,6 +1477,14 @@ impl ApplicationHandler<Wake> for UmberApp {
 
         splash.show(splash::Stage::Fonts);
         let egui_ctx = egui::Context::default();
+        // egui scales its own interface on Ctrl+= / Ctrl+- / Ctrl+0 by default.
+        // Here those are the canvas's zoom and Fit to view, and interface scale
+        // is a slider in Settings — so egui would silently take a second action
+        // on every one of them, growing the panels while the artist zoomed.
+        // Turned off at the context rather than swallowed per key: key presses
+        // are read off the winit event before egui is asked, so there is no
+        // point in the dispatch where the press could be withheld from it.
+        egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         theme::install_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),

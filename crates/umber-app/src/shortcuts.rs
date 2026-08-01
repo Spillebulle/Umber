@@ -27,6 +27,8 @@ pub enum Action {
     SwapColours,
     FitView,
     ActualSize,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl Action {
@@ -35,7 +37,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 15] = [
         Action::Save,
         Action::SaveAs,
         Action::Undo,
@@ -49,6 +51,8 @@ impl Action {
         Action::SwapColours,
         Action::FitView,
         Action::ActualSize,
+        Action::ZoomIn,
+        Action::ZoomOut,
     ];
 
     /// Human-readable, British spelling, e.g. "Swap colours".
@@ -67,6 +71,8 @@ impl Action {
             Action::SwapColours => "Swap colours",
             Action::FitView => "Fit to view",
             Action::ActualSize => "Actual size",
+            Action::ZoomIn => "Zoom in",
+            Action::ZoomOut => "Zoom out",
         }
     }
 
@@ -78,7 +84,7 @@ impl Action {
             Action::BrushTool | Action::EraserTool | Action::PanTool | Action::ZoomTool => "Tools",
             Action::SizeDown | Action::SizeUp => "Brush",
             Action::SwapColours => "Colour",
-            Action::FitView | Action::ActualSize => "View",
+            Action::FitView | Action::ActualSize | Action::ZoomIn | Action::ZoomOut => "View",
         }
     }
 
@@ -237,6 +243,13 @@ pub fn defaults() -> Vec<Binding> {
         // View
         binding(Action::FitView, KeyCode::Digit0, true, false, false),
         binding(Action::ActualSize, KeyCode::Digit1, true, false, false),
+        binding(Action::ZoomIn, KeyCode::Equal, true, false, false),
+        // `+` is Shift+= on most layouts, and browsers accept both rather than
+        // asking which one the user meant. Modifiers are compared exactly, so
+        // the shifted form has to be its own binding — the same reason Redo
+        // carries two.
+        binding(Action::ZoomIn, KeyCode::Equal, true, true, false),
+        binding(Action::ZoomOut, KeyCode::Minus, true, false, false),
     ]
 }
 
@@ -813,6 +826,20 @@ mod tests {
         assert_eq!(hit(KeyCode::BracketRight, NONE), Some(Action::SizeUp));
         assert_eq!(hit(KeyCode::Digit0, CTRL), Some(Action::FitView));
         assert_eq!(hit(KeyCode::Digit1, CTRL), Some(Action::ActualSize));
+    }
+
+    #[test]
+    fn ctrl_plus_and_minus_zoom_the_canvas() {
+        // These are the keys egui uses to scale its own interface, and they are
+        // the canvas's here — interface scale is a slider in Settings. Both
+        // spellings of "plus" reach the same action, since `+` is Shift+= on
+        // most layouts and modifiers are compared exactly.
+        assert_eq!(hit(KeyCode::Equal, CTRL), Some(Action::ZoomIn));
+        assert_eq!(hit(KeyCode::Equal, CTRL | SHIFT), Some(Action::ZoomIn));
+        assert_eq!(hit(KeyCode::Minus, CTRL), Some(Action::ZoomOut));
+        // Unmodified, they are free for anyone to bind.
+        assert_eq!(hit(KeyCode::Equal, NONE), None);
+        assert_eq!(hit(KeyCode::Minus, NONE), None);
     }
 
     #[test]

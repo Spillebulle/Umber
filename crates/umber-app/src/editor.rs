@@ -437,6 +437,19 @@ impl Editor {
         self.camera = Camera::fit(self.doc.size_vec2(), self.canvas_size);
     }
 
+    /// Zoom about the centre of the canvas region.
+    ///
+    /// The wheel and the zoom tool anchor on the pointer, but a keyboard zoom
+    /// has no pointer to anchor on — anchoring on the cursor anyway would move
+    /// the canvas under a hand that is nowhere near it, and off the edge of the
+    /// window if the cursor happens to be over a panel. Anchoring on the pivot
+    /// leaves `camera.center` exactly where it was, which is what
+    /// "zoom in on what I am looking at" means.
+    pub fn zoom_by(&mut self, factor: f32) {
+        let pivot = self.canvas_pivot;
+        self.camera.zoom_at(pivot, factor, pivot);
+    }
+
     // --- documents -------------------------------------------------------
     //
     // A tab switch moves state between here and [`Session`]; nothing above
