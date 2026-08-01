@@ -6,6 +6,7 @@
 
 mod app;
 mod brushlib;
+mod canvasdlg;
 mod colorpicker;
 mod controls;
 mod cputext;

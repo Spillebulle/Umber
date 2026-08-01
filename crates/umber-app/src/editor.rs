@@ -6,7 +6,7 @@ use crate::session::{DocId, DocumentState, Session};
 use crate::settings::SettingsTab;
 use crate::tabs::Notice;
 use crate::theme::{Accent, ThemeKind};
-use glam::{UVec2, Vec2};
+use glam::Vec2;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -154,6 +154,11 @@ pub struct Editor {
     /// that could not be represented in full, or one that failed outright.
     pub notice: Option<Notice>,
     pub ui: UiState,
+    /// State of the New document and Canvas settings dialogs. Kept out of
+    /// [`UiState`] so that stays `Copy` — it holds a colour picker's HSV, which
+    /// has the same reason to be its own source of truth here as in the Colour
+    /// panel. Seeded from the live document when a dialog opens.
+    pub canvas_form: crate::canvasdlg::CanvasForm,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -226,6 +231,7 @@ impl Default for Editor {
             session: Session::default(),
             notice: None,
             ui: UiState::default(),
+            canvas_form: crate::canvasdlg::CanvasForm::default(),
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -437,15 +443,47 @@ impl Editor {
         id
     }
 
-    /// Open a new blank document the size of the current one.
-    ///
-    /// Inheriting the size rather than always using the default is what makes
-    /// "new document" useful next to an imported one: the common reason to
-    /// open a second tab is to try something at the same scale.
-    pub fn new_document(&mut self) -> DocId {
-        let doc = self.doc;
+    /// Open a new blank document described by `doc`.
+    pub fn create_document(&mut self, doc: Document) -> DocId {
         let title = self.session.next_untitled_title();
         self.open_document(DocumentState::blank(doc), title, None, Vec::new())
+    }
+
+    /// Open a new blank document like the current one.
+    ///
+    /// Inheriting the whole document rather than using the default is what
+    /// makes the tab strip's `+` useful next to an imported one: the common
+    /// reason to open a second tab is to try something at the same scale, on
+    /// the same paper. File → New… asks instead.
+    pub fn new_document(&mut self) -> DocId {
+        self.create_document(self.doc)
+    }
+
+    /// Apply new canvas settings to the live document.
+    ///
+    /// Returns true when the *geometry* changed, which is the caller's cue to
+    /// resize the document's textures and throw the undo history away — every
+    /// patch in it is a rectangle of the old canvas, and the same reasoning
+    /// applies as when a layer is deleted.
+    ///
+    /// The history is cleared here rather than left to the caller so it cannot
+    /// be forgotten by one of two call sites.
+    pub fn apply_canvas(&mut self, doc: Document) -> bool {
+        let resized = doc.size != self.doc.size;
+        // Only a real change is a change: pressing Apply on a dialog nobody
+        // touched must not put a dot on the tab and start asking about
+        // unsaved work.
+        if doc != self.doc {
+            self.mark_modified();
+        }
+        self.doc = doc;
+        if resized {
+            self.history.clear();
+            // Keep the zoom, but not the ability to be looking at a part of the
+            // canvas that no longer exists.
+            self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
+        }
+        resized
     }
 
     /// Make tab `index` the live document.
@@ -497,22 +535,22 @@ impl Editor {
         self.session.mark_saved(path);
     }
 
-    /// Every open document, its canvas size and how many texture-array slices
-    /// its layers occupy. The live document is included.
+    /// Every open document and how many texture-array slices its layers
+    /// occupy. The live document is included.
     ///
     /// Used to rebuild GPU storage after the surface has been destroyed and
     /// recreated, which on Android happens whenever the app is backgrounded.
-    /// The slot count has to travel with the size: a renderer is built with
+    /// The slot count has to travel with the document: a renderer is built with
     /// room for a few slices, and a document with more layers than that would
     /// come back to a texture array too shallow to commit its strokes into.
-    pub fn open_documents(&self) -> Vec<(DocId, UVec2, u32)> {
-        let live = (self.doc.size, self.layers.slot_capacity_needed());
+    pub fn open_documents(&self) -> Vec<(DocId, Document, u32)> {
+        let live = (self.doc, self.layers.slot_capacity_needed());
         self.session
             .tabs()
             .iter()
             .map(|tab| {
-                let (size, slots) = tab.parked_storage().unwrap_or(live);
-                (tab.id, size, slots)
+                let (doc, slots) = tab.parked_storage().unwrap_or(live);
+                (tab.id, doc, slots)
             })
             .collect()
     }

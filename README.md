@@ -7,7 +7,8 @@ decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
 > **Status: early.** The canvas, brush, eraser, layers, colour picker, brush
-> editor, brush library, settings and PNG export work on desktop; layered
+> editor, brush library, canvas settings, settings and PNG export work on
+> desktop; layered
 > documents can be saved and reopened, and documents written by Krita,
 > Photoshop and any OpenRaster application can be opened. Preferences — theme,
 > layout, input and shortcut bindings — persist across runs. There is no mobile
@@ -306,16 +307,52 @@ holding the pen still keeps spraying.
 
 ### Documents
 
+**A document is a canvas size, a background and a resolution.** *File → New…*
+and *File → Canvas settings…* are the same four questions, once for a document
+that does not exist yet and once for the one in front: how many pixels, on what
+background, at how many pixels per inch, and — only when the size is
+changing — which of nine anchors the existing artwork is held by. Presets cover
+the sizes worth one click, from a square 2048 to A4 at 300 dpi, and each carries
+its own resolution, because 2480 × 3508 is A4 at 300 dpi and a meaningless pair
+of numbers at 72. An aspect lock makes one edge drive the other, and a readout
+beside them says what the canvas measures in millimetres or inches.
+
+The **background** is a document property rather than a filled bottom layer, so
+it can be changed afterwards, erasing cannot punch a hole through it, and
+"transparent" stays expressible. It composites *under* the stack inside the same
+single pass the layers use, which is one multiply-add per pixel and is exactly
+nothing when there is no background — and it means the flat PNG export, the
+eyedropper and a blender picking colour off the canvas all see it without a
+second code path.
+
+**Resizing** reallocates every texture the document owns and copies the artwork
+across, every layer together. It clears the undo history, and says so before you
+click: undo stores rectangles of the canvas, and a rectangle means different
+pixels on a different one.
+
 **Umber saves to OpenRaster** (`.ora`) — the same format it reads. It has no
 container of its own and deliberately did not grow one: everything an Umber
 document holds is a canvas size and a stack of layers with a name, an opacity, a
 visibility and a blend mode, which is exactly what ORA is, and inventing a
 second spelling of it would have meant a second reader to keep in step. A `.ora`
 is a ZIP of PNGs and a small XML file, so a document made here opens in Krita,
-GIMP, MyPaint, Drawpile and Pinta as well. Three extra attributes carry what
-baseline ORA cannot — the selected layer, a document-format version, and Umber's
-own name for a blend mode where the SVG one is only approximate — and every
-other application ignores them, as XML readers do.
+GIMP, MyPaint, Drawpile and Pinta as well. Four extra attributes carry what
+baseline ORA cannot — the selected layer, a document-format version, Umber's own
+name for a blend mode where the SVG one is only approximate, and which layer is
+really the background — and every other application ignores them, as XML readers
+do. Resolution needs no attribute of Umber's: ORA already has `xres` and `yres`,
+and inventing one beside a standard would mean other applications ignoring a
+number they already understand.
+
+**The background is written to the file twice, on purpose.** The obvious
+extension — a colour named in an attribute — would have every other application
+open the document on transparency, and a white painting on a checkerboard in
+Krita is not a dramatic failure, which is exactly what makes it a bad one:
+nobody notices until they export. So it also goes in as a real opaque bottom
+layer carrying the pixels, tagged so that Umber's own reader turns it back into
+the property rather than a layer you never made. An older Umber opens the file
+and shows the same picture, which is why the format version did not have to be
+bumped for it. `docs/document-format.md` has the whole argument.
 
 **Ctrl+S** saves, **Ctrl+Shift+S** saves under a new name, and the tab strip's
 dot clears when it lands. Layers are written cropped to what they actually
@@ -476,7 +513,9 @@ layer would otherwise preview wrongly and then jump on release.
   stroke would be 16 MB at 2048², exhausting a gigabyte in about sixty strokes.
   Undo covers painting only — adding, deleting or reordering a layer is *not*
   undoable yet, and deleting one clears the history, because slots are recycled
-  and a stale entry would otherwise be replayed into the wrong layer.
+  and a stale entry would otherwise be replayed into the wrong layer. Resizing
+  the canvas clears it for the same kind of reason: a rectangle of the old
+  canvas means different pixels on the new one.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 

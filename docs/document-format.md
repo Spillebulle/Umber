@@ -45,6 +45,7 @@ mimetype                    "image/openraster", stored uncompressed, first
 stack.xml                   the layer stack
 data/layer000.png           top layer
 data/layer001.png           …down to the bottom
+data/background.png         the document background, when it has one — see below
 mergedimage.png             the flattened composite, required by the spec
 Thumbnails/thumbnail.png    at most 256 px on its long edge, also required
 ```
@@ -242,6 +243,11 @@ verbatim.
 
 ## In the application
 
+- **File → New…** and **File → Canvas settings…** are the same four questions —
+  size, background, resolution, and where existing artwork is anchored when the
+  size changes. The first three are what this file carries; the anchor is a
+  one-off instruction to the renderer and is not saved, because it describes a
+  move rather than a document.
 - **File → Save** (`Ctrl+S`) writes to the file the document came from, and asks
   for one the first time.
 - **File → Save as…** (`Ctrl+Shift+S`) always asks.
