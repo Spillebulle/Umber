@@ -593,8 +593,10 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
 
 fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut shape = ed.ui.wheel_shape;
-    let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut ed.hsv);
+    let mut rotates = ed.ui.wheel_rotates;
+    let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut rotates, &mut ed.hsv);
     ed.ui.wheel_shape = shape;
+    ed.ui.wheel_rotates = rotates;
     if changed {
         ed.commit_picker();
     }

@@ -56,6 +56,9 @@ pub struct UiState {
     pub tool: Tool,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
+    /// Whether the wheel's triangle turns to follow the hue. Meaningless while
+    /// the centre is the square, which has no orientation.
+    pub wheel_rotates: bool,
     /// Open state of the picker-mode dropdown in the Colour panel header.
     pub picker_menu_open: bool,
     pub brush_editor_open: bool,
@@ -104,6 +107,8 @@ impl Default for UiState {
             tool: Tool::Brush,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
+            // What the picker has always done, and what the design draws.
+            wheel_rotates: true,
             picker_menu_open: false,
             brush_editor_open: false,
             brush_tab: BrushTab::Tip,

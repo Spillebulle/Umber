@@ -60,22 +60,37 @@ fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Where the triangle's hue corner sits when it is not following the hue.
+///
+/// Straight up. Screen y is down, so that is a quarter turn anticlockwise from
+/// egui's zero angle, which points right. Any orientation would do — the
+/// barycentric maths reads the three corners wherever they are — but a fixed
+/// triangle that points sideways looks like one that failed to finish turning.
+const STILL_APEX: f32 = -std::f32::consts::FRAC_PI_2;
+
 /// Draw the picker. Returns true when the colour changed.
 pub fn show(
     ui: &mut Ui,
     p: &Palette,
     mode: PickerMode,
     shape: &mut WheelShape,
+    rotate: &mut bool,
     hsv: &mut Hsv,
 ) -> bool {
     match mode {
-        PickerMode::Wheel => wheel(ui, p, shape, hsv),
+        PickerMode::Wheel => wheel(ui, p, shape, rotate, hsv),
         PickerMode::Square => square(ui, p, hsv),
         PickerMode::Sliders => sliders(ui, p, hsv),
     }
 }
 
-fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> bool {
+fn wheel(
+    ui: &mut Ui,
+    p: &Palette,
+    shape: &mut WheelShape,
+    rotate: &mut bool,
+    hsv: &mut Hsv,
+) -> bool {
     let mut changed = false;
 
     let size = ui.available_width().clamp(MIN_PICKER, 176.0);
@@ -144,7 +159,7 @@ fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> boo
             changed |= sv_square(ui, sv, hsv, "wheel-sv");
         }
         WheelShape::Triangle => {
-            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), hsv);
+            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), *rotate, hsv);
         }
     }
 
@@ -164,22 +179,34 @@ fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> boo
         *shape = picked;
     }
 
+    // Only the triangle turns, so the row is drawn only when it is showing —
+    // rather than drawn disabled — because the square centre has no orientation
+    // for the setting to be about. A dead control here would be asking the user
+    // to work out which of the two shapes it refers to.
+    if *shape == WheelShape::Triangle {
+        crate::widgets::toggle_row(ui, p, "Rotate with hue", rotate);
+    }
+
     changed
 }
 
-/// Saturation/value triangle inscribed in the ring, rotated to follow the hue.
+/// Saturation/value triangle inscribed in the ring.
 ///
-/// The apex sits at the current hue, with white and black at the other two
-/// corners, so the triangle turns with the ring the way the design shows.
-fn sv_triangle(ui: &mut Ui, centre: Pos2, radius: f32, hsv: &mut Hsv) -> bool {
+/// The apex is the full hue, with white and black at the other two corners.
+/// When `rotate` is set the apex tracks the hue marker round the ring, which is
+/// what the design shows; otherwise it holds still at [`STILL_APEX`] and only
+/// its colour changes.
+///
+/// The choice is not cosmetic. Following the hue keeps the apex next to the
+/// marker that sets it, so the two controls read as one instrument — but it
+/// also means the whole saturation/value field swings under the pointer while
+/// the ring is being dragged, so a tint chosen at one hue is somewhere else at
+/// the next. Holding still gives up the first to get the second: the point you
+/// last picked stays where you left it, and picking the same tint across
+/// several hues becomes a matter of returning to the same place.
+fn sv_triangle(ui: &mut Ui, centre: Pos2, radius: f32, rotate: bool, hsv: &mut Hsv) -> bool {
     let mut changed = false;
-    let base = hsv.h.to_radians();
-    let corner = |k: f32| {
-        let a = base + k * std::f32::consts::TAU / 3.0;
-        centre + vec2(a.cos(), a.sin()) * radius
-    };
-    // 0 = full hue, 1 = white, 2 = black.
-    let (hue_pt, white_pt, black_pt) = (corner(0.0), corner(1.0), corner(2.0));
+    let (hue_pt, white_pt, black_pt) = triangle_corners(centre, radius, rotate, hsv.h);
 
     let rect = Rect::from_center_size(centre, vec2(radius * 2.0, radius * 2.0));
     let response = ui.interact(rect, ui.id().with("wheel-tri"), Sense::click_and_drag());
@@ -229,6 +256,22 @@ fn sv_triangle(ui: &mut Ui, centre: Pos2, radius: f32, hsv: &mut Hsv) -> bool {
     painter.circle_stroke(marker, 5.0, Stroke::new(2.0, Color32::WHITE));
 
     changed
+}
+
+/// The triangle's three corners, in the order the rest of this file reads them:
+/// full hue, white, black.
+///
+/// Split out from [`sv_triangle`] because it is the whole of what `rotate`
+/// changes, and everything else about the triangle — the hit test, the mesh,
+/// the marker — is derived from these three points. Testing it without a `Ui`
+/// is therefore testing the feature.
+fn triangle_corners(centre: Pos2, radius: f32, rotate: bool, hue: f32) -> (Pos2, Pos2, Pos2) {
+    let base = if rotate { hue.to_radians() } else { STILL_APEX };
+    let corner = |k: f32| {
+        let a = base + k * std::f32::consts::TAU / 3.0;
+        centre + vec2(a.cos(), a.sin()) * radius
+    };
+    (corner(0.0), corner(1.0), corner(2.0))
 }
 
 fn barycentric(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> (f32, f32, f32) {
@@ -431,4 +474,68 @@ fn sliders(ui: &mut Ui, p: &Palette, hsv: &mut Hsv) -> bool {
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CENTRE: Pos2 = pos2(100.0, 100.0);
+    const RADIUS: f32 = 50.0;
+
+    fn corners(rotate: bool, hue: f32) -> (Pos2, Pos2, Pos2) {
+        triangle_corners(CENTRE, RADIUS, rotate, hue)
+    }
+
+    fn apart(a: Pos2, b: Pos2) -> f32 {
+        (a - b).length()
+    }
+
+    #[test]
+    fn a_rotating_triangle_follows_the_hue() {
+        let (red, ..) = corners(true, 0.0);
+        let (green, ..) = corners(true, 120.0);
+        // A third of a turn round the ring is a third of a turn of the apex.
+        assert!(apart(red, green) > RADIUS, "{red:?} vs {green:?}");
+        // And a full turn brings it back to where it started.
+        let (round_again, ..) = corners(true, 360.0);
+        assert!(apart(red, round_again) < 1e-3);
+    }
+
+    #[test]
+    fn a_still_triangle_holds_its_corners_at_every_hue() {
+        let at_zero = corners(false, 0.0);
+        for hue in [1.0, 47.0, 120.0, 210.0, 359.0] {
+            let (h, w, b) = corners(false, hue);
+            assert!(apart(h, at_zero.0) < 1e-4, "hue corner moved at {hue}");
+            assert!(apart(w, at_zero.1) < 1e-4, "white corner moved at {hue}");
+            assert!(apart(b, at_zero.2) < 1e-4, "black corner moved at {hue}");
+        }
+    }
+
+    /// A fixed triangle that pointed sideways would look like one that failed
+    /// to finish turning, so the apex is straight up. Screen y is down.
+    #[test]
+    fn a_still_triangle_points_up() {
+        let (hue_pt, ..) = corners(false, 0.0);
+        assert!((hue_pt.x - CENTRE.x).abs() < 1e-3, "{hue_pt:?}");
+        assert!(hue_pt.y < CENTRE.y, "{hue_pt:?}");
+    }
+
+    /// Whichever way it is turned, the three corners have to stay a triangle:
+    /// the barycentric hit test divides by its area, and a degenerate one
+    /// returns NaN and freezes the picker.
+    #[test]
+    fn the_corners_are_never_collinear() {
+        for rotate in [true, false] {
+            for hue in [0.0, 30.0, 90.0, 180.0, 275.0, 359.9] {
+                let (h, w, b) = corners(rotate, hue);
+                let (a, _, _) = barycentric(CENTRE, h, w, b);
+                assert!(a.is_finite(), "degenerate at rotate={rotate} hue={hue}");
+                // The centre is inside, so every weight is positive.
+                let (x, y, z) = barycentric(CENTRE, h, w, b);
+                assert!(x > 0.0 && y > 0.0 && z > 0.0, "{x} {y} {z}");
+            }
+        }
+    }
 }
