@@ -8,7 +8,9 @@
 
 use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use umber_core::{BlendMode, BrushMode, Camera, Color, Dab, PixelRect, TipMask};
+use umber_core::{
+    BlendMode, Brush, BrushMode, Camera, Color, Dab, InputPoint, PixelRect, StrokeBuilder, TipMask,
+};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, ProbeParams, StrokeStyle};
 
 const DOC: u32 = 64;
@@ -439,6 +441,63 @@ fn rotating_a_dab_rotates_the_ellipse() {
         h.pixel(42, 32)[3],
         0,
         "10 px sideways is now past the short axis"
+    );
+}
+
+#[test]
+fn a_jittered_angle_spreads_a_stroke_the_way_a_fixed_one_cannot() {
+    // The whole path for the shape mapping that most of the pack asks for:
+    // `Brush` says the dab may turn, `StrokeBuilder` rolls an angle per dab,
+    // and the vertex shader builds each quad rotated. A stroke of long dabs
+    // all lying the same way covers a band as thin as the *short* axis; one
+    // that turns covers ground out to the long axis.
+    //
+    // Asserted as coverage where there would otherwise be none, rather than as
+    // a pixel value, because the point is the footprint and not the blend.
+    let mut h = harness_or_skip!();
+
+    let comb = Brush {
+        size: 24.0,
+        spacing: 0.25,
+        stabilization: 0.0,
+        pressure_size: false,
+        hardness: 1.0,
+        dab_ratio: 6.0,
+        ..Default::default()
+    };
+    let paint = |h: &mut Harness, brush: Brush| {
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            brush,
+            [1.0, 1.0, 1.0],
+            InputPoint::new(Vec2::new(14.0, 32.0), 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(Vec2::new(50.0, 32.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        h.stamp(&dabs);
+        h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+        // 10 px above the line: outside the 2 px short semi-axis, well inside
+        // the 12 px long one.
+        (16..48).map(|x| h.pixel(x, 22)[3]).max().unwrap_or(0)
+    };
+
+    assert_eq!(
+        paint(&mut h, comb),
+        0,
+        "dabs all lying along the stroke should not reach 10 px off it"
+    );
+
+    let mut enc = h.encoder();
+    h.canvas.clear_all_layers(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let grain = Brush {
+        dab_angle_jitter: 360.0,
+        ..comb
+    };
+    assert!(
+        paint(&mut h, grain) > 0,
+        "a dab free to turn should reach out towards its long axis"
     );
 }
 

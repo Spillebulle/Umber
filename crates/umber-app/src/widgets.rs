@@ -9,7 +9,7 @@ use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
-use umber_core::ResponseCurve;
+use umber_core::{Brush, ResponseCurve};
 
 /// Narrowest anything here will draw itself.
 ///
@@ -324,8 +324,10 @@ pub struct BrushRow<'a> {
     /// The line under the name: author and licence. Empty in the panel, which
     /// has no room for it and puts the credit in a tooltip instead.
     pub detail: &'a str,
-    pub opacity: f32,
-    pub hardness: f32,
+    /// The brush itself, rather than the two numbers the sample used to be
+    /// drawn from. The library is 201 presets deep and the sample is how you
+    /// choose between them, so it has to show what actually separates them.
+    pub brush: &'a Brush,
     pub selected: bool,
     /// One the user saved, as opposed to one Umber ships. Marked with a dot
     /// rather than a word, because the panel is 264 px wide.
@@ -337,16 +339,20 @@ pub struct BrushRow<'a> {
     pub trailing: f32,
 }
 
-/// A brush preset: a tapered stroke sample, then the name.
+/// A brush preset: a stroke sample, then the name.
 ///
-/// The sample is drawn from the preset's own opacity and hardness, so the rows
-/// differ the way the brushes do rather than all showing the same smear.
+/// The sample is stamped from the preset's own settings — spacing, shape,
+/// angle, scatter, jitter and colour pickup, all under a pressure ramp — so a
+/// chisel reads as a chisel and a spray as a spray. Drawing it from opacity and
+/// hardness alone made two hundred rows look like one row repeated, which in a
+/// list this long is the difference between choosing a brush and scrolling past
+/// it.
 pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), row.height), Sense::click());
 
-    // The library is 133 presets deep and both lists are scrolled, so most
-    // rows on most frames are off screen. Each sample is two dozen circles;
+    // The library is 201 presets deep and both lists are scrolled, so most
+    // rows on most frames are off screen. Each sample is a few dozen stamps;
     // painting the invisible ones is the one part of this that would show up
     // in a frame time.
     if !ui.is_rect_visible(rect) {
@@ -360,33 +366,12 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
         painter.rect_filled(rect, metrics::RADIUS, p.control);
     }
 
-    // Tapered sample: a row of circles whose radius and alpha rise then fall.
     let sample_h = (row.height - 12.0).clamp(10.0, 16.0);
     let sample = Rect::from_center_size(
         pos2(rect.left() + 7.0 + 32.0, rect.center().y),
         vec2(64.0, sample_h),
     );
-    const STEPS: usize = 26;
-    for i in 0..STEPS {
-        let t = i as f32 / (STEPS - 1) as f32;
-        // Ends taper to nothing; the middle is the brush at full width.
-        //
-        // The `max(0.0)` is load-bearing: `sin(PI)` in f32 lands just *below*
-        // zero, and a negative base with a fractional exponent is NaN, which
-        // propagates into the alpha and trips ecolor's assert.
-        let taper = (t * std::f32::consts::PI).sin().max(0.0);
-        let radius = (sample.height() * 0.5) * taper.powf(0.6);
-        if radius <= 0.2 {
-            continue;
-        }
-        // Softer brushes read as a wider, fainter smear.
-        let alpha = row.opacity * taper.powf(1.0 + (1.0 - row.hardness) * 1.5);
-        painter.circle_filled(
-            pos2(sample.left() + sample.width() * t, sample.center().y),
-            radius,
-            p.text_strong.gamma_multiply(alpha.clamp(0.0, 1.0)),
-        );
-    }
+    brush_sample(painter, p, sample, row.brush);
 
     // A dot marks the rows that are yours — the ones the browser will let you
     // rename and delete.
@@ -425,6 +410,158 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     }
 
     response
+}
+
+/// A deterministic scatter source for the previews.
+///
+/// The same xorshift the stroke builder uses, and started from the same seed on
+/// every row: two brushes then differ because their *settings* differ, not
+/// because one happened to draw a luckier set of numbers. A seed off the clock
+/// would also make the list shimmer as it scrolled.
+struct Scatter(u32);
+
+impl Scatter {
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (self.0 as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// Roughly normal, mean 0, sd 1 — three uniforms summed, as in
+    /// `umber_core::stroke`, so a preview scatters in the same shape the
+    /// engine does.
+    fn gaussian(&mut self) -> f32 {
+        self.next() + self.next() + self.next()
+    }
+}
+
+/// Stamp one brush's mark into `sample`.
+///
+/// A miniature of the real dab loop: a pressure ramp along the stroke drives
+/// size, coverage, hardness and scatter through the brush's own curves, and
+/// each stamp is the ellipse the engine would lay down. It is not a simulation
+/// — there is no wet layer, so overlaps here do compound where the canvas would
+/// saturate — but every difference it *does* show is a real one.
+fn brush_sample(painter: &egui::Painter, p: &Palette, sample: Rect, brush: &Brush) {
+    // Scatter and jitter throw stamps off the line, and the sample sits inside
+    // a row that also holds a name. Clip rather than clamp: a spray squashed
+    // back onto its own axis is a spray that looks like a line.
+    let painter = painter.with_clip_rect(sample.expand2(vec2(2.0, 3.0)));
+
+    let radius = sample.height() * 0.5;
+    // Spacing is a fraction of the diameter, so this is the real dab count for
+    // a stroke this long — which is what makes a widely spaced spray read as
+    // separate blobs rather than as a thinner line.
+    let steps =
+        (sample.width() / (radius * 2.0 * brush.spacing).max(0.5)).clamp(6.0, 40.0) as usize;
+
+    let mut rng = Scatter(0x9E37_79B9);
+    let aspect = brush.dab_ratio.max(1.0);
+    // A blender's mark carries the colour it found rather than the palette's,
+    // and the row has to show that or every Blenders entry looks like a paint.
+    // The "found" colour is the dim ink: it reads as canvas rather than as a
+    // second palette colour, and it needs no token of its own.
+    let carried = brush.smudge.clamp(0.0, 1.0);
+    let keep = brush.smudge_length.clamp(0.0, 0.99);
+
+    for i in 0..steps {
+        let t = i as f32 / (steps - 1).max(1) as f32;
+        // The ramp stands in for pressure: nothing at the ends, full in the
+        // middle. That is what gives a tapered stroke, and feeding it through
+        // the brush's curves is what makes the pressure dynamics visible here.
+        //
+        // The `max(0.0)` is load-bearing: `sin(PI)` in f32 lands just *below*
+        // zero, and a negative base with a fractional exponent is NaN, which
+        // propagates into the alpha and trips ecolor's assert.
+        let pressure = (t * std::f32::consts::PI).sin().max(0.0);
+        // Width comes from the brush's own size response, not from the ramp: a
+        // marker that ignores pressure should draw a bar of even width, and
+        // tapering it anyway is exactly the flattery that made every row look
+        // the same.
+        let width = brush.radius_at(pressure) / (brush.size * 0.5).max(0.5);
+        let mut r = radius * width.clamp(0.0, 1.0);
+        if brush.radius_jitter > 0.0 {
+            r *= (rng.gaussian() * brush.radius_jitter).exp();
+            r = r.min(radius * 1.6);
+        }
+        if r <= 0.25 {
+            continue;
+        }
+
+        let mut centre = pos2(sample.left() + sample.width() * t, sample.center().y);
+        let scatter = brush.scatter_at(pressure);
+        if scatter > 0.0 {
+            let spread = r * scatter;
+            centre += vec2(rng.gaussian(), rng.gaussian()) * spread;
+        }
+
+        // The sample stroke runs left to right, so a dab that follows the
+        // stroke sits at zero and one that does not sits at its own angle.
+        let mut angle = if brush.dab_angle_follows_stroke {
+            0.0
+        } else {
+            brush.dab_angle.to_radians()
+        };
+        if brush.dab_angle_jitter > 0.0 {
+            angle += rng.next() * brush.dab_angle_jitter.to_radians() * 0.5;
+        }
+
+        // Softer brushes read as a wider, fainter smear.
+        let hardness = brush.hardness_at(pressure);
+        let alpha = (brush.opacity * brush.coverage_at(pressure))
+            * pressure.powf(1.0 + (1.0 - hardness) * 1.5);
+        // How much of the picked-up colour a stamp is still carrying. A short
+        // smear loses it within a stamp or two; a long one keeps it the whole
+        // way. `0f32.powf(0.0)` is 1, so the head of the stroke is always fully
+        // loaded — which is what a blender does.
+        let held = carried * keep.powf(t * 6.0);
+        let ink = mix(p.text_strong, p.text_dim, held).gamma_multiply(alpha.clamp(0.0, 1.0));
+
+        if aspect > 1.05 {
+            // A 10:1 dab whose long axis fits a 14 px row has a short axis of
+            // less than a pixel. The floor is legibility, not flattery: below
+            // it the mark stops being a thin shape and becomes an absent one,
+            // and a row that shows nothing tells you less than one that
+            // exaggerates slightly.
+            let minor = (r / aspect).max(0.6);
+            painter.add(egui::Shape::convex_polygon(
+                ellipse(centre, r, minor, angle),
+                ink,
+                Stroke::NONE,
+            ));
+        } else {
+            painter.circle_filled(centre, r, ink);
+        }
+    }
+}
+
+/// Points around an ellipse with semi-axes `a` (along `angle`) and `b`.
+///
+/// Ten segments: enough that a 10:1 chisel reads as a straight-edged sliver at
+/// 14 px tall, and few enough that forty of them per row stay off the frame
+/// budget.
+fn ellipse(centre: egui::Pos2, a: f32, b: f32, angle: f32) -> Vec<egui::Pos2> {
+    const SEGMENTS: usize = 10;
+    let (sin, cos) = angle.sin_cos();
+    (0..SEGMENTS)
+        .map(|k| {
+            let theta = k as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let (x, y) = (a * theta.cos(), b * theta.sin());
+            centre + vec2(x * cos - y * sin, x * sin + y * cos)
+        })
+        .collect()
+}
+
+/// Linear blend of two opaque palette colours.
+fn mix(from: Color32, to: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    Color32::from_rgb(
+        lerp(from.r(), to.r()),
+        lerp(from.g(), to.g()),
+        lerp(from.b(), to.b()),
+    )
 }
 
 /// Cut a run of text down to what fits, ending in an ellipsis.

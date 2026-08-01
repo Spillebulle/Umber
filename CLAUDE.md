@@ -262,6 +262,13 @@ A dab is an ellipse with an angle, and may be scattered off the stroke and have
 its radius jittered. `Brush::size` always describes the **long** axis, so
 raising `dab_ratio` narrows the dab rather than growing it.
 
+- **The angle has three states, not two.** Fixed (`dab_angle` alone — a broad
+  nib), following the stroke (`dab_angle_follows_stroke` — a rake), and rolled
+  per dab (`dab_angle_jitter` — grain, a fringe, charcoal). Jitter is an
+  *offset* on whichever of the first two applies, not a replacement for it, and
+  it is uniform rather than gaussian: a rotation that clusters around one
+  heading is still a comb.
+
 - **The quad is built rotated and squashed in the vertex shader**, so `local`
   stays the fragment's position in the dab's own frame and `length(local) <= 1`
   still means "inside". That is what keeps the fragment falloff identical to
@@ -277,6 +284,27 @@ raising `dab_ratio` narrows the dab rather than growing it.
 - **The scatter RNG is seeded per stroke, never from the clock.** A stroke has
   to redraw identically, or every pixel test involving a scattering brush
   becomes flaky and undo/redo would not reproduce the same marks.
+- **Every random draw is guarded by its `> 0.0` setting.** The RNG is a single
+  stream, so an unconditional draw for a feature a brush does not use would
+  reshuffle the numbers every *other* feature gets. `a_brush_with_no_new_
+  dynamics_emits_exactly_what_it_used_to` pins that.
+
+### Pressure dynamics
+
+Four parameters follow pressure — size, opacity, hardness and scatter — and
+three of them share one shape: `peak × (min_ratio + (1 - min_ratio) ×
+curve(p))`, behind a `pressure_*` flag. Opacity has no floor because coverage
+genuinely reaches zero.
+
+- **Read them through `radius_at` / `hardness_at` / `scatter_at`, never off the
+  field.** The field is the value at full pressure, not the value now.
+- **`min_scatter_ratio` may legitimately be zero**, unlike the size and hardness
+  ratios: "clean line until you press" is a real pencil, and 16 shipped brushes
+  are exactly that.
+- The importer's `normalised_curve` fills all three from MyPaint's mappings, and
+  the same rule governs each: MyPaint states most of what a brush *does* as a
+  mapping on top of a base of zero, so reading `base_value` alone silently drops
+  it. See `docs/brushes.md`.
 
 ### Colour pickup
 
@@ -323,9 +351,9 @@ page — go by it.
 
 Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
-brush editor's Texture tab, Palette and Harmony picker modes, twelve of the
-sixteen tools, drag-to-reorder in the rail, saved workspaces — is listed with
-its reason in the README. **Do not add UI for features that do not work** — a
+brush editor's Texture and Wet edges sections, Palette and Harmony picker modes,
+twelve of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
+listed with its reason in the README. **Do not add UI for features that do not work** — a
 disabled control with an explanatory tooltip is better than a live one that
 lies, and a control that is simply not drawn is better than either where the
 design shows a whole row of them.
@@ -360,6 +388,16 @@ design shows a whole row of them.
 - Watch for `powf` on a value that can go slightly negative — `sin(PI)` in f32
   is just below zero, and a negative base with a fractional exponent is NaN,
   which ecolor's `gamma_multiply` asserts on. This has already bitten once.
+- **The brush editor's sections are Tip, Dynamics, Scatter and Blending.** The
+  design names six; Texture and Wet edges have no engine behind them and are not
+  drawn at all, Stabiliser is one slider and rides on Tip, and Blending is a
+  name of our own because colour pickup needed a home and none of the design's
+  is one. Between them they expose every field of `Brush` — adding one means
+  adding a control, or the library can use a brush nobody can make.
+- **The brush list's samples are stamped from the brush**, not drawn from two of
+  its numbers. `widgets::brush_sample` is a miniature dab loop under a pressure
+  ramp; it seeds its RNG identically on every row, so two rows differ because
+  their settings differ and the list does not shimmer as it scrolls.
 - `ResponseCurve` is a fixed array of evenly spaced samples, not free control
   points. That keeps `Brush` `Copy`, makes sampling a lerp with no search, and
   means the editor's handles move only vertically — so the curve can never be

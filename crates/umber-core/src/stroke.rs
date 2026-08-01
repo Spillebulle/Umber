@@ -392,24 +392,34 @@ impl StrokeBuilder {
 
         // Scatter is stated in radii, so a big brush sprays wider than a small
         // one — which is what keeps a spray can looking like itself at any size.
+        // Read through `scatter_at` rather than off the field: a pencil skips
+        // across the tooth of the paper under a light hand and bites into it
+        // under a heavy one, so the amount is pressure's to decide.
         let mut centre = pos;
-        if self.brush.scatter > 0.0 {
-            let spread = radius * self.brush.scatter;
+        let scatter = self.brush.scatter_at(pressure);
+        if scatter > 0.0 {
+            let spread = radius * scatter;
             centre += Vec2::new(self.rng.gaussian(), self.rng.gaussian()) * spread;
         }
 
-        let angle = if self.brush.dab_angle_follows_stroke {
+        let mut angle = if self.brush.dab_angle_follows_stroke {
             // A rake keeps its bristles across the line of travel. `heading` is
             // whatever the last segment was, so the dab turns through a curve.
             self.heading.y.atan2(self.heading.x) + self.brush.dab_angle.to_radians()
         } else {
             self.brush.dab_angle.to_radians()
         };
+        // Uniform rather than the gaussian used for position and radius: a
+        // rotation that clusters around one heading is still a comb, and a
+        // brush asking for 360° means "any way up", not "usually this way up".
+        if self.brush.dab_angle_jitter > 0.0 {
+            angle += self.rng.signed() * self.brush.dab_angle_jitter.to_radians() * 0.5;
+        }
 
         self.pending.push(Dab {
             pos: [centre.x, centre.y],
             radius,
-            hardness: self.brush.hardness,
+            hardness: self.brush.hardness_at(pressure),
             coverage,
             color: self.dab_color(),
             aspect: self.brush.dab_ratio.max(1.0),
@@ -985,6 +995,156 @@ mod tests {
                 "angle drifted to {}",
                 d.angle
             );
+        }
+    }
+
+    #[test]
+    fn angle_jitter_turns_every_dab_a_different_way() {
+        // A long dab stamped repeatedly at one angle is a comb, not a brush.
+        // This is what a watercolour fringe, a charcoal and a grain brush all
+        // are, and it is the single most common shape mapping in the pack.
+        let grain = Brush {
+            size: 20.0,
+            spacing: 0.5,
+            stabilization: 0.0,
+            pressure_size: false,
+            dab_ratio: 8.0,
+            dab_angle_jitter: 360.0,
+            ..Default::default()
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(grain, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(400.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert!(dabs.len() > 20);
+
+        // Bounded by half the stated width, and actually spread across it —
+        // a jitter that never leaves a few degrees of centre would still comb.
+        let limit = 180f32.to_radians() + 1e-4;
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for d in &dabs {
+            assert!(d.angle.abs() <= limit, "angle {} escaped", d.angle);
+            lo = lo.min(d.angle);
+            hi = hi.max(d.angle);
+        }
+        assert!(
+            hi - lo > 180f32.to_radians(),
+            "jitter only spanned {} degrees",
+            (hi - lo).to_degrees()
+        );
+    }
+
+    #[test]
+    fn angle_jitter_is_measured_from_the_brush_angle_and_the_heading() {
+        // Jitter is an offset, not a replacement: a rake with a little wobble
+        // must still lie across the line of travel.
+        let rake = Brush {
+            size: 20.0,
+            spacing: 0.5,
+            stabilization: 0.0,
+            pressure_size: false,
+            dab_ratio: 6.0,
+            dab_angle_follows_stroke: true,
+            dab_angle_jitter: 20.0,
+            ..Default::default()
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(rake, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.drain_pending();
+        s.extend(InputPoint::new(vec2(0.0, 200.0), 1.0, 0.1));
+        let quarter = std::f32::consts::FRAC_PI_2;
+        for d in s.drain_pending() {
+            let off = (d.angle - quarter).abs();
+            assert!(
+                off <= 10f32.to_radians() + 1e-4,
+                "a 20° wobble moved the dab {} degrees off the heading",
+                off.to_degrees()
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_can_scatter_a_brush_that_is_otherwise_a_clean_line() {
+        // 16 of the shipped brushes state no constant scatter and put the whole
+        // of it on pressure. Reading only the constant made every one of them a
+        // perfectly smooth line.
+        let pencil = Brush {
+            size: 20.0,
+            spacing: 0.2,
+            stabilization: 0.0,
+            pressure_size: false,
+            scatter: 2.0,
+            pressure_scatter: true,
+            min_scatter_ratio: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(pencil.scatter_at(0.0), 0.0, "a feather touch is clean");
+        assert!((pencil.scatter_at(1.0) - 2.0).abs() < 1e-5);
+
+        let mut s = StrokeBuilder::new();
+        s.begin(pencil, WHITE, InputPoint::new(Vec2::ZERO, 0.0, 0.0));
+        s.extend(InputPoint::new(vec2(100.0, 0.0), 0.0, 0.1));
+        for d in s.drain_pending() {
+            assert_eq!(d.pos[1], 0.0, "zero pressure must not scatter");
+        }
+
+        s.end();
+        s.clear_pending();
+        s.begin(pencil, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        let off_line = dabs.iter().filter(|d| d.pos[1].abs() > 0.5).count();
+        assert!(off_line > dabs.len() / 2, "full pressure did not scatter");
+    }
+
+    #[test]
+    fn pressure_softens_the_edge_when_the_brush_asks_it_to() {
+        // `Dab::hardness` was already per-dab; it just always carried the same
+        // value. 69 of the 196 shipped brushes want it to vary.
+        let pencil = Brush {
+            size: 20.0,
+            spacing: 0.2,
+            stabilization: 0.0,
+            pressure_size: false,
+            hardness: 0.9,
+            pressure_hardness: true,
+            min_hardness_ratio: 0.25,
+            ..Default::default()
+        };
+        assert!((pencil.hardness_at(1.0) - 0.9).abs() < 1e-5);
+        assert!((pencil.hardness_at(0.0) - 0.225).abs() < 1e-5);
+
+        let mut s = StrokeBuilder::new();
+        s.begin(pencil, WHITE, InputPoint::new(Vec2::ZERO, 0.2, 0.0));
+        s.extend(InputPoint::new(vec2(100.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        let first = dabs.first().expect("a dab").hardness;
+        let last = dabs.last().expect("a dab").hardness;
+        assert!(
+            last > first + 0.2,
+            "hardness did not follow pressure: {first} to {last}"
+        );
+        assert!(dabs.iter().all(|d| (0.0..=1.0).contains(&d.hardness)));
+    }
+
+    #[test]
+    fn a_brush_with_no_new_dynamics_emits_exactly_what_it_used_to() {
+        // The default path. Every pixel test in the suite depends on hardness
+        // being the flat setting and the RNG being untouched when nothing asks
+        // for randomness — an extra draw here would reshuffle every scatter.
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            unsmoothed(20.0, 0.1),
+            WHITE,
+            InputPoint::new(Vec2::ZERO, 0.3, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(100.0, 0.0), 0.7, 0.1));
+        let want = Brush::default().hardness;
+        for d in s.drain_pending() {
+            assert_eq!(d.hardness, want);
+            assert_eq!(d.angle, 0.0);
+            assert_eq!(d.pos[1], 0.0);
         }
     }
 

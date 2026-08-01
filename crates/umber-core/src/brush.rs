@@ -40,10 +40,23 @@ pub struct Brush {
     pub spacing: f32,
     pub pressure_size: bool,
     pub pressure_opacity: bool,
+    /// Whether pressure drives the edge falloff.
+    ///
+    /// The most widely used dynamic in the MyPaint pack after size and
+    /// opacity — 69 of its 196 brushes map hardness onto pressure — and the
+    /// reason a pencil's light strokes are feathery rather than merely thin.
+    pub pressure_hardness: bool,
     /// Shapes how pressure drives size.
     pub size_curve: ResponseCurve,
     /// Shapes how pressure drives per-dab coverage.
     pub opacity_curve: ResponseCurve,
+    /// Shapes how pressure drives hardness.
+    pub hardness_curve: ResponseCurve,
+    /// Hardness at zero pressure, as a fraction of `hardness`. Mirrors
+    /// [`Brush::min_size_ratio`], and for the same reason: a curve that reaches
+    /// zero would mean a completely diffuse dab at a feather touch, which no
+    /// real brush does.
+    pub min_hardness_ratio: f32,
     /// Input smoothing, `0.0` (raw) to just under `1.0` (very heavy).
     pub stabilization: f32,
     pub mode: BrushMode,
@@ -89,12 +102,36 @@ pub struct Brush {
     /// keeps its bristles across the direction of travel. Both are common and
     /// neither looks remotely like the other.
     pub dab_angle_follows_stroke: bool,
+    /// Random rotation added to each dab, in degrees, as the **full width** of
+    /// a uniform range: `360.0` is a dab that may point anywhere, `0.0` one
+    /// that holds its angle exactly.
+    ///
+    /// The third state of an elliptical dab, alongside the nib and the rake
+    /// above, and it is what a watercolour fringe, a charcoal and a grain
+    /// brush all are. Without it a long dab repeated down a stroke is a comb:
+    /// every stamp lies the same way, so the mark reads as machined ruling
+    /// rather than as a loaded brush. 31 of the shipped 196 ask for it.
+    pub dab_angle_jitter: f32,
     /// Random offset applied to each dab's position, in multiples of the dab
     /// radius, as a standard deviation. `0.0` lays dabs exactly on the stroke.
     ///
     /// This is what makes a spray can spray and a charcoal stick catch on the
     /// tooth of the paper. Without it those brushes are smooth lines.
     pub scatter: f32,
+    /// Whether pressure drives scatter.
+    ///
+    /// Usually *inversely*: a pencil bitten into the paper lays a solid line
+    /// while a light one skips across the tooth. 38 of the shipped brushes map
+    /// it, and 16 of those state no constant scatter at all — before this they
+    /// imported as perfectly smooth lines wearing the name of something
+    /// granular.
+    pub pressure_scatter: bool,
+    /// Scatter at zero pressure, as a fraction of `scatter`. Unlike the size
+    /// and hardness ratios this may legitimately be `0.0`: a brush that
+    /// scatters only when pressed is an ordinary thing to want.
+    pub min_scatter_ratio: f32,
+    /// Shapes how pressure drives scatter.
+    pub scatter_curve: ResponseCurve,
     /// Random variation in each dab's radius, as a standard deviation applied
     /// in **log** space — so `0.7` means "typically within a factor of two",
     /// symmetrically, and no amount of it can produce a negative radius.
@@ -111,8 +148,11 @@ impl Default for Brush {
             spacing: 0.1,
             pressure_size: true,
             pressure_opacity: false,
+            pressure_hardness: false,
             size_curve: ResponseCurve::LINEAR,
             opacity_curve: ResponseCurve::LINEAR,
+            hardness_curve: ResponseCurve::LINEAR,
+            min_hardness_ratio: 0.5,
             stabilization: 0.35,
             mode: BrushMode::Paint,
             smudge: 0.0,
@@ -122,7 +162,11 @@ impl Default for Brush {
             dab_ratio: 1.0,
             dab_angle: 0.0,
             dab_angle_follows_stroke: false,
+            dab_angle_jitter: 0.0,
             scatter: 0.0,
+            pressure_scatter: false,
+            min_scatter_ratio: 0.0,
+            scatter_curve: ResponseCurve::LINEAR,
             radius_jitter: 0.0,
         }
     }
@@ -155,6 +199,34 @@ impl Brush {
         }
     }
 
+    /// Edge falloff for a given pressure.
+    ///
+    /// Scaled between `min_hardness_ratio * hardness` and `hardness` rather
+    /// than between zero and `hardness`, so the softest end of the curve is
+    /// still a brush rather than a cloud.
+    pub fn hardness_at(&self, pressure: f32) -> f32 {
+        if !self.pressure_hardness {
+            return self.hardness;
+        }
+        let p = self.hardness_curve.sample(pressure.clamp(0.0, 1.0));
+        let ratio = self.min_hardness_ratio.clamp(0.0, 1.0);
+        (self.hardness * (ratio + (1.0 - ratio) * p)).clamp(0.0, 1.0)
+    }
+
+    /// Scatter for a given pressure, in multiples of the dab radius.
+    ///
+    /// The floor is zero, not a fraction of `scatter`: "no scatter at all
+    /// below a light touch" is the shape of a real pencil and the ratio has to
+    /// be able to say it.
+    pub fn scatter_at(&self, pressure: f32) -> f32 {
+        if !self.pressure_scatter {
+            return self.scatter;
+        }
+        let p = self.scatter_curve.sample(pressure.clamp(0.0, 1.0));
+        let ratio = self.min_scatter_ratio.clamp(0.0, 1.0);
+        (self.scatter * (ratio + (1.0 - ratio) * p)).max(0.0)
+    }
+
     /// Distance to the next dab, in document pixels.
     pub fn step_at(&self, pressure: f32) -> f32 {
         (self.radius_at(pressure) * 2.0 * self.spacing).max(0.25)
@@ -181,6 +253,14 @@ impl Brush {
     /// uploaded regardless.
     pub fn is_shaped(&self) -> bool {
         self.dab_ratio > 1.01 || self.scatter > 0.0 || self.radius_jitter > 0.0
+    }
+
+    /// Whether the dab's angle is worth showing the user.
+    ///
+    /// A circle has no angle, so an Angle slider on a round brush is a control
+    /// that does nothing — which is worse than one that is visibly disabled.
+    pub fn dab_has_angle(&self) -> bool {
+        self.dab_ratio > 1.01
     }
 }
 

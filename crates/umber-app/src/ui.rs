@@ -795,7 +795,11 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 .inner_margin(Margin::same(18)),
         )
         .show(root.ctx(), |ui| {
-            ui.set_width(430.0);
+            // Wider than the other modals because the Tip section is the
+            // design's two-column grid and the Dynamics section is three curves
+            // side by side. At 430 px either would have to stack, and a brush
+            // editor you have to scroll is one you stop reaching for.
+            ui.set_width(metrics::BRUSH_EDITOR_WIDTH);
 
             ui.horizontal(|ui| {
                 ui.label(
@@ -816,13 +820,20 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 ui,
                 p,
                 &mut ed.ui.brush_tab,
-                &[(BrushTab::Tip, "Tip"), (BrushTab::Dynamics, "Dynamics")],
+                &[
+                    (BrushTab::Tip, "Tip"),
+                    (BrushTab::Dynamics, "Dynamics"),
+                    (BrushTab::Scatter, "Scatter"),
+                    (BrushTab::Blending, "Blending"),
+                ],
             );
             ui.add_space(12.0);
 
             match ed.ui.brush_tab {
                 BrushTab::Tip => brush_editor_tip(ui, p, ed),
                 BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
+                BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
+                BrushTab::Blending => brush_editor_blending(ui, p, ed),
             }
 
             // The design's footer: name what you have made, or write it back
@@ -836,65 +847,162 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     }
 }
 
+/// A percentage readout, which most of these sliders share.
+fn percent(v: f32) -> String {
+    format!("{:.0}%", v * 100.0)
+}
+
+/// A caption under a control, explaining why it is off or what it does.
+fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
+    ui.label(egui::RichText::new(line).size(10.0).color(p.text_dim));
+}
+
+/// The design's Tip section: a two-column grid of the dab's own properties.
 fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
     let stamped = bitmap_tip_row(ui, p, ed);
-    widgets::slider_row(
-        ui,
-        p,
-        "Size",
-        &mut ed.brush.size,
-        Brush::MIN_SIZE..=400.0,
-        true,
-        |v| format!("{v:.0} px"),
-    );
-    // A tip *replaces* the procedural falloff rather than being multiplied into
-    // it, so hardness has nothing left to shape. Drawn dead with the reason
-    // underneath rather than removed: a control that disappears when you pick a
-    // brush reads as a bug.
-    ui.scope(|ui| {
-        if stamped {
-            ui.disable();
-        }
+    ui.columns(2, |c| {
         widgets::slider_row(
-            ui,
+            &mut c[0],
             p,
-            "Hardness",
-            &mut ed.brush.hardness,
+            "Size",
+            &mut ed.brush.size,
+            Brush::MIN_SIZE..=400.0,
+            true,
+            |v| format!("{v:.0} px"),
+        );
+        // A tip *replaces* the procedural falloff rather than being multiplied
+        // into it, so hardness has nothing left to shape. Drawn dead with the
+        // reason underneath rather than removed: a control that disappears when
+        // you pick a brush reads as a bug.
+        let column = &mut c[1];
+        column.scope(|ui| {
+            if stamped {
+                ui.disable();
+            }
+            widgets::slider_row(
+                ui,
+                p,
+                "Hardness",
+                &mut ed.brush.hardness,
+                0.0..=1.0,
+                false,
+                percent,
+            );
+        });
+        if stamped {
+            caption(column, p, "The stamp decides this brush's edge.");
+        }
+    });
+    ui.columns(2, |c| {
+        widgets::slider_row(
+            &mut c[0],
+            p,
+            "Opacity",
+            &mut ed.brush.opacity,
             0.0..=1.0,
             false,
-            |v| format!("{:.0}%", v * 100.0),
+            percent,
+        );
+        widgets::slider_row(
+            &mut c[1],
+            p,
+            "Spacing",
+            &mut ed.brush.spacing,
+            0.01..=0.5,
+            true,
+            percent,
         );
     });
-    if stamped {
-        crate::controls::note(ui, p, "The stamp decides this brush's edge.");
-    }
-    widgets::slider_row(
+    ui.columns(2, |c| {
+        // Roundness rather than the engine's aspect ratio, because that is the
+        // word the design uses and the word every other paint application uses.
+        // `dab_ratio` is long-over-short, so the two are reciprocals; 5% is the
+        // floor because a 20:1 chisel is already thinner than any real bristle.
+        let mut roundness = 1.0 / ed.brush.dab_ratio.max(1.0);
+        if widgets::slider_row(
+            &mut c[0],
+            p,
+            "Roundness",
+            &mut roundness,
+            0.05..=1.0,
+            false,
+            percent,
+        ) {
+            ed.brush.dab_ratio = 1.0 / roundness.clamp(0.05, 1.0);
+        }
+        widgets::slider_row(
+            &mut c[1],
+            p,
+            "Airbrush rate",
+            &mut ed.brush.dabs_per_second,
+            0.0..=100.0,
+            false,
+            |v| {
+                if v <= 0.0 {
+                    "off".to_string()
+                } else {
+                    format!("{v:.0}/s")
+                }
+            },
+        );
+    });
+    ui.columns(2, |c| {
+        // A circle has no angle. Rather than let the slider lie, it is disabled
+        // until the dab is elliptical and says why.
+        let round = !ed.brush.dab_has_angle();
+        c[0].scope(|ui| {
+            if round {
+                ui.disable();
+            }
+            widgets::slider_row(
+                ui,
+                p,
+                "Angle",
+                &mut ed.brush.dab_angle,
+                0.0..=359.0,
+                false,
+                |v| format!("{v:.0}°"),
+            );
+        });
+        widgets::slider_row(
+            &mut c[1],
+            p,
+            "Stabilisation",
+            &mut ed.brush.stabilization,
+            0.0..=0.95,
+            false,
+            percent,
+        );
+    });
+
+    ui.scope(|ui| {
+        if !ed.brush.dab_has_angle() {
+            ui.disable();
+        }
+        toggle_row(
+            ui,
+            p,
+            "Angle follows the stroke",
+            &mut ed.brush.dab_angle_follows_stroke,
+        );
+    });
+    caption(
         ui,
         p,
-        "Opacity",
-        &mut ed.brush.opacity,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
+        if ed.brush.dab_has_angle() {
+            "A rake keeps its bristles across the line of travel; a broad nib \
+             holds one angle through a curve."
+        } else {
+            "Angle needs an elliptical dab — lower Roundness first."
+        },
     );
-    widgets::slider_row(
+    ui.add_space(2.0);
+    caption(
         ui,
         p,
-        "Spacing",
-        &mut ed.brush.spacing,
-        0.01..=0.5,
-        true,
-        |v| format!("{:.0}%", v * 100.0),
-    );
-    widgets::slider_row(
-        ui,
-        p,
-        "Stabilisation",
-        &mut ed.brush.stabilization,
-        0.0..=0.95,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
+        "Airbrush rate keeps depositing paint while the pen is held still. \
+         Spacing alone stops when you do.",
     );
 }
 
@@ -1043,50 +1151,178 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ],
     );
     if ed.pressure.source == PressureSource::Device {
-        ui.label(
-            egui::RichText::new(
-                "Touch screens report real pressure. Desktop pens fall back to \
-                 full pressure.",
-            )
-            .size(10.0)
-            .color(p.text_dim),
+        caption(
+            ui,
+            p,
+            "Touch screens report real pressure. Desktop pens fall back to \
+             full pressure.",
         );
     }
 
     ui.add_space(4.0);
 
-    ui.columns(2, |columns| {
+    // Three curves rather than the design's two. Hardness is the most used
+    // pressure dynamic in the shipped library after size and opacity — 69 of
+    // its 196 brushes ask for it — and a light stroke that thins without also
+    // softening does not read as a pencil.
+    ui.columns(3, |c| {
         curve_column(
-            &mut columns[0],
+            &mut c[0],
             p,
             "Pressure → size",
             "size",
             &mut ed.brush.pressure_size,
             &mut ed.brush.size_curve,
+            Some(("Min size", &mut ed.brush.min_size_ratio)),
         );
         curve_column(
-            &mut columns[1],
+            &mut c[1],
             p,
             "Pressure → opacity",
             "opacity",
             &mut ed.brush.pressure_opacity,
             &mut ed.brush.opacity_curve,
+            None,
+        );
+        curve_column(
+            &mut c[2],
+            p,
+            "Pressure → hardness",
+            "hardness",
+            &mut ed.brush.pressure_hardness,
+            &mut ed.brush.hardness_curve,
+            Some(("Min hardness", &mut ed.brush.min_hardness_ratio)),
+        );
+    });
+}
+
+/// The design's Scatter section: everything the dab does at random.
+fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 12.0;
+
+    ui.columns(2, |c| {
+        // Stated in dab radii, so a brush sprays the same way at any size.
+        widgets::slider_row(
+            &mut c[0],
+            p,
+            "Scatter",
+            &mut ed.brush.scatter,
+            0.0..=8.0,
+            false,
+            |v| format!("{v:.2}×"),
+        );
+        widgets::slider_row(
+            &mut c[1],
+            p,
+            "Size jitter",
+            &mut ed.brush.radius_jitter,
+            0.0..=2.0,
+            false,
+            |v| format!("{v:.2}"),
         );
     });
 
-    ui.add_space(4.0);
-    widgets::slider_row(
+    ui.columns(2, |c| {
+        let round = !ed.brush.dab_has_angle();
+        c[0].scope(|ui| {
+            if round {
+                ui.disable();
+            }
+            widgets::slider_row(
+                ui,
+                p,
+                "Angle jitter",
+                &mut ed.brush.dab_angle_jitter,
+                0.0..=360.0,
+                false,
+                |v| format!("±{:.0}°", v * 0.5),
+            );
+        });
+        // A curve rather than a fourth column on Dynamics: pressure-driven
+        // scatter is a property of the scatter, and it is unreadable next to
+        // three curves that are all about the mark rather than its randomness.
+        curve_column(
+            &mut c[1],
+            p,
+            "Pressure → scatter",
+            "scatter",
+            &mut ed.brush.pressure_scatter,
+            &mut ed.brush.scatter_curve,
+            Some(("Min scatter", &mut ed.brush.min_scatter_ratio)),
+        );
+    });
+
+    caption(
         ui,
         p,
-        "Min size",
-        &mut ed.brush.min_size_ratio,
-        0.0..=1.0,
-        false,
-        |v| format!("{:.0}%", v * 100.0),
+        "Scatter is measured in dab radii, so a spray looks like itself at any \
+         size. Angle jitter needs an elliptical dab to show.",
     );
 }
 
-/// One dynamics column: an on/off toggle, the curve, and its presets.
+/// Colour pickup — a brush that carries what it finds on the canvas.
+fn brush_editor_blending(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 12.0;
+
+    widgets::slider_row(
+        ui,
+        p,
+        "Colour pickup",
+        &mut ed.brush.smudge,
+        0.0..=1.0,
+        false,
+        percent,
+    );
+
+    // The other two only mean anything once something is being picked up, and
+    // `smudges()` is the same threshold the renderer uses to decide whether to
+    // run a canvas probe at all — so a control that is live here is a control
+    // whose effect is actually rendered.
+    let blending = ed.brush.smudges();
+    ui.scope(|ui| {
+        if !blending {
+            ui.disable();
+        }
+        ui.spacing_mut().item_spacing.y = 12.0;
+        ui.columns(2, |c| {
+            widgets::slider_row(
+                &mut c[0],
+                p,
+                "Smear length",
+                &mut ed.brush.smudge_length,
+                0.0..=0.99,
+                false,
+                percent,
+            );
+            widgets::slider_row(
+                &mut c[1],
+                p,
+                "Pickup radius",
+                &mut ed.brush.smudge_radius,
+                0.25..=8.0,
+                true,
+                |v| format!("{v:.2}×"),
+            );
+        });
+    });
+
+    caption(
+        ui,
+        p,
+        if blending {
+            "Colour pickup mixes what is under the brush into what it deposits; \
+             at 100% it deposits only what it found. Smear length is how long \
+             that colour survives, pickup radius how wide a patch it averages."
+        } else {
+            "Raise colour pickup to turn this into a blender. The canvas is \
+             sampled once a frame while a stroke is live, so it costs nothing \
+             until you do."
+        },
+    );
+}
+
+/// One dynamics column: an on/off toggle, the curve, its presets, and — where
+/// the parameter has a floor rather than falling to zero — that floor.
 fn curve_column(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -1094,6 +1330,7 @@ fn curve_column(
     salt: &str,
     enabled: &mut bool,
     curve: &mut ResponseCurve,
+    min: Option<(&str, &mut f32)>,
 ) {
     toggle_row(ui, p, label, enabled);
 
@@ -1105,7 +1342,7 @@ fn curve_column(
         if !*enabled {
             ui.disable();
         }
-        let size = ui.available_width().min(150.0);
+        let size = ui.available_width().min(metrics::CURVE_PANEL);
         widgets::curve_editor(ui, p, curve, size);
 
         ui.add_space(6.0);
@@ -1123,5 +1360,10 @@ fn curve_column(
                     }
                 }
             });
+
+        if let Some((label, value)) = min {
+            ui.add_space(8.0);
+            widgets::slider_row(ui, p, label, value, 0.0..=1.0, false, percent);
+        }
     });
 }
