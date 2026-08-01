@@ -413,6 +413,29 @@ until commit, so reading it there yields exactly the pre-stroke pixels, and by
 then the damaged rect is known. `read_layer_rect` blocks on the GPU, which is
 acceptable once per stroke but must never move into the drawing loop.
 
+- **Every entry is an `Edit` — a patch and an `EditKind`** — and the label
+  travels with it across an undo. Recomputing it on the far side would renumber
+  the list as it is stepped through, and it is read off the *snapshotted* stroke
+  style, so switching tool mid-stroke cannot change what the stroke that is
+  ending turns out to have been.
+- **`EditKind` has a variant only for something the engine can restore.** It is
+  Paint and Erase because an entry exists only where a patch was captured.
+  Adding "Clear layer" or "Delete layer" means making those undoable *first*; a
+  row naming an action that clicking it will not undo is worse than one the list
+  stays quiet about, and the History module's footnote exists to say so.
+- **The two stacks read as one timeline** — everything applied, oldest first,
+  then everything undone in the order redoing would put it back. `kind_at`
+  indexes it without allocating, and `position` is the count of applied edits,
+  which is what a row of the list stands for.
+- **A jump is a count of single steps, not a seek.** `steps_to` clamps to what
+  is held and the app carries it out as that many `undo`/`redo` calls. There are
+  no snapshots to jump to — that is the whole design — so an eight-row jump
+  costs eight blocking reads and writes, which is fine on an explicit click and
+  is why nothing on the drawing path may reach it.
+- **Evictions are counted, not forgotten.** `dropped` is what lets the list
+  admit it no longer reaches the start of the document instead of drawing the
+  oldest surviving entry as though it were the beginning.
+
 ## Interface
 
 Layout and tokens come from the **"Umber app"** screen of the Umber design
@@ -480,6 +503,45 @@ design shows a whole row of them.
   means the editor's handles move only vertically — so the curve can never be
   dragged into mapping one pressure to two values. Do not "improve" it into a
   `Vec` of points without solving all three.
+
+### The dockable modules
+
+`dock.rs` is the model — where every module is, what a drag would do — and has
+**no drawing in it at all**, which is what lets insertion indices, minimum
+sizes, the config round trip and the drop rules be tested without a window.
+`panels.rs` paints. Keep the two apart.
+
+- **`PanelKind::ALL` is every module; `DEFAULT_DOCK` is the shipped
+  arrangement, and they are deliberately different.** History is in the first
+  and not the second. A layout file written before a module existed does not
+  name it, and an absent panel is a closed one — so a default that included a
+  new module would make a fresh install and an upgraded one disagree about what
+  the workspace holds, and the alternative (bumping `umber-layout`) discards
+  every arrangement anybody has made. Adding a kind therefore needs no version
+  bump; adding one to `DEFAULT_DOCK` would.
+- **Adding a module hands it to the pointer.** `Layout::add_dragging` lifts it
+  straight into a drag with `Origin::Closed`, so the same drop that moves an
+  existing panel places the new one and `Esc` abandons the add. Do not "simplify"
+  it into `open`, which appends to a sidebar — that is what the Window menu's
+  checkboxes are for, and a checkbox that threw the pointer into a drag would be
+  a surprise.
+- **A drag begun by a *click* cannot end on a release.** The button is already
+  up, so the ordinary test drops the module on the button that added it, on the
+  next frame. `Layout::drag_should_drop` gives a sticky drag its own rule: the
+  next press, and not until a frame has been seen with the pointer idle, because
+  a fast click reports press and release together. The rule is in the model so
+  it is tested without a window; `panels.rs` only supplies this frame's pointer.
+- **The module library is drawn from `panels::sidebars`**, like the brush
+  library's modals and for the same reason, plus one of its own: it is how a
+  removed module comes back, so tying it to a panel would tie the way back to
+  the thing that has gone.
+- **A module's picture is painted, never a bitmap.** `module_preview` is a
+  schematic in palette tokens. A screenshot would be stale the first time the
+  panel gained a control and wrong in the other theme immediately.
+- **A module body must not imply the engine does more than it does.** The
+  History list has a row only where a patch exists, and says under itself that
+  it covers strokes and not layers. Same rule as everywhere else here: a control
+  that lies is worse than one that is not drawn.
 
 ## Testing
 

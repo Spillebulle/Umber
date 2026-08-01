@@ -75,7 +75,9 @@ sudo pacman -S wayland libxkbcommon libx11 libxrandr libxi vulkan-icd-loader
 
 The workspace follows the **Umber app** screen of the design project: a menu
 bar, a document tab strip, a tool options strip, a two-column tool rail, the
-canvas, and stacked modules (Colour, Brushes, Layers) in a sidebar.
+canvas, and stacked modules (Colour, Brushes, Layers) in a sidebar. A fourth,
+**History**, is not in the shipped arrangement and is added from the module
+library.
 
 ### Layout edit mode
 
@@ -96,12 +98,66 @@ Sizes are draggable at any time: the boundary between two stacked modules, a
 sidebar's inner edge, and a floating module's bottom-right corner. Everything
 has a minimum, so a module cannot be squashed out of existence.
 
-Modules are hidden by the close mark in their header and brought back from
-**Window → Panels**, which also has **Reset layout**. The arrangement is saved
-between runs (`%APPDATA%\Umber\layout.conf` on Windows,
-`~/.config/umber/layout.conf` on Linux, `~/Library/Application Support/Umber/`
-on macOS); an unreadable file is ignored rather than being an error, and one
-written by a future version is refused rather than misread.
+The cross in a module's header removes it from the layout — only in edit mode,
+so a stray click cannot make a panel vanish while you are painting. It is the
+one mark in a header that takes something away, so it lights up in the warning
+colour rather than the ordinary hover ink. **Window → Reset layout** puts
+everything back where it started.
+
+The arrangement is saved between runs (`%APPDATA%\Umber\layout.conf` on
+Windows, `~/.config/umber/layout.conf` on Linux,
+`~/Library/Application Support/Umber/` on macOS); an unreadable file is ignored
+rather than being an error, and one written by a future version is refused
+rather than misread. A file written by an *older* version simply lacks the
+modules that did not exist then, and an absent module is a closed one — which
+is why the History module is not in the shipped arrangement either. A default
+that included it would have made a fresh install and an upgraded one disagree
+about what the workspace holds.
+
+### The module library
+
+**Window → Modules** is every module there is: a picture of each, a sentence
+saying what it is for, and a button to add it. It is how a removed module comes
+back, and how one you have never opened is found — a list of four titles is
+fine for flicking a familiar panel off and on, and useless for finding one.
+
+The pictures are **painted**, not screenshots. Umber paints its widgets rather
+than shipping images of them, and a bitmap of a panel would be stale the first
+time that panel gained a control and wrong in the other theme immediately. Each
+is a schematic in the palette's own colours, which is the shape your eye is
+matching against the sidebar anyway.
+
+Adding does not place the module: it hands it to the pointer, in layout edit
+mode, and you **click where you want it** — a sidebar to dock it, anywhere else
+to leave it floating. That is the same drop that moves a module already in the
+layout, so there is one way to say where a panel lives rather than two, and
+`Esc` abandons the add exactly as it abandons a move.
+
+**Window → Panels** is still there as plain checkboxes, for flicking a familiar
+module off and on without being put into a mode.
+
+Neither this dialog nor the History module is in the design, for the same
+reason the brush library's browser is not: the design draws three modules that
+are always there, and once modules can be removed there has to be somewhere
+they come back from.
+
+### History
+
+A viewable edit history, as a module you can dock, float or close like any
+other. It lists what has been painted on the document oldest first, with a
+marker showing where the document stands; entries behind it read as ink, those
+ahead of it as the ghosts they are, and clicking either takes the document
+there — an undo or a redo of however many steps it takes, which is what an
+eight-step jump costs and no more.
+
+It shows **strokes only**, and says so under the list. Umber's history covers
+painting: adding, deleting or reordering a layer is not recorded, and deleting
+one clears the list. A row appears only where something can actually be
+restored, because a history naming an action that clicking it will not undo is
+worse than one that admits its own edges. The first row is the document with
+nothing applied — the only way back to a blank canvas — and once the memory
+budget has aged the oldest entries out it says so rather than pretending to
+reach the beginning.
 
 There used to be a global left-handed flag that mirrored the whole workspace.
 It is gone. With every part of the workspace going where you put it — the tool
@@ -476,7 +532,10 @@ layer would otherwise preview wrongly and then jump on release.
   stroke would be 16 MB at 2048², exhausting a gigabyte in about sixty strokes.
   Undo covers painting only — adding, deleting or reordering a layer is *not*
   undoable yet, and deleting one clears the history, because slots are recycled
-  and a stale entry would otherwise be replayed into the wrong layer.
+  and a stale entry would otherwise be replayed into the wrong layer. Every
+  entry carries what it was, and the two stacks read as one timeline, which is
+  what the History module lists; a jump to a point in it is that many single
+  steps, because there are no snapshots to jump to.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 
@@ -515,7 +574,8 @@ rather than removing it.
 
 Next, roughly in order:
 
-- Structural undo, so layer add/delete/reorder joins the history
+- Structural undo, so layer add/delete/reorder joins the history — and stops
+  the History module having to explain that it lists strokes and not layers
 - Getting the save off the drawing thread. It reads every layer back from the
   GPU with a blocking call, so a large document pauses for a moment — the one
   place left where Umber does the thing it exists not to do.
