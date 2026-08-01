@@ -20,16 +20,23 @@
 //!
 //! Then `width * height * bytes` of pixel data.
 //!
+//! A `.gpb` — GIMP's obsolete "pixmap brush" — is the same file with a whole
+//! **pattern** appended: a `GPAT` header and `width × height × 3` RGB bytes
+//! sharing the mask's dimensions. GIMP still reads one, and so does this, which
+//! is why [`read_one`] has to know where a `.gbr` ends rather than assuming it
+//! runs to the end of the buffer.
+//!
 //! # What is dropped
 //!
-//! - **Colour.** A 4-byte `.gbr` is a coloured stamp; Umber's scratch texture is
-//!   a single coverage channel by design, so only the alpha channel survives.
-//!   A pixmap brush therefore imports as its silhouette.
+//! - **Colour.** A 4-byte `.gbr` is a coloured stamp, and a `.gpb` carries its
+//!   colour in a trailing pattern; Umber's scratch texture is a single coverage
+//!   channel by design, so only the coverage survives. A pixmap brush therefore
+//!   imports as its silhouette.
 //! - **Spacing.** Carried out separately as [`GbrBrush::spacing`] rather than
 //!   folded into the mask, because it belongs on the `Brush`, not the tip.
-//! - **`.gih` animated brushes**, which are a `.gbr` sequence with a parameter
-//!   header. Umber stamps one tip per stroke, so there is nowhere to put the
-//!   other frames.
+//!
+//! `.gih` animated brushes are a sequence of these with a parameter header of
+//! their own; see [`super::gih`].
 
 use crate::brush::Brush;
 use crate::preset::PresetError;
@@ -37,6 +44,12 @@ use crate::tip::TipMask;
 
 /// `GIMP`, big-endian, at offset 20 of a version 2 or later file.
 const MAGIC: u32 = u32::from_be_bytes(*b"GIMP");
+
+/// `GPAT`, the magic of the pattern a `.gpb` appends to its mask.
+const PATTERN_MAGIC: u32 = u32::from_be_bytes(*b"GPAT");
+
+/// A GIMP pattern header is six big-endian words before its name.
+const PATTERN_HEADER: usize = 24;
 
 /// The largest header this will read. A `.gbr` header is a fixed 28 bytes plus
 /// a name; anything claiming megabytes of name is corrupt or hostile.
@@ -52,10 +65,23 @@ pub struct GbrBrush {
     /// [`crate::Brush::spacing`]. `None` for version 1 files, which do not
     /// record it.
     pub spacing: Option<f32>,
+    /// The file described a colour as well as a coverage — a 4-byte RGBA stamp
+    /// or a `.gpb`'s trailing pattern — and only the coverage came across.
+    pub coloured: bool,
 }
 
 /// Decode a GIMP `.gbr` file.
 pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
+    read_one(bytes).map(|(brush, _)| brush)
+}
+
+/// Decode the `.gbr` at the start of `bytes`, and say how far it reached.
+///
+/// The length matters to exactly two callers and for two different reasons:
+/// [`super::gih`] concatenates whole `.gbr` files and has to find the next one,
+/// and a `.gpb`'s trailing pattern is only recognisable once the mask's end is
+/// known. Everything else wants [`from_gbr`].
+pub(crate) fn read_one(bytes: &[u8]) -> Result<(GbrBrush, usize), PresetError> {
     let header_size = be_u32(bytes, 0)?;
     let version = be_u32(bytes, 4)?;
     let width = be_u32(bytes, 8)?;
@@ -116,13 +142,13 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
         .checked_mul(height as usize)
         .ok_or_else(|| malformed(format!("{width}x{height} overflows")))?;
 
-    let coverage = match depth {
+    let (coverage, mut consumed, mut coloured) = match depth {
         // A coverage mask, already in Umber's convention: 255 is full paint.
         1 => {
             if pixels.len() < texels {
                 return Err(short_data(texels, pixels.len()));
             }
-            pixels[..texels].to_vec()
+            (pixels[..texels].to_vec(), texels, false)
         }
         // A coloured stamp. Only the alpha survives — see the module docs.
         4 => {
@@ -132,7 +158,11 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
             if pixels.len() < needed {
                 return Err(short_data(needed, pixels.len()));
             }
-            pixels[..needed].chunks_exact(4).map(|px| px[3]).collect()
+            (
+                pixels[..needed].chunks_exact(4).map(|px| px[3]).collect(),
+                needed,
+                true,
+            )
         }
         other => {
             return Err(malformed(format!(
@@ -141,11 +171,51 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
         }
     };
 
-    Ok(GbrBrush {
-        name,
-        tip: TipMask::new(width, height, coverage)?,
-        spacing,
-    })
+    // A `.gpb` is a 1-byte `.gbr` with a pattern stapled to the end of it. The
+    // colour is dropped like a 4-byte stamp's, but the *length* has to be right
+    // or a `.gih` of `.gpb` frames would read the pattern as the next frame.
+    if depth == 1
+        && let Some(pattern) = pattern_length(&pixels[consumed..], width, height)
+    {
+        consumed += pattern;
+        coloured = true;
+    }
+
+    Ok((
+        GbrBrush {
+            name,
+            tip: TipMask::new(width, height, coverage)?,
+            spacing,
+            coloured,
+        },
+        header_size as usize + consumed,
+    ))
+}
+
+/// Length of the GIMP pattern at the start of `bytes`, if there is one of
+/// exactly `width × height`.
+///
+/// Deliberately strict about the dimensions: a `.gpb`'s pattern always matches
+/// its mask, so anything else is the next thing in the file rather than a
+/// pattern, and swallowing it would lose a frame of a pipe.
+fn pattern_length(bytes: &[u8], width: u32, height: u32) -> Option<usize> {
+    if be_u32(bytes, 20).ok()? != PATTERN_MAGIC
+        || be_u32(bytes, 4).ok()? != 1
+        || be_u32(bytes, 8).ok()? != width
+        || be_u32(bytes, 12).ok()? != height
+        || be_u32(bytes, 16).ok()? != 3
+    {
+        return None;
+    }
+    let header = be_u32(bytes, 0).ok()? as usize;
+    if header < PATTERN_HEADER || header > MAX_HEADER as usize {
+        return None;
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(3)?;
+    let total = header.checked_add(pixels)?;
+    (bytes.len() >= total).then_some(total)
 }
 
 /// Turn a decoded `.gbr` into the brush Umber will paint with, and the mask it
@@ -183,18 +253,27 @@ pub fn to_brush(brush: GbrBrush) -> (Brush, TipMask) {
 
 /// What reading this `.gbr` will throw away.
 ///
-/// Deliberately best-effort and header-only: a file this cannot parse returns
-/// nothing here and fails properly in [`from_gbr`], so nothing is reported on
-/// twice. See [`crate::brushimport::dropped_features`].
+/// Deliberately best-effort: a file this cannot parse returns nothing here and
+/// fails properly in [`from_gbr`], so nothing is reported on twice. See
+/// [`crate::brushimport::dropped_features`].
 pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
     // A coloured stamp arrives as its silhouette — the stroke scratch is a
     // single coverage channel by design. Worth saying out loud: the brush works,
     // and it does not look like the picture in the file.
-    match be_u32(bytes, 16) {
-        Ok(4) => vec!["coloured stamps"],
+    //
+    // The whole file rather than its header, because a `.gpb` states its depth
+    // as 1 and hides the colour in a pattern at the far end. Decoding twice
+    // costs a copy of a mask on an explicit import and nothing at all on the
+    // drawing path.
+    match from_gbr(bytes) {
+        Ok(brush) if brush.coloured => vec![COLOURED],
         _ => Vec::new(),
     }
 }
+
+/// The one loss this format has, named once so `.gih` and `.bundle` report it
+/// with the same words.
+pub(crate) const COLOURED: &str = "coloured stamps";
 
 fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, PresetError> {
     bytes
@@ -215,7 +294,7 @@ fn short_data(needed: usize, got: usize) -> PresetError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build a `.gbr` by hand. No CC0 `.gbr` pack has a licence statement that
@@ -223,7 +302,14 @@ mod tests {
     /// `docs/brush-sources.md`), so there is no real file to check into the
     /// tests — which makes the round trip below the only thing pinning the
     /// byte layout down.
-    fn gbr(version: u32, width: u32, height: u32, depth: u32, name: &str, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn gbr(
+        version: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        name: &str,
+        data: &[u8],
+    ) -> Vec<u8> {
         let fixed: u32 = if version == 1 { 20 } else { 28 };
         let name_bytes = {
             let mut v = name.as_bytes().to_vec();
@@ -303,6 +389,61 @@ mod tests {
         // Best effort: a file this cannot parse says nothing, and fails
         // properly in `from_gbr` instead.
         assert!(dropped_features(b"short").is_empty());
+    }
+
+    /// A GIMP pattern, as a `.gpb` staples one to the end of its mask.
+    pub(crate) fn pattern(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for field in [PATTERN_HEADER as u32 + 1, 1, width, height, 3] {
+            out.extend_from_slice(&field.to_be_bytes());
+        }
+        out.extend_from_slice(&PATTERN_MAGIC.to_be_bytes());
+        out.push(0); // the name, empty
+        out.extend(std::iter::repeat_n(200u8, (width * height * 3) as usize));
+        out
+    }
+
+    /// A `.gpb` is a mask with a whole colour pattern behind it. Umber keeps
+    /// the mask, and — the part that is easy to get wrong — has to know where
+    /// the pattern ends, or a `.gih` made of these reads one as the next frame.
+    #[test]
+    fn a_gpb_pixmap_brush_keeps_its_mask_and_says_it_dropped_the_colour() {
+        let mut file = gbr(2, 2, 2, 1, "Pixmap", &[10, 20, 30, 40]);
+        let mask_only = file.len();
+        file.extend_from_slice(&pattern(2, 2));
+
+        let (brush, consumed) = read_one(&file).expect("decode");
+        assert_eq!(brush.tip.coverage(), [10, 20, 30, 40]);
+        assert!(brush.coloured);
+        assert_eq!(consumed, file.len(), "the pattern was not accounted for");
+        assert_eq!(dropped_features(&file), ["coloured stamps"]);
+
+        // And a plain `.gbr` must not grow a pattern it does not have.
+        let (plain, consumed) = read_one(&file[..mask_only]).expect("decode");
+        assert!(!plain.coloured);
+        assert_eq!(consumed, mask_only);
+    }
+
+    /// A pattern whose dimensions do not match the mask is the *next thing in
+    /// the file*, not this brush's colour. Swallowing it loses a frame.
+    #[test]
+    fn a_mismatched_pattern_is_left_where_it_is() {
+        let mut file = gbr(2, 2, 2, 1, "T", &[1, 2, 3, 4]);
+        let mask_only = file.len();
+        file.extend_from_slice(&pattern(4, 4));
+        let (brush, consumed) = read_one(&file).expect("decode");
+        assert!(!brush.coloured);
+        assert_eq!(consumed, mask_only);
+    }
+
+    #[test]
+    fn a_decoded_brush_reports_where_it_ended() {
+        // What `.gih` walks the file with. Off by one byte and every frame
+        // after the first is rubbish.
+        let file = gbr(2, 3, 2, 1, "T", &[7; 6]);
+        assert_eq!(read_one(&file).expect("decode").1, file.len());
+        let coloured = gbr(2, 3, 2, 4, "T", &[7; 24]);
+        assert_eq!(read_one(&coloured).expect("decode").1, coloured.len());
     }
 
     #[test]

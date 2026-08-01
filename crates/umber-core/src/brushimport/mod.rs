@@ -1,13 +1,33 @@
 //! Reading brushes that other applications wrote.
 //!
-//! Every importer lands on [`crate::Brush`], which is a parametric round brush
-//! and nothing more. Formats richer than that lose the parts Umber cannot
-//! render, and each importer documents exactly what it drops — see
-//! [`mypaint`] for the shape those notes take. An importer that quietly
-//! discarded half a brush would be worse than one that refuses the file.
+//! Every importer lands on [`crate::Brush`] and, where the format has one, a
+//! [`TipMask`]. Formats richer than that lose the parts Umber cannot render,
+//! and each importer documents exactly what it drops — see [`mypaint`] for the
+//! shape those notes take. An importer that quietly discarded half a brush
+//! would be worse than one that refuses the file.
+//!
+//! | Extension | From | Reader |
+//! |---|---|---|
+//! | `.myb` | MyPaint | [`mypaint`] |
+//! | `.gbr`, `.gpb` | GIMP, Krita | [`gbr`] |
+//! | `.gih` | GIMP animated brush | [`gih`] |
+//! | `.vbr` | GIMP parametric brush | [`vbr`] |
+//! | `.kpp` | Krita paintop preset | [`kpp`] |
+//! | `.bundle` | Krita resource bundle | [`bundle`] |
+//! | `.abr` | Photoshop | [`abr`] |
+//! | `.ron` | an Umber library | [`crate::preset::parse_library`] |
+//!
+//! Two of those are **containers** — a `.gih` holds a sequence of stamps and a
+//! `.bundle` holds a whole pack — so [`read_file`] returns a `Vec`, and the
+//! caller has to report "twenty brushes arrived" as readily as "one did".
 
+pub mod abr;
+pub mod bundle;
 pub mod gbr;
+pub mod gih;
+pub mod kpp;
 pub mod mypaint;
+pub mod vbr;
 
 use std::path::Path;
 
@@ -53,28 +73,107 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                 tip: None,
             }])
         }
-        "gbr" => {
+        // `.gpb` is a `.gbr` with a colour pattern stapled on; the same reader
+        // handles both, and reports the colour it could not keep.
+        "gbr" | "gpb" => {
             let bytes = preset::read_bytes(path)?;
             let brush = gbr::from_gbr(&bytes).map_err(|e| e.at(path))?;
-            // The format has a name field of its own, but packs routinely leave
-            // it empty — and when they do fill it in, it is often the file name
-            // with the extension still attached, which would show as
-            // "Chalk.gbr" in the picker.
-            let embedded = brush.name.trim();
-            let embedded = embedded
-                .strip_suffix(".gbr")
-                .or_else(|| embedded.strip_suffix(".GBR"))
-                .unwrap_or(embedded);
-            let name = if embedded.is_empty() {
-                display_name(&stem)
-            } else {
-                display_name(embedded)
-            };
+            let name = embedded_name(&brush.name, &stem);
             let (parameters, tip) = gbr::to_brush(brush);
             Ok(vec![Imported {
                 preset: preset_for("gbr", name, parameters),
                 tip: Some(tip),
             }])
+        }
+        // A pipe is a container: every cell arrives as its own brush, because
+        // Umber binds one tip per stroke and so cannot rotate through them.
+        // See the module docs in `gih`.
+        "gih" => {
+            let bytes = preset::read_bytes(path)?;
+            let pipe = gih::from_gih(&bytes).map_err(|e| e.at(path))?;
+            let base = embedded_name(&pipe.name, &stem);
+            let many = pipe.cells.len() > 1;
+            Ok(pipe
+                .cells
+                .into_iter()
+                .enumerate()
+                .map(|(i, cell)| {
+                    // Numbered only when there is more than one, so a one-cell
+                    // pipe does not arrive as "Bark 1".
+                    let name = if many {
+                        format!("{base} {}", i + 1)
+                    } else {
+                        base.clone()
+                    };
+                    let (parameters, tip) = gbr::to_brush(cell);
+                    Imported {
+                        preset: preset_for("gih", name, parameters),
+                        tip: Some(tip),
+                    }
+                })
+                .collect())
+        }
+        "vbr" => {
+            let text = preset::read_to_string(path)?;
+            let decoded = vbr::from_vbr(&text).map_err(|e| e.at(path))?;
+            let name = embedded_name(&decoded.name, &stem);
+            Ok(vec![Imported {
+                preset: preset_for("vbr", name, decoded.brush),
+                tip: None,
+            }])
+        }
+        "kpp" => {
+            let bytes = preset::read_bytes(path)?;
+            let decoded =
+                kpp::from_kpp_in(&bytes, &sibling_brushes(path)).map_err(|e| e.at(path))?;
+            let name = embedded_name(&decoded.name, &stem);
+            Ok(vec![Imported {
+                preset: preset_for("kpp", name, decoded.brush),
+                tip: decoded.tip,
+            }])
+        }
+        // The other container, and the one that carries its own attribution:
+        // a bundle's `meta.xml` names the author and the licence, which is what
+        // `BrushPreset::credit` is for.
+        "bundle" => {
+            let bytes = preset::read_bytes(path)?;
+            let contents = bundle::from_bundle(&bytes).map_err(|e| e.at(path))?;
+            Ok(contents
+                .brushes
+                .into_iter()
+                .map(|decoded| {
+                    let name = embedded_name(&decoded.name, &stem);
+                    let mut preset = preset_for("krita", name, decoded.brush);
+                    preset.credit = contents.credit.clone();
+                    Imported {
+                        preset,
+                        tip: decoded.tip,
+                    }
+                })
+                .collect())
+        }
+        "abr" => {
+            let bytes = preset::read_bytes(path)?;
+            let file = abr::from_abr(&bytes).map_err(|e| e.at(path))?;
+            let base = display_name(&stem);
+            let many = file.brushes.len() > 1;
+            Ok(file
+                .brushes
+                .into_iter()
+                .enumerate()
+                .map(|(i, brush)| {
+                    let name = match (&brush.name, many) {
+                        (Some(name), _) => display_name(name),
+                        (None, true) => format!("{base} {}", i + 1),
+                        (None, false) => base.clone(),
+                    };
+                    let (parameters, tip) = abr::to_brush(brush);
+                    Imported {
+                        preset: preset_for("abr", name, parameters),
+                        tip: Some(tip),
+                    }
+                })
+                .collect())
         }
         "ron" => {
             let text = preset::read_to_string(path)?;
@@ -108,6 +207,57 @@ fn preset_for(source: &str, name: String, brush: Brush) -> BrushPreset {
     }
 }
 
+/// Where to look for the bitmap tip a loose `.kpp` names.
+///
+/// Krita's own resource layout — and every pack distributed as a directory
+/// rather than a `.bundle`, which is GDQuest's and Raghukamath's — puts the
+/// presets in `paintoppresets/` and their tips in a `brushes/` beside it. A
+/// preset read straight off disk would otherwise arrive round, and that is
+/// thirty of GDQuest's fifty brushes.
+///
+/// Deliberately three fixed places rather than a search: a reader that hunted
+/// the filesystem for a file name a stranger supplied is a way to read things
+/// nobody meant to offer.
+fn sibling_brushes(path: &Path) -> impl Fn(&str) -> Option<Vec<u8>> {
+    let here = path.parent().map(Path::to_path_buf);
+    move |wanted: &str| {
+        // A file name, never a path: `../../etc/passwd` in a preset must not
+        // reach outside the pack.
+        if wanted.contains(['/', '\\']) || wanted.is_empty() {
+            return None;
+        }
+        let here = here.as_ref()?;
+        [
+            here.join(wanted),
+            here.join("brushes").join(wanted),
+            here.join("..").join("brushes").join(wanted),
+        ]
+        .into_iter()
+        .find_map(|candidate| std::fs::read(candidate).ok())
+    }
+}
+
+/// The name to show: the file's own where it has one, otherwise the file name.
+///
+/// Most bitmap formats have a name field and packs routinely leave it empty —
+/// and when they do fill it in, it is often the file name with the extension
+/// still attached, which would show as "Chalk.gbr" in the picker.
+fn embedded_name(embedded: &str, stem: &str) -> String {
+    let embedded = embedded.trim();
+    let trimmed = embedded
+        .rsplit_once('.')
+        .filter(|(_, extension)| {
+            ["gbr", "gpb", "gih", "vbr", "kpp", "abr", "png"]
+                .contains(&extension.to_ascii_lowercase().as_str())
+        })
+        .map_or(embedded, |(stem, _)| stem);
+    if trimmed.is_empty() {
+        display_name(stem)
+    } else {
+        display_name(trimmed)
+    }
+}
+
 /// What reading this file will have to throw away, named.
 ///
 /// The shipped library is built by a script that *refuses* a brush depending on
@@ -125,14 +275,29 @@ pub fn dropped_features(path: &Path) -> Vec<&'static str> {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
+    let text = || preset::read_to_string(path).unwrap_or_default();
+    let bytes = || preset::read_bytes(path).unwrap_or_default();
+
     match extension.as_str() {
-        "myb" => preset::read_to_string(path)
-            .ok()
-            .and_then(|text| mypaint::unsupported_features(&text).ok())
-            .unwrap_or_default(),
-        "gbr" => preset::read_bytes(path)
-            .map(|bytes| gbr::dropped_features(&bytes))
-            .unwrap_or_default(),
+        "myb" => mypaint::unsupported_features(&text()).unwrap_or_default(),
+        "gbr" | "gpb" => gbr::dropped_features(&bytes()),
+        "gih" => gih::dropped_features(&bytes()),
+        "vbr" => vbr::dropped_features(&text()),
+        "kpp" => {
+            // Resolved the same way the read will resolve it, or a preset
+            // whose tip *is* beside it would be reported as missing one.
+            let raw = bytes();
+            let Ok(preset) = kpp::from_kpp_in(&raw, &sibling_brushes(path)) else {
+                return Vec::new();
+            };
+            let mut out = preset.dropped;
+            if preset.missing_tip.is_some() {
+                out.push(kpp::MISSING_TIP);
+            }
+            out
+        }
+        "bundle" => bundle::dropped_features(&bytes()),
+        "abr" => abr::dropped_features(&bytes()),
         // An Umber library holds Umber brushes; there is nothing in it that
         // Umber cannot render.
         _ => Vec::new(),
@@ -185,11 +350,13 @@ mod tests {
 
     #[test]
     fn an_unknown_extension_is_refused_by_name() {
-        let err = read_file(Path::new("somewhere/nice.kpp")).unwrap_err();
+        // `.tpl` is Photoshop's tool preset, which is a whole tool rather than
+        // a brush — one of the extensions deliberately not claimed.
+        let err = read_file(Path::new("somewhere/nice.tpl")).unwrap_err();
         assert!(matches!(err, PresetError::UnknownFormat(_)));
         // The message must name the file, or a failed drag-and-drop of twenty
         // files tells the user nothing.
-        assert!(err.to_string().contains("nice.kpp"), "{err}");
+        assert!(err.to_string().contains("nice.tpl"), "{err}");
     }
 
     #[test]
