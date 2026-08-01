@@ -683,6 +683,25 @@ impl UmberApp {
         }
     }
 
+    /// Write every open document that holds work, and say whether all of them
+    /// went.
+    ///
+    /// Each is switched to before it is saved. `save_document` reads the live
+    /// document out of the editor, and a background document's state is parked
+    /// in its tab — but it is also the only honest thing to do: a file dialog
+    /// asking where to put a painting the painter cannot see is asking about
+    /// the wrong one. The tab in front at the end is the last one saved, or the
+    /// one that could not be, which is the one worth being left looking at.
+    fn save_every_document(&mut self) -> bool {
+        for index in self.editor.unsaved_documents() {
+            self.switch_document(index);
+            if !self.save_document(false) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Flatten the visible stack and write it to a PNG the user picks.
     fn export_png(&mut self) {
         let id = self.editor.session.active_id();
@@ -1122,6 +1141,20 @@ impl UmberApp {
             // still has what they need.
             log::warn!("could not open {}: {e}", dir.display());
         }
+        if actions.save_all_and_quit {
+            self.editor.ui.quit_prompt = false;
+            // Quits only if every document was actually written. A cancelled
+            // file dialog on the third of four is not permission to discard the
+            // other three — the same reading of "Save" the close prompt takes.
+            self.editor.quit_requested = self.save_every_document();
+            if !self.editor.quit_requested {
+                self.editor.ui.quit_prompt = true;
+            }
+        }
+        if actions.quit {
+            self.editor.ui.quit_prompt = false;
+            self.editor.quit_requested = true;
+        }
 
         // Last, and after the interface has run at least once: the preferences
         // file is read by `settings::show`, so this is the first point at which
@@ -1534,6 +1567,13 @@ impl ApplicationHandler<Wake> for UmberApp {
             event_loop.exit();
             return;
         }
+        // The quit prompt's answer. It is drawn from `ui::draw`, which has no
+        // `ActiveEventLoop` — so it sets a flag and this is where the loop
+        // actually stops, exactly as the update's own quit request does.
+        if self.editor.quit_requested {
+            event_loop.exit();
+            return;
+        }
         match self.repaint_at {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -1597,7 +1637,18 @@ impl ApplicationHandler<Wake> for UmberApp {
         let pivot = self.editor.canvas_pivot;
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // Never an immediate exit. Closing the window is the one gesture
+            // that can discard *every* open document at once, so it is refused
+            // until each one with unsaved work has been accounted for — and the
+            // question has to be answerable with "actually, no".
+            WindowEvent::CloseRequested => {
+                if self.editor.unsaved_documents().is_empty() {
+                    event_loop.exit();
+                } else {
+                    self.editor.ui.quit_prompt = true;
+                    gfx.window.request_redraw();
+                }
+            }
 
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {

@@ -72,6 +72,13 @@ pub struct UiState {
     pub about_open: bool,
     /// Tab whose close is waiting on confirmation, if any.
     pub close_prompt: Option<usize>,
+    /// The window has been asked to close and something would be lost.
+    ///
+    /// A flag rather than a list of tabs because the list is recomputed from
+    /// the session every frame — a tab could be saved or closed while the
+    /// prompt is up, and a snapshot taken when it opened would go on naming a
+    /// document that is no longer at risk.
+    pub quit_prompt: bool,
     /// Which row of the brush editor's Inputs list is open for editing.
     ///
     /// An index rather than a copy of the entry, because the list is short and
@@ -132,6 +139,7 @@ impl Default for UiState {
             module_library_open: false,
             about_open: false,
             close_prompt: None,
+            quit_prompt: false,
             modulation: 0,
             save_history: true,
         }
@@ -185,6 +193,13 @@ pub struct Editor {
     /// writes. Out of [`UiState`] for the same reason `updates` is — it holds
     /// channels and a map of every open document.
     pub autosave: crate::autosave::Autosave,
+    /// True once the application has been asked to close and every document
+    /// with unsaved work has been accounted for.
+    ///
+    /// A flag rather than a call to `event_loop.exit()` because the quit prompt
+    /// is drawn from `ui::draw`, which has no `ActiveEventLoop` — the same
+    /// arrangement `Updates::take_quit_request` uses for the Windows installer.
+    pub quit_requested: bool,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -260,6 +275,7 @@ impl Default for Editor {
             canvas_form: crate::canvasdlg::CanvasForm::default(),
             updates: crate::update::Updates::default(),
             autosave: crate::autosave::Autosave::default(),
+            quit_requested: false,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),
@@ -561,6 +577,24 @@ impl Editor {
     /// Note that the live document has been written to `path`.
     pub fn mark_saved(&mut self, path: PathBuf) {
         self.session.mark_saved(path);
+    }
+
+    /// Every open document that would lose something if it went now, as tab
+    /// positions.
+    ///
+    /// **Every** document, not only the one in front: closing the window
+    /// discards all of them at once, and a prompt that named one while quietly
+    /// dropping the other two would be worse than none. Recomputed on demand
+    /// rather than snapshotted, so the prompt cannot go on naming a document
+    /// that has since been saved.
+    pub fn unsaved_documents(&self) -> Vec<usize> {
+        self.session
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.modified)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Every open document and how many texture-array slices its layers

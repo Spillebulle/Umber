@@ -438,6 +438,141 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
     choice
 }
 
+/// What the user chose in the quit prompt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QuitChoice {
+    /// Stay. The window does not close.
+    Cancel,
+    /// Write every document that holds work — asking for a file for any that
+    /// has never had one — and quit only if all of them succeed.
+    SaveAll,
+    /// Quit, losing what has not been written.
+    Discard,
+}
+
+/// Ask before closing the window on work that is not written down.
+///
+/// The close prompt asks about one document; this asks about all of them at
+/// once, because closing the window discards every open document and naming
+/// one of three would be worse than naming none. It lists them, so the answer
+/// is given with the facts in view rather than to the word "documents".
+///
+/// Cancel is the emphasised answer here, unlike the close prompt where Save is.
+/// Closing a window is very often a mis-click on the wrong title bar, and the
+/// safest reading of that is "stay".
+pub fn quit_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option<QuitChoice> {
+    if !ed.ui.quit_prompt {
+        return None;
+    }
+    // Recomputed rather than remembered: a document saved while this is up is
+    // no longer at risk, and the prompt should stop claiming it is.
+    let at_risk = ed.unsaved_documents();
+    if at_risk.is_empty() {
+        ed.ui.quit_prompt = false;
+        return Some(QuitChoice::Discard);
+    }
+
+    let names: Vec<(String, bool)> = at_risk
+        .iter()
+        .filter_map(|i| ed.session.tabs().get(*i))
+        .map(|tab| (tab.title.clone(), tab.path.is_some()))
+        .collect();
+    let any_untitled = names.iter().any(|(_, has_file)| !has_file);
+    let mut choice = None;
+
+    let modal = egui::Modal::new(egui::Id::new("quit-umber"))
+        .frame(dialog_frame(p))
+        .show(root.ctx(), |ui| {
+            ui.set_width(440.0);
+            ui.label(
+                egui::RichText::new(if names.len() == 1 {
+                    "One document has unsaved work.".to_string()
+                } else {
+                    format!("{} documents have unsaved work.", names.len())
+                })
+                .size(text::CONTROL)
+                .color(p.text_strong)
+                .strong(),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Closing Umber now discards those changes for good.")
+                    .size(text::SMALL)
+                    .color(p.text),
+            );
+
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for (title, has_file) in &names {
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(vec2(MARK, MARK), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.0, p.accent);
+                            ui.label(egui::RichText::new(title).size(text::SMALL).color(p.text));
+                            ui.label(
+                                egui::RichText::new(if *has_file {
+                                    "unsaved changes"
+                                } else {
+                                    "never saved"
+                                })
+                                .size(text::TINY)
+                                .color(p.text_dim),
+                            );
+                        });
+                    }
+                });
+
+            if any_untitled {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Save all will ask where to put anything that has never \
+                         been saved.",
+                    )
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+                );
+            }
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if button(ui, p, "Discard and quit", false) {
+                    choice = Some(QuitChoice::Discard);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Emphasis on staying: closing a window is very often a
+                    // mis-click, and this is the answer that loses nothing.
+                    if button(ui, p, "Keep painting", true) {
+                        choice = Some(QuitChoice::Cancel);
+                    }
+                    if button(
+                        ui,
+                        p,
+                        if any_untitled {
+                            "Save all…"
+                        } else {
+                            "Save all"
+                        },
+                        false,
+                    ) {
+                        choice = Some(QuitChoice::SaveAll);
+                    }
+                });
+            });
+        });
+
+    // Escape and a click outside are "not now", as everywhere else that a
+    // dialog's other answer destroys work.
+    if modal.should_close() {
+        choice = Some(QuitChoice::Cancel);
+    }
+    if matches!(choice, Some(QuitChoice::Cancel)) {
+        ed.ui.quit_prompt = false;
+    }
+    choice
+}
+
 /// Show whatever the last import could not do, or could not do at all.
 pub fn notice(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let Some(notice) = ed.notice.clone() else {
