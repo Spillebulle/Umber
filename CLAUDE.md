@@ -860,6 +860,21 @@ cannot half-publish; `.github/workflows/release.yml` does the rest.
 - The MSI's `UpgradeCode` in `packaging/windows/umber.wxs` must never change. It
   is what tells Windows the next version replaces this one rather than
   installing beside it.
+- **Windows keeps two icons per window and Umber has to set both.**
+  `with_window_icon` is `ICON_SMALL`, the title bar's; the taskbar and Alt-Tab
+  draw `ICON_BIG`, which is winit's separate `with_taskbar_icon`. winit
+  registers its window class with `hIcon: 0`, so setting only the first leaves
+  the taskbar with nothing and Windows substitutes its generic application
+  icon — which is what shipped through 0.0.3. The executable's own icon
+  resource does not cover this: that one is for Explorer, the Start Menu
+  shortcut and the moment before the process exists.
+- **The installer's "Start Umber" checkbox must stay `Impersonate="yes"`.**
+  Umber installs per-machine, so the installer is elevated; launching without it
+  would run Umber as the elevated account and write every preference, brush and
+  autosave into that profile instead of the user's. Its condition is
+  `NOT Installed` so a repair does not launch the application unasked. The
+  action comes from `WixToolset.Util.wixext`, which `release.yml` must add
+  alongside the UI extension.
 - **RPM requirements are sonames, not package names.** Fedora calls a library
   `libX11` and openSUSE calls it `libX11-6`, so an rpm naming one refuses to
   install on the other; every rpm distribution records the sonames it provides,

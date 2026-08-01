@@ -121,6 +121,11 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           export PATH="$PATH:$HOME/.dotnet/tools"
           wix extension add -g WixToolset.UI.wixext/5.0.2
+          # Util supplies WixShellExec, which is what the exit dialog's
+          # "Start Umber" checkbox runs. Pinned to the same version as the
+          # toolset: a custom action from a mismatched extension is a binary
+          # that may not be there under the name the .wxs asks for.
+          wix extension add -g WixToolset.Util.wixext/5.0.2
 
           # WiX's licence page wants RTF. The conversion is a script rather
           # than a few lines here because the escaping behaved differently in
@@ -137,6 +142,7 @@ jobs:
           wix build packaging/windows/umber.wxs \
             -arch ${{ matrix.arch }} \
             -ext WixToolset.UI.wixext \
+            -ext WixToolset.Util.wixext \
             -pdbtype none \
             -d Version="$VERSION" \
             -d BinDir="target/release" \
