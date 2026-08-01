@@ -1585,6 +1585,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&internal);
     }
 
+    /// The whole feature through the frame loop, on a real device.
+    ///
+    /// Every part of this is tested on its own — the capture against the
+    /// blocking readback in `umber-render`, the scheduler above, the writing
+    /// below. What is left is the wiring in [`drive`] and [`collect`], and it
+    /// is exactly the seam where a mistake means "autosave silently never
+    /// fires", which no unit test would notice.
+    ///
+    /// Skips rather than fails with no adapter, like the GPU tests.
+    #[test]
+    fn a_frame_loop_writes_the_document_out_by_itself() {
+        let instance = Gpu::create_instance();
+        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+
+        let documents = scratch("loop-documents");
+        let internal = scratch("loop-internal");
+        let theirs = documents.join("hands.ora");
+
+        let mut editor = Editor::default();
+        editor.doc = umber_core::Document::new(8, 8);
+        // A document that has a file and has been painted on since — the case
+        // where an autosave writes both destinations.
+        editor.session.mark_saved(theirs.clone());
+        editor.session.mark_modified();
+
+        let id = editor.session.active_id();
+        let canvas = CanvasRenderer::new(
+            &gpu.device,
+            editor.doc.size,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear_all_layers(&mut enc);
+        canvas.clear_stroke(&mut enc);
+        gpu.queue.submit(Some(enc.finish()));
+        let mut canvases = HashMap::from([(id, canvas)]);
+
+        // Due immediately, and pointed at a scratch directory rather than at
+        // the real one — a test must not write into somebody's data folder.
+        editor.autosave.interval = Duration::ZERO;
+        editor.autosave.expiry = None;
+        editor
+            .autosave
+            .next_due(Instant::now(), true, &editor.session);
+        editor
+            .autosave
+            .docs
+            .get_mut(&id)
+            .expect("a record")
+            .internal = Some(internal.join("hands-aaaabbbbccccdddd.ora"));
+        let ours = internal.join("hands-aaaabbbbccccdddd.ora");
+
+        // A stroke in progress must hold everything back, however overdue it
+        // is. This is the guarantee the whole schedule rests on.
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        drive(&mut editor, &gpu, &mut canvases, &mut enc, false);
+        gpu.queue.submit(Some(enc.finish()));
+        assert!(
+            !editor.autosave.capturing(),
+            "an autosave started in the middle of a stroke"
+        );
+
+        for _ in 0..2000 {
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            drive(&mut editor, &gpu, &mut canvases, &mut enc, true);
+            gpu.queue.submit(Some(enc.finish()));
+            let notice = collect(&mut editor, &gpu, &mut canvases);
+            assert!(notice.is_none(), "{:?}", notice.map(|n| n.lines));
+            if theirs.exists() && ours.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(theirs.exists(), "the document's own file was never written");
+        assert!(ours.exists(), "the internal copy was never written");
+        assert!(umber_core::docimport::import(&theirs).is_ok());
+        assert!(
+            !editor.session.active_tab().modified,
+            "the tab's dot should come off once its own file has been written"
+        );
+
+        let _ = std::fs::remove_dir_all(&documents);
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
     #[test]
     fn a_title_that_is_not_a_file_name_still_becomes_one() {
         assert_eq!(stem_of("hands"), "hands");
