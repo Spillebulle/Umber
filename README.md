@@ -17,6 +17,9 @@ nothing you make here is trapped here.
 > tools. [What is not there yet](#what-is-not-there-yet) is honest about the
 > rest.
 
+![The Umber workspace: the tool rail, the canvas, and the Colour, Brushes,
+Layers and History modules](docs/images/window.png)
+
 ## Installing
 
 Download from the [latest release](https://github.com/Spillebulle/umber/releases/latest).

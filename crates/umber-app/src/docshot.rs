@@ -19,6 +19,14 @@
 //! reason: a picture of the interface that something else drew goes stale in
 //! silence, and a README is exactly where nobody looks for the drift.
 //!
+//! **`docs/images/window.png` is the exception, and is not written here.** It
+//! is a photograph of a real session — a document with actual work on it, which
+//! is the one thing this module cannot produce, since `ui::draw` leaves the
+//! canvas region empty for the GPU composite that never runs offscreen. It is
+//! therefore the one picture that will not follow the interface, and it has to
+//! be retaken by hand when the workspace changes shape. Regenerating everything
+//! else leaves it alone.
+//!
 //! Three things about the offscreen render are worth knowing before changing it:
 //!
 //! - **The target is `Rgba8Unorm`, deliberately non-sRGB**, matching the real
