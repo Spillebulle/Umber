@@ -632,6 +632,12 @@ design shows a whole row of them.
 - **Shortcuts live in `shortcuts.rs`, not in a `match`.** The settings dialog
   enumerates them, which a match arm cannot do. `resolve` compares ctrl/shift/alt
   exactly — that is what stops plain `Z` (zoom tool) also firing on `Ctrl+Z`.
+- **A widget revealed on hover must not be what decides the hover.** egui stops
+  its hover search at the topmost *interactive* widget, so a `Sense::hover()`
+  row reads as not-hovered the moment the pointer is over a button inside it —
+  and if that button only exists while the row is hovered, the two oscillate
+  once a frame. Allocate the row unconditionally and test `contains_pointer`,
+  which is geometry alone. This was a real bug on the Shortcuts page's `+`.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
