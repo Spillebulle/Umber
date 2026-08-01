@@ -216,6 +216,37 @@ impl DabTarget {
         matches!(self, Self::Hue | Self::Saturation | Self::Value)
     }
 
+    /// Sensible bounds for the brush editor's two range sliders, in this
+    /// target's own unit. Wider than any brush in the shipped pack asks for,
+    /// and narrow enough that the slider has useful resolution.
+    pub fn range(self) -> std::ops::RangeInclusive<f32> {
+        match self {
+            // Log radius: ±2 is a seven-fold change either way.
+            Self::Size => -2.0..=2.0,
+            Self::Opacity => 0.0..=1.0,
+            Self::Hardness | Self::Smudge | Self::Saturation | Self::Value => -1.0..=1.0,
+            Self::Scatter => -4.0..=4.0,
+            Self::Ratio => -8.0..=8.0,
+            Self::Angle => -180.0..=180.0,
+            // Turns, so half a turn is the far side of the wheel.
+            Self::Hue => -0.5..=0.5,
+        }
+    }
+
+    /// How the editor should read a value of this target back to the user.
+    pub fn format(self, v: f32) -> String {
+        match self {
+            // The stored number is a log offset; the useful one is the factor
+            // it multiplies the radius by.
+            Self::Size => format!("×{:.2}", v.exp()),
+            Self::Angle => format!("{v:+.0}°"),
+            Self::Ratio | Self::Scatter => format!("{v:+.2}"),
+            Self::Hue => format!("{:+.0}°", v * 360.0),
+            Self::Opacity => format!("{:.0}%", v * 100.0),
+            _ => format!("{:+.0}%", v * 100.0),
+        }
+    }
+
     /// The smallest output span worth a slot, in this target's own unit.
     ///
     /// Two jobs, and it has to be a property of the target rather than of the
@@ -345,9 +376,7 @@ impl Modulations {
         if m.weight() < 1.0 {
             return false;
         }
-        if (self.len as usize) < Self::MAX {
-            self.entries[self.len as usize] = m;
-            self.len += 1;
+        if self.insert(m) {
             return true;
         }
         // Full: keep the ones that move the stroke most. Discarding the
@@ -365,6 +394,24 @@ impl Modulations {
         } else {
             false
         }
+    }
+
+    /// Append if there is room, without the significance check.
+    ///
+    /// For the brush editor, where an entry is created empty and given its
+    /// range afterwards — [`Modulations::push`]'s refusal is right for an
+    /// import and would be baffling on a button.
+    pub fn insert(&mut self, m: Modulation) -> bool {
+        if (self.len as usize) >= Self::MAX {
+            return false;
+        }
+        self.entries[self.len as usize] = m;
+        self.len += 1;
+        true
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len as usize >= Self::MAX
     }
 
     pub fn remove(&mut self, i: usize) {

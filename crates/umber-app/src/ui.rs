@@ -25,7 +25,9 @@ use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use std::sync::Arc;
-use umber_core::{Brush, ResponseCurve, TipMask, input::PressureSource};
+use umber_core::{
+    Brush, DabInput, DabTarget, Modulation, ResponseCurve, TipMask, input::PressureSource,
+};
 
 /// Requests the UI makes that need GPU access, handled by the caller.
 #[derive(Default, Clone, Copy)]
@@ -823,6 +825,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 &[
                     (BrushTab::Tip, "Tip"),
                     (BrushTab::Dynamics, "Dynamics"),
+                    (BrushTab::Inputs, "Inputs"),
                     (BrushTab::Scatter, "Scatter"),
                     (BrushTab::Blending, "Blending"),
                 ],
@@ -832,6 +835,7 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             match ed.ui.brush_tab {
                 BrushTab::Tip => brush_editor_tip(ui, p, ed),
                 BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
+                BrushTab::Inputs => brush_editor_inputs(ui, p, ed),
                 BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
                 BrushTab::Blending => brush_editor_blending(ui, p, ed),
             }
@@ -1196,6 +1200,307 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
+/// Everything that drives the brush and is not pressure.
+///
+/// A fifth section rather than a fourth column on Dynamics. Dynamics is three
+/// curves that all answer "what does pressing harder do"; this is a *list* of
+/// arbitrary length, and no amount of column arithmetic makes those the same
+/// shape. `docs/brushes.md` records the naming.
+fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.spacing_mut().item_spacing.y = 8.0;
+
+    caption(
+        ui,
+        p,
+        "Speed, stroke position, direction and chance can each drive the brush, \
+         on top of whatever pressure is doing. This is where an imported \
+         MyPaint brush keeps the rest of its character.",
+    );
+
+    let count = ed.brush.modulations.len();
+    ed.ui.modulation = ed.ui.modulation.min(count.saturating_sub(1));
+
+    let mut remove = None;
+    for i in 0..count {
+        let entry = ed.brush.modulations.as_slice()[i];
+        let selected = i == ed.ui.modulation;
+        let row = Frame::NONE
+            .fill(if selected {
+                p.control_active
+            } else {
+                p.control
+            })
+            .stroke(Stroke::new(1.0, if selected { p.accent } else { p.border }))
+            .corner_radius(6)
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} \u{2190} {}",
+                            entry.target.label(),
+                            entry.input.label()
+                        ))
+                        .size(text::TINY)
+                        .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, p, Icon::Trash, true, "Remove this input") {
+                            remove = Some(i);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} … {}",
+                                entry.target.format(entry.low),
+                                entry.target.format(entry.high)
+                            ))
+                            .size(text::TINY)
+                            .color(p.text_dim),
+                        );
+                    });
+                });
+            });
+        // The whole row selects, not just the label — a 6 px target is not one.
+        if row
+            .response
+            .interact(Sense::click())
+            .on_hover_text("Edit this input")
+            .clicked()
+        {
+            ed.ui.modulation = i;
+        }
+    }
+    if let Some(i) = remove {
+        ed.brush.modulations.remove(i);
+    }
+
+    let full = ed.brush.modulations.is_full();
+    ui.scope(|ui| {
+        if full {
+            ui.disable();
+        }
+        if text_icon_link(ui, p, Icon::Plus, "Add an input").clicked() {
+            // Speed onto size is the pack's most common non-pressure mapping
+            // by a wide margin, so it is the least surprising thing to land on.
+            let added = ed.brush.modulations.insert(Modulation {
+                target: DabTarget::Size,
+                input: DabInput::Speed,
+                low: 0.0,
+                high: 0.0,
+                curve: ResponseCurve::LINEAR,
+            });
+            if added {
+                ed.ui.modulation = ed.brush.modulations.len() - 1;
+            }
+        }
+    });
+    if full {
+        caption(ui, p, "A brush holds twelve inputs at most.");
+    }
+
+    let Some(entry) = ed.brush.modulations.get_mut(ed.ui.modulation).map(|m| *m) else {
+        ui.add_space(6.0);
+        caption(
+            ui,
+            p,
+            "Nothing but pressure drives this brush. That is the fast path — no \
+             per-dab evaluation and no random draws at all.",
+        );
+        return;
+    };
+    let mut edited = entry;
+
+    ui.add_space(6.0);
+    divider(ui, p);
+    ui.add_space(6.0);
+
+    ui.columns(2, |c| {
+        c[0].label(
+            egui::RichText::new("Drives")
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        egui::ComboBox::from_id_salt("mod-target")
+            .selected_text(
+                egui::RichText::new(edited.target.label())
+                    .size(text::TINY)
+                    .color(p.text),
+            )
+            .width(c[0].available_width())
+            .show_ui(&mut c[0], |ui| {
+                for target in DabTarget::ALL {
+                    if ui
+                        .selectable_label(target == edited.target, target.label())
+                        .clicked()
+                    {
+                        edited.target = target;
+                        // The range is stated in the target's own unit, so it
+                        // means something different the moment the target
+                        // changes. Clearing it is honest; carrying a 180-degree
+                        // angle over onto hue is not.
+                        edited.low = 0.0;
+                        edited.high = 0.0;
+                    }
+                }
+            });
+
+        c[1].label(
+            egui::RichText::new("Driven by")
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        egui::ComboBox::from_id_salt("mod-input")
+            .selected_text(
+                egui::RichText::new(edited.input.label())
+                    .size(text::TINY)
+                    .color(p.text),
+            )
+            .width(c[1].available_width())
+            .show_ui(&mut c[1], |ui| {
+                for input in DabInput::ALL {
+                    if ui
+                        .selectable_label(input == edited.input, input.label())
+                        .clicked()
+                    {
+                        edited.input = input;
+                    }
+                }
+            });
+    });
+
+    ui.add_space(8.0);
+    let range = edited.target.range();
+    let target = edited.target;
+    ui.columns(2, |c| {
+        widgets::slider_row(
+            &mut c[0],
+            p,
+            "At the low end",
+            &mut edited.low,
+            range.clone(),
+            false,
+            move |v| target.format(v),
+        );
+        widgets::slider_row(
+            &mut c[1],
+            p,
+            "At the high end",
+            &mut edited.high,
+            range,
+            false,
+            move |v| target.format(v),
+        );
+    });
+
+    ui.add_space(8.0);
+    ui.columns(2, |c| {
+        c[0].label(
+            egui::RichText::new("Shape")
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        let size = c[0].available_width().min(metrics::CURVE_PANEL);
+        widgets::curve_editor(&mut c[0], p, &mut edited.curve, size);
+        c[0].add_space(6.0);
+        let current = edited.curve.preset_name().unwrap_or("Custom");
+        egui::ComboBox::from_id_salt("mod-curve")
+            .selected_text(egui::RichText::new(current).size(text::TINY).color(p.text))
+            .width(size)
+            .show_ui(&mut c[0], |ui| {
+                for (name, preset) in ResponseCurve::PRESETS {
+                    if ui
+                        .selectable_label(edited.curve.preset_name() == Some(name), name)
+                        .clicked()
+                    {
+                        edited.curve = preset;
+                    }
+                }
+            });
+
+        caption(&mut c[1], p, input_note(edited.input));
+    });
+
+    if let Some(slot) = ed.brush.modulations.get_mut(ed.ui.modulation) {
+        *slot = edited;
+    }
+
+    // The stroke ramp is a property of the brush rather than of one entry, and
+    // it means nothing at all unless something reads it — so it is drawn dead,
+    // with the reason, rather than hidden or left live and inert.
+    ui.add_space(8.0);
+    divider(ui, p);
+    ui.add_space(8.0);
+    let uses_stroke = ed.brush.uses_stroke_position();
+    ui.scope(|ui| {
+        if !uses_stroke {
+            ui.disable();
+        }
+        ui.columns(2, |c| {
+            widgets::slider_row(
+                &mut c[0],
+                p,
+                "Stroke ramp",
+                &mut ed.brush.stroke_span,
+                1.0..=500.0,
+                true,
+                |v| format!("{v:.0} radii"),
+            );
+            widgets::slider_row(
+                &mut c[1],
+                p,
+                "Then hold for",
+                &mut ed.brush.stroke_hold,
+                0.0..=10.0,
+                false,
+                |v| format!("{v:.1}×"),
+            );
+        });
+    });
+    caption(
+        ui,
+        p,
+        if uses_stroke {
+            "Stroke position climbs from 0 to 1 over this much travel, measured \
+             in dab radii so the brush behaves the same at any size, then holds \
+             and starts again."
+        } else {
+            "Only used once something above is driven by stroke position."
+        },
+    );
+}
+
+/// One line about what an input actually measures, shown beside the curve.
+fn input_note(input: DabInput) -> &'static str {
+    match input {
+        DabInput::Pressure => {
+            "How hard the pen is pressed. Size, opacity, hardness and scatter \
+             have their own pressure curves on the Dynamics and Scatter tabs; \
+             use this for the rest."
+        }
+        DabInput::Speed => {
+            "How fast the pointer is moving right now — it reacts within a \
+             flick, so it is the one that makes a stroke thin as it is thrown."
+        }
+        DabInput::SlowSpeed => {
+            "The same measurement smoothed over most of a second, so it \
+             describes the pace of the whole gesture rather than the moment."
+        }
+        DabInput::Stroke => {
+            "How far into the mark you are, from the ramp below. Good for paint \
+             running out, or colour drifting along a stroke."
+        }
+        DabInput::Direction => {
+            "Which way the stroke is heading, over half a turn — a line pulled \
+             left and the same line pulled right read the same."
+        }
+        DabInput::Random => {
+            "A fresh throw of the dice for every dab. One throw is shared by \
+             every random input on the brush, so two of them move together."
+        }
+    }
+}
+
 /// The design's Scatter section: everything the dab does at random.
 fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
@@ -1252,11 +1557,28 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         );
     });
 
+    // A *directed* offset, so it belongs here with the other things that move
+    // a dab off the line rather than on Inputs with the modulations — and it is
+    // deliberately not spelled as scatter, because a lead trails and a spray
+    // does not.
+    widgets::slider_row(
+        ui,
+        p,
+        "Speed lead",
+        &mut ed.brush.speed_offset,
+        -3.0..=3.0,
+        false,
+        |v| format!("{v:+.2}"),
+    );
+
     caption(
         ui,
         p,
         "Scatter is measured in dab radii, so a spray looks like itself at any \
-         size. Angle jitter needs an elliptical dab to show.",
+         size. Angle jitter needs an elliptical dab to show. Speed lead throws \
+         each dab along the direction of travel — a tenth of a second's worth \
+         of it per unit — so a fast stroke runs ahead of the cursor and a slow \
+         one sits on it.",
     );
 }
 

@@ -64,6 +64,12 @@ pub struct UiState {
     pub settings_tab: SettingsTab,
     /// Tab whose close is waiting on confirmation, if any.
     pub close_prompt: Option<usize>,
+    /// Which row of the brush editor's Inputs list is open for editing.
+    ///
+    /// An index rather than a copy of the entry, because the list is short and
+    /// the entry is the brush's — a copy would need writing back and would go
+    /// stale the moment a row above it was deleted.
+    pub modulation: usize,
 }
 
 /// Tabs of the brush editor dialog.
@@ -74,13 +80,17 @@ pub struct UiState {
 /// are not drawn at all rather than drawn empty; Stabilisation is one slider
 /// and rides on Tip rather than getting a section to itself.
 ///
-/// `Blending` is not one of the design's names. Colour pickup needs a home and
-/// none of the six is one: filing it under "Wet edges" would be borrowing a
-/// term that means something else in every application that has it.
+/// `Blending` and `Inputs` are not among the design's names. Colour pickup
+/// needs a home and none of the six is one: filing it under "Wet edges" would
+/// be borrowing a term that means something else in every application that has
+/// it. `Inputs` is the modulation table — everything that drives the brush and
+/// is not pressure — and `Dynamics` is already taken by the pressure curves,
+/// which is exactly the distinction the two names have to draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushTab {
     Tip,
     Dynamics,
+    Inputs,
     Scatter,
     Blending,
 }
@@ -100,6 +110,7 @@ impl Default for UiState {
             settings_open: false,
             settings_tab: SettingsTab::Themes,
             close_prompt: None,
+            modulation: 0,
         }
     }
 }
