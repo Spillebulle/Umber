@@ -102,6 +102,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         active: None,
         background: Background::Transparent,
         dpi: doc.dpi,
+        history: None,
         warnings,
     })
 }
@@ -463,6 +464,7 @@ fn flattened_fallback(
         active: None,
         background: Background::Transparent,
         dpi: None,
+        history: None,
         warnings,
     })
 }

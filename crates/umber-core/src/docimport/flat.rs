@@ -105,6 +105,7 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         active: None,
         background: Background::Transparent,
         dpi: None,
+        history: None,
         warnings: Vec::new(),
     })
 }
