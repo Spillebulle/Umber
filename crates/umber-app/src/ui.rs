@@ -301,10 +301,11 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         if closed {
             screen.push(screen[0]);
         }
-        painter.add(egui::Shape::line(
-            screen.clone(),
-            Stroke::new(1.0, p.backdrop),
-        ));
+        // Segment by segment rather than one `Shape::line`, which would want
+        // the points by value and so a copy of them per ring per frame.
+        for pair in screen.windows(2) {
+            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.backdrop));
+        }
         painter.extend(egui::Shape::dashed_line(
             &screen,
             Stroke::new(1.0, p.accent),
@@ -322,10 +323,14 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         // Into the editor's own buffer rather than a fresh one: this is the
         // one part of the selection path that runs every frame.
         draft.outline_into(&mut ed.selection_outline);
-        // Open, because it is not closed yet — a polygon two clicks in is a
-        // path, and drawing the closing edge would promise a shape the next
-        // click is going to change.
-        draw_ring(&ed.selection_outline, draft.mode() != SelectionMode::Lasso);
+        // Only the rectangle is closed while it is being drawn: its four
+        // corners *are* the shape. A lasso mid-drag and a polygon two clicks in
+        // are paths, and drawing the edge back to the start would promise a
+        // shape the next moment is going to change.
+        draw_ring(
+            &ed.selection_outline,
+            draft.mode() == SelectionMode::Rectangle,
+        );
     }
 }
 
