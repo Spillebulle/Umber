@@ -592,11 +592,17 @@ cannot half-publish; `.github/workflows/release.yml` does the rest.
 | | x86-64 | ARM64 |
 |---|---|---|
 | Windows MSI | ✔ | ✔ |
-| macOS archive | ✔ | ✔ |
+| macOS archive | one universal binary, both slices | |
 | `.deb`, `.rpm`, AppImage, tarball | ✔ | ✔ |
 | Flatpak bundle | ✔ | — |
 | Arch `.pkg.tar.zst` | ✔ | — |
 
+- **macOS ships one universal binary**, built on Apple Silicon with the Intel
+  slice cross-compiled and `lipo`'d in. There is no Intel runner job: GitHub is
+  retiring `macos-13`, and a queue that never gets picked up stalls every job
+  downstream of the matrix — which is how the Flatpak and Arch jobs went three
+  rehearsals without ever starting. Only the native slice is tested, which is
+  the honest limit of a machine with one architecture.
 - **Arch is x86-64 only because Arch Linux is.** ARM is Arch Linux ARM, a
   separate distribution with its own repositories and no official container
   image; packaging for it would mean trusting a third party's image to build

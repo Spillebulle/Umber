@@ -32,8 +32,14 @@ jobs:
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, arch: arm64 }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,    arch: x64   }
           - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   arch: arm64 }
-          - { os: macos-latest,     target: aarch64-apple-darwin,      arch: arm64 }
-          - { os: macos-13,         target: x86_64-apple-darwin,       arch: x64   }
+          # One universal binary rather than a job per architecture. GitHub's
+          # Intel macOS runner is being retired and its queue can sit unpicked
+          # for half an hour or more, which stalled every job downstream of the
+          # matrix. Apple Silicon can build both slices, and `lipo` joins them
+          # into the artefact macOS actually wants: one file that runs
+          # everywhere. Tests run on the native slice only, which is honest —
+          # there is no Intel machine here to run the other one.
+          - { os: macos-latest,     target: universal-apple-darwin,    arch: universal }
 
     steps:
       - uses: actions/checkout@v5
@@ -63,7 +69,23 @@ jobs:
         run: cargo test --workspace
 
       - name: Build
-        run: cargo build --release -p umber-desktop
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ matrix.target }}" = "universal-apple-darwin" ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+            cargo build --release -p umber-desktop --target aarch64-apple-darwin
+            cargo build --release -p umber-desktop --target x86_64-apple-darwin
+            # Staged where every later step already looks for it, so nothing
+            # downstream has to know this target was built differently.
+            mkdir -p target/release
+            lipo -create -output target/release/umber \
+              target/aarch64-apple-darwin/release/umber \
+              target/x86_64-apple-darwin/release/umber
+            lipo -info target/release/umber
+          else
+            cargo build --release -p umber-desktop
+          fi
 
       - name: Stage
         shell: bash

@@ -21,7 +21,7 @@ packages for x86-64 and ARM64:
 | Platform | |
 |---|---|
 | Windows | `.msi` installer |
-| macOS | `.tar.gz` |
+| macOS | `.tar.gz`, a universal binary for Apple Silicon and Intel |
 | Debian, Ubuntu, Mint | `.deb` |
 | Fedora, RHEL, openSUSE | `.rpm` |
 | Any Linux | `.flatpak` bundle, or an AppImage that needs nothing installed |
