@@ -1075,3 +1075,186 @@ pub fn tool_button(ui: &mut Ui, p: &Palette, icon: Icon, active: bool, tooltip: 
 
     response.on_hover_text(tooltip)
 }
+
+// ---------------------------------------------------------------------------
+// Input diagnostics
+// ---------------------------------------------------------------------------
+
+/// A `0..=1` bar with the figure beside it.
+///
+/// `value` is an `Option` deliberately. A device that reported nothing has to
+/// read as nothing: printing an absent reading as `0.00` is exactly the
+/// ambiguity the pen fix exists to resolve — winit answers `None` both for a
+/// mouse with no sensor and for a pen a hair off the glass — and a meter that
+/// quietly bottomed out would put that ambiguity straight back on the page.
+/// `absent` is what to say instead.
+pub fn value_meter(ui: &mut Ui, p: &Palette, label: &str, value: Option<f32>, absent: &str) {
+    ui.horizontal(|ui| {
+        ui.scope(|ui| {
+            ui.set_width(132.0);
+            ui.label(
+                egui::RichText::new(label)
+                    .size(text::SMALL)
+                    .color(p.text_muted),
+            );
+        });
+
+        let width = (ui.available_width() - 62.0).max(MIN_TRACK * 4.0);
+        let (row, _) = ui.allocate_exact_size(vec2(width, 14.0), Sense::hover());
+        let track = Rect::from_center_size(row.center(), vec2(row.width(), 5.0));
+        let painter = ui.painter();
+        painter.rect_filled(track, 2.5, p.rail);
+        if let Some(v) = value {
+            let t = v.clamp(0.0, 1.0);
+            if t > 0.0 {
+                painter.rect_filled(
+                    Rect::from_min_size(track.min, vec2(track.width() * t, track.height())),
+                    2.5,
+                    p.accent,
+                );
+            }
+            // A genuine zero still gets a tick, or it is indistinguishable from
+            // the empty rail an absent reading draws.
+            painter.rect_filled(
+                Rect::from_min_size(track.min, vec2(1.5, track.height())),
+                0.0,
+                p.text_dim,
+            );
+        }
+
+        ui.add_space(6.0);
+        let (body, colour) = match value {
+            Some(v) => (format!("{v:.3}"), p.text),
+            None => (absent.to_string(), p.text_dim),
+        };
+        ui.label(
+            egui::RichText::new(body)
+                .monospace()
+                .size(text::TINY)
+                .color(colour),
+        );
+    });
+}
+
+/// One column of [`pressure_graph`]: the pair of figures for a single event.
+#[derive(Clone, Copy, Default)]
+pub struct TracePoint {
+    /// What the device reported, `None` where it reported nothing.
+    pub reported: Option<f32>,
+    /// What the pressure model made of it, `None` where nothing resolved it.
+    pub resolved: Option<f32>,
+}
+
+/// A trace of the recent pointer samples: reported against resolved.
+///
+/// The most useful picture on the Input & pen page, because it answers what a
+/// still readout cannot — does pressure actually fall to zero as the pen is
+/// lifted, or does it jump back to full for the last few samples?
+///
+/// One column per sample rather than per unit of time. Even spacing is the
+/// right choice here: the shape of the fall is what is being read, and a
+/// time-scaled x would squash a fast lift — the very part worth seeing — into
+/// nothing. It also means the trace stands still once the hand stops, so it can
+/// be studied after the fact, and costs no repaint timer to keep true.
+///
+/// A missing figure is a **gap**, never a zero. The line is broken and picked
+/// up on the far side, so an absent reading is visibly absent.
+pub fn pressure_graph(
+    ui: &mut Ui,
+    p: &Palette,
+    height: f32,
+    columns: usize,
+    points: impl Iterator<Item = TracePoint>,
+) {
+    let width = ui.available_width().max(MIN_TRACK * 8.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS_LARGE, p.window);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS_LARGE,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let plot = rect.shrink(8.0);
+    let hair = Stroke::new(1.0, p.border.gamma_multiply(0.7));
+    for (t, caption) in [(0.0, "1.0"), (0.5, "0.5"), (1.0, "0")] {
+        let y = plot.top() + plot.height() * t;
+        painter.line_segment([pos2(plot.left() + 22.0, y), pos2(plot.right(), y)], hair);
+        painter.text(
+            pos2(plot.left() + 18.0, y),
+            Align2::RIGHT_CENTER,
+            caption,
+            FontId::monospace(9.0),
+            p.text_dim.gamma_multiply(0.8),
+        );
+    }
+
+    let field = Rect::from_min_max(pos2(plot.left() + 24.0, plot.top()), plot.max);
+    let span = (columns.max(2) - 1) as f32;
+    let at = |i: usize, v: f32| {
+        pos2(
+            field.left() + field.width() * (i as f32 / span),
+            field.bottom() - field.height() * v.clamp(0.0, 1.0),
+        )
+    };
+
+    // Each figure becomes a list of runs, broken wherever it was absent.
+    let mut reported: Vec<Vec<egui::Pos2>> = vec![Vec::new()];
+    let mut resolved: Vec<Vec<egui::Pos2>> = vec![Vec::new()];
+    let mut seen = 0usize;
+    for (i, point) in points.enumerate() {
+        seen = i + 1;
+        for (value, runs) in [
+            (point.reported, &mut reported),
+            (point.resolved, &mut resolved),
+        ] {
+            match value {
+                Some(v) => runs
+                    .last_mut()
+                    .expect("a run is always open")
+                    .push(at(i, v)),
+                // A new run rather than a join across the gap, so an absent
+                // reading reads as absent instead of as a dive to zero.
+                None => {
+                    if !runs.last().is_some_and(Vec::is_empty) {
+                        runs.push(Vec::new());
+                    }
+                }
+            }
+        }
+    }
+
+    if seen == 0 {
+        painter.text(
+            field.center(),
+            Align2::CENTER_CENTER,
+            "Nothing yet — move the pointer over the window.",
+            FontId::proportional(text::TINY),
+            p.text_dim,
+        );
+        return;
+    }
+
+    // Resolved underneath and thicker, so where the two agree — the ordinary
+    // case on Device — the reported line rides on it and the trace reads as one
+    // band rather than as two lines that keep crossing.
+    for (runs, stroke) in [
+        (&resolved, Stroke::new(3.0, p.text_muted)),
+        (&reported, Stroke::new(1.5, p.accent)),
+    ] {
+        for run in runs {
+            match run.len() {
+                0 => {}
+                // A lone sample between two gaps still has to appear.
+                1 => {
+                    painter.circle_filled(run[0], stroke.width * 0.6, stroke.color);
+                }
+                _ => {
+                    painter.add(egui::Shape::line(run.clone(), stroke));
+                }
+            }
+        }
+    }
+}

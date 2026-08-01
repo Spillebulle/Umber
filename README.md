@@ -230,6 +230,14 @@ rows and left for you to settle.
 
 ![The settings dialog, Shortcuts pane](docs/images/settings-shortcuts.png)
 
+**Input & pen** is not a page of settings — there is nothing to configure about
+the pointer — but a live reading of what your tablet is actually sending.
+Counters for mouse against pen events, the pressure the device reported beside
+the pressure Umber resolved from it, a trace of the last couple of hundred
+samples, and a strip to scribble in. It is the page to open when a pen feels
+wrong: it says whether the pen is reaching Umber as a pen at all, and whether
+pressure really falls to zero as you lift off.
+
 Settings are a plain `key = value` file you can read, in
 `%APPDATA%\Umber\config`, `~/.config/umber` or
 `~/Library/Application Support/Umber`; the dialog shows the exact path. A
@@ -279,10 +287,13 @@ risk.
 Everything except the held modifiers is rebindable. On macOS `Ctrl` here is
 `Cmd`, and the dialog names it that way.
 
-**Pen pressure**: touch screens report it properly. **Desktop pen tablets do
-not report pressure through the window system Umber uses**, so on desktop it
-falls back to a flat setting or a speed-derived approximation, chosen in
-Settings → Pressure. A native tablet path is on the roadmap.
+**Pen pressure**: touch screens report it properly, and so do pens on Windows —
+a pen arrives through Windows Ink carrying 1024 levels. **Pens on macOS and
+Linux do not reach Umber through the window system yet**, so there it falls back
+to a flat setting or a speed-derived approximation, chosen in Settings →
+Pressure; a mouse always paints at full pressure. Settings → Input & pen shows
+you which of those is happening on your machine. A native tablet path for the
+other two platforms is on the roadmap.
 
 ## What is not there yet
 
@@ -293,7 +304,7 @@ Settings → Pressure. A native tablet path is on the roadmap.
   folder, but nothing offers one back to you the next time Umber starts.
 - **Structural undo.** Undo covers painting; adding, deleting or reordering a
   layer is not recorded, and deleting a layer clears the history.
-- **Native desktop pen pressure**, as above.
+- **Pen pressure on macOS and Linux**, as above. Windows works.
 - Navigator, palette and harmony colour modes, per-brush blend modes, and
   stylus tilt.
 

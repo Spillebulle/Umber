@@ -1728,6 +1728,13 @@ impl ApplicationHandler<Wake> for UmberApp {
         let ui_has_pointer = ui_owns_pointer(&self.editor, &gfx.egui_ctx, self.editor.cursor);
         let pivot = self.editor.canvas_pivot;
 
+        // Settings → Input & pen is a live reading of this stream, so every
+        // event is noted here — before the match, so a branch that returns
+        // early still counts, and before dispatch, so `Editor::sample` has a
+        // sample of its own to write the resolved pressure onto. Observation
+        // only; see `inputlog`.
+        self.editor.note_input(&event);
+
         match event {
             // Never an immediate exit. Closing the window is the one gesture
             // that can discard *every* open document at once, so it is refused

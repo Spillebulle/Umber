@@ -22,6 +22,7 @@ mod dock;
 pub mod docshot;
 mod editor;
 mod icons;
+mod inputlog;
 mod keylayout;
 mod localtime;
 mod logo;
