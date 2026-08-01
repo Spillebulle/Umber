@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     BlendMode, Brush, BrushMode, Camera, Color, Dab, InputPoint, PixelRect, StrokeBuilder, TipMask,
 };
-use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, ProbeParams, StrokeStyle};
+use umber_render::{
+    CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
+};
 
 const DOC: u32 = 64;
 
@@ -78,16 +80,37 @@ impl Harness {
     }
 
     fn stamp(&mut self, dabs: &[Dab]) {
-        self.stamp_colored(dabs, false);
+        self.stamp_styled(dabs, DabStyle::default());
     }
 
     /// Stamp with the per-dab colour path on, as a smudging brush does.
     fn stamp_colored(&mut self, dabs: &[Dab], colored: bool) {
-        self.per_dab_color = colored;
+        self.stamp_styled(
+            dabs,
+            DabStyle {
+                per_dab_color: colored,
+                build_up: false,
+            },
+        );
+    }
+
+    /// Stamp with the build-up blend, as a texture stamp does.
+    fn stamp_building(&mut self, dabs: &[Dab]) {
+        self.stamp_styled(
+            dabs,
+            DabStyle {
+                per_dab_color: false,
+                build_up: true,
+            },
+        );
+    }
+
+    fn stamp_styled(&mut self, dabs: &[Dab], style: DabStyle) {
+        self.per_dab_color = style.per_dab_color;
         let mut enc = self.encoder();
         self.canvas.begin_frame();
         self.canvas
-            .draw_dabs(&self.gpu.device, &self.gpu.queue, &mut enc, dabs, colored);
+            .draw_dabs(&self.gpu.device, &self.gpu.queue, &mut enc, dabs, style);
         self.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -124,6 +147,15 @@ impl Harness {
     fn set_tip(&mut self, tip: Option<TipMask>) {
         self.canvas
             .set_tip(&self.gpu.device, &self.gpu.queue, tip.map(Arc::new));
+    }
+
+    /// The paper, as `(tile, strength, tile size in document pixels)`.
+    fn set_grain(&mut self, grain: Option<(TipMask, f32, f32)>) {
+        self.canvas.set_grain(
+            &self.gpu.device,
+            &self.gpu.queue,
+            grain.map(|(tile, strength, scale)| (Arc::new(tile), strength, scale)),
+        );
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -322,6 +354,183 @@ fn overlapping_dabs_do_not_compound() {
     assert!(
         (100..=155).contains(&alpha),
         "expected ~128 (single coverage), got {alpha} — dabs are compounding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Build-up
+// ---------------------------------------------------------------------------
+
+/// What `n` dabs of coverage `c` composite to: `1 - (1 - c)^n`.
+///
+/// The model the build-up blend is supposed to implement, written out so the
+/// tests below assert against the maths rather than against a number somebody
+/// once read off a screen.
+fn composited(coverage: f32, dabs: i32) -> f32 {
+    1.0 - (1.0 - coverage).powi(dabs)
+}
+
+#[test]
+fn building_dabs_reach_the_coverage_compositing_predicts() {
+    // The whole point of the build-up mode. Eight quarter-coverage dabs on one
+    // spot composite to 1 - 0.75^8 = 0.900, where a `max` cannot pass 0.25
+    // however many are stamped.
+    //
+    // This is the mechanism a sparse texture stamp needs: the CC0 GIMP pack's
+    // brightest texel is 0.49, so under a `max` a stroke of it can never be
+    // more than half as strong as the author's however long it is. See
+    // `docs/brush-sources.md`.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp_building(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let expected = (composited(0.25, 8) * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (1 - 0.75^8), got {alpha}"
+    );
+}
+
+#[test]
+fn build_up_leaves_the_max_path_alone() {
+    // The other half of the evidence, and the half that matters more: the same
+    // dabs through the ordinary pipeline must still saturate at one dab's
+    // worth. Every brush in the library is on that path, and a build-up mode
+    // that quietly changed it would be a regression across the whole set
+    // wearing the name of a new feature.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let expected = (0.25 * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (one dab's coverage), got {alpha} — the max blend has moved"
+    );
+}
+
+#[test]
+fn a_building_stroke_still_applies_its_opacity_exactly_once() {
+    // Build-up must not become a second place stroke opacity is folded in.
+    // Coverage builds to 0.900 and commit scales it by 0.5, once, so the
+    // committed alpha is 0.450 — not 0.900 and not 0.125.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp_building(&[d; 8]);
+    h.commit(Color::WHITE, 0.5, BrushMode::Paint);
+
+    let expected = (composited(0.25, 8) * 0.5 * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (built coverage, halved once), got {alpha}"
+    );
+}
+
+#[test]
+fn a_building_stroke_saturates_rather_than_overflowing() {
+    // `a + cov(1 - a)` can never pass 1.0, in exact arithmetic or in the
+    // target's unorm. Worth pinning: an accumulation written as a plain `Add`
+    // would look right for a few dabs and then clip, squaring the soft edge off
+    // into a hard-edged blob.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.5);
+    h.stamp_building(&[d; 40]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    // 254, not 255. The scratch is `R8Unorm`, so once coverage reaches 254/255
+    // the next dab contributes `0.5/255` and rounds to nothing: a partial dab
+    // asymptotes one level short of solid. A dab of full coverage does reach
+    // 255 — `a + 1(1 - a)` is exactly 1 — so this is the floor of the
+    // quantisation and not a leak in the formula. Sixteen-bit coverage would
+    // close it, at four times the bandwidth of the hottest texture in the
+    // frame, to remove a difference of 0.4%.
+    assert!(
+        h.pixel(32, 32)[3] >= 254,
+        "forty half-coverage dabs should be solid, got {}",
+        h.pixel(32, 32)[3]
+    );
+    assert_eq!(
+        h.pixel(CORNER, CORNER)[3],
+        0,
+        "the corner outside a round dab must stay empty"
+    );
+}
+
+#[test]
+fn a_building_tip_reaches_solid_where_a_max_one_cannot() {
+    // The measurement from `docs/brush-sources.md`, in miniature: a stamp whose
+    // strongest texel is 0.49 stamped repeatedly. Under a `max` the stroke
+    // stops at 0.49 — half the author's mark — and under build-up it reaches
+    // solid, which is what GIMP draws.
+    let mut h = harness_or_skip!();
+
+    // 125/255 = 0.490, the exact peak of `Organic/Organic_000.gbr`.
+    let tip = TipMask::new(2, 2, vec![125; 4]).expect("tip");
+    h.set_tip(Some(tip));
+
+    let d = dab(32.0, 32.0, 12.0, 1.0);
+    h.stamp(&[d; 12]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let capped = h.pixel(32, 32)[3];
+    assert!(
+        capped.abs_diff(125) <= 3,
+        "a max stroke cannot exceed the tip's brightest texel; got {capped}"
+    );
+
+    h.stamp_building(&[d; 12]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    let built = h.pixel_in(1, 32, 32)[3];
+    assert!(
+        built >= 250,
+        "twelve stamps at 0.49 should composite to solid; got {built}"
+    );
+}
+
+#[test]
+fn a_building_smudge_keeps_its_colour_and_its_accumulation() {
+    // The fourth pipeline, and the combination worth pinning because it is the
+    // one that could have been refused. Coverage builds while colour still
+    // blends premultiplied `over` — and under build-up the two attachments
+    // agree exactly, because `over` accumulates the colour target's alpha by
+    // the same formula the coverage target now uses. The un-premultiply in
+    // `commit.wgsl` is therefore dividing by the coverage that is really there,
+    // which is what makes the smear come out the later dabs' colour at the
+    // built-up strength rather than washed towards the palette.
+    let mut h = harness_or_skip!();
+
+    let d = |c: [f32; 3]| coloured_dab(32.0, 32.0, 12.0, 0.25, c);
+    h.stamp_styled(
+        &[
+            d([1.0, 0.0, 0.0]),
+            d([1.0, 0.0, 0.0]),
+            d([0.0, 0.0, 1.0]),
+            d([0.0, 0.0, 1.0]),
+        ],
+        DabStyle {
+            per_dab_color: true,
+            build_up: true,
+        },
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let px = h.pixel(32, 32);
+    let expected = (composited(0.25, 4) * 255.0) as u8;
+    assert!(
+        px[3].abs_diff(expected) <= 6,
+        "expected ~{expected} of coverage, got {}",
+        px[3]
+    );
+    assert!(
+        px[2] > px[0],
+        "the later blue dabs should dominate the smear: {px:?}"
     );
 }
 
@@ -621,6 +830,75 @@ fn a_tip_decides_where_paint_lands() {
 }
 
 #[test]
+fn a_stamp_gets_the_same_shape_dynamics_a_round_dab_does() {
+    // Scatter, size jitter and angle jitter are per-dab fields on an instance
+    // the vertex shader shapes *before* it samples the tip, so a stamp brush
+    // gets all three for free — but "for free" is exactly the kind of claim
+    // that stops being true. A spatter brush that laid every stamp on the line
+    // at one size would be a texture with a ruler through it.
+    //
+    // Asserted first as dabs landing off the line and off the nominal size,
+    // then — the part that matters — as the scratch being *empty* once the
+    // stroke has been committed over the rect the builder reported. That is the
+    // end-to-end form of "the damaged rect is wide enough": anything the rect
+    // missed is still sitting in the scratch, and the next commit would bake it
+    // in wearing the next stroke's colour. A tip reaches into its quad's
+    // corners, so a rotated, scattered stamp is the hardest case there is.
+    let mut h = harness_or_skip!();
+    h.set_tip(Some(TipMask::new(2, 2, vec![255; 4]).expect("tip")));
+
+    let spatter = Brush {
+        size: 8.0,
+        spacing: 0.5,
+        stabilization: 0.0,
+        pressure_size: false,
+        scatter: 2.5,
+        radius_jitter: 0.4,
+        dab_angle_jitter: 360.0,
+        ..Default::default()
+    };
+
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        spatter,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(20.0, 32.0), 1.0, 0.0),
+    );
+    s.extend(InputPoint::new(Vec2::new(44.0, 32.0), 1.0, 0.1));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    let bounds = s.bounds();
+
+    // 4 px radius on the line, so nothing unscattered can reach 8 px off it.
+    let off_line = dabs
+        .iter()
+        .any(|d| (d.pos[1] - 32.0).abs() > 8.0 || (d.radius - 4.0).abs() > 0.5);
+    assert!(off_line, "the stamp is not being scattered or jittered");
+
+    h.stamp(&dabs);
+    let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        StrokeStyle {
+            color: Color::WHITE,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Nothing may be left in the scratch: whatever it still held would redraw
+    // as a preview and be baked into the next stroke.
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    let leftover = (0..DOC)
+        .flat_map(|y| (0..DOC).map(move |x| (x, y)))
+        .any(|(x, y)| h.pixel_in(1, x, y)[3] != 0);
+    assert!(!leftover, "the spatter left coverage outside its own rect");
+}
+
+#[test]
 fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
     // The clearest evidence the procedural falloff has been replaced rather
     // than multiplied into: a full tip covers its whole bounding square, where
@@ -643,6 +921,110 @@ fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
         h.pixel_in(1, CORNER, CORNER)[3],
         255,
         "a full tip must cover the whole square"
+    );
+}
+
+#[test]
+fn a_non_square_tip_keeps_its_proportions() {
+    // A 4:1 landscape mask, solid. It has to land four times as wide as it is
+    // tall: stretched over the dab's square it would be a block, and padded
+    // into a square it would be this shape at the cost of a margin of empty
+    // fragments and four times the texture.
+    //
+    // `Brush::size` describes the long axis, so the mask's long side spans the
+    // full 2 * radius and its short side a quarter of that.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(TipMask::new(4, 1, vec![255; 4]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    // Radius 12: the stamp spans 20..44 across and 29..35 down.
+    assert_eq!(h.pixel(21, 32)[3], 255, "the long axis should reach 20");
+    assert_eq!(h.pixel(43, 32)[3], 255, "and 44");
+    assert_eq!(h.pixel(32, 30)[3], 255, "the short axis is 3 px each way");
+    assert_eq!(
+        h.pixel(32, 38)[3],
+        0,
+        "6 px down is past a quarter-height stamp — it is being stretched"
+    );
+
+    // Turned on its side, the same file must give the same picture rotated.
+    h.set_tip(Some(TipMask::new(1, 4, vec![255; 4]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(h.pixel_in(1, 32, 21)[3], 255, "portrait reaches down");
+    assert_eq!(
+        h.pixel_in(1, 38, 32)[3],
+        0,
+        "and not across — the aspect is being applied to the wrong axis"
+    );
+}
+
+/// A rotated stamp must not lose its corners to the damaged rect.
+///
+/// The failure this guards has happened twice in this project and is nasty both
+/// times: coverage outside the committed rectangle stays in the scratch,
+/// redraws as a live preview so the stroke appears to hang, and is then baked
+/// in by the *next* stroke wearing that stroke's colour.
+///
+/// A round dab fits inside its bounding square at any angle, so the old
+/// circumscribing-circle bound held for every brush that existed. A bitmap tip
+/// paints right into its quad's corners, and a quad turned 45° reaches out to
+/// `radius * sqrt(2)`.
+#[test]
+fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
+    let mut h = harness_or_skip!();
+
+    let brush = Brush {
+        size: 24.0,
+        spacing: 1.0,
+        stabilization: 0.0,
+        pressure_size: false,
+        dab_angle: 45.0,
+        // A round dab has no angle, so the ratio has to say the dab is shaped
+        // before `dab_angle` means anything to the bounds.
+        dab_ratio: 1.0,
+        ..Default::default()
+    };
+
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        brush,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(32.0, 32.0), 1.0, 0.0),
+    );
+    let bounds = s.bounds();
+    let reach = 12.0 * std::f32::consts::SQRT_2;
+    assert!(
+        bounds.min.x <= 32.0 - reach + 0.01 && bounds.max.y >= 32.0 + reach - 0.01,
+        "the damaged rect stops short of a 45° quad's corners: {bounds:?}"
+    );
+
+    // And the whole stamp really is committed: a solid tip turned 45° must mark
+    // the far corner of its own footprint.
+    h.set_tip(Some(TipMask::new(2, 2, vec![255; 4]).expect("tip")));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    h.stamp(&dabs);
+    let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        StrokeStyle {
+            color: Color::WHITE,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // 45°, so the quad's corner sits on the +y axis at radius * sqrt(2) ≈ 17.
+    assert_eq!(
+        h.pixel(32, 47)[3],
+        255,
+        "the corner of the rotated stamp was outside the committed rect"
     );
 }
 
@@ -693,6 +1075,138 @@ fn a_second_brush_with_a_different_tip_replaces_the_first() {
         "the second tip's empty half painted — the first tip is still bound"
     );
     assert_eq!(h.pixel_in(1, 42, 32)[3], 255);
+}
+
+// ---------------------------------------------------------------------------
+// Paper grain
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grain_off_is_the_exact_identity() {
+    // The claim the whole design rests on: a brush that asks for no paper must
+    // paint precisely what it painted before the paper existed. The shader
+    // computes `mix(1.0, tile, strength)`, so at strength zero the tile is
+    // multiplied out exactly rather than nearly — and this binds a *black* tile
+    // to prove the multiply really is by one and not by something close to it.
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let plain = h.pixel(32, 32);
+
+    h.set_grain(Some((
+        TipMask::new(2, 2, vec![0; 4]).expect("tile"),
+        0.0,
+        64.0,
+    )));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        plain,
+        "a black paper at zero strength changed the mark"
+    );
+}
+
+#[test]
+fn grain_bites_coverage_out_of_a_dab() {
+    // A tile that is solid on its left half and empty on its right, one tile per
+    // 32 document pixels. At full strength the empty half must take the paint
+    // away entirely and the solid half must leave it alone.
+    //
+    // Eight texels rather than two: the sampler filters linearly, so a two-texel
+    // tile is a gradient from end to end with no flat region to assert on. Four
+    // solid texels give a plateau over u = 1/16 .. 7/16, which at this scale is
+    // document x 34..46 in each tile.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(8, 1, vec![255, 255, 255, 255, 0, 0, 0, 0]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(48.0, 32.0, 20.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel(40, 32)[3],
+        255,
+        "the paper's solid half should paint"
+    );
+    assert_eq!(h.pixel(56, 32)[3], 0, "its empty half should not");
+}
+
+#[test]
+fn grain_is_anchored_to_the_paper_and_not_to_the_dab() {
+    // What makes it *paper*. Two dabs at different places must land on different
+    // parts of the tile, so the same brush pulled across a sheet catches and
+    // skips rather than stamping the same texture over and over.
+    //
+    // Tile of 32 document pixels, solid over x = 34..46 of each tile and empty
+    // over 50..62. Two identical dabs, one sitting in each: if the grain were
+    // anchored to the dab, they would be indistinguishable.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(8, 1, vec![255, 255, 255, 255, 0, 0, 0, 0]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(40.0, 32.0, 5.0, 1.0), dab(56.0, 32.0, 5.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel(40, 32)[3],
+        255,
+        "a dab over the tile's solid stretch should paint"
+    );
+    assert_eq!(
+        h.pixel(56, 32)[3],
+        0,
+        "an identical dab half a tile along should not — the grain is travelling \
+         with the brush"
+    );
+}
+
+#[test]
+fn a_grained_stroke_still_saturates_under_overlap() {
+    // The wet-layer guarantee has to survive the paper, exactly as it survived
+    // the tip. Grain modulates coverage; it does not touch the blend state.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(1, 1, vec![255]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 0.5), dab(32.0, 32.0, 12.0, 0.5)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (single coverage), got {alpha} — grained dabs are compounding"
+    );
+}
+
+#[test]
+fn a_grained_stroke_may_still_build_up() {
+    // The two combine, and they have to: paper is what makes a build-up brush
+    // interesting. A half-strength paper bites each dab down to 0.5 and the
+    // stroke then composites towards solid, where a `max` would stop at 0.5.
+    let mut h = harness_or_skip!();
+
+    let tile = TipMask::new(1, 1, vec![128]).expect("tile");
+    h.set_grain(Some((tile, 1.0, 32.0)));
+
+    let d = dab(32.0, 32.0, 12.0, 1.0);
+    h.stamp(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    assert!(
+        h.pixel(32, 32)[3].abs_diff(128) <= 4,
+        "a max stroke should stop at the paper's own value, got {}",
+        h.pixel(32, 32)[3]
+    );
+
+    h.stamp_building(&[d; 8]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert!(
+        h.pixel_in(1, 32, 32)[3] >= 250,
+        "eight dabs through half-strength paper should build to solid, got {}",
+        h.pixel_in(1, 32, 32)[3]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +1684,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
         &gpu.queue,
         &mut enc,
         &[dab(32.0, 32.0, 20.0, 1.0)],
-        false,
+        DabStyle::default(),
     );
     gpu.queue.submit(Some(enc.finish()));
 

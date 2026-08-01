@@ -231,11 +231,18 @@ Documented in full in the module docs of
   device to drive it would change nothing on any machine Umber currently runs
   on.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
-  darkens as a stroke crosses itself. Umber takes a `max` of coverage across the
-  whole stroke and applies opacity once at commit — that is the wet-layer design
-  in `CLAUDE.md`, and it is why `opaque_linearize` is ignored rather than
-  approximated. A MyPaint wash and an Umber wash of the same numbers will not
-  look the same.
+  darkens as a stroke crosses itself. Umber takes a `max` of coverage and
+  applies opacity once at commit — the wet-layer design in `CLAUDE.md` — which
+  is why `opaque_linearize` is ignored rather than approximated. A MyPaint wash
+  and an Umber wash of the same numbers will not look the same.
+
+  The engine now *has* a build-up mode (see below), and MyPaint brushes
+  deliberately do not use it. Umber applies opacity once at commit, so an
+  ordinary `.myb` dab arrives with a per-dab coverage of exactly 1.0 — and
+  building up from 1.0 is the same as taking a max of it. Turning it on would
+  change nothing for most of the pack and would deepen the rest into something
+  MyPaint does not draw either, since MyPaint's build-up is on *opacity* and
+  Umber's opacity is not in the dab.
 
 ## Bitmap tips
 
@@ -246,18 +253,24 @@ falloff. This is what the stamp-based packs need.
 full, so the engine keeps no GPU types. `CanvasRenderer::set_tip` uploads one to
 an `R8Unorm` texture and flips a flag in the dab uniforms.
 
-Three things about the design are load-bearing:
+Four things about the design are load-bearing:
 
 - **The tip is bound per pass, not per dab.** A stroke has one brush, so one
   tip covers the whole dab pass and a thousand tipped dabs are still a single
   draw call. Set it between strokes; changing it mid-stroke would restamp what
   is already in the scratch under a new shape.
 - **The tip modulates coverage; it does not composite.** The blend state is
-  untouched and still `max`, so a tipped stroke saturates at 1.0 under overlap
-  exactly as a round one does and stroke opacity is still applied once, at
-  commit. `a_tipped_stamp_still_saturates_under_overlap` is the guard, and it is
-  a deliberate copy of `overlapping_dabs_do_not_compound` rather than an
-  extension of it.
+  untouched, so a tipped stroke saturates at 1.0 under overlap exactly as a
+  round one does — *unless the brush asked to build up*, which is a separate
+  choice of blend state and not something the tip does.
+  `a_tipped_stamp_still_saturates_under_overlap` is the guard, and it is a
+  deliberate copy of `overlapping_dabs_do_not_compound` rather than an extension
+  of it.
+- **The dab knows the tip's proportions.** `tip_scale` is a per-pass uniform —
+  the mask's dimensions with the longer normalised to 1 — and the vertex shader
+  scales the quad's axes by it, so a 512×256 stamp occupies a 2:1 box and keeps
+  its shape. It is `(1, 1)` with no tip, which is the exact identity. See
+  "Non-square tips" below.
 - **The round path is untouched.** The shader samples the tip unconditionally —
   `textureSample` may not sit in non-uniform control flow — and then `select`s
   between it and the falloff. With no tip the binding is a 1×1 placeholder whose
@@ -290,18 +303,18 @@ unrecognisable in a list and obvious the moment it makes a mark.
 
 | From the file | Becomes | Why |
 |---|---|---|
-| mask width and height | `size`, after padding to a square | a stamp lands at its original scale until you say otherwise |
+| mask width and height | `size`, the mask's longer side | a stamp lands at its original scale until you say otherwise |
 | spacing, per cent | `spacing` | GIMP's default of 10 % is Umber's default too |
 | spacing of **0** | the default, not 1 % | GIMP's own control cannot go below 1, so a zero is a writer that never filled the field in; taken literally it turns a 500 px stamp into five-pixel steps |
 | — | `pressure_size` and `pressure_opacity` **off** | a `.gbr` carries no dynamics, and GIMP stamps one at a constant size |
 
-The mask is padded to a square rather than given a `dab_ratio`. The dab spreads
-a tip over its bounding box, so an unpadded portrait stamp comes out squashed;
-the ratio's long axis is the dab's *x* axis, so preserving proportions with it
-would mean rotating a portrait mask a quarter turn and rotating it back with
-`dab_angle`. Padding is exact, needs no rotation, and leaves `dab_ratio` free
-for the user to squash a stamp deliberately. It costs shading an empty margin,
-which for the near-square masks packs actually contain is a few per cent.
+The mask is handed over exactly as the file holds it — see "Non-square tips".
+
+`build_up` is the fourth thing decided here, and the one that decides whether
+the stamp paints like its author's. It is **measured** by
+`umber_core::tip::stroke_coverage` rather than guessed: a stamp whose `max`
+stroke is as strong as a compositing one stays on the `max` path, and a sparse
+photographic texture gets `build_up: true`. See `docs/brush-sources.md`.
 
 A 4-byte `.gbr` is a coloured stamp and imports as its silhouette — the stroke
 scratch is one coverage channel by design. `brushimport::dropped_features` says
@@ -315,28 +328,144 @@ hardness has nothing left to shape. A round brush shows none of this. Almost
 every brush is round, and a permanent row saying so would be a control that
 never does anything.
 
+## Build-up
+
+Coverage takes a `max` so that overlapping dabs within one stroke cannot
+compound. That is right for a solid disc, where overlap is an artefact of how a
+line is drawn. It is wrong for a sparse texture stamp, where overlap **is** the
+mark: GIMP and Krita composite every dab, so a stamp whose brightest texel is
+0.49 builds to solid along a stroke, and under a `max` it can never exceed 0.49
+however long the stroke is.
+
+`Brush::build_up` switches the coverage attachment's blend state to
+`a = cov + a(1 − cov)`, which is one dab compositing over the last. Five things
+about it:
+
+- **It is a blend-state change and nothing else.** The dab shader is byte for
+  byte what it was, so the two paths cannot drift into stamping different
+  shapes. That is the lesson the paint-versus-erase note in `CLAUDE.md` records.
+- **Nothing downstream sees it.** The scratch still holds coverage in 0..1, so
+  `composite.wgsl` and `commit.wgsl` are untouched and `Brush::opacity` is still
+  applied exactly once, at commit.
+  `a_building_stroke_still_applies_its_opacity_exactly_once` pins that.
+- **The `max` path is untouched.** It is the default, every pre-existing GPU
+  test passes unchanged, and `build_up_leaves_the_max_path_alone` says so
+  directly.
+- **It combines with smudging** rather than being refused with it. There are
+  four dab pipelines now, from two independent binary choices, built by one loop
+  over one descriptor. Under build-up the colour attachment's premultiplied
+  `over` accumulates its alpha by the very formula the coverage attachment uses,
+  so the two agree exactly and the un-premultiply at commit divides by the
+  coverage that is really there.
+  `a_building_smudge_keeps_its_colour_and_its_accumulation` is the guard.
+- **It asymptotes one level short of solid.** The scratch is `R8Unorm`, so once
+  coverage reaches 254/255 a further half-coverage dab contributes `0.5/255` and
+  rounds to nothing. A dab of *full* coverage does reach 255, because
+  `a + 1(1 − a)` is exactly 1. Sixteen-bit coverage would close a 0.4 % gap at
+  four times the bandwidth of the hottest texture in the frame.
+
+Build-up only means anything where a dab is not solid: a bitmap tip, paper
+grain, or a pressure-opacity ramp. For an ordinary brush per-dab coverage is
+exactly 1.0 and the two rules agree — which is why nothing in the MyPaint pack
+uses it.
+
+## Non-square tips
+
+A non-square mask used to be **padded into a square**, because the dab stretched
+whatever it was given over its bounding box. The recorded reason for padding
+rather than spending `dab_ratio` on it still stands: the ratio's long axis is
+the dab's *x* axis, so a portrait mask would have to be rotated a quarter turn
+and rotated back by `dab_angle`, and the ratio is the user's setting rather than
+the file's.
+
+It was never a choice between only those two. The dab pass is now told the tip's
+proportions — `TipMask::aspect`, the mask's dimensions with the longer
+normalised to 1 — and the vertex shader scales the quad's axes by them. That is
+**exactly the geometry padding produced**: a mask padded to side `max(w, h)` and
+stretched over a square occupies `w/side` by `h/side` of it. Three costs go with
+the padding — the margin of empty fragments, the padded texture, and having to
+think about the ratio at all — and the quarter-turn problem never arises,
+because this scales the dab's own axes rather than borrowing the ratio.
+
+`Brush::size` still describes the long axis, of the stamp now, and `dab_ratio`
+still squashes on top of it. `a_non_square_tip_keeps_its_proportions` guards it.
+
+One consequence worth stating: a **tipped dab has an angle whatever its
+roundness**, because a bitmap is not rotationally symmetric. `dab_angle`,
+`dab_angle_follows_stroke` and `dab_angle_jitter` are all live for a stamp
+brush, and the editor enables them from `Editor::tip` rather than from
+`Brush::dab_has_angle`, which cannot know.
+
+A second consequence, in the damaged rect: a tip paints into its quad's
+**corners**, and a quad turned 45° reaches out to `radius × √2`.
+`StrokeBuilder::bounds` unioned the circumscribing circle, which is enough for a
+round dab at any angle and was not enough for a rotated stamp — coverage left
+outside the committed rectangle redraws as a hanging preview and is then baked
+in by the next stroke, in that stroke's colour. It now unions the axis-aligned
+box of the rotated quad: exact for a tip, conservative for a round dab, and
+*tighter* than the circle for an unrotated ellipse.
+`a_rotated_stamp_is_committed_all_the_way_into_its_corners` guards it.
+
+## Paper grain
+
+An optional tiling texture multiplied into dab coverage:
+`coverage × mix(1.0, tile, strength)`. This is what makes a pencil catch on the
+tooth of the paper, and it is the design's **Texture** section.
+
+- **Zero strength is the exact identity.** `mix(1.0, tile, 0.0)` is 1.0 whatever
+  the tile holds, so a brush that asks for no paper pays one multiply by one and
+  no branch. `grain_off_is_the_exact_identity` binds a *black* tile at strength
+  zero to prove the multiply really is by one.
+- **The grain is anchored to the document, not to the dab.** That is the whole
+  effect: a second stroke lands in the same pits as the first, and a brush
+  dragged across the sheet catches and skips. The fragment shader interpolates
+  the document position for it, and
+  `grain_is_anchored_to_the_paper_and_not_to_the_dab` is the guard.
+- **`Brush::grain_scale` is in document pixels.** Paper does not get coarser
+  when you pick up a bigger pencil.
+- **Its own sampler**, which repeats where the tip's clamps. A paper tile covers
+  the whole document and must wrap; a tip stretched over its dab must not.
+- **It does not touch the blend state.** A grained stroke saturates under
+  overlap exactly as a plain one does, and builds up if — and only if — the
+  brush asked to.
+
+Three papers ship, generated rather than photographed.
+`assets/patterns/LICENSES.md` records why, and
+`crates/umber-core/examples/build-bitmaps.rs` is the source. `GrainPattern` is a
+closed enum rather than a name because `Brush` is `Copy` — the same constraint
+that makes `ResponseCurve` a fixed array of samples.
+
+## Tips in the shipped library
+
+`BrushPreset::tip` used to resolve against the *user's* library only, so nothing
+shipped could carry a stamp. It now falls through to `tip::builtin`, which
+decodes an `include_bytes!` table generated from the files in
+`crates/umber-core/assets/tips/`. Both sources hand back an `Arc<TipMask>` that
+is stable for the life of the process, which is what `CanvasRenderer::set_tip`'s
+identity check needs.
+
+One shipped brush uses it: **Stipple chalk**, a sparse speckle Umber drew.
+Sparse on purpose — a dense silhouette would paint identically under either
+coverage rule and would demonstrate nothing. Its brightest texel is 0.44, so it
+ships with `build_up` set, and
+`a_shipped_stamp_paints_at_the_strength_it_was_drawn_at` checks that flag
+against the measurement rather than against anybody's memory.
+
+Adding a stamp is dropping an 8-bit greyscale PNG into that directory and
+re-running `cargo run -p umber-core --example build-bitmaps`, which rewrites the
+table from the listing. The table *is* the listing, so a file that is not there
+is not in the binary and one that is cannot be forgotten.
+
 ## Not done yet
 
-- **A licensed `.gbr` pack to ship.** The machinery is complete — a stamp brush
-  can be imported, saved, reloaded and painted with — but nothing ships with
-  one. The one CC0 pack whose licence *is* stated inside the download is a raw
-  photographic-texture resource whose brushes rely on GIMP's per-dab build-up,
-  which Umber's `max` coverage cannot reproduce; see `docs/brush-sources.md` for
-  the measurement. The `.gbr` decoder is tested against files built byte by byte
-  in the test module rather than against a real brush.
-- **Tips in the *shipped* library.** `BrushPreset::tip` resolves against the
-  user's library only. Shipping a stamp would additionally need the masks
-  embedded in the binary — a generated `assets/tips/` and an `include_bytes!`
-  table beside `builtin-brushes.ron` — and a rule in the generator for which of
-  a pack's tips are dense enough to reproduce faithfully. Neither is built,
-  because there is nothing yet to point them at.
-- **A stamp brush's row in the library looks round.** `widgets::brush_row`
-  paints its sample from opacity and hardness, which is what a procedural dab
-  is made of. The brush editor shows the mask; the list does not.
-- **Grain / paper texture** multiplied into dab coverage.
-- **Elliptical tips.** The tip is stretched over the dab's bounding square, so a
-  non-square mask loses its aspect ratio. The dab carries a single radius and
-  has nowhere to record one.
+- **A third-party `.gbr` pack to ship.** The machinery is complete — a stamp
+  brush can be imported, saved, reloaded, painted with, embedded and shipped —
+  and the build-up problem that blocked the one licence-clearing CC0 pack is
+  solved. What remains for that pack is curation rather than engine work; see
+  `docs/brush-sources.md`. The `.gbr` decoder is still tested against files
+  built byte by byte in the test module rather than against a real brush.
+- **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
+  and reading a fourth off disk needs a variant that names a file.
 - **Ellipticity driven by an input**, and scatter driven by pen speed — see
   "What conversion loses" above for why each was left alone rather than
   approximated.
@@ -353,7 +482,7 @@ never does anything.
 
 ## What a user can set
 
-The brush editor has four sections, following the design's naming where it has
+The brush editor has five sections, following the design's naming where it has
 a name for the thing:
 
 | Section | Holds |
@@ -361,17 +490,23 @@ a name for the thing:
 | Tip | size, hardness, opacity, spacing, airbrush rate, roundness, angle, angle-follows-stroke, stabilisation |
 | Dynamics | pressure source, and pressure → size / opacity / hardness with their curves and floors |
 | Scatter | scatter, size jitter, angle jitter, pressure → scatter |
+| Texture | build-up, paper strength, which paper, tile size |
 | Blending | colour pickup, smear length, pickup radius |
 
 That is every field of `Brush` except `mode`, which is the tool choice (Brush
 or Eraser) rather than a brush setting, and is on the tool rail.
 
-Two of the design's six sections are not drawn at all rather than drawn empty:
-**Texture** has no engine behind it (see above) and **Wet edges** has none
-either. **Stabiliser** is one slider and rides on Tip. Colour pickup needed a
-home and none of the design's names is one, so **Blending** is a name of our
-own — filing it under "Wet edges" would have borrowed a term that means
-something else in every application that has it.
+Build-up and the paper share a section deliberately. Both are about a mark made
+of many faint stamps rather than one solid one: grain is what makes it faint,
+and build-up is what lets a second pass make it darker. A textured brush without
+build-up paints one pass and then stops responding, which is the surprise the
+pairing avoids.
+
+One of the design's six sections is still not drawn at all rather than drawn
+empty: **Wet edges** has no engine behind it. **Stabiliser** is one slider and
+rides on Tip. Colour pickup needed a home and none of the design's names is one,
+so **Blending** is a name of our own — filing it under "Wet edges" would have
+borrowed a term that means something else in every application that has it.
 
 Roundness is shown rather than `dab_ratio`, because that is the design's word
 and every other paint application's; the two are reciprocals. Angle and angle

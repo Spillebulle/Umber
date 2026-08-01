@@ -70,22 +70,49 @@ better.
   "All Brushes in this Package are created by me. You can use this resource for
   whatever you want without any restrictions." That is a licence statement
   inside the download, which is what the rule at the top of this file asks for.
-- **Not shipped anyway.** Three reasons, and the first is the one that decides
-  it:
+- **Not shipped yet.** It used to be three reasons, and the first of them was
+  the one that decided it. That one is now **answered**:
 
-  1. **Umber cannot paint them the way GIMP does.** These are photographic
-     texture stamps, sparse and faint — the ones sampled run from 2 % to 5 %
-     mean coverage. GIMP composites every dab, so a stroke at the pack's own
-     spacing builds up to solid. Umber takes a `max` of coverage across the
-     whole stroke and applies opacity once at commit (the wet-layer design in
-     `CLAUDE.md`), so it cannot build up at all. Stamping `Organic/Organic_000`
-     along a line at the file's spacing reaches **1.00** coverage compositing
-     and **0.48** taking a max — a stroke half as strong as the author's. That
-     is the same standard the generator already holds MyPaint brushes to:
-     nothing shipped under an author's name should paint unlike their brush.
-     Note the standard for a brush the *user* imports is deliberately the
-     opposite — an approximation of a brush you chose beats a refusal — and
-     these import perfectly well.
+  1. ~~**Umber cannot paint them the way GIMP does.**~~ **Fixed.** These are
+     photographic texture stamps, sparse and faint — the ones sampled run from
+     2 % to 12 % mean coverage. GIMP composites every dab, so a stroke at the
+     pack's own spacing builds up to solid. Umber took a `max` of coverage
+     across the whole stroke, which caps a stroke at the mask's own brightest
+     texel however long it is, so `Organic/Organic_000` — peak texel 125 of 255
+     — could never paint stronger than **0.49** where its author's stroke
+     reaches solid.
+
+     `Brush::build_up` now selects a second coverage blend,
+     `a = cov + a(1 - cov)`, which is per-dab compositing exactly. The
+     measurement is reproducible rather than remembered:
+
+     ```sh
+     cargo run -p umber-core --example measure-stamp -- <files>.gbr
+     ```
+
+     | Stamp | Size | Mean | Peak texel | Stroke under `max` | Stroke building up |
+     |---|---|---|---|---|---|
+     | `Organic/Organic_000` | 512×512 | 0.053 | 0.490 | **0.490** | **0.907** |
+     | `Organic/Organic_001` | 512×512 | 0.042 | 0.514 | 0.514 | 0.900 |
+     | `Dots/Dots_000` | 232×232 | 0.023 | 0.808 | 0.808 | 0.920 |
+     | `Aqua/Aqua_001` | 394×487 | 0.122 | 0.745 | 0.745 | 0.996 |
+     | `Shapes/Shapes_001` | 348×348 | 0.085 | 0.839 | 0.839 | 0.981 |
+     | `Opaque/Opaque_000` | 110×113 | 0.357 | 1.000 | 1.000 | 1.000 |
+     | `Spot/Spot_000` | 36×36 | 0.380 | 1.000 | 1.000 | 1.000 |
+     | `Fuzzy/Fuzzy_000` | 256×246 | 1.000 | 1.000 | 1.000 | 1.000 |
+
+     "Stroke" is the peak coverage a straight line of stamps at the file's own
+     spacing reaches, measured by `umber_core::tip::stroke_coverage`. Nine of
+     the twenty-four sampled — two from every folder — need build-up; the
+     others are dense enough that the two rules agree and they stay on the
+     cheaper `max` path, where a stroke crossing itself also stays even. **No
+     stamp in the sample is too faint to accumulate.** `gbr::to_brush` runs the
+     measurement per file and sets `build_up` from it, so this is a decision the
+     importer makes rather than one a person has to remember.
+
+     Note that the peak under `max` is always exactly the mask's brightest
+     texel. That is not a coincidence and it is the whole argument: a `max`
+     blend cannot produce a value no dab contained.
   2. **It is raw material, and says so.** The README calls it "a 'raw' resource
      (not adjusted or proofed) meant to help people creating their own custom
      brushes". Every brush has an empty name field and a spacing of 0, so a
@@ -95,10 +122,11 @@ better.
      commit (`16b7899`, 2024-08-27) and still download the whole thing to keep
      a dozen files.
 
-  Reasons 2 and 3 are answerable — curate the dense folders (`Opaque` and `Spot`
-  average 91 and 97 mean coverage and would reproduce faithfully), name them by
-  folder, pin the commit. Reason 1 is answerable only by giving the dab pass a
-  build-up mode, which is a change to the wet-layer design and not a brush job.
+  Reasons 2 and 3 are ordinary work — curate a folder, name the brushes by
+  hand, pin the commit in `tools/fetch-brushes.ps1` — and they are what stands
+  between this pack and the library now. The engine is no longer the obstacle:
+  the fourth step below is built, and `assets/tips/` ships Umber's own stamp
+  through it as proof.
 
 ### OpenGameArt — 60 free GIMP/Krita brushes (rubberduck)
 
@@ -122,8 +150,20 @@ better.
 
 ### CC0 paper and grain textures (ambientCG, Poly Haven, Texture Ninja)
 
-- **Skipped for now.** Umber has no grain channel in the dab pass yet, so there
-  is nothing to point them at.
+- **Skipped**, and now on the licence rule rather than for want of a feature.
+  The dab pass has a grain channel; what these do not have is a licence
+  statement *inside the download*. All three state CC0 on a web page beside the
+  file, which is exactly the case the rule at the top of this document covers.
+- Umber ships three papers of its own instead, drawn by
+  `crates/umber-core/examples/build-bitmaps.rs` and recorded in
+  `assets/patterns/LICENSES.md`. Two things fall out of generating them that a
+  photograph would not have given: they **tile by construction** — the noise
+  lattice wraps, and a seam would draw a grid across every textured mark, since
+  the grain is anchored to the document — and three of them are 200 kB rather
+  than megabytes.
+- A photographic set is still worth having, and the way in is somebody
+  satisfying themselves about a particular download and dropping the files into
+  `assets/patterns/`. The project will not claim a licence it cannot check.
 
 ## Adding a pack
 
@@ -138,11 +178,19 @@ better.
 The test `every_shipped_preset_is_usable_and_attributed` fails if any shipped
 preset has no credit, which is the backstop for step 2.
 
-**A pack of bitmap tips needs a fourth step that does not exist yet.** The
-shipped library is a single embedded RON, so there is nowhere in it for a
-bitmap: `BrushPreset::tip` resolves against the *user's* library only. Shipping
-stamps means the generator also writing the masks to
-`crates/umber-core/assets/tips/` and an `include_bytes!` table beside them, and
-deciding — measurably, not by eye — which of a pack's tips reproduce faithfully
-under a `max`-coverage stroke. See the Gimp Brushcollection entry above for why
-that measurement is the part that matters.
+**A pack of bitmap tips has a fourth step.** `BrushPreset::tip` used to resolve
+against the *user's* library only, so there was nowhere in the shipped set to
+put a bitmap. There now is:
+
+4. Put the masks in `crates/umber-core/assets/tips/` as 8-bit greyscale PNGs and
+   name them in `TIPS` in `crates/umber-core/src/tip.rs`, which is an
+   `include_bytes!` table beside `builtin-brushes.ron`. A preset's `tip` field
+   resolves against the shipped table first and the user's library second, so a
+   shipped stamp and a user's own are the same mechanism.
+
+   Whether a tip reproduces faithfully is **measured**, by
+   `umber_core::tip::stroke_coverage`, and it is now a question with two
+   answers rather than one: a dense stamp ships on the `max` path and a sparse
+   one ships with `build_up` set. Only a mask too faint for eight-bit coverage
+   to accumulate — `StrokeCoverage::is_usable` — is refused, and nothing
+   sampled from the packs above comes close to that.

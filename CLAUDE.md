@@ -71,11 +71,32 @@ Invariants that are easy to break:
   paints. This was a real bug; `erasing_removes_coverage` guards it.
 - **The dab pass loads rather than clears.** The scratch accumulates across
   frames for the whole stroke; only new dabs are drawn each frame.
+- **`Brush::build_up` is the one exception to the `max`, and it is a *blend
+  state*, not a shader branch.** A sparse texture stamp's mark is the overlap of
+  many faint stamps — GIMP and Krita composite every dab — so a `max` caps a
+  stroke at the mask's own brightest texel and paints half the author's mark.
+  Build-up swaps the coverage target for `a = cov + a(1 − cov)`. The dab shader
+  is byte for byte identical either way, and nothing downstream sees it: the
+  scratch still holds coverage in 0..1, so composite and commit are untouched
+  and opacity is still applied exactly once. The `max` path is the default and
+  stays exactly as it was. Build-up is only meaningful where a dab is not solid
+  — a bitmap tip, grain, or a pressure-opacity ramp — which is why no MyPaint
+  brush uses it.
+- **There are four dab pipelines**, from two independent binary choices
+  (per-dab colour, build-up), built by one loop over one descriptor rather than
+  four copies of it. `DabStyle` carries both and must be the same for every
+  frame of a stroke.
+- **Grain multiplies coverage and is anchored to the *document*.**
+  `mix(1.0, tile, strength)`, so a strength of zero is the exact identity — a
+  brush with no paper pays one multiply by one and no branch. Document-anchored
+  is the whole effect: a second stroke lands in the same pits as the first. It
+  needs its **own repeating sampler** — a paper tile covers the document and has
+  to wrap, where a tip stretched over its dab must not.
 - **A smudging stroke writes a *second* scratch target, holding a colour per
-  dab.** Coverage keeps its `max` blend — the anti-compounding guarantee above
+  dab.** Coverage keeps its blend — the anti-compounding guarantee above
   is untouched — while colour blends `over`, so the smear trails along the
-  stroke instead of averaging everything the brush picked up. Two dab pipelines
-  exist for this; the ordinary one writes a single attachment and is the fast
+  stroke instead of averaging everything the brush picked up. The coloured
+  pipelines write two attachments; the ordinary ones write one and are the fast
   path. `StrokeStyle::per_dab_color` must match what `draw_dabs` was told, for
   the whole stroke: turning it on midway leaves the earlier dabs with no colour
   recorded, and they commit as the flat palette colour while the rest smudge.
@@ -207,14 +228,22 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   Changing a tip mid-stroke would restamp what is already in the scratch under a
   new shape, and the failure direction of the guard is a *stale* tip —
   `a_second_brush_with_a_different_tip_replaces_the_first`.
-- **A non-square tip is padded, not squashed.** The dab spreads a tip over its
-  bounding box, and `dab_ratio`'s long axis is the dab's *x* axis, so keeping a
-  portrait mask's proportions with the ratio would mean rotating it a quarter
-  turn and rotating it back. Padding is exact and leaves the ratio to the user.
-- **Nothing shipped carries a tip, and the shipped library cannot hold one.**
-  `builtin-brushes.ron` is embedded text; masks would need an `assets/tips/` and
-  an `include_bytes!` table. Do not add either speculatively — the reason there
-  is no pack is recorded, with a measurement, in `docs/brush-sources.md`.
+- **A non-square tip keeps its own proportions, via a per-pass uniform.**
+  `tip_scale` is the mask's dimensions with the longer normalised to 1, and the
+  vertex shader scales the quad's axes by it — which is exactly the geometry
+  padding the mask into a square used to produce, minus the empty margin and the
+  padded texture. It does *not* go through `dab_ratio`: the ratio's long axis is
+  the dab's *x* axis, so a portrait mask would have to be rotated a quarter turn
+  and rotated back, and the ratio is the user's to squash a stamp with.
+  `tip_scale` is `(1, 1)` with no tip, which is the exact identity.
+- **A tipped dab has an angle whatever its roundness**, because a bitmap is not
+  rotationally symmetric. `Brush::dab_has_angle` answers only the elliptical
+  half — the tip is a *name* the editor resolves — so the UI combines it with
+  `Editor::tip`.
+- **The shipped library can carry masks**, through `tip::builtin` and the
+  generated `tip_table.rs`. `BrushPreset::tip` resolves against the user's
+  library first and the shipped table second. The table is generated from the
+  directory listing by `examples/build-bitmaps.rs`; do not hand-edit it.
 - **Key dispatch happens at the winit level, before egui sees a keystroke**, so
   every text field outside the canvas has to suspend it via
   `shortcuts::set_capturing`. Without that, typing "brush" into a search box
@@ -277,10 +306,14 @@ raising `dab_ratio` narrows the dab rather than growing it.
 - **Antialiasing is sized from the *short* axis.** It is the demanding one: a
   chisel two pixels across needs the same softening a two-pixel round brush
   does.
-- **Scatter must widen the damaged rect.** `StrokeBuilder::bounds` unions the
-  circumscribing circle of the *scattered* dab. Too tight and the edge of a
-  spray is never committed — it redraws as a live preview and is then baked in
-  by the next stroke, in that stroke's colour.
+- **The damaged rect must cover the dab's *quad*, not its circle.**
+  `StrokeBuilder::bounds` unions the axis-aligned box of the rotated quad of the
+  *scattered* dab. Too tight and the edge of a mark is never committed — it
+  redraws as a live preview and is then baked in by the next stroke, in that
+  stroke's colour, and that has now happened three times. A round dab fits its
+  bounding square at any angle, which is why the circle held until bitmap tips
+  arrived: **a tip paints into the corners**, and a quad turned 45° reaches
+  `radius * sqrt(2)`.
 - **The scatter RNG is seeded per stroke, never from the clock.** A stroke has
   to redraw identically, or every pixel test involving a scattering brush
   becomes flaky and undo/redo would not reproduce the same marks.
@@ -351,7 +384,7 @@ page — go by it.
 
 Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
-brush editor's Texture and Wet edges sections, Palette and Harmony picker modes,
+brush editor's Wet edges section, Palette and Harmony picker modes,
 twelve of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
 listed with its reason in the README. **Do not add UI for features that do not work** — a
 disabled control with an explanatory tooltip is better than a live one that
@@ -388,16 +421,20 @@ design shows a whole row of them.
 - Watch for `powf` on a value that can go slightly negative — `sin(PI)` in f32
   is just below zero, and a negative base with a fractional exponent is NaN,
   which ecolor's `gamma_multiply` asserts on. This has already bitten once.
-- **The brush editor's sections are Tip, Dynamics, Scatter and Blending.** The
-  design names six; Texture and Wet edges have no engine behind them and are not
+- **The brush editor's sections are Tip, Dynamics, Scatter, Texture and
+  Blending.** The design names six; Wet edges has no engine behind it and is not
   drawn at all, Stabiliser is one slider and rides on Tip, and Blending is a
   name of our own because colour pickup needed a home and none of the design's
-  is one. Between them they expose every field of `Brush` — adding one means
-  adding a control, or the library can use a brush nobody can make.
+  is one. Texture holds the paper *and* build-up, because both are about a mark
+  made of many faint stamps rather than one solid one. Between them they expose
+  every field of `Brush` — adding one means adding a control, or the library can
+  use a brush nobody can make.
 - **The brush list's samples are stamped from the brush**, not drawn from two of
   its numbers. `widgets::brush_sample` is a miniature dab loop under a pressure
   ramp; it seeds its RNG identically on every row, so two rows differ because
-  their settings differ and the list does not shimmer as it scrolls.
+  their settings differ and the list does not shimmer as it scrolls. A stamp
+  brush draws its *mask*, from one texture per mask cached by `Arc` identity and
+  one mesh per row — not one texture per row, and never one per stamp.
 - `ResponseCurve` is a fixed array of evenly spaced samples, not free control
   points. That keeps `Brush` `Copy`, makes sampling a lerp with no search, and
   means the editor's handles move only vertically — so the curve can never be

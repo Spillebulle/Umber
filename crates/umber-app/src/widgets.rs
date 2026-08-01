@@ -9,7 +9,8 @@ use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
-use umber_core::{Brush, ResponseCurve};
+use std::sync::Arc;
+use umber_core::{Brush, ResponseCurve, TipMask};
 
 /// Narrowest anything here will draw itself.
 ///
@@ -328,6 +329,14 @@ pub struct BrushRow<'a> {
     /// drawn from. The library is 201 presets deep and the sample is how you
     /// choose between them, so it has to show what actually separates them.
     pub brush: &'a Brush,
+    /// The stamp this brush lays down, if it has one.
+    ///
+    /// Without it a stamp brush's row is a row of circles, which is the same
+    /// flattery that made two hundred rows look like one row repeated when the
+    /// sample was drawn from opacity and hardness alone. A stamp is
+    /// unrecognisable from its numbers and unmistakable the moment it makes a
+    /// mark.
+    pub tip: Option<&'a Arc<TipMask>>,
     pub selected: bool,
     /// One the user saved, as opposed to one Umber ships. Marked with a dot
     /// rather than a word, because the panel is 264 px wide.
@@ -371,7 +380,7 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
         pos2(rect.left() + 7.0 + 32.0, rect.center().y),
         vec2(64.0, sample_h),
     );
-    brush_sample(painter, p, sample, row.brush);
+    brush_sample(painter, p, sample, row.brush, row.tip);
 
     // A dot marks the rows that are yours — the ones the browser will let you
     // rename and delete.
@@ -443,11 +452,30 @@ impl Scatter {
 /// each stamp is the ellipse the engine would lay down. It is not a simulation
 /// — there is no wet layer, so overlaps here do compound where the canvas would
 /// saturate — but every difference it *does* show is a real one.
-fn brush_sample(painter: &egui::Painter, p: &Palette, sample: Rect, brush: &Brush) {
+fn brush_sample(
+    painter: &egui::Painter,
+    p: &Palette,
+    sample: Rect,
+    brush: &Brush,
+    tip: Option<&Arc<TipMask>>,
+) {
     // Scatter and jitter throw stamps off the line, and the sample sits inside
     // a row that also holds a name. Clip rather than clamp: a spray squashed
     // back onto its own axis is a spray that looks like a line.
     let painter = painter.with_clip_rect(sample.expand2(vec2(2.0, 3.0)));
+
+    // A stamp brush's mark is its mask, so the row draws the mask. One texture
+    // per *mask* — not per row and not per stamp — cached by `Arc` identity, so
+    // two brushes cut from one stamp share one upload exactly as they do on the
+    // GPU. Everything else below is unchanged, including the RNG seeding: two
+    // rows still differ because their settings differ.
+    let stamp = tip.and_then(|mask| row_tip_texture(painter.ctx(), mask, p.text_strong));
+    // One mesh for the whole row rather than one per stamp. The list is 201
+    // presets deep, and this is the drawing path.
+    let mut mesh = stamp
+        .as_ref()
+        .map(|texture| egui::Mesh::with_texture(texture.id()));
+    let (tsx, tsy) = tip.map_or((1.0, 1.0), |mask| mask.aspect());
 
     let radius = sample.height() * 0.5;
     // Spacing is a fraction of the diameter, so this is the real dab count for
@@ -518,6 +546,16 @@ fn brush_sample(painter: &egui::Painter, p: &Palette, sample: Rect, brush: &Brus
         let held = carried * keep.powf(t * 6.0);
         let ink = mix(p.text_strong, p.text_dim, held).gamma_multiply(alpha.clamp(0.0, 1.0));
 
+        if let Some(mesh) = mesh.as_mut() {
+            // The stamp, on the same footing as the engine's: the quad carries
+            // the tip's proportions, `size` is its long axis, and `dab_ratio`
+            // squashes on top of that. A tipped dab has an angle whatever its
+            // roundness — a bitmap is not rotationally symmetric — so this is
+            // also the one place jitter shows on a round-ratio brush.
+            push_stamp(mesh, centre, vec2(r * tsx, r * tsy / aspect), angle, ink);
+            continue;
+        }
+
         if aspect > 1.05 {
             // A 10:1 dab whose long axis fits a 14 px row has a short axis of
             // less than a pixel. The floor is legibility, not flattery: below
@@ -534,6 +572,111 @@ fn brush_sample(painter: &egui::Painter, p: &Palette, sample: Rect, brush: &Brus
             painter.circle_filled(centre, r, ink);
         }
     }
+
+    // One shape for the whole row's stamps, added last so it sits where the
+    // circles would have.
+    if let Some(mesh) = mesh
+        && !mesh.indices.is_empty()
+    {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+/// Add one rotated, tinted copy of the tip texture to `mesh`.
+///
+/// `half` is the quad's semi-axes before rotation, so the tip's proportions and
+/// the brush's roundness are both already in it.
+fn push_stamp(mesh: &mut egui::Mesh, centre: egui::Pos2, half: Vec2, angle: f32, tint: Color32) {
+    let (sin, cos) = angle.sin_cos();
+    let base = mesh.vertices.len() as u32;
+    for (sx, sy, u, v) in [
+        (-1.0, -1.0, 0.0, 0.0),
+        (1.0, -1.0, 1.0, 0.0),
+        (1.0, 1.0, 1.0, 1.0),
+        (-1.0, 1.0, 0.0, 1.0),
+    ] {
+        let (x, y) = (sx * half.x, sy * half.y);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: centre + vec2(x * cos - y * sin, x * sin + y * cos),
+            uv: pos2(u, v),
+            color: tint,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// The row-sized thumbnail of one mask, cached by `Arc` identity and ink.
+///
+/// In egui's temporary store rather than in a field, because the sample is
+/// painted from a `Painter` deep inside a scroll area and the alternative is
+/// threading a cache through every call site. Keyed by ink as well as by mask so
+/// that switching theme does not leave every stamp row the old colour.
+fn row_tip_texture(
+    ctx: &egui::Context,
+    mask: &Arc<TipMask>,
+    ink: Color32,
+) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("brush-row-tip", Arc::as_ptr(mask) as usize));
+    let cached: Option<(Arc<TipMask>, Color32, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+    if let Some((held, held_ink, texture)) = cached
+        && Arc::ptr_eq(&held, mask)
+        && held_ink == ink
+    {
+        return Some(texture);
+    }
+    let texture = ctx.load_texture(
+        "brush-row-tip",
+        tip_image(mask, ink, ROW_TIP_TEXELS),
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(id, (Arc::clone(mask), ink, texture.clone())));
+    Some(texture)
+}
+
+/// Widest a mask is downsampled to for a library row.
+///
+/// The row's sample is 14 points tall and holds up to forty stamps, so 32 texels
+/// is already more than the screen can show. It is also what keeps the upload
+/// small enough to do eagerly the first time a stamp row scrolls into view.
+const ROW_TIP_TEXELS: u32 = 32;
+
+/// Box-average a coverage mask down to a thumbnail, tinted with an ink.
+///
+/// Coverage becomes *alpha* rather than luminance, so a stamp reads the same way
+/// on either theme and an empty texel is the surface behind it rather than
+/// black. Box-averaged rather than point-sampled: a sparse spatter tip shown by
+/// nearest neighbour is an empty square about half the time.
+pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage {
+    let scale = (mask.width().max(mask.height()).div_ceil(texels)).max(1);
+    let (w, h) = (
+        mask.width().div_ceil(scale).max(1),
+        mask.height().div_ceil(scale).max(1),
+    );
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for sy in y * scale..((y + 1) * scale).min(mask.height()) {
+                for sx in x * scale..((x + 1) * scale).min(mask.width()) {
+                    sum += u32::from(mask.at(sx, sy));
+                    n += 1;
+                }
+            }
+            // `n` is zero only for a cell entirely past the mask's edge, which
+            // the ceiling division above cannot produce — the guard is there so
+            // an off-by-one here can never be a division by zero.
+            let coverage = sum.checked_div(n).unwrap_or(0) as u8;
+            pixels.push(Color32::from_rgba_unmultiplied(
+                ink.r(),
+                ink.g(),
+                ink.b(),
+                coverage,
+            ));
+        }
+    }
+    egui::ColorImage::new([w as usize, h as usize], pixels)
 }
 
 /// Points around an ellipse with semi-axes `a` (along `angle`) and `b`.

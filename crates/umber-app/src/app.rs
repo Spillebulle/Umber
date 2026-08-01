@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch, PixelRect};
-use umber_render::{CanvasRenderer, CompositeParams, Gpu, ProbeParams};
+use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -129,7 +129,10 @@ impl UmberApp {
         }
 
         let bounds = self.editor.stroke.bounds();
-        let coloured = self.editor.stroke.is_coloured();
+        let dab_style = DabStyle {
+            per_dab_color: self.editor.stroke.is_coloured(),
+            build_up: self.editor.stroke.builds_up(),
+        };
         self.editor.stroke.end();
         self.editor.interaction = Interaction::Idle;
 
@@ -154,7 +157,7 @@ impl UmberApp {
         let tail: Vec<Dab> = self.editor.stroke.drain_pending().collect();
         if !tail.is_empty() {
             canvas.begin_frame();
-            canvas.draw_dabs(&gfx.gpu.device, &gfx.gpu.queue, &mut enc, &tail, coloured);
+            canvas.draw_dabs(&gfx.gpu.device, &gfx.gpu.queue, &mut enc, &tail, dab_style);
         }
 
         let Some(rect) = bounds.to_pixels_clamped(self.editor.doc.size) else {
@@ -240,6 +243,16 @@ impl UmberApp {
             // Cheap when the brush has not changed: `set_tip` compares the mask
             // by identity and returns without touching the GPU.
             canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
+
+            // The paper, on the same footing and for the same reasons: one
+            // binding per pass, changed only between strokes. Read off the
+            // *snapshotted* brush, so changing the Texture sliders mid-stroke
+            // cannot re-texture the half already painted.
+            let grain = self.editor.stroke.grain().and_then(|(strength, scale)| {
+                let key = self.editor.brush.grain_pattern.key();
+                umber_core::tip::pattern(key).map(|tile| (tile.clone(), strength, scale))
+            });
+            canvas.set_grain(&gfx.gpu.device, &gfx.gpu.queue, grain);
 
             let mut enc = gfx
                 .gpu
@@ -757,7 +770,10 @@ impl UmberApp {
             return;
         };
         canvas.begin_frame();
-        let coloured = self.editor.stroke.is_coloured();
+        let dab_style = DabStyle {
+            per_dab_color: self.editor.stroke.is_coloured(),
+            build_up: self.editor.stroke.builds_up(),
+        };
         if self.editor.stroke.pending_len() > 0 {
             let dabs: Vec<_> = self.editor.stroke.drain_pending().collect();
             canvas.draw_dabs(
@@ -765,7 +781,7 @@ impl UmberApp {
                 &gfx.gpu.queue,
                 &mut encoder,
                 &dabs,
-                coloured,
+                dab_style,
             );
         }
 
@@ -850,7 +866,9 @@ impl UmberApp {
         // The probe's copy is only submitted now, so mapping it has to wait
         // until here. Collecting is a non-blocking poll: whatever came home
         // feeds the stroke, and whatever did not is picked up next frame.
-        if coloured && let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id()) {
+        if dab_style.per_dab_color
+            && let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id())
+        {
             canvas.submit_probes();
             if let Some(sample) = canvas.take_probe(&gfx.gpu.device) {
                 self.editor.stroke.absorb(sample);

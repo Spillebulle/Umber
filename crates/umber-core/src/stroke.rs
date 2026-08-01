@@ -201,6 +201,32 @@ impl StrokeBuilder {
         self.brush.smudges()
     }
 
+    /// Whether this stroke's dabs accumulate coverage instead of saturating.
+    ///
+    /// Read off the brush snapshotted at [`Self::begin`] rather than off the
+    /// live one, for the same reason the colour is: the dab pass picks a
+    /// pipeline from this every frame, and a stroke that changed pipeline
+    /// halfway would have its first half drawn under one rule and its second
+    /// under the other.
+    pub fn builds_up(&self) -> bool {
+        self.brush.build_up
+    }
+
+    /// The grain this stroke bites through, as `(strength, tile size)`.
+    ///
+    /// `None` when the brush asks for none, which is the signal to the renderer
+    /// to leave the grain binding at its 1×1 placeholder and multiply by one.
+    pub fn grain(&self) -> Option<(f32, f32)> {
+        self.brush.has_grain().then(|| {
+            (
+                self.brush.grain.clamp(0.0, 1.0),
+                self.brush
+                    .grain_scale
+                    .clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE),
+            )
+        })
+    }
+
     /// Where the next canvas sample should be taken, and how wide.
     ///
     /// `None` when the brush does not smudge, which is the common case and the
@@ -426,12 +452,29 @@ impl StrokeBuilder {
             angle,
         });
 
-        // Bounded by the circumscribing circle of the *scattered* dab. The long
-        // axis is `radius` whatever the aspect, so this covers the ellipse at
-        // every angle without having to work out where it actually points —
-        // and an under-tight bound here is a stroke whose edge is not committed
-        // and reappears as a ghost on the next stroke.
-        self.bounds.union_circle(centre, radius);
+        // Bounded by the axis-aligned box of the *scattered* dab's quad, which
+        // is exactly what the rasteriser can touch.
+        //
+        // The circumscribing circle is not enough, and this is the third time
+        // an under-tight damaged rect has bitten this project: coverage left
+        // outside it stays in the scratch, redraws as a live preview, and is
+        // then baked in by the *next* stroke wearing that stroke's colour. A
+        // round dab does fit inside its bounding square at any angle, so the
+        // old bound held — but a **bitmap tip paints into the quad's corners**,
+        // and a rotated quad's corners reach out to `radius * sqrt(2)`. Any
+        // stamp brush with an angle or angle jitter was losing its edges.
+        //
+        // Exact for a tip and merely conservative for a round dab, and for an
+        // unrotated ellipse it is *tighter* than the circle was.
+        let (sin, cos) = angle.sin_cos();
+        let short = radius / self.brush.dab_ratio.max(1.0);
+        self.bounds.union_box(
+            centre,
+            Vec2::new(
+                (radius * cos).abs() + (short * sin).abs(),
+                (radius * sin).abs() + (short * cos).abs(),
+            ),
+        );
     }
 
     /// The colour this dab deposits: the palette colour, pulled towards

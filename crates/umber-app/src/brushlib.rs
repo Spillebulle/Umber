@@ -684,6 +684,15 @@ fn list(
                     ""
                 },
                 brush: &preset.brush,
+                // Resolved per row, but only for the handful of presets that
+                // name a stamp: `tip` is `None` on every round brush, so this
+                // is a null check on two hundred of the two hundred and one
+                // rows and one map lookup on the rest. Same two-step as
+                // `Editor::apply_preset` — the user's library, then Umber's.
+                tip: preset
+                    .tip
+                    .as_deref()
+                    .and_then(|name| ed.tips.get(name).or_else(|| umber_core::tip::builtin(name))),
                 selected: ed.active_preset == Some(i),
                 user,
                 height,

@@ -334,6 +334,23 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         min_scatter_ratio,
         scatter_curve,
         radius_jitter,
+        // MyPaint composites every dab, so it is tempting to import all 196 of
+        // these with build-up on. It would be wrong, and mostly a no-op.
+        //
+        // Umber applies `Brush::opacity` once at commit, so an ordinary MyPaint
+        // dab arrives here with a per-dab coverage of exactly 1.0 — and
+        // building up from 1.0 is the same as taking a max of it. The only
+        // brushes it would touch are the ones whose coverage genuinely varies
+        // per dab, where it would deepen a light pressure ramp into something
+        // MyPaint does not draw either, because MyPaint's build-up is on
+        // *opacity* and Umber's opacity is not in the dab. Build-up earns its
+        // keep where a dab is sparse by construction — a bitmap tip, or grain —
+        // which is precisely what a `.myb` never has.
+        build_up: false,
+        // MyPaint has no paper texture. The `.gbr` packs do.
+        grain: 0.0,
+        grain_scale: Brush::default().grain_scale,
+        grain_pattern: Brush::default().grain_pattern,
     })
 }
 

@@ -3,7 +3,9 @@
 //! # Frame structure
 //!
 //! 1. **Dab pass** — new dabs since the last frame are stamped into a scratch
-//!    coverage texture with `max` blending.
+//!    coverage texture with `max` blending, or — for a brush that asks to build
+//!    up, which a sparse texture stamp must — with each dab compositing over
+//!    the last.
 //! 2. **Composite pass** — the whole layer stack and the scratch are combined
 //!    and drawn to the surface under the camera transform.
 //! 3. **Commit** (at pointer-up only) — the scratch is baked into the active
@@ -18,5 +20,5 @@
 pub mod canvas;
 pub mod gpu;
 
-pub use canvas::{CanvasRenderer, CompositeParams, LayerDraw, ProbeParams, StrokeStyle};
+pub use canvas::{CanvasRenderer, CompositeParams, DabStyle, LayerDraw, ProbeParams, StrokeStyle};
 pub use gpu::Gpu;

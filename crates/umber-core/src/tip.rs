@@ -15,6 +15,8 @@
 //! directory rather than the single RON file it used to be.
 
 use crate::preset::PresetError;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 /// An 8-bit coverage mask, row-major from the top-left.
 ///
@@ -92,39 +94,26 @@ impl TipMask {
         self.coverage[(y * self.width + x) as usize]
     }
 
-    /// The same mask centred — to the nearest texel — in a square of empty
-    /// coverage.
+    /// The mask's proportions, longer side normalised to 1.
     ///
-    /// The dab pass stretches a tip over the dab's bounding box, so a mask that
-    /// is not square comes out squashed. Padding is the fix rather than
-    /// [`crate::Brush::dab_ratio`], for two reasons: the ratio's long axis is
-    /// the dab's *x* axis, so a portrait mask would additionally have to be
-    /// rotated by a quarter turn and rotated back by `dab_angle`, and the ratio
-    /// is the user's setting — spending it on the file's proportions would mean
-    /// a stamp brush could never be deliberately squashed. The cost is shading
-    /// an empty margin, which for the near-square masks brush packs actually
-    /// contain is a few per cent.
+    /// A non-square mask used to be **padded into a square**, because the dab
+    /// stretched whatever it was given over its bounding box. The recorded
+    /// reason for padding rather than using [`crate::Brush::dab_ratio`] still
+    /// stands — the ratio's long axis is the dab's *x* axis, so a portrait mask
+    /// would have to be rotated a quarter turn and rotated back, and the ratio
+    /// is the user's setting rather than the file's — but it turns out not to
+    /// be a choice between those two.
     ///
-    /// Already-square masks are returned unchanged.
-    pub fn padded_to_square(self) -> Self {
-        let side = self.width.max(self.height);
-        if self.width == side && self.height == side {
-            return self;
-        }
-        let x0 = (side - self.width) / 2;
-        let y0 = (side - self.height) / 2;
-        let mut coverage = vec![0u8; side as usize * side as usize];
-        for y in 0..self.height {
-            let src = (y * self.width) as usize;
-            let dst = ((y + y0) * side + x0) as usize;
-            coverage[dst..dst + self.width as usize]
-                .copy_from_slice(&self.coverage[src..src + self.width as usize]);
-        }
-        Self {
-            width: side,
-            height: side,
-            coverage,
-        }
+    /// The dab pass is now told the tip's proportions directly and shapes its
+    /// quad to match. That is the **same geometry padding produced** (a mask
+    /// padded to side `max(w, h)` and stretched over a square occupies exactly
+    /// `w/side` by `h/side` of it) with three costs removed: no empty margin to
+    /// shade, no padded texture to upload, and `dab_ratio` still free. The
+    /// quarter-turn problem never arises because this scales the dab's own
+    /// axes rather than borrowing the ratio.
+    pub fn aspect(&self) -> (f32, f32) {
+        let long = self.width.max(self.height) as f32;
+        (self.width as f32 / long, self.height as f32 / long)
     }
 
     /// Encode as an 8-bit greyscale PNG — how a tip is stored in the library.
@@ -198,6 +187,182 @@ impl TipMask {
     }
 }
 
+/// Every mask Umber ships, by name, decoded once.
+///
+/// The shipped library is an embedded RON and a bitmap does not go in a text
+/// file, so the masks are embedded separately and named from
+/// [`crate::BrushPreset::tip`] exactly as a user's own are. Naming rather than
+/// embedding-per-preset is what lets two shipped brushes cut from one stamp
+/// share a file and a single GPU upload.
+///
+/// The `Arc`s are stable for the life of the process, which
+/// `CanvasRenderer::set_tip` depends on: it compares tips by pointer identity to
+/// decide whether the GPU upload can be skipped, and a fresh `Arc` per lookup
+/// would put a texture allocation on the first frame of every stroke.
+///
+/// A shipped file that will not decode is dropped rather than fatal —
+/// `every_shipped_tip_decodes_and_makes_a_mark` is what stops one reaching a
+/// release — because a brush that paints round is a far better outcome than a
+/// binary that will not start.
+pub fn builtin_tips() -> &'static BTreeMap<&'static str, Arc<TipMask>> {
+    static TIPS: OnceLock<BTreeMap<&'static str, Arc<TipMask>>> = OnceLock::new();
+    TIPS.get_or_init(|| {
+        crate::tip_table::TIPS
+            .iter()
+            .filter_map(|(name, bytes)| {
+                TipMask::from_png(bytes)
+                    .ok()
+                    .map(|mask| (*name, Arc::new(mask)))
+            })
+            .collect()
+    })
+}
+
+/// The shipped mask a [`crate::BrushPreset::tip`] names, if it is one of ours.
+pub fn builtin(name: &str) -> Option<&'static Arc<TipMask>> {
+    builtin_tips().get(name)
+}
+
+/// Every paper grain Umber ships, by name, decoded once.
+///
+/// The same mechanism as [`builtin_tips`] and the same `Arc` stability
+/// guarantee, because the grain is uploaded and compared the same way. These
+/// are **tiles**: seamless by construction, since the grain is anchored to the
+/// document and repeats across it, and a seam would draw a grid over every
+/// stroke.
+pub fn patterns() -> &'static BTreeMap<&'static str, Arc<TipMask>> {
+    static PATTERNS: OnceLock<BTreeMap<&'static str, Arc<TipMask>>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        crate::pattern_table::PATTERNS
+            .iter()
+            .filter_map(|(name, bytes)| {
+                TipMask::from_png(bytes)
+                    .ok()
+                    .map(|mask| (*name, Arc::new(mask)))
+            })
+            .collect()
+    })
+}
+
+/// The tile a [`crate::brush::GrainPattern`] names.
+pub fn pattern(name: &str) -> Option<&'static Arc<TipMask>> {
+    patterns().get(name)
+}
+
+/// What a straight stroke of one tip reaches, under each of the two coverage
+/// rules the dab pass offers.
+///
+/// The measurement that decides whether a stamp can be shipped, and the reason
+/// it is a function rather than a judgement: a photographic texture stamp looks
+/// dense and is not. See `docs/brush-sources.md`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrokeCoverage {
+    /// Strongest coverage anywhere in the stroke under the wet-layer `max`.
+    ///
+    /// Bounded above by the mask's own brightest texel, whatever the spacing
+    /// and however long the stroke — which is the entire problem.
+    pub under_max: f32,
+    /// The same, with each dab compositing over the last:
+    /// [`crate::Brush::build_up`]. This is what GIMP and Krita draw.
+    pub under_build_up: f32,
+}
+
+impl StrokeCoverage {
+    /// How close the two rules agree, as a fraction. `1.0` is a tip that needs
+    /// no build-up at all.
+    pub fn agreement(&self) -> f32 {
+        if self.under_build_up <= f32::EPSILON {
+            return 1.0;
+        }
+        (self.under_max / self.under_build_up).clamp(0.0, 1.0)
+    }
+
+    /// Whether a `max` stroke of this tip is the same mark a compositing one
+    /// makes, to within a level of 8-bit storage either way.
+    ///
+    /// True for a dense stamp — a solid silhouette, a blot — whose texels
+    /// already reach 1.0, and false for every sparse photographic texture. A
+    /// tip that answers false must be shipped with `build_up` set, or it paints
+    /// at a fraction of the strength its author drew it at.
+    pub fn needs_build_up(&self) -> bool {
+        self.agreement() < 0.98
+    }
+
+    /// Whether the tip makes a usable mark at all once it is allowed to build.
+    ///
+    /// The floor is the `R8Unorm` scratch: a dab weaker than `1/255` rounds
+    /// away and a stroke of them never accumulates, so a mask that faint is a
+    /// brush that paints nothing however hard it is pressed.
+    pub fn is_usable(&self) -> bool {
+        self.under_build_up >= 0.5
+    }
+}
+
+/// Stamp `mask` along a straight line at its own scale and report the peak
+/// coverage under both rules.
+///
+/// The model, deliberately the same one the dab pass implements:
+///
+/// - the tip is stretched over the dab's bounding square, side `max(w, h)`,
+///   with a non-square mask centred in it — exactly what
+///   [`TipMask::aspect`] gives the dab pass, and the same geometry padding the
+///   mask into a square used to produce;
+/// - dabs land every `spacing * side` document pixels;
+/// - `max` takes the strongest texel any dab put at that pixel, and build-up
+///   composites: `a += cov(1 - a)`.
+///
+/// Peak rather than mean, because peak is what an artist reads as "the strength
+/// of the stroke" and because it is the figure a `max` blend caps: no `max`
+/// stroke can ever exceed the mask's brightest texel.
+///
+/// Sampled over one full period of the stamp spacing, well inside the stroke so
+/// that neither end is measured, and over the whole height of the mask.
+pub fn stroke_coverage(mask: &TipMask, spacing: f32) -> StrokeCoverage {
+    let side = mask.width().max(mask.height()) as f32;
+    let step = (spacing.max(0.001) * side).max(1.0);
+    // Enough stamps that a pixel in the sampled period is reached by every dab
+    // whose footprint can contain it, from both sides.
+    let count = (side / step).ceil() as i32 * 2 + 2;
+    // Start far enough in that the sampled period sees a full complement.
+    let base = count / 2;
+
+    // The mask, centred in the square, in texel coordinates.
+    let x0 = (side - mask.width() as f32) * 0.5;
+    let y0 = (side - mask.height() as f32) * 0.5;
+
+    let mut under_max: f32 = 0.0;
+    let mut under_build_up: f32 = 0.0;
+    let period = step.ceil() as i32;
+    let half = (side * 0.5).ceil() as i32;
+
+    for py in -half..=half {
+        for px in 0..period {
+            let x = (base as f32) * step + px as f32;
+            let mut peak: f32 = 0.0;
+            let mut built: f32 = 0.0;
+            for i in 0..count {
+                // Position within the dab's bounding square, then within the
+                // mask sitting centred in it.
+                let u = x - i as f32 * step + side * 0.5 - x0;
+                let v = py as f32 + side * 0.5 - y0;
+                if u < 0.0 || v < 0.0 {
+                    continue;
+                }
+                let cov = mask.at(u as u32, v as u32) as f32 / 255.0;
+                peak = peak.max(cov);
+                built += cov * (1.0 - built);
+            }
+            under_max = under_max.max(peak);
+            under_build_up = under_build_up.max(built);
+        }
+    }
+
+    StrokeCoverage {
+        under_max,
+        under_build_up,
+    }
+}
+
 fn malformed(message: String) -> PresetError {
     PresetError::Malformed(None, message)
 }
@@ -267,31 +432,144 @@ mod tests {
     }
 
     #[test]
-    fn padding_centres_a_mask_without_stretching_it() {
-        // A 2x4 mask becomes 4x4 with its two columns in the middle — a
-        // portrait or landscape stamp has to keep its proportions, and the dab
-        // stretches whatever it is given over a square.
+    fn a_masks_aspect_normalises_its_longer_side() {
+        // What the dab pass multiplies its quad's axes by, and what replaced
+        // padding a stamp into a square. The long side is 1.0 either way round,
+        // because `Brush::size` describes the long axis.
         let tall = TipMask::new(2, 4, vec![9; 8]).expect("build");
-        let square = tall.padded_to_square();
-        assert_eq!((square.width(), square.height()), (4, 4));
-        #[rustfmt::skip]
-        let expected = [
-            0, 9, 9, 0,
-            0, 9, 9, 0,
-            0, 9, 9, 0,
-            0, 9, 9, 0,
-        ];
-        assert_eq!(square.coverage(), expected);
+        assert_eq!(tall.aspect(), (0.5, 1.0));
 
-        // Landscape is the same rule turned on its side.
         let wide = TipMask::new(4, 2, vec![9; 8]).expect("build");
-        let square = wide.padded_to_square();
-        assert_eq!((square.width(), square.height()), (4, 4));
-        assert_eq!(&square.coverage()[..4], [0, 0, 0, 0]);
-        assert_eq!(&square.coverage()[4..12], [9; 8]);
+        assert_eq!(wide.aspect(), (1.0, 0.5));
 
-        // An already-square mask is left exactly alone.
-        let round = TipMask::new(2, 2, vec![1, 2, 3, 4]).expect("build");
-        assert_eq!(round.clone().padded_to_square(), round);
+        // A square mask scales nothing, which is the exact identity the round
+        // path relies on.
+        let square = TipMask::new(2, 2, vec![1, 2, 3, 4]).expect("build");
+        assert_eq!(square.aspect(), (1.0, 1.0));
+    }
+
+    /// A shipped tip that will not decode is a brush that paints round, which
+    /// is a quiet failure. The table is generated from a directory listing, so
+    /// the way to get one is to commit a file that is not a greyscale PNG.
+    #[test]
+    fn every_shipped_tip_decodes_and_makes_a_mark() {
+        assert_eq!(
+            builtin_tips().len(),
+            crate::tip_table::TIPS.len(),
+            "a shipped tip failed to decode"
+        );
+        assert!(!builtin_tips().is_empty(), "the table should not be empty");
+
+        for (name, mask) in builtin_tips() {
+            assert!(
+                stroke_coverage(mask, 0.1).is_usable(),
+                "{name} is too faint to accumulate — it would paint nothing"
+            );
+        }
+    }
+
+    /// Every shipped stamp has to paint at the strength it was drawn at, which
+    /// after the build-up work is a measurable claim rather than a hope.
+    #[test]
+    fn a_shipped_stamp_paints_at_the_strength_it_was_drawn_at() {
+        let stamped: Vec<_> = crate::preset::builtin()
+            .iter()
+            .filter(|p| p.tip.is_some())
+            .collect();
+        assert!(
+            !stamped.is_empty(),
+            "the shipped library carries no stamp brush, so the mechanism is untested"
+        );
+
+        for preset in stamped {
+            let name = preset.tip.as_deref().expect("tip");
+            let mask = builtin(name)
+                .unwrap_or_else(|| panic!("{} names a tip nobody ships: {name}", preset.name));
+            let measured = stroke_coverage(mask, preset.brush.spacing);
+            assert_eq!(
+                preset.brush.build_up,
+                measured.needs_build_up(),
+                "{} is shipped with build_up = {} but measures {measured:?}",
+                preset.name,
+                preset.brush.build_up
+            );
+        }
+    }
+
+    /// The grain is anchored to the document and repeats across it, so a seam
+    /// would draw a grid over every stroke that used it.
+    ///
+    /// Tested as a statistic rather than as an equality: the tiles are noise, so
+    /// neighbouring texels differ everywhere. What must not happen is for the
+    /// pair *across* the seam to differ by more than pairs inside the tile do.
+    #[test]
+    fn every_shipped_pattern_tiles_without_a_seam() {
+        assert_eq!(
+            patterns().len(),
+            crate::pattern_table::PATTERNS.len(),
+            "a shipped pattern failed to decode"
+        );
+
+        for (name, tile) in patterns() {
+            let (w, h) = (tile.width(), tile.height());
+            let step = |a: u8, b: u8| a.abs_diff(b) as f32;
+
+            let interior: f32 = (0..h)
+                .map(|y| step(tile.at(w / 2, y), tile.at(w / 2 + 1, y)))
+                .sum::<f32>()
+                / h as f32;
+            let seam: f32 = (0..h)
+                .map(|y| step(tile.at(w - 1, y), tile.at(0, y)))
+                .sum::<f32>()
+                / h as f32;
+            assert!(
+                seam <= interior * 2.0 + 1.0,
+                "{name} has a vertical seam: {seam:.2} across it, {interior:.2} inside"
+            );
+
+            let interior: f32 = (0..w)
+                .map(|x| step(tile.at(x, h / 2), tile.at(x, h / 2 + 1)))
+                .sum::<f32>()
+                / w as f32;
+            let seam: f32 = (0..w)
+                .map(|x| step(tile.at(x, h - 1), tile.at(x, 0)))
+                .sum::<f32>()
+                / w as f32;
+            assert!(
+                seam <= interior * 2.0 + 1.0,
+                "{name} has a horizontal seam: {seam:.2} across it, {interior:.2} inside"
+            );
+        }
+    }
+
+    /// The measurement `docs/brush-sources.md` turns on, in a form small enough
+    /// to check by hand.
+    #[test]
+    fn a_faint_stamp_needs_build_up_and_a_solid_one_does_not() {
+        // Every texel at 0.49 — the peak of the sparsest CC0 pack sampled. A
+        // `max` stroke of it can never pass 0.49 however many times it lands;
+        // compositing reaches solid.
+        let faint = TipMask::new(8, 8, vec![125; 64]).expect("build");
+        let measured = stroke_coverage(&faint, 0.1);
+        assert!((measured.under_max - 125.0 / 255.0).abs() < 1e-3);
+        assert!(
+            measured.under_build_up > 0.99,
+            "compositing should reach solid, got {measured:?}"
+        );
+        assert!(measured.needs_build_up());
+        assert!(measured.is_usable());
+
+        // A solid stamp is the same mark under either rule, so it ships on the
+        // `max` path — which is the cheaper one and the one that keeps a stroke
+        // crossing itself even.
+        let solid = TipMask::new(8, 8, vec![255; 64]).expect("build");
+        let measured = stroke_coverage(&solid, 0.1);
+        assert_eq!(measured.under_max, 1.0);
+        assert!(!measured.needs_build_up());
+
+        // And a mask too faint for eight-bit coverage to accumulate is not a
+        // brush at all.
+        let ghost = TipMask::new(8, 8, vec![0; 64]).expect("build");
+        assert!(!stroke_coverage(&ghost, 0.1).is_usable());
     }
 }

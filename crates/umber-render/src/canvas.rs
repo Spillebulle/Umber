@@ -47,8 +47,9 @@ const STROKE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Floa
 /// The coverage attachment's blend state.
 ///
 /// `Max` is the whole trick: coverage saturates instead of accumulating, so a
-/// stroke crossing itself stays even. Shared by both dab pipelines, so smudging
-/// cannot quietly reintroduce the compounding this prevents.
+/// stroke crossing itself stays even. Shared by both non-building dab
+/// pipelines, so smudging cannot quietly reintroduce the compounding this
+/// prevents.
 const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
     format: STROKE_FORMAT,
     blend: Some(wgpu::BlendState {
@@ -61,6 +62,44 @@ const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Max,
+        },
+    }),
+    write_mask: wgpu::ColorWrites::ALL,
+};
+
+/// The coverage attachment's blend state for a **building-up** brush:
+/// `a = cov + a(1 - cov)`, which is what one dab compositing over the last
+/// means.
+///
+/// Expressed as `src * One + dst * (1 - src)`. `OneMinusSrc` reads the source
+/// *colour*, and coverage lives in the red channel of a single-channel target,
+/// so the factor is `1 - cov` per channel — exactly the complement wanted. The
+/// alternative, writing coverage into the fragment's alpha as well and using
+/// `OneMinusSrcAlpha`, would mean the two paths ran different shader code, and
+/// the paint-versus-erase note in `CLAUDE.md` records what that costs: a
+/// difference of blending has to live in the blend state or it drifts.
+///
+/// Nothing downstream changes. The result is still coverage in `0..1` in the
+/// same texture, so `composite.wgsl` and `commit.wgsl` are untouched and stroke
+/// opacity is still applied exactly once, at commit.
+///
+/// The floor worth knowing about: the scratch is `R8Unorm`, so a dab weaker
+/// than about `1/255` rounds away and a stroke of them never builds. Real
+/// texture stamps are nowhere near that faint — the sparsest pack measured runs
+/// to a peak of 0.49 — and widening the hottest texture in the frame to sixteen
+/// bits to hold a coverage nobody can see would be the wrong trade.
+const COVERAGE_BUILDUP_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
+    format: STROKE_FORMAT,
+    blend: Some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
         },
     }),
     write_mask: wgpu::ColorWrites::ALL,
@@ -269,6 +308,34 @@ impl Default for StrokeStyle {
     }
 }
 
+/// How the dab pass should blend, for the whole of one stroke.
+///
+/// Both flags choose a *pipeline*, and a pipeline cannot be changed halfway
+/// through a stroke without the dabs already in the scratch having been drawn
+/// under the other rule. Hence one struct rather than two loose booleans:
+/// whatever a stroke starts with, it finishes with.
+///
+/// Neither flag reaches [`CompositeParams`] or [`CanvasRenderer::commit_stroke`]
+/// except through [`StrokeStyle::per_dab_color`], which they must agree with —
+/// build-up is invisible downstream by design, because it changes only how
+/// coverage arrives in the scratch and not what the scratch means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DabStyle {
+    /// Record a colour per dab as well as coverage. Must equal the
+    /// [`StrokeStyle::per_dab_color`] handed to composite and commit.
+    pub per_dab_color: bool,
+    /// Accumulate coverage rather than taking a `max` of it. See
+    /// [`COVERAGE_BUILDUP_TARGET`].
+    pub build_up: bool,
+}
+
+impl DabStyle {
+    /// Index into the pipeline matrix. Bit 0 is colour, bit 1 is build-up.
+    fn index(self) -> usize {
+        usize::from(self.per_dab_color) | usize::from(self.build_up) << 1
+    }
+}
+
 /// Where a smudging brush should sample the canvas, and what it is painting.
 ///
 /// The stack and stroke are the same ones the screen composite is given, and
@@ -308,10 +375,32 @@ pub struct CompositeParams<'a> {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DabUniforms {
     doc_size: [f32; 2],
+    /// The tip's proportions, longer side normalised to 1. `[1.0, 1.0]` with no
+    /// tip, which is the exact identity in the shader.
+    tip_scale: [f32; 2],
     /// Non-zero when a real tip texture is bound. Scalar padding, not a vec2 —
     /// see the uniform-layout note in CLAUDE.md.
     use_tip: u32,
+    /// How hard the paper bites, 0..1. Zero is the exact identity.
+    grain_strength: f32,
+    /// Side of one grain tile in document pixels.
+    grain_scale: f32,
     _pad: f32,
+}
+
+impl DabUniforms {
+    /// The uniforms for a document with no tip and no grain: every factor the
+    /// shader multiplies by is one.
+    fn plain(doc_size: UVec2) -> Self {
+        Self {
+            doc_size: [doc_size.x as f32, doc_size.y as f32],
+            tip_scale: [1.0, 1.0],
+            use_tip: 0,
+            grain_strength: 0.0,
+            grain_scale: 1.0,
+            _pad: 0.0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -415,11 +504,19 @@ impl LayerStore {
 #[derive(Clone)]
 struct Shared {
     sampler: wgpu::Sampler,
+    /// Repeats where [`Shared::sampler`] clamps. A paper tile has to wrap — it
+    /// covers the whole document — and a tip stretched over its dab must not.
+    grain_sampler: wgpu::Sampler,
 
-    dab_pipeline: wgpu::RenderPipeline,
-    /// Writes the colour scratch as well. Used only while a smudging stroke is
-    /// in progress, so an ordinary stroke never pays for the second attachment.
-    dab_colored_pipeline: wgpu::RenderPipeline,
+    /// The four dab pipelines, indexed by [`DabStyle::index`].
+    ///
+    /// Two independent binary choices, so four — but written once and built by
+    /// a loop, because they differ in exactly two fields and four copies of a
+    /// pipeline descriptor is four places for the vertex layout to drift. The
+    /// coloured pair carry a second attachment that nearly every stroke does
+    /// not want; the building pair swap the coverage target's blend state. All
+    /// four share one shader module and one pipeline layout.
+    dab_pipelines: [wgpu::RenderPipeline; 4],
     dab_layout: wgpu::BindGroupLayout,
 
     composite_pipeline: wgpu::RenderPipeline,
@@ -462,6 +559,19 @@ pub struct CanvasRenderer {
     /// Which mask is in that texture, so [`CanvasRenderer::set_tip`] can tell
     /// "the same brush again" from "a different brush".
     tip_mask: Option<Arc<TipMask>>,
+    /// The paper tile, or a 1x1 placeholder. Held so it outlives the bind group.
+    grain: wgpu::Texture,
+    grain_view: wgpu::TextureView,
+    /// Which tile is in that texture, compared by `Arc` identity for exactly
+    /// the reason [`CanvasRenderer::tip_mask`] is.
+    grain_tile: Option<Arc<TipMask>>,
+    /// The dab pass's uniforms, held rather than rebuilt: the tip and the grain
+    /// are set independently, and reconstructing the block from one of them
+    /// would clear the other's fields.
+    dab_state: DabUniforms,
+    /// Strength and tile size, so that changing only these does not rebuild a
+    /// bind group or re-upload a texture.
+    grain_params: (f32, f32),
 
     composite_bind_group: wgpu::BindGroup,
     view_uniforms: wgpu::Buffer,
@@ -483,6 +593,17 @@ impl Shared {
             ..Default::default()
         });
 
+        let grain_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("umber-grain-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         // ---- dab pass -------------------------------------------------------
         let dab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dab"),
@@ -490,7 +611,13 @@ impl Shared {
         });
         let dab_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dab-bgl"),
-            entries: &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
+            entries: &[
+                uniform_entry(0),
+                texture_entry(1),
+                sampler_entry(2),
+                texture_entry(3),
+                sampler_entry(4),
+            ],
         });
 
         let dab_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -503,52 +630,55 @@ impl Shared {
             ..Default::default()
         };
 
-        let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dab-pipeline"),
-            layout: Some(&dab_pl),
-            vertex: wgpu::VertexState {
-                module: &dab_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: DAB_VERTEX_LAYOUT,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &dab_shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(COVERAGE_TARGET)],
-            }),
-            primitive: dab_primitive,
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Same geometry, same coverage target, plus the colour scratch. Kept as
-        // a separate pipeline rather than one that always writes both, because
-        // the second attachment is pure cost for the strokes — nearly all of
-        // them — that paint a single colour.
-        let dab_colored_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dab-colored-pipeline"),
-            layout: Some(&dab_pl),
-            vertex: wgpu::VertexState {
-                module: &dab_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: DAB_VERTEX_LAYOUT,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &dab_shader,
-                entry_point: Some("fs_colored"),
-                compilation_options: Default::default(),
-                targets: &[Some(COVERAGE_TARGET), Some(STROKE_COLOR_TARGET)],
-            }),
-            primitive: dab_primitive,
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+        // One descriptor, four pipelines. `colored` decides the fragment entry
+        // point and whether the colour scratch is attached; `build_up` decides
+        // only the coverage target's blend state, which is the whole reason it
+        // is a pipeline choice and not a shader branch.
+        let dab_pipelines = std::array::from_fn(|i| {
+            let style = DabStyle {
+                per_dab_color: i & 1 != 0,
+                build_up: i & 2 != 0,
+            };
+            let coverage = if style.build_up {
+                COVERAGE_BUILDUP_TARGET
+            } else {
+                COVERAGE_TARGET
+            };
+            let targets: &[Option<wgpu::ColorTargetState>] = if style.per_dab_color {
+                &[Some(coverage), Some(STROKE_COLOR_TARGET)]
+            } else {
+                &[Some(coverage)]
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(match i {
+                    0 => "dab-pipeline",
+                    1 => "dab-colored-pipeline",
+                    2 => "dab-buildup-pipeline",
+                    _ => "dab-colored-buildup-pipeline",
+                }),
+                layout: Some(&dab_pl),
+                vertex: wgpu::VertexState {
+                    module: &dab_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: DAB_VERTEX_LAYOUT,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &dab_shader,
+                    entry_point: Some(if style.per_dab_color {
+                        "fs_colored"
+                    } else {
+                        "fs"
+                    }),
+                    compilation_options: Default::default(),
+                    targets,
+                }),
+                primitive: dab_primitive,
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
         });
 
         // ---- composite pass -------------------------------------------------
@@ -680,8 +810,8 @@ impl Shared {
 
         Self {
             sampler,
-            dab_pipeline,
-            dab_colored_pipeline,
+            grain_sampler,
+            dab_pipelines,
             dab_layout,
             composite_pipeline,
             composite_offscreen_pipeline,
@@ -743,11 +873,7 @@ impl CanvasRenderer {
 
         let dab_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dab-uniforms"),
-            contents: bytemuck::bytes_of(&DabUniforms {
-                doc_size: [doc_size.x as f32, doc_size.y as f32],
-                use_tip: 0,
-                _pad: 0.0,
-            }),
+            contents: bytemuck::bytes_of(&DabUniforms::plain(doc_size)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let dab_instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -764,12 +890,19 @@ impl CanvasRenderer {
         // `textureSample` out of non-uniform control flow.
         let tip = make_tip_texture(device, 1, 1);
         let tip_view = tip.create_view(&wgpu::TextureViewDescriptor::default());
+        // The same placeholder trick for the paper. Its contents do not matter
+        // either: with `grain_strength` at zero the shader's `mix` returns
+        // exactly 1.0 whatever was sampled.
+        let grain = make_tip_texture(device, 1, 1);
+        let grain_view = grain.create_view(&wgpu::TextureViewDescriptor::default());
         let dab_bind_group = make_dab_bind_group(
             device,
             &shared.dab_layout,
             &dab_uniforms,
             &tip_view,
             &shared.sampler,
+            &grain_view,
+            &shared.grain_sampler,
         );
 
         let view_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -832,6 +965,11 @@ impl CanvasRenderer {
             tip,
             has_tip: false,
             tip_mask: None,
+            grain,
+            grain_view,
+            grain_tile: None,
+            grain_params: (0.0, 1.0),
+            dab_state: DabUniforms::plain(doc_size),
             composite_bind_group,
             view_uniforms,
             commit_bind_group,
@@ -947,53 +1085,97 @@ impl CanvasRenderer {
 
         let (texture, has_tip) = match &tip {
             Some(mask) => {
-                let texture = make_tip_texture(device, mask.width(), mask.height());
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    mask.coverage(),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        // One byte per texel: R8Unorm is all a coverage mask
-                        // needs, matching the stroke scratch it feeds.
-                        bytes_per_row: Some(mask.width()),
-                        rows_per_image: Some(mask.height()),
-                    },
-                    wgpu::Extent3d {
-                        width: mask.width(),
-                        height: mask.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
-                (texture, true)
+                // The mask's own proportions. Padding it into a square would
+                // reach the same geometry and pay for an empty margin in
+                // texture memory and in fragments — see `TipMask::aspect`.
+                let (sx, sy) = mask.aspect();
+                self.dab_state.tip_scale = [sx, sy];
+                self.dab_state.use_tip = 1;
+                (upload_mask(device, queue, mask), true)
             }
-            None => (make_tip_texture(device, 1, 1), false),
+            None => {
+                self.dab_state.tip_scale = [1.0, 1.0];
+                self.dab_state.use_tip = 0;
+                (make_tip_texture(device, 1, 1), false)
+            }
         };
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.tip = texture;
+        self.has_tip = has_tip;
+        self.tip_mask = tip;
+        self.rebuild_dab_bind_group(device);
+        queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
+    }
+
+    /// Set the paper the dab pass bites through, or `None` for none.
+    ///
+    /// Per stroke, exactly as [`Self::set_tip`] is and for the same reasons: one
+    /// binding covers a whole dab pass, and changing it mid-stroke would leave
+    /// the dabs already in the scratch textured by the previous paper.
+    ///
+    /// The tile is compared by `Arc` identity, so calling this every stroke with
+    /// the same paper costs a pointer comparison. `strength` and `scale` are
+    /// compared by value and cost a uniform write when they change — no texture
+    /// upload and no bind group, which is what makes dragging the Texture
+    /// section's sliders cheap.
+    ///
+    /// A strength of zero is the **exact identity**: the shader computes
+    /// `mix(1.0, tile, strength)`, which at zero is 1.0 whatever the tile holds.
+    /// `grain_off_is_the_exact_identity` is the guard, and it is why an ordinary
+    /// brush pays one multiply rather than a branch.
+    pub fn set_grain(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grain: Option<(Arc<TipMask>, f32, f32)>,
+    ) {
+        let (tile, strength, scale) = match grain {
+            Some((tile, strength, scale)) => (Some(tile), strength.clamp(0.0, 1.0), scale.max(1.0)),
+            // Nothing to bind and nothing to sample: leave whatever tile is
+            // already uploaded where it is and turn the strength off. A painter
+            // who reaches for grain once will reach for it again, and dropping
+            // the texture would mean re-uploading it on the next stroke.
+            None => (self.grain_tile.clone(), 0.0, self.dab_state.grain_scale),
+        };
+
+        let same_tile = match (&self.grain_tile, &tile) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_tile && self.grain_params == (strength, scale) {
+            return;
+        }
+
+        if !same_tile {
+            let texture = match &tile {
+                Some(mask) => upload_mask(device, queue, mask),
+                None => make_tip_texture(device, 1, 1),
+            };
+            self.grain_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.grain = texture;
+            self.grain_tile = tile;
+            self.rebuild_dab_bind_group(device);
+        }
+
+        self.grain_params = (strength, scale);
+        self.dab_state.grain_strength = strength;
+        self.dab_state.grain_scale = scale;
+        queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
+    }
+
+    fn rebuild_dab_bind_group(&mut self, device: &wgpu::Device) {
+        let tip_view = self
+            .tip
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.dab_bind_group = make_dab_bind_group(
             device,
             &self.shared.dab_layout,
             &self.dab_uniforms,
-            &view,
+            &tip_view,
             &self.shared.sampler,
-        );
-        self.tip = texture;
-        self.has_tip = has_tip;
-        self.tip_mask = tip;
-
-        queue.write_buffer(
-            &self.dab_uniforms,
-            0,
-            bytemuck::bytes_of(&DabUniforms {
-                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                use_tip: u32::from(has_tip),
-                _pad: 0.0,
-            }),
+            &self.grain_view,
+            &self.shared.grain_sampler,
         );
     }
 
@@ -1045,22 +1227,26 @@ impl CanvasRenderer {
 
     /// Upload dabs and stamp them into the scratch texture.
     ///
-    /// `colored` must be true for every frame of a stroke whose brush smudges,
-    /// and must match the `per_dab_color` handed to [`Self::composite`] and
-    /// [`Self::commit_stroke`]. Turning it on midway through a stroke would
-    /// leave the earlier dabs with no colour recorded, and they would commit as
-    /// the flat palette colour while the rest smudged.
+    /// `style` must be the **same for every frame of a stroke**, and its
+    /// `per_dab_color` must match the [`StrokeStyle`] handed to
+    /// [`Self::composite`] and [`Self::commit_stroke`]. Turning colour on midway
+    /// would leave the earlier dabs with no colour recorded, and they would
+    /// commit as the flat palette colour while the rest smudged; turning
+    /// build-up on midway would leave the first half of the stroke saturating
+    /// where the second half accumulates, which is a visible step in a mark that
+    /// should be even.
     pub fn draw_dabs(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         dabs: &[Dab],
-        colored: bool,
+        style: DabStyle,
     ) {
         if dabs.is_empty() {
             return;
         }
+        let colored = style.per_dab_color;
         if colored {
             self.ensure_stroke_color(device);
         }
@@ -1106,11 +1292,7 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(if colored {
-            &self.shared.dab_colored_pipeline
-        } else {
-            &self.shared.dab_pipeline
-        });
+        pass.set_pipeline(&self.shared.dab_pipelines[style.index()]);
         pass.set_bind_group(0, &self.dab_bind_group, &[]);
         pass.set_vertex_buffer(
             0,
@@ -1878,6 +2060,33 @@ fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, labe
     });
 }
 
+/// Upload an 8-bit mask — a tip or a paper tile — into a fresh texture.
+fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wgpu::Texture {
+    let texture = make_tip_texture(device, mask.width(), mask.height());
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        mask.coverage(),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            // One byte per texel: R8Unorm is all a coverage mask needs, matching
+            // the stroke scratch it feeds.
+            bytes_per_row: Some(mask.width()),
+            rows_per_image: Some(mask.height()),
+        },
+        wgpu::Extent3d {
+            width: mask.width(),
+            height: mask.height(),
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
+}
+
 /// Storage for a brush tip: single-channel coverage, matching the stroke
 /// scratch it feeds. Four channels would be four times the bandwidth to say the
 /// same thing.
@@ -1898,12 +2107,15 @@ fn make_tip_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Tex
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_dab_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
     tip: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    grain: &wgpu::TextureView,
+    grain_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dab-bg"),
@@ -1920,6 +2132,14 @@ fn make_dab_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(grain),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(grain_sampler),
             },
         ],
     })

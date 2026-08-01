@@ -69,10 +69,9 @@ pub struct UiState {
 /// Tabs of the brush editor dialog.
 ///
 /// The design lists six sections — Tip, Dynamics, Texture, Scatter, Wet edges,
-/// Stabiliser — and these are the four Umber can fill. Texture (paper grain
-/// multiplied into coverage) and Wet edges have no engine behind them, so they
-/// are not drawn at all rather than drawn empty; Stabilisation is one slider
-/// and rides on Tip rather than getting a section to itself.
+/// Stabiliser — and these are the five Umber can fill. Wet edges has no engine
+/// behind it, so it is not drawn at all rather than drawn empty; Stabilisation
+/// is one slider and rides on Tip rather than getting a section to itself.
 ///
 /// `Blending` is not one of the design's names. Colour pickup needs a home and
 /// none of the six is one: filing it under "Wet edges" would be borrowing a
@@ -82,6 +81,7 @@ pub enum BrushTab {
     Tip,
     Dynamics,
     Scatter,
+    Texture,
     Blending,
 }
 
@@ -346,10 +346,18 @@ impl Editor {
         self.brush.mode = mode;
         // A name pointing at a mask that is not here paints round rather than
         // refusing — see `BrushPreset::tip`.
-        self.tip = preset
-            .tip
-            .as_ref()
-            .and_then(|name| self.tips.get(name).cloned());
+        //
+        // The user's library first, then the masks Umber ships. Both hand back
+        // an `Arc<TipMask>` that is stable for as long as it is reachable,
+        // which is what `CanvasRenderer::set_tip`'s identity check needs; the
+        // order only decides a name collision, and the user's own file winning
+        // is the answer that cannot surprise anybody.
+        self.tip = preset.tip.as_ref().and_then(|name| {
+            self.tips
+                .get(name)
+                .cloned()
+                .or_else(|| umber_core::tip::builtin(name).cloned())
+        });
         self.active_preset = Some(index);
     }
 
