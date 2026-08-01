@@ -62,6 +62,14 @@ pub struct Prefs {
     /// the first run?" — has no answer on a machine where the preferences file
     /// could not be written.
     pub update_notice_seen: bool,
+    /// Whether the hue wheel's triangle turns to follow the hue.
+    ///
+    /// The one preference here with no control in the settings dialog: it is
+    /// set on the Colour panel, beneath the wheel it applies to, which is the
+    /// only place it means anything. A preference is not defined by which
+    /// dialog changes it — it is a choice about the workspace that should still
+    /// be true tomorrow.
+    pub wheel_rotates: bool,
     /// The complete binding table, already merged with the defaults.
     pub shortcuts: Vec<Binding>,
 }
@@ -78,6 +86,8 @@ impl Default for Prefs {
             pressure_response: pressure.responsiveness,
             check_updates: true,
             update_notice_seen: false,
+            // What the picker has always done, and what the design draws.
+            wheel_rotates: true,
             shortcuts: shortcuts::defaults(),
         }
     }
@@ -231,6 +241,11 @@ pub fn to_text(prefs: &Prefs) -> String {
         "update_notice_seen = {}\n",
         prefs.update_notice_seen
     ));
+    out.push_str(&format!(
+        "wheel_rotates = {}
+",
+        prefs.wheel_rotates
+    ));
 
     // Only actions that differ from the factory table are written. An action
     // left out keeps its defaults, which is what lets a later version add a
@@ -310,6 +325,11 @@ pub fn from_text(text: &str) -> Prefs {
             "update_notice_seen" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.update_notice_seen = v;
+                }
+            }
+            "wheel_rotates" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.wheel_rotates = v;
                 }
             }
             "shortcut" => shortcut_lines.push(value),
@@ -474,6 +494,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         pressure_response: ed.pressure.responsiveness,
         check_updates: ed.updates.check_on_startup,
         update_notice_seen: ed.updates.notice_seen,
+        wheel_rotates: ed.ui.wheel_rotates,
         shortcuts: shortcuts::published(),
     }
 }
@@ -487,6 +508,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.pressure.responsiveness = prefs.pressure_response;
     ed.updates.check_on_startup = prefs.check_updates;
     ed.updates.notice_seen = prefs.update_notice_seen;
+    ed.ui.wheel_rotates = prefs.wheel_rotates;
     shortcuts::publish(prefs.shortcuts.clone());
 
     // Setting the zoom factor when it has not changed still marks egui's fonts
@@ -555,7 +577,32 @@ mod tests {
         assert_eq!(prefs.pressure_response, editor.pressure.responsiveness);
         assert_eq!(prefs.check_updates, editor.updates.check_on_startup);
         assert_eq!(prefs.update_notice_seen, editor.updates.notice_seen);
+        assert_eq!(prefs.wheel_rotates, editor.ui.wheel_rotates);
         assert_eq!(prefs.shortcuts, shortcuts::defaults());
+    }
+
+    /// The one setting whose control is not in the settings dialog. It is set
+    /// on the Colour panel, under the wheel it applies to, and it has to be
+    /// carried through the file and back into the editor exactly like the ones
+    /// that are — which is the step that would be easy to leave out.
+    #[test]
+    fn the_wheels_rotation_survives_a_restart() {
+        let prefs = Prefs {
+            wheel_rotates: false,
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert!(!back.wheel_rotates, "the file must not lose the choice");
+
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        assert!(editor.ui.wheel_rotates, "the default is on");
+        apply(&back, &ctx, &mut editor);
+        assert!(
+            !editor.ui.wheel_rotates,
+            "reading the file must reach the picker, not just the Prefs struct"
+        );
+        assert!(!capture(&ctx, &editor).wheel_rotates, "and back out again");
     }
 
     #[test]
@@ -601,6 +648,7 @@ mod tests {
             pressure_response: 0.6,
             check_updates: false,
             update_notice_seen: true,
+            wheel_rotates: false,
             shortcuts: shortcuts::defaults(),
         };
         let at = shortcuts::slot_of(&prefs.shortcuts, Action::BrushTool, 0);
@@ -621,6 +669,7 @@ mod tests {
         assert_eq!(back.pressure_response, prefs.pressure_response);
         assert_eq!(back.check_updates, prefs.check_updates);
         assert_eq!(back.update_notice_seen, prefs.update_notice_seen);
+        assert_eq!(back.wheel_rotates, prefs.wheel_rotates);
         // Compared per action rather than as one list: editing a binding
         // appends it, so the live table is in interaction order while a loaded
         // one is in `Action::ALL` order. What has to survive is which chords

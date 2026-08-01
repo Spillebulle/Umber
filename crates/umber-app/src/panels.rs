@@ -636,7 +636,16 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut rotates = ed.ui.wheel_rotates;
     let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut rotates, &mut ed.hsv);
     ed.ui.wheel_shape = shape;
-    ed.ui.wheel_rotates = rotates;
+    // Kept between runs, though its control is here rather than in the settings
+    // dialog — it is a choice about the workspace, and where it is set does not
+    // decide whether it should still be true tomorrow. Compared rather than
+    // asked of the toggle, because `show` reports a change of *colour*, and
+    // marking the preferences dirty on every drag of the wheel would queue a
+    // file write per frame.
+    if rotates != ed.ui.wheel_rotates {
+        ed.ui.wheel_rotates = rotates;
+        crate::prefs::mark_dirty();
+    }
     if changed {
         ed.commit_picker();
     }
