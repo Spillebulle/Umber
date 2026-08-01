@@ -108,17 +108,136 @@ pub struct Notice {
     pub lines: Vec<String>,
 }
 
+/// One tab: its body, its name, and the dot or close mark at its end.
+///
+/// Split out of [`strip`] because the tabs are painted in two passes with the
+/// strip's rule between them, and a second copy of this is how the selected tab
+/// would end up a different height from the rest.
+#[allow(clippy::too_many_arguments)]
+fn paint_tab(
+    ui: &egui::Ui,
+    p: &Palette,
+    ed: &Editor,
+    rect: Rect,
+    index: usize,
+    response: &egui::Response,
+    closable: bool,
+    actions: &mut TabActions,
+) {
+    let Some(tab) = ed.session.tabs().get(index) else {
+        return;
+    };
+    let is_active = index == ed.session.active_index();
+    let font = FontId::proportional(text::SMALL);
+    let painter = ui.painter();
+
+    // A folder leaf: rounded where it meets the top of the strip, square where
+    // it meets the surface below, so the two read as one continuous face.
+    let radius = egui::CornerRadius {
+        nw: metrics::RADIUS_LARGE as u8,
+        ne: metrics::RADIUS_LARGE as u8,
+        sw: 0,
+        se: 0,
+    };
+
+    if is_active {
+        // The selected tab wears the tool options strip's own colour and runs a
+        // pixel past the bottom of its panel, so the rule and the tab's own
+        // bottom edge are both outside the clip. What is left is a tab open at
+        // the foot into the strip beneath it.
+        let body = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y + 1.0));
+        painter.rect_filled(body, radius, p.chrome);
+        painter.rect_stroke(body, radius, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    } else {
+        // The others are darker than the selected one and sit behind the rule,
+        // which the caller paints after this pass.
+        let fill = if response.hovered() {
+            p.control_hover
+        } else {
+            p.control
+        };
+        painter.rect_filled(rect, radius, fill);
+    }
+
+    let ink = if is_active {
+        p.text_strong
+    } else if response.hovered() {
+        p.text
+    } else {
+        p.text_dim
+    };
+    // The mark's place is reserved whether or not it is drawn, so a name
+    // that has been squeezed ends in an ellipsis rather than under the dot.
+    let room = rect.width() - TAB_PAD * 2.0 - MARK;
+    painter.text(
+        pos2(rect.left() + TAB_PAD, rect.center().y),
+        Align2::LEFT_CENTER,
+        crate::widgets::elide(painter, &tab.title, text::SMALL, room),
+        font,
+        ink,
+    );
+
+    // The design puts a dot after the name on a document with unsaved work.
+    // Hovering turns it into the close mark, so the tab needs no extra
+    // width for a control that is only wanted momentarily.
+    let mark = Rect::from_center_size(
+        pos2(rect.right() - TAB_PAD - MARK * 0.5, rect.center().y),
+        vec2(MARK, MARK),
+    );
+    let over_mark = response
+        .hover_pos()
+        .is_some_and(|pos| mark.expand(2.0).contains(pos));
+
+    if response.hovered() && closable {
+        if over_mark {
+            painter.circle_filled(mark.center(), MARK * 0.5, p.control_hover);
+        }
+        icons::draw(
+            painter,
+            mark.shrink(3.0),
+            Icon::Close,
+            if over_mark { p.text_strong } else { p.text_dim },
+        );
+    } else if tab.modified {
+        painter.circle_filled(mark.center(), 3.0, p.accent);
+    }
+
+    if response.clicked() {
+        if over_mark && closable {
+            actions.close = Some(index);
+        } else {
+            actions.pick = Some(index);
+        }
+    }
+
+    // The active tab's document is live in the editor rather than parked.
+    let size = tab.parked_size().unwrap_or(ed.doc.size);
+    let mut tip = format!("{} — {} × {}", tab.title, size.x, size.y);
+    if let Some(path) = &tab.path {
+        tip.push('\n');
+        tip.push_str(&path.display().to_string());
+    }
+    if tab.modified {
+        tip.push_str(if tab.path.is_some() {
+            "\nUnsaved changes"
+        } else {
+            "\nNever saved"
+        });
+    }
+    response.clone().on_hover_text(tip);
+}
+
 /// Draw the strip. Panels are laid out by the caller; this fills one.
 pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
     let mut actions = TabActions::default();
 
     let full = ui.max_rect();
-    // The strip's own bottom border, which the active tab breaks through.
+    // The strip's own bottom rule. Painted between the two passes below rather
+    // than here — see them for why.
     let border = Rect::from_min_size(
         pos2(full.left(), full.bottom() - 1.0),
         vec2(full.width(), 1.0),
     );
-    ui.painter().rect_filled(border, 0.0, p.border);
 
     let active = ed.session.active_index();
     let closable = ed.session.len() > 1;
@@ -150,110 +269,38 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
     let (first, widths) = tab_layout(&natural, plus.left() - 4.0 - (full.left() + 8.0), active);
     let hidden = natural.len() - widths.len();
 
+    // Where every visible tab sits, and what the pointer is doing to it.
+    //
+    // Collected before anything is painted because the paint order is not the
+    // tab order: the strip's rule has to run *over* the tabs that are not
+    // selected and *under* the one that is. That is what makes the selected tab
+    // read as the front leaf of a folder — it breaks the line and joins the
+    // strip below — while the rest are tucked behind it. A single pass could
+    // only put the rule under all of them or over all of them, and the selected
+    // tab is not reliably last.
+    let mut placed: Vec<(usize, Rect, egui::Response)> = Vec::with_capacity(widths.len());
     let mut x = full.left() + 8.0;
-
-    for (offset, tab) in ed
-        .session
-        .tabs()
-        .iter()
-        .skip(first)
-        .take(widths.len())
-        .enumerate()
-    {
+    for (offset, width) in widths.iter().copied().enumerate() {
         let index = first + offset;
-        let width = widths[offset];
         let rect = Rect::from_min_size(
             pos2(x, full.bottom() - metrics::TAB),
             vec2(width, metrics::TAB),
         );
         x += width + TAB_GAP;
-
         let response = ui.interact(rect, ui.id().with(("doc-tab", index)), Sense::click());
-        let is_active = index == active;
-        let painter = ui.painter();
+        placed.push((index, rect, response));
+    }
 
-        if is_active {
-            // Rounded at the top only, and one pixel taller than the strip, so
-            // it joins the surface below it exactly as the design draws it.
-            let body = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y + 1.0));
-            painter.rect_filled(body, metrics::RADIUS_LARGE, p.window);
-            painter.rect_stroke(
-                body,
-                metrics::RADIUS_LARGE,
-                Stroke::new(1.0, p.border),
-                StrokeKind::Inside,
-            );
-        } else if response.hovered() {
-            painter.rect_filled(rect, metrics::RADIUS_LARGE, p.control);
+    for (index, rect, response) in &placed {
+        if *index != active {
+            paint_tab(ui, p, ed, *rect, *index, response, closable, &mut actions);
         }
-
-        let ink = if is_active {
-            p.text_strong
-        } else if response.hovered() {
-            p.text
-        } else {
-            p.text_dim
-        };
-        // The mark's place is reserved whether or not it is drawn, so a name
-        // that has been squeezed ends in an ellipsis rather than under the dot.
-        let room = rect.width() - TAB_PAD * 2.0 - MARK;
-        painter.text(
-            pos2(rect.left() + TAB_PAD, rect.center().y),
-            Align2::LEFT_CENTER,
-            crate::widgets::elide(painter, &tab.title, text::SMALL, room),
-            font.clone(),
-            ink,
-        );
-
-        // The design puts a dot after the name on a document with unsaved work.
-        // Hovering turns it into the close mark, so the tab needs no extra
-        // width for a control that is only wanted momentarily.
-        let mark = Rect::from_center_size(
-            pos2(rect.right() - TAB_PAD - MARK * 0.5, rect.center().y),
-            vec2(MARK, MARK),
-        );
-        let over_mark = response
-            .hover_pos()
-            .is_some_and(|pos| mark.expand(2.0).contains(pos));
-
-        if response.hovered() && closable {
-            let painter = ui.painter();
-            if over_mark {
-                painter.circle_filled(mark.center(), MARK * 0.5, p.control_hover);
-            }
-            icons::draw(
-                painter,
-                mark.shrink(3.0),
-                Icon::Close,
-                if over_mark { p.text_strong } else { p.text_dim },
-            );
-        } else if tab.modified {
-            ui.painter().circle_filled(mark.center(), 3.0, p.accent);
+    }
+    ui.painter().rect_filled(border, 0.0, p.border);
+    for (index, rect, response) in &placed {
+        if *index == active {
+            paint_tab(ui, p, ed, *rect, *index, response, closable, &mut actions);
         }
-
-        if response.clicked() {
-            if over_mark && closable {
-                actions.close = Some(index);
-            } else {
-                actions.pick = Some(index);
-            }
-        }
-
-        // The active tab's document is live in the editor rather than parked.
-        let size = tab.parked_size().unwrap_or(ed.doc.size);
-        let mut tip = format!("{} — {} × {}", tab.title, size.x, size.y);
-        if let Some(path) = &tab.path {
-            tip.push('\n');
-            tip.push_str(&path.display().to_string());
-        }
-        if tab.modified {
-            tip.push_str(if tab.path.is_some() {
-                "\nUnsaved changes"
-            } else {
-                "\nNever saved"
-            });
-        }
-        response.on_hover_text(tip);
     }
 
     // The design's `+`, drawn rather than typed: Archivo has no such glyph. It
