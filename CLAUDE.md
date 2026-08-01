@@ -601,6 +601,22 @@ acceptable once per stroke but must never move into the drawing loop.
   oldest surviving entry as though it were the beginning. It survives a save,
   because a history that did not reach the beginning when it was written does
   not reach it now either.
+- **The budget is a fixed 512 MB, not a fraction of the canvas — and the panel
+  names the figure once anything has been dropped.** A patch is the *rectangle*
+  a stroke covered, so its cost follows the canvas rather than the mark: on a
+  10000² document a stroke drawn across the picture is 400 MB, the budget holds
+  exactly one, and the second ages the first out. That is correct and it is
+  indistinguishable from a bug unless the module says what the limit is —
+  "Earlier edits discarded" alone was read as a regression from the banded
+  readback, which touched none of this. Scaling the budget to the canvas is the
+  tempting fix and is wrong twice: it is *per document*, so a few large tabs
+  would be gigabytes, and a short history is a far better failure than being
+  killed for memory. Compressing the patches in memory is the other tempting
+  fix — `measure-history.rs` puts PNG at the fast level at about 1.6 ms/MB, so
+  a 400 MB patch is two thirds of a second of encoding added to every
+  pointer-up, and as much again to decode on undo. If depth on a large canvas
+  is ever genuinely wanted, the fix is a patch that stores *tiles* rather than
+  the stroke's bounding box; nothing short of that is worth the change.
 - **`restore` rebuilds the whole timeline from one read out of a file** —
   entries in timeline order, the position within them, and `dropped` — and still
   answers to the in-memory budget, so a file written by a build with a larger
