@@ -165,17 +165,31 @@ pub fn from_gbr(bytes: &[u8]) -> Result<GbrBrush, PresetError> {
 ///   Umber's pressure-to-size mapping on would shrink the stamp to 8 % of
 ///   itself at the start of every line, which is not what the file describes.
 ///
-/// The mask is padded to a square: the dab stretches a tip over its bounding
-/// box, so an unpadded portrait stamp would come out squashed. See
-/// [`TipMask::padded_to_square`].
+/// The mask is handed over as the file holds it, non-square and all. The dab
+/// pass is told the tip's proportions and shapes its quad to match, so nothing
+/// has to be padded and `dab_ratio` stays the user's to squash a stamp with.
+///
+/// The fourth thing the file does not carry, and the one that decides whether
+/// the stamp paints like its author's: **build-up**. GIMP composites every dab
+/// and Umber takes a `max` unless told otherwise, so a sparse photographic
+/// texture would paint at a fraction of its strength. Which of the two applies
+/// is measured, not guessed — see [`crate::tip::stroke_coverage`].
 pub fn to_brush(brush: GbrBrush) -> (Brush, TipMask) {
-    let tip = brush.tip.padded_to_square();
+    let tip = brush.tip;
     let default = Brush::default();
+    let spacing = brush.spacing.unwrap_or(default.spacing);
+    // Whether a `max` stroke of this stamp is the mark its author drew, or half
+    // of it. Measured rather than assumed: a photographic texture looks dense
+    // and is not, and the difference between the two rules is the difference
+    // between a solid stroke and one that can never pass the mask's brightest
+    // texel. See `crate::tip::stroke_coverage`.
+    let build_up = crate::tip::stroke_coverage(&tip, spacing).needs_build_up();
     let parameters = Brush {
-        size: (tip.width() as f32).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
-        spacing: brush.spacing.unwrap_or(default.spacing),
+        size: (tip.width().max(tip.height()) as f32).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
+        spacing,
         pressure_size: false,
         pressure_opacity: false,
+        build_up,
         ..default
     };
     (parameters, tip)
@@ -280,14 +294,20 @@ mod tests {
     }
 
     #[test]
-    fn a_stamp_becomes_a_square_tip_at_its_own_size() {
-        // Padded rather than stretched: the dab spreads a tip over its bounding
-        // box, so a 4x2 stamp rendered unpadded would come out twice as tall as
-        // the picture in the file.
+    fn a_stamp_keeps_its_own_shape_and_its_own_size() {
+        // The mask is handed over exactly as the file holds it. The dab pass is
+        // told the tip's proportions and shapes its quad to match, so a 4x2
+        // stamp lands 4 wide and 2 tall — where padding it to 4x4 used to cost
+        // a texture twice the size and a margin of empty fragments to shade.
+        //
+        // `size` is the *long* side, which is what `Brush::size` means.
         let brush = from_gbr(&gbr(2, 4, 2, 1, "Wide", &[255; 8])).expect("decode");
         let (parameters, tip) = to_brush(brush);
-        assert_eq!((tip.width(), tip.height()), (4, 4));
+        assert_eq!((tip.width(), tip.height()), (4, 2));
         assert_eq!(parameters.size, 4.0);
+        // A solid stamp is as strong under a `max` as it is compositing, so it
+        // ships on the fast path rather than asking to build up.
+        assert!(!parameters.build_up);
         // 25% spacing, from the header the fixture writes.
         assert_eq!(parameters.spacing, 0.25);
         // A `.gbr` carries no dynamics, and GIMP stamps one at a constant size.

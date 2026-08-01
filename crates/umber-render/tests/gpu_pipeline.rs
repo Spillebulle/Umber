@@ -847,6 +847,110 @@ fn a_tip_paints_the_corners_a_round_brush_leaves_alone() {
 }
 
 #[test]
+fn a_non_square_tip_keeps_its_proportions() {
+    // A 4:1 landscape mask, solid. It has to land four times as wide as it is
+    // tall: stretched over the dab's square it would be a block, and padded
+    // into a square it would be this shape at the cost of a margin of empty
+    // fragments and four times the texture.
+    //
+    // `Brush::size` describes the long axis, so the mask's long side spans the
+    // full 2 * radius and its short side a quarter of that.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(TipMask::new(4, 1, vec![255; 4]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    // Radius 12: the stamp spans 20..44 across and 29..35 down.
+    assert_eq!(h.pixel(21, 32)[3], 255, "the long axis should reach 20");
+    assert_eq!(h.pixel(43, 32)[3], 255, "and 44");
+    assert_eq!(h.pixel(32, 30)[3], 255, "the short axis is 3 px each way");
+    assert_eq!(
+        h.pixel(32, 38)[3],
+        0,
+        "6 px down is past a quarter-height stamp — it is being stretched"
+    );
+
+    // Turned on its side, the same file must give the same picture rotated.
+    h.set_tip(Some(TipMask::new(1, 4, vec![255; 4]).expect("tip")));
+    h.stamp(&[dab(32.0, 32.0, 12.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(h.pixel_in(1, 32, 21)[3], 255, "portrait reaches down");
+    assert_eq!(
+        h.pixel_in(1, 38, 32)[3],
+        0,
+        "and not across — the aspect is being applied to the wrong axis"
+    );
+}
+
+/// A rotated stamp must not lose its corners to the damaged rect.
+///
+/// The failure this guards has happened twice in this project and is nasty both
+/// times: coverage outside the committed rectangle stays in the scratch,
+/// redraws as a live preview so the stroke appears to hang, and is then baked
+/// in by the *next* stroke wearing that stroke's colour.
+///
+/// A round dab fits inside its bounding square at any angle, so the old
+/// circumscribing-circle bound held for every brush that existed. A bitmap tip
+/// paints right into its quad's corners, and a quad turned 45° reaches out to
+/// `radius * sqrt(2)`.
+#[test]
+fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
+    let mut h = harness_or_skip!();
+
+    let brush = Brush {
+        size: 24.0,
+        spacing: 1.0,
+        stabilization: 0.0,
+        pressure_size: false,
+        dab_angle: 45.0,
+        // A round dab has no angle, so the ratio has to say the dab is shaped
+        // before `dab_angle` means anything to the bounds.
+        dab_ratio: 1.0,
+        ..Default::default()
+    };
+
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        brush,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(32.0, 32.0), 1.0, 0.0),
+    );
+    let bounds = s.bounds();
+    let reach = 12.0 * std::f32::consts::SQRT_2;
+    assert!(
+        bounds.min.x <= 32.0 - reach + 0.01 && bounds.max.y >= 32.0 + reach - 0.01,
+        "the damaged rect stops short of a 45° quad's corners: {bounds:?}"
+    );
+
+    // And the whole stamp really is committed: a solid tip turned 45° must mark
+    // the far corner of its own footprint.
+    h.set_tip(Some(TipMask::new(2, 2, vec![255; 4]).expect("tip")));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    h.stamp(&dabs);
+    let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        StrokeStyle {
+            color: Color::WHITE,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // 45°, so the quad's corner sits on the +y axis at radius * sqrt(2) ≈ 17.
+    assert_eq!(
+        h.pixel(32, 47)[3],
+        255,
+        "the corner of the rotated stamp was outside the committed rect"
+    );
+}
+
+#[test]
 fn clearing_the_tip_restores_the_round_brush() {
     // Tips are per stroke, so going back to a round brush has to actually go
     // back — a stale `use_tip` flag would leave every later stroke square.

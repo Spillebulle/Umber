@@ -375,10 +375,25 @@ pub struct CompositeParams<'a> {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DabUniforms {
     doc_size: [f32; 2],
+    /// The tip's proportions, longer side normalised to 1. `[1.0, 1.0]` with no
+    /// tip, which is the exact identity in the shader.
+    tip_scale: [f32; 2],
     /// Non-zero when a real tip texture is bound. Scalar padding, not a vec2 —
     /// see the uniform-layout note in CLAUDE.md.
     use_tip: u32,
     _pad: f32,
+}
+
+impl DabUniforms {
+    /// The uniforms for a document with no tip bound.
+    fn plain(doc_size: UVec2) -> Self {
+        Self {
+            doc_size: [doc_size.x as f32, doc_size.y as f32],
+            tip_scale: [1.0, 1.0],
+            use_tip: 0,
+            _pad: 0.0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -817,11 +832,7 @@ impl CanvasRenderer {
 
         let dab_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dab-uniforms"),
-            contents: bytemuck::bytes_of(&DabUniforms {
-                doc_size: [doc_size.x as f32, doc_size.y as f32],
-                use_tip: 0,
-                _pad: 0.0,
-            }),
+            contents: bytemuck::bytes_of(&DabUniforms::plain(doc_size)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let dab_instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1019,8 +1030,15 @@ impl CanvasRenderer {
             return;
         }
 
+        let mut uniforms = DabUniforms::plain(self.doc_size);
         let (texture, has_tip) = match &tip {
             Some(mask) => {
+                // The mask's own proportions. Padding it into a square would
+                // reach the same geometry and pay for an empty margin in
+                // texture memory and in fragments — see `TipMask::aspect`.
+                let (sx, sy) = mask.aspect();
+                uniforms.tip_scale = [sx, sy];
+                uniforms.use_tip = 1;
                 let texture = make_tip_texture(device, mask.width(), mask.height());
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -1060,15 +1078,7 @@ impl CanvasRenderer {
         self.has_tip = has_tip;
         self.tip_mask = tip;
 
-        queue.write_buffer(
-            &self.dab_uniforms,
-            0,
-            bytemuck::bytes_of(&DabUniforms {
-                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
-                use_tip: u32::from(has_tip),
-                _pad: 0.0,
-            }),
-        );
+        queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&uniforms));
     }
 
     /// Whether a bitmap tip is currently bound.

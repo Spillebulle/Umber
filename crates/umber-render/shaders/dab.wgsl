@@ -7,6 +7,14 @@
 
 struct DabUniforms {
     doc_size: vec2<f32>,
+    // The tip's proportions, its longer side normalised to 1: a 512x256 stamp
+    // gives (1.0, 0.5). (1.0, 1.0) with no tip bound, which is the exact
+    // identity — every multiplication by it is by one.
+    //
+    // This is what keeps a non-square stamp from being squashed, and it lives
+    // here rather than on the dab because a stroke has one tip: the mask is
+    // bound for the whole pass, so its shape is a property of the pass.
+    tip_scale: vec2<f32>,
     // Non-zero when `tip` holds a real bitmap mask rather than the 1x1 white
     // placeholder. A scalar, not a vec3 pad: WGSL aligns vec3 to 16 bytes and
     // the Rust struct would come out short.
@@ -66,8 +74,18 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     //   - a thin chisel rasterises a thin quad rather than the square that
     //     would contain it, so a 20:1 brush does not shade twenty times the
     //     fragments it covers.
+    //
+    // `tip_scale` narrows whichever axis the mask is shorter on, so a 512x256
+    // stamp occupies a 2:1 box and keeps its proportions. It is (1, 1) for a
+    // round brush, so this line is what it always was. Note the falloff is then
+    // computed in a distorted frame — which does not matter, because a
+    // `tip_scale` other than (1, 1) means a tip is bound and the falloff is
+    // discarded.
     let short = inst.radius / max(inst.aspect, 1.0);
-    let scaled = vec2<f32>(corner.x * inst.radius, corner.y * short);
+    let scaled = vec2<f32>(
+        corner.x * inst.radius * u.tip_scale.x,
+        corner.y * short * u.tip_scale.y,
+    );
     let ca = cos(inst.angle);
     let sa = sin(inst.angle);
     let rotated = vec2<f32>(
@@ -87,7 +105,10 @@ fn vs(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.local = corner;
     out.hardness = inst.hardness;
     out.coverage = inst.coverage;
-    out.radius = short;
+    // The shorter of the quad's two semi-axes, whichever it turns out to be:
+    // a landscape tip on a round dab is narrow across y, a portrait one across
+    // x. With no tip this is `short` exactly, since `aspect` is at least 1.
+    out.radius = min(inst.radius * u.tip_scale.x, short * u.tip_scale.y);
     out.color = inst.color;
     return out;
 }
@@ -104,9 +125,9 @@ fn dab_coverage(in: VsOut) -> f32 {
     // that happens to come from a uniform buffer. With no tip bound this reads
     // a 1x1 white texture, which is a cache hit and nothing else.
     //
-    // `local` runs -1..1 across the quad, so the tip is stretched over the
-    // dab's bounding square. Non-square tips lose their aspect ratio; the dab
-    // is described by a single radius, so there is nowhere to record one.
+    // `local` runs -1..1 across the quad, and the quad has already been given
+    // the tip's proportions in the vertex shader, so the mask lands unsquashed
+    // and fills its whole quad — no padding, no empty margin to shade.
     let uv = in.local * 0.5 + vec2<f32>(0.5, 0.5);
     let masked = textureSample(tip, tip_sampler, uv).r;
 

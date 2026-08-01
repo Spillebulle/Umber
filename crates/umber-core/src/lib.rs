@@ -35,4 +35,4 @@ pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
 pub use stroke::{Dab, StrokeBuilder};
-pub use tip::TipMask;
+pub use tip::{StrokeCoverage, TipMask, stroke_coverage};

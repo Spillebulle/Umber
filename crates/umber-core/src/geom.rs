@@ -26,10 +26,19 @@ impl Rect {
         self.min.x > self.max.x || self.min.y > self.max.y
     }
 
-    /// Grow to include a circle — the shape a dab actually covers.
+    /// Grow to include a circle — the shape a round dab actually covers.
     pub fn union_circle(&mut self, center: Vec2, radius: f32) {
         self.min = self.min.min(center - radius);
         self.max = self.max.max(center + radius);
+    }
+
+    /// Grow to include an axis-aligned box, given as a centre and half-extents.
+    ///
+    /// What a *dab* needs, as opposed to a circle: a dab is a quad, and a
+    /// bitmap tip paints right into its corners.
+    pub fn union_box(&mut self, center: Vec2, half: Vec2) {
+        self.min = self.min.min(center - half);
+        self.max = self.max.max(center + half);
     }
 
     pub fn union(&mut self, other: &Rect) {
