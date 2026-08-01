@@ -257,15 +257,31 @@ fn main() {
     let (with, _) = docformat::encode(&document).unwrap();
     let t_with = t.elapsed().as_secs_f64();
 
+    // Reopening costs something too — the patches have to be decoded — and it
+    // is a cost paid while the artist is waiting for their document.
+    let reopen = |bytes: &[u8]| {
+        let t = Instant::now();
+        let doc = umber_core::docimport::read_openraster(bytes).unwrap();
+        let opened = doc.open();
+        (t.elapsed().as_secs_f64(), opened.history.len())
+    };
+    let (t_open_plain, _) = reopen(&plain);
+    let (t_open_with, restored) = reopen(&with);
+
     println!("one-layer document, {} × {}", size.x, size.y);
     println!(
-        "  without history {:8.2} MB  {t_plain:.2}s",
+        "  without history {:8.2} MB  save {t_plain:.2}s  open {t_open_plain:.2}s",
         mb(plain.len())
     );
     println!(
-        "  with history    {:8.2} MB  {t_with:.2}s  (+{:.2} MB, +{:.2}s)",
+        "  with history    {:8.2} MB  save {t_with:.2}s  open {t_open_with:.2}s",
         mb(with.len()),
-        mb(with.len() - plain.len()),
-        t_with - t_plain
+    );
+    println!(
+        "  delta           {:+8.2} MB       {:+.2}s        {:+.2}s   ({restored} of {} edits kept)",
+        mb(with.len()) - mb(plain.len()),
+        t_with - t_plain,
+        t_open_with - t_open_plain,
+        history.len(),
     );
 }

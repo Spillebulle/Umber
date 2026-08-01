@@ -191,6 +191,9 @@ nothing applied — the only way back to a blank canvas — and once the memory
 budget has aged the oldest entries out it says so rather than pretending to
 reach the beginning.
 
+The list survives being closed and reopened, because a saved document carries
+its history — see below.
+
 There used to be a global left-handed flag that mirrored the whole workspace.
 It is gone. With every part of the workspace going where you put it — the tool
 rail included — a handedness switch is a worse version of the same feature.
@@ -458,10 +461,24 @@ contain, so a sketch is a few hundred kilobytes rather than a few megabytes. The
 file is built whole and renamed into place, so a save interrupted by a full disk
 cannot leave a broken file where the last good one was. Closing a document with
 unsaved work offers to save it, and closes the tab only if a file was really
-written. What does not go in the file: undo history, the camera, and — since
-Umber has none — groups, masks and adjustment layers.
-`docs/document-format.md` records the whole of it, including why the round trip
-is byte-exact and where the format will have to grow.
+written. What does not go in the file: the camera, and — since Umber has none —
+groups, masks and adjustment layers. `docs/document-format.md` records the whole
+of it, including why the round trip is byte-exact and where the format will have
+to grow.
+
+**The undo history goes in the file too**, so a document reopened tomorrow can
+still be stepped back through and the History module comes back where you left
+it, redo stack and all. It rides as private entries every other OpenRaster
+reader walks straight past, so the file is still an ordinary `.ora`. Two things
+made that harder than it sounds. A patch belongs to a *layer*, not to the
+texture slot it happened to be recorded against — slots are recycled — so the
+file names layers by their place in the stack and refuses to restore anything it
+cannot match exactly; a history replayed into the wrong layer would be far worse
+than none. And size is the real problem: 32 MB of the newest edits is the limit,
+which on a sketching session is under half a megabyte and free, and on an
+afternoon of full-canvas painting is the difference between a 9.7 MB file and a
+41.5 MB one. That is why **Settings → General** can switch it off, with the
+trade stated in megabytes rather than in adverbs.
 
 **File → Open**, or a file dropped on the window, reads documents written by
 other applications: **OpenRaster** (`.ora`), **Krita** (`.kra`), **Photoshop**
@@ -616,7 +633,9 @@ layer would otherwise preview wrongly and then jump on release.
   canvas means different pixels on the new one. Every entry carries what it
   was, and the two stacks read as one timeline, which is what the History
   module lists; a jump to a point in it is that many single steps, because
-  there are no snapshots to jump to.
+  there are no snapshots to jump to. A save writes the newest 32 MB of it into
+  the document, keyed by stack position rather than by slot, and refuses to
+  restore a history that does not match the stack that loaded.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 

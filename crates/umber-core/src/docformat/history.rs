@@ -61,11 +61,14 @@
 //! over it pays neither the time nor the space for the entries it will not
 //! keep. What that costs end to end, on a one-layer 2048² document:
 //!
-//! | session | file | save |
-//! |---|---|---|
-//! | 300 small strokes | 2.67 → 3.09 MB | 0.08 s → 0.07 s |
-//! | 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 s → 0.16 s |
-//! | 120 full-canvas strokes | 9.68 → 41.53 MB | 0.11 s → 0.39 s |
+//! | session | file | save | open |
+//! |---|---|---|---|
+//! | 300 small strokes | 2.67 → 3.09 MB | 0.09 → 0.08 s | 0.03 → 0.04 s |
+//! | 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 → 0.15 s | 0.04 → 0.10 s |
+//! | 120 full-canvas strokes | 9.68 → 41.53 MB | 0.12 → 0.39 s | 0.04 → 0.28 s |
+//!
+//! Opening is in there because the patches have to be decoded before the
+//! document appears, and that is time the artist spends waiting.
 //!
 //! The last row is the budget saturating, and it is why saving the history is a
 //! **preference** rather than a policy: an afternoon of full-canvas painting
@@ -120,10 +123,11 @@ pub const VERSION: u32 = 1;
 /// How much encoded patch data a document will carry.
 ///
 /// 32 MB, against 512 MB in memory. At the 2.6–5× that painted patches compress
-/// by, that is 80–170 MB of raw history: about ninety full-canvas strokes, and
-/// several hundred ordinary ones. It bounds both the extra size of the file and
-/// the extra time a save takes — see the module docs for what those actually
-/// measure at.
+/// by, that is 80–170 MB of raw history — measured, the newest 62 of 120
+/// full-canvas strokes, 26 of 120 heavily grained ones, and all 300 of a
+/// sketching session with room to spare. It bounds the extra size of the file,
+/// the extra time a save takes and the extra time an *open* takes; the module
+/// docs have what those measure at.
 ///
 /// One number rather than a fraction of the document, because a rule nobody can
 /// predict is worse than a limit everybody can. A larger one would not help the
