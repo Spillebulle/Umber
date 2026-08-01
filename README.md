@@ -35,6 +35,34 @@ loader, because bundling that one would mean talking to the wrong driver.
 There is no RISC-V build. It could only be cross-compiled and never run, and
 nothing here has been tested on the architecture.
 
+### Updating
+
+Umber asks GitHub which release is newest when it starts, and tells you if there
+is one. The first run says so before the first request goes out, and the check
+is switched off in **Settings → General**; **Help → About** runs it on demand and
+shows what came back. The request carries nothing about you or your work.
+
+Whether Umber can then install the update depends on how it was installed:
+
+| | |
+|---|---|
+| Portable zip or tarball | Replaced in place; the new build runs next start |
+| AppImage | The one file is replaced |
+| Windows `.msi` | The new installer is downloaded and handed to `msiexec` |
+| `.deb`, `.rpm`, Arch, Flatpak | Named, with the command to run — never overwritten |
+
+The last row is the important one. Those files belong to a package manager that
+keeps its own record of them, so writing over them is usually not permitted,
+makes that record false, and is undone by the next system upgrade. Umber says
+which manager owns the copy and what to type, and points at the releases page.
+It does the same for anything it cannot identify: a button that lies about what
+it is about to do is worse than one that is not there.
+
+**Releases are not signed.** A download is fetched over HTTPS from an address
+the release API gave, and checked against the size that API reported. That
+catches a truncated or substituted download and is not the same as a signature;
+About says so rather than implying otherwise.
+
 ## Building
 
 Requires a recent stable Rust toolchain (1.92+) and a GPU with Vulkan, D3D12 or
@@ -119,7 +147,8 @@ theme is a table of values.
 ### Settings
 
 The settings dialog follows the design's shape: a left rail of six panes with
-one open at a time. Four are live — **General** (interface scale), **Pressure**
+one open at a time. Four are live — **General** (interface scale, and whether
+Umber checks for updates when it starts), **Pressure**
 (where pressure comes from and how the speed-derived model responds),
 **Themes** and **Shortcuts**. **Input & pen** and **Performance** are in the
 design but have nothing behind them, so they are shown greyed with a tooltip
@@ -515,6 +544,10 @@ rather than removing it.
 
 Next, roughly in order:
 
+- **Signed releases.** Umber updates itself in place, and the only thing
+  standing behind a download today is HTTPS and a length check. A signature and
+  a public key compiled into the application is what would make that a
+  guarantee; until then About says exactly what is and is not promised.
 - Structural undo, so layer add/delete/reorder joins the history
 - Getting the save off the drawing thread. It reads every layer back from the
   GPU with a blocking call, so a large document pauses for a moment — the one
