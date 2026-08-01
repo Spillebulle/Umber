@@ -336,7 +336,7 @@ pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
 /// A preset naming a bitmap tip nobody has. The brush arrives round, which is
 /// most of a stamp brush gone; both this reader and [`super::bundle`] can
 /// produce it, so the sentence is written once.
-pub const MISSING_TIP: &str = "a bitmap tip that was not in the file";
+pub const MISSING_TIP: &str = "bitmap tips stored outside the file";
 
 // ---------------------------------------------------------------------------
 // The PNG wrapper

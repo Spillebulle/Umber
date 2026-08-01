@@ -2,9 +2,10 @@
 //!
 //! `umber-core` already held all of this: 201 shipped presets with their
 //! attribution ([`preset::builtin`]), a user library that writes itself to disk
-//! on every change ([`UserLibrary`]), and importers for MyPaint `.myb`, GIMP
-//! `.gbr` and Umber `.ron`. None of it was reachable from the interface, which
-//! listed the presets and offered nothing else. This module is the reach.
+//! on every change ([`UserLibrary`]), and importers for MyPaint, GIMP, Krita,
+//! Photoshop and Umber's own `.ron`. None of it was reachable from the
+//! interface, which listed the presets and offered nothing else. This module is
+//! the reach.
 //!
 //! Five things here are worth knowing before changing them:
 //!
@@ -545,7 +546,7 @@ fn panel_links(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let writable = state.writable();
     if link(ui, p, Icon::Import, "Import brushes…", writable)
         .on_hover_text(if writable {
-            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
+            "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
         } else {
             state.why_not()
         })
@@ -1043,11 +1044,21 @@ fn import(state: &mut State, ed: &mut Editor) {
     if !state.writable() {
         return;
     }
+    // Every extension `umber_core::brushimport::read_file` claims, in one
+    // filter first so that a folder of mixed formats — which is what a brush
+    // pack actually is — can be selected in one go.
     let Some(paths) = rfd::FileDialog::new()
         .set_title("Import brushes")
-        .add_filter("Brush files", &["myb", "gbr", "ron"])
+        .add_filter(
+            "Brush files",
+            &[
+                "myb", "gbr", "gpb", "gih", "vbr", "kpp", "bundle", "abr", "ron",
+            ],
+        )
         .add_filter("MyPaint brush", &["myb"])
-        .add_filter("GIMP brush", &["gbr"])
+        .add_filter("GIMP brush", &["gbr", "gpb", "gih", "vbr"])
+        .add_filter("Krita brush", &["kpp", "bundle"])
+        .add_filter("Photoshop brush", &["abr"])
         .add_filter("Umber brush library", &["ron"])
         // Deliberately present, and deliberately last: picking the wrong kind
         // of file gives a sentence naming it and the reason, which is a better
@@ -1122,10 +1133,14 @@ fn import_notice(
         (n, 1) => format!("Imported {n} brushes from {}.", file_label(&paths[0])),
         (n, f) => format!("Imported {n} brushes from {f} files."),
     };
+    // "Umber has no …" was the wording until a container could report six
+    // losses at once, several of which are things Umber *does* have and simply
+    // could not find — a tip stored outside the file, say. This frame is true
+    // of every entry any reader produces.
     let losses = match dropped.len() {
         0 => String::new(),
         _ => format!(
-            " Umber has no {}, so {} will paint differently.",
+            " Umber could not bring across {}, so {} will paint differently.",
             join_words(dropped),
             if added.len() == 1 {
                 "it"
@@ -1325,7 +1340,7 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
-                            "Read MyPaint .myb brushes, GIMP .gbr stamps, or an Umber .ron library"
+                            "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
                         } else {
                             why_not.as_str()
                         })

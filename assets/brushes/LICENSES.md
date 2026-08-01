@@ -10,6 +10,11 @@ Preview thumbnails (`*_prev.png`) are deliberately **not** downloaded. In the
 MyPaint pack the brush settings are CC0 but some previews are CC-BY, and not
 having the files is the surest way not to ship them.
 
+**Read the "Licence" line of each entry.** Most say *verified inside the
+download*, which is the rule `docs/brush-sources.md` is written against. One
+says *declared on the submission page*, which is weaker, and is spelled out
+in full where it applies.
+
 ## MyPaint default brushes 2.0.2
 
 - **Directory:** `assets/brushes/mypaint/`
@@ -18,3 +23,51 @@ having the files is the surest way not to ship them.
 - **Licence:** CC0-1.0, verified against `Licenses.dep5` in the download itself
 - **Authors:** Martin Renold and the MyPaint Development Team; Ramón Miranda; Marcelo "Tanda" Cerviño; David Revoy; Guillaume Loussarévian; Brien Dieterle
 - **Format:** .myb (MyPaint, JSON)
+
+## David Revoy — Krita brush bundle 2025-01
+
+- **Directory:** `assets/brushes/deevad/`
+- **Source:** <https://www.davidrevoy.com/article1060/krita-brushes-2025-01-bundle>
+- **Downloaded from:** <https://www.peppercarrot.com/extras/resources/deevad-bundle_25.01.zip>
+- **SHA-256 of the archive:** `4c628a9418fcde63abacafdcb143881f2cbbf907275cb4f72335545841cf8173`
+- **Licence:** CC0-1.0, verified against `meta.xml` inside `Deevad_25.01.bundle` in the download itself
+- **Authors:** David Revoy (Deevad)
+- **Format:** .bundle (Krita resource bundle)
+
+## Raghavendra Kamath — Krita brush presets v2.1
+
+- **Directory:** `assets/brushes/raghukamath/`
+- **Source:** <https://gitlab.com/raghukamath/krita-brush-presets>
+- **Downloaded from:** <https://gitlab.com/raghukamath/krita-brush-presets/-/archive/v2.1/krita-brush-presets-v2.1.zip>
+- **Licence:** CC0-1.0, verified against `LICENSE` in the download itself
+- **Authors:** Raghavendra Kamath
+- **Format:** .bundle (Krita resource bundle)
+
+## GDQuest — Free Krita brushes for game artists
+
+- **Directory:** `assets/brushes/gdquest/`
+- **Source:** <https://github.com/GDQuest/krita-free-brushes>
+- **Downloaded from:** <https://github.com/GDQuest/krita-free-brushes/archive/c68b0cc9ea4f10c3ce239ac7329fc13461aec8ed.zip>
+- **Licence:** CC-BY-4.0, verified against `README.md` in the download itself
+- **Authors:** GDquest (Nathan Lovato)
+- **Format:** .kpp (Krita) with .gbr and .gih tips
+
+  Attribution is **required**: every preset generated from this pack carries
+  a `Credit`, and the brush browser prints it on the row.
+
+## rubberduck — 60 free GIMP/Krita brushes
+
+- **Directory:** `assets/brushes/rubberduck/`
+- **Source:** <https://opengameart.org/content/60-free-gimp-krita-brushes>
+- **Downloaded from:** <https://opengameart.org/sites/default/files/60-free-gimp-and-krita-brushes.zip>
+- **SHA-256 of the archive:** `212069242a44ac19c44894df25e93c36dc546d7d84008454cc2d0f22acddaee6`
+- **Licence:** CC0-1.0 — **declared on the submission page, not inside the download.**
+  <https://opengameart.org/content/60-free-gimp-krita-brushes> lists the author as `rubberduck` and, under
+  "License(s)", a single Creative Commons Zero mark linking to
+  <http://creativecommons.org/publicdomain/zero/1.0/>. The archive itself
+  carries no licence file, so this could not be checked mechanically; the
+  page was read by hand on 2026-08-01, and the SHA-256 above ties that reading
+  to exactly these bytes. This is a deliberate exception to the rule at the
+  top of `docs/brush-sources.md`, made once, for this source only.
+- **Authors:** rubberduck
+- **Format:** .gbr and .gih (GIMP)

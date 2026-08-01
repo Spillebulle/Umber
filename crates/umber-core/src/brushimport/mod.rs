@@ -44,6 +44,14 @@ use crate::tip::TipMask;
 pub struct Imported {
     pub preset: BrushPreset,
     pub tip: Option<TipMask>,
+    /// What this *particular* brush lost on the way in.
+    ///
+    /// [`dropped_features`] answers the same question for a whole file, which
+    /// is what the import notice needs — twenty files should not produce twenty
+    /// notices. A container cannot use it: a `.bundle` of forty-six brushes
+    /// reports the union of everything any of them dropped, and the library
+    /// generator has to be able to keep the thirty that dropped nothing.
+    pub dropped: Vec<&'static str>,
 }
 
 /// Read every brush in a file, whatever format it is in.
@@ -71,6 +79,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("mypaint", name, brush),
                 tip: None,
+                dropped: mypaint::unsupported_features(&text).unwrap_or_default(),
             }])
         }
         // `.gpb` is a `.gbr` with a colour pattern stapled on; the same reader
@@ -79,10 +88,16 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let bytes = preset::read_bytes(path)?;
             let brush = gbr::from_gbr(&bytes).map_err(|e| e.at(path))?;
             let name = embedded_name(&brush.name, &stem);
+            let dropped = if brush.coloured {
+                vec![gbr::COLOURED]
+            } else {
+                Vec::new()
+            };
             let (parameters, tip) = gbr::to_brush(brush);
             Ok(vec![Imported {
                 preset: preset_for("gbr", name, parameters),
                 tip: Some(tip),
+                dropped,
             }])
         }
         // A pipe is a container: every cell arrives as its own brush, because
@@ -93,6 +108,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let pipe = gih::from_gih(&bytes).map_err(|e| e.at(path))?;
             let base = embedded_name(&pipe.name, &stem);
             let many = pipe.cells.len() > 1;
+            let animated = pipe.animated;
             Ok(pipe
                 .cells
                 .into_iter()
@@ -105,10 +121,18 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     } else {
                         base.clone()
                     };
+                    let mut dropped = Vec::new();
+                    if animated {
+                        dropped.push(gih::ANIMATION);
+                    }
+                    if cell.coloured {
+                        dropped.push(gbr::COLOURED);
+                    }
                     let (parameters, tip) = gbr::to_brush(cell);
                     Imported {
                         preset: preset_for("gih", name, parameters),
                         tip: Some(tip),
+                        dropped,
                     }
                 })
                 .collect())
@@ -120,6 +144,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("vbr", name, decoded.brush),
                 tip: None,
+                dropped: vbr::dropped_features(&text),
             }])
         }
         "kpp" => {
@@ -127,9 +152,14 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let decoded =
                 kpp::from_kpp_in(&bytes, &sibling_brushes(path)).map_err(|e| e.at(path))?;
             let name = embedded_name(&decoded.name, &stem);
+            let mut dropped = decoded.dropped;
+            if decoded.missing_tip.is_some() {
+                dropped.push(kpp::MISSING_TIP);
+            }
             Ok(vec![Imported {
                 preset: preset_for("kpp", name, decoded.brush),
                 tip: decoded.tip,
+                dropped,
             }])
         }
         // The other container, and the one that carries its own attribution:
@@ -145,9 +175,14 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     let name = embedded_name(&decoded.name, &stem);
                     let mut preset = preset_for("krita", name, decoded.brush);
                     preset.credit = contents.credit.clone();
+                    let mut dropped = decoded.dropped;
+                    if decoded.missing_tip.is_some() {
+                        dropped.push(kpp::MISSING_TIP);
+                    }
                     Imported {
                         preset,
                         tip: decoded.tip,
+                        dropped,
                     }
                 })
                 .collect())
@@ -157,6 +192,10 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let file = abr::from_abr(&bytes).map_err(|e| e.at(path))?;
             let base = display_name(&stem);
             let many = file.brushes.len() > 1;
+            // A `.abr` states its losses per file, not per brush: a computed
+            // brush that was skipped is not *this* stamp's problem, and the
+            // missing descriptor is every stamp's.
+            let dropped = abr::dropped_features(&bytes);
             Ok(file
                 .brushes
                 .into_iter()
@@ -171,6 +210,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset: preset_for("abr", name, parameters),
                         tip: Some(tip),
+                        dropped: dropped.clone(),
                     }
                 })
                 .collect())
@@ -183,7 +223,13 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             // only it knows whether it already holds a mask by that name.
             Ok(presets
                 .into_iter()
-                .map(|preset| Imported { preset, tip: None })
+                .map(|preset| Imported {
+                    preset,
+                    tip: None,
+                    // An Umber library holds Umber brushes; there is nothing in
+                    // it that Umber cannot render.
+                    dropped: Vec::new(),
+                })
                 .collect())
         }
         _ => Err(PresetError::UnknownFormat(path.to_path_buf())),
@@ -314,7 +360,10 @@ pub fn display_name(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len());
     let mut start_of_word = true;
     for c in stem.chars() {
-        if c == '_' || c == '-' {
+        // Runs collapse, and a space counts as one of them. Krita's own names
+        // are written "c1) Pencil H Sketch - deevad 25.01", so a separator with
+        // spaces either side would otherwise leave three in a row.
+        if c == '_' || c == '-' || c.is_whitespace() {
             if !out.ends_with(' ') && !out.is_empty() {
                 out.push(' ');
                 start_of_word = true;
@@ -346,6 +395,13 @@ mod tests {
         assert_eq!(display_name("charcoal"), "Charcoal");
         assert_eq!(display_name("__"), "Brush");
         assert_eq!(display_name(""), "Brush");
+        // Krita states its own names with spaces around the separator, so a
+        // run of them has to collapse to one — "Sketch  Deevad" otherwise.
+        assert_eq!(
+            display_name("c1) Pencil H Sketch - deevad 25.01"),
+            "C1) Pencil H Sketch Deevad 25.01"
+        );
+        assert_eq!(display_name("  spaced   out  "), "Spaced Out");
     }
 
     #[test]
@@ -390,7 +446,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(found.len(), 1);
-        let Imported { preset, tip } = &found[0];
+        let Imported {
+            preset,
+            tip,
+            dropped,
+        } = &found[0];
+        // A plain 8-bit `.gbr` is exactly what Umber stamps, so nothing about
+        // it is an approximation and the import has nothing to apologise for.
+        assert!(dropped.is_empty(), "{dropped:?}");
         // The file has no name of its own, so the file name is what shows.
         assert_eq!(preset.name, "Chalk Stamp");
         assert_eq!(preset.id, "gbr/chalk-stamp");

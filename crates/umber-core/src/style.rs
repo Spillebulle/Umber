@@ -88,6 +88,9 @@ const RULES: &[(&str, &str)] = &[
     ("blur", Style::BLENDER),
     ("pickanddrag", Style::BLENDER),
     ("dissolver", Style::BLENDER),
+    // A waterfall is not a wet brush, and `water` below would say it was.
+    // Ahead of everything, because it is the most specific thing in the list.
+    ("waterfall", Style::EFFECT),
     // --- wet media ---------------------------------------------------------
     // Also ahead of the paints, so `acrylic-03-with-water` and
     // `oil-01-clean`'s watery siblings sort by how they behave.
@@ -105,6 +108,7 @@ const RULES: &[(&str, &str)] = &[
     ("chalk", Style::CHARCOAL),
     ("pastel", Style::CHARCOAL),
     ("conte", Style::CHARCOAL),
+    ("crayon", Style::CHARCOAL),
     ("marker", Style::MARKER),
     // --- pens and ink ------------------------------------------------------
     ("ink", Style::INK),
@@ -128,8 +132,23 @@ const RULES: &[(&str, &str)] = &[
     ("rough", Style::TEXTURE),
     ("bulk", Style::TEXTURE),
     ("sponge", Style::TEXTURE),
-    ("dirty", Style::TEXTURE),
+    ("dirt", Style::TEXTURE),
     ("coarse", Style::TEXTURE),
+    // The GIMP and Krita stamp packs are mostly surfaces, and every one of
+    // these is a name several of them use. Without them the OpenGameArt pack
+    // arrives as 269 brushes in "Paint & brushes".
+    ("scratch", Style::TEXTURE),
+    ("crack", Style::TEXTURE),
+    ("structure", Style::TEXTURE),
+    ("patch", Style::TEXTURE),
+    ("wall", Style::TEXTURE),
+    ("rock", Style::TEXTURE),
+    ("stone", Style::TEXTURE),
+    ("gravel", Style::TEXTURE),
+    ("pitted", Style::TEXTURE),
+    ("debris", Style::TEXTURE),
+    ("canvas", Style::TEXTURE),
+    ("paper", Style::TEXTURE),
     // --- shapes that are pictures of something -----------------------------
     ("feather", Style::NATURE),
     ("grass", Style::NATURE),
@@ -137,6 +156,12 @@ const RULES: &[(&str, &str)] = &[
     ("leaf", Style::NATURE),
     ("fur", Style::NATURE),
     ("cloud", Style::NATURE),
+    ("foliage", Style::NATURE),
+    ("vegeta", Style::NATURE), // vegetal, vegetation
+    ("flower", Style::NATURE),
+    ("bark", Style::NATURE),
+    ("wood", Style::NATURE),
+    ("moss", Style::NATURE),
     // --- named effects -----------------------------------------------------
     // Above the paints, because these are distinctive names while `brush` and
     // `paint` below are catch-alls: `DNA_brush` is an effect, not a brush, and
@@ -158,6 +183,20 @@ const RULES: &[(&str, &str)] = &[
     ("bubble", Style::EFFECT),
     ("glow", Style::EFFECT),
     ("fill", Style::EFFECT),
+    // The other half of the stamp packs: shapes that are pictures of nothing
+    // in particular, which is what "Effects & experimental" is for.
+    ("explo", Style::EFFECT), // explosion, exploding
+    ("spark", Style::EFFECT),
+    ("fractal", Style::EFFECT),
+    ("crystal", Style::EFFECT),
+    ("plasma", Style::EFFECT),
+    ("radioactiv", Style::EFFECT),
+    ("microbe", Style::EFFECT),
+    ("smoke", Style::EFFECT),
+    ("lava", Style::EFFECT),
+    ("star", Style::EFFECT),
+    ("spik", Style::EFFECT), // spiky, spikeball
+    ("weird", Style::EFFECT),
     ("blot", Style::INK),
     ("sting", Style::INK),
     // --- paint -------------------------------------------------------------
@@ -332,6 +371,62 @@ mod tests {
         assert_eq!(classify("blending_knife", &mixes), Style::BLENDER);
         // Or when the name says nothing at all.
         assert_eq!(classify("zzz_unknown", &mixes), Style::BLENDER);
+    }
+
+    /// The stamp packs name their brushes after what the mark looks like, not
+    /// after a medium, so they land in "Paint & brushes" unless the rules learn
+    /// those words. These are real names from rubberduck's OpenGameArt pack,
+    /// Revoy's bundle, Raghukamath's and GDQuest's.
+    #[test]
+    fn the_stamp_packs_names_land_somewhere_sensible() {
+        for (name, style) in [
+            ("Bark", Style::NATURE),
+            ("Vegetation", Style::NATURE),
+            ("Symmetric flower", Style::NATURE),
+            ("Wood Brush", Style::NATURE),
+            ("Y) foliage", Style::NATURE),
+            ("Scratches 2", Style::TEXTURE),
+            ("Cracks (2)", Style::TEXTURE),
+            ("Wall Structure", Style::TEXTURE),
+            ("Patches", Style::TEXTURE),
+            ("Dirt", Style::TEXTURE),
+            ("Rock 1", Style::TEXTURE),
+            ("Thick Dry Canvas", Style::TEXTURE),
+            ("Fine Grain", Style::TEXTURE),
+            ("Pack01 Sponge 03", Style::TEXTURE),
+            ("Explosion Particles", Style::EFFECT),
+            ("Exploding Sparks", Style::EFFECT),
+            ("Fractal Brush", Style::EFFECT),
+            ("Crystallix", Style::EFFECT),
+            ("Plasmaball", Style::EFFECT),
+            ("Radioactivity", Style::EFFECT),
+            ("Cold Lava", Style::EFFECT),
+            ("Weird Smoke", Style::EFFECT),
+            ("MultiStar", Style::EFFECT),
+            ("Spikeball", Style::EFFECT),
+            ("Gdquest PixelArt OnePixel", Style::EFFECT),
+            ("Pack01 Crayon09", Style::CHARCOAL),
+            ("Pack01 Softpastel", Style::CHARCOAL),
+            ("C1) Pencil H Sketch", Style::PENCIL),
+            ("Pack01 Inkbrush", Style::INK),
+            ("Pack01 Gouache 03", Style::PAINT),
+            ("K) Blender Rake Smudge", Style::BLENDER),
+            ("B1) Airbrush", Style::AIRBRUSH),
+            ("Splatters (2)", Style::AIRBRUSH),
+        ] {
+            assert_eq!(named(name), style, "{name}");
+        }
+    }
+
+    /// A waterfall is not a wet brush, and the `water` rule would say it was.
+    /// The most specific rule has to come first, which is the whole ordering
+    /// discipline in one example.
+    #[test]
+    fn a_waterfall_is_not_watercolour() {
+        assert_eq!(named("Waterfall"), Style::EFFECT);
+        assert_eq!(named("watercolor-02-paint"), Style::WATERCOLOUR);
+        // And a medium still beats a surface: `Charcoal Rock Soft` is charcoal.
+        assert_eq!(named("D) Charcoal Rock Soft"), Style::CHARCOAL);
     }
 
     #[test]
