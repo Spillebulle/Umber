@@ -2318,7 +2318,7 @@ fn run_capture(
     canvas: &mut CanvasRenderer,
     slots: &[u32],
     draws: &[LayerDraw],
-) -> (DocumentCapture, std::time::Duration) {
+) -> (DocumentCapture, std::time::Duration, usize) {
     assert!(
         canvas.begin_capture(slots, draws),
         "a capture was in flight"
@@ -2330,11 +2330,13 @@ fn run_capture(
 fn drive_to_completion(
     gpu: &Gpu,
     canvas: &mut CanvasRenderer,
-) -> (DocumentCapture, std::time::Duration) {
+) -> (DocumentCapture, std::time::Duration, usize) {
     let mut worst = std::time::Duration::ZERO;
+    let mut frames = 0usize;
     // Generous: a few frames per step, and a step is one layer. A capture that
     // has not finished inside this is a bug, not a slow machine.
     for _ in 0..2000 {
+        frames += 1;
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -2353,7 +2355,7 @@ fn drive_to_completion(
         worst = worst.max(recording + started.elapsed());
 
         if let Some(doc) = taken {
-            return (doc, worst);
+            return (doc, worst, frames);
         }
         // Stand in for the frame this loop is pretending to be. `take_capture`
         // polls *without* blocking — the whole point — so a loop with nothing
@@ -2412,7 +2414,7 @@ fn a_capture_reads_back_exactly_what_the_blocking_path_does() {
         .collect();
     let expected_merged = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
 
-    let (captured, _) = run_capture(h.gpu, &mut h.canvas, &[0, 1], &draws);
+    let (captured, _, _) = run_capture(h.gpu, &mut h.canvas, &[0, 1], &draws);
 
     assert_eq!(captured.size, UVec2::splat(DOC));
     assert_eq!(captured.layers.len(), 2);
@@ -2465,7 +2467,7 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
         .collect();
 
     let started = std::time::Instant::now();
-    let (captured, worst) = run_capture(h.gpu, &mut h.canvas, &slots, &draws);
+    let (captured, worst, frames) = run_capture(h.gpu, &mut h.canvas, &slots, &draws);
     let total = started.elapsed();
 
     assert_eq!(captured.layers.len(), LAYERS as usize);
@@ -2476,20 +2478,49 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
     );
     assert_eq!(captured.merged.len(), (BIG * BIG * 4) as usize);
 
-    // Reported whether or not it passes: the number is the point, and it is a
-    // property of the machine rather than of this code.
+    let software = h.gpu.adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     eprintln!(
-        "capture of {BIG}x{BIG}, {LAYERS} layers: worst frame {:.2} ms, \
-         {:.0} ms end to end",
+        "capture of {BIG}x{BIG}, {LAYERS} layers: {frames} frames, worst frame \
+         {:.2} ms, {:.0} ms end to end{}",
         worst.as_secs_f64() * 1000.0,
         total.as_secs_f64() * 1000.0,
+        if software { " (software adapter)" } else { "" },
     );
+
+    // The guarantee, asserted everywhere: the work is *spread*. One frame per
+    // layer is the floor the design implies — a capture that finished in fewer
+    // frames than it has layers would have to have read more than one layer in
+    // some frame, which is the thing being ruled out.
+    //
+    // This is the assertion that survives the machine changing under it. It
+    // holds on a software rasteriser at forty milliseconds a frame exactly as
+    // it does on a discrete card at one.
     assert!(
-        worst < std::time::Duration::from_millis(8),
-        "one frame of the capture cost {:.2} ms — something on this path is \
-         waiting for the GPU, or reading the whole document at once",
-        worst.as_secs_f64() * 1000.0,
+        frames >= LAYERS as usize,
+        "the capture finished in {frames} frames for {LAYERS} layers, so some \
+         frame read more than one — the whole point is that it does not",
     );
+
+    // And the wall clock, only where there is hardware to hold to it.
+    //
+    // CI's Linux runners have no GPU: they fall back to a software Vulkan
+    // implementation where a 2048-square eight-layer readback takes forty-odd
+    // milliseconds a frame however it is written, because the pixels are being
+    // produced by the CPU. Asserting a frame budget there measures the runner,
+    // not this code — it failed the 0.0.2 release build for exactly that
+    // reason. Loosening the number for everyone would have been worse: it is
+    // the figure that catches a blocking readback creeping back in on the
+    // machines people actually paint on. The GPU tests already skip themselves
+    // rather than fail when there is no adapter at all; this is the same idea
+    // one step further in.
+    if !software {
+        assert!(
+            worst < std::time::Duration::from_millis(8),
+            "one frame of the capture cost {:.2} ms — something on this path is \
+             waiting for the GPU, or reading the whole document at once",
+            worst.as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 #[test]
