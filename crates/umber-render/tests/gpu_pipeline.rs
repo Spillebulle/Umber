@@ -10,7 +10,7 @@ use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
-    InputPoint, Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
+    InputPoint, Modulation, PixelRect, ResponseCurve, Selection, StrokeBuilder, TipMask,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, Gpu, LayerDraw, ProbeParams,
@@ -152,6 +152,15 @@ impl Harness {
     fn set_tip(&mut self, tip: Option<TipMask>) {
         self.canvas
             .set_tip(&self.gpu.device, &self.gpu.queue, tip.map(Arc::new));
+    }
+
+    /// The selection the dab pass is clipped to. The `Arc` is made here for
+    /// the reason [`Harness::set_tip`]'s is: the renderer compares by identity,
+    /// and a fresh `Arc` per call is the "this is a different selection" case
+    /// each of these tests means.
+    fn set_selection(&mut self, selection: Option<Selection>) {
+        self.canvas
+            .set_selection(&self.gpu.device, &self.gpu.queue, selection.map(Arc::new));
     }
 
     /// The paper, as `(tile, strength, tile size in document pixels)`.
@@ -1368,6 +1377,157 @@ fn a_grained_stroke_may_still_build_up() {
         "eight dabs through half-strength paper should build to solid, got {}",
         h.pixel_in(1, 32, 32)[3]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Selections
+// ---------------------------------------------------------------------------
+
+/// The left half of the canvas, as a rectangle selection.
+fn left_half() -> Selection {
+    Selection::rectangle(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(DOC as f32 * 0.5, DOC as f32),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection")
+}
+
+#[test]
+fn a_stroke_is_clipped_to_the_selection() {
+    // The one that matters. A dab straddling the boundary must mark the layer
+    // on one side of it and leave the other exactly as it was.
+    //
+    // The clip is applied in the *dab pass*, so what reaches the scratch is
+    // already clipped and neither `composite.wgsl` nor `commit.wgsl` knows
+    // there is a selection at all. That is deliberate: those two implement the
+    // same blending maths, and a stroke clipped in one of them and not the
+    // other would visibly jump at pointer-up.
+    let mut h = harness_or_skip!();
+
+    h.set_selection(Some(left_half()));
+    h.stamp(&[dab(32.0, 32.0, 20.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel(20, 32)[3], 255, "inside the selection");
+    assert_eq!(h.pixel(44, 32)[3], 0, "outside it");
+}
+
+#[test]
+fn no_selection_is_the_exact_identity() {
+    // The claim the design rests on, the same one `grain_off_is_the_exact_
+    // identity` makes: a document with nothing selected must paint precisely
+    // what it painted before selections existed. The shader multiplies coverage
+    // by a `select`ed 1.0 rather than branching, so this is a multiply by one.
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 12.0, 0.6)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let plain = h.pixel(32, 32);
+
+    // Set one and take it off again, so the placeholder path has really been
+    // through a real mask rather than never having left its initial state.
+    h.set_selection(Some(left_half()));
+    h.set_selection(None);
+    h.stamp(&[dab(32.0, 32.0, 12.0, 0.6)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        plain,
+        "clearing the selection did not restore the unclipped mark"
+    );
+}
+
+#[test]
+fn erasing_is_clipped_to_the_selection_too() {
+    // The eraser is a blend state, not a shader branch, and the selection sits
+    // upstream of both — so this cannot be got right for paint and wrong for
+    // erase. Worth pinning anyway: an eraser that ignored the selection would
+    // be the most destructive way for this to fail.
+    let mut h = harness_or_skip!();
+
+    h.fill(0, Color::WHITE);
+    h.set_selection(Some(left_half()));
+    h.stamp(&[dab(32.0, 32.0, 20.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Erase);
+
+    assert_eq!(h.pixel(20, 32)[3], 0, "erased inside the selection");
+    assert_eq!(h.pixel(44, 32)[3], 255, "untouched outside it");
+}
+
+#[test]
+fn a_selection_edge_is_antialiased() {
+    // The reason coverage is a byte rather than a bit. The boundary is put down
+    // the middle of a column, so that column must come out about half painted —
+    // a hard edge here is a staircase the artist can see, at every zoom level.
+    let mut h = harness_or_skip!();
+
+    let sel = Selection::rectangle(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(32.5, DOC as f32),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    h.set_selection(Some(sel));
+    h.stamp(&[dab(32.0, 32.0, 20.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let edge = h.pixel(32, 32)[3];
+    assert!(
+        (100..=155).contains(&edge),
+        "expected ~128 on the half-covered column, got {edge}"
+    );
+    assert_eq!(h.pixel(31, 32)[3], 255, "the column before it is fully in");
+    assert_eq!(h.pixel(33, 32)[3], 0, "the one after is fully out");
+}
+
+#[test]
+fn a_clipped_stroke_still_saturates_under_overlap() {
+    // The wet-layer guarantee has to survive the selection exactly as it
+    // survived the tip and the paper. The mask modulates coverage; it does not
+    // touch the blend state.
+    let mut h = harness_or_skip!();
+
+    h.set_selection(Some(left_half()));
+    h.stamp(&[dab(20.0, 32.0, 12.0, 0.5), dab(20.0, 32.0, 12.0, 0.5)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let alpha = h.pixel(20, 32)[3];
+    assert!(
+        (100..=155).contains(&alpha),
+        "expected ~128 (single coverage), got {alpha} — clipped dabs are compounding"
+    );
+}
+
+#[test]
+fn nothing_outside_a_selections_own_rectangle_is_paintable() {
+    // The mask covers only its own bounds, so everywhere else has to be decided
+    // by the shader rather than by a texture lookup. Clamping instead of
+    // rejecting would leave the whole row and column beyond a rectangle
+    // selection paintable — the boundary texels smeared across the canvas.
+    let mut h = harness_or_skip!();
+
+    let sel = Selection::rectangle(
+        Vec2::new(24.0, 24.0),
+        Vec2::new(40.0, 40.0),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    h.set_selection(Some(sel));
+    // Wide enough to reach well past the selection on every side.
+    h.stamp(&[dab(32.0, 32.0, 28.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    assert_eq!(h.pixel(32, 32)[3], 255, "inside");
+    for (x, y, where_) in [
+        (32, 12, "above"),
+        (32, 52, "below"),
+        (12, 32, "left of"),
+        (52, 32, "right of"),
+    ] {
+        assert_eq!(h.pixel(x, y)[3], 0, "paint landed {where_} the selection");
+    }
 }
 
 // ---------------------------------------------------------------------------

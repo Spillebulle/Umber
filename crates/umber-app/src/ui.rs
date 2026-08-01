@@ -27,8 +27,8 @@ use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use std::sync::Arc;
 use umber_core::{
-    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, TipMask,
-    input::PressureSource,
+    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, SelectionMode,
+    TipMask, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -219,6 +219,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .frame(Frame::NONE)
         .show(root, |ui| {
             let rect = ui.max_rect();
+            selection_outline(ui, &p, ed, rect);
             canvas_scrollbars(ui, &p, ed, rect);
             brush_size_preview(ui, &p, ed);
             // After the preview, so the pen sits on top of the ring rather
@@ -254,6 +255,82 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     UiOutput {
         actions,
         canvas_rect,
+    }
+}
+
+/// The selection, and the outline being drawn if one is.
+///
+/// Drawn whatever tool is in hand, because it is how the artist knows their
+/// painting is being clipped. Not animated: "marching" ants would mean asking
+/// egui for a repaint every frame for ever, which is a fifth of a core spent on
+/// a document nobody is touching — the exact cost `render`'s `repaint_at`
+/// exists to avoid. A static dashed line says the same thing.
+///
+/// Two passes, dark then light, so the outline reads over both a white canvas
+/// and a black one. Neither colour is a literal: `backdrop` and `accent` are
+/// each dark in one theme and light in the other, which is what makes the pair
+/// work on any artwork.
+fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
+    if ed.selection.is_none() && ed.selection_draft.is_none() {
+        return;
+    }
+
+    // The pivot from *this* frame's canvas rect rather than `Editor::
+    // canvas_pivot`, which is written after this runs and is therefore last
+    // frame's. It is the same number the composite pass will be given, so the
+    // outline and the pixels it describes cannot be a frame apart while the
+    // panels are being dragged.
+    let scale = ed.pixels_per_point.max(1e-3);
+    let pivot = glam::Vec2::new(rect.center().x, rect.center().y) * scale;
+    let camera = ed.camera;
+    let to_screen = |doc: glam::Vec2| {
+        let s = camera.doc_to_screen(doc, pivot);
+        pos2(s.x / scale, s.y / scale)
+    };
+
+    // Clipped to the canvas region: a selection scrolled under a panel must
+    // not draw its outline across it.
+    let painter = ui.painter().with_clip_rect(rect);
+    let mut screen: Vec<egui::Pos2> = Vec::new();
+    let mut draw_ring = |ring: &[glam::Vec2], closed: bool| {
+        if ring.len() < 2 {
+            return;
+        }
+        screen.clear();
+        screen.extend(ring.iter().copied().map(to_screen));
+        if closed {
+            screen.push(screen[0]);
+        }
+        // Segment by segment rather than one `Shape::line`, which would want
+        // the points by value and so a copy of them per ring per frame.
+        for pair in screen.windows(2) {
+            painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.backdrop));
+        }
+        painter.extend(egui::Shape::dashed_line(
+            &screen,
+            Stroke::new(1.0, p.accent),
+            4.0,
+            4.0,
+        ));
+    };
+
+    if let Some(selection) = ed.selection.as_ref() {
+        for ring in selection.rings() {
+            draw_ring(ring, true);
+        }
+    }
+    if let Some(draft) = ed.selection_draft.as_ref() {
+        // Into the editor's own buffer rather than a fresh one: this is the
+        // one part of the selection path that runs every frame.
+        draft.outline_into(&mut ed.selection_outline);
+        // Only the rectangle is closed while it is being drawn: its four
+        // corners *are* the shape. A lasso mid-drag and a polygon two clicks in
+        // are paths, and drawing the edge back to the start would promise a
+        // shape the next moment is going to change.
+        draw_ring(
+            &ed.selection_outline,
+            draft.mode() == SelectionMode::Rectangle,
+        );
     }
 }
 
@@ -607,6 +684,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         let (icon, name) = match ed.ui.tool {
             Tool::Brush => (Icon::Brush, "Brush"),
             Tool::Eraser => (Icon::Eraser, "Eraser"),
+            Tool::Select => (Icon::Select, "Select"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
         };
@@ -661,6 +739,28 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                      Edit brush, on the Tip tab.",
                 );
             }
+        } else if ed.ui.tool == Tool::Select {
+            selection_mode_switch(ui, p, ed);
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(ed.ui.selection_mode.hint())
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+            if ed.selection.is_some() {
+                divider(ui, p);
+                // Only offered where there is something to clear. A live
+                // control that answers to nothing is the thing this interface
+                // does not do.
+                if status_link(
+                    ui,
+                    p,
+                    &shortcuts::labelled("Deselect", Action::Deselect),
+                    "Let edits reach the whole layer again.",
+                ) {
+                    ed.deselect();
+                }
+            }
         } else {
             ui.label(
                 egui::RichText::new("drag on the canvas")
@@ -678,6 +778,67 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }
         });
     });
+}
+
+/// The selection tool's mode switch: the mode name and a chevron, opening a
+/// list of the three.
+///
+/// The trigger is painted, like every other control the design specifies;
+/// the list itself is a popup of `selectable_label`s, exactly as the Colour
+/// panel's picker-mode switch is. One dropdown pattern rather than two.
+fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    let label = ed.ui.selection_mode.label();
+    let font = FontId::proportional(text::SMALL);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 16.0, 18.0), Sense::click());
+    let colour = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, metrics::RADIUS, p.control);
+    painter.text(
+        rect.left_center() + vec2(6.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        colour,
+    );
+    icons::draw(
+        painter,
+        Rect::from_min_size(rect.right_top() - vec2(12.0, 0.0), vec2(12.0, 18.0)),
+        Icon::ChevronDown,
+        colour,
+    );
+
+    if response.clicked() {
+        ed.ui.selection_menu_open = !ed.ui.selection_menu_open;
+    }
+    let popup = egui::Popup::from_response(&response)
+        .open(ed.ui.selection_menu_open)
+        .show(|ui| {
+            for mode in SelectionMode::ALL {
+                if ui
+                    .selectable_label(ed.ui.selection_mode == mode, mode.label())
+                    .clicked()
+                {
+                    ed.ui.selection_mode = mode;
+                    // A half-drawn outline belongs to the mode that was
+                    // drawing it, and a polygon left open under the lasso
+                    // would take its next click as a vertex.
+                    ed.cancel_selection_draft();
+                    ed.ui.selection_menu_open = false;
+                }
+            }
+        });
+    if popup.is_none() {
+        ed.ui.selection_menu_open = false;
+    }
 }
 
 fn divider(ui: &mut egui::Ui, p: &Palette) {

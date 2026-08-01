@@ -22,6 +22,9 @@ pub enum Icon {
     // Tools
     Brush,
     Eraser,
+    /// A dashed box — the marquee, which is what a selection looks like on the
+    /// canvas.
+    Select,
     Pan,
     Zoom,
     // Layers
@@ -97,6 +100,21 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             ] {
                 line(at(tip.0, tip.1), at(a.0, a.1));
                 line(at(tip.0, tip.1), at(b.0, b.1));
+            }
+        }
+
+        Icon::Select => {
+            // Dashes rather than a stroked rectangle: a solid box reads as a
+            // shape tool, and the dashes are the same mark the selection makes
+            // on the canvas. The spans reach both corners of every side, so the
+            // box still reads as a box at 18 px.
+            const LO: f32 = 5.0;
+            const HI: f32 = 19.0;
+            for (from, to) in [(0.0, 4.0), (6.0, 8.0), (10.0, 14.0)] {
+                line(at(LO + from, LO), at(LO + to, LO));
+                line(at(LO + from, HI), at(LO + to, HI));
+                line(at(LO, LO + from), at(LO, LO + to));
+                line(at(HI, LO + from), at(HI, LO + to));
             }
         }
 

@@ -5,10 +5,11 @@
 //! and what belongs to the application?
 //!
 //! **Per document** — the [`Document`] itself, its [`LayerStack`], its
-//! [`History`] and its [`Camera`], together with the tab metadata here. Those
-//! four are exactly the things that would be wrong to share: two documents that
-//! shared an undo stack would replay each other's strokes, and two that shared
-//! a camera would jump when you switched between them.
+//! [`History`], its [`Camera`] and its [`Selection`], together with the tab
+//! metadata here. Those are exactly the things that would be wrong to share:
+//! two documents that shared an undo stack would replay each other's strokes,
+//! two that shared a camera would jump when you switched between them, and a
+//! selection carried onto another canvas could name pixels it does not have.
 //!
 //! **Global** — everything else. Theme, accent, tool, brush and presets,
 //! colour, pressure model and, emphatically, the panel layout: a painter who
@@ -25,9 +26,10 @@
 //! [`Tab::parked`] is therefore `None` for exactly one tab, the active one.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use glam::UVec2;
-use umber_core::{Camera, Document, History, LayerStack};
+use umber_core::{Camera, Document, History, LayerStack, Selection};
 
 /// Identity of an open document, stable for as long as it stays open.
 ///
@@ -48,6 +50,12 @@ pub struct DocumentState {
     pub layers: LayerStack,
     pub history: History,
     pub camera: Camera,
+    /// Where an edit may land on this document, or `None` for all of it.
+    ///
+    /// Per-document like everything else here: switching tabs must not carry
+    /// one document's selection onto another's canvas, where its bounds might
+    /// not even fit.
+    pub selection: Option<Arc<Selection>>,
 }
 
 impl DocumentState {
@@ -64,6 +72,7 @@ impl DocumentState {
             doc,
             layers: LayerStack::new(),
             history: History::default(),
+            selection: None,
         }
     }
 }

@@ -6,7 +6,7 @@ use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{
-    Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, TipMask,
+    Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, Selection, TipMask,
 };
 use wgpu::util::DeviceExt;
 
@@ -577,11 +577,23 @@ struct DabUniforms {
     /// Side of one grain tile in document pixels.
     grain_scale: f32,
     _pad: f32,
+    /// Where the selection mask is mapped to, in document pixels.
+    sel_min: [f32; 2],
+    /// Its size. `[1.0, 1.0]` with no selection, so the shader's divide is
+    /// never by zero even though its result is thrown away.
+    sel_size: [f32; 2],
+    /// Non-zero when a real mask is bound. Unlike the tip and the grain this
+    /// cannot be folded into a placeholder — see the WGSL struct.
+    use_selection: u32,
+    /// Scalar padding, not a vec3: see the uniform-layout note in CLAUDE.md.
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 impl DabUniforms {
-    /// The uniforms for a document with no tip and no grain: every factor the
-    /// shader multiplies by is one.
+    /// The uniforms for a document with no tip, no grain and no selection:
+    /// every factor the shader multiplies by is one.
     fn plain(doc_size: UVec2) -> Self {
         Self {
             doc_size: [doc_size.x as f32, doc_size.y as f32],
@@ -590,6 +602,12 @@ impl DabUniforms {
             grain_strength: 0.0,
             grain_scale: 1.0,
             _pad: 0.0,
+            sel_min: [0.0, 0.0],
+            sel_size: [1.0, 1.0],
+            use_selection: 0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         }
     }
 }
@@ -780,6 +798,14 @@ pub struct CanvasRenderer {
     /// Which tile is in that texture, compared by `Arc` identity for exactly
     /// the reason [`CanvasRenderer::tip_mask`] is.
     grain_tile: Option<Arc<TipMask>>,
+    /// The selection mask, or a 1x1 placeholder. Held so it outlives the bind
+    /// group.
+    selection: wgpu::Texture,
+    selection_view: wgpu::TextureView,
+    /// Which selection is in that texture, by `Arc` identity — the same check
+    /// and the same reason as [`CanvasRenderer::tip_mask`]: comparing the
+    /// coverage would cost more than the upload it saves.
+    selection_mask: Option<Arc<Selection>>,
     /// The dab pass's uniforms, held rather than rebuilt: the tip and the grain
     /// are set independently, and reconstructing the block from one of them
     /// would clear the other's fields.
@@ -832,6 +858,7 @@ impl Shared {
                 sampler_entry(2),
                 texture_entry(3),
                 sampler_entry(4),
+                texture_entry(5),
             ],
         });
 
@@ -1098,6 +1125,12 @@ impl CanvasRenderer {
         // exactly 1.0 whatever was sampled.
         let grain = make_tip_texture(device, 1, 1);
         let grain_view = grain.create_view(&wgpu::TextureViewDescriptor::default());
+        // A placeholder again, but for a different reason: this one is never
+        // sampled, because `use_selection` is zero and the shader's `select`
+        // returns 1.0 without looking. It exists so the bind group layout does
+        // not vary — there is still exactly one set of dab pipelines.
+        let selection = make_coverage_texture(device, 1, 1, "umber-selection-mask");
+        let selection_view = selection.create_view(&wgpu::TextureViewDescriptor::default());
         let dab_bind_group = make_dab_bind_group(
             device,
             &shared.dab_layout,
@@ -1106,6 +1139,7 @@ impl CanvasRenderer {
             &shared.sampler,
             &grain_view,
             &shared.grain_sampler,
+            &selection_view,
         );
 
         let view_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1176,6 +1210,9 @@ impl CanvasRenderer {
             grain,
             grain_view,
             grain_tile: None,
+            selection,
+            selection_view,
+            selection_mask: None,
             grain_params: (0.0, 1.0),
             dab_state: DabUniforms::plain(doc_size),
             composite_bind_group,
@@ -1289,6 +1326,11 @@ impl CanvasRenderer {
     ///   bytes into the wrong pixels, or name a rectangle off the edge. This is
     ///   the same reason deleting a layer clears it, and structural undo is the
     ///   same real fix.
+    /// * **Drop the selection**, for the same reason again: its bounds are a
+    ///   rectangle of the old canvas and can now name pixels that do not exist.
+    ///   This drops the *mask*, so a caller that forgot leaves a document that
+    ///   is unclipped rather than one clipped to the wrong place — but it also
+    ///   leaves the outline on screen describing nothing, so do not forget.
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
@@ -1374,6 +1416,12 @@ impl CanvasRenderer {
 
         self.doc_size = new_size;
         self.dab_state.doc_size = [new_size.x as f32, new_size.y as f32];
+        // The mask names pixels of a canvas that no longer exists. Dropped
+        // rather than rescaled: a selection is the artist's statement about
+        // where they are working, and a resampled one is a guess.
+        // `set_selection` rebuilds the bind group, so this must run before the
+        // uniform write rather than after it.
+        self.set_selection(device, queue, None);
         queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
 
         self.composite_bind_group = make_composite_bind_group(
@@ -1511,6 +1559,65 @@ impl CanvasRenderer {
         queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
     }
 
+    /// Clip the dab pass to `selection`, or to nothing at all with `None`.
+    ///
+    /// Per stroke, exactly as [`Self::set_tip`] and [`Self::set_grain`] are, and
+    /// for the same reason: one binding covers a whole dab pass, so changing it
+    /// mid-stroke would leave the coverage already in the scratch clipped by the
+    /// selection that has gone. The mask is compared by `Arc` identity, so
+    /// calling this at the start of every stroke costs a pointer comparison.
+    ///
+    /// **The selection is applied here and nowhere else.** The scratch then
+    /// holds coverage that is already clipped, so the preview and the commit —
+    /// which must implement identical blending maths — cannot disagree about
+    /// where the selection was, because neither of them knows there is one.
+    pub fn set_selection(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        selection: Option<Arc<Selection>>,
+    ) {
+        let unchanged = match (&self.selection_mask, &selection) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+
+        let texture = match &selection {
+            Some(sel) => {
+                let rect = sel.bounds();
+                self.dab_state.sel_min = [rect.x as f32, rect.y as f32];
+                self.dab_state.sel_size = [rect.width as f32, rect.height as f32];
+                self.dab_state.use_selection = 1;
+                upload_coverage(
+                    device,
+                    queue,
+                    rect.width,
+                    rect.height,
+                    sel.coverage(),
+                    "umber-selection-mask",
+                )
+            }
+            None => {
+                self.dab_state.sel_min = [0.0, 0.0];
+                // Not zero: the shader divides by this, and a NaN would take
+                // the whole dab with it rather than merely being discarded.
+                self.dab_state.sel_size = [1.0, 1.0];
+                self.dab_state.use_selection = 0;
+                make_coverage_texture(device, 1, 1, "umber-selection-mask")
+            }
+        };
+
+        self.selection_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.selection = texture;
+        self.selection_mask = selection;
+        self.rebuild_dab_bind_group(device);
+        queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
+    }
+
     fn rebuild_dab_bind_group(&mut self, device: &wgpu::Device) {
         let tip_view = self
             .tip
@@ -1523,6 +1630,7 @@ impl CanvasRenderer {
             &self.shared.sampler,
             &self.grain_view,
             &self.shared.grain_sampler,
+            &self.selection_view,
         );
     }
 
@@ -2763,7 +2871,26 @@ fn clear_view(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, labe
 
 /// Upload an 8-bit mask — a tip or a paper tile — into a fresh texture.
 fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wgpu::Texture {
-    let texture = make_tip_texture(device, mask.width(), mask.height());
+    upload_coverage(
+        device,
+        queue,
+        mask.width(),
+        mask.height(),
+        mask.coverage(),
+        "umber-brush-tip",
+    )
+}
+
+/// Put `bytes` — one per texel, row-major — into a new coverage texture.
+fn upload_coverage(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+    label: &str,
+) -> wgpu::Texture {
+    let texture = make_coverage_texture(device, width, height, label);
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -2771,17 +2898,17 @@ fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wg
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        mask.coverage(),
+        bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             // One byte per texel: R8Unorm is all a coverage mask needs, matching
             // the stroke scratch it feeds.
-            bytes_per_row: Some(mask.width()),
-            rows_per_image: Some(mask.height()),
+            bytes_per_row: Some(width),
+            rows_per_image: Some(height),
         },
         wgpu::Extent3d {
-            width: mask.width(),
-            height: mask.height(),
+            width,
+            height,
             depth_or_array_layers: 1,
         },
     );
@@ -2792,8 +2919,21 @@ fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &TipMask) -> wg
 /// scratch it feeds. Four channels would be four times the bandwidth to say the
 /// same thing.
 fn make_tip_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    make_coverage_texture(device, width, height, "umber-brush-tip")
+}
+
+/// Single-channel coverage storage — a brush tip, a paper tile or a selection
+/// mask. One function because they are the same texture with different
+/// contents, and a second copy of this descriptor is a second place for the
+/// format to drift from the stroke scratch these all feed.
+fn make_coverage_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("umber-brush-tip"),
+        label: Some(label),
         size: wgpu::Extent3d {
             width,
             height,
@@ -2817,6 +2957,7 @@ fn make_dab_bind_group(
     sampler: &wgpu::Sampler,
     grain: &wgpu::TextureView,
     grain_sampler: &wgpu::Sampler,
+    selection: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dab-bg"),
@@ -2841,6 +2982,10 @@ fn make_dab_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(grain_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(selection),
             },
         ],
     })

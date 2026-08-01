@@ -13,16 +13,24 @@ use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
     Brush, BrushMode, BrushPreset, Camera, Color, Document, History, Hsv, InputPoint, LayerStack,
-    StrokeBuilder, TipMask,
+    Selection, SelectionDraft, SelectionMode, StrokeBuilder, TipMask,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
+
+/// How near the first vertex a click has to land to close a polygon, in
+/// *screen* pixels. Divided by the zoom at the point of use.
+const SELECT_CLOSE_PIXELS: f32 = 10.0;
 
 /// What the pointer is currently doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interaction {
     Idle,
     Drawing,
+    /// A selection outline is being drawn. Distinct from `Drawing` because
+    /// nothing about it touches the stroke builder or the scratch surface —
+    /// and because the autosave's "is it quiet?" test must count it as busy.
+    Selecting,
     Panning,
     Zooming,
 }
@@ -43,11 +51,13 @@ pub struct BrushResize {
     pub from: f32,
 }
 
-/// The selected tool. Brush and eraser paint; pan and zoom navigate.
+/// The selected tool. Brush and eraser paint, select marks out where they may,
+/// and pan and zoom navigate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Brush,
     Eraser,
+    Select,
     Pan,
     Zoom,
 }
@@ -70,6 +80,11 @@ pub struct UiState {
     pub accent: Accent,
     pub pressure_open: bool,
     pub tool: Tool,
+    /// Which outline the selection tool draws. One tool with a mode rather
+    /// than three tools: see `umber_core::selection`.
+    pub selection_mode: SelectionMode,
+    /// Open state of the mode dropdown in the tool options strip.
+    pub selection_menu_open: bool,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
     /// Whether the wheel's triangle turns to follow the hue. Meaningless while
@@ -143,6 +158,8 @@ impl Default for UiState {
             accent: Accent::Umber,
             pressure_open: true,
             tool: Tool::Brush,
+            selection_mode: SelectionMode::Rectangle,
+            selection_menu_open: false,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
@@ -190,6 +207,16 @@ pub struct Editor {
     /// keeps `presets` in step.
     pub tips: BTreeMap<String, Arc<TipMask>>,
     pub layers: LayerStack,
+    /// Where the live document lets an edit land, or `None` for all of it.
+    ///
+    /// An `Arc` because the renderer compares it by identity to decide whether
+    /// the mask on the GPU is still the right one — the same check
+    /// `Editor::tip` gets, and for the same reason: a selection is up to a
+    /// megabyte of coverage, and comparing it every stroke would cost more
+    /// than the upload it saves.
+    ///
+    /// Per-document, so it lives in [`DocumentState`] as well as here.
+    pub selection: Option<Arc<Selection>>,
     /// Every open document, and which of them the fields above belong to.
     pub session: Session,
     /// A message that has to reach the user rather than the log — an import
@@ -244,6 +271,16 @@ pub struct Editor {
     pub pixels_per_point: f32,
 
     pub stroke: StrokeBuilder,
+    /// The selection outline being drawn, if one is. Transient like
+    /// [`Editor::stroke`], and abandoned rather than carried across a tab
+    /// switch — half a lasso belongs to the gesture, not to the document.
+    pub selection_draft: Option<SelectionDraft>,
+    /// Scratch for the outline being painted this frame.
+    ///
+    /// Held rather than built per frame for the reason
+    /// `SelectionDraft::outline_into` takes a buffer at all: drawing the
+    /// outline is the one part of the selection path that runs every frame.
+    pub selection_outline: Vec<glam::Vec2>,
     pub history: History,
     pub pressure: PressureModel,
     /// What the pointer stream has been doing lately, for Settings → Input &
@@ -339,7 +376,10 @@ impl Default for Editor {
             canvas_size: Vec2::ONE,
             scroll_bars: [None, None],
             pixels_per_point: 1.0,
+            selection: None,
             stroke: StrokeBuilder::new(),
+            selection_draft: None,
+            selection_outline: Vec::new(),
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
@@ -457,10 +497,20 @@ impl Editor {
     /// Select a tool, keeping the brush's paint/erase mode in step.
     pub fn set_tool(&mut self, tool: Tool) {
         self.ui.tool = tool;
+        // A half-drawn outline belongs to the tool that was drawing it. Through
+        // `cancel_selection_draft` rather than by clearing the field, because
+        // the interaction has to come back to `Idle` with it: a shortcut can
+        // change tool with the button still down, and an interaction left in
+        // `Selecting` with no draft to answer for it is one that nothing ever
+        // ends — no autosave, and a redraw requested on every mouse move for
+        // the rest of the session.
+        if tool != Tool::Select {
+            self.cancel_selection_draft();
+        }
         match tool {
             Tool::Brush => self.brush.mode = BrushMode::Paint,
             Tool::Eraser => self.brush.mode = BrushMode::Erase,
-            Tool::Pan | Tool::Zoom => {}
+            Tool::Select | Tool::Pan | Tool::Zoom => {}
         }
     }
 
@@ -553,6 +603,7 @@ impl Editor {
             layers: std::mem::replace(&mut self.layers, LayerStack::new()),
             history: std::mem::take(&mut self.history),
             camera: self.camera,
+            selection: self.selection.take(),
         }
     }
 
@@ -561,6 +612,10 @@ impl Editor {
         self.layers = state.layers;
         self.history = state.history;
         self.camera = state.camera;
+        self.selection = state.selection;
+        // The gesture, unlike the selection, does not travel: it belonged to
+        // the pointer, and the pointer is now over a different document.
+        self.selection_draft = None;
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*
         // document being carried into the next commit.
@@ -622,6 +677,14 @@ impl Editor {
         self.doc = doc;
         if resized {
             self.history.clear();
+            // Its bounds are a rectangle of the old canvas and can now name
+            // pixels that do not exist. Dropped rather than rescaled, for the
+            // reason the history is dropped rather than remapped: a selection
+            // is a statement about where the artist is working, and a
+            // resampled one is a guess. `CanvasRenderer::resize` drops the
+            // mask on the GPU to match.
+            self.selection = None;
+            self.selection_draft = None;
             // Keep the zoom, but not the ability to be looking at a part of the
             // canvas that no longer exists.
             self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
@@ -741,6 +804,81 @@ impl Editor {
         let paint = [self.color.r, self.color.g, self.color.b];
         self.stroke.begin(self.brush, paint, point);
         self.interaction = Interaction::Drawing;
+    }
+
+    // --- selections -------------------------------------------------------
+
+    /// A press on the canvas with the selection tool in hand.
+    ///
+    /// Only the polygon can see a second press: the other two modes are one
+    /// press, a drag and a release, and their draft is gone by the time
+    /// another arrives.
+    pub fn selection_press(&mut self, doc: Vec2) {
+        // A screen distance, divided by the zoom. A fixed *document* distance
+        // would be impossible to hit at 10% and impossible to avoid at 800%.
+        let close = SELECT_CLOSE_PIXELS / self.camera.zoom.max(1e-3);
+        match self.selection_draft.as_mut() {
+            Some(draft) => {
+                if draft.press(doc, close) {
+                    self.finish_selection();
+                }
+            }
+            None => {
+                self.selection_draft = Some(SelectionDraft::new(self.ui.selection_mode, doc));
+                self.interaction = Interaction::Selecting;
+            }
+        }
+    }
+
+    pub fn selection_moved(&mut self, doc: Vec2) {
+        if let Some(draft) = self.selection_draft.as_mut() {
+            draft.moved(doc);
+        }
+    }
+
+    pub fn selection_release(&mut self, doc: Vec2) {
+        let Some(draft) = self.selection_draft.as_mut() else {
+            // The draft went while the button was down — Escape, or a tool
+            // shortcut. The button coming up is then what ends the gesture,
+            // and leaving the interaction in `Selecting` would leave it with
+            // nothing that could ever end it.
+            self.interaction = Interaction::Idle;
+            return;
+        };
+        if draft.release(doc) {
+            self.finish_selection();
+        }
+    }
+
+    /// Close the outline being drawn and adopt it.
+    ///
+    /// A gesture that encloses nothing **clears** the selection rather than
+    /// leaving the previous one standing. A bare click on the canvas is how
+    /// every paint application spells "deselect", and keeping the old one
+    /// would look like the tool had stopped answering.
+    pub fn finish_selection(&mut self) {
+        let Some(draft) = self.selection_draft.take() else {
+            return;
+        };
+        self.interaction = Interaction::Idle;
+        self.selection = draft.finish(self.doc.size).map(Arc::new);
+    }
+
+    /// Abandon the outline being drawn, keeping whatever was selected before
+    /// it started. Returns whether there was one — Escape does other things
+    /// when there is not.
+    pub fn cancel_selection_draft(&mut self) -> bool {
+        let had = self.selection_draft.take().is_some();
+        if had {
+            self.interaction = Interaction::Idle;
+        }
+        had
+    }
+
+    /// Select the whole document again, which is what having no selection is.
+    pub fn deselect(&mut self) {
+        self.selection = None;
+        self.cancel_selection_draft();
     }
 
     /// Flatten the layer stack into what the composite pass consumes.

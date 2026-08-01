@@ -107,6 +107,49 @@ Invariants that are easy to break:
   *next* stroke's commit, wearing that stroke's colour. This was a real bug;
   `ending_a_stroke_keeps_its_tail_pending` guards the core half of it.
 
+### Selections
+
+`umber-core::selection`. A selection is **an outline plus a coverage mask over
+the outline's own bounding rectangle**, and it is both halves deliberately —
+the module docs have the argument. Short version: a byte per document pixel is
+100 MB on a canvas Umber supports and nearly all of it zero; a path alone is
+the wrong thing to hand a fragment shader and has no answer for a partly
+covered pixel. So the mask is what gets used and the rings are what get drawn.
+
+- **The clip is applied in the dab pass and nowhere else.** Coverage is
+  multiplied by the mask on its way into the scratch, so `composite.wgsl` and
+  `commit.wgsl` never learn there is a selection — which is the only way to
+  guarantee the two of them cannot clip differently and make the stroke jump at
+  pointer-up. It also means stroke opacity is still applied exactly once, the
+  `max` still saturates, and an eraser is clipped by construction rather than by
+  a second piece of code.
+- **A placeholder texture cannot stand in for "no selection"**, unlike the tip's
+  and the paper's. A 1x1 mask read outside its own rectangle is *zero*, which
+  would mean nothing may be painted anywhere. Hence `use_selection`, read
+  through a `select` rather than a branch, and with it clear the shader
+  multiplies by exactly 1.0 — `no_selection_is_the_exact_identity` pins it.
+- **Outside the mask's rectangle is decided arithmetically, not by clamping.**
+  Clamp-to-edge would smear the boundary texels across the canvas and leave the
+  whole row and column beyond a rectangle selection paintable.
+  `nothing_outside_a_selections_own_rectangle_is_paintable` guards it.
+- **Bound from `start_stroke`, like the tip and the paper**, and compared by
+  `Arc` identity. That is also what re-binds it after a tab switch or an Android
+  resume, where the renderer is a different object.
+- **Fill is nonzero winding and the edge is antialiased.** Even-odd would punch
+  a hole in the middle of a loop somebody drew freehand. Coverage is four
+  sub-scanlines per row with exact horizontal span coverage, which makes an
+  axis-aligned rectangle exact on both axes.
+- **A resize drops it**, for the reason a resize clears the undo history: the
+  bounds are a rectangle of a canvas that no longer exists. Both halves —
+  `Editor::apply_canvas` and `CanvasRenderer::resize` — do it, so neither can be
+  the one that forgot.
+- **The selection is per-document and the draft is not.** `Selection` lives in
+  `DocumentState`; `SelectionDraft` is the gesture, and belongs to the pointer,
+  so a tab switch abandons it.
+- **The outline is a dashed line, not marching ants.** Animating it means
+  requesting a frame for ever, which is the cost `render`'s `repaint_at` exists
+  to avoid.
+
 ### Layers
 
 Layers occupy slices ("slots") of one texture array, and the whole stack
@@ -632,7 +675,7 @@ page — go by it.
 Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
 brush editor's Wet edges section, Palette and Harmony picker modes,
-twelve of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
+eleven of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
 listed in the README's "What is not there yet", with the reasoning in
 `docs/architecture.md`'s roadmap and, for the brush settings, `docs/brushes.md`. **Do not add UI for features that do not work** — a
 disabled control with an explanatory tooltip is better than a live one that
@@ -707,6 +750,10 @@ design shows a whole row of them.
   *and* build-up, because both are about a mark made of many faint stamps rather
   than one solid one. Between them they expose every field of `Brush` — adding
   one means adding a control, or the library can use a brush nobody can make.
+- **The selection tool's mode is a dropdown, and it is the Colour panel's
+  dropdown pattern.** A painted trigger and a popup of `selectable_label`s, the
+  same shape `picker_mode_switch` uses. One dropdown pattern in the interface
+  rather than two, and `widgets.rs` gains nothing a second caller would need.
 - **The canvas dialogs are one form and two call sites** (`canvasdlg.rs`). New
   document and Canvas settings ask the same four questions, so they share
   `CanvasForm` and one body; two dialogs drifting apart is how "New" ends up
