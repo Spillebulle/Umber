@@ -12,6 +12,13 @@ mod colorpicker;
 mod controls;
 mod cputext;
 mod dock;
+/// Redrawing the pictures in `docs/images/` from the interface itself.
+///
+/// Public because `examples/docs-images.rs` is the thing that runs it, and an
+/// example sees only what the crate exposes. It is the *only* thing exposed for
+/// that: everything the generator reaches — `splash`, `theme`, `settings`,
+/// `panels` — stays private behind [`docshot::generate`].
+pub mod docshot;
 mod editor;
 mod icons;
 mod logo;

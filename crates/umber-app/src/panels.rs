@@ -33,7 +33,7 @@ const SPLITTER_GRAB: f32 = 7.0;
 /// What a panel's chrome reported this frame. The caller applies these, because
 /// the layout cannot be mutated while it is being iterated.
 #[derive(Default)]
-struct PanelEvents {
+pub(crate) struct PanelEvents {
     /// Pointer position and the panel's rect at the moment a drag began.
     grab: Option<(Pos2, Rect)>,
     close: bool,
@@ -306,7 +306,12 @@ pub fn floats(root: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActio
 }
 
 /// One panel: header strip, then its body, drawn into `rect`.
-fn panel(
+///
+/// Crate-visible rather than private because `docshot` draws a module on its own
+/// for the README. It takes an explicit rect already — the dock model works
+/// every rect out up front — so a caller outside the sidebar needs nothing the
+/// sidebar does not already supply.
+pub(crate) fn panel(
     ui: &mut Ui,
     p: &Palette,
     ed: &mut Editor,
