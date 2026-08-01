@@ -249,11 +249,12 @@ fights the design.
 
 ### Brushes
 
-Umber ships **221 presets**. Six are its own; 196 are the whole of
+Umber ships **239 presets**. Six are its own; 196 are the whole of
 [mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes), and the
-remaining 19 are the procedural brushes out of three CC0 and CC-BY Krita packs.
-Every one carries its author and licence through the conversion and shows them
-in the library.
+remaining 37 come out of three CC0 and CC-BY Krita packs — 18 procedural and 19
+that stamp a **bitmap tip**, which the shipped library carries now. Every one
+carries its author and licence through the conversion and shows them in the
+library.
 
 They are grouped by **style** — pencils, inks, markers, charcoal, paint,
 watercolour, airbrush, blenders, erasers, texture, foliage, effects — rather
@@ -317,7 +318,7 @@ shipped under an author's name should paint unlike their brush.
 **Five packs are fetched**, four of them new: MyPaint's, David Revoy's 2025-01
 Krita bundle, Raghavendra Kamath's, GDQuest's — CC-BY, so every one of those
 carries its credit — and rubberduck's 60 GIMP stamps. That is 269 stamps and 116
-Krita presets you can import today, and 19 more brushes in the shipped library.
+Krita presets you can import today, and 37 more brushes in the shipped library.
 
 **A stamp brush can build up.** A sparse photographic texture stamp is not a
 solid disc: GIMP and Krita composite every dab, so the mark is the *overlap* of
@@ -330,18 +331,27 @@ second blend that composites instead, and which of the two a stamp needs is
 prints both figures per file, and the `.gbr` importer runs the same measurement.
 The default is unchanged and stays exactly what it was.
 
-**One shipped brush carries a bitmap tip**, which is one more than before: the
-shipped library can now embed masks alongside its presets. It is Umber's own —
-a sparse chalk stipple, drawn by `examples/build-bitmaps.rs`, deliberately faint
-enough that it needs build-up to paint at full strength.
+**Twenty shipped brushes carry a bitmap tip.** One is Umber's own — a sparse
+chalk stipple, drawn by `examples/build-bitmaps.rs`, deliberately faint enough
+that it needs build-up to paint at full strength. The other nineteen are Revoy's,
+Raghukamath's and GDQuest's stamps: their masks travel as ordinary greyscale
+PNGs in `crates/umber-core/assets/tips/`, embedded beside the library and named
+from the preset, so two brushes cut from one stamp share a file and a single GPU
+upload. Fifteen masks carry the nineteen brushes, at 624 kB and 664 kB of
+release binary.
 
-**No third-party pack's stamps ship**, though every one of them imports. The
-obstacle is no longer the engine: build-up answers the half-strength problem
-that used to decide it. It is size and licence. One pack's 269 masks are 10.7 MB
-of PNG against a 200 KB library, and Umber will not claim a licence it cannot
-verify from a pack's own files. `docs/brush-sources.md` records the
-measurements, every pack considered, and the one place that rule was
-deliberately bent.
+Every one of them turns the way its author drew it. A stamp is not
+rotationally symmetric, so a bitmap tip is live for all three of the dab's angle
+states — held at a fixed angle, turning to follow the stroke, or rolled per dab
+— and Krita's rake lean, its compound rotation sensors and GIMP's angular brush
+pipes are all read for what they mean.
+
+**rubberduck's stamps still do not ship**, though all 269 import. The obstacle
+is not the engine and it is not the size: it is that the pack's CC0 is declared
+on its download page rather than inside the download, and redistributing 17
+masks of somebody else's artwork in every release is a larger claim than
+converting them on one machine. `docs/brush-sources.md` records the
+measurements, every pack considered, and the one line that would reverse it.
 
 **Paper grain.** An optional tiling texture bitten into dab coverage, which is
 what makes a pencil catch on the tooth of the paper. It is anchored to the
@@ -668,13 +678,15 @@ Next, roughly in order:
   its own right.
 - Scatter that reacts to pen speed
 - Per-brush blend modes
-- **A third-party stamp pack in the shipped library.** Bitmap tips work end to
-  end — import a `.gbr`, a `.gih` or a Krita bundle, save it, reload it, paint
-  with it — the shipped library can carry masks, which it now does for one brush
-  of Umber's own, and five packs are fetched. The build-up problem that used to
-  decide this is solved. What is left is size and the licence rule: one pack's
-  stamps are 10.7 MB of PNG against a 200 KB library. `docs/brush-sources.md`
-  has the measurements and the curation work.
+- **rubberduck's stamps in the shipped library.** Three packs' stamps ship now;
+  this one's do not, because its CC0 is declared on the OpenGameArt page rather
+  than inside the download, and shipping a mask is redistributing artwork rather
+  than describing it. All 269 import today. `docs/brush-sources.md` has the
+  measurement — 17 brushes, 1.2 MB — and the one line that would reverse it.
+- **The Gimp Brushcollection**, 1022 CC0 stamps whose licence *is* verifiable
+  from the download. What stands between it and the library is curation rather
+  than machinery: every brush has an empty name and a spacing of 0, and the
+  repository is 158 MB with no tags.
 - **A cell chosen per dab**, which is what would make a `.gih` one brush rather
   than five. The dab pass binds one tip per pass, deliberately; this needs it to
   bind a small array and the dab instance to carry an index into it.

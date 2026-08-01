@@ -107,16 +107,27 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-**221 presets**: Umber's own six, all 196 MyPaint brushes, and 19 out of four
-more packs — David Revoy's 2025-01 Krita bundle (8), Raghavendra Kamath's v2.1
-(4), GDQuest's (7), and rubberduck's 60 GIMP stamps (none). All CC0 except
+**239 presets**: Umber's own six, all 196 MyPaint brushes, and 37 out of four
+more packs — David Revoy's 2025-01 Krita bundle (18), Raghavendra Kamath's v2.1
+(8), GDQuest's (11), and rubberduck's 60 GIMP stamps (none). All CC0 except
 GDQuest's, which is CC-BY and therefore carries its credit.
 
-Those 19 are the Krita brushes whose dab is *generated* rather than stamped, so
-they convert exactly. The rest of what those packs hold — 338 stamps and about
-90 more presets — needs a bitmap tip, and the shipped library has nowhere to put
-one. `docs/brush-sources.md` has the counts, the measurements and the reason.
-Every one of them imports.
+Eighteen of those 37 are Krita brushes whose dab is *generated* rather than
+stamped, so they convert exactly. **The other nineteen stamp a bitmap tip**,
+which the shipped library carries now: 15 masks, 624 kB of 8-bit greyscale PNG
+in `crates/umber-core/assets/tips/`, 664 kB of release binary. See "Tips in the
+shipped library" below.
+
+The rest of what those packs hold needs a mask too and still does not ship. 338
+brushes across the five packs carry one, and the numbers say where they went:
+
+| | |
+|---:|---|
+| 19 | ship |
+| 17 | are rubberduck's, whose masks this project does not redistribute — a licence decision, in `docs/brush-sources.md` |
+| 302 | lost something else on the way in and would have been refused whatever happened to their masks; 257 of them for one reason alone — a `.gih` pipe's sequencing, which Umber cannot reproduce |
+
+Every one of the 338 imports.
 
 It was 128 for a while. The 68 missing were refused by the generator rather than
 lost by accident, and both reasons were engine gaps rather than import gaps:
@@ -158,22 +169,22 @@ pack ever need it.
 
 Twelve collections, in the order the picker lists them:
 
-Counted over the 215 the generator converts; Umber's own six are on top of
+Counted over the 233 the generator converts; Umber's own six are on top of
 these and sort the same way.
 
 | Collection | Count |
 |---|---|
-| Pencils & sketching | 14 |
+| Pencils & sketching | 15 |
 | Inks & pens | 32 |
 | Markers | 5 |
 | Charcoal, chalk & pastel | 6 |
-| Paint & brushes | 51 |
+| Paint & brushes | 61 |
 | Watercolour & wet media | 22 |
 | Airbrush & spray | 13 |
 | Blenders & smudge | 22 |
 | Erasers | 9 |
-| Texture & grain | 13 |
-| Foliage & fur | 8 |
+| Texture & grain | 19 |
+| Foliage & fur | 9 |
 | Effects & experimental | 20 |
 
 Adding the stamp packs meant teaching `RULES` the words they use. They name a
@@ -422,8 +433,9 @@ Documented in full in the module docs of
   randomness made larger, by the square of the ratio, so a jittered stroke keeps
   its average density. Umber's `max` coverage has no per-dab density to keep.
 - **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
-  nothing is lost here. The engine and the library now have them
-  (see below); it is the Krita and GIMP packs they exist for.
+  nothing is lost here. The engine and the library both have them now, and
+  nineteen Krita stamps ship through them; it is the Krita and GIMP packs they
+  exist for.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
   darkens as a stroke crosses itself. Umber takes a `max` of coverage and
   applies opacity once at commit — the wet-layer design in `CLAUDE.md` — which
@@ -463,16 +475,19 @@ of them are:
 
 | Field | Default in | Live in | Verdict |
 |---|---|---|---|
-| `min_size_ratio` | 89 of 215 | the other 126, all of which set `pressure_size` | dead where defaulted |
-| `min_hardness_ratio` | 147 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
-| `grain`, `grain_scale`, `grain_pattern` | 215 | none | nothing in any pack asks for paper |
-| `build_up` | 215 | none | deliberate — see below |
-| `stroke_span` | 159 | 37 read the `Stroke` input | 19 carry a span nothing reads; the editor draws it dead |
-| `stabilization` | 19 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
+| `min_size_ratio` | 95 of 233 | the other 138, all of which set `pressure_size` | dead where defaulted |
+| `min_hardness_ratio` | 165 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
+| `grain`, `grain_scale`, `grain_pattern` | 233 | none | nothing in any pack asks for paper |
+| `build_up` | 232 | 1 — Raghukamath's "Drybrush", measured | see below |
+| `stroke_span` | 177 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
+| `stabilization` | 37 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
 
-The two ratios are the useful result: the counts add up to 215 exactly, so no
+The two ratios are the useful result: the counts add up to 233 exactly, so no
 brush that varies with pressure is falling back on a default, and the ones that
-do not vary are carrying a number nothing reads. `smudge_length` and
+do not vary are carrying a number nothing reads. `build_up` stopped being all
+default when the stamps arrived, and it is the one row here that is *measured*
+per brush rather than defaulted: `stroke_coverage` decides it, and it comes out
+true for exactly one of the nineteen shipped stamps. `smudge_length` and
 `smudge_radius` look like the same case at a glance — 153 and 195 presets sit on
 Umber's default — and are not: those *are* MyPaint's defaults, read out of the
 file through the same evaluation as everything else.
@@ -625,6 +640,22 @@ is the **sequencing**, and the import says so.
 Choosing per dab is the better answer and needs the dab pass to hold an array of
 tips and an index per instance — see "Not done yet".
 
+**`sel0:angular` is the exception, and it is named separately.** Of GIMP's eight
+selection rules that one is not a shuffle: it picks the cell by the *direction
+of the stroke*, so the cells are one mark drawn at `ncells` rotations and
+painting a curve turns the stamp through them. Umber's dab does exactly that
+natively — `dab_angle_follows_stroke` turns the quad and its tip with it — so
+one cell plus that flag would reproduce such a pipe rather than approximate it.
+
+It is deliberately not done. Collapsing to the first cell is right only if the
+other cells really are that cell rotated, which is what `angular` *means* but
+not what the file *says*, and a pipe of unrelated pictures walked angularly
+would lose every stamp but one in silence. **No `.gih` in any fetched pack is
+angular** — all 43 of rubberduck's are `sel0:random` — so there is nothing to
+check such a collapse against. Until there is, an angular pipe arrives as one
+preset per cell and the import names the rule that was lost rather than the
+general one.
+
 ### Importing a GIMP parametric brush (`.vbr`)
 
 The one GIMP format Umber reproduces **exactly**. A `.vbr` is not a picture: it
@@ -665,7 +696,9 @@ wrong, and all three were got wrong first:
 | `Brush@spacing` | `spacing` |
 | `OpacityValue` × `FlowValue` × the opacity curve's peak | `opacity` |
 | `Pressure<X>` + `<X>Sensor` + `<X>commonCurve` | `pressure_*`, `min_*_ratio`, `*_curve` |
-| `RotationSensor` `id="drawingangle"` / `"fuzzy"` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
+| `RotationSensor` `id="drawingangle"` / `"fuzzy"`, including inside a `sensorslist` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
+| `RotationSensor@angleOffset`, degrees | added to `dab_angle` — the rake's lean |
+| a bitmap tip's measured stroke coverage | `build_up` |
 | `PressureScatter` × `ScatterValue` | `scatter` |
 | `EraserMode`, `CompositeOp` | `mode` |
 | `AirbrushOption/` **or** `PaintOpSettings/` `isAirbrushing` + `rate` | `dabs_per_second` |
@@ -705,6 +738,37 @@ antialiases unconditionally and has nothing to switch off. It is the whole of a
 pixel-art brush, so it is now named — which costs the library GDQuest's two
 pixel-art presets, correctly: a one-pixel brush that paints a soft grey dot is
 not the brush its author drew.
+
+#### And three more, all about how a dab turns
+
+Found by asking the packs what they actually say about rotation rather than by
+reading the reader. All three are silent losses, which for a *bitmap* tip is the
+most visible kind there is: a stamp that was meant to turn and does not is a
+comb.
+
+- **A compound sensor defeated the reader.** Krita writes
+  `<params id="sensorslist">` with a `<ChildSensor>` per input when a dynamic has
+  more than one, and `sensor_id` took the first id it found — the wrapper's.
+  Five presets in the fetched packs rotate that way, GDQuest's cloud and rock
+  brushes among them, and every one of them laid each stamp the same way up.
+- **`angleOffset` was dropped**, which is the rake's *lean*. Krita adds it to
+  the drawing angle inside the sensor — `0.5 + drawingAngle / 2π +
+  angleOffset / 360` — so it goes through exactly the transformation the heading
+  does, and Umber composes the same two terms the same way in
+  `angle = heading + dab_angle`. Four presets state one, between 92° and 139°:
+  without it they drag their bristles *along* the stroke instead of across it.
+- **A rotation driven by something Umber has no value for was on and did
+  nothing.** `ascension` is tilt direction, `rotation` is barrel rotation, and a
+  `pressure` rotation would need an `Angle` modulation this reader does not
+  build. Named now, on the same terms as the other foreign sensors, which costs
+  the library "B3) Basic Oval Brush" — correctly: what Krita draws for one of
+  these at rest could not even be determined, and that is a better reason to
+  refuse a brush than to ship it.
+
+**Fan corners** is the one rotation feature approximated rather than named.
+Krita adds dabs through a sharp corner so a rake fans round it; Umber's dab
+turns with the heading and the heading turns at the corner, so a stroke differs
+only where it changes direction abruptly. Six presets ask for it.
 
 **Only two of Krita's paint engines are accepted**: `paintbrush` and
 `colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an
@@ -870,33 +934,68 @@ decodes an `include_bytes!` table generated from the files in
 is stable for the life of the process, which is what `CanvasRenderer::set_tip`'s
 identity check needs.
 
-One shipped brush uses it: **Stipple chalk**, a sparse speckle Umber drew.
-Sparse on purpose — a dense silhouette would paint identically under either
-coverage rule and would demonstrate nothing. Its brightest texel is 0.44, so it
-ships with `build_up` set, and
-`a_shipped_stamp_paints_at_the_strength_it_was_drawn_at` checks that flag
-against the measurement rather than against anybody's memory.
+**Twenty shipped brushes use it**, carried by sixteen masks.
 
-Adding a stamp is dropping an 8-bit greyscale PNG into that directory and
-re-running `cargo run -p umber-core --example build-bitmaps`, which rewrites the
-table from the listing. The table *is* the listing, so a file that is not there
-is not in the binary and one that is cannot be forgotten.
+One is Umber's own: **Stipple chalk**, a sparse speckle drawn by
+`examples/build-bitmaps.rs`. Sparse on purpose — a dense silhouette would paint
+identically under either coverage rule and would demonstrate nothing. Its
+brightest texel is 0.44, so it ships with `build_up` set, and
+`a_shipped_stamp_paints_at_the_strength_it_was_drawn_at` checks that flag
+against the measurement rather than against anybody's memory. It checks the
+other nineteen the same way, which is what makes the flag a measurement rather
+than a habit: exactly one of them — Raghukamath's "Drybrush", peak texel 0.878 —
+comes out needing it.
+
+The other nineteen are Revoy's, Raghukamath's and GDQuest's stamps, written by
+`examples/build-brush-library.rs` into the same directory. Three things about
+how they get there:
+
+- **Deduplicated by content.** Fifteen masks carry nineteen brushes, because a
+  pack routinely cuts several presets from one stamp. That is exactly what
+  `BrushPreset::tip` holding a *name* buys — one file, one embedded copy, one
+  GPU upload, and `CanvasRenderer::set_tip`'s identity check skipping the upload
+  when a second such brush is picked up.
+- **At their original resolution.** A cap was measured rather than assumed and
+  is not worth having: the median mask in the packs is 350 px, so capping the
+  long side at 512 saves 6% of the bytes and capping it at 256 flips eleven
+  build-up verdicts and takes one mask below the strength at which eight-bit
+  coverage can accumulate at all. Fifteen masks at full size are 624 kB, which
+  is 664 kB of release binary — measured, before and after.
+- **The generator owns the pack half of the directory.** It deletes the masks a
+  previous run left behind, so a brush that stops shipping cannot leave a
+  megabyte in the binary that nothing references, and it rewrites `tip_table.rs`
+  itself rather than depending on `build-bitmaps` being run afterwards.
+
+Adding a stamp of Umber's own is dropping an 8-bit greyscale PNG into that
+directory and re-running `cargo run -p umber-core --example build-bitmaps`,
+which rewrites the table from the listing. The table *is* the listing, so a file
+that is not there is not in the binary and one that is cannot be forgotten. Both
+generators write it, through the same `examples/common/table.rs`, so either can
+be run on its own.
+
+**Which packs' masks may be shipped is a separate decision from which packs may
+be converted**, and a stricter one: converting a stamp is describing somebody's
+work and shipping its mask is redistributing the work itself, in every release
+on every platform. `Pack::ship_tips` in the generator is where that is recorded
+per pack. See `docs/brush-sources.md`.
 
 ## Not done yet
 
-- **A third-party stamp pack to ship**, which is now the only thing between
-  five fetched packs and 269 more brushes in the picker. The machinery is
-  complete — a stamp brush can be imported, saved, reloaded, painted with,
-  embedded and shipped — and the build-up problem that used to decide it is
-  solved. What is left is size and the licence rule: one pack's stamps are
-  10.7 MB of PNG against a 200 KB library. See `docs/brush-sources.md`.
+- **rubberduck's stamps in the shipped library.** Three packs' stamps ship now
+  and this one's do not, on the licence rule rather than on size or on
+  machinery: its CC0 is declared on the OpenGameArt submission page and nowhere
+  inside the download. It is 17 brushes and 1.2 MB. All 269 import today. See
+  `docs/brush-sources.md`, which has the measurement and the one line that
+  reverses it.
 - **Picking a cell per dab**, which is what would make a `.gih` a brush rather
   than five. The dab pass binds one tip per pass — that is what keeps a thousand
   tipped dabs a single draw call — so it would need the tip binding to become a
   small array and the dab instance to carry an index into it, chosen by the same
   seeded RNG that already drives scatter and angle jitter. Every pipe in the
-  wild picks at random, so `sel0:` would not have to be honoured in full. Until
-  then a pipe arrives as one preset per cell and says so.
+  fetched packs picks at random, so `sel0:` would not have to be honoured in
+  full — and `angular`, the one rule that is not a shuffle, would be better
+  served by a single stroke-following cell than by an array. Until then a pipe
+  arrives as one preset per cell and says which rule it lost.
 - **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
   and reading a fourth off disk needs a variant that names a file.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a

@@ -109,6 +109,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let base = embedded_name(&pipe.name, &stem);
             let many = pipe.cells.len() > 1;
             let animated = pipe.animated;
+            let angular = pipe.angular;
             Ok(pipe
                 .cells
                 .into_iter()
@@ -122,7 +123,9 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                         base.clone()
                     };
                     let mut dropped = Vec::new();
-                    if animated {
+                    if angular {
+                        dropped.push(gih::ANGULAR);
+                    } else if animated {
                         dropped.push(gih::ANIMATION);
                     }
                     if cell.coloured {

@@ -315,6 +315,13 @@ $lines = @(
     'download*, which is the rule `docs/brush-sources.md` is written against. One',
     'says *declared on the submission page*, which is weaker, and is spelled out',
     'in full where it applies.',
+    '',
+    '**"Masks shipped" is a second, stricter question.** Converting a pack into',
+    'settings is a description of somebody''s work; embedding its bitmap tips puts',
+    'the artwork itself in every Umber release. Only a licence verified inside the',
+    'download is enough for that, so the pack whose licence is merely declared on a',
+    'page converts but does not travel. `Pack::ship_tips` in',
+    '`crates/umber-core/examples/build-brush-library.rs` is where that is enforced.',
     ''
 )
 foreach ($pack in $fetched) {
@@ -343,6 +350,16 @@ foreach ($pack in $fetched) {
     else {
         $where = if ($pack.LicenceIn) { "``$($pack.LicenceFile)`` inside ``$($pack.LicenceIn)``" } else { "``$($pack.LicenceFile)``" }
         $lines += "- **Licence:** $($pack.Licence), verified against $where in the download itself"
+    }
+    if ($pack.DeclaredOn) {
+        $lines += @(
+            '- **Masks shipped:** **no** — the licence above is declared on a page rather',
+            '  than inside the download, and redistributing somebody''s artwork asks more',
+            '  of the evidence than converting it does. Every brush in it still imports.'
+        )
+    }
+    else {
+        $lines += '- **Masks shipped:** yes, on the licence verified above.'
     }
     $lines += @(
         "- **Authors:** $($pack.Authors)",

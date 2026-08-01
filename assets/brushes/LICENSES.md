@@ -15,12 +15,20 @@ download*, which is the rule `docs/brush-sources.md` is written against. One
 says *declared on the submission page*, which is weaker, and is spelled out
 in full where it applies.
 
+**"Masks shipped" is a second, stricter question.** Converting a pack into
+settings is a description of somebody's work; embedding its bitmap tips puts
+the artwork itself in every Umber release. Only a licence verified inside the
+download is enough for that, so the pack whose licence is merely declared on a
+page converts but does not travel. `Pack::ship_tips` in
+`crates/umber-core/examples/build-brush-library.rs` is where that is enforced.
+
 ## MyPaint default brushes 2.0.2
 
 - **Directory:** `assets/brushes/mypaint/`
 - **Source:** <https://github.com/mypaint/mypaint-brushes>
 - **Downloaded from:** <https://github.com/mypaint/mypaint-brushes/archive/refs/tags/v2.0.2.zip>
 - **Licence:** CC0-1.0, verified against `Licenses.dep5` in the download itself
+- **Masks shipped:** yes, on the licence verified above.
 - **Authors:** Martin Renold and the MyPaint Development Team; Ramón Miranda; Marcelo "Tanda" Cerviño; David Revoy; Guillaume Loussarévian; Brien Dieterle
 - **Format:** .myb (MyPaint, JSON)
 
@@ -31,6 +39,7 @@ in full where it applies.
 - **Downloaded from:** <https://www.peppercarrot.com/extras/resources/deevad-bundle_25.01.zip>
 - **SHA-256 of the archive:** `4c628a9418fcde63abacafdcb143881f2cbbf907275cb4f72335545841cf8173`
 - **Licence:** CC0-1.0, verified against `meta.xml` inside `Deevad_25.01.bundle` in the download itself
+- **Masks shipped:** yes, on the licence verified above.
 - **Authors:** David Revoy (Deevad)
 - **Format:** .bundle (Krita resource bundle)
 
@@ -40,6 +49,7 @@ in full where it applies.
 - **Source:** <https://gitlab.com/raghukamath/krita-brush-presets>
 - **Downloaded from:** <https://gitlab.com/raghukamath/krita-brush-presets/-/archive/v2.1/krita-brush-presets-v2.1.zip>
 - **Licence:** CC0-1.0, verified against `LICENSE` in the download itself
+- **Masks shipped:** yes, on the licence verified above.
 - **Authors:** Raghavendra Kamath
 - **Format:** .bundle (Krita resource bundle)
 
@@ -49,6 +59,7 @@ in full where it applies.
 - **Source:** <https://github.com/GDQuest/krita-free-brushes>
 - **Downloaded from:** <https://github.com/GDQuest/krita-free-brushes/archive/c68b0cc9ea4f10c3ce239ac7329fc13461aec8ed.zip>
 - **Licence:** CC-BY-4.0, verified against `README.md` in the download itself
+- **Masks shipped:** yes, on the licence verified above.
 - **Authors:** GDquest (Nathan Lovato)
 - **Format:** .kpp (Krita) with .gbr and .gih tips
 
@@ -69,6 +80,9 @@ in full where it applies.
   page was read by hand on 2026-08-01, and the SHA-256 above ties that reading
   to exactly these bytes. This is a deliberate exception to the rule at the
   top of `docs/brush-sources.md`, made once, for this source only.
+- **Masks shipped:** **no** — the licence above is declared on a page rather
+  than inside the download, and redistributing somebody's artwork asks more
+  of the evidence than converting it does. Every brush in it still imports.
 - **Authors:** rubberduck
 - **Format:** .gbr and .gih (GIMP)
 

@@ -30,10 +30,19 @@
 //! stamp is dropping a PNG in and re-running this — the same shape as
 //! `build-brush-library.rs` and `builtin-brushes.ron`, and a generated file
 //! whose diff can be read.
+//!
+//! `assets/tips/` is **shared**: this writes Umber's own stamps there and
+//! `build-brush-library.rs` writes the brush packs' masks beside them. Both end
+//! by rewriting `tip_table.rs` from the whole listing, through the same
+//! [`table::write_table`], so either one can be run on its own and neither can
+//! leave the table naming a file that is not there.
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use umber_core::tip::{TipMask, stroke_coverage};
+
+#[path = "common/table.rs"]
+mod table;
+use table::{workspace_root, write_table};
 
 /// Side of a paper tile, in texels. One tile covers `Brush::grain_scale`
 /// document pixels, so 256 is roughly one texel per pixel at the default scale
@@ -270,55 +279,4 @@ fn stipple() -> TipMask {
 fn write_png(path: &Path, mask: &TipMask) {
     let bytes = mask.to_png().expect("encode");
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
-
-/// Rewrite an `include_bytes!` table from a directory listing.
-///
-/// The table *is* the listing, so a bitmap that is not in the directory is not
-/// in the binary and one that is cannot be forgotten.
-fn write_table(path: &Path, what: &str, constant: &str, include_prefix: &str, dir: &Path) {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .expect("read directory")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".png"))
-        .collect();
-    names.sort();
-
-    let mut out = String::new();
-    writeln!(
-        out,
-        "//! The shipped {what} bitmaps, embedded.\n\
-         //!\n\
-         //! **Generated** by `cargo run -p umber-core --example build-bitmaps`,\n\
-         //! from the files in `{include_prefix}`. `include_bytes!` needs a literal\n\
-         //! path, so the set of shipped bitmaps has to be source; writing it from the\n\
-         //! directory listing is what keeps the two from disagreeing.\n\
-         //!\n\
-         //! Do not edit by hand.\n\n\
-         /// Name and 8-bit greyscale PNG, sorted by name.\n\
-         pub(crate) const {constant}: &[(&str, &[u8])] = &["
-    )
-    .expect("write");
-    for name in &names {
-        let stem = name.trim_end_matches(".png");
-        writeln!(
-            out,
-            "    (\"{stem}\", include_bytes!(\"{include_prefix}/{name}\")),"
-        )
-        .expect("write");
-    }
-    writeln!(out, "];").expect("write");
-
-    std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    println!("{} <- {} entries", path.display(), names.len());
-}
-
-/// The workspace root, from this crate's manifest directory.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
 }

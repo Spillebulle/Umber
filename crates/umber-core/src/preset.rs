@@ -154,12 +154,12 @@ fn umber_defaults() -> Vec<BrushPreset> {
         tip: None,
     };
     // A shipped brush that carries a bitmap tip, resolved out of
-    // `crate::tip::builtin` rather than the user's library. Only one so far:
-    // no third-party stamp pack has yet cleared the licence rule in
-    // `docs/brush-sources.md`, so the one Umber ships is one Umber drew —
-    // `examples/build-bitmaps.rs` generates it, and it is deliberately sparse,
-    // because a stamp that paints the same under either coverage rule would
-    // demonstrate nothing.
+    // `crate::tip::builtin` rather than the user's library. Only one of *these*
+    // — the generated library carries nineteen more, out of the three Krita
+    // packs whose licences allow their masks to be redistributed — and this one
+    // is Umber's own, drawn by `examples/build-bitmaps.rs`. Deliberately
+    // sparse, because a stamp that paints the same under either coverage rule
+    // would demonstrate nothing.
     let stamped = |id: &str, name: &str, tip: &str, brush: Brush| BrushPreset {
         tip: Some(tip.to_string()),
         ..make(id, name, brush)

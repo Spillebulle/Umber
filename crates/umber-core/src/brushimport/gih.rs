@@ -45,6 +45,29 @@
 //!   how GIMP walks the cells, and Umber has one cell in hand at a time.
 //! - **Colour**, exactly as [`super::gbr`] drops it: a cell may be a 4-byte
 //!   RGBA stamp or a `.gpb`, and only its coverage survives.
+//!
+//! # `sel0:angular` is the stroke-following stamp, and it is named separately
+//!
+//! GIMP's selection modes are `constant`, `incremental`, `random`, `angular`,
+//! `velocity`, `pressure`, `xtilt` and `ytilt`, and one of them is a different
+//! kind of thing from the rest. **`angular` picks the cell by the direction of
+//! the stroke**: the cells are one stamp drawn at `ncells` rotations, and
+//! painting a curve turns the mark through them. That is a brush whose tip
+//! follows the stroke, and Umber's dab does exactly that natively —
+//! [`Brush::dab_angle_follows_stroke`](crate::Brush::dab_angle_follows_stroke)
+//! turns the quad, tip and all, so *one* cell plus that flag would reproduce
+//! the whole pipe rather than approximating it.
+//!
+//! It is deliberately not done, and the reason is that it cannot be checked.
+//! Collapsing a pipe to its first cell is only right if the other cells really
+//! are that cell rotated, which is what `angular` *means* but not what the file
+//! *says*; a pipe whose cells are unrelated pictures walked angularly would
+//! lose every stamp but one, silently, which is the failure this whole module
+//! is written against. **No `.gih` in any pack Umber fetches is angular** — all
+//! 43 in rubberduck's are `sel0:random` — so there is nothing to verify such a
+//! collapse against. Until there is, an angular pipe arrives as one preset per
+//! cell like any other and says precisely which rule was lost, rather than the
+//! general "sequence" sentence.
 
 use crate::preset::PresetError;
 
@@ -71,6 +94,10 @@ pub struct GihPipe {
     /// first" — which every pipe in the wild does, and which is the thing
     /// Umber cannot reproduce.
     pub animated: bool,
+    /// True when it walks them by the **direction of the stroke**, which is a
+    /// rotating stamp rather than a shuffled one. Reported separately because
+    /// it is a different loss: see the module docs.
+    pub angular: bool,
 }
 
 /// Decode a GIMP `.gih` file.
@@ -94,13 +121,18 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
         ));
     }
 
+    // The rule for the first dimension. Written `sel0:` because a pipe may have
+    // several — `dim:2` with `sel0:` and `sel1:` — and no pack in the wild uses
+    // more than one.
+    let selection = words.filter_map(|w| w.strip_prefix("sel0:")).next_back();
+
     // `sel0:constant` on a single-cell pipe is a plain `.gbr` wearing a pipe's
     // header, and nothing is lost converting it. Anything else walks the cells.
-    let animated = count > 1
-        || words.any(|w| {
-            w.strip_prefix("sel0:")
-                .is_some_and(|mode| mode != "constant")
-        });
+    let animated = count > 1 || selection.is_some_and(|mode| mode != "constant");
+    // Read off the same word, and reported on the same terms as `incremental`
+    // is: a pipe that says it walks its cells by direction is taken at its
+    // word, whether or not it happens to have only one to walk.
+    let angular = selection == Some("angular");
 
     let mut cells = Vec::with_capacity(count.min(64));
     for index in 0..count {
@@ -127,6 +159,7 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
         name,
         cells,
         animated,
+        angular,
     })
 }
 
@@ -139,7 +172,9 @@ pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if pipe.animated {
+    if pipe.angular {
+        out.push(ANGULAR);
+    } else if pipe.animated {
         out.push(ANIMATION);
     }
     if pipe.cells.iter().any(|cell| cell.coloured) {
@@ -150,6 +185,11 @@ pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
 
 /// Named once so the pipe reader and the bundle reader report it identically.
 pub(crate) const ANIMATION: &str = "animated brush sequences";
+
+/// The one selection rule that is a rotating stamp rather than a shuffled one.
+/// See the module docs for why it is named apart and why the pipe is not
+/// collapsed into a single stroke-following brush.
+pub(crate) const ANGULAR: &str = "stamps chosen by the direction of the stroke";
 
 /// One line of the text header, and the offset just past its newline.
 fn line(bytes: &[u8], from: usize) -> Result<(&[u8], usize), PresetError> {
@@ -281,6 +321,37 @@ mod tests {
         // …but one cell walked by an incremental rule still is not.
         let walked = gih("Single", "ncells:1 sel0:incremental", &[cell(1)]);
         assert!(from_gih(&walked).expect("decode").animated);
+    }
+
+    /// `angular` is the one selection rule that describes a *rotating* stamp
+    /// rather than a shuffled one, and Umber's dab turns its tip natively — so
+    /// what is lost here is a specific thing and the import says which. The
+    /// general sentence would send somebody looking for a randomiser.
+    #[test]
+    fn a_pipe_that_turns_with_the_stroke_names_that_rather_than_the_sequence() {
+        let turning = gih(
+            "Rake",
+            "ncells:4 dim:1 rank0:4 placement:constant sel0:angular",
+            &[cell(1), cell(2), cell(3), cell(4)],
+        );
+        let pipe = from_gih(&turning).expect("decode");
+        assert!(pipe.angular);
+        assert!(pipe.animated, "it still walks its cells");
+        assert_eq!(
+            dropped_features(&turning),
+            ["stamps chosen by the direction of the stroke"]
+        );
+
+        // A shuffled pipe is the ordinary case and keeps the ordinary sentence.
+        let shuffled = gih("Bark", "ncells:2 sel0:random", &[cell(1), cell(2)]);
+        assert!(!from_gih(&shuffled).expect("decode").angular);
+        assert_eq!(dropped_features(&shuffled), ["animated brush sequences"]);
+
+        // A pipe is taken at its word, on the same terms `incremental` is: a
+        // one-cell angular pipe reports the rule it states rather than the
+        // rule its cell count happens to make redundant.
+        let single = gih("One", "ncells:1 sel0:angular", &[cell(1)]);
+        assert!(from_gih(&single).expect("decode").angular);
     }
 
     #[test]

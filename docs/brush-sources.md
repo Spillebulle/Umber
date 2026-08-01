@@ -11,6 +11,15 @@ is not — the specific reason. The rule this list is written against:
 declared licence file is present in the archive and states what it is supposed
 to state. See `docs/brushes.md` for what happens to a pack once it is fetched.
 
+**Shipping a mask is a second, stricter question.** Converting a pack into
+settings is a description of somebody's work, made on one machine; embedding its
+**bitmap tips** puts the artwork itself in the binary and in this repository, in
+every release on every platform. The rule above therefore has to be met in full
+before a pack's masks travel, and `Pack::ship_tips` in
+`crates/umber-core/examples/build-brush-library.rs` records that decision per
+pack. Exactly one pack answers differently to the two questions, and it is
+rubberduck's.
+
 **One pack is a recorded exception to that rule**, made deliberately by the
 project's owner and marked as such everywhere it appears. It is the rubberduck
 entry below. Nothing else gets the same treatment without the same decision
@@ -54,9 +63,11 @@ better.
   check that can open a nested archive.
 - Result: **44 of the 46 read**; the other two are `deformbrush` and
   `experimentbrush`, which are separate Krita paint engines rather than brush
-  settings. Of the 44, **8 ship**. The rest need a bitmap tip, which the shipped
-  library still cannot hold — see "Shipping a stamp" below. All 44 import
-  through **Import brushes…** today, tips and all.
+  settings. Of the 44, **18 ship** — 7 procedural and **11 stamps**, carried by
+  7 masks. The rest drop something Umber cannot render. All 44 import through
+  **Import brushes…** today, tips and all.
+- Masks shipped: yes. CC0 stated in the bundle's own `meta.xml`, which is a
+  licence statement inside the download.
 
 ### Raghavendra Kamath — Krita brush presets v2.1 — CC0-1.0
 
@@ -67,8 +78,11 @@ better.
 - Licence evidence: **passes.** `LICENSE` at the root of the repository is the
   full CC0 1.0 Universal text, and `README.md` states "## Licence — [CC0]".
   Both are in any archive of it.
-- Result: 26 read, **4 ship**; the rest need a bitmap tip or use Krita's
-  brush-tip randomness and density, which Umber's dab has no equivalent for.
+- Result: 26 read, **8 ship** — 4 procedural and **4 stamps**, carried by 4
+  masks. The rest use Krita's brush-tip randomness and density, which Umber's
+  dab has no equivalent for, or drop something else.
+- Masks shipped: yes. CC0 stated in the repository's `LICENSE` and `README.md`,
+  both of which are in any archive of it.
 - The repository also ships the same presets loose under `paintoppresets/`. The
   fetch script takes only the bundle: taking both converts every preset twice,
   under two ids, with two rows in the picker.
@@ -86,7 +100,13 @@ better.
   row, and `every_shipped_preset_is_usable_and_attributed` fails the build if
   one ever does not. This is what `BrushPreset::credit` was built for.
 - Result: 43 read (7 refused as other paint engines — `spraybrush`,
-  `hatchingbrush`, `experimentbrush`, `deformbrush`), **9 ship**.
+  `hatchingbrush`, `experimentbrush`, `deformbrush`), **11 ship** — 7 procedural
+  and **4 stamps**, carried by 4 masks.
+- Masks shipped: yes, **with attribution**, which for CC-BY is a condition
+  rather than a courtesy. Every preset generated from this pack carries a
+  `Credit` naming GDquest whether it stamps a mask or not, and
+  `every_shipped_preset_is_usable_and_attributed` fails the build if one does
+  not.
 - The presets name their tips rather than embedding them, and the tips are in a
   sibling `brushes/`. `brushimport::read_file` looks there, which is the
   difference between 14 of these importing as stamps and 22 doing so.
@@ -119,47 +139,84 @@ better.
   `tools/fetch-brushes.ps1` prints a warning on every run for this pack, and
   `assets/brushes/LICENSES.md` repeats all of the above. It is deliberately not
   described as "verified".
-- Result: **all 60 files read, all 269 stamps import**. **None ships**, because
-  every one of them is a bitmap tip — see below.
+- Result: **all 60 files read, all 269 stamps import**. **None ships**, and the
+  reason has changed: it used to be that the library could not hold a mask, and
+  it is now the licence. Of the 269, the 252 that come out of a `.gih` lose the
+  pipe's sequencing and would be refused for that whatever happened here; the
+  remaining **17**, one per `.gbr`, convert cleanly and would ship but for this
+  entry.
+- Masks shipped: **no.** This is the pack the rule at the top of this file
+  covers, and shipping a mask is where that rule bites hardest. The exception
+  recorded above was made so the pack could be *fetched and converted*; putting
+  17 pieces of somebody else's artwork inside every Umber release, on every
+  platform, is a larger claim than converting them on one machine, and it is not
+  one this project makes on evidence it could not check. The cost is exactly 17
+  brushes and 1.2 MB of PNG. `ship_tips: false` in
+  `crates/umber-core/examples/build-brush-library.rs` is the whole of it, and
+  flipping it is a decision for whoever owns the project rather than a default.
 - The earlier entry also said `.gih` "is not read at all". It is now; see
   `docs/brushes.md`.
 
 ## Shipping a stamp
 
-Everything above that does not ship is held back by one thing, and it is worth
-stating once rather than five times.
+Stamps ship now: **19 brushes carried by 15 masks, 624 kB of 8-bit greyscale
+PNG in `crates/umber-core/assets/tips/`, 664 kB of release binary** — measured,
+17,162,752 bytes before and 17,842,176 after. The generator writes the masks,
+deduplicates them by content and rewrites the `include_bytes!` table;
+`preset::builtin()` resolves a shipped tip through `tip::builtin` before the
+user's library. `docs/brushes.md` has the mechanism.
 
-**The shipped library is a single embedded RON, and a bitmap does not go in
-it.** `BrushPreset::tip` holds a mask's *name* and resolves it against the
-**user's** library. Shipping a stamp needs three things that do not exist:
+What decided the shape of it, in the order the questions were asked.
 
-1. The generator writing masks to `crates/umber-core/assets/tips/` and an
-   `include_bytes!` table beside `builtin-brushes.ron`.
-2. `preset::builtin()` resolving a shipped tip, which today it cannot.
-3. A rule for **which** stamps reproduce faithfully, decided by measurement.
+### How many brushes is this actually about
 
-The third is the one that decides it, and there are now numbers. Measured over
-the packs above, as 8-bit PNG and as mean coverage:
+**338** across the five packs carry a mask. Only **37** of them drop nothing
+else, so the other 301 were never candidates whatever the library could hold —
+257 are refused for a `.gih` pipe's sequencing alone, and the rest for coloured
+stamps, mirrored dabs, brush-tip randomness, a separate paint-deposit rate or a
+rotation Umber cannot drive. Of the 37, 19 ship and 17 are rubberduck's.
 
-| Pack | Tips | Encoded | Mean coverage |
-|---|---|---|---|
-| rubberduck (OpenGameArt) | 269 | **10.7 MB** | 0.14 |
-| Revoy 25.01 | 34 | 0.5 MB | 0.23 |
-| Raghukamath v2.1 | 34 | 0.9 MB | 0.22 |
-| GDQuest | 22 | 0.7 MB | 0.47 |
+### How big the whole thing would have been
 
-Two things follow.
+Every unique mask the 338 need, as 8-bit PNG, at four maximum long sides:
 
-- **10.7 MB is not a library, it is a download.** The whole of
-  `builtin-brushes.ron` is about 200 KB. Embedding one pack's stamps would
-  multiply what every user fetches, on every platform, by fifty, for a pack
-  whose brushes cannot yet be painted faithfully anyway.
-- **A mean coverage of 0.14 is the Gimp Brushcollection problem again.** GIMP
-  composites every dab, so a sparse stamp builds up to solid along a stroke;
-  Umber takes a `max` of coverage and applies opacity once at commit (the
-  wet-layer design in `CLAUDE.md`), so it cannot build up at all. The
-  measurement below, taken on that other pack, applies to these in the same
-  proportion.
+| Pack | Brushes with a mask | Unique masks | Full size | ≤ 1024 px | ≤ 512 px | ≤ 256 px |
+|---|---:|---:|---:|---:|---:|---:|
+| Revoy 25.01 | 34 | 24 | 0.5 MB | 0.5 MB | 0.5 MB | 0.3 MB |
+| Raghukamath v2.1 | 13 | 12 | 0.5 MB | 0.4 MB | 0.3 MB | 0.1 MB |
+| GDQuest | 22 | 14 | 0.5 MB | 0.5 MB | 0.5 MB | 0.2 MB |
+| rubberduck (OpenGameArt) | 269 | 265 | **10.9 MB** | 10.9 MB | 10.4 MB | 5.5 MB |
+| **all** | **338** | **315** | **12.4 MB** | 12.4 MB | 11.7 MB | 6.1 MB |
+
+Three things follow, and the first two are why the answer is not "downsample".
+
+- **Deduplication is worth having and does not decide anything.** 338 brushes
+  need 315 masks: a pack does cut several presets from one stamp, but not
+  often. It is worth doing because it is free — `BrushPreset::tip` already holds
+  a *name* — and because it saves a GPU upload as well as bytes.
+- **A resolution cap buys almost nothing.** The median mask is already 350 px
+  long, so capping at 512 saves 6%. Capping at 256 does save half, and costs
+  too much for it: eleven masks change their build-up verdict, and one drops
+  below the strength at which eight-bit coverage can accumulate at all. **The
+  masks that ship are shipped at their original resolution**, which needs no cap
+  and no re-measurement.
+- **12.4 MB was never the question**, because 315 masks was never the set. The
+  masks the shipping brushes need are 33, and without rubberduck's 15.
+
+### The three that ship, and the one that does not
+
+624 kB on a 5.9 MB MSI is about 11%, for 19 brushes — a trade worth making and
+stated rather than made quietly. Revoy's, Raghukamath's and GDQuest's licences
+are verified inside their downloads, which is what shipping artwork requires.
+
+rubberduck's is not, and that is the finding worth reading twice: **its 17
+brushes and 1.2 MB are held back by the licence rule and by nothing else.** The
+pack is CC0 as far as anyone can tell — the terms would permit this — but the
+statement is on the OpenGameArt submission page and not inside the archive, and
+the recorded exception above was made so the pack could be fetched and
+converted. Redistributing the masks is a further step. `ship_tips: false` in
+`crates/umber-core/examples/build-brush-library.rs` is where that decision
+lives, in one line, next to the reason.
 
 None of this stops anybody using them. All 269 import through **Import
 brushes…**, are saved into the user's own library with their masks, reload, and
@@ -247,9 +304,11 @@ Umber claims*, and it is the same distinction everywhere else in the importer.
 
   Reasons 2 and 3 are ordinary work — curate a folder, name the brushes by
   hand, pin the commit in `tools/fetch-brushes.ps1` — and they are what stands
-  between this pack and the library now. The engine is no longer the obstacle:
-  the fourth step below is built, and `assets/tips/` ships Umber's own stamp
-  through it as proof.
+  between this pack and the library now. Neither the engine nor the library is
+  the obstacle any more: `assets/tips/` carries fifteen third-party masks and
+  nineteen brushes stamp them, and this pack's licence is *verifiable from the
+  download*, which is the test rubberduck's fails. It is the strongest
+  remaining candidate.
 
   Note the standard for a brush the *user* imports is deliberately the
   opposite — an approximation of a brush you chose beats a refusal — and these
@@ -298,19 +357,28 @@ Umber claims*, and it is the same distinction everywhere else in the importer.
 The test `every_shipped_preset_is_usable_and_attributed` fails if any shipped
 preset has no credit, which is the backstop for step 2.
 
-**A pack of bitmap tips has a fourth step.** `BrushPreset::tip` used to resolve
-against the *user's* library only, so there was nowhere in the shipped set to
-put a bitmap. There now is:
+**A pack of bitmap tips has a fourth decision**, and it is the only one that is
+not mechanical:
 
-4. Put the masks in `crates/umber-core/assets/tips/` as 8-bit greyscale PNGs and
-   name them in `TIPS` in `crates/umber-core/src/tip.rs`, which is an
-   `include_bytes!` table beside `builtin-brushes.ron`. A preset's `tip` field
-   resolves against the shipped table first and the user's library second, so a
-   shipped stamp and a user's own are the same mechanism.
+4. Set `ship_tips` on the pack's row. `true` means its masks are written to
+   `crates/umber-core/assets/tips/` as 8-bit greyscale PNGs, deduplicated by
+   content, and named in the generated `tip_table.rs` — a preset's `tip` field
+   resolves against that table first and the user's library second, so a shipped
+   stamp and a user's own are the same mechanism. Nothing else has to be done by
+   hand; the generator owns that half of the directory, stale masks included.
+
+   Say `true` only if the pack's licence was verified **inside the download**.
+   Shipping a mask is redistributing artwork rather than describing it, and a
+   pack may pass the fetch script's check on evidence that is good enough to
+   convert and not good enough to redistribute — which is exactly rubberduck's
+   position above.
 
    Whether a tip reproduces faithfully is **measured**, by
-   `umber_core::tip::stroke_coverage`, and it is now a question with two
-   answers rather than one: a dense stamp ships on the `max` path and a sparse
-   one ships with `build_up` set. Only a mask too faint for eight-bit coverage
-   to accumulate — `StrokeCoverage::is_usable` — is refused, and nothing
-   sampled from the packs above comes close to that.
+   `umber_core::tip::stroke_coverage`, and it is a question with two answers
+   rather than one: a dense stamp ships on the `max` path and a sparse one ships
+   with `build_up` set. Every reader that produces a mask runs the measurement —
+   `.gbr`, `.abr` and, since the stamps started shipping, `.kpp`. Only a mask
+   too faint for eight-bit coverage to accumulate — `StrokeCoverage::is_usable`
+   — is refused, and nothing in the packs above comes close to that.
+   `a_shipped_stamp_paints_at_the_strength_it_was_drawn_at` re-derives the flag
+   for every shipped stamp on every `cargo test`.
