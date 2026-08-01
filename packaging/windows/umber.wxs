@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  The Windows installer, built with WiX 5 (`dotnet tool install --global wix`).
+  The Windows installer, built with WiX 5, installed as a global dotnet tool.
+
+  Note for anyone editing this header: an XML comment may not contain two
+  hyphens in a row, so a command line with a long option cannot be written
+  here. That is what broke the first build of this file.
 
   Deliberately small. Umber is one executable with everything — brushes, fonts,
   papers, icons — compiled into it, so there is nothing to lay out beside it and

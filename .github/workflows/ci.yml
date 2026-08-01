@@ -10,6 +10,50 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # The packaging files are only exercised when a release is built, which is
+  # the worst moment to discover a typo in one: the tag is already pushed. They
+  # cost seconds to parse, so they are parsed on every push instead. An XML
+  # comment containing two hyphens in a row broke the first MSI build this way.
+  packaging:
+    name: packaging files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Parse
+        run: |
+          python3 - <<'PY'
+          import sys, xml.dom.minidom, yaml
+          bad = False
+          for f in ['packaging/windows/umber.wxs',
+                    'packaging/io.github.spillebulle.umber.metainfo.xml']:
+              try:
+                  xml.dom.minidom.parse(f)
+              except Exception as e:
+                  bad = True
+                  print(f'{f}: {e}')
+          for f in ['.github/workflows/ci.yml',
+                    '.github/workflows/release.yml',
+                    'packaging/linux/io.github.spillebulle.umber.yml']:
+              try:
+                  yaml.safe_load(open(f, encoding='utf-8'))
+              except Exception as e:
+                  bad = True
+                  print(f'{f}: {e}')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Shell syntax
+        run: |
+          for f in packaging/linux/build-packages.sh tools/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Desktop entry
+        run: |
+          sudo apt-get update && sudo apt-get install -y desktop-file-utils
+          desktop-file-validate packaging/umber.desktop
+
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
