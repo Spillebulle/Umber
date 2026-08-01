@@ -322,6 +322,30 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
          and nothing stronger. Help, About has the details and a button to \
          check on demand.",
     );
+
+    ui.add_space(16.0);
+    controls::section(ui, p, "Documents");
+    // The one setting that trades file size for a feature, so it is a switch
+    // rather than a policy, and the note states the trade in megabytes rather
+    // than in adverbs.
+    let mut history = ed.ui.save_history;
+    controls::row(ui, p, "Save the undo history in the document", |ui| {
+        if widgets::toggle(ui, p, &mut history).clicked() {
+            ed.ui.save_history = history;
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Lets a document be undone after it has been closed and reopened. The \
+         history goes in as private entries other applications ignore, so the \
+         file is still an ordinary OpenRaster. The newest edits are kept, up to \
+         32 MB of them — a sketching session is well under a megabyte of that, \
+         while an hour of full-canvas painting reaches the limit and its oldest \
+         strokes are dropped. Switching this off makes saving quicker and the \
+         file smaller, and costs only the history.",
+    );
 }
 
 // ---------------------------------------------------------------------------
