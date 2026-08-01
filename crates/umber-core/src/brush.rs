@@ -136,6 +136,42 @@ pub struct Brush {
     /// in **log** space — so `0.7` means "typically within a factor of two",
     /// symmetrically, and no amount of it can produce a negative radius.
     pub radius_jitter: f32,
+    /// Whether overlapping dabs within one stroke **accumulate** instead of
+    /// saturating at the strongest of them.
+    ///
+    /// Off — the default — is the wet-layer scheme the whole renderer is built
+    /// around: coverage takes a `max`, so a stroke crossing itself is no more
+    /// opaque than one that does not, and stroke opacity is applied once at
+    /// commit. That is right for a brush whose dab is a solid disc, where
+    /// overlap is an artefact of how a line is drawn rather than something the
+    /// artist asked for.
+    ///
+    /// On, coverage composites: `a = a + cov(1 - a)`. That is wrong for a disc
+    /// and it is the *entire mark* for a sparse texture stamp. GIMP and Krita
+    /// composite every dab, so a photographic stamp whose brightest texel is
+    /// 0.49 builds to solid along a stroke; under a `max` it can never exceed
+    /// 0.49 however many times it is stamped, which is a stroke half as strong
+    /// as the author's. See `docs/brush-sources.md` for the measurement.
+    ///
+    /// It is a **blend-state** change and nothing else — the dab shader is
+    /// untouched, so the two paths cannot drift into stamping different shapes.
+    pub build_up: bool,
+    /// How strongly a tiling grain texture bites into dab coverage, `0.0`
+    /// (none) to `1.0` (the grain's dark texels erase the dab entirely).
+    ///
+    /// Zero is the exact identity: coverage is multiplied by
+    /// `mix(1.0, grain, strength)`, so a brush that does not ask for grain
+    /// pays a multiply by one and nothing else. This is what makes a pencil
+    /// catch on the tooth of the paper — the grain is fixed to the *document*,
+    /// not to the dab, so the same texel is hit every time the brush passes
+    /// over it and a second stroke lands in the same pits as the first.
+    pub grain: f32,
+    /// Size of one tile of the grain texture, in document pixels.
+    ///
+    /// Document pixels rather than a multiple of the brush size, for the same
+    /// reason the grain is anchored to the document: paper does not get coarser
+    /// when you pick up a bigger pencil.
+    pub grain_scale: f32,
 }
 
 impl Default for Brush {
@@ -168,6 +204,9 @@ impl Default for Brush {
             min_scatter_ratio: 0.0,
             scatter_curve: ResponseCurve::LINEAR,
             radius_jitter: 0.0,
+            build_up: false,
+            grain: 0.0,
+            grain_scale: 256.0,
         }
     }
 }
@@ -175,6 +214,12 @@ impl Default for Brush {
 impl Brush {
     pub const MIN_SIZE: f32 = 1.0;
     pub const MAX_SIZE: f32 = 2000.0;
+    /// Bounds on [`Brush::grain_scale`]. Below the lower one a paper texture is
+    /// finer than the pixels it is sampled at and reads as noise; above the
+    /// upper one a single tile is bigger than most canvases and the tiling
+    /// stops being a texture at all.
+    pub const MIN_GRAIN_SCALE: f32 = 16.0;
+    pub const MAX_GRAIN_SCALE: f32 = 2048.0;
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {
@@ -244,6 +289,15 @@ impl Brush {
     /// Whether the brush keeps depositing paint while the pen is stationary.
     pub fn is_timed(&self) -> bool {
         self.dabs_per_second > 0.0
+    }
+
+    /// Whether the grain texture is doing anything.
+    ///
+    /// The threshold is not zero for the same reason [`Brush::smudges`]'s is
+    /// not: a strength of a few thousandths would cost a texture binding and a
+    /// second sampler to render something nobody can see.
+    pub fn has_grain(&self) -> bool {
+        self.grain > 0.004
     }
 
     /// Whether the dab is anything other than a plain circle laid on the line.

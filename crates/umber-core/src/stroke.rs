@@ -201,6 +201,32 @@ impl StrokeBuilder {
         self.brush.smudges()
     }
 
+    /// Whether this stroke's dabs accumulate coverage instead of saturating.
+    ///
+    /// Read off the brush snapshotted at [`Self::begin`] rather than off the
+    /// live one, for the same reason the colour is: the dab pass picks a
+    /// pipeline from this every frame, and a stroke that changed pipeline
+    /// halfway would have its first half drawn under one rule and its second
+    /// under the other.
+    pub fn builds_up(&self) -> bool {
+        self.brush.build_up
+    }
+
+    /// The grain this stroke bites through, as `(strength, tile size)`.
+    ///
+    /// `None` when the brush asks for none, which is the signal to the renderer
+    /// to leave the grain binding at its 1×1 placeholder and multiply by one.
+    pub fn grain(&self) -> Option<(f32, f32)> {
+        self.brush.has_grain().then(|| {
+            (
+                self.brush.grain.clamp(0.0, 1.0),
+                self.brush
+                    .grain_scale
+                    .clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE),
+            )
+        })
+    }
+
     /// Where the next canvas sample should be taken, and how wide.
     ///
     /// `None` when the brush does not smudge, which is the common case and the

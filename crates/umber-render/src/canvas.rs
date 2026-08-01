@@ -47,8 +47,9 @@ const STROKE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Floa
 /// The coverage attachment's blend state.
 ///
 /// `Max` is the whole trick: coverage saturates instead of accumulating, so a
-/// stroke crossing itself stays even. Shared by both dab pipelines, so smudging
-/// cannot quietly reintroduce the compounding this prevents.
+/// stroke crossing itself stays even. Shared by both non-building dab
+/// pipelines, so smudging cannot quietly reintroduce the compounding this
+/// prevents.
 const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
     format: STROKE_FORMAT,
     blend: Some(wgpu::BlendState {
@@ -61,6 +62,44 @@ const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Max,
+        },
+    }),
+    write_mask: wgpu::ColorWrites::ALL,
+};
+
+/// The coverage attachment's blend state for a **building-up** brush:
+/// `a = cov + a(1 - cov)`, which is what one dab compositing over the last
+/// means.
+///
+/// Expressed as `src * One + dst * (1 - src)`. `OneMinusSrc` reads the source
+/// *colour*, and coverage lives in the red channel of a single-channel target,
+/// so the factor is `1 - cov` per channel — exactly the complement wanted. The
+/// alternative, writing coverage into the fragment's alpha as well and using
+/// `OneMinusSrcAlpha`, would mean the two paths ran different shader code, and
+/// the paint-versus-erase note in `CLAUDE.md` records what that costs: a
+/// difference of blending has to live in the blend state or it drifts.
+///
+/// Nothing downstream changes. The result is still coverage in `0..1` in the
+/// same texture, so `composite.wgsl` and `commit.wgsl` are untouched and stroke
+/// opacity is still applied exactly once, at commit.
+///
+/// The floor worth knowing about: the scratch is `R8Unorm`, so a dab weaker
+/// than about `1/255` rounds away and a stroke of them never builds. Real
+/// texture stamps are nowhere near that faint — the sparsest pack measured runs
+/// to a peak of 0.49 — and widening the hottest texture in the frame to sixteen
+/// bits to hold a coverage nobody can see would be the wrong trade.
+const COVERAGE_BUILDUP_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
+    format: STROKE_FORMAT,
+    blend: Some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
         },
     }),
     write_mask: wgpu::ColorWrites::ALL,
@@ -269,6 +308,34 @@ impl Default for StrokeStyle {
     }
 }
 
+/// How the dab pass should blend, for the whole of one stroke.
+///
+/// Both flags choose a *pipeline*, and a pipeline cannot be changed halfway
+/// through a stroke without the dabs already in the scratch having been drawn
+/// under the other rule. Hence one struct rather than two loose booleans:
+/// whatever a stroke starts with, it finishes with.
+///
+/// Neither flag reaches [`CompositeParams`] or [`CanvasRenderer::commit_stroke`]
+/// except through [`StrokeStyle::per_dab_color`], which they must agree with —
+/// build-up is invisible downstream by design, because it changes only how
+/// coverage arrives in the scratch and not what the scratch means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DabStyle {
+    /// Record a colour per dab as well as coverage. Must equal the
+    /// [`StrokeStyle::per_dab_color`] handed to composite and commit.
+    pub per_dab_color: bool,
+    /// Accumulate coverage rather than taking a `max` of it. See
+    /// [`COVERAGE_BUILDUP_TARGET`].
+    pub build_up: bool,
+}
+
+impl DabStyle {
+    /// Index into the pipeline matrix. Bit 0 is colour, bit 1 is build-up.
+    fn index(self) -> usize {
+        usize::from(self.per_dab_color) | usize::from(self.build_up) << 1
+    }
+}
+
 /// Where a smudging brush should sample the canvas, and what it is painting.
 ///
 /// The stack and stroke are the same ones the screen composite is given, and
@@ -416,10 +483,15 @@ impl LayerStore {
 struct Shared {
     sampler: wgpu::Sampler,
 
-    dab_pipeline: wgpu::RenderPipeline,
-    /// Writes the colour scratch as well. Used only while a smudging stroke is
-    /// in progress, so an ordinary stroke never pays for the second attachment.
-    dab_colored_pipeline: wgpu::RenderPipeline,
+    /// The four dab pipelines, indexed by [`DabStyle::index`].
+    ///
+    /// Two independent binary choices, so four — but written once and built by
+    /// a loop, because they differ in exactly two fields and four copies of a
+    /// pipeline descriptor is four places for the vertex layout to drift. The
+    /// coloured pair carry a second attachment that nearly every stroke does
+    /// not want; the building pair swap the coverage target's blend state. All
+    /// four share one shader module and one pipeline layout.
+    dab_pipelines: [wgpu::RenderPipeline; 4],
     dab_layout: wgpu::BindGroupLayout,
 
     composite_pipeline: wgpu::RenderPipeline,
@@ -503,52 +575,55 @@ impl Shared {
             ..Default::default()
         };
 
-        let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dab-pipeline"),
-            layout: Some(&dab_pl),
-            vertex: wgpu::VertexState {
-                module: &dab_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: DAB_VERTEX_LAYOUT,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &dab_shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(COVERAGE_TARGET)],
-            }),
-            primitive: dab_primitive,
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Same geometry, same coverage target, plus the colour scratch. Kept as
-        // a separate pipeline rather than one that always writes both, because
-        // the second attachment is pure cost for the strokes — nearly all of
-        // them — that paint a single colour.
-        let dab_colored_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dab-colored-pipeline"),
-            layout: Some(&dab_pl),
-            vertex: wgpu::VertexState {
-                module: &dab_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: DAB_VERTEX_LAYOUT,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &dab_shader,
-                entry_point: Some("fs_colored"),
-                compilation_options: Default::default(),
-                targets: &[Some(COVERAGE_TARGET), Some(STROKE_COLOR_TARGET)],
-            }),
-            primitive: dab_primitive,
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+        // One descriptor, four pipelines. `colored` decides the fragment entry
+        // point and whether the colour scratch is attached; `build_up` decides
+        // only the coverage target's blend state, which is the whole reason it
+        // is a pipeline choice and not a shader branch.
+        let dab_pipelines = std::array::from_fn(|i| {
+            let style = DabStyle {
+                per_dab_color: i & 1 != 0,
+                build_up: i & 2 != 0,
+            };
+            let coverage = if style.build_up {
+                COVERAGE_BUILDUP_TARGET
+            } else {
+                COVERAGE_TARGET
+            };
+            let targets: &[Option<wgpu::ColorTargetState>] = if style.per_dab_color {
+                &[Some(coverage), Some(STROKE_COLOR_TARGET)]
+            } else {
+                &[Some(coverage)]
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(match i {
+                    0 => "dab-pipeline",
+                    1 => "dab-colored-pipeline",
+                    2 => "dab-buildup-pipeline",
+                    _ => "dab-colored-buildup-pipeline",
+                }),
+                layout: Some(&dab_pl),
+                vertex: wgpu::VertexState {
+                    module: &dab_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: DAB_VERTEX_LAYOUT,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &dab_shader,
+                    entry_point: Some(if style.per_dab_color {
+                        "fs_colored"
+                    } else {
+                        "fs"
+                    }),
+                    compilation_options: Default::default(),
+                    targets,
+                }),
+                primitive: dab_primitive,
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
         });
 
         // ---- composite pass -------------------------------------------------
@@ -680,8 +755,7 @@ impl Shared {
 
         Self {
             sampler,
-            dab_pipeline,
-            dab_colored_pipeline,
+            dab_pipelines,
             dab_layout,
             composite_pipeline,
             composite_offscreen_pipeline,
@@ -1045,22 +1119,26 @@ impl CanvasRenderer {
 
     /// Upload dabs and stamp them into the scratch texture.
     ///
-    /// `colored` must be true for every frame of a stroke whose brush smudges,
-    /// and must match the `per_dab_color` handed to [`Self::composite`] and
-    /// [`Self::commit_stroke`]. Turning it on midway through a stroke would
-    /// leave the earlier dabs with no colour recorded, and they would commit as
-    /// the flat palette colour while the rest smudged.
+    /// `style` must be the **same for every frame of a stroke**, and its
+    /// `per_dab_color` must match the [`StrokeStyle`] handed to
+    /// [`Self::composite`] and [`Self::commit_stroke`]. Turning colour on midway
+    /// would leave the earlier dabs with no colour recorded, and they would
+    /// commit as the flat palette colour while the rest smudged; turning
+    /// build-up on midway would leave the first half of the stroke saturating
+    /// where the second half accumulates, which is a visible step in a mark that
+    /// should be even.
     pub fn draw_dabs(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         dabs: &[Dab],
-        colored: bool,
+        style: DabStyle,
     ) {
         if dabs.is_empty() {
             return;
         }
+        let colored = style.per_dab_color;
         if colored {
             self.ensure_stroke_color(device);
         }
@@ -1106,11 +1184,7 @@ impl CanvasRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(if colored {
-            &self.shared.dab_colored_pipeline
-        } else {
-            &self.shared.dab_pipeline
-        });
+        pass.set_pipeline(&self.shared.dab_pipelines[style.index()]);
         pass.set_bind_group(0, &self.dab_bind_group, &[]);
         pass.set_vertex_buffer(
             0,

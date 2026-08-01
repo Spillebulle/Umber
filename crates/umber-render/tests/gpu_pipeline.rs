@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     BlendMode, Brush, BrushMode, Camera, Color, Dab, InputPoint, PixelRect, StrokeBuilder, TipMask,
 };
-use umber_render::{CanvasRenderer, CompositeParams, Gpu, LayerDraw, ProbeParams, StrokeStyle};
+use umber_render::{
+    CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
+};
 
 const DOC: u32 = 64;
 
@@ -78,16 +80,37 @@ impl Harness {
     }
 
     fn stamp(&mut self, dabs: &[Dab]) {
-        self.stamp_colored(dabs, false);
+        self.stamp_styled(dabs, DabStyle::default());
     }
 
     /// Stamp with the per-dab colour path on, as a smudging brush does.
     fn stamp_colored(&mut self, dabs: &[Dab], colored: bool) {
-        self.per_dab_color = colored;
+        self.stamp_styled(
+            dabs,
+            DabStyle {
+                per_dab_color: colored,
+                build_up: false,
+            },
+        );
+    }
+
+    /// Stamp with the build-up blend, as a texture stamp does.
+    fn stamp_building(&mut self, dabs: &[Dab]) {
+        self.stamp_styled(
+            dabs,
+            DabStyle {
+                per_dab_color: false,
+                build_up: true,
+            },
+        );
+    }
+
+    fn stamp_styled(&mut self, dabs: &[Dab], style: DabStyle) {
+        self.per_dab_color = style.per_dab_color;
         let mut enc = self.encoder();
         self.canvas.begin_frame();
         self.canvas
-            .draw_dabs(&self.gpu.device, &self.gpu.queue, &mut enc, dabs, colored);
+            .draw_dabs(&self.gpu.device, &self.gpu.queue, &mut enc, dabs, style);
         self.gpu.queue.submit(Some(enc.finish()));
     }
 
@@ -322,6 +345,183 @@ fn overlapping_dabs_do_not_compound() {
     assert!(
         (100..=155).contains(&alpha),
         "expected ~128 (single coverage), got {alpha} — dabs are compounding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Build-up
+// ---------------------------------------------------------------------------
+
+/// What `n` dabs of coverage `c` composite to: `1 - (1 - c)^n`.
+///
+/// The model the build-up blend is supposed to implement, written out so the
+/// tests below assert against the maths rather than against a number somebody
+/// once read off a screen.
+fn composited(coverage: f32, dabs: i32) -> f32 {
+    1.0 - (1.0 - coverage).powi(dabs)
+}
+
+#[test]
+fn building_dabs_reach_the_coverage_compositing_predicts() {
+    // The whole point of the build-up mode. Eight quarter-coverage dabs on one
+    // spot composite to 1 - 0.75^8 = 0.900, where a `max` cannot pass 0.25
+    // however many are stamped.
+    //
+    // This is the mechanism a sparse texture stamp needs: the CC0 GIMP pack's
+    // brightest texel is 0.49, so under a `max` a stroke of it can never be
+    // more than half as strong as the author's however long it is. See
+    // `docs/brush-sources.md`.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp_building(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let expected = (composited(0.25, 8) * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (1 - 0.75^8), got {alpha}"
+    );
+}
+
+#[test]
+fn build_up_leaves_the_max_path_alone() {
+    // The other half of the evidence, and the half that matters more: the same
+    // dabs through the ordinary pipeline must still saturate at one dab's
+    // worth. Every brush in the library is on that path, and a build-up mode
+    // that quietly changed it would be a regression across the whole set
+    // wearing the name of a new feature.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp(&[d; 8]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let expected = (0.25 * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (one dab's coverage), got {alpha} — the max blend has moved"
+    );
+}
+
+#[test]
+fn a_building_stroke_still_applies_its_opacity_exactly_once() {
+    // Build-up must not become a second place stroke opacity is folded in.
+    // Coverage builds to 0.900 and commit scales it by 0.5, once, so the
+    // committed alpha is 0.450 — not 0.900 and not 0.125.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.25);
+    h.stamp_building(&[d; 8]);
+    h.commit(Color::WHITE, 0.5, BrushMode::Paint);
+
+    let expected = (composited(0.25, 8) * 0.5 * 255.0) as u8;
+    let alpha = h.pixel(32, 32)[3];
+    assert!(
+        alpha.abs_diff(expected) <= 6,
+        "expected ~{expected} (built coverage, halved once), got {alpha}"
+    );
+}
+
+#[test]
+fn a_building_stroke_saturates_rather_than_overflowing() {
+    // `a + cov(1 - a)` can never pass 1.0, in exact arithmetic or in the
+    // target's unorm. Worth pinning: an accumulation written as a plain `Add`
+    // would look right for a few dabs and then clip, squaring the soft edge off
+    // into a hard-edged blob.
+    let mut h = harness_or_skip!();
+
+    let d = dab(32.0, 32.0, 12.0, 0.5);
+    h.stamp_building(&[d; 40]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    // 254, not 255. The scratch is `R8Unorm`, so once coverage reaches 254/255
+    // the next dab contributes `0.5/255` and rounds to nothing: a partial dab
+    // asymptotes one level short of solid. A dab of full coverage does reach
+    // 255 — `a + 1(1 - a)` is exactly 1 — so this is the floor of the
+    // quantisation and not a leak in the formula. Sixteen-bit coverage would
+    // close it, at four times the bandwidth of the hottest texture in the
+    // frame, to remove a difference of 0.4%.
+    assert!(
+        h.pixel(32, 32)[3] >= 254,
+        "forty half-coverage dabs should be solid, got {}",
+        h.pixel(32, 32)[3]
+    );
+    assert_eq!(
+        h.pixel(CORNER, CORNER)[3],
+        0,
+        "the corner outside a round dab must stay empty"
+    );
+}
+
+#[test]
+fn a_building_tip_reaches_solid_where_a_max_one_cannot() {
+    // The measurement from `docs/brush-sources.md`, in miniature: a stamp whose
+    // strongest texel is 0.49 stamped repeatedly. Under a `max` the stroke
+    // stops at 0.49 — half the author's mark — and under build-up it reaches
+    // solid, which is what GIMP draws.
+    let mut h = harness_or_skip!();
+
+    // 125/255 = 0.490, the exact peak of `Organic/Organic_000.gbr`.
+    let tip = TipMask::new(2, 2, vec![125; 4]).expect("tip");
+    h.set_tip(Some(tip));
+
+    let d = dab(32.0, 32.0, 12.0, 1.0);
+    h.stamp(&[d; 12]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let capped = h.pixel(32, 32)[3];
+    assert!(
+        capped.abs_diff(125) <= 3,
+        "a max stroke cannot exceed the tip's brightest texel; got {capped}"
+    );
+
+    h.stamp_building(&[d; 12]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    let built = h.pixel_in(1, 32, 32)[3];
+    assert!(
+        built >= 250,
+        "twelve stamps at 0.49 should composite to solid; got {built}"
+    );
+}
+
+#[test]
+fn a_building_smudge_keeps_its_colour_and_its_accumulation() {
+    // The fourth pipeline, and the combination worth pinning because it is the
+    // one that could have been refused. Coverage builds while colour still
+    // blends premultiplied `over` — and under build-up the two attachments
+    // agree exactly, because `over` accumulates the colour target's alpha by
+    // the same formula the coverage target now uses. The un-premultiply in
+    // `commit.wgsl` is therefore dividing by the coverage that is really there,
+    // which is what makes the smear come out the later dabs' colour at the
+    // built-up strength rather than washed towards the palette.
+    let mut h = harness_or_skip!();
+
+    let d = |c: [f32; 3]| coloured_dab(32.0, 32.0, 12.0, 0.25, c);
+    h.stamp_styled(
+        &[
+            d([1.0, 0.0, 0.0]),
+            d([1.0, 0.0, 0.0]),
+            d([0.0, 0.0, 1.0]),
+            d([0.0, 0.0, 1.0]),
+        ],
+        DabStyle {
+            per_dab_color: true,
+            build_up: true,
+        },
+    );
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let px = h.pixel(32, 32);
+    let expected = (composited(0.25, 4) * 255.0) as u8;
+    assert!(
+        px[3].abs_diff(expected) <= 6,
+        "expected ~{expected} of coverage, got {}",
+        px[3]
+    );
+    assert!(
+        px[2] > px[0],
+        "the later blue dabs should dominate the smear: {px:?}"
     );
 }
 
@@ -1170,7 +1370,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
         &gpu.queue,
         &mut enc,
         &[dab(32.0, 32.0, 20.0, 1.0)],
-        false,
+        DabStyle::default(),
     );
     gpu.queue.submit(Some(enc.finish()));
 
