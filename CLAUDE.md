@@ -483,7 +483,8 @@ Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
 brush editor's Wet edges section, Palette and Harmony picker modes,
 twelve of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
-listed with its reason in the README. **Do not add UI for features that do not work** — a
+listed in the README's "What is not there yet", with the reasoning in
+`docs/architecture.md`'s roadmap and, for the brush settings, `docs/brushes.md`. **Do not add UI for features that do not work** — a
 disabled control with an explanatory tooltip is better than a live one that
 lies, and a control that is simply not drawn is better than either where the
 design shows a whole row of them.
