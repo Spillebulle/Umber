@@ -292,6 +292,12 @@ pub mod metrics {
     /// The canvas scrollbars, along the bottom and right of the document
     /// region. Thin, because they sit over the picture rather than beside it.
     pub const SCROLLBAR: f32 = 11.0;
+    /// Radius of the dot Umber draws where a pen is, in place of the arrow.
+    ///
+    /// Small on purpose: it says where the nib is and nothing else — how wide
+    /// the mark will be is the brush preview's to answer, and a dot big enough
+    /// to be mistaken for one would be a second answer to that question.
+    pub const PEN_DOT: f32 = 2.5;
     pub const SLIDER_ROW: f32 = 16.0;
     pub const SLIDER_RAIL: f32 = 3.0;
     pub const SLIDER_KNOB: f32 = 11.0;

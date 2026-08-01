@@ -17,9 +17,50 @@ pub struct Camera {
     pub zoom: f32,
 }
 
+/// What one screen pixel of drag along the zoom axis multiplies the zoom by.
+///
+/// Small because it is spent per pixel of a continuous gesture, where
+/// `ZOOM_KEY_STEP` in `app.rs` is spent per keypress: about 90 pixels doubles
+/// the zoom, which is a short sweep of the hand.
+const ZOOM_DRAG_RATE: f32 = 1.008;
+
 impl Camera {
     pub const MIN_ZOOM: f32 = 0.02;
     pub const MAX_ZOOM: f32 = 64.0;
+
+    /// What a zoom-tool drag of `delta` screen pixels multiplies the zoom by.
+    ///
+    /// Right and up zoom in, left and down zoom out — screen y being
+    /// down-positive is why the two axes are *subtracted*. The zoom-in
+    /// direction is therefore the diagonal `(1, -1)`, and the drag has to be
+    /// resolved onto it somehow.
+    ///
+    /// Adding the axes outright is the obvious way and is wrong: a 45° drag of
+    /// 100 pixels each way is 141 pixels of hand movement and would be worth
+    /// 200, so the same gesture zooms half again as fast for being made
+    /// diagonally. Projecting onto the diagonal is the other obvious way and
+    /// only moves the problem — it is the same expression times a constant, so
+    /// a diagonal still outruns an axis, and it slows the horizontal drag this
+    /// gesture has always been by 30%.
+    ///
+    /// So: **the distance the hand travelled, weighted by how far the drag
+    /// leans towards "in" rather than "out"**. `(dx - dy) / (|dx| + |dy|)` is
+    /// that lean, running from +1 for a drag purely towards in to -1 for one
+    /// purely towards out and passing through 0 on the neutral diagonal, where
+    /// a drag along `(1, 1)` asks for nothing. Every drag is then worth at most
+    /// its own length, a pure right drag is worth exactly what it was worth
+    /// before this took the vertical axis in, and a diagonal is worth its own
+    /// 141 pixels rather than 200.
+    pub fn zoom_drag_factor(delta: Vec2) -> f32 {
+        let lean = delta.x.abs() + delta.y.abs();
+        // A sample that did not move has no direction to lean in, and the
+        // division below would be 0/0.
+        if lean <= f32::EPSILON {
+            return 1.0;
+        }
+        let along = delta.length() * (delta.x - delta.y) / lean;
+        ZOOM_DRAG_RATE.powf(along)
+    }
 
     /// Frame the whole document inside a region of `viewport` size.
     pub fn fit(doc_size: Vec2, viewport: Vec2) -> Self {
@@ -180,6 +221,74 @@ mod tests {
             (doc_before - doc_after).length() < 1e-3,
             "anchor drifted: {doc_before:?} -> {doc_after:?}"
         );
+    }
+
+    // --- the zoom tool's drag ----------------------------------------------
+
+    #[test]
+    fn dragging_right_or_up_zooms_in_and_the_other_way_out() {
+        // The whole of what the gesture promises, in one place: two directions
+        // in, two out, and nothing at all for a drag that has not moved.
+        assert!(Camera::zoom_drag_factor(vec2(20.0, 0.0)) > 1.0);
+        assert!(Camera::zoom_drag_factor(vec2(0.0, -20.0)) > 1.0, "up is in");
+        assert!(Camera::zoom_drag_factor(vec2(-20.0, 0.0)) < 1.0);
+        assert!(
+            Camera::zoom_drag_factor(vec2(0.0, 20.0)) < 1.0,
+            "screen y is down-positive, so down is out"
+        );
+        assert_eq!(Camera::zoom_drag_factor(Vec2::ZERO), 1.0);
+    }
+
+    #[test]
+    fn the_two_axes_are_worth_the_same() {
+        // Neither axis is the "real" one with the other bolted on.
+        let across = Camera::zoom_drag_factor(vec2(17.0, 0.0));
+        let up = Camera::zoom_drag_factor(vec2(0.0, -17.0));
+        assert!((across - up).abs() < 1e-5, "{across} vs {up}");
+    }
+
+    #[test]
+    fn a_diagonal_drag_is_worth_its_own_length_and_not_the_sum_of_its_axes() {
+        // The reason the axes are not simply added. A 45° drag of 40 pixels
+        // each way is 56 pixels of hand movement; adding would make it 80, so
+        // the same sweep would zoom half again as fast for being made
+        // diagonally.
+        let diagonal = Camera::zoom_drag_factor(vec2(40.0, -40.0));
+        let same_distance = Camera::zoom_drag_factor(vec2(40.0 * 2f32.sqrt(), 0.0));
+        assert!(
+            (diagonal - same_distance).abs() < 1e-4,
+            "{diagonal} vs {same_distance}"
+        );
+        assert!(diagonal < Camera::zoom_drag_factor(vec2(80.0, 0.0)));
+    }
+
+    #[test]
+    fn a_drag_along_the_neutral_diagonal_does_nothing() {
+        // Down-right and up-left are exactly between "in" and "out", and a
+        // gesture between two answers must not pick one.
+        assert_eq!(Camera::zoom_drag_factor(vec2(30.0, 30.0)), 1.0);
+        assert_eq!(Camera::zoom_drag_factor(vec2(-30.0, -30.0)), 1.0);
+    }
+
+    #[test]
+    fn no_drag_is_worth_more_than_the_distance_the_hand_moved() {
+        // What stops any direction from being a fast lane. The bound is the
+        // pure horizontal drag, which is what the gesture was before the
+        // vertical axis was taken in — so nothing got faster.
+        let bound = Camera::zoom_drag_factor(vec2(50.0, 0.0));
+        for step in 0..64 {
+            let angle = step as f32 * std::f32::consts::TAU / 64.0;
+            let factor = Camera::zoom_drag_factor(vec2(angle.cos(), angle.sin()) * 50.0);
+            assert!(factor <= bound + 1e-4, "{angle} gave {factor}");
+            assert!(factor >= 1.0 / bound - 1e-4, "{angle} gave {factor}");
+        }
+    }
+
+    #[test]
+    fn a_horizontal_drag_keeps_the_rate_it_has_always_had() {
+        // Pinned so the two axes cannot be combined by quietly slowing the one
+        // that was already there.
+        assert!((Camera::zoom_drag_factor(vec2(12.0, 0.0)) - 1.008f32.powf(12.0)).abs() < 1e-5);
     }
 
     // --- scrollbars --------------------------------------------------------

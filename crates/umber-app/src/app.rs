@@ -547,6 +547,35 @@ impl UmberApp {
         true
     }
 
+    /// Start or stop the brush-size drag — Alt held down with nothing else.
+    ///
+    /// **Alt with a button is the eyedropper, and this is Alt without one.**
+    /// That is the whole of how the two are told apart, and it is why this is
+    /// driven from `ModifiersChanged` while the eyedropper is driven from
+    /// `MouseInput`: a press cancels the gesture (see there), so the click that
+    /// picks a colour is never also a resize, and the resize never eats a
+    /// press. Neither can happen without the other having been decided first.
+    ///
+    /// Refused while anything else is going on. A stroke or a pan is a gesture
+    /// the pointer is already committed to, and changing the brush half way
+    /// through a stroke would not affect the dabs already stamped anyway — the
+    /// stroke paints with the brush it began with.
+    fn set_brush_resize(&mut self, wanted: bool) {
+        let start = wanted
+            && self.editor.interaction == Interaction::Idle
+            && !self.editor.stroke.is_active();
+        if start == self.editor.brush_resize.is_some() {
+            return;
+        }
+        self.editor.brush_resize = start.then_some(crate::editor::BrushResize {
+            origin: self.editor.cursor,
+            from: self.editor.brush.size,
+        });
+        // The circle appearing and — more importantly — disappearing is a frame
+        // nothing else would ask for.
+        self.request_redraw();
+    }
+
     /// Take the colour under the cursor as the painting colour.
     fn pick_colour_at_cursor(&mut self) {
         let doc = self.editor.screen_to_doc(self.editor.cursor);
@@ -1728,7 +1757,20 @@ impl ApplicationHandler<Wake> for UmberApp {
             // itself here too rather than silently doing nothing.
             WindowEvent::DroppedFile(path) => self.open_path(&path),
 
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                let was_alt = self.modifiers.alt_key();
+                self.modifiers = m.state();
+                let alt = self.modifiers.alt_key();
+                if alt != was_alt {
+                    self.set_brush_resize(alt && !ui_has_pointer);
+                }
+            }
+
+            // A modifier released while another window has the keyboard never
+            // reaches us, so Alt can be "held" for ever after an Alt-Tab. The
+            // resize gesture would then still be live — and its circle still on
+            // the canvas — when the window came back.
+            WindowEvent::Focused(false) => self.set_brush_resize(false),
 
             // Switching input language changes what every key prints, and
             // therefore what every shortcut label should say. Taking the window
@@ -1761,6 +1803,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                 let pos = Vec2::new(position.x as f32, position.y as f32);
                 self.editor.last_cursor = self.editor.cursor;
                 self.editor.cursor = pos;
+                // A mouse event, so a mouse is what is driving the pointer:
+                // the pen's dot gives way to the ordinary arrow. A pen sends
+                // none of these — see `Editor::pen_pointer`.
+                self.editor.pen_pointer = false;
 
                 match self.editor.interaction {
                     Interaction::Drawing => {
@@ -1772,16 +1818,30 @@ impl ApplicationHandler<Wake> for UmberApp {
                         self.editor.camera.pan_by_screen(delta);
                     }
                     Interaction::Zooming => {
-                        // Horizontal drag zooms about where the drag started,
-                        // which is the convention every other paint app uses.
-                        let dx = pos.x - self.editor.last_cursor.x;
-                        let factor = 1.008f32.powf(dx);
+                        // Zooms about where the drag started, which is the
+                        // convention every other paint app uses. Right and up
+                        // zoom in; how the two axes combine into one factor is
+                        // `Camera::zoom_drag_factor`'s, so it can be reasoned
+                        // about and tested without a pointer.
+                        let delta = pos - self.editor.last_cursor;
+                        let factor = umber_core::Camera::zoom_drag_factor(delta);
                         let anchor = self.editor.zoom_anchor;
                         self.editor.camera.zoom_at(anchor, factor, pivot);
                     }
-                    Interaction::Idle => {}
+                    // Nothing is held, so this is where the Alt-held resize
+                    // lives: the pointer's travel from where Alt went down is
+                    // the size, read absolutely rather than stepped per event.
+                    // Horizontal only, and right is bigger — the axis and the
+                    // direction the zoom tool's drag already uses for "more".
+                    Interaction::Idle => {
+                        if let Some(resize) = self.editor.brush_resize {
+                            self.editor.brush.size =
+                                Brush::size_after_drag(resize.from, pos.x - resize.origin.x);
+                        }
+                    }
                 }
-                if self.editor.interaction != Interaction::Idle
+                if (self.editor.interaction != Interaction::Idle
+                    || self.editor.brush_resize.is_some())
                     && let Some(g) = self.gfx.as_ref()
                 {
                     g.window.request_redraw();
@@ -1790,6 +1850,18 @@ impl ApplicationHandler<Wake> for UmberApp {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // A button is a mouse's, whatever moved the pointer last.
+                self.editor.pen_pointer = false;
+                // The other half of how the resize and the eyedropper are told
+                // apart: the resize is Alt with *nothing* down, so a press ends
+                // it, and the press itself goes on to be handled as it always
+                // was. Without this an Alt-click would pick a colour with the
+                // resize still live, so the eyedropper would leave a circle on
+                // the canvas and the next flick of the wrist would silently
+                // rescale the brush.
+                if pressed {
+                    self.set_brush_resize(false);
+                }
                 // Middle-drag and space-drag always pan, whatever tool is
                 // selected — muscle memory should not depend on the rail.
                 let pan_override = button == MouseButton::Middle
@@ -1897,6 +1969,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                     touch.phase,
                     touch.id
                 );
+                // Whatever else this event turns out to be, it came from a pen
+                // or a finger rather than a mouse — which is what the canvas
+                // draws its own cursor for.
+                self.editor.pen_pointer = true;
 
                 match touch.phase {
                     TouchPhase::Started => {
@@ -1931,15 +2007,38 @@ impl ApplicationHandler<Wake> for UmberApp {
                     TouchPhase::Moved => {
                         // An update for an id that never started is a **hover** —
                         // a pen in range but off the glass, which Windows reports
-                        // as a pointer update with no down flag. It is not a
-                        // contact and must not be recorded as one: a pen that
-                        // hovers and is then carried out of range leaves no
-                        // "up", so the entry would sit there for ever, and the
+                        // as a pointer update with no down flag. Two things are
+                        // true of it and they must not be run together:
+                        //
+                        // It is not a contact and must not be recorded as one: a
+                        // pen that hovers and is then carried out of range leaves
+                        // no "up", so the entry would sit there for ever, and the
                         // next real press — Windows gives each contact session a
                         // fresh pointer id — would look like a second finger and
                         // be taken for a pinch. A finger always starts before it
                         // moves, so nothing is lost by requiring it.
+                        //
+                        // But *where the pen is* is worth having anyway, and used
+                        // to be thrown away with the rest of the event. It is
+                        // where the pen's own dot is drawn, and where Alt reads
+                        // the brush-resize gesture's anchor from — without it
+                        // both sat wherever the mouse was last left. So the
+                        // position is taken, and nothing else is.
+                        //
+                        // `last_cursor` is deliberately left alone. It is the
+                        // previous point of a *gesture* — what the pan and zoom
+                        // drags measure against, and what a stroke's speed and
+                        // therefore its simulated pressure come from — and a
+                        // pen waved about in mid-air is none of those.
                         if !self.editor.touches.contains_key(&touch.id) {
+                            self.editor.cursor = pos;
+                            // A pen sends a few hundred of these a second, so
+                            // the frame is asked for only where the dot it
+                            // moves is actually drawn — over a panel or a menu
+                            // this would be repainting an identical picture.
+                            if self.editor.pointer_over_canvas(pos) {
+                                self.request_redraw();
+                            }
                             return;
                         }
                         self.editor.touches.insert(touch.id, pos);

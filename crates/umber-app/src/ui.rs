@@ -228,6 +228,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .show(root, |ui| {
             let rect = ui.max_rect();
             canvas_scrollbars(ui, &p, ed, rect);
+            brush_size_preview(ui, &p, ed);
+            // After the preview, so the pen sits on top of the ring rather
+            // than under it. Both are drawn when Alt is held with a pen, and
+            // deliberately: they answer different questions — the ring is a
+            // measurement anchored where the gesture began, the dot is where
+            // the nib is now, and watching the second cross the first is how
+            // the size is judged.
+            pen_cursor(ui, &p, ed);
             rect
         })
         .inner;
@@ -310,6 +318,76 @@ fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
             ed.camera.center.x += by;
         }
     }
+}
+
+/// The circle the Alt-held resize draws, showing the size the brush has been
+/// dragged to.
+///
+/// Centred on where the pointer was when Alt went down, not on the pointer:
+/// the drag *is* the size, so a ring that ran along with the hand would be
+/// something to chase rather than something to measure against — and the
+/// canvas underneath the anchor is what the artist is judging the size against.
+///
+/// **Document space scaled to the screen**, because that is what a size is:
+/// [`Brush::size`] is a diameter in document pixels, so a 50-pixel brush at
+/// 200% draws a hundred pixels across — the width of the mark it will actually
+/// leave, at any zoom.
+///
+/// A circle rather than the ellipse an elliptical brush stamps. `size` is the
+/// *long* axis and is the one number this gesture moves; the dab's own outline
+/// turns with `dab_angle`, rolls with the jitter, narrows under pressure and
+/// scatters off the line, so an ellipse here would be a picture of one dab
+/// rather than of the number under the hand.
+fn brush_size_preview(ui: &egui::Ui, p: &Palette, ed: &Editor) {
+    let Some(resize) = ed.brush_resize else {
+        return;
+    };
+    let at = ed.to_points(resize.origin);
+    // Document pixels → physical pixels is the zoom; physical → points is
+    // egui's, and the same conversion every other canvas boundary makes.
+    let radius = ed.brush.size * 0.5 * ed.camera.zoom / ed.pixels_per_point.max(1e-3);
+    let painter = ui.painter();
+    painter.circle_stroke(at, radius, Stroke::new(1.0, p.accent));
+    // The anchor the drag is measured from — and the only thing on screen at
+    // all when a one-pixel brush is being sized at a low zoom.
+    painter.circle_filled(at, 1.0, p.accent);
+}
+
+/// The pen's own pointer: a small grey dot where the nib is, instead of the
+/// arrow.
+///
+/// A pen that is being aimed at a canvas is a drawing instrument, and an arrow
+/// pointing up and to the left says nothing about where the mark will start.
+/// Only for a pen — [`Editor::pen_pointer`] is what the last pointer event was
+/// driven by, not a preference — so a mouse keeps the cursor the rest of the
+/// desktop gave it.
+///
+/// **`CursorIcon::None` rather than winit's `set_cursor_visible`**, and the
+/// difference is which way the state runs. egui's cursor is re-derived from
+/// what the interface asked for on *every* frame, so this hides the arrow only
+/// for as long as this function keeps asking: the pen goes away, the pointer
+/// crosses onto a panel, another window takes focus, a widget claims a cursor
+/// of its own — and the arrow is back with nothing having to remember to put
+/// it back. `set_cursor_visible(false)` is the opposite, a latch whose failure
+/// mode is a window with no pointer in it and no way to say so.
+///
+/// The dot is in points, which is egui's unit and already scaled — so it is
+/// the same size on the screen whatever the display's density, exactly as the
+/// panels and the type are.
+fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
+    // Over a panel, a menu or a scrollbar the ordinary cursor is the right
+    // one: those are things to point at, and a workspace whose pointer
+    // vanished at the edge of the canvas would be unusable.
+    if !ed.pen_pointer || !ed.pointer_over_canvas(ed.cursor) {
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    // `text_dim` is the palette's recessive ink, and it is the one token that
+    // is a mid-grey in *both* themes — the surfaces invert between Graphite and
+    // Paper and most of the ink with them, so anything stronger would be black
+    // on one and white on the other, over artwork that is neither.
+    ui.painter()
+        .circle_filled(ed.to_points(ed.cursor), metrics::PEN_DOT, p.text_dim);
 }
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {

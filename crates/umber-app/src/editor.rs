@@ -27,6 +27,22 @@ pub enum Interaction {
     Zooming,
 }
 
+/// A brush-size drag in progress: Alt held down with no button pressed.
+///
+/// Not an [`Interaction`], because it is not what the *pointer* is doing —
+/// nothing is held, the canvas is not being drawn on or moved, and letting go
+/// of Alt over a panel has to end it wherever the pointer happens to be. It is
+/// a modifier's state, and it lives and dies with `ModifiersChanged`.
+#[derive(Clone, Copy, Debug)]
+pub struct BrushResize {
+    /// Where the pointer was when Alt went down, in physical window pixels.
+    /// The drag is measured from here, and the preview circle is centred here.
+    pub origin: Vec2,
+    /// The size the brush had at that moment. The drag is absolute against
+    /// this, so coming back to the origin comes back to exactly this size.
+    pub from: f32,
+}
+
 /// The selected tool. Brush and eraser paint; pan and zoom navigate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -235,10 +251,30 @@ pub struct Editor {
     /// Cursor in physical window pixels.
     pub cursor: Vec2,
     pub last_cursor: Vec2,
+    /// True when a pen, rather than a mouse, is driving the pointer.
+    ///
+    /// The signal is which *kind* of event last moved it. A pen reaches winit
+    /// as `WindowEvent::Touch` — Windows delivers it through `WM_POINTER`, and
+    /// winit consumes those messages rather than letting the system promote
+    /// them to legacy mouse ones, so a pen produces no `CursorMoved` at all.
+    /// See the pressure notes in CLAUDE.md, which is the same fact read the
+    /// other way round.
+    ///
+    /// Latched, because the canvas is painted between events and has to know
+    /// what it is drawing a cursor for; and cleared by any real mouse event, so
+    /// that putting the pen down and taking hold of the mouse hands the arrow
+    /// straight back.
+    pub pen_pointer: bool,
     /// Space held — temporary pan modifier.
     pub space_down: bool,
     /// Where a zoom-tool drag started; zooming keeps this point pinned.
     pub zoom_anchor: Vec2,
+    /// The brush-size drag, while Alt is held with no button down.
+    ///
+    /// `Some` is also what draws the preview circle, so there is one thing to
+    /// look at for "is this gesture live" rather than a flag and a state that
+    /// could disagree.
+    pub brush_resize: Option<BrushResize>,
 
     /// Brush settings captured at stroke start. The user can change the colour
     /// mid-stroke via the UI; the stroke must still commit with what it began
@@ -299,8 +335,10 @@ impl Default for Editor {
             interaction: Interaction::Idle,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
+            pen_pointer: false,
             space_down: false,
             zoom_anchor: Vec2::ZERO,
+            brush_resize: None,
             stroke_style: StrokeStyle::default(),
             stroke_slot: 0,
             touches: HashMap::new(),
