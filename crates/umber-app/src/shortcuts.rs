@@ -270,6 +270,29 @@ struct Live {
     /// True while the settings page is listening for a chord. Dispatch is
     /// suspended then, or pressing B to bind it would also switch to the brush.
     capturing: bool,
+    /// True while a text field anywhere in the interface has the keyboard.
+    ///
+    /// Separate from `capturing` rather than folded into it, because the two
+    /// have different owners and would otherwise take the lever off one
+    /// another: the settings page arms and disarms capture as a field listens,
+    /// while typing is a property of the whole frame. Either one suspends
+    /// dispatch; neither can clear the other's reason.
+    typing: bool,
+}
+
+impl Live {
+    fn new(bindings: Vec<Binding>) -> Self {
+        Self {
+            bindings,
+            capturing: false,
+            typing: false,
+        }
+    }
+
+    /// Whether a key press should reach the canvas at all.
+    fn suspended(&self) -> bool {
+        self.capturing || self.typing
+    }
 }
 
 static LIVE: RwLock<Option<Live>> = RwLock::new(None);
@@ -279,12 +302,7 @@ pub fn publish(bindings: Vec<Binding>) {
     let mut live = write_live();
     match live.as_mut() {
         Some(l) => l.bindings = bindings,
-        None => {
-            *live = Some(Live {
-                bindings,
-                capturing: false,
-            })
-        }
+        None => *live = Some(Live::new(bindings)),
     }
 }
 
@@ -302,10 +320,32 @@ pub fn set_capturing(capturing: bool) {
     match live.as_mut() {
         Some(l) => l.capturing = capturing,
         None => {
-            *live = Some(Live {
-                bindings: defaults(),
-                capturing,
-            })
+            let mut fresh = Live::new(defaults());
+            fresh.capturing = capturing;
+            *live = Some(fresh);
+        }
+    }
+}
+
+/// Suspend or resume dispatch while a text field has the keyboard.
+///
+/// Key presses are read straight off the winit event, before egui is asked, so
+/// without this every name typed into a search box or a rename field also drives
+/// the tool shortcuts — "brush" would select the brush, then the eraser, and a
+/// couple more on the way to the end of the word.
+///
+/// Called from one place, `ui::draw`, for the whole interface rather than per
+/// field: a module that pulls the lever for its own fields only ever covers the
+/// fields it knows about, and the settings dialog's search box was exactly the
+/// one nobody had.
+pub fn set_typing(typing: bool) {
+    let mut live = write_live();
+    match live.as_mut() {
+        Some(l) => l.typing = typing,
+        None => {
+            let mut fresh = Live::new(defaults());
+            fresh.typing = typing;
+            *live = Some(fresh);
         }
     }
 }
@@ -318,7 +358,7 @@ pub fn set_capturing(capturing: bool) {
 /// (and cannot) keep its snapshot current.
 pub fn resolve(fallback: &[Binding], key: KeyCode, mods: ModifiersState) -> Option<Action> {
     match read_live().as_ref() {
-        Some(l) if l.capturing => None,
+        Some(l) if l.suspended() => None,
         Some(l) => resolve_in(&l.bindings, key, mods),
         None => resolve_in(fallback, key, mods),
     }
@@ -452,6 +492,34 @@ pub fn is_default(bindings: &[Binding], action: Action) -> bool {
     let mine: Vec<Chord> = chords_for(bindings, action);
     let theirs: Vec<Chord> = chords_for(&defaults(), action);
     mine == theirs
+}
+
+/// `Brush (B)` — a label with the chord that runs it, as the live table has it.
+///
+/// The tool rail and the colour wells used to spell their own keys out, which
+/// made them a second copy of the binding table: rebind the brush and the
+/// tooltip carried on naming `B`. This reads the table that is actually
+/// dispatching, so a tooltip cannot say something the keyboard will not do, and
+/// an action the user has unbound simply loses its bracket.
+pub fn labelled(name: &str, action: Action) -> String {
+    match first_chord(action) {
+        Some(chord) => format!("{name} ({chord})"),
+        None => name.to_owned(),
+    }
+}
+
+/// The first chord bound to `action` in the live table, ready to show.
+pub fn first_chord(action: Action) -> Option<String> {
+    let first = |bindings: &[Binding]| {
+        bindings
+            .iter()
+            .find(|b| b.action == action)
+            .map(|b| b.chord().display())
+    };
+    match read_live().as_ref() {
+        Some(l) => first(&l.bindings),
+        None => first(&defaults()),
+    }
 }
 
 /// Every chord bound to `action`, in table order.
@@ -1002,6 +1070,39 @@ mod tests {
         assert!(is_default(&b, Action::BrushTool));
         bind(&mut b, Action::BrushTool, None, Q);
         assert!(!is_default(&b, Action::BrushTool));
+    }
+
+    // --- suspension --------------------------------------------------------
+
+    /// Both levers, exercised through the process-global table.
+    ///
+    /// Deliberately the *only* test in this file that touches `LIVE`. Every
+    /// other one goes through `resolve_in`, so nothing here can race with them;
+    /// a second global test could, and the failure would be a mystery.
+    #[test]
+    fn either_lever_suspends_dispatch_and_neither_clears_the_other() {
+        publish(defaults());
+        assert_eq!(
+            resolve(&[], KeyCode::KeyB, NONE),
+            Some(Action::BrushTool),
+            "nothing is suspended yet"
+        );
+
+        // A field listening for a chord: pressing B to bind it must not also
+        // select the brush.
+        set_capturing(true);
+        assert_eq!(resolve(&[], KeyCode::KeyB, NONE), None);
+
+        // A text field takes the keyboard while that field is still listening.
+        // Whichever finishes first must not hand dispatch back to the canvas
+        // while the other is still going — this is what a single shared flag
+        // got wrong.
+        set_typing(true);
+        set_capturing(false);
+        assert_eq!(resolve(&[], KeyCode::KeyB, NONE), None, "still typing");
+
+        set_typing(false);
+        assert_eq!(resolve(&[], KeyCode::KeyB, NONE), Some(Action::BrushTool));
     }
 
     #[test]

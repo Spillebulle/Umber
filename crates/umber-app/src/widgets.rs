@@ -11,6 +11,16 @@ use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos
 use std::ops::RangeInclusive;
 use umber_core::ResponseCurve;
 
+/// Narrowest anything here will draw itself.
+///
+/// A docked panel can be dragged down to a width that leaves a slider or a
+/// picker no room at all, and `available_width` then comes back at or below
+/// zero. An `egui::Rect` built from a negative size has its max to the left of
+/// its min, which does not panic — it paints somewhere unrelated, or fills the
+/// whole panel. Clamping here means a squeezed control is merely useless rather
+/// than wrong.
+const MIN_TRACK: f32 = 8.0;
+
 /// Label on the left, monospace readout on the right, thin rail beneath.
 ///
 /// Returns true when the value changed. `log` maps the rail logarithmically,
@@ -27,30 +37,15 @@ pub fn slider_row(
 ) -> bool {
     let (lo, hi) = (*range.start(), *range.end());
     let log = log && lo > 0.0 && hi > lo;
-
-    let to_t = |v: f32| {
-        let v = v.clamp(lo, hi);
-        if log {
-            (v.ln() - lo.ln()) / (hi.ln() - lo.ln())
-        } else {
-            (v - lo) / (hi - lo)
-        }
-    };
-    let from_t = |t: f32| {
-        let t = t.clamp(0.0, 1.0);
-        if log {
-            (lo.ln() + t * (hi.ln() - lo.ln())).exp()
-        } else {
-            lo + t * (hi - lo)
-        }
-    };
-
     let mut changed = false;
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
 
-        let width = ui.available_width();
+        // A panel squeezed to its minimum can leave nothing here at all, and a
+        // negative width makes a `Rect` whose max is left of its min — which
+        // paints as a stray mark somewhere it was never asked to.
+        let width = ui.available_width().max(MIN_TRACK);
 
         // Header: name and current value on one baseline.
         let (header, _) = ui.allocate_exact_size(vec2(width, text::SMALL + 2.0), Sense::hover());
@@ -76,30 +71,20 @@ pub fn slider_row(
             ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
         let track = Rect::from_center_size(
             row.center(),
-            vec2(row.width() - metrics::SLIDER_KNOB, metrics::SLIDER_RAIL),
+            vec2(
+                (row.width() - metrics::SLIDER_KNOB).max(MIN_TRACK),
+                metrics::SLIDER_RAIL,
+            ),
         );
 
-        if (response.dragged() || response.clicked())
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
-            let next = from_t(t);
-            if next != *value {
-                *value = next;
-                changed = true;
-            }
-        }
-
-        let t = to_t(*value);
-        let painter = ui.painter();
-        let radius = metrics::SLIDER_RAIL * 0.5;
-        painter.rect_filled(track, radius, p.rail);
-        if t > 0.0 {
-            let filled = Rect::from_min_size(track.min, vec2(track.width() * t, track.height()));
-            painter.rect_filled(filled, radius, p.accent);
-        }
-        let knob = pos2(track.left() + track.width() * t, track.center().y);
-        painter.circle_filled(knob, metrics::SLIDER_KNOB * 0.5, p.knob);
+        changed = drag_track(&response, track, value, lo, hi, log);
+        paint_track(
+            ui.painter(),
+            p,
+            track,
+            to_t(*value, lo, hi, log),
+            metrics::SLIDER_KNOB,
+        );
     });
 
     changed
@@ -136,11 +121,16 @@ pub fn segmented<T: PartialEq + Copy>(
     }
     let mut changed = false;
 
-    let width = ui.available_width();
+    let width = ui.available_width().max(MIN_TRACK);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
     ui.painter().rect_filled(rect, metrics::RADIUS, p.window);
 
-    let inner = rect.shrink(2.0);
+    // `shrink` on a rect narrower than its own inset inverts it, so the inner
+    // well is built from the clamped width rather than taken off the outside.
+    let inner = Rect::from_center_size(
+        rect.center(),
+        vec2((rect.width() - 4.0).max(MIN_TRACK), rect.height() - 4.0),
+    );
     let cell_w = inner.width() / options.len() as f32;
 
     for (i, (value, label)) in options.iter().enumerate() {
@@ -273,7 +263,7 @@ pub fn inline_slider(
 /// A rail with no label or readout, for rows that supply their own.
 pub fn bare_slider(ui: &mut Ui, p: &Palette, value: &mut f32, range: RangeInclusive<f32>) -> bool {
     let (lo, hi) = (*range.start(), *range.end());
-    let width = (ui.available_width() - 30.0).max(24.0);
+    let width = (ui.available_width() - 30.0).max(MIN_TRACK * 3.0);
     let (row, response) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
     let track = Rect::from_center_size(row.center(), vec2(row.width(), 3.0));
     let changed = drag_track(&response, track, value, lo, hi, false);
@@ -282,7 +272,11 @@ pub fn bare_slider(ui: &mut Ui, p: &Palette, value: &mut f32, range: RangeInclus
 }
 
 /// A read-only bordered pill showing a name and its value.
-pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
+///
+/// `tooltip` is not optional on purpose: the design draws these with a chevron,
+/// as menus, and a pill that looks like a control has to say why it is not one
+/// and where the real one is.
+pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str, tooltip: &str) {
     let padding = 9.0;
     let font = FontId::proportional(text::SMALL);
     let text_w = ui
@@ -290,7 +284,8 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
         .layout_no_wrap(format!("{label}  {value}"), font.clone(), p.text)
         .size()
         .x;
-    let (rect, _) = ui.allocate_exact_size(vec2(text_w + padding * 2.0, 22.0), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(text_w + padding * 2.0, 22.0), Sense::hover());
 
     let painter = ui.painter();
     painter.rect_filled(rect, metrics::RADIUS, p.window);
@@ -314,6 +309,8 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
         font,
         p.text,
     );
+
+    response.on_hover_text(tooltip);
 }
 
 /// What one brush row shows.
@@ -471,10 +468,18 @@ pub struct LayerRowResponse {
 }
 
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
+///
+/// `slot` identifies the layer for the eye's own hit target. The layer's *name*
+/// looks like the obvious key and is not one: names Umber generates are unique,
+/// but an imported ORA or PSD routinely carries two layers called the same
+/// thing, and two widgets sharing an id is an egui id clash — one of the two
+/// eyes then stops answering. A slot is unique by construction and never
+/// changes hands while a layer exists.
 pub fn layer_row(
     ui: &mut Ui,
     p: &Palette,
     name: &str,
+    slot: u32,
     visible: bool,
     active: bool,
     blend: &str,
@@ -497,7 +502,7 @@ pub fn layer_row(
     // The eye is its own hit target inside the row, so toggling visibility
     // does not also change the selection.
     let eye = Rect::from_min_size(rect.left_top() + vec2(5.0, 6.0), vec2(18.0, 18.0));
-    let eye_response = ui.interact(eye, ui.id().with(("eye", name)), Sense::click());
+    let eye_response = ui.interact(eye, ui.id().with(("eye", slot)), Sense::click());
 
     icons::draw(
         ui.painter(),
@@ -555,6 +560,7 @@ pub fn layer_row(
 /// values.
 pub fn curve_editor(ui: &mut Ui, p: &Palette, curve: &mut ResponseCurve, size: f32) -> bool {
     let mut changed = false;
+    let size = size.max(MIN_TRACK * 2.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
 
     let at = |i: usize, v: f32| {
@@ -619,7 +625,7 @@ pub fn curve_editor(ui: &mut Ui, p: &Palette, curve: &mut ResponseCurve, size: f
     changed
 }
 
-/// A 36×36 icon button for the tool rail.
+/// The design's tool-rail button: [`metrics::TOOL_BUTTON`] square.
 ///
 /// Icons are painted rather than loaded: the design specifies them as a handful
 /// of SVG primitives, and drawing those directly avoids shipping an image

@@ -256,11 +256,25 @@ pub mod text {
 /// Fixed sizes taken straight from the design.
 pub mod metrics {
     pub const MENU_BAR: f32 = 34.0;
+    /// The document tab strip, between the menu bar and the tool options.
+    pub const TAB_STRIP: f32 = 30.0;
+    /// A tab within that strip. Shorter than the strip because the design sits
+    /// the tabs on its bottom border rather than filling it.
+    pub const TAB: f32 = 24.0;
     pub const OPTIONS_STRIP: f32 = 36.0;
+    /// The layout-edit strip, which replaces nothing and is only there while
+    /// the mode is on.
+    pub const EDIT_BAR: f32 = 32.0;
     pub const STATUS_BAR: f32 = 26.0;
+    /// Horizontal padding inside the chrome strips above — the design's
+    /// `padding: 0 12px`.
+    pub const STRIP_PAD: i8 = 12;
     pub const TOOL_RAIL: f32 = 76.0;
     pub const TOOL_BUTTON: f32 = 32.0;
     pub const PANEL: f32 = 264.0;
+    /// A docked panel's header: the design's 8 px padding around an 11 px line,
+    /// and the strip the whole panel is dragged by.
+    pub const PANEL_HEADER: f32 = 32.0;
     /// Horizontal padding inside a docked panel.
     pub const PANEL_PAD: i8 = 12;
     pub const RADIUS: f32 = 5.0;

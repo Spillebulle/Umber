@@ -6,7 +6,7 @@ use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
 use crate::tabs::{self, Notice};
-use crate::theme::{self, ThemeKind};
+use crate::theme::{self, Accent, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::collections::HashMap;
@@ -76,7 +76,12 @@ pub struct UmberApp {
     last_frame: Option<std::time::Instant>,
     /// Theme currently pushed into egui's style, so restyling only happens on
     /// an actual change.
-    applied_theme: Option<ThemeKind>,
+    ///
+    /// The accent is part of the key, not just the theme: it re-hues the
+    /// palette, and egui's own tokens — selection fill, hyperlink colour —
+    /// carry it too. Keyed on the theme alone, picking a new accent left those
+    /// on the old hue until something else happened to trigger a restyle.
+    applied_theme: Option<(ThemeKind, Accent)>,
     bindings: Vec<shortcuts::Binding>,
 }
 
@@ -448,12 +453,13 @@ impl UmberApp {
 
         // Restyling walks the whole style struct, so only do it when the theme
         // actually changed rather than every frame.
-        if self.applied_theme != Some(self.editor.ui.theme) {
+        let wanted = (self.editor.ui.theme, self.editor.ui.accent);
+        if self.applied_theme != Some(wanted) {
             theme::apply(
                 &gfx.egui_ctx,
-                &theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent),
+                &theme::Palette::with_accent(wanted.0, wanted.1),
             );
-            self.applied_theme = Some(self.editor.ui.theme);
+            self.applied_theme = Some(wanted);
         }
 
         // --- UI ---

@@ -41,6 +41,15 @@ pub enum WheelShape {
 const RING_SEGMENTS: usize = 96;
 const RING_THICKNESS: f32 = 20.0;
 
+/// Smallest picker that is still a picker.
+///
+/// A docked panel can be dragged narrow enough that `available_width` reaches
+/// zero, and every shape here is built from it. A ring whose inner radius went
+/// negative drew a mesh turned inside out across the whole panel; a square with
+/// a negative side is an `egui::Rect` with its max left of its min. Below this
+/// the picker is drawn small and useless, which is honest, rather than wrong.
+const MIN_PICKER: f32 = 48.0;
+
 fn hue_colour(h: f32) -> Color32 {
     let [r, g, b, _] = Hsv::new(h, 1.0, 1.0).to_color(1.0).to_srgb_u8();
     Color32::from_rgb(r, g, b)
@@ -69,12 +78,15 @@ pub fn show(
 fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> bool {
     let mut changed = false;
 
-    let size = ui.available_width().min(176.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), size), Sense::hover());
+    let size = ui.available_width().clamp(MIN_PICKER, 176.0);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width().max(size), size), Sense::hover());
     let area = Rect::from_center_size(rect.center(), vec2(size, size));
     let centre = area.center();
     let outer = size * 0.5;
-    let inner = outer - RING_THICKNESS;
+    // The ring is a fixed thickness, so a small enough wheel would have its
+    // inner edge outside its outer one. Keep a hub for the triangle instead.
+    let inner = (outer - RING_THICKNESS).max(outer * 0.25);
 
     // --- hue ring ---
     let ring_response = ui.interact(area, ui.id().with("hue-ring"), Sense::click_and_drag());
@@ -118,21 +130,21 @@ fn wheel(ui: &mut Ui, p: &Palette, shape: &mut WheelShape, hsv: &mut Hsv) -> boo
     }
     painter.add(Shape::mesh(mesh));
 
-    // Hue marker.
+    // Hue marker, on the middle of the ring wherever the ring ended up.
     let ha = hsv.h.to_radians();
-    let marker = centre + vec2(ha.cos(), ha.sin()) * (inner + RING_THICKNESS * 0.5);
+    let marker = centre + vec2(ha.cos(), ha.sin()) * (inner + outer) * 0.5;
     painter.circle_stroke(marker, 6.0, Stroke::new(2.0, Color32::WHITE));
 
     // --- saturation / value shape ---
     match shape {
         WheelShape::Square => {
             // Largest square that fits inside the ring.
-            let half = inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0;
+            let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
             let sv = Rect::from_center_size(centre, vec2(half * 2.0, half * 2.0));
             changed |= sv_square(ui, sv, hsv, "wheel-sv");
         }
         WheelShape::Triangle => {
-            changed |= sv_triangle(ui, centre, inner - 3.0, hsv);
+            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), hsv);
         }
     }
 
@@ -247,7 +259,7 @@ fn clamp_barycentric(a: f32, b: f32, c: f32) -> (f32, f32, f32) {
 /// Saturation/value square with a hue bar beneath.
 fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     let mut changed = false;
-    let width = ui.available_width();
+    let width = ui.available_width().max(MIN_PICKER);
 
     let (rect, _) = ui.allocate_exact_size(vec2(width, 130.0), Sense::hover());
     changed |= sv_square(ui, rect, hsv, "square-sv");
@@ -367,7 +379,7 @@ fn sliders(ui: &mut Ui, p: &Palette, hsv: &mut Hsv) -> bool {
             );
 
             let value_w = 30.0;
-            let width = (ui.available_width() - value_w - 8.0).max(20.0);
+            let width = (ui.available_width() - value_w - 8.0).max(MIN_PICKER * 0.5);
             let (bar, response) =
                 ui.allocate_exact_size(vec2(width, 12.0), Sense::click_and_drag());
 

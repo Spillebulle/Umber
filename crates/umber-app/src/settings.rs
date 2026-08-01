@@ -287,8 +287,15 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette) {
     ui.add_space(16.0);
     controls::section(ui, p, "Start-up");
     controls::row(ui, p, "Show the splash screen", |ui| {
-        let _ = controls::text_button(ui, p, "Not built", false, false)
-            .on_hover_text("Umber opens straight into the workspace; there is no splash to skip.");
+        // There *is* a splash, so the old wording here — "there is no splash to
+        // skip" — was untrue. It is a progress overlay painted from the CPU
+        // while the graphics driver starts, which is the only thing on screen
+        // at that point; switching it off would leave an empty window instead.
+        let _ = controls::text_button(ui, p, "Always", false, false).on_hover_text(
+            "The splash is the start-up progress overlay, and it is only up while \
+             the GPU is being set up. Turning it off would leave a blank window \
+             for exactly as long, so there is nothing to switch.",
+        );
     });
 }
 
@@ -666,8 +673,9 @@ fn accent_choice(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             } else if response.hovered() {
                 painter.circle_stroke(rect.center(), 10.0, Stroke::new(1.0, p.text_dim));
             }
-            if response.clicked() {
+            if response.clicked() && ed.ui.accent != accent {
                 ed.ui.accent = accent;
+                prefs::mark_dirty();
             }
             let _ = response.on_hover_text(accent.label());
         }

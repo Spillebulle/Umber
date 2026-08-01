@@ -23,6 +23,7 @@
 //! "does this index count the panel I am holding?" case to get wrong, and the
 //! drop indicator cannot disagree with the result.
 
+use crate::theme::metrics;
 use egui::{Pos2, Rect, Vec2, pos2, vec2};
 use std::path::PathBuf;
 
@@ -46,9 +47,6 @@ pub mod limits {
     /// is the only way to move it, so the header must never be unreachable.
     pub const FLOAT_KEEP_VISIBLE: f32 = 96.0;
 }
-
-/// Height of a panel's header strip — the bar you drag it by.
-pub const HEADER: f32 = 24.0;
 
 /// A module that can be docked, floated or closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -328,7 +326,7 @@ impl Default for Layout {
                     .collect(),
             ],
             floating: Vec::new(),
-            widths: [crate::theme::metrics::PANEL, crate::theme::metrics::PANEL],
+            widths: [metrics::PANEL, metrics::PANEL],
             rail_side: Side::Left,
             drag: None,
             edit_mode: false,
@@ -421,7 +419,20 @@ impl Layout {
     // --- geometry ----------------------------------------------------------
 
     /// Lay the whole thing out inside `workspace`.
+    ///
+    /// Every rect this returns is non-negative in both directions, however
+    /// small the window is. That is not fussiness: an `egui::Rect` whose max is
+    /// left of its min reports a negative width, and everything downstream —
+    /// drop zones, panel bodies, the canvas the camera pivot comes from — is
+    /// derived from these by subtraction, so one inverted rect here turns into
+    /// widgets painted somewhere they were never asked for.
     pub fn geometry(&self, workspace: Rect, rail_width: f32) -> Geometry {
+        // The strips above and below claim their height first, so on a window
+        // shorter than the sum of them what arrives here is already inverted.
+        let workspace = Rect::from_min_size(workspace.min, workspace.size().max(Vec2::ZERO));
+        // A window narrower than the rail itself. The rail wins — it is the one
+        // piece of chrome with no way to hide it — and the canvas gets nothing.
+        let rail_width = rail_width.clamp(0.0, workspace.width());
         let mut canvas = workspace;
         let rail = match self.rail_side {
             Side::Left => {
@@ -450,10 +461,12 @@ impl Layout {
             if stack.is_empty() {
                 continue;
             }
-            // Never let the two sidebars eat the canvas entirely.
+            // Never let the two sidebars eat the canvas entirely. `canvas` is
+            // already non-negative, so this cannot come out below zero and the
+            // sidebar cannot claim more than there is.
             let width = self.widths[side.index()]
                 .min((canvas.width() - limits::SIDEBAR_MIN_WIDTH).max(0.0))
-                .max(0.0)
+                .clamp(0.0, canvas.width())
                 .round();
             let rect = match side {
                 Side::Left => {
@@ -520,7 +533,7 @@ impl Layout {
             // edge, since it is the only handle the panel has.
             let y = f.rect.top().clamp(
                 workspace.top(),
-                (workspace.bottom() - HEADER).max(workspace.top()),
+                (workspace.bottom() - metrics::PANEL_HEADER).max(workspace.top()),
             );
             let next = Rect::from_min_size(pos2(x, y), size);
             if next != f.rect {
@@ -806,7 +819,7 @@ impl Layout {
         let mut layout = Self {
             sides: [Vec::new(), Vec::new()],
             floating: Vec::new(),
-            widths: [crate::theme::metrics::PANEL, crate::theme::metrics::PANEL],
+            widths: [metrics::PANEL, metrics::PANEL],
             rail_side: Side::Left,
             drag: None,
             edit_mode: false,
@@ -1060,6 +1073,42 @@ mod tests {
         assert_eq!(geo.slots[Side::Right.index()].len(), 3);
     }
 
+    /// Every rect the layout hands out has to survive a window dragged down to
+    /// nothing. A `Rect` with its max left of its min does not panic — it draws
+    /// in the wrong place, or fills the panel it was meant to sit inside — so
+    /// this is the kind of bug that only shows up as "the interface looked odd
+    /// for a moment while I resized".
+    #[test]
+    fn a_window_too_small_for_the_chrome_still_produces_sane_rects() {
+        let layout = Layout::default();
+        for (w, h) in [
+            (0.0, 0.0),
+            (10.0, 400.0),
+            (76.0, 400.0),
+            (200.0, 5.0),
+            (240.0, 240.0),
+            // Shorter than the strips: what reaches `geometry` is inverted.
+            (900.0, -60.0),
+        ] {
+            let geo = layout.geometry(rect(0.0, 70.0, w, h), 76.0);
+            let mut all = vec![geo.workspace, geo.rail, geo.canvas];
+            all.extend(geo.sidebar.iter().flatten().copied());
+            all.extend(geo.slots.iter().flatten().copied());
+            all.push(geo.drop_zone(Side::Left));
+            all.push(geo.drop_zone(Side::Right));
+            for r in all {
+                assert!(
+                    r.width() >= 0.0 && r.height() >= 0.0,
+                    "{w}×{h} produced {r:?}",
+                );
+            }
+            // And a drop still resolves to something rather than panicking on
+            // the way through the empty slot list.
+            let _ = geo.drop_target(pos2(0.0, 0.0));
+            let _ = geo.insertion_line(Side::Right, 0);
+        }
+    }
+
     #[test]
     fn floating_panels_do_not_shrink_the_canvas() {
         // The camera pivot comes from the canvas region, so a panel that hovers
@@ -1258,7 +1307,7 @@ mod tests {
                     nonsense here\n";
         let layout = Layout::from_config(text).expect("still loads");
         assert_eq!(layout.rail_side(), Side::Left, "bad side falls back");
-        assert_eq!(layout.width(Side::Right), crate::theme::metrics::PANEL);
+        assert_eq!(layout.width(Side::Right), metrics::PANEL);
         assert_eq!(
             layout.docked(Side::Right).len(),
             1,
@@ -1284,7 +1333,7 @@ mod tests {
 
         let r = layout.floating()[0].rect;
         assert!(r.left() <= workspace.right() - limits::FLOAT_KEEP_VISIBLE);
-        assert!(r.top() <= workspace.bottom() - HEADER);
+        assert!(r.top() <= workspace.bottom() - metrics::PANEL_HEADER);
         assert!(r.top() >= workspace.top());
     }
 
