@@ -181,27 +181,30 @@ jobs:
           name: x86_64-unknown-linux-gnu
           path: dist
 
-      # The builder comes from Flathub rather than from apt.
+      # flatpak-builder from apt, on the runner whose version is new enough.
       #
-      # A distribution's flatpak-builder ages independently of the runtime it
-      # is asked to build against, and the two fall out of step: Ubuntu
-      # 22.04's 1.2 only knows how to run `appstream-compose`, which the 24.08
-      # SDK no longer ships — it has `appstreamcli` instead — so the build died
-      # at `execvp appstream-compose: No such file or directory`. Ubuntu
-      # 24.04's 1.4.2 does know `appstreamcli compose`, so a runner bump would
-      # have worked today and broken again at the next runtime.
+      # Two ways to get this wrong, both of which this job has now made:
       #
-      # `org.flatpak.Builder` is Flathub's own packaging of the builder and
-      # carries the tooling it needs, so this stops being a question about
-      # whichever runner image is current.
+      #   - Ubuntu 22.04 ships flatpak-builder 1.2, which only knows how to run
+      #     `appstream-compose`. The 24.08 SDK dropped that tool for
+      #     `appstreamcli`, so the build died at `execvp appstream-compose: No
+      #     such file or directory`. 24.04 ships 1.4.2, and `strings` on that
+      #     binary shows `Running appstreamcli compose` — it picks whichever
+      #     the SDK actually has.
+      #   - Reaching for `org.flatpak.Builder` instead. It runs the builder
+      #     inside a sandbox of its own, and `--user` then means *that*
+      #     sandbox's installation rather than the host's, so a runtime
+      #     installed here is invisible to it: `Unable to find sdk
+      #     org.freedesktop.Sdk version 24.08`, with the install log showing it
+      #     had just been installed.
       - name: Install flatpak
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak-builder --version
           flatpak remote-add --if-not-exists --user \
             flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y --noninteractive flathub \
-            org.flatpak.Builder \
             org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
 
       - name: Build
@@ -213,9 +216,8 @@ jobs:
             packaging/linux/umber-linux.tar.gz
           mkdir -p out
           cd packaging/linux
-          flatpak run org.flatpak.Builder --user --disable-rofiles-fuse \
-            --force-clean --repo=repo build-dir \
-            io.github.spillebulle.umber.yml
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --repo=repo build-dir io.github.spillebulle.umber.yml
           flatpak build-bundle repo \
             "../../out/umber-${version}-x86_64.flatpak" \
             io.github.spillebulle.umber \

@@ -12,6 +12,13 @@
   <name>Umber</name>
   <summary>GPU-accelerated painting application built for latency</summary>
 
+  <!-- AppStream 1.0 reads this element; `developer_name` is the older spelling
+       and is kept beside it so both generations of tooling find an author. -->
+  <developer id="io.github.spillebulle">
+    <name>Umber contributors</name>
+  </developer>
+  <developer_name>Umber contributors</developer_name>
+
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
