@@ -319,10 +319,10 @@ fn size_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
     caption(ui, p, "Canvas size");
     ui.add_space(6.0);
 
-    if number_row(ui, p, "Width", &mut form.width, "px") && form.lock {
+    if number_row(ui, p, "Width", &mut form.width, "px", edges()) && form.lock {
         form.height = locked_height(form.width, form.ratio);
     }
-    if number_row(ui, p, "Height", &mut form.height, "px") && form.lock {
+    if number_row(ui, p, "Height", &mut form.height, "px", edges()) && form.lock {
         form.width = locked_width(form.height, form.ratio);
     }
 
@@ -375,7 +375,14 @@ fn size_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
 fn resolution(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
     caption(ui, p, "Resolution");
     ui.add_space(6.0);
-    number_row(ui, p, "Pixels per inch", &mut form.dpi, "dpi");
+    number_row(
+        ui,
+        p,
+        "Pixels per inch",
+        &mut form.dpi,
+        "dpi",
+        Document::MIN_DPI as u32..=Document::MAX_DPI as u32,
+    );
 }
 
 fn background_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
@@ -494,10 +501,18 @@ fn anchor_grid(ui: &mut Ui, p: &Palette, anchor: &mut Anchor) -> bool {
 ///
 /// `egui::DragValue` rather than something painted in `widgets.rs`: the design
 /// has no numeric field, and a canvas size is one of the few values in this
-/// application that people type exactly rather than feel for on a rail. It
-/// clamps to a canvas that can be allocated, so the field cannot ask for one
-/// nothing could hold.
-fn number_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut u32, suffix: &str) -> bool {
+/// application that people type exactly rather than feel for on a rail.
+///
+/// The range is the caller's, and it is what stops a field asking for a canvas
+/// nothing could allocate or a resolution the physical readout would divide by.
+fn number_row(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    value: &mut u32,
+    suffix: &str,
+    range: std::ops::RangeInclusive<u32>,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(
@@ -506,11 +521,6 @@ fn number_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut u32, suffix: &s
                 .color(p.text_dim),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let range = if suffix == "dpi" {
-                Document::MIN_DPI as u32..=Document::MAX_DPI as u32
-            } else {
-                1..=Document::MAX_EDGE
-            };
             changed = ui
                 .add(
                     egui::DragValue::new(value)
@@ -522,6 +532,11 @@ fn number_row(ui: &mut Ui, p: &Palette, label: &str, value: &mut u32, suffix: &s
         });
     });
     changed
+}
+
+/// Every canvas edge a field will accept.
+fn edges() -> std::ops::RangeInclusive<u32> {
+    1..=Document::MAX_EDGE
 }
 
 #[cfg(test)]
