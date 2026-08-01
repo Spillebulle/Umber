@@ -21,15 +21,34 @@
 //! - **It lost something on the way in.** `Imported::dropped` names it, per
 //!   brush, and a non-empty list is a refusal. That is the same check
 //!   `mypaint::unsupported_features` used to be, generalised to every format.
-//! - **It needs a bitmap tip.** The shipped library is a single embedded RON
-//!   and there is nowhere in it for a mask — `BrushPreset::tip` resolves
-//!   against the *user's* library only. Shipping stamps needs a generated
-//!   `assets/tips/` and an `include_bytes!` table beside this file, and the
-//!   measurement that decides which stamps reproduce faithfully under a
-//!   `max`-coverage stroke. See `docs/brush-sources.md`, which has the numbers.
+//! - **Its pack's masks may not be redistributed.** See below.
 //!
 //! The counts for both are printed on every run, because they are the honest
 //! answer to "why is my favourite brush not in here".
+//!
+//! # Bitmap tips ship now
+//!
+//! This used to refuse every brush with a mask, because the shipped library is
+//! a single embedded RON and there is nowhere in a text file for a bitmap. The
+//! mask goes beside it instead: written to `crates/umber-core/assets/tips/` and
+//! named from `BrushPreset::tip`, which resolves against `tip::builtin` before
+//! the user's library. Masks are **deduplicated by content**, so two brushes
+//! cut from one stamp share a file and a single GPU upload — which is the whole
+//! reason the field holds a name rather than a picture.
+//!
+//! The engine had to be able to paint them first, and now can: a tip keeps its
+//! own proportions, turns with the stroke or rolls per dab, and builds up when
+//! it is too faint for a `max` to reach the mark its author drew. Each of those
+//! is measured or tested rather than assumed — `docs/brushes.md` says where.
+//!
+//! # Shipping a mask is redistributing artwork
+//!
+//! Shipping a brush's *settings* is a description of somebody's work. Shipping
+//! its *mask* is the work itself, inside the binary and inside this repository,
+//! so it needs the licence rule at the top of `docs/brush-sources.md` to be met
+//! in full: **verified from the download's own files**. [`Pack::ship_tips`] is
+//! that decision, per pack, and it is not the same question as whether the pack
+//! may be converted at all.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -38,6 +57,11 @@ use std::path::{Path, PathBuf};
 use umber_core::brushimport::{self, Imported};
 use umber_core::preset::{self, BrushPreset, Credit};
 use umber_core::style;
+use umber_core::tip::TipMask;
+
+#[path = "common/table.rs"]
+mod table;
+use table::write_table;
 
 /// Where each pack lives after a fetch, and what to say about it.
 struct Pack {
@@ -55,6 +79,17 @@ struct Pack {
     /// which reads the brush, not the folder it arrived in.
     authors: &'static [(&'static str, &'static str)],
     fallback_author: &'static str,
+    /// Whether this pack's **masks** may be embedded in the binary.
+    ///
+    /// A separate decision from whether the pack is converted at all, and a
+    /// stricter one. Converting a `.gbr` into settings on a machine is a local
+    /// act; shipping the bitmap is redistributing the artwork, in every release
+    /// on every platform, so it needs a licence verified from inside the
+    /// download — the rule at the top of `docs/brush-sources.md`. A pack that
+    /// says `false` still converts, still imports, and still has every one of
+    /// its stamps available through **Import brushes…**; what it does not do is
+    /// travel inside Umber.
+    ship_tips: bool,
 }
 
 /// Every row here must have a matching entry in `tools/fetch-brushes.ps1` and
@@ -78,6 +113,8 @@ const PACKS: &[Pack] = &[
             ("Dieterle", "Brien Dieterle"),
         ],
         fallback_author: "MyPaint Development Team",
+        // A `.myb` is always a round dab, so there is no mask here either way.
+        ship_tips: true,
     },
     Pack {
         dir: "deevad",
@@ -86,6 +123,9 @@ const PACKS: &[Pack] = &[
         source: "https://www.davidrevoy.com/article1060/krita-brushes-2025-01-bundle",
         authors: &[],
         fallback_author: "David Revoy (Deevad)",
+        // CC0 stated in the bundle's own `meta.xml`, which is a licence
+        // statement inside the download.
+        ship_tips: true,
     },
     Pack {
         dir: "raghukamath",
@@ -94,6 +134,9 @@ const PACKS: &[Pack] = &[
         source: "https://gitlab.com/raghukamath/krita-brush-presets",
         authors: &[],
         fallback_author: "Raghavendra Kamath",
+        // CC0 stated in the repository's `LICENSE` and `README.md`, both of
+        // which are in any archive of it.
+        ship_tips: true,
     },
     // CC-BY rather than CC0, which is why the credit matters here in a way it
     // does not for the others: `every_shipped_preset_is_usable_and_attributed`
@@ -105,12 +148,16 @@ const PACKS: &[Pack] = &[
         source: "https://github.com/GDQuest/krita-free-brushes",
         authors: &[],
         fallback_author: "GDquest (Nathan Lovato)",
+        // CC-BY-4.0 stated in the repository's `README.md`. Attribution is a
+        // condition rather than an obstacle: every preset carries a `Credit`
+        // and the browser prints it on the row, which is what CC-BY asks for
+        // and what `every_shipped_preset_is_usable_and_attributed` enforces.
+        ship_tips: true,
     },
-    // Every brush in this one is a bitmap stamp, so every one of them is
-    // refused below with "needs a bitmap tip". It is listed anyway, and
-    // deliberately: the run then *prints* that 269 brushes were fetched and
-    // none could ship, which is a far better record than the pack silently not
-    // being here. It is importable today through Import brushes…
+    // Every brush in this one is a bitmap stamp and none of them ships, so the
+    // run prints that 269 were fetched and 269 were refused — a far better
+    // record than the pack silently not being here. Every one of them imports
+    // today through Import brushes….
     Pack {
         dir: "rubberduck",
         id_prefix: "rubberduck",
@@ -118,6 +165,16 @@ const PACKS: &[Pack] = &[
         source: "https://opengameart.org/content/60-free-gimp-krita-brushes",
         authors: &[],
         fallback_author: "rubberduck",
+        // **The one pack whose masks are not shipped**, and the reason is the
+        // licence rather than the size. Its CC0 is declared on the OpenGameArt
+        // submission page and nowhere inside the download — the recorded
+        // exception in `docs/brush-sources.md`, made so the pack could be
+        // fetched and read. Redistributing 17 masks of somebody's artwork is a
+        // larger claim than converting them locally, and it is not one this
+        // project makes on evidence it could not check. The cost is exactly 17
+        // brushes and 1.2 MB; flipping this to `true` is all it would take, and
+        // that is a decision for whoever owns the project rather than a default.
+        ship_tips: false,
     },
 ];
 
@@ -140,6 +197,8 @@ fn main() {
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut failed: Vec<String> = Vec::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let tips_dir = repo_root.join("crates/umber-core/assets/tips");
+    let mut tips = TipLibrary::open(&tips_dir);
 
     for pack in PACKS {
         let dir = brush_root.join(pack.dir);
@@ -178,17 +237,20 @@ fn main() {
             } in found
             {
                 // Two refusals, both about not misrepresenting somebody's work.
-                // See the module docs.
-                if tip.is_some() {
+                // See the module docs. What was lost on the way in is asked
+                // first, because it is the more informative answer: a brush
+                // that both carries a mask and dropped something is refused for
+                // the thing it dropped whatever happens to its mask.
+                if !dropped.is_empty() {
                     skipped
-                        .entry("needing a bitmap tip".to_string())
+                        .entry(dropped.join(", "))
                         .or_default()
                         .push(label(&preset.name));
                     continue;
                 }
-                if !dropped.is_empty() {
+                if tip.is_some() && !pack.ship_tips {
                     skipped
-                        .entry(dropped.join(", "))
+                        .entry("a mask this project does not redistribute".to_string())
                         .or_default()
                         .push(label(&preset.name));
                     continue;
@@ -235,7 +297,12 @@ fn main() {
                     licence: pack.licence.to_string(),
                     source: pack.source.to_string(),
                 });
-                preset.tip = None;
+                // The mask travels beside the library rather than in it, named
+                // from the preset. Deduplicated by content: two brushes cut
+                // from one stamp get one file, one embedded copy and one GPU
+                // upload, which is what `BrushPreset::tip` holding a name
+                // rather than a picture is for.
+                preset.tip = tip.map(|mask| tips.store(pack.id_prefix, &preset.id, mask));
                 presets.push(preset);
             }
         }
@@ -259,7 +326,25 @@ fn main() {
 ";
     fs::write(&out, format!("{header}{body}\n")).expect("write the library");
 
+    // The masks, and the table that embeds them. Written after the presets
+    // rather than as they are found, so a run that failed half way cannot leave
+    // `assets/tips/` describing a library that was never written.
+    let written = tips.finish();
+    write_table(
+        &repo_root.join("crates/umber-core/src/tip_table.rs"),
+        "tip",
+        "TIPS",
+        "../assets/tips",
+        &tips_dir,
+    );
+
     println!("{} brushes -> {}", presets.len(), out.display());
+    println!(
+        "{} masks, {:.0} kB -> {}",
+        written.count,
+        written.bytes as f32 / 1024.0,
+        tips_dir.display()
+    );
 
     // Printed so the classification can actually be checked. A rule that sends
     // half the library into one collection is not something a test catches —
@@ -282,8 +367,19 @@ fn main() {
     println!("\nby pack:");
     for pack in PACKS {
         let prefix = format!("{}/", pack.id_prefix);
-        let kept = presets.iter().filter(|p| p.id.starts_with(&prefix)).count();
-        println!("  {:14} {kept:4} shipped ({})", pack.dir, pack.licence);
+        let mine = || presets.iter().filter(|p| p.id.starts_with(&prefix));
+        let kept = mine().count();
+        let stamped = mine().filter(|p| p.tip.is_some()).count();
+        println!(
+            "  {:14} {kept:4} shipped, {stamped:3} of them stamps ({}{})",
+            pack.dir,
+            pack.licence,
+            if pack.ship_tips {
+                ""
+            } else {
+                ", masks not redistributed"
+            }
+        );
     }
 
     println!();
@@ -304,6 +400,105 @@ fn main() {
     }
     for problem in &failed {
         println!("failed: {problem}");
+    }
+}
+
+/// The shipped masks, collected as the packs are read and written out at the
+/// end.
+///
+/// It owns exactly the files in `assets/tips/` that a *pack* put there —
+/// anything whose name starts with a pack's id prefix. Umber's own stamps are
+/// `build-bitmaps.rs`'s and are left alone. Owning them means **deleting the
+/// stale ones**: a brush that stops shipping, or a mask that changes name,
+/// would otherwise leave a file behind that the table would go on embedding
+/// for ever, and megabytes of binary nobody could account for is exactly the
+/// kind of rot a generated directory invites.
+struct TipLibrary {
+    dir: PathBuf,
+    /// Mask contents to the name allotted to it. Deduplication is by the whole
+    /// mask, which is the only definition that makes two brushes "cut from the
+    /// same stamp" the same thing.
+    by_content: BTreeMap<Vec<u8>, String>,
+    /// Name to the PNG that will be written under it. A `BTreeMap` so the
+    /// writing order is the sorted order, whatever order the packs were read
+    /// in — this directory is committed.
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+/// What [`TipLibrary::finish`] wrote, for the run's own report.
+struct TipsWritten {
+    count: usize,
+    bytes: usize,
+}
+
+impl TipLibrary {
+    fn open(dir: &Path) -> Self {
+        fs::create_dir_all(dir).expect("create the tips directory");
+        Self {
+            dir: dir.to_path_buf(),
+            by_content: BTreeMap::new(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    /// Record `mask` and answer the name a preset should carry.
+    ///
+    /// The name is derived from the **first** preset to use the mask, and the
+    /// packs are walked in a fixed order over sorted files, so it is stable
+    /// across runs — which a committed directory needs as much as a committed
+    /// file does.
+    fn store(&mut self, prefix: &str, preset_id: &str, mask: TipMask) -> String {
+        let png = mask.to_png().expect("encode a mask");
+        if let Some(name) = self.by_content.get(&png) {
+            return name.clone();
+        }
+
+        // A preset id is `<prefix>/<slug>` and a file name cannot hold the
+        // slash. The prefix is kept rather than dropped: it is what tells this
+        // library which files are its to delete, and it keeps two packs' brushes
+        // of the same name apart.
+        let base = format!("{prefix}-{}", preset_id.rsplit('/').next().unwrap_or(""));
+        let mut name = base.clone();
+        let mut n = 1;
+        while self.files.contains_key(&name) {
+            n += 1;
+            name = format!("{base}-{n}");
+        }
+        self.files.insert(name.clone(), png.clone());
+        self.by_content.insert(png, name.clone());
+        name
+    }
+
+    /// Delete the masks a previous run left, write this run's, and report.
+    fn finish(self) -> TipsWritten {
+        let owned = |name: &str| PACKS.iter().any(|p| name.starts_with(p.id_prefix));
+        for entry in fs::read_dir(&self.dir)
+            .expect("read the tips directory")
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".png") else {
+                continue;
+            };
+            if owned(stem) && !self.files.contains_key(stem) {
+                fs::remove_file(entry.path()).expect("remove a stale mask");
+            }
+        }
+
+        let mut bytes = 0;
+        for (name, png) in &self.files {
+            bytes += png.len();
+            let path = self.dir.join(format!("{name}.png"));
+            // Only when it differs, so a regeneration that changes nothing does
+            // not restamp the mtime of every file in a committed directory.
+            if fs::read(&path).ok().as_ref() != Some(png) {
+                fs::write(&path, png).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+            }
+        }
+        TipsWritten {
+            count: self.files.len(),
+            bytes,
+        }
     }
 }
 
