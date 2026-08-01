@@ -150,8 +150,20 @@ better.
 
 ### CC0 paper and grain textures (ambientCG, Poly Haven, Texture Ninja)
 
-- **Skipped for now.** Umber has no grain channel in the dab pass yet, so there
-  is nothing to point them at.
+- **Skipped**, and now on the licence rule rather than for want of a feature.
+  The dab pass has a grain channel; what these do not have is a licence
+  statement *inside the download*. All three state CC0 on a web page beside the
+  file, which is exactly the case the rule at the top of this document covers.
+- Umber ships three papers of its own instead, drawn by
+  `crates/umber-core/examples/build-bitmaps.rs` and recorded in
+  `assets/patterns/LICENSES.md`. Two things fall out of generating them that a
+  photograph would not have given: they **tile by construction** — the noise
+  lattice wraps, and a seam would draw a grid across every textured mark, since
+  the grain is anchored to the document — and three of them are 200 kB rather
+  than megabytes.
+- A photographic set is still worth having, and the way in is somebody
+  satisfying themselves about a particular download and dropping the files into
+  `assets/patterns/`. The project will not claim a licence it cannot check.
 
 ## Adding a pack
 

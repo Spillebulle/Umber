@@ -184,12 +184,31 @@ coloured `.gbr` says the same about arriving as its silhouette. The generated
 library holds itself to the stricter rule and refuses those outright, since
 nothing shipped under an author's name should paint unlike their brush.
 
-**Nothing shipped carries a bitmap tip yet.** Umber will not claim a licence it
-cannot verify from a pack's own files, and the one CC0 `.gbr` collection that
-clears that bar is raw photographic texture whose brushes rely on GIMP building
-each dab up over the last — which Umber's wet-layer stroke cannot reproduce, and
-which would make them paint about half as strongly as their author intended.
-`docs/brush-sources.md` records the measurement and every other pack considered.
+**A stamp brush can build up.** A sparse photographic texture stamp is not a
+solid disc: GIMP and Krita composite every dab, so the mark is the *overlap* of
+many faint stamps. Umber takes a `max` of coverage across a stroke — the whole
+reason it never goes blotchy — which caps a stroke at the mask's own brightest
+texel. For the CC0 GIMP pack that is 0.49, so its brushes painted half as
+strongly as their author drew them. `Brush::build_up` switches the dab pass to a
+second blend that composites instead, and which of the two a stamp needs is
+*measured* rather than guessed: `cargo run -p umber-core --example measure-stamp`
+prints both figures per file, and the `.gbr` importer runs the same measurement.
+The default is unchanged and stays exactly what it was.
+
+**One shipped brush carries a bitmap tip**, which is one more than before: the
+shipped library can now embed masks alongside its presets. It is Umber's own —
+a sparse chalk stipple, drawn by `examples/build-bitmaps.rs`, deliberately faint
+enough that it needs build-up to paint at full strength. Third-party stamp packs
+still wait on the licence rule: Umber will not claim a licence it cannot verify
+from a pack's own files. `docs/brush-sources.md` records the measurement and
+every pack considered.
+
+**Paper grain.** An optional tiling texture bitten into dab coverage, which is
+what makes a pencil catch on the tooth of the paper. It is anchored to the
+document rather than to the brush, so a second stroke lands in the same pits as
+the first. Three papers ship — a fine tooth, a canvas weave and a coarse rough —
+drawn rather than photographed, for the same licence reason and because a
+photograph does not tile.
 
 **Dabs have shape.** A dab is an ellipse with an angle, not a circle, and it can
 scatter off the stroke and vary its own size — so a chisel is a chisel, a spray
@@ -208,9 +227,9 @@ shipped brushes soften their edge under a light hand, and 38 change how much
 they scatter — 16 of them stating *no* constant scatter at all, so before this
 they imported as perfectly smooth lines wearing the name of something granular.
 
-**The brush editor reaches all of it.** Tip, Dynamics, Scatter and Blending:
-every field a brush has, colour pickup and dab shape and jitter and airbrush
-rate included. The samples in the brush list are stamped from each preset's own
+**The brush editor reaches all of it.** Tip, Dynamics, Scatter, Texture and
+Blending: every field a brush has, colour pickup and dab shape and jitter and
+airbrush rate and paper included. The samples in the brush list are stamped from each preset's own
 settings under a pressure ramp rather than drawn from its opacity and hardness,
 so in a list two hundred entries long a spray looks like a spray.
 
@@ -276,10 +295,9 @@ Taken from the design but not implemented, roughly by size:
 - **Drag-to-reorder tools** in the rail, and **saved workspaces**: the two
   parts of the design's layout edit mode still outstanding. The rest of it is
   built — see [Layout edit mode](#layout-edit-mode).
-- The brush editor's **Texture** and **Wet edges** sections. Tip, Dynamics,
-  Scatter and Blending are built; the other two have no engine behind them —
-  paper grain multiplied into dab coverage does not exist — so they are not
-  drawn rather than drawn empty.
+- The brush editor's **Wet edges** section. Tip, Dynamics, Scatter, Texture and
+  Blending are built; that one has no engine behind it, so it is not drawn
+  rather than drawn empty.
 - The Navigator overlay, Palette and Harmony colour modes, and per-brush blend
   modes.
 - **Autosave and recovery.** Saving works and does not lose work when it fails;
@@ -346,7 +364,10 @@ Umber instead uses a **wet layer**:
 1. **Dab pass.** New dabs since the last frame are stamped into a scratch
    coverage texture using a `max` blend, so coverage saturates at 1.0 no matter
    how many dabs land on a pixel. All dabs in a frame are instances of one
-   4-vertex quad, so a thousand dabs cost a single draw call.
+   4-vertex quad, so a thousand dabs cost a single draw call. A brush that asks
+   to *build up* — which a sparse texture stamp must — swaps that blend for one
+   that composites each dab over the last. It is a change of blend state and
+   nothing else: same shader, same scratch, same single commit.
 2. **Composite pass.** The layer stack and the scratch are combined and drawn
    under the camera transform. One fullscreen triangle.
 3. **Commit.** At pointer-up the scratch is baked into the active layer *once*,
@@ -450,10 +471,14 @@ Next, roughly in order:
   its own right.
 - Scatter that reacts to pen speed
 - Per-brush blend modes
-- A stamp pack to ship. Bitmap tips work end to end — import a `.gbr`, save it,
-  reload it, paint with it — but the library that ships with Umber has no
-  bitmaps in it, and cannot until a pack clears both the licence rule and the
-  build-up problem above.
+- A third-party stamp pack to ship. Bitmap tips work end to end — import a
+  `.gbr`, save it, reload it, paint with it — and the shipped library can carry
+  masks of its own, which it now does. What is still missing is somebody else's
+  pack: the build-up problem is solved, so the remaining obstacles are the
+  licence rule and the curation work `docs/brush-sources.md` lists.
+- A paper texture of your own. Three ship; `GrainPattern` is a closed enum
+  because `Brush` is `Copy`, and reading a fourth off disk needs a variant that
+  names a file.
 - Tilt support
 - Stroke prediction to hide remaining latency
 
