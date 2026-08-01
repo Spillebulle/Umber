@@ -157,6 +157,12 @@ fn main() {
                     source: pack.source.to_string(),
                 }),
                 brush,
+                // A `.myb` is always a round dab, and no stamp pack has cleared
+                // the licence rule in `docs/brush-sources.md`, so nothing
+                // generated here carries a bitmap tip yet. Shipping one would
+                // need the masks embedded beside this file — see
+                // `docs/brushes.md`.
+                tip: None,
             });
         }
     }

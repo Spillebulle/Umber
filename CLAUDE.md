@@ -187,6 +187,34 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   the user saved — and `apply_preset` selects by *index* into it. `resync`
   rebuilds it and re-finds the selection **by id**, because an index does not
   survive a delete.
+- **The user library is a directory, not a file.** `brushes/brushes.ron` plus
+  `brushes/tips/*.png`, because a bitmap tip does not go in a text file. A zip
+  was the alternative and loses on all three counts: every edit rewrites the
+  whole archive, the atomic write would have to risk the masks as well as the
+  index, and a stamp is a picture people want to be able to open.
+- **`BrushPreset::tip` is a *name*, not a mask.** It resolves through
+  `UserLibrary::tip`, which is what lets two brushes share one stamp and one GPU
+  upload. A name that resolves to nothing **paints round** — a library copied
+  without its tips must still load. `UserLibrary::save` takes the mask
+  separately, and `None` there means "keep the tip it already names"; taking a
+  tip off is clearing the field.
+- **A pre-tips `brushes.ron` is migrated and the original is left in place.** A
+  migration that deletes the only copy of somebody's collection has to be right
+  first time. Guarded by `a_flat_library_is_migrated_into_the_directory`.
+- **`set_tip` is called from `start_stroke` and nowhere else**, and skips the
+  upload when the mask is the same `Arc`. Identity, not equality: comparing a
+  megabyte of coverage would put back the cost the check exists to avoid.
+  Changing a tip mid-stroke would restamp what is already in the scratch under a
+  new shape, and the failure direction of the guard is a *stale* tip —
+  `a_second_brush_with_a_different_tip_replaces_the_first`.
+- **A non-square tip is padded, not squashed.** The dab spreads a tip over its
+  bounding box, and `dab_ratio`'s long axis is the dab's *x* axis, so keeping a
+  portrait mask's proportions with the ratio would mean rotating it a quarter
+  turn and rotating it back. Padding is exact and leaves the ratio to the user.
+- **Nothing shipped carries a tip, and the shipped library cannot hold one.**
+  `builtin-brushes.ron` is embedded text; masks would need an `assets/tips/` and
+  an `include_bytes!` table. Do not add either speculatively — the reason there
+  is no pack is recorded, with a measurement, in `docs/brush-sources.md`.
 - **Key dispatch happens at the winit level, before egui sees a keystroke**, so
   every text field outside the canvas has to suspend it via
   `shortcuts::set_capturing`. Without that, typing "brush" into a search box

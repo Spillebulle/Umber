@@ -459,6 +459,9 @@ pub struct CanvasRenderer {
     /// group that references it.
     tip: wgpu::Texture,
     has_tip: bool,
+    /// Which mask is in that texture, so [`CanvasRenderer::set_tip`] can tell
+    /// "the same brush again" from "a different brush".
+    tip_mask: Option<Arc<TipMask>>,
 
     composite_bind_group: wgpu::BindGroup,
     view_uniforms: wgpu::Buffer,
@@ -828,6 +831,7 @@ impl CanvasRenderer {
             dabs_this_frame: 0,
             tip,
             has_tip: false,
+            tip_mask: None,
             composite_bind_group,
             view_uniforms,
             commit_bind_group,
@@ -918,8 +922,30 @@ impl CanvasRenderer {
     /// not touch the blend state, so overlapping tipped dabs still saturate at
     /// 1.0 and stroke opacity is still applied once, at commit —
     /// `a_tipped_stamp_still_saturates_under_overlap` guards that.
-    pub fn set_tip(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tip: Option<&TipMask>) {
-        let (texture, has_tip) = match tip {
+    ///
+    /// Called at the start of every stroke, so it early-outs when the mask has
+    /// not changed. The test is `Arc` **identity**, not equality: masks are
+    /// shared out of the brush library, so two brushes cut from one stamp
+    /// really are one allocation, and comparing a megabyte of coverage to
+    /// answer "same brush as last time?" would put the cost back. Without the
+    /// guard a texture allocation and a copy land on the first frame of every
+    /// stroke, which is the one moment this project exists to keep short.
+    pub fn set_tip(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tip: Option<Arc<TipMask>>,
+    ) {
+        let unchanged = match (&self.tip_mask, &tip) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+
+        let (texture, has_tip) = match &tip {
             Some(mask) => {
                 let texture = make_tip_texture(device, mask.width(), mask.height());
                 queue.write_texture(
@@ -945,7 +971,6 @@ impl CanvasRenderer {
                 );
                 (texture, true)
             }
-            None if !self.has_tip => return,
             None => (make_tip_texture(device, 1, 1), false),
         };
 
@@ -959,6 +984,7 @@ impl CanvasRenderer {
         );
         self.tip = texture;
         self.has_tip = has_tip;
+        self.tip_mask = tip;
 
         queue.write_buffer(
             &self.dab_uniforms,

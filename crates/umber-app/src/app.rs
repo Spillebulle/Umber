@@ -212,19 +212,30 @@ impl UmberApp {
         gfx.gpu.queue.submit(Some(enc.finish()));
     }
 
-    /// Begin a stroke, guaranteeing the scratch surface starts empty.
+    /// Begin a stroke, guaranteeing the scratch surface starts empty and the
+    /// right brush tip is bound.
     ///
-    /// Every path that ends a stroke already clears the scratch, so this is
+    /// Every path that ends a stroke already clears the scratch, so that half is
     /// belt-and-braces — but stale coverage leaking into a new stroke is
     /// precisely the failure this module has already been bitten by, and it
     /// presents as a mystery colour change rather than as anything obvious.
+    ///
+    /// The tip is bound here and nowhere else. The dab pass binds one tip for
+    /// the whole pass, so a thousand tipped dabs are still one draw call;
+    /// changing it mid-stroke would restamp what is already in the scratch under
+    /// a new shape. Between strokes is the only safe moment, and this is it.
     fn start_stroke(&mut self, point: InputPoint) {
         self.editor.begin_stroke(point);
 
         let id = self.editor.session.active_id();
-        if let Some(gfx) = self.gfx.as_ref()
-            && let Some(canvas) = gfx.canvases.get(&id)
+        let tip = self.editor.tip.clone();
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(canvas) = gfx.canvases.get_mut(&id)
         {
+            // Cheap when the brush has not changed: `set_tip` compares the mask
+            // by identity and returns without touching the GPU.
+            canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
+
             let mut enc = gfx
                 .gpu
                 .device

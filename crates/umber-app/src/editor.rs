@@ -7,12 +7,13 @@ use crate::settings::SettingsTab;
 use crate::tabs::Notice;
 use crate::theme::{Accent, ThemeKind};
 use glam::{UVec2, Vec2};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
     Brush, BrushMode, BrushPreset, Camera, Color, Document, History, Hsv, InputPoint, LayerStack,
-    StrokeBuilder,
+    StrokeBuilder, TipMask,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -105,6 +106,19 @@ pub struct Editor {
     pub hsv: Hsv,
     pub presets: Vec<BrushPreset>,
     pub active_preset: Option<usize>,
+    /// The bitmap tip the brush in hand stamps, or `None` for the procedural
+    /// round dab.
+    ///
+    /// Resolved once, when a preset is selected, rather than looked up per
+    /// stroke: `BrushPreset::tip` is a *name*, and the masks live in the user's
+    /// library, which the drawing path has no business reaching into. The `Arc`
+    /// is what `CanvasRenderer::set_tip` compares to decide whether the tip
+    /// already on the GPU is the one wanted.
+    pub tip: Option<Arc<TipMask>>,
+    /// Every mask the user's library holds, by name — what [`Editor::tip`] is
+    /// resolved against. Filled in by `brushlib::resync`, which is also what
+    /// keeps `presets` in step.
+    pub tips: BTreeMap<String, Arc<TipMask>>,
     pub layers: LayerStack,
     /// Every open document, and which of them the fields above belong to.
     pub session: Session,
@@ -178,6 +192,8 @@ impl Default for Editor {
             hsv: Color::from_srgb_u8(20, 20, 24, 255).to_hsv(),
             presets: umber_core::preset::builtin().to_vec(),
             active_preset: None,
+            tip: None,
+            tips: BTreeMap::new(),
             layers: LayerStack::new(),
             session: Session::default(),
             notice: None,
@@ -316,7 +332,19 @@ impl Editor {
         let mode = self.brush.mode;
         self.brush = preset.brush;
         self.brush.mode = mode;
+        // A name pointing at a mask that is not here paints round rather than
+        // refusing — see `BrushPreset::tip`.
+        self.tip = preset
+            .tip
+            .as_ref()
+            .and_then(|name| self.tips.get(name).cloned());
         self.active_preset = Some(index);
+    }
+
+    /// Take the bitmap tip off the brush in hand, without touching the preset
+    /// it came from. Saving is what makes that stick.
+    pub fn clear_tip(&mut self) {
+        self.tip = None;
     }
 
     pub fn fit_view(&mut self) {
