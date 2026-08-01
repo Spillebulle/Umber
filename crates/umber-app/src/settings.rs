@@ -549,9 +549,10 @@ fn pressure_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         PressureSource::Device => controls::note(
             ui,
             p,
-            "Touch screens report real pressure. Desktop pen tablets do not reach \
-             Umber through the window system yet, so on a mouse or a desktop pen \
-             this behaves as Off — pick Speed for a stand-in.",
+            "Touch screens report real pressure, and so do pens on Windows. Pens on \
+             macOS and Linux do not reach Umber through the window system yet, so \
+             there this behaves as Off — pick Speed for a stand-in. A mouse always \
+             paints at full pressure.",
         ),
         PressureSource::Simulated => controls::note(
             ui,

@@ -1249,8 +1249,8 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         caption(
             ui,
             p,
-            "Touch screens report real pressure. Desktop pens fall back to \
-             full pressure.",
+            "Touch screens and Windows pens report real pressure. A mouse, and a \
+             pen on macOS or Linux, falls back to full pressure.",
         );
     }
 
