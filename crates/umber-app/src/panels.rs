@@ -14,7 +14,7 @@
 
 use crate::brushlib;
 use crate::colorpicker::{self, PickerMode};
-use crate::dock::{DropTarget, Floating, Geometry, PanelKind, Side, limits};
+use crate::dock::{ColumnGeometry, DropTarget, Floating, Geometry, PanelKind, Side, limits};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
@@ -40,7 +40,12 @@ pub(crate) struct PanelEvents {
     close: bool,
 }
 
-/// Draw both sidebars, their panels and their splitters.
+/// Draw every docked column, its panels and its splitters.
+///
+/// One `egui::Panel` per column, claimed in the model's own order — outermost
+/// first — so what egui lays out and what [`Geometry`] predicted are the same
+/// rects. Whatever is left when the loop finishes is the central panel, and
+/// therefore the canvas.
 pub fn sidebars(
     root: &mut Ui,
     p: &Palette,
@@ -49,26 +54,30 @@ pub fn sidebars(
     geo: &Geometry,
 ) {
     for side in Side::ALL {
-        let Some(rect) = geo.sidebar[side.index()] else {
-            continue;
-        };
-        let frame = Frame {
-            fill: p.dock,
-            ..Default::default()
-        };
-        let panel = match side {
-            Side::Left => egui::Panel::left("dock-left"),
-            Side::Right => egui::Panel::right("dock-right"),
-        };
-        panel
-            .exact_size(rect.width())
-            .frame(frame)
-            // `width_splitter` draws this edge itself, and lights it up in the
-            // accent while it is being dragged. egui's separator lands on the
-            // same pixel and is painted afterwards, so leaving it on put a dim
-            // rule over the highlight and the resize affordance never showed.
-            .show_separator_line(false)
-            .show(root, |ui| sidebar(ui, p, ed, actions, side, geo));
+        for (column, at) in geo.columns(side).iter().enumerate() {
+            let frame = Frame {
+                fill: p.dock,
+                ..Default::default()
+            };
+            // The id has to name the column as well as the side: two panels
+            // sharing one would fight over the same stored state and the outer
+            // one would take the inner one's width.
+            let id = Id::new(("dock", side.index(), column));
+            let panel = match side {
+                Side::Left => egui::Panel::left(id),
+                Side::Right => egui::Panel::right(id),
+            };
+            panel
+                .exact_size(at.rect.width())
+                .frame(frame)
+                // `width_splitter` draws this edge itself, and lights it up in
+                // the accent while it is being dragged. egui's separator lands
+                // on the same pixel and is painted afterwards, so leaving it on
+                // put a dim rule over the highlight and the resize affordance
+                // never showed.
+                .show_separator_line(false)
+                .show(root, |ui| sidebar(ui, p, ed, actions, side, column, at));
+        }
     }
 
     // The library's browser and its dialogs. Drawn here rather than from inside
@@ -87,12 +96,18 @@ fn sidebar(
     ed: &mut Editor,
     actions: &mut UiActions,
     side: Side,
-    geo: &Geometry,
+    column: usize,
+    at: &ColumnGeometry,
 ) {
-    let slots = &geo.slots[side.index()];
+    let slots = &at.slots;
     // Snapshot the stack: drawing a panel can start a drag, which removes it
     // from the layout, and the loop must not be reading the Vec when it does.
-    let kinds: Vec<PanelKind> = ed.layout.docked(side).iter().map(|d| d.kind).collect();
+    let kinds: Vec<PanelKind> = ed
+        .layout
+        .docked(side, column)
+        .iter()
+        .map(|d| d.kind)
+        .collect();
 
     let mut grabbed = None;
     let mut closed = None;
@@ -113,8 +128,8 @@ fn sidebar(
         }
     }
 
-    height_splitters(ui, p, ed, side, slots);
-    width_splitter(ui, p, ed, side, geo);
+    height_splitters(ui, p, ed, side, column, slots);
+    width_splitter(ui, p, ed, side, column, at.rect);
 
     if let Some(kind) = closed {
         ed.layout.close(kind);
@@ -125,7 +140,14 @@ fn sidebar(
 }
 
 /// The draggable boundaries between stacked panels.
-fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots: &[Rect]) {
+fn height_splitters(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    side: Side,
+    column: usize,
+    slots: &[Rect],
+) {
     let heights: Vec<f32> = slots.iter().map(|s| s.height()).collect();
     // The last slot has nothing below it to push against, so it has no handle.
     let boundaries = slots.len().saturating_sub(1);
@@ -138,13 +160,13 @@ fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots
         let response = ui
             .interact(
                 handle,
-                ui.id().with(("vsplit", side.index(), index)),
+                ui.id().with(("vsplit", side.index(), column, index)),
                 Sense::drag(),
             )
             .on_hover_cursor(CursorIcon::ResizeVertical);
         if response.dragged() {
             ed.layout
-                .resize_split(side, index, response.drag_delta().y, &heights);
+                .resize_split(side, column, index, response.drag_delta().y, &heights);
         }
         if response.hovered() || response.dragged() {
             ui.painter()
@@ -153,15 +175,21 @@ fn height_splitters(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, slots
     }
 }
 
-/// The draggable inner edge that sets the sidebar's width.
+/// The draggable inner edge that sets one column's width.
 ///
-/// The handle sits *inside* the sidebar rather than straddling its edge, so
-/// that grabbing it counts as pointing at the panel and never at the canvas —
-/// otherwise the first pixel of a resize drag would also start a stroke.
-fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &Geometry) {
-    let Some(rect) = geo.sidebar[side.index()] else {
-        return;
-    };
+/// The handle sits *inside* the column rather than straddling its edge, so that
+/// grabbing it counts as pointing at the panel and never at the canvas —
+/// otherwise the first pixel of a resize drag would also start a stroke. That
+/// is also what keeps two neighbouring columns' handles apart: each is inside
+/// its own column, at the edge facing the canvas.
+fn width_splitter(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    side: Side,
+    column: usize,
+    rect: Rect,
+) {
     let handle = match side {
         Side::Left => Rect::from_min_max(
             pos2(rect.right() - SPLITTER_GRAB, rect.top()),
@@ -175,7 +203,7 @@ fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &G
     let response = ui
         .interact(
             handle,
-            ui.id().with(("hsplit", side.index())),
+            ui.id().with(("hsplit", side.index(), column)),
             Sense::drag(),
         )
         .on_hover_cursor(CursorIcon::ResizeHorizontal);
@@ -187,7 +215,7 @@ fn width_splitter(ui: &mut Ui, p: &Palette, ed: &mut Editor, side: Side, geo: &G
             Side::Left => pointer.x - rect.left(),
             Side::Right => rect.right() - pointer.x,
         };
-        ed.layout.set_width(side, width);
+        ed.layout.set_width(side, column, width);
     }
 
     let x = match side {
@@ -509,8 +537,13 @@ fn dashed_rect(painter: &egui::Painter, rect: Rect, radius: f32, stroke: Stroke)
     }
 }
 
-/// The dashed outline the design puts round a sidebar while the layout is being
-/// edited, so it reads as a container you can drop into.
+/// The dashed outline the design puts round a docked column while the layout is
+/// being edited, so it reads as a container you can drop into.
+///
+/// One per column rather than one per side: two columns side by side are two
+/// containers, and an outline round the pair would say the boundary between
+/// them is not a place anything can go, which is exactly where a new column
+/// lands.
 pub fn edit_mode_outline(root: &mut Ui, p: &Palette, ed: &Editor, geo: &Geometry) {
     if !ed.layout.edit_mode() {
         return;
@@ -520,10 +553,10 @@ pub fn edit_mode_outline(root: &mut Ui, p: &Palette, ed: &Editor, geo: &Geometry
         Id::new("dock-edit-outline"),
     ));
     for side in Side::ALL {
-        if let Some(rect) = geo.sidebar[side.index()] {
+        for column in geo.columns(side) {
             dashed_rect(
                 &painter,
-                rect.shrink(4.0),
+                column.rect.shrink(4.0),
                 8.0,
                 Stroke::new(1.5, p.accent_dim),
             );
@@ -549,14 +582,21 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
 
     let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dock-drag")));
     match target {
-        DropTarget::Dock { side, index } => {
+        DropTarget::Dock {
+            side,
+            column,
+            index,
+        } => {
             // The design's dock indicator: a dashed accent block reading "dock
             // here". It is drawn *at the insertion point* rather than always at
             // the top of the sidebar, because unlike the design's model this
             // one can insert between two panels, and an indicator that lied
             // about where the panel lands would be worse than none.
-            let zone = geo.drop_zone(side);
-            let (a, b) = geo.insertion_line(side, index);
+            let zone = geo
+                .columns(side)
+                .get(column)
+                .map_or_else(|| geo.drop_zone(side), |c| c.rect);
+            let (a, b) = geo.insertion_line(side, column, index);
             let block = Rect::from_min_max(
                 pos2(zone.left() + 8.0, a.y.min(zone.bottom() - 40.0)),
                 pos2(b.x - 8.0, (a.y + 110.0).min(zone.bottom() - 8.0)),
@@ -569,6 +609,23 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
                     block.center(),
                     Align2::CENTER_CENTER,
                     "dock here",
+                    FontId::proportional(text::TINY),
+                    p.accent,
+                );
+            }
+        }
+        // A column of its own, at the boundary the pointer is nearest. Full
+        // height, because that is what the column will be — the block a stack
+        // drop draws would say "somewhere in this list" and mean the opposite.
+        DropTarget::NewColumn { side, column } => {
+            let strip = geo.new_column_strip(side, column);
+            painter.rect_filled(strip, 8.0, p.accent.gamma_multiply(0.09));
+            dashed_rect(&painter, strip, 8.0, Stroke::new(2.0, p.accent));
+            if strip.height() > 34.0 && strip.width() > 60.0 {
+                painter.text(
+                    strip.center(),
+                    Align2::CENTER_CENTER,
+                    "new column",
                     FontId::proportional(text::TINY),
                     p.accent,
                 );
@@ -1401,8 +1458,9 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "drag a panel by its header — a sidebar re-docks it, anywhere \
-                         else floats · drag an edge to resize · the cross removes",
+                        "drag a panel by its header — a column re-docks it, a column's \
+                         edge starts a new one, anywhere else floats · drag an edge to \
+                         resize · the cross removes",
                     )
                     .size(text::TINY)
                     .color(p.text_dim),

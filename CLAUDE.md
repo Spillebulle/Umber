@@ -715,6 +715,20 @@ sizes, the config round trip and the drop rules be tested without a window.
   the workspace holds, and the alternative (bumping `umber-layout`) discards
   every arrangement anybody has made. Adding a kind therefore needs no version
   bump; adding one to `DEFAULT_DOCK` would.
+- **A side is a list of `Column`s, ordered from the window edge inwards**, and a
+  column is exactly what a whole sidebar used to be: a stack with a width. Index
+  0 is against the window on *either* edge, so nothing downstream has to ask
+  which way round a side counts. That shape is also what kept the config's
+  version header still: a file written before columns names none, and every
+  `dock` line for a side falls into the one column that side implicitly has. The
+  `width` line is read and no longer written, and it is the whole of the
+  migration — `a_config_written_before_columns_loads_as_one_column_a_side` pins
+  it. **Do not bump `umber-layout` for a change an old file can be read into.**
+- **A column emptied by a drag is kept until the drop resolves.** Removing it on
+  the spot slides every column outside it sideways under the pointer, and
+  renumbers the very column indices the drop target is being computed against.
+  `Layout::prune` runs *after* the insert, from everything that ends a drag and
+  from `close`. `a_column_emptied_by_a_drag_survives_until_the_drop` guards it.
 - **Adding a module hands it to the pointer.** `Layout::add_dragging` lifts it
   straight into a drag with `Origin::Closed`, so the same drop that moves an
   existing panel places the new one and `Esc` abandons the add. Do not "simplify"

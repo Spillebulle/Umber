@@ -15,6 +15,21 @@
 //! readable and makes a corrupt one easy to repair — a kind that appears twice
 //! is dropped, a kind that appears nowhere is simply closed.
 //!
+//! ## Why a side is a list of columns
+//!
+//! Each edge of the workspace used to hold one stack of panels. It now holds a
+//! list of [`Column`]s, each its own stack with its own width, laid out from
+//! the window edge **inwards** — so Colour can sit at the far right with
+//! Brushes full height immediately to its left.
+//!
+//! A column is exactly what a sidebar used to be, which is what let the config
+//! file keep its version header. A file written before columns existed names no
+//! column at all, and every `dock` line for a side falls into the one column
+//! that side implicitly has; see [`Layout::from_config`]. Ordering columns from
+//! the edge inwards rather than left to right is what makes the two sides
+//! symmetric: index 0 is always the one against the window, on either edge, so
+//! nothing downstream has to ask which way round this side counts.
+//!
 //! ## Why a drag lifts the panel out of the layout
 //!
 //! [`Layout::begin_drag`] removes the panel from wherever it was. The stack it
@@ -22,6 +37,12 @@
 //! remaining slots is exactly the index the drop will use — there is no
 //! "does this index count the panel I am holding?" case to get wrong, and the
 //! drop indicator cannot disagree with the result.
+//!
+//! A column emptied that way is deliberately *kept* until the drop resolves.
+//! Removing it on the spot would slide every column outside it sideways under
+//! the pointer mid-drag, and would renumber the very column indices the drop
+//! target is being computed against. It is pruned by whatever ends the drag —
+//! see [`Layout::prune`].
 //!
 //! That is also what makes *adding* a module a drag rather than a placement.
 //! [`Layout::add_dragging`] puts a closed module straight into the pointer's
@@ -40,15 +61,25 @@ use std::path::PathBuf;
 pub mod limits {
     /// Enough for a header plus a usable sliver of content.
     pub const PANEL_MIN_HEIGHT: f32 = 96.0;
+    /// The narrowest a column may be dragged.
     pub const SIDEBAR_MIN_WIDTH: f32 = 190.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 460.0;
+    /// What is always left for the document, however many columns are docked.
+    /// Columns are laid out from the edge inwards, so this is taken off each in
+    /// turn and the innermost one is the one that gives.
+    pub const CANVAS_MIN_WIDTH: f32 = 190.0;
     pub const FLOAT_MIN_WIDTH: f32 = 190.0;
     pub const FLOAT_MIN_HEIGHT: f32 = 130.0;
     pub const FLOAT_MAX_WIDTH: f32 = 720.0;
     pub const FLOAT_MAX_HEIGHT: f32 = 900.0;
-    /// How far in from the canvas edge counts as "drop into this sidebar" when
-    /// that sidebar is currently empty and so has no rect of its own.
+    /// How far in from the canvas edge counts as "drop into this side" when
+    /// that side is currently empty and so has no rect of its own.
     pub const EMPTY_ZONE_WIDTH: f32 = 104.0;
+    /// How far in from a column's outer or inner edge counts as "put a new
+    /// column here" rather than "add to this column's stack". Capped at a share
+    /// of the column so the two bands can never meet in the middle of a narrow
+    /// one and leave it with no way to be stacked into.
+    pub const NEW_COLUMN_ZONE: f32 = 40.0;
     /// How much of a floating panel must stay inside the workspace. Its header
     /// is the only way to move it, so the header must never be unreachable.
     pub const FLOAT_KEEP_VISIBLE: f32 = 96.0;
@@ -66,8 +97,8 @@ pub enum PanelKind {
 impl PanelKind {
     pub const ALL: [PanelKind; 4] = [Self::Colour, Self::Brushes, Self::Layers, Self::History];
 
-    /// The arrangement Umber ships with: the design's three modules, in the
-    /// right-hand sidebar.
+    /// The arrangement Umber ships with: the design's three modules, in one
+    /// column at the right-hand edge.
     ///
     /// History is deliberately *not* among them, and that is the same answer a
     /// layout file written before History existed gets — an absent panel is a
@@ -129,7 +160,7 @@ impl PanelKind {
         Self::ALL.into_iter().find(|k| k.key() == key)
     }
 
-    /// Share of the sidebar's flexible space in the default layout. The colour
+    /// Share of the column's flexible space in the default layout. The colour
     /// picker is the tallest thing in the dock, so it gets the most.
     fn default_weight(self) -> f32 {
         match self {
@@ -180,12 +211,34 @@ impl Side {
     }
 }
 
-/// A panel in a sidebar stack. `weight` is its share of the space left over
-/// once every panel in the stack has its minimum height.
+/// A panel in a column's stack. `weight` is its share of the space left over
+/// once every panel in the column has its minimum height.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Docked {
     pub kind: PanelKind,
     pub weight: f32,
+}
+
+/// One column of docked panels: a stack, and how wide it is.
+///
+/// Exactly what a whole sidebar used to be. Columns on a side are ordered from
+/// the window edge inwards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Column {
+    pub panels: Vec<Docked>,
+    pub width: f32,
+}
+
+impl Column {
+    fn of(kind: PanelKind) -> Self {
+        Self {
+            panels: vec![Docked {
+                kind,
+                weight: kind.default_weight(),
+            }],
+            width: metrics::PANEL,
+        }
+    }
 }
 
 /// A panel hovering over the canvas, positioned in absolute window points.
@@ -200,8 +253,13 @@ pub struct Floating {
 enum Origin {
     Dock {
         side: Side,
+        column: usize,
         index: usize,
         weight: f32,
+        /// The column's width. Carried so that a panel dropped as a *new*
+        /// column keeps the width it had rather than snapping back to the
+        /// design's default every time it is moved.
+        width: f32,
     },
     Float(Rect),
     /// It was not in the layout at all — the drag is an *add*, from the module
@@ -243,8 +301,26 @@ impl Drag {
 /// Where a release would put the dragged panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropTarget {
-    Dock { side: Side, index: usize },
+    /// Into an existing column's stack.
+    Dock {
+        side: Side,
+        column: usize,
+        index: usize,
+    },
+    /// As a column of its own, inserted at `column` — counting, like every
+    /// column index, from the window edge inwards.
+    NewColumn {
+        side: Side,
+        column: usize,
+    },
     Float,
+}
+
+/// One column's rects: the whole of it, and one slot per panel in it.
+#[derive(Clone, Debug)]
+pub struct ColumnGeometry {
+    pub rect: Rect,
+    pub slots: Vec<Rect>,
 }
 
 /// Everything the layout occupies this frame, in egui points.
@@ -257,8 +333,8 @@ pub struct Geometry {
     /// Below the options strip, above the status bar, full window width.
     pub workspace: Rect,
     pub rail: Rect,
-    pub sidebar: [Option<Rect>; 2],
-    pub slots: [Vec<Rect>; 2],
+    /// Per side, one entry per column, ordered from the window edge inwards.
+    pub sides: [Vec<ColumnGeometry>; 2],
     /// What is left for the document. Floating panels do **not** come out of
     /// this — they hover, so the canvas region and therefore the camera pivot
     /// are unaffected by them.
@@ -266,13 +342,23 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The region that counts as "drop into this sidebar".
+    pub fn columns(&self, side: Side) -> &[ColumnGeometry] {
+        &self.sides[side.index()]
+    }
+
+    /// The whole of one side, or `None` when nothing is docked there.
+    pub fn sidebar(&self, side: Side) -> Option<Rect> {
+        let columns = self.columns(side);
+        Some(columns.first()?.rect.union(columns.last()?.rect))
+    }
+
+    /// The region that counts as "drop into this side".
     ///
-    /// An occupied sidebar is its own rect. An empty one has no rect, so a
-    /// strip at that edge of the canvas stands in — otherwise a sidebar you
+    /// An occupied side is the union of its columns. An empty one has no rect,
+    /// so a strip at that edge of the canvas stands in — otherwise a side you
     /// emptied could never be filled again.
     pub fn drop_zone(&self, side: Side) -> Rect {
-        if let Some(rect) = self.sidebar[side.index()] {
+        if let Some(rect) = self.sidebar(side) {
             return rect;
         }
         let width = limits::EMPTY_ZONE_WIDTH.min(self.canvas.width() * 0.5);
@@ -289,13 +375,45 @@ impl Geometry {
     }
 
     /// Where a release at `pointer` would put the panel.
+    ///
+    /// Within a column, a band at either edge means "a new column here" and the
+    /// middle means "into this stack". The bands of two neighbouring columns
+    /// name the same boundary and therefore resolve to the same index, so which
+    /// of the pair the pointer is a hair inside cannot change the answer.
     pub fn drop_target(&self, pointer: Pos2) -> DropTarget {
         for side in Side::ALL {
-            let zone = self.drop_zone(side);
-            if zone.contains(pointer) {
+            let columns = self.columns(side);
+            if columns.is_empty() {
+                if self.drop_zone(side).contains(pointer) {
+                    return DropTarget::NewColumn { side, column: 0 };
+                }
+                continue;
+            }
+            for (index, column) in columns.iter().enumerate() {
+                if !column.rect.contains(pointer) {
+                    continue;
+                }
+                let band = limits::NEW_COLUMN_ZONE.min(column.rect.width() * 0.3);
+                let (outer, inner) = match side {
+                    Side::Left => (column.rect.left(), column.rect.right()),
+                    Side::Right => (column.rect.right(), column.rect.left()),
+                };
+                if (pointer.x - outer).abs() <= band {
+                    return DropTarget::NewColumn {
+                        side,
+                        column: index,
+                    };
+                }
+                if (pointer.x - inner).abs() <= band {
+                    return DropTarget::NewColumn {
+                        side,
+                        column: index + 1,
+                    };
+                }
                 return DropTarget::Dock {
                     side,
-                    index: insert_index(&self.slots[side.index()], pointer.y),
+                    column: index,
+                    index: insert_index(&column.slots, pointer.y),
                 };
             }
         }
@@ -303,14 +421,60 @@ impl Geometry {
     }
 
     /// The line a dock drop would insert at, for the drop indicator.
-    pub fn insertion_line(&self, side: Side, index: usize) -> (Pos2, Pos2) {
-        let zone = self.drop_zone(side);
-        let slots = &self.slots[side.index()];
-        let y = match slots.get(index) {
-            Some(slot) => slot.top(),
-            None => slots.last().map_or(zone.top(), |slot| slot.bottom()),
+    pub fn insertion_line(&self, side: Side, column: usize, index: usize) -> (Pos2, Pos2) {
+        let Some(column) = self.columns(side).get(column) else {
+            let zone = self.drop_zone(side);
+            return (zone.left_top(), zone.right_top());
         };
-        (pos2(zone.left(), y), pos2(zone.right(), y))
+        let y = match column.slots.get(index) {
+            Some(slot) => slot.top(),
+            None => column
+                .slots
+                .last()
+                .map_or(column.rect.top(), |slot| slot.bottom()),
+        };
+        (pos2(column.rect.left(), y), pos2(column.rect.right(), y))
+    }
+
+    /// Where a column inserted at `column` would appear, for the drop
+    /// indicator. A hint at the boundary rather than the column's eventual
+    /// width, which is not known until the drop resolves.
+    pub fn new_column_strip(&self, side: Side, column: usize) -> Rect {
+        let columns = self.columns(side);
+        let edge = match columns.get(column) {
+            // Against the outer edge of the column it would push inwards.
+            Some(column) => match side {
+                Side::Left => column.rect.left(),
+                Side::Right => column.rect.right(),
+            },
+            // Past the innermost one, or — with nothing docked at all —
+            // against the canvas edge, which is where the empty drop zone is.
+            None => match columns.last() {
+                Some(column) => match side {
+                    Side::Left => column.rect.right(),
+                    Side::Right => column.rect.left(),
+                },
+                None => match side {
+                    Side::Left => self.canvas.left(),
+                    Side::Right => self.canvas.right(),
+                },
+            },
+        };
+        let width = limits::EMPTY_ZONE_WIDTH
+            .min(self.workspace.width())
+            .max(0.0);
+        let (a, b) = match side {
+            Side::Left => (edge, edge + width),
+            Side::Right => (edge - width, edge),
+        };
+        // Clamped in order, so the result cannot come out inverted however
+        // small the window is.
+        let left = a.max(self.workspace.left()).min(self.workspace.right());
+        let right = b.min(self.workspace.right()).max(left);
+        Rect::from_min_max(
+            pos2(left, self.workspace.top()),
+            pos2(right, self.workspace.bottom()),
+        )
     }
 }
 
@@ -356,10 +520,10 @@ pub fn stack_heights(weights: &[f32], available: f32) -> Vec<f32> {
 }
 
 pub struct Layout {
-    sides: [Vec<Docked>; 2],
+    /// Per side, columns ordered from the window edge inwards.
+    sides: [Vec<Column>; 2],
     /// Draw order, and therefore z-order: the last one is on top.
     floating: Vec<Floating>,
-    widths: [f32; 2],
     rail_side: Side,
     drag: Option<Drag>,
     /// The design's layout edit mode. Panels are only draggable while it is on,
@@ -378,16 +542,18 @@ impl Default for Layout {
         Self {
             sides: [
                 Vec::new(),
-                PanelKind::DEFAULT_DOCK
-                    .into_iter()
-                    .map(|kind| Docked {
-                        kind,
-                        weight: kind.default_weight(),
-                    })
-                    .collect(),
+                vec![Column {
+                    panels: PanelKind::DEFAULT_DOCK
+                        .into_iter()
+                        .map(|kind| Docked {
+                            kind,
+                            weight: kind.default_weight(),
+                        })
+                        .collect(),
+                    width: metrics::PANEL,
+                }],
             ],
             floating: Vec::new(),
-            widths: [metrics::PANEL, metrics::PANEL],
             rail_side: Side::Left,
             drag: None,
             edit_mode: false,
@@ -399,16 +565,25 @@ impl Default for Layout {
 impl Layout {
     // --- queries -----------------------------------------------------------
 
-    pub fn docked(&self, side: Side) -> &[Docked] {
+    pub fn columns(&self, side: Side) -> &[Column] {
         &self.sides[side.index()]
+    }
+
+    /// The panels in one column, or nothing if there is no such column.
+    pub fn docked(&self, side: Side, column: usize) -> &[Docked] {
+        self.sides[side.index()]
+            .get(column)
+            .map_or(&[], |c| c.panels.as_slice())
     }
 
     pub fn floating(&self) -> &[Floating] {
         &self.floating
     }
 
-    pub fn width(&self, side: Side) -> f32 {
-        self.widths[side.index()]
+    pub fn width(&self, side: Side, column: usize) -> f32 {
+        self.sides[side.index()]
+            .get(column)
+            .map_or(metrics::PANEL, |c| c.width)
     }
 
     pub fn rail_side(&self) -> Side {
@@ -443,12 +618,16 @@ impl Layout {
 
     fn place_of(&self, kind: PanelKind) -> Option<Origin> {
         for side in Side::ALL {
-            if let Some(index) = self.sides[side.index()].iter().position(|d| d.kind == kind) {
-                return Some(Origin::Dock {
-                    side,
-                    index,
-                    weight: self.sides[side.index()][index].weight,
-                });
+            for (column, col) in self.sides[side.index()].iter().enumerate() {
+                if let Some(index) = col.panels.iter().position(|d| d.kind == kind) {
+                    return Some(Origin::Dock {
+                        side,
+                        column,
+                        index,
+                        weight: col.panels[index].weight,
+                        width: col.width,
+                    });
+                }
             }
         }
         self.floating
@@ -514,57 +693,57 @@ impl Layout {
             }
         };
 
-        let mut sidebar = [None, None];
-        let mut slots = [Vec::new(), Vec::new()];
-
+        let mut sides = [Vec::new(), Vec::new()];
         for side in Side::ALL {
-            let stack = &self.sides[side.index()];
-            if stack.is_empty() {
-                continue;
-            }
-            // Never let the two sidebars eat the canvas entirely. `canvas` is
-            // already non-negative, so this cannot come out below zero and the
-            // sidebar cannot claim more than there is.
-            let width = self.widths[side.index()]
-                .min((canvas.width() - limits::SIDEBAR_MIN_WIDTH).max(0.0))
-                .clamp(0.0, canvas.width())
-                .round();
-            let rect = match side {
-                Side::Left => {
-                    let r = Rect::from_min_max(
-                        canvas.left_top(),
-                        pos2(canvas.left() + width, canvas.bottom()),
-                    );
-                    canvas.min.x = r.right();
-                    r
-                }
-                Side::Right => {
-                    let r = Rect::from_min_max(
-                        pos2(canvas.right() - width, canvas.top()),
-                        canvas.right_bottom(),
-                    );
-                    canvas.max.x = r.left();
-                    r
-                }
-            };
-            sidebar[side.index()] = Some(rect);
+            for column in &self.sides[side.index()] {
+                // Never let the columns eat the canvas entirely. `canvas` is
+                // already non-negative, so this cannot come out below zero and
+                // a column cannot claim more than there is. Applied per column
+                // as they are peeled off, so the innermost is the one that
+                // gives on a narrow window.
+                let width = column
+                    .width
+                    .max(0.0)
+                    .min((canvas.width() - limits::CANVAS_MIN_WIDTH).max(0.0))
+                    .clamp(0.0, canvas.width())
+                    .round();
+                let rect = match side {
+                    Side::Left => {
+                        let r = Rect::from_min_max(
+                            canvas.left_top(),
+                            pos2(canvas.left() + width, canvas.bottom()),
+                        );
+                        canvas.min.x = r.right();
+                        r
+                    }
+                    Side::Right => {
+                        let r = Rect::from_min_max(
+                            pos2(canvas.right() - width, canvas.top()),
+                            canvas.right_bottom(),
+                        );
+                        canvas.max.x = r.left();
+                        r
+                    }
+                };
 
-            let weights: Vec<f32> = stack.iter().map(|d| d.weight).collect();
-            let mut y = rect.top();
-            for height in stack_heights(&weights, rect.height()) {
-                slots[side.index()].push(Rect::from_min_size(
-                    pos2(rect.left(), y),
-                    vec2(rect.width(), height),
-                ));
-                y += height;
+                let weights: Vec<f32> = column.panels.iter().map(|d| d.weight).collect();
+                let mut slots = Vec::with_capacity(weights.len());
+                let mut y = rect.top();
+                for height in stack_heights(&weights, rect.height()) {
+                    slots.push(Rect::from_min_size(
+                        pos2(rect.left(), y),
+                        vec2(rect.width(), height),
+                    ));
+                    y += height;
+                }
+                sides[side.index()].push(ColumnGeometry { rect, slots });
             }
         }
 
         Geometry {
             workspace,
             rail,
-            sidebar,
-            slots,
+            sides,
             canvas,
         }
     }
@@ -605,21 +784,33 @@ impl Layout {
 
     // --- mutation ----------------------------------------------------------
 
-    pub fn set_width(&mut self, side: Side, width: f32) {
+    pub fn set_width(&mut self, side: Side, column: usize, width: f32) {
+        let Some(col) = self.sides[side.index()].get_mut(column) else {
+            return;
+        };
         let width = width
             .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH)
             .round();
-        if self.widths[side.index()] != width {
-            self.widths[side.index()] = width;
+        if col.width != width {
+            col.width = width;
             self.dirty = true;
         }
     }
 
-    /// Move the boundary between panels `index` and `index + 1` by `delta`
-    /// points, given the heights they currently have.
-    pub fn resize_split(&mut self, side: Side, index: usize, delta: f32, heights: &[f32]) {
-        let stack = &mut self.sides[side.index()];
-        if index + 1 >= stack.len() || heights.len() != stack.len() {
+    /// Move the boundary between panels `index` and `index + 1` of one column
+    /// by `delta` points, given the heights they currently have.
+    pub fn resize_split(
+        &mut self,
+        side: Side,
+        column: usize,
+        index: usize,
+        delta: f32,
+        heights: &[f32],
+    ) {
+        let Some(col) = self.sides[side.index()].get(column) else {
+            return;
+        };
+        if index + 1 >= col.panels.len() || heights.len() != col.panels.len() {
             return;
         }
         let mut next: Vec<f32> = heights.to_vec();
@@ -629,12 +820,14 @@ impl Layout {
         let delta = delta.max(min - next[index]).min(next[index + 1] - min);
         next[index] += delta;
         next[index + 1] -= delta;
-        self.set_weights_from_heights(side, &next);
+        self.set_weights_from_heights(side, column, &next);
     }
 
-    fn set_weights_from_heights(&mut self, side: Side, heights: &[f32]) {
-        let stack = &mut self.sides[side.index()];
-        if heights.len() != stack.len() {
+    fn set_weights_from_heights(&mut self, side: Side, column: usize, heights: &[f32]) {
+        let Some(col) = self.sides[side.index()].get_mut(column) else {
+            return;
+        };
+        if heights.len() != col.panels.len() {
             return;
         }
         let flexible: Vec<f32> = heights
@@ -642,11 +835,11 @@ impl Layout {
             .map(|h| (h - limits::PANEL_MIN_HEIGHT).max(0.0))
             .collect();
         if flexible.iter().sum::<f32>() <= 1e-6 {
-            for d in stack.iter_mut() {
+            for d in col.panels.iter_mut() {
                 d.weight = 1.0;
             }
         } else {
-            for (d, w) in stack.iter_mut().zip(flexible) {
+            for (d, w) in col.panels.iter_mut().zip(flexible) {
                 d.weight = w;
             }
         }
@@ -685,15 +878,16 @@ impl Layout {
 
     pub fn close(&mut self, kind: PanelKind) {
         self.take(kind);
+        self.prune();
         self.dirty = true;
     }
 
-    /// Put a closed panel back, at the bottom of whichever sidebar has room.
+    /// Put a closed panel back, at the bottom of whichever side has room.
     pub fn open(&mut self, kind: PanelKind) {
         if self.is_open(kind) {
             return;
         }
-        // Prefer the side that already has panels, so reopening does not
+        // Prefer the side that already has columns, so reopening does not
         // conjure a second sidebar the user never asked for.
         let side = if self.sides[Side::Right.index()].is_empty()
             && !self.sides[Side::Left.index()].is_empty()
@@ -702,10 +896,16 @@ impl Layout {
         } else {
             Side::Right
         };
-        self.sides[side.index()].push(Docked {
-            kind,
-            weight: kind.default_weight(),
-        });
+        // Into the innermost column, which is the one nearest the canvas and
+        // so the one the eye reaches first — or a column of its own where the
+        // side is empty.
+        match self.sides[side.index()].last_mut() {
+            Some(col) => col.panels.push(Docked {
+                kind,
+                weight: kind.default_weight(),
+            }),
+            None => self.sides[side.index()].push(Column::of(kind)),
+        }
         self.dirty = true;
     }
 
@@ -718,15 +918,34 @@ impl Layout {
         self.dirty = true;
     }
 
-    /// Remove a panel from wherever it is, reporting where that was.
+    /// Drop any column left with nothing in it.
+    ///
+    /// Not done by [`Self::take`], because a drag deliberately leaves the
+    /// column it emptied standing until the drop resolves — see the module
+    /// comment. Everything that *ends* a drag, and everything that removes a
+    /// panel outright, calls this.
+    fn prune(&mut self) {
+        for side in &mut self.sides {
+            side.retain(|c| !c.panels.is_empty());
+        }
+    }
+
+    /// Remove a panel from wherever it is, reporting where that was. May leave
+    /// an empty column behind; see [`Self::prune`].
     fn take(&mut self, kind: PanelKind) -> Option<Origin> {
         for side in Side::ALL {
-            if let Some(index) = self.sides[side.index()].iter().position(|d| d.kind == kind) {
-                let removed = self.sides[side.index()].remove(index);
+            for column in 0..self.sides[side.index()].len() {
+                let col = &mut self.sides[side.index()][column];
+                let Some(index) = col.panels.iter().position(|d| d.kind == kind) else {
+                    continue;
+                };
+                let removed = col.panels.remove(index);
                 return Some(Origin::Dock {
                     side,
+                    column,
                     index,
                     weight: removed.weight,
+                    width: col.width,
                 });
             }
         }
@@ -738,12 +957,30 @@ impl Layout {
         match origin {
             Origin::Dock {
                 side,
+                column,
                 index,
                 weight,
+                width,
             } => {
-                let stack = &mut self.sides[side.index()];
-                let index = index.min(stack.len());
-                stack.insert(index, Docked { kind, weight });
+                let columns = &mut self.sides[side.index()];
+                match columns.get_mut(column) {
+                    Some(col) => {
+                        let index = index.min(col.panels.len());
+                        col.panels.insert(index, Docked { kind, weight });
+                    }
+                    // The column has gone since — a `close` between the two, or
+                    // a layout replaced under it. Rebuild it where it was.
+                    None => {
+                        let at = column.min(columns.len());
+                        columns.insert(
+                            at,
+                            Column {
+                                panels: vec![Docked { kind, weight }],
+                                width,
+                            },
+                        );
+                    }
+                }
             }
             Origin::Float(rect) => self.floating.push(Floating { kind, rect }),
             // It came from nowhere, so it goes back to nowhere.
@@ -868,19 +1105,44 @@ impl Layout {
     /// Release the dragged panel onto `target`.
     pub fn end_drag(&mut self, target: DropTarget) {
         let Some(drag) = self.drag.take() else { return };
+        let weight = match drag.origin {
+            Origin::Dock { weight, .. } => weight,
+            Origin::Float(_) | Origin::Closed => drag.kind.default_weight(),
+        };
+        let docked = Docked {
+            kind: drag.kind,
+            weight,
+        };
         match target {
-            DropTarget::Dock { side, index } => {
-                let weight = match drag.origin {
-                    Origin::Dock { weight, .. } => weight,
-                    Origin::Float(_) | Origin::Closed => drag.kind.default_weight(),
-                };
-                let stack = &mut self.sides[side.index()];
-                let index = index.min(stack.len());
-                stack.insert(
-                    index,
-                    Docked {
-                        kind: drag.kind,
-                        weight,
+            DropTarget::Dock {
+                side,
+                column,
+                index,
+            } => {
+                let columns = &mut self.sides[side.index()];
+                match columns.get_mut(column) {
+                    Some(col) => {
+                        let index = index.min(col.panels.len());
+                        col.panels.insert(index, docked);
+                    }
+                    None => columns.push(Column::of(drag.kind)),
+                }
+            }
+            DropTarget::NewColumn { side, column } => {
+                // A panel that had a column keeps its width, so moving one
+                // along does not silently resize it.
+                let width = match drag.origin {
+                    Origin::Dock { width, .. } => width,
+                    Origin::Float(_) | Origin::Closed => metrics::PANEL,
+                }
+                .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH);
+                let columns = &mut self.sides[side.index()];
+                let at = column.min(columns.len());
+                columns.insert(
+                    at,
+                    Column {
+                        panels: vec![docked],
+                        width,
                     },
                 );
             }
@@ -891,6 +1153,9 @@ impl Layout {
                 });
             }
         }
+        // After the insert, not before: the target's column index was computed
+        // against a layout that still had the column the drag emptied in it.
+        self.prune();
         self.dirty = true;
     }
 
@@ -898,6 +1163,7 @@ impl Layout {
     pub fn cancel_drag(&mut self) {
         let Some(drag) = self.drag.take() else { return };
         self.put(drag.kind, drag.origin);
+        self.prune();
         self.dirty = true;
     }
 
@@ -908,22 +1174,31 @@ impl Layout {
     /// Hand-rolled rather than serde: the whole format is six line shapes, and
     /// a parser that can be read in one screen is worth more here than a
     /// dependency plus derive macros on types that also carry drag state.
+    ///
+    /// The version header has not moved, and the line that used to be written
+    /// and is not any more is why it did not have to: `width` said how wide a
+    /// side was, which a `column` now says for each of its columns. It is
+    /// still *read* — see [`Self::from_config`].
     pub fn to_config(&self) -> String {
         let mut out = String::from("umber-layout 1\n");
         out.push_str(&format!("rail {}\n", self.rail_side.key()));
         for side in Side::ALL {
-            out.push_str(&format!(
-                "width {} {:.0}\n",
-                side.key(),
-                self.widths[side.index()]
-            ));
-            for d in &self.sides[side.index()] {
-                out.push_str(&format!(
-                    "dock {} {} {:.4}\n",
-                    side.key(),
-                    d.kind.key(),
-                    d.weight
-                ));
+            for column in &self.sides[side.index()] {
+                // A column with nothing in it is a ghost a drag left behind and
+                // is about to be pruned. Never write one out: reading it back
+                // would be an empty strip nobody asked for.
+                if column.panels.is_empty() {
+                    continue;
+                }
+                out.push_str(&format!("column {} {:.0}\n", side.key(), column.width));
+                for d in &column.panels {
+                    out.push_str(&format!(
+                        "dock {} {} {:.4}\n",
+                        side.key(),
+                        d.kind.key(),
+                        d.weight
+                    ));
+                }
             }
         }
         for f in &self.floating {
@@ -946,6 +1221,12 @@ impl Layout {
     /// refusing to start over a stray line would be a poor trade. A wrong
     /// version header *is* fatal, because silently reinterpreting an older
     /// format is how a layout ends up subtly wrong instead of obviously reset.
+    ///
+    /// **`width <side> <points>`** is read and no longer written, and it is the
+    /// whole of why columns cost nobody their arrangement. It said how wide
+    /// that side was, back when a side *was* one column; it now sets the width
+    /// of the column a side implicitly has, so a file with no `column` line at
+    /// all loads as exactly the single column it describes.
     pub fn from_config(text: &str) -> Option<Self> {
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
         if lines.next()? != "umber-layout 1" {
@@ -955,13 +1236,15 @@ impl Layout {
         let mut layout = Self {
             sides: [Vec::new(), Vec::new()],
             floating: Vec::new(),
-            widths: [metrics::PANEL, metrics::PANEL],
             rail_side: Side::Left,
             drag: None,
             edit_mode: false,
             dirty: false,
         };
         let mut seen: Vec<PanelKind> = Vec::new();
+        // The width a side's implicit column takes, from a pre-columns `width`
+        // line. Only ever consulted by a file that has no `column` line at all.
+        let mut implied_width = [metrics::PANEL; 2];
 
         for line in lines {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -973,10 +1256,25 @@ impl Layout {
                 }
                 ["width", side, value] => {
                     if let (Some(side), Ok(value)) = (Side::from_key(side), value.parse::<f32>()) {
-                        layout.widths[side.index()] = value
+                        implied_width[side.index()] = value
                             .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH)
                             .round();
                     }
+                }
+                ["column", side, width] => {
+                    let (Some(side), Ok(width)) = (Side::from_key(side), width.parse::<f32>())
+                    else {
+                        continue;
+                    };
+                    if !width.is_finite() {
+                        continue;
+                    }
+                    layout.sides[side.index()].push(Column {
+                        panels: Vec::new(),
+                        width: width
+                            .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH)
+                            .round(),
+                    });
                 }
                 ["dock", side, kind, weight] => {
                     let (Some(side), Some(kind)) =
@@ -988,10 +1286,21 @@ impl Layout {
                         continue;
                     }
                     seen.push(kind);
-                    layout.sides[side.index()].push(Docked {
-                        kind,
-                        weight: weight.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1000.0),
-                    });
+                    let columns = &mut layout.sides[side.index()];
+                    if columns.is_empty() {
+                        // A pre-columns file: every dock line on this side
+                        // belongs to the one column it implicitly has.
+                        columns.push(Column {
+                            panels: Vec::new(),
+                            width: implied_width[side.index()],
+                        });
+                    }
+                    let weight = weight.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1000.0);
+                    columns
+                        .last_mut()
+                        .expect("just ensured")
+                        .panels
+                        .push(Docked { kind, weight });
                 }
                 ["float", kind, x, y, w, h] => {
                     let Some(kind) = PanelKind::from_key(kind) else {
@@ -1026,6 +1335,11 @@ impl Layout {
                 _ => {}
             }
         }
+
+        // A `column` line with nothing under it — a truncated write, or a file
+        // somebody edited. An empty strip in the workspace is worse than a
+        // column that was never there.
+        layout.prune();
 
         Some(layout)
     }
@@ -1103,6 +1417,21 @@ mod tests {
         Rect::from_min_size(pos2(x, y), vec2(w, h))
     }
 
+    /// The shipped arrangement's one column, which most of these work against.
+    const DOCK: usize = 0;
+
+    fn weights(layout: &Layout, side: Side, column: usize) -> Vec<f32> {
+        layout
+            .docked(side, column)
+            .iter()
+            .map(|d| d.weight)
+            .collect()
+    }
+
+    fn kinds(layout: &Layout, side: Side, column: usize) -> Vec<PanelKind> {
+        layout.docked(side, column).iter().map(|d| d.kind).collect()
+    }
+
     #[test]
     fn stack_heights_fill_exactly() {
         let h = stack_heights(&[3.0, 1.0, 2.0], 600.0);
@@ -1131,21 +1460,11 @@ mod tests {
         // the stack creeps every frame.
         let mut layout = Layout::default();
         let available = 700.0;
-        let weights: Vec<f32> = layout
-            .docked(Side::Right)
-            .iter()
-            .map(|d| d.weight)
-            .collect();
-        let heights = stack_heights(&weights, available);
+        let heights = stack_heights(&weights(&layout, Side::Right, DOCK), available);
 
-        layout.resize_split(Side::Right, 0, 40.0, &heights);
+        layout.resize_split(Side::Right, DOCK, 0, 40.0, &heights);
 
-        let after: Vec<f32> = layout
-            .docked(Side::Right)
-            .iter()
-            .map(|d| d.weight)
-            .collect();
-        let replayed = stack_heights(&after, available);
+        let replayed = stack_heights(&weights(&layout, Side::Right, DOCK), available);
         assert!(
             (replayed[0] - (heights[0] + 40.0)).abs() < 1e-2,
             "{replayed:?}"
@@ -1161,22 +1480,12 @@ mod tests {
     fn a_splitter_cannot_destroy_a_panel() {
         let mut layout = Layout::default();
         let available = 700.0;
-        let weights: Vec<f32> = layout
-            .docked(Side::Right)
-            .iter()
-            .map(|d| d.weight)
-            .collect();
-        let heights = stack_heights(&weights, available);
+        let heights = stack_heights(&weights(&layout, Side::Right, DOCK), available);
 
         // Shove the boundary far past the bottom panel's minimum.
-        layout.resize_split(Side::Right, 0, 10_000.0, &heights);
+        layout.resize_split(Side::Right, DOCK, 0, 10_000.0, &heights);
 
-        let after: Vec<f32> = layout
-            .docked(Side::Right)
-            .iter()
-            .map(|d| d.weight)
-            .collect();
-        let replayed = stack_heights(&after, available);
+        let replayed = stack_heights(&weights(&layout, Side::Right, DOCK), available);
         assert!(
             replayed
                 .iter()
@@ -1186,13 +1495,42 @@ mod tests {
         assert!((replayed.iter().sum::<f32>() - available).abs() < 1e-2);
     }
 
+    /// A splitter drag belongs to one column and must leave the others alone.
     #[test]
-    fn sidebar_width_is_clamped() {
+    fn a_splitter_only_moves_its_own_column() {
+        let mut layout = two_columns_on_the_right();
+        let before = weights(&layout, Side::Right, 0);
+        let inner = stack_heights(&weights(&layout, Side::Right, 1), 700.0);
+        layout.resize_split(Side::Right, 1, 0, 30.0, &inner);
+        assert_eq!(weights(&layout, Side::Right, 0), before);
+    }
+
+    /// Layers pulled out into a column of its own at the very edge, with the
+    /// other two inside it.
+    fn two_columns_on_the_right() -> Layout {
         let mut layout = Layout::default();
-        layout.set_width(Side::Right, 10.0);
-        assert_eq!(layout.width(Side::Right), limits::SIDEBAR_MIN_WIDTH);
-        layout.set_width(Side::Right, 9999.0);
-        assert_eq!(layout.width(Side::Right), limits::SIDEBAR_MAX_WIDTH);
+        layout.set_edit_mode(true);
+        layout.begin_drag(
+            PanelKind::Layers,
+            pos2(1200.0, 700.0),
+            rect(1176.0, 680.0, 264.0, 200.0),
+        );
+        layout.end_drag(DropTarget::NewColumn {
+            side: Side::Right,
+            column: 0,
+        });
+        layout.set_edit_mode(false);
+        assert_eq!(layout.columns(Side::Right).len(), 2);
+        layout
+    }
+
+    #[test]
+    fn a_column_width_is_clamped() {
+        let mut layout = Layout::default();
+        layout.set_width(Side::Right, DOCK, 10.0);
+        assert_eq!(layout.width(Side::Right, DOCK), limits::SIDEBAR_MIN_WIDTH);
+        layout.set_width(Side::Right, DOCK, 9999.0);
+        assert_eq!(layout.width(Side::Right, DOCK), limits::SIDEBAR_MAX_WIDTH);
     }
 
     #[test]
@@ -1201,12 +1539,34 @@ mod tests {
         let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0), 76.0);
         assert_eq!(geo.rail.left(), 0.0);
         assert_eq!(geo.rail.width(), 76.0);
-        assert!(geo.sidebar[Side::Left.index()].is_none());
-        let right = geo.sidebar[Side::Right.index()].expect("default docks on the right");
+        assert!(geo.sidebar(Side::Left).is_none());
+        let right = geo
+            .sidebar(Side::Right)
+            .expect("default docks on the right");
         assert_eq!(right.right(), 1440.0);
         assert_eq!(geo.canvas.left(), 76.0);
         assert_eq!(geo.canvas.right(), right.left());
-        assert_eq!(geo.slots[Side::Right.index()].len(), 3);
+        assert_eq!(geo.columns(Side::Right)[0].slots.len(), 3);
+    }
+
+    /// Two columns on one side sit side by side, outermost first, and the
+    /// canvas is what is left inside both.
+    #[test]
+    fn two_columns_on_a_side_stack_inwards_from_the_edge() {
+        let layout = two_columns_on_the_right();
+        assert_eq!(kinds(&layout, Side::Right, 0), vec![PanelKind::Layers]);
+        assert_eq!(
+            kinds(&layout, Side::Right, 1),
+            vec![PanelKind::Colour, PanelKind::Brushes]
+        );
+
+        let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0), 76.0);
+        let cols = geo.columns(Side::Right);
+        assert_eq!(cols[0].rect.right(), 1440.0, "column 0 is at the edge");
+        assert_eq!(cols[1].rect.right(), cols[0].rect.left());
+        assert_eq!(geo.canvas.right(), cols[1].rect.left());
+        // Both are full height, which is the whole point of the arrangement.
+        assert_eq!(cols[0].rect.height(), cols[1].rect.height());
     }
 
     /// Every rect the layout hands out has to survive a window dragged down to
@@ -1215,16 +1575,29 @@ mod tests {
     /// this is the kind of bug that only shows up as "the interface looked odd
     /// for a moment while I resized".
     ///
-    /// Run over the default layout *and* over one holding every module there
-    /// is, since the stack's minimum height is per panel: a fourth module is a
-    /// fourth minimum to fit into the same sliver of window.
+    /// Run over the default layout, over one holding every module there is, and
+    /// over one with several columns a side, since each column is another
+    /// minimum to fit into the same sliver of window.
     #[test]
     fn a_window_too_small_for_the_chrome_still_produces_sane_rects() {
         let mut crowded = Layout::default();
         for kind in PanelKind::ALL {
             crowded.open(kind);
         }
-        for layout in [Layout::default(), crowded] {
+
+        let mut columned = Layout::default();
+        columned.set_edit_mode(true);
+        for (kind, side, column) in [
+            (PanelKind::Layers, Side::Right, 0),
+            (PanelKind::Brushes, Side::Left, 0),
+            (PanelKind::History, Side::Left, 1),
+        ] {
+            columned.open(kind);
+            columned.begin_drag(kind, pos2(0.0, 0.0), rect(0.0, 0.0, 264.0, 200.0));
+            columned.end_drag(DropTarget::NewColumn { side, column });
+        }
+
+        for layout in [Layout::default(), crowded, columned] {
             small_window_sweep(&layout);
         }
     }
@@ -1241,10 +1614,17 @@ mod tests {
         ] {
             let geo = layout.geometry(rect(0.0, 70.0, w, h), 76.0);
             let mut all = vec![geo.workspace, geo.rail, geo.canvas];
-            all.extend(geo.sidebar.iter().flatten().copied());
-            all.extend(geo.slots.iter().flatten().copied());
-            all.push(geo.drop_zone(Side::Left));
-            all.push(geo.drop_zone(Side::Right));
+            for side in Side::ALL {
+                all.extend(geo.sidebar(side));
+                all.push(geo.drop_zone(side));
+                for column in 0..=geo.columns(side).len() {
+                    all.push(geo.new_column_strip(side, column));
+                }
+                for column in geo.columns(side) {
+                    all.push(column.rect);
+                    all.extend(column.slots.iter().copied());
+                }
+            }
             for r in all {
                 assert!(
                     r.width() >= 0.0 && r.height() >= 0.0,
@@ -1254,7 +1634,7 @@ mod tests {
             // And a drop still resolves to something rather than panicking on
             // the way through the empty slot list.
             let _ = geo.drop_target(pos2(0.0, 0.0));
-            let _ = geo.insertion_line(Side::Right, 0);
+            let _ = geo.insertion_line(Side::Right, 0, 0);
         }
     }
 
@@ -1278,17 +1658,19 @@ mod tests {
     }
 
     #[test]
-    fn dropping_over_a_sidebar_picks_the_slot_under_the_pointer() {
+    fn dropping_over_a_column_picks_the_slot_under_the_pointer() {
         let layout = Layout::default();
         let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
-        let slots = &geo.slots[Side::Right.index()];
+        let slots = &geo.columns(Side::Right)[0].slots;
 
-        // Top half of the first slot inserts above it.
+        // Top half of the first slot inserts above it. Horizontally in the
+        // middle of the column, away from the new-column bands.
         let p = pos2(slots[0].center().x, slots[0].top() + 4.0);
         assert_eq!(
             geo.drop_target(p),
             DropTarget::Dock {
                 side: Side::Right,
+                column: 0,
                 index: 0
             }
         );
@@ -1299,21 +1681,62 @@ mod tests {
             geo.drop_target(p),
             DropTarget::Dock {
                 side: Side::Right,
+                column: 0,
                 index: slots.len()
             }
         );
     }
 
+    /// The edges of a column are where a *new* column is asked for, and the two
+    /// sides of one boundary have to name the same index or the indicator would
+    /// jump as the pointer crossed it.
     #[test]
-    fn an_empty_sidebar_still_accepts_a_drop() {
+    fn the_edge_of_a_column_asks_for_a_new_one() {
+        let layout = two_columns_on_the_right();
+        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        let cols = geo.columns(Side::Right);
+
+        // Hard against the window edge: outside everything docked.
+        assert_eq!(
+            geo.drop_target(pos2(1439.0, 400.0)),
+            DropTarget::NewColumn {
+                side: Side::Right,
+                column: 0
+            }
+        );
+        // The boundary between the two columns, from either side of it.
+        let boundary = cols[0].rect.left();
+        for x in [boundary + 2.0, boundary - 2.0] {
+            assert_eq!(
+                geo.drop_target(pos2(x, 400.0)),
+                DropTarget::NewColumn {
+                    side: Side::Right,
+                    column: 1
+                },
+                "at {x}"
+            );
+        }
+        // And inside the innermost column, against the canvas.
+        assert_eq!(
+            geo.drop_target(pos2(cols[1].rect.left() + 2.0, 400.0)),
+            DropTarget::NewColumn {
+                side: Side::Right,
+                column: 2
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_side_still_accepts_a_drop() {
         let layout = Layout::default();
         let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        assert!(geo.columns(Side::Left).is_empty());
         let zone = geo.drop_zone(Side::Left);
         assert_eq!(
             geo.drop_target(zone.center()),
-            DropTarget::Dock {
+            DropTarget::NewColumn {
                 side: Side::Left,
-                index: 0
+                column: 0
             }
         );
     }
@@ -1338,11 +1761,37 @@ mod tests {
         );
         assert!(layout.is_dragging());
         assert!(!layout.is_open(PanelKind::Brushes));
-        assert_eq!(layout.docked(Side::Right).len(), 2);
+        assert_eq!(layout.docked(Side::Right, DOCK).len(), 2);
 
         layout.cancel_drag();
         assert!(!layout.is_dragging());
         assert_eq!(layout.to_config(), before);
+    }
+
+    /// A drag that empties a column leaves it standing until the drop resolves
+    /// — otherwise every column outside it slides sideways under the pointer,
+    /// and the column indices the drop is computed against renumber mid-drag.
+    #[test]
+    fn a_column_emptied_by_a_drag_survives_until_the_drop() {
+        let mut layout = two_columns_on_the_right();
+        layout.set_edit_mode(true);
+
+        layout.begin_drag(
+            PanelKind::Layers,
+            pos2(1400.0, 200.0),
+            rect(1176.0, 180.0, 264.0, 200.0),
+        );
+        assert_eq!(
+            layout.columns(Side::Right).len(),
+            2,
+            "the column it emptied is still there"
+        );
+        assert!(layout.columns(Side::Right)[0].panels.is_empty());
+        // And the empty one is never written down.
+        assert_eq!(layout.to_config().matches("column right").count(), 1);
+
+        layout.end_drag(DropTarget::Float);
+        assert_eq!(layout.columns(Side::Right).len(), 1, "and then it goes");
     }
 
     #[test]
@@ -1354,13 +1803,12 @@ mod tests {
             pos2(1200.0, 700.0),
             rect(1176.0, 680.0, 264.0, 200.0),
         );
-        layout.end_drag(DropTarget::Dock {
+        layout.end_drag(DropTarget::NewColumn {
             side: Side::Left,
-            index: 0,
+            column: 0,
         });
-        assert_eq!(layout.docked(Side::Left).len(), 1);
-        assert_eq!(layout.docked(Side::Left)[0].kind, PanelKind::Layers);
-        assert_eq!(layout.docked(Side::Right).len(), 2);
+        assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::Layers]);
+        assert_eq!(layout.docked(Side::Right, DOCK).len(), 2);
     }
 
     #[test]
@@ -1375,16 +1823,38 @@ mod tests {
         layout.drag_to(pos2(600.0, 400.0));
         layout.end_drag(DropTarget::Float);
         assert_eq!(layout.floating().len(), 1);
-        assert_eq!(layout.docked(Side::Right).len(), 2);
+        assert_eq!(layout.docked(Side::Right, DOCK).len(), 2);
 
         let rect = layout.floating()[0].rect;
         layout.begin_drag(PanelKind::Colour, rect.center(), rect);
         layout.end_drag(DropTarget::Dock {
             side: Side::Right,
+            column: DOCK,
             index: 0,
         });
         assert!(layout.floating().is_empty());
-        assert_eq!(layout.docked(Side::Right)[0].kind, PanelKind::Colour);
+        assert_eq!(layout.docked(Side::Right, DOCK)[0].kind, PanelKind::Colour);
+    }
+
+    /// A column moved somewhere else keeps the width it was dragged to. Losing
+    /// it would make every move a silent resize.
+    #[test]
+    fn a_column_dropped_somewhere_else_keeps_its_width() {
+        let mut layout = two_columns_on_the_right();
+        layout.set_width(Side::Right, 0, 210.0);
+        layout.set_edit_mode(true);
+
+        layout.begin_drag(
+            PanelKind::Layers,
+            pos2(1400.0, 200.0),
+            rect(1176.0, 180.0, 210.0, 200.0),
+        );
+        layout.end_drag(DropTarget::NewColumn {
+            side: Side::Left,
+            column: 0,
+        });
+        assert_eq!(layout.width(Side::Left, 0), 210.0);
+        assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::Layers]);
     }
 
     #[test]
@@ -1394,17 +1864,30 @@ mod tests {
         assert!(!layout.is_open(PanelKind::Brushes));
         layout.open(PanelKind::Brushes);
         layout.open(PanelKind::Brushes);
-        let count = Side::ALL
+        let count: usize = Side::ALL
             .iter()
-            .map(|s| {
-                layout
-                    .docked(*s)
+            .flat_map(|s| layout.columns(*s))
+            .map(|c| {
+                c.panels
                     .iter()
                     .filter(|d| d.kind == PanelKind::Brushes)
                     .count()
             })
-            .sum::<usize>();
+            .sum();
         assert_eq!(count, 1);
+    }
+
+    /// Closing the only module in a column takes the column with it, or the
+    /// workspace keeps a blank strip nobody can fill or remove.
+    #[test]
+    fn closing_the_last_module_in_a_column_removes_the_column() {
+        let mut layout = two_columns_on_the_right();
+        layout.close(PanelKind::Layers);
+        assert_eq!(layout.columns(Side::Right).len(), 1);
+        assert_eq!(
+            kinds(&layout, Side::Right, 0),
+            vec![PanelKind::Colour, PanelKind::Brushes]
+        );
     }
 
     #[test]
@@ -1412,7 +1895,7 @@ mod tests {
         let mut layout = Layout::default();
         layout.set_edit_mode(true);
         layout.set_rail_side(Side::Right);
-        layout.set_width(Side::Left, 300.0);
+        layout.set_width(Side::Right, DOCK, 300.0);
         layout.begin_drag(
             PanelKind::Colour,
             pos2(1200.0, 200.0),
@@ -1425,18 +1908,45 @@ mod tests {
             pos2(1200.0, 700.0),
             rect(1176.0, 680.0, 264.0, 200.0),
         );
-        layout.end_drag(DropTarget::Dock {
+        layout.end_drag(DropTarget::NewColumn {
             side: Side::Left,
-            index: 0,
+            column: 0,
         });
 
         let text = layout.to_config();
         let back = Layout::from_config(&text).expect("valid config");
         assert_eq!(back.to_config(), text);
         assert_eq!(back.rail_side(), layout.rail_side());
-        assert_eq!(back.width(Side::Left), layout.width(Side::Left));
-        assert_eq!(back.docked(Side::Left), layout.docked(Side::Left));
+        assert_eq!(back.columns(Side::Left), layout.columns(Side::Left));
+        assert_eq!(back.columns(Side::Right), layout.columns(Side::Right));
         assert_eq!(back.floating(), layout.floating());
+    }
+
+    /// Several columns a side, with their own widths, have to come back in the
+    /// same order — outermost first — or the workspace mirrors itself on the
+    /// next launch.
+    #[test]
+    fn several_columns_a_side_round_trip_in_order() {
+        let mut layout = Layout::default();
+        layout.set_edit_mode(true);
+        for (kind, column) in [(PanelKind::Colour, 0), (PanelKind::Brushes, 1)] {
+            layout.begin_drag(kind, pos2(0.0, 0.0), rect(0.0, 0.0, 264.0, 200.0));
+            layout.end_drag(DropTarget::NewColumn {
+                side: Side::Right,
+                column,
+            });
+        }
+        layout.set_width(Side::Right, 0, 240.0);
+        layout.set_width(Side::Right, 1, 320.0);
+        assert_eq!(layout.columns(Side::Right).len(), 3);
+
+        let text = layout.to_config();
+        let back = Layout::from_config(&text).expect("valid config");
+        assert_eq!(back.to_config(), text);
+        assert_eq!(kinds(&back, Side::Right, 0), vec![PanelKind::Colour]);
+        assert_eq!(kinds(&back, Side::Right, 1), vec![PanelKind::Brushes]);
+        assert_eq!(back.width(Side::Right, 0), 240.0);
+        assert_eq!(back.width(Side::Right, 1), 320.0);
     }
 
     #[test]
@@ -1449,20 +1959,28 @@ mod tests {
     fn a_damaged_config_loses_only_the_damaged_lines() {
         let text = "umber-layout 1\n\
                     rail sideways\n\
-                    width right not-a-number\n\
+                    column right not-a-number\n\
+                    column right 300\n\
                     dock right colour 3\n\
                     dock right colour 9\n\
+                    column left 200\n\
                     dock left brushes 1\n\
+                    column left 250\n\
                     nonsense here\n";
         let layout = Layout::from_config(text).expect("still loads");
         assert_eq!(layout.rail_side(), Side::Left, "bad side falls back");
-        assert_eq!(layout.width(Side::Right), metrics::PANEL);
+        assert_eq!(layout.width(Side::Right, 0), 300.0);
         assert_eq!(
-            layout.docked(Side::Right).len(),
+            layout.docked(Side::Right, 0).len(),
             1,
             "the duplicate is dropped"
         );
-        assert_eq!(layout.docked(Side::Left).len(), 1);
+        assert_eq!(layout.docked(Side::Left, 0).len(), 1);
+        assert_eq!(
+            layout.columns(Side::Left).len(),
+            1,
+            "a column with nothing under it is not a column"
+        );
         assert!(
             !layout.is_open(PanelKind::Layers),
             "an absent panel is closed"
@@ -1551,16 +2069,16 @@ mod tests {
             pos2(1200.0, 700.0),
             rect(1176.0, 680.0, 264.0, 200.0),
         );
-        layout.end_drag(DropTarget::Dock {
+        layout.end_drag(DropTarget::NewColumn {
             side: Side::Left,
-            index: 0,
+            column: 0,
         });
 
         let text = layout.to_config();
         assert!(text.contains("history"), "{text}");
         let back = Layout::from_config(&text).expect("valid config");
         assert_eq!(back.to_config(), text);
-        assert_eq!(back.docked(Side::Left)[0].kind, PanelKind::History);
+        assert_eq!(back.docked(Side::Left, 0)[0].kind, PanelKind::History);
     }
 
     /// A layout file written before the History module existed names three
@@ -1568,26 +2086,39 @@ mod tests {
     /// with History closed, which is where the shipped arrangement puts it too,
     /// so an upgraded workspace and a fresh one agree. That is the reason the
     /// version header did not have to move; see `PanelKind::DEFAULT_DOCK`.
+    ///
+    /// It also predates columns, so its one list per side has to arrive as one
+    /// column per side, at the width the `width` line gives — which is the
+    /// whole of what "no version bump" has to mean for the column change.
     #[test]
-    fn a_config_written_before_the_history_module_still_loads() {
+    fn a_config_written_before_columns_loads_as_one_column_a_side() {
         let text = "umber-layout 1\n\
                     rail left\n\
                     width left 264\n\
+                    dock left history 2\n\
                     width right 300\n\
                     dock right colour 3\n\
                     dock right brushes 1.3\n\
                     dock right layers 2.2\n";
         let layout = Layout::from_config(text).expect("still loads");
-        assert_eq!(layout.docked(Side::Right).len(), 3);
-        assert_eq!(layout.width(Side::Right), 300.0);
-        assert!(
-            !layout.is_open(PanelKind::History),
-            "an absent panel is a closed one",
+
+        assert_eq!(layout.rail_side(), Side::Left);
+        assert_eq!(
+            layout.columns(Side::Right).len(),
+            1,
+            "one column, as before"
         );
-        // And it is reachable, so nothing has been lost by not being named.
-        let mut layout = layout;
-        layout.open(PanelKind::History);
-        assert!(layout.is_open(PanelKind::History));
+        assert_eq!(
+            kinds(&layout, Side::Right, 0),
+            vec![PanelKind::Colour, PanelKind::Brushes, PanelKind::Layers]
+        );
+        assert_eq!(layout.width(Side::Right, 0), 300.0, "and at its own width");
+        // The stack's own proportions come back untouched.
+        assert_eq!(weights(&layout, Side::Right, 0), vec![3.0, 1.3, 2.2]);
+
+        assert_eq!(layout.columns(Side::Left).len(), 1);
+        assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::History]);
+        assert_eq!(layout.width(Side::Left, 0), 264.0);
     }
 
     /// The edit-mode remove control. Whatever else it does, a removed module
@@ -1597,15 +2128,16 @@ mod tests {
         let mut layout = Layout::default();
         layout.close(PanelKind::Layers);
         assert!(!layout.is_open(PanelKind::Layers));
-        assert_eq!(layout.docked(Side::Right).len(), 2);
+        assert_eq!(layout.docked(Side::Right, DOCK).len(), 2);
 
         layout.add_dragging(PanelKind::Layers, pos2(600.0, 400.0));
         layout.end_drag(DropTarget::Dock {
             side: Side::Right,
+            column: DOCK,
             index: 2,
         });
         assert!(layout.is_open(PanelKind::Layers));
-        assert_eq!(layout.docked(Side::Right).len(), 3);
+        assert_eq!(layout.docked(Side::Right, DOCK).len(), 3);
     }
 
     /// Adding from the library leaves the module in the pointer's hand, in the
@@ -1649,6 +2181,26 @@ mod tests {
 
         assert!(!layout.is_open(PanelKind::History));
         assert_eq!(layout.to_config(), before);
+    }
+
+    /// And the same for a module lifted out of a column of its own: cancelling
+    /// has to put the column back, not leave the side one short.
+    #[test]
+    fn cancelling_a_drag_out_of_a_lone_column_puts_the_column_back() {
+        let mut layout = two_columns_on_the_right();
+        layout.set_edit_mode(true);
+        let before = layout.to_config();
+
+        layout.begin_drag(
+            PanelKind::Layers,
+            pos2(1400.0, 200.0),
+            rect(1176.0, 180.0, 264.0, 200.0),
+        );
+        layout.drag_to(pos2(600.0, 400.0));
+        layout.cancel_drag();
+
+        assert_eq!(layout.to_config(), before);
+        assert_eq!(layout.columns(Side::Right).len(), 2);
     }
 
     /// A sticky drag cannot end on a release — the release that started it has
