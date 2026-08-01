@@ -22,6 +22,7 @@ mod pattern_table;
 pub mod preset;
 pub mod stroke;
 pub mod style;
+pub mod time;
 pub mod tip;
 mod tip_table;
 
@@ -39,4 +40,5 @@ pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
 pub use stroke::{Dab, StrokeBuilder};
+pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, stroke_coverage};

@@ -279,8 +279,13 @@ impl ImportedDocument {
                 let mut entries = Vec::with_capacity(saved.entries.len());
                 for edit in saved.entries {
                     let slot = stack.get(edit.layer)?.slot();
-                    entries.push(Edit::new(
+                    // `made_at`, never `new`: an edit read out of a file was
+                    // made when the file says, and stamping it with the moment
+                    // the document was opened would tell the History list that
+                    // yesterday's afternoon of painting happened in one second.
+                    entries.push(Edit::made_at(
                         edit.kind,
+                        edit.at,
                         PixelPatch::new(edit.rect, slot, edit.bytes),
                     ));
                 }

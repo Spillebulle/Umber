@@ -173,12 +173,13 @@ and view. **Export flat PNG** means what it says — one image, for showing
 people. Save is what keeps the layers.
 
 **A saved document carries its undo history**, so one reopened tomorrow can
-still be stepped back through, redo included. It rides as private entries every
-other OpenRaster reader walks straight past, so the file is still an ordinary
-`.ora`. The limit is the newest 32 MB of edits: on a sketching session that is
-under half a megabyte and free, and on an afternoon of full-canvas painting it
-is the difference between a 9.7 MB file and a 41.5 MB one. **Settings → General**
-switches it off, with the trade stated in megabytes rather than in adverbs.
+still be stepped back through, redo included, with the times intact. It rides as
+private entries every other OpenRaster reader walks straight past, so the file is
+still an ordinary `.ora`. The limit is the newest 32 MB of edits: on a sketching
+session that is under half a megabyte and free, and on an afternoon of
+full-canvas painting it is the difference between a 9.7 MB file and a 41.5 MB
+one. **Settings → General** switches it off, with the trade stated in megabytes
+rather than in adverbs.
 
 ## The workspace
 
@@ -200,7 +201,10 @@ and snaps to whichever side you release it on. `Esc` puts a module back.
 sentence saying what it is for. Adding one hands it to the pointer and you click
 where you want it. Among them is **History**: a viewable list of everything
 painted on the document, with a marker showing where you stand — click any entry
-to go there.
+to go there. Each row carries the mark of the tool that made it and how long
+after the previous one it happened, so the pauses in a session are visible at a
+glance; hover a time for the full date. Times are UTC, and an entry from a
+document saved before Umber recorded them shows none rather than a made-up one.
 
 Your arrangement is saved between runs.
 

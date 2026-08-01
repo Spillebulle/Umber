@@ -24,7 +24,8 @@ use egui::{
     Align, Align2, CursorIcon, FontId, Frame, Id, LayerId, Layout, Order, Pos2, Rect, Sense,
     Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
-use umber_core::{BlendMode, LayerStack};
+use std::time::Duration;
+use umber_core::{BlendMode, EditKind, LayerStack, Timestamp};
 
 /// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
 /// target is not something anyone can hit.
@@ -778,15 +779,40 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     }
 }
 
-/// The History module: what has been painted on this document, and a click to
-/// go back to any point in it.
+/// One row of the History list, as the list has worked it out.
+///
+/// A struct rather than seven positional arguments, because four of them are
+/// booleans and a call site that reads `true, false, true, false` is one nobody
+/// can check.
+struct HistoryRow {
+    /// What made the mark. A row's icon is the icon of the *tool* that made it
+    /// — the brush mark for a stroke, the eraser block for an erase — so the
+    /// list and the tool rail name the same action the same way. There is no
+    /// icon here for anything Umber cannot undo; see [`history_body`].
+    icon: Icon,
+    label: &'static str,
+    /// How long after the previous entry this one was made. `None` at the top
+    /// of the list, and for an entry either side of which has no recorded time.
+    gap: Option<Duration>,
+    /// When it was made, for the tooltip. `None` for an entry restored from a
+    /// document written before histories carried times.
+    at: Option<Timestamp>,
+    applied: bool,
+    current: bool,
+    scroll_here: bool,
+}
+
+/// The History module: what has been painted on this document, when, and a
+/// click to go back to any point in it.
 ///
 /// What it deliberately does *not* show is anything it cannot restore. Umber's
 /// history covers painting only — adding, deleting or reordering a layer is not
 /// recorded, and deleting one clears the list outright — so a row appears only
 /// where a patch was captured, and the note at the foot says so rather than
 /// leaving the gap to be discovered. A list that named a structural action it
-/// could not undo would be worse than one that admits its own edges.
+/// could not undo would be worse than one that admits its own edges. That is
+/// also why there are exactly two edit icons: an icon set richer than
+/// `EditKind` would be a promise about what the engine records.
 fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let position = ed.history.position();
     let count = ed.history.len();
@@ -811,7 +837,19 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
         "Opened"
     };
     let at_start = position == 0;
-    if history_row(ui, p, base, true, at_start, at_start && follow).clicked() {
+    let opened = HistoryRow {
+        icon: Icon::Document,
+        label: base,
+        // The document as it opened is not an edit and was not timed. Nothing
+        // is shown against it rather than the moment the file happened to be
+        // read, which is not when any of this was painted.
+        gap: None,
+        at: None,
+        applied: true,
+        current: at_start,
+        scroll_here: at_start && follow,
+    };
+    if history_row(ui, p, &opened).clicked() {
         jump = Some(0);
     }
 
@@ -823,7 +861,16 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
         // click on one of those is a redo.
         let applied = index < position;
         let current = position == index + 1;
-        if history_row(ui, p, kind.label(), applied, current, current && follow).clicked() {
+        let row = HistoryRow {
+            icon: edit_icon(kind),
+            label: kind.label(),
+            gap: ed.history.gap_at(index),
+            at: ed.history.time_at(index),
+            applied,
+            current,
+            scroll_here: current && follow,
+        };
+        if history_row(ui, p, &row).clicked() {
             jump = Some(index + 1);
         }
     }
@@ -848,24 +895,33 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
     );
 }
 
-/// One entry in that list: a marker, then what the edit was.
+/// Which mark stands for an edit of this kind.
 ///
-/// Nothing here allocates and nothing off screen is painted. The list is as
-/// long as the session is, and both of those show up in a frame time before
-/// anything else about it does.
-fn history_row(
-    ui: &mut Ui,
-    p: &Palette,
-    label: &'static str,
-    applied: bool,
-    current: bool,
-    scroll_here: bool,
-) -> egui::Response {
+/// The tool's own icon, so a row and the rail agree. Exhaustive over
+/// [`EditKind`] on purpose: adding a variant to that enum should not compile
+/// until somebody has decided what it looks like.
+fn edit_icon(kind: EditKind) -> Icon {
+    match kind {
+        EditKind::Paint => Icon::Brush,
+        EditKind::Erase => Icon::Eraser,
+    }
+}
+
+/// One entry in that list: a marker, what made the mark, what it was, and how
+/// long after the entry before it that happened.
+///
+/// Nothing off screen is painted and nothing here reaches the heap that egui
+/// would not have reached anyway: the elapsed figure is formatted into
+/// [`umber_core::time::Brief`], which lives on the stack, and the exact date is
+/// spelled out only for the one row a pointer is actually over. The list is as
+/// long as the session is, and a `format!` per visible row per frame shows up
+/// in a frame time before anything else about it does.
+fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), metrics::HISTORY_ROW),
         Sense::click(),
     );
-    if scroll_here {
+    if row.scroll_here {
         response.scroll_to_me(Some(Align::Center));
     }
     if !ui.is_rect_visible(rect) {
@@ -873,7 +929,7 @@ fn history_row(
     }
 
     let painter = ui.painter();
-    if current {
+    if row.current {
         painter.rect_filled(rect, metrics::RADIUS, p.control_active);
     } else if response.hovered() {
         painter.rect_filled(rect, metrics::RADIUS, p.control);
@@ -881,30 +937,81 @@ fn history_row(
 
     // The marker is the cursor: filled and accented where the document stands,
     // hollow behind it, and hollow and dim ahead of it.
-    let ink = match (current, applied) {
+    let ink = match (row.current, row.applied) {
         (true, _) => p.accent,
         (false, true) => p.text,
         (false, false) => p.text_dim.gamma_multiply(0.55),
     };
-    let dot = pos2(rect.left() + 8.0, rect.center().y);
-    if current {
+    let dot = pos2(rect.left() + 7.0, rect.center().y);
+    if row.current {
         painter.circle_filled(dot, 3.5, ink);
     } else {
         painter.circle_stroke(dot, 3.0, Stroke::new(1.0, ink));
     }
-    painter.text(
-        pos2(dot.x + 9.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(text::SMALL),
-        ink,
-    );
 
-    response.on_hover_text(if applied {
-        "Go back to this point"
-    } else {
-        "Put this back"
-    })
+    let icon_rect = Rect::from_center_size(pos2(dot.x + 13.0, rect.center().y), vec2(12.0, 12.0));
+    icons::draw(painter, icon_rect, row.icon, ink);
+
+    // The elapsed column, right-aligned, and the first thing drawn because the
+    // label is clipped to whatever it leaves behind. `Painter::text` hands back
+    // the rect it used, which is also the region the date tooltip answers to —
+    // measuring it a second time would be a second layout of the same glyphs.
+    //
+    // A row that has a time but no measurable gap — the first entry, or a pair
+    // the clock put in the wrong order — draws a hyphen, so its date is still
+    // reachable by hovering. A row with no time at all draws nothing: there is
+    // nothing to hover for, and an empty cell is the honest report.
+    let dim = ink.gamma_multiply(0.7);
+    let elapsed = row.gap.map(umber_core::time::brief);
+    let time_rect = match (elapsed.as_ref(), row.at) {
+        (Some(brief), _) => Some(brief.as_str()),
+        (None, Some(_)) => Some("-"),
+        (None, None) => None,
+    }
+    .map(|text| {
+        painter.text(
+            pos2(rect.right() - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            text,
+            FontId::proportional(text::TINY),
+            dim,
+        )
+    });
+
+    // Clipped rather than shortened: the panel can be dragged narrow and this
+    // is the column that gives, but the elapsed figure must never be walked
+    // over by a label that has run out of room.
+    let label_left = icon_rect.right() + 4.0;
+    let label_right = time_rect.map_or(rect.right(), |r| r.left()) - 5.0;
+    let clip = Rect::from_min_max(
+        pos2(label_left, rect.top()),
+        pos2(label_right.max(label_left), rect.bottom()),
+    );
+    painter
+        .with_clip_rect(clip.intersect(painter.clip_rect()))
+        .text(
+            pos2(label_left, rect.center().y),
+            Align2::LEFT_CENTER,
+            row.label,
+            FontId::proportional(text::SMALL),
+            ink,
+        );
+
+    // One tooltip or the other, decided by where the pointer is, rather than a
+    // second interactive widget inside the row: an `interact` over part of a
+    // clickable row would take the click with it.
+    let over_time = match (time_rect, response.hover_pos()) {
+        (Some(r), Some(pos)) => r.expand(4.0).contains(pos),
+        _ => false,
+    };
+    match (over_time, row.at) {
+        (true, Some(at)) => response.on_hover_text(at.describe()),
+        _ => response.on_hover_text(if row.applied {
+            "Go back to this point"
+        } else {
+            "Put this back"
+        }),
+    }
 }
 
 /// The Colour panel's picker-type switch: a half-filled disc, the mode name,

@@ -125,11 +125,32 @@ layer would otherwise preview wrongly and then jump on release.
   and a stale entry would otherwise be replayed into the wrong layer. Resizing
   the canvas clears it for the same kind of reason: a rectangle of the old
   canvas means different pixels on the new one. Every entry carries what it
-  was, and the two stacks read as one timeline, which is what the History
-  module lists; a jump to a point in it is that many single steps, because
-  there are no snapshots to jump to. A save writes the newest 32 MB of it into
-  the document, keyed by stack position rather than by slot, and refuses to
-  restore a history that does not match the stack that loaded.
+  was and when it happened, and the two stacks read as one timeline, which is
+  what the History module lists; a jump to a point in it is that many single
+  steps, because there are no snapshots to jump to. A save writes the newest
+  32 MB of it into the document, keyed by stack position rather than by slot,
+  and refuses to restore a history that does not match the stack that loaded.
+- **The History module's time column is a gap, not an age.** `History::gap_at`
+  measures from the entry before, which is a property of the pair and so does
+  not go stale — an age would need the panel repainted every second to stay
+  true. Both the kind and the time travel with an entry as undo and redo move
+  it between the stacks (`Edit::made_at`), so stepping through the list neither
+  renumbers nor re-times it. A row's icon is the icon of the *tool* that made
+  the mark, and `panels::edit_icon` is exhaustive over `EditKind` on purpose:
+  the list must not be able to grow rows for actions the engine cannot restore.
+- **Times are wall-clock, UTC, and optional.** `umber_core::time::Timestamp` is
+  Unix milliseconds — an `Instant` means nothing outside the run that produced
+  it, and these are written into documents. `Timestamp::since` returns `None`
+  rather than clamping when the later stamp precedes the earlier one, because
+  an NTP correction or a changed clock is not an interval an artist spent, and
+  a plausible number in place of one we do not have is the worse failure. An
+  entry from a document written before timestamps existed keeps `None` all the
+  way to an empty column. Calendar arithmetic is Hinnant's `civil_from_days`,
+  about twenty lines, tested across 1970, 2000 and 2100 and against an
+  independent calendar for every day of forty years — no date crate, because
+  the only thing one would add over this is *local* time, and `time`'s
+  local-offset declines to answer in a multi-threaded process, which Umber is.
+  Everything shown is labelled UTC for that reason.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 

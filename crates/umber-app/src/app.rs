@@ -311,11 +311,13 @@ impl UmberApp {
         let current =
             canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
-        // The label travels with the entry rather than being recomputed, so an
-        // undone stroke keeps its name on the far side of the cursor and the
-        // list does not renumber itself as it is stepped through.
-        self.editor.history.push_redo(Edit::new(
+        // The label and the time travel with the entry rather than being
+        // recomputed, so an undone stroke keeps its name and the moment it was
+        // painted on the far side of the cursor — the list neither renumbers
+        // nor re-times itself as it is stepped through.
+        self.editor.history.push_redo(Edit::made_at(
             edit.kind,
+            edit.at,
             PixelPatch::new(patch.rect, patch.slot, current),
         ));
         self.editor.mark_modified();
@@ -334,8 +336,9 @@ impl UmberApp {
         let current =
             canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
-        self.editor.history.push_undo(Edit::new(
+        self.editor.history.push_undo(Edit::made_at(
             edit.kind,
+            edit.at,
             PixelPatch::new(patch.rect, patch.slot, current),
         ));
         self.editor.mark_modified();
