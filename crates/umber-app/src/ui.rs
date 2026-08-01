@@ -169,6 +169,12 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
 
     brush_editor(root, &p, ed);
     crate::settings::show(root, &p, ed);
+    // About, the first-run notice about the update check, and the prompt the
+    // check raises. Drawn from here rather than from the Help menu, for the
+    // same reason the brush library's modals are drawn from `panels`: a menu
+    // closes the moment it is clicked, and a dialog owned by something that is
+    // no longer on screen cannot be shut.
+    crate::about::show(root, &p, ed);
 
     // Drawn here rather than from a panel body, for the same reason the brush
     // library's modals are: the layout can hide a panel, and a modal that goes
@@ -343,10 +349,19 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
             });
 
             ui.menu_button("Help", |ui| {
-                ui.label(
-                    egui::RichText::new(format!("Umber {}", env!("CARGO_PKG_VERSION"))).strong(),
-                );
-                ui.label(egui::RichText::new("GPL-3.0-or-later").small().weak());
+                if ui.button("Check for updates…").clicked() {
+                    ed.updates.check();
+                    // Opened alongside, because that is where the answer
+                    // appears: a check whose result had nowhere to land would
+                    // be a menu item that does nothing visible.
+                    ed.ui.about_open = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("About Umber").clicked() {
+                    ed.ui.about_open = true;
+                    ui.close();
+                }
             });
         });
 

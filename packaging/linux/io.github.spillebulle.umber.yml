@@ -28,6 +28,15 @@ finish-args:
   - --filesystem=home
   - --filesystem=xdg-pictures
 
+# Deliberately **no `--share=network`**, and Umber knows it:
+# `update::Updates::check_unavailable` switches the update check off inside a
+# Flatpak rather than letting it time out and report a failure that is really a
+# decision. Flatpak already keeps this bundle current — `flatpak update`, or any
+# software centre — so opening the sandbox would buy a duplicate of something
+# that already works, at the price of giving a painting application the network.
+# If some later feature genuinely needs it, this is the line to change and the
+# About dialog's wording is the other half of the change.
+
 modules:
   - name: umber
     buildsystem: simple

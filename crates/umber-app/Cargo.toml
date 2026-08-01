@@ -40,6 +40,31 @@ softbuffer = "0.4"
 skrifa = "0.42"
 ab_glyph_rasterizer = "0.1"
 
+# The update check (`update/`). Desktop only: it asks GitHub what the newest
+# release is, and — where the installation is not a package manager's — fetches
+# one of its assets and swaps the binary.
+#
+# `ureq` with **rustls and no default features**. rustls rather than native-tls
+# because native-tls is OpenSSL on Linux, and an OpenSSL C build would have to
+# be satisfied on both aarch64 cross-builds and inside the Flatpak sandbox —
+# where there is no system OpenSSL to link against. Roots come from
+# `webpki-roots`, compiled in, for the same reason: the AppImage and the Flatpak
+# cannot rely on the host's certificate store being where they expect it.
+# `default-features = false` drops `gzip`, which only matters for a response
+# body measured in kilobytes and would otherwise put a second copy of the
+# decompressor in the binary.
+#
+# `serde`/`serde_json` read the release JSON. Both are already in the tree under
+# `umber-core`, so neither is a new build. `zip`, `tar` and `flate2` open the
+# release archive far enough to lift one file out of it — the same `zip` the
+# document format uses, with its codec list already cut down.
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zip = { workspace = true }
+tar = "0.4"
+flate2 = "1"
+
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }
 android_logger = "0.15"

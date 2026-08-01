@@ -68,6 +68,8 @@ pub struct UiState {
     /// The module library — every dockable module, and the way to put one back
     /// after it has been removed from the layout.
     pub module_library_open: bool,
+    /// Help, About. The update prompts raise themselves and are not here.
+    pub about_open: bool,
     /// Tab whose close is waiting on confirmation, if any.
     pub close_prompt: Option<usize>,
     /// Which row of the brush editor's Inputs list is open for editing.
@@ -118,6 +120,7 @@ impl Default for UiState {
             settings_open: false,
             settings_tab: SettingsTab::Themes,
             module_library_open: false,
+            about_open: false,
             close_prompt: None,
             modulation: 0,
         }
@@ -163,6 +166,10 @@ pub struct Editor {
     /// has the same reason to be its own source of truth here as in the Colour
     /// panel. Seeded from the live document when a dialog opens.
     pub canvas_form: crate::canvasdlg::CanvasForm,
+    /// The update check: whether it runs, what it last said, and how this copy
+    /// was installed. Kept out of [`UiState`] because it holds a channel and a
+    /// downloaded release, neither of which is `Copy`.
+    pub updates: crate::update::Updates,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -236,6 +243,7 @@ impl Default for Editor {
             notice: None,
             ui: UiState::default(),
             canvas_form: crate::canvasdlg::CanvasForm::default(),
+            updates: crate::update::Updates::default(),
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),

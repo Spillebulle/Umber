@@ -236,7 +236,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.add_space(10.0);
 
             match ed.ui.settings_tab {
-                SettingsTab::General => general_pane(ui, p),
+                SettingsTab::General => general_pane(ui, p, ed),
                 SettingsTab::Pressure => pressure_pane(ui, p, ed),
                 SettingsTab::Themes => themes_pane(ui, p, ed),
                 SettingsTab::Shortcuts => shortcuts_pane(ui, p),
@@ -257,7 +257,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 // General
 // ---------------------------------------------------------------------------
 
-fn general_pane(ui: &mut egui::Ui, p: &Palette) {
+fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     controls::section(ui, p, "Interface");
     ui.scope(|ui| {
         ui.set_max_width(320.0);
@@ -297,6 +297,31 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette) {
              for exactly as long, so there is nothing to switch.",
         );
     });
+
+    ui.add_space(8.0);
+    // The one control in Umber that governs a request leaving the machine, so
+    // it is a live switch rather than a note — and it sits in General beside
+    // the other "how the workspace behaves before a document is open" settings
+    // rather than getting a pane of its own, which the design does not have.
+    let mut check = ed.updates.check_on_startup;
+    controls::row(ui, p, "Check for updates on start-up", |ui| {
+        if widgets::toggle(ui, p, &mut check).clicked() {
+            ed.updates.check_on_startup = check;
+            // Changing this is also an answer to the first-run notice: somebody
+            // who has found the switch has plainly been told.
+            ed.updates.notice_seen = true;
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Asks GitHub which release is newest, once, when Umber starts. The \
+         request carries nothing about you or your work. Umber does not sign \
+         its releases — a download is checked against the size GitHub reports \
+         and nothing stronger. Help, About has the details and a button to \
+         check on demand.",
+    );
 }
 
 // ---------------------------------------------------------------------------

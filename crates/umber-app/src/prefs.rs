@@ -53,6 +53,15 @@ pub struct Prefs {
     pub pressure_source: PressureSource,
     pub pressure_max_speed: f32,
     pub pressure_response: f32,
+    /// Whether Umber asks GitHub for the release list when it starts.
+    pub check_updates: bool,
+    /// Whether the user has been shown what that check does.
+    ///
+    /// Stored rather than derived, because the notice has to be shown exactly
+    /// once per installation and the alternative — inferring it from "is this
+    /// the first run?" — has no answer on a machine where the preferences file
+    /// could not be written.
+    pub update_notice_seen: bool,
     /// The complete binding table, already merged with the defaults.
     pub shortcuts: Vec<Binding>,
 }
@@ -67,6 +76,8 @@ impl Default for Prefs {
             pressure_source: pressure.source,
             pressure_max_speed: pressure.max_speed,
             pressure_response: pressure.responsiveness,
+            check_updates: true,
+            update_notice_seen: false,
             shortcuts: shortcuts::defaults(),
         }
     }
@@ -215,6 +226,11 @@ pub fn to_text(prefs: &Prefs) -> String {
         "pressure_response = {:.3}\n",
         prefs.pressure_response
     ));
+    out.push_str(&format!("check_updates = {}\n", prefs.check_updates));
+    out.push_str(&format!(
+        "update_notice_seen = {}\n",
+        prefs.update_notice_seen
+    ));
 
     // Only actions that differ from the factory table are written. An action
     // left out keeps its defaults, which is what lets a later version add a
@@ -284,6 +300,16 @@ pub fn from_text(text: &str) -> Prefs {
             "pressure_response" => {
                 if let Some(v) = parse_f32(value, 0.01, 1.0) {
                     prefs.pressure_response = v;
+                }
+            }
+            "check_updates" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.check_updates = v;
+                }
+            }
+            "update_notice_seen" => {
+                if let Some(v) = parse_bool(value) {
+                    prefs.update_notice_seen = v;
                 }
             }
             "shortcut" => shortcut_lines.push(value),
@@ -368,6 +394,19 @@ fn parse_f32(value: &str, lo: f32, hi: f32) -> Option<f32> {
     }
 }
 
+/// Parse a flag.
+///
+/// Anything that is not one of the two words leaves the setting at its default,
+/// which for the update check means a hand-edited `check_updates = maybe`
+/// arrives as "on and announced" rather than as "off and silent".
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Stable names for the themes.
 ///
 /// A `match` rather than a derive: it is the point at which someone adding a
@@ -433,6 +472,8 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         pressure_source: ed.pressure.source,
         pressure_max_speed: ed.pressure.max_speed,
         pressure_response: ed.pressure.responsiveness,
+        check_updates: ed.updates.check_on_startup,
+        update_notice_seen: ed.updates.notice_seen,
         shortcuts: shortcuts::published(),
     }
 }
@@ -444,6 +485,8 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.pressure.source = prefs.pressure_source;
     ed.pressure.max_speed = prefs.pressure_max_speed;
     ed.pressure.responsiveness = prefs.pressure_response;
+    ed.updates.check_on_startup = prefs.check_updates;
+    ed.updates.notice_seen = prefs.update_notice_seen;
     shortcuts::publish(prefs.shortcuts.clone());
 
     // Setting the zoom factor when it has not changed still marks egui's fonts
@@ -510,7 +553,41 @@ mod tests {
         assert_eq!(prefs.pressure_source, editor.pressure.source);
         assert_eq!(prefs.pressure_max_speed, editor.pressure.max_speed);
         assert_eq!(prefs.pressure_response, editor.pressure.responsiveness);
+        assert_eq!(prefs.check_updates, editor.updates.check_on_startup);
+        assert_eq!(prefs.update_notice_seen, editor.updates.notice_seen);
         assert_eq!(prefs.shortcuts, shortcuts::defaults());
+    }
+
+    #[test]
+    fn the_update_check_defaults_to_on_and_unannounced() {
+        // The pair that makes "on by default" defensible: the check is wanted,
+        // and nobody has been told about it yet — so the first run shows the
+        // notice and holds the request until it is answered. Flipping either of
+        // these silently is how an application starts phoning home unannounced.
+        let prefs = Prefs::default();
+        assert!(prefs.check_updates);
+        assert!(!prefs.update_notice_seen);
+    }
+
+    #[test]
+    fn turning_the_update_check_off_survives_a_restart() {
+        let prefs = Prefs {
+            check_updates: false,
+            update_notice_seen: true,
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert!(!back.check_updates, "the file must not lose a refusal");
+        assert!(back.update_notice_seen, "and must not ask again");
+    }
+
+    #[test]
+    fn a_corrupt_update_flag_leaves_the_check_announced_rather_than_silent() {
+        // The failure direction matters: a setting that could not be read must
+        // not become "check, and say nothing about it".
+        let prefs = from_text("check_updates = maybe\nupdate_notice_seen = yes\n");
+        assert!(prefs.check_updates);
+        assert!(!prefs.update_notice_seen);
     }
 
     #[test]
@@ -522,6 +599,8 @@ mod tests {
             pressure_source: PressureSource::Simulated,
             pressure_max_speed: 1800.0,
             pressure_response: 0.6,
+            check_updates: false,
+            update_notice_seen: true,
             shortcuts: shortcuts::defaults(),
         };
         let at = shortcuts::slot_of(&prefs.shortcuts, Action::BrushTool, 0);
@@ -540,6 +619,8 @@ mod tests {
         assert_eq!(back.pressure_source, prefs.pressure_source);
         assert_eq!(back.pressure_max_speed, prefs.pressure_max_speed);
         assert_eq!(back.pressure_response, prefs.pressure_response);
+        assert_eq!(back.check_updates, prefs.check_updates);
+        assert_eq!(back.update_notice_seen, prefs.update_notice_seen);
         // Compared per action rather than as one list: editing a binding
         // appends it, so the live table is in interaction order while a loaded
         // one is in `Action::ALL` order. What has to survive is which chords

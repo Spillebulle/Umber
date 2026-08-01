@@ -462,6 +462,12 @@ pub fn summarise(warnings: &[ImportWarning]) -> Vec<String> {
     out
 }
 
+/// The frame every modal in this application uses.
+///
+/// Shared out of here rather than copied: the canvas dialogs, the About dialog
+/// and the update prompts are the same kind of thing as the close prompt and
+/// the import notice, and two spellings of one border is how a set of dialogs
+/// starts drifting apart.
 pub(crate) fn dialog_frame(p: &Palette) -> Frame {
     Frame::NONE
         .fill(p.popover)
@@ -472,8 +478,9 @@ pub(crate) fn dialog_frame(p: &Palette) -> Frame {
 
 /// A dialog button. `strong` marks the one that carries out the action.
 ///
-/// Shared with the canvas dialogs rather than copied: two dialog buttons of
-/// slightly different sizes is exactly what a second copy produces.
+/// Shared with the canvas dialogs, About and the update prompts rather than
+/// copied: two dialog buttons of slightly different sizes is exactly what a
+/// second copy produces.
 pub(crate) fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
     let font = FontId::proportional(text::SMALL);
     let text_w = ui

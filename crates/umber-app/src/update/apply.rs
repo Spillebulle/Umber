@@ -1,0 +1,434 @@
+//! Putting a downloaded release in place.
+//!
+//! Three shapes, one per installation Umber owns (see [`super::install`]):
+//!
+//! * **Portable** — the archive holds one binary; lift it out and put it where
+//!   the running one is.
+//! * **AppImage** — the download *is* the application; replace the file
+//!   `$APPIMAGE` names.
+//! * **MSI** — hand the package to `msiexec` and get out of the way. Umber does
+//!   not touch Program Files itself: the installer owns those files, keeps a
+//!   record of them, and elevates on its own.
+//!
+//! The awkward part is Windows, where a running executable cannot be deleted or
+//! written to — but *can* be renamed, because the lock is on the file's data,
+//! not on its directory entry. So the swap is rename-then-replace: the running
+//! binary is moved aside to `umber.exe.old`, the new one takes its name, and
+//! the next start deletes the leftover ([`sweep_previous_binary`]). If the
+//! second rename fails the first is undone, so a failed update leaves a working
+//! Umber rather than none at all.
+//!
+//! On Unix a plain `rename` is enough and is atomic: the running process holds
+//! the old inode open and carries on, while the name points at the new file
+//! from that moment.
+
+use super::install::InstallKind;
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// A downloaded binary can be large, but not this large. A tarball claiming a
+/// gigabyte of `umber` is a decompression bomb or a mistake, and either way is
+/// not something to hold in memory.
+const MAX_BINARY: u64 = 512 * 1024 * 1024;
+
+/// What happened, and therefore what the user has to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The new build is in place and runs the next time Umber is started.
+    Restart,
+    /// An installer is now running and needs Umber to close.
+    Installer,
+}
+
+/// Put a downloaded release in place.
+///
+/// `bytes` is exactly what the release carried, already length-checked against
+/// what the API reported.
+pub fn apply(kind: &InstallKind, asset_name: &str, bytes: &[u8]) -> Result<Applied, String> {
+    match kind {
+        InstallKind::Msi => {
+            hand_to_msiexec(asset_name, bytes)?;
+            Ok(Applied::Installer)
+        }
+
+        // One file, and the download is it. No archive to open.
+        InstallKind::AppImage(path) => {
+            swap_in(path, bytes)?;
+            Ok(Applied::Restart)
+        }
+
+        InstallKind::Portable => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("Umber could not find its own program file: {e}"))?;
+            let binary = if asset_name.ends_with(".zip") {
+                binary_from_zip(bytes, "umber.exe")?
+            } else {
+                binary_from_tar_gz(bytes, "umber")?
+            };
+            swap_in(&exe, &binary)?;
+            Ok(Applied::Restart)
+        }
+
+        // Never reached: nothing is downloaded for these. Kept as a refusal
+        // rather than an `unreachable!`, because the one thing that must not
+        // happen here is writing over a package manager's files.
+        InstallKind::Managed(_) | InstallKind::Unknown => Err(
+            "This installation is not Umber's to replace. Take the new build from \
+             the releases page."
+                .to_string(),
+        ),
+    }
+}
+
+/// Replace the file at `path` with `bytes`, keeping the old one recoverable
+/// until the swap has succeeded.
+fn swap_in(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let new = suffixed(path, ".new");
+    // Written beside the target rather than into a temporary directory: a
+    // rename is only atomic — and on Windows only *possible* — within one
+    // volume, and a portable copy can be on a different drive from `%TEMP%`.
+    write_executable(&new, bytes)?;
+
+    if cfg!(windows) {
+        let old = suffixed(path, ".old");
+        // A leftover from a previous update that the next start failed to
+        // sweep. Renaming onto an existing name fails on Windows.
+        let _ = std::fs::remove_file(&old);
+        if let Err(e) = std::fs::rename(path, &old) {
+            let _ = std::fs::remove_file(&new);
+            return Err(format!(
+                "Umber could not move its own program file aside: {e}\n\n\
+                 Nothing was changed."
+            ));
+        }
+        if let Err(e) = std::fs::rename(&new, path) {
+            // Put the running binary's name back before reporting. A half-done
+            // swap that leaves nothing at `umber.exe` is the one outcome that
+            // costs the user their installation.
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&new);
+            return Err(format!(
+                "Umber could not put the new build in place: {e}\n\n\
+                 The version you are running was left as it was."
+            ));
+        }
+        return Ok(());
+    }
+
+    // Unix: one rename, and it is atomic. The running process keeps the old
+    // inode open, so nothing is disturbed until Umber is next started.
+    std::fs::rename(&new, path).map_err(|e| {
+        let _ = std::fs::remove_file(&new);
+        format!(
+            "Umber could not put the new build in place: {e}\n\n\
+             The version you are running was left as it was."
+        )
+    })
+}
+
+/// Write a file and make sure it can be run.
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| {
+        format!(
+            "Umber could not write {}: {e}\n\n\
+             This copy may be somewhere it is not allowed to change itself.",
+            path.display(),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // An archive member's mode is not carried across by `fs::write`, and a
+        // binary without the execute bit is an update that silently bricks the
+        // installation.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Umber could not make {} executable: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `path` with `suffix` appended to the whole name.
+///
+/// Appended rather than substituted: `Path::with_extension(".new")` on
+/// `umber.exe` gives `umber.new`, which is a *different program's* name on a
+/// system that has one, and loses the `.exe` Windows needs to run it.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Delete the binary a previous update moved aside.
+///
+/// Called once at start-up. On Windows the old file cannot be deleted while it
+/// is running, so the swap leaves it behind and this is the first moment it can
+/// go. Failure is ignored: a stale `umber.exe.old` is untidy, not broken, and
+/// an application that refused to start over one would be worse.
+pub fn sweep_previous_binary() {
+    if !cfg!(windows) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    for leftover in [suffixed(&exe, ".old"), suffixed(&exe, ".new")] {
+        if leftover.exists() && std::fs::remove_file(&leftover).is_ok() {
+            log::info!("removed {} from a previous update", leftover.display());
+        }
+    }
+}
+
+/// Lift one file out of a zip.
+fn binary_from_zip(bytes: &[u8], wanted: &str) -> Result<Vec<u8>, String> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("The download is not a zip file: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("The download could not be read: {e}"))?;
+        // `enclosed_name` rather than `name`: it refuses an entry whose path
+        // escapes the archive root. Nothing is unpacked to disk here, so a
+        // traversal could not reach anything — but comparing against a name
+        // that has already been rejected as unsafe is a habit worth keeping.
+        let Some(path) = entry.enclosed_name() else {
+            continue;
+        };
+        if path.file_name().is_some_and(|n| n == wanted) {
+            let size = entry.size();
+            return read_capped(&mut entry, size);
+        }
+    }
+    Err(format!("The download does not contain {wanted}."))
+}
+
+/// Lift one file out of a gzipped tar.
+fn binary_from_tar_gz(bytes: &[u8], wanted: &str) -> Result<Vec<u8>, String> {
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("The download is not a tar archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("The download could not be read: {e}"))?;
+        let size = entry.header().size().unwrap_or(0);
+        let path = entry
+            .path()
+            .map_err(|e| format!("The download holds an unreadable file name: {e}"))?
+            .into_owned();
+        if path.file_name().is_some_and(|n| n == wanted) {
+            return read_capped(&mut entry, size);
+        }
+    }
+    Err(format!("The download does not contain {wanted}."))
+}
+
+/// Read an archive member, refusing one that claims to be absurdly large.
+///
+/// The declared size is checked *before* allocating and the read is capped
+/// again afterwards, because a header can lie: the point of the cap is that a
+/// hostile or corrupt archive cannot make Umber allocate until it dies.
+fn read_capped(reader: &mut impl Read, declared: u64) -> Result<Vec<u8>, String> {
+    if declared > MAX_BINARY {
+        return Err("The download claims to hold a file far larger than Umber.".to_string());
+    }
+    let mut out = Vec::with_capacity(declared.min(64 * 1024 * 1024) as usize);
+    reader
+        .take(MAX_BINARY + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("The download could not be unpacked: {e}"))?;
+    if out.len() as u64 > MAX_BINARY {
+        return Err("The download unpacks to far more than Umber's own size.".to_string());
+    }
+    Ok(out)
+}
+
+/// Write the package somewhere `msiexec` can reach it, and start it.
+///
+/// `msiexec` is given the package and nothing else: it shows its own interface,
+/// asks for elevation itself, and — because `packaging/windows/umber.wxs` keeps
+/// one `UpgradeCode` for ever — replaces the installed version rather than
+/// installing beside it.
+fn hand_to_msiexec(asset_name: &str, bytes: &[u8]) -> Result<(), String> {
+    // The asset's own name, with anything that is not part of a file name
+    // stripped. It comes from the release API rather than from the user, but it
+    // is about to become a path and a command-line argument.
+    let name: String = asset_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    let name = if name.ends_with(".msi") {
+        name
+    } else {
+        "umber-update.msi".to_string()
+    };
+
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, bytes).map_err(|e| {
+        format!(
+            "Umber could not write the installer to {}: {e}",
+            path.display()
+        )
+    })?;
+
+    std::process::Command::new("msiexec")
+        .arg("/i")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "Umber could not start the Windows installer: {e}\n\n\
+                 The package was saved to {}.",
+                path.display(),
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch directory of this test's own, removed on the way out.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("umber-update-test-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_suffix_is_added_to_the_whole_name_not_swapped_for_the_extension() {
+        // `with_extension` would give `umber.new`, losing the `.exe` Windows
+        // needs to run the file and colliding with any other `umber.*` beside
+        // it.
+        assert_eq!(
+            suffixed(Path::new("/a/umber.exe"), ".new"),
+            PathBuf::from("/a/umber.exe.new"),
+        );
+        assert_eq!(
+            suffixed(Path::new("/a/umber"), ".old"),
+            PathBuf::from("/a/umber.old"),
+        );
+    }
+
+    #[test]
+    fn a_swap_replaces_the_file_and_leaves_nothing_half_written() {
+        let scratch = Scratch::new("swap");
+        let target = scratch.path("umber.exe");
+        std::fs::write(&target, b"old build").expect("write the old build");
+
+        swap_in(&target, b"new build").expect("the swap succeeds");
+
+        assert_eq!(std::fs::read(&target).expect("read back"), b"new build");
+        assert!(
+            !suffixed(&target, ".new").exists(),
+            "the staging file must not survive a successful swap",
+        );
+        // On Windows the displaced file is left for the next start to sweep,
+        // because a running binary cannot be deleted. Everywhere else the
+        // rename replaced it outright.
+        if !cfg!(windows) {
+            assert!(!suffixed(&target, ".old").exists());
+        }
+    }
+
+    #[test]
+    fn a_swap_over_a_leftover_from_a_previous_update_still_works() {
+        // Windows cannot rename onto an existing name, so an `umber.exe.old`
+        // that the last start failed to remove would otherwise stop every
+        // future update.
+        let scratch = Scratch::new("leftover");
+        let target = scratch.path("umber.exe");
+        std::fs::write(&target, b"old build").expect("write the old build");
+        std::fs::write(suffixed(&target, ".old"), b"older still").expect("write the leftover");
+
+        swap_in(&target, b"new build").expect("the swap succeeds");
+        assert_eq!(std::fs::read(&target).expect("read back"), b"new build");
+    }
+
+    #[test]
+    fn a_zip_gives_up_its_binary_and_says_so_when_it_has_none() {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let stored: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("umber-1.0.0-x86_64-pc-windows-msvc/README.md", stored)
+                .expect("start README");
+            std::io::Write::write_all(&mut zip, b"not the binary").expect("write README");
+            zip.start_file("umber-1.0.0-x86_64-pc-windows-msvc/umber.exe", stored)
+                .expect("start the binary");
+            std::io::Write::write_all(&mut zip, b"MZ the new build").expect("write the binary");
+            zip.finish().expect("finish the zip");
+        }
+
+        assert_eq!(
+            binary_from_zip(&buf, "umber.exe").expect("the binary is found"),
+            b"MZ the new build",
+        );
+        // A release that shipped the wrong archive must be a refusal, not an
+        // empty file written over the running one.
+        assert!(binary_from_zip(&buf, "umber").is_err());
+        assert!(binary_from_zip(b"not a zip at all", "umber.exe").is_err());
+    }
+
+    #[test]
+    fn a_tarball_gives_up_its_binary_and_says_so_when_it_has_none() {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "umber-1.0.0/LICENSE", &b"GPL3"[..])
+                .expect("append the licence");
+            let payload = b"\x7fELF the new build";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "umber-1.0.0/umber", &payload[..])
+                .expect("append the binary");
+            tar.finish().expect("finish the tar");
+        }
+        let bytes = gz.finish().expect("finish the gzip");
+
+        assert_eq!(
+            binary_from_tar_gz(&bytes, "umber").expect("the binary is found"),
+            b"\x7fELF the new build",
+        );
+        assert!(binary_from_tar_gz(&bytes, "umber.exe").is_err());
+        assert!(binary_from_tar_gz(b"not a tarball", "umber").is_err());
+    }
+
+    #[test]
+    fn a_managed_installation_is_refused_even_with_bytes_in_hand() {
+        // The last guard. Everything upstream declines to download for these,
+        // and this is what makes a mistake upstream a refusal rather than a
+        // package manager's files being overwritten.
+        for kind in [
+            InstallKind::Managed(super::super::install::Manager::Dpkg),
+            InstallKind::Managed(super::super::install::Manager::Flatpak),
+            InstallKind::Unknown,
+        ] {
+            assert!(apply(&kind, "umber-1.0.0-x64.msi", b"anything").is_err());
+        }
+    }
+}

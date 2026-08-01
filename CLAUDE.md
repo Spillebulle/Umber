@@ -697,6 +697,69 @@ cannot half-publish; `.github/workflows/release.yml` does the rest.
   so `libvulkan.so.1()(64bit)` resolves on all of them. Debian's names are
   stable across its derivatives, so the `.deb` may name packages.
 
+### Updating an installed copy
+
+`umber-app::update` asks the releases API what the newest version is, and — for
+the installations Umber owns — fetches an asset and swaps the binary. The whole
+of it is desktop-only and lives in `umber-app`: `umber-core` and `umber-render`
+must not learn about HTTP, the same boundary that keeps them testable.
+
+- **Umber does not sign its releases.** That is the missing piece, and it is the
+  reason every guarantee here is stated in terms of the transport: HTTPS only
+  (`Agent::https_only`, so redirects cannot drop to plain http), an address
+  taken from the API rather than constructed, and a download that must be
+  exactly the length the API reported. A length is not a signature and nothing —
+  the About dialog least of all — may imply that it is. Signing means a key with
+  somewhere to live, a step in `release.yml`, and a public key compiled in;
+  until that exists, say what is actually true.
+- **An installation a package manager owns is never written to.** `.deb`,
+  `.rpm`, Arch and Flatpak copies are detected and told which manager owns them
+  and what to run. Overwriting them is usually not permitted, makes the
+  manager's records false, and is undone by the next system upgrade — silently,
+  months later, which is the worst shape this bug takes. The MSI is the one
+  managed case Umber still updates, because Windows supplies the mechanism:
+  hand `msiexec` a package. Never edit Program Files directly.
+- **The Flatpak does not check at all**, and that is not an oversight. Its
+  sandbox is granted no network — `packaging/linux/io.github.spillebulle.umber.yml`
+  carries no `--share=network` on purpose — so a request could only time out and
+  report a decision as a failure, and Flatpak's own updater already does the
+  job. `Updates::check_unavailable` is the switch, and the manifest comment is
+  the other half of it.
+- **`install::detect` is a pure function of a `Probe`.** The path, the
+  environment and a "does this exist" predicate are injected, which is what lets
+  the Linux and macOS answers be tested on a Windows machine — the only way they
+  are tested at all. Do not reach for `std::env` inside it.
+- **Version comparison is numeric, and a tag that is not `v<major>.<minor>.<patch>`
+  is ignored.** `"0.0.10" < "0.0.9"` lexically, so string ordering would decide
+  the tenth patch release was older than the ninth. Pre-releases are in the
+  ignored group deliberately: the release script never makes one, and a stable
+  installation should not be walked onto a candidate build.
+- **The asset suffixes in `release::wanted_asset` are the other half of
+  `release.yml`.** Renaming an artefact there without changing them means an
+  update that reports "no build for this machine" for ever.
+- **On Windows the swap is rename-then-replace.** A running executable cannot be
+  deleted but *can* be renamed, so the old binary becomes `umber.exe.old` and
+  the next start sweeps it (`sweep_previous_binary`, called from `run`). If the
+  second rename fails the first is undone: a failed update must leave a working
+  Umber, not none.
+- **The check runs on a thread and wakes the loop with an `EventLoopProxy`.**
+  `ControlFlow::Wait` means a value appearing in a channel is not an event, so
+  without the wake the answer sits there until the user moves the mouse. That is
+  what `app::Wake` and `user_event` are for, and why `update` takes a plain
+  closure rather than a winit type — the same layering rule as everywhere else.
+- **The startup check is on by default and the first run says so.** Off by
+  default is a check nobody ever switches on. On is only defensible because
+  `notice_seen` holds the first request back until a notice has been shown and
+  answered, and the switch is in Settings, General. Do not make the default on
+  without the notice, or quietly widen what the request carries.
+- **`ureq` is built with `rustls` and no default features.** native-tls is
+  OpenSSL on Linux, which would have to be satisfied on the aarch64 cross-builds
+  and inside the Flatpak sandbox; roots are compiled in because an AppImage
+  cannot rely on the host's certificate store.
+- **No test may touch the network.** The release parsing is driven from a
+  fixture, the install detection from injected readings, and the archive
+  handling from archives the test builds itself.
+
 ### What is built, and what is deliberately not
 
 | | x86-64 | ARM64 |
