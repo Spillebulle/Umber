@@ -72,8 +72,16 @@ flate2 = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `Win32_System_Time` is the local-time offset above; `Win32_UI_Input_Keyboard\
+# AndMouse` is what a shortcut label is named from — `MapVirtualKeyW` answers
+# what the user's own layout prints on a physical key, which is the only way to
+# label a binding with a key their keyboard actually has. See `src/keylayout.rs`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Time",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }

@@ -2,6 +2,7 @@
 
 use crate::canvasdlg;
 use crate::editor::{Editor, Interaction, Tool};
+use crate::keylayout;
 use crate::logo;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
@@ -1718,7 +1719,16 @@ impl ApplicationHandler<Wake> for UmberApp {
 
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 
+            // Switching input language changes what every key prints, and
+            // therefore what every shortcut label should say. Taking the window
+            // back is one of the two moments that follows such a switch; a key
+            // press is the other, below. Both are on the input path
+            // deliberately — see `keylayout`'s module docs for why the check
+            // must not be on the drawing path instead.
+            WindowEvent::Focused(true) => keylayout::forget_if_changed(),
+
             WindowEvent::KeyboardInput { event, .. } => {
+                keylayout::forget_if_changed();
                 // Punctuation dispatches on what the user's layout *prints*,
                 // not on the US position winit names it by — otherwise Ctrl and
                 // the key marked `+` zooms out on half the keyboards in Europe.

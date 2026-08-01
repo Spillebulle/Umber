@@ -677,6 +677,32 @@ pub const BINDABLE: &[KeyCode] = &[
     KeyCode::ArrowRight,
 ];
 
+/// The punctuation keys, with the two legends a US keyboard prints on each —
+/// unshifted first.
+///
+/// Both legends are listed because which one is unshifted is itself
+/// layout-dependent: `+` is Shift+= on a US board and unshifted on a Nordic
+/// one, and both must reach [`KeyCode::Equal`].
+///
+/// **One table, read in both directions.** [`key_for_text`] folds a typed
+/// character onto the position that prints it, and `keylayout::name_for` asks
+/// the other way round — which of a key's legends this keyboard actually has.
+/// Two copies of it would be two things to keep in step, and they would drift
+/// the first time a key was added to one of them.
+pub const PUNCTUATION: [(KeyCode, [char; 2]); 11] = [
+    (KeyCode::Backquote, ['`', '~']),
+    (KeyCode::Minus, ['-', '_']),
+    (KeyCode::Equal, ['=', '+']),
+    (KeyCode::BracketLeft, ['[', '{']),
+    (KeyCode::BracketRight, [']', '}']),
+    (KeyCode::Backslash, ['\\', '|']),
+    (KeyCode::Semicolon, [';', ':']),
+    (KeyCode::Quote, ['\'', '"']),
+    (KeyCode::Comma, [',', '<']),
+    (KeyCode::Period, ['.', '>']),
+    (KeyCode::Slash, ['/', '?']),
+];
+
 /// The bindable key a layout prints `typed` on, for the punctuation keys.
 ///
 /// Bindings are *physical* positions: winit's `KeyCode` names the key where a
@@ -699,10 +725,6 @@ pub const BINDABLE: &[KeyCode] = &[
 /// the same character, so a punctuation binding follows the legend on the
 /// user's own keyboard.
 ///
-/// Both legends of each key are listed, because which one is unshifted is
-/// itself layout-dependent: `+` is Shift+= on a US board and unshifted on a
-/// Nordic one, and both must reach [`KeyCode::Equal`].
-///
 /// Returns `None` for anything not a single bindable punctuation character —
 /// letters and digits included, deliberately, so they keep their positions.
 pub fn key_for_text(typed: &str) -> Option<KeyCode> {
@@ -711,20 +733,10 @@ pub fn key_for_text(typed: &str) -> Option<KeyCode> {
     if chars.next().is_some() {
         return None;
     }
-    Some(match first {
-        '-' | '_' => KeyCode::Minus,
-        '=' | '+' => KeyCode::Equal,
-        '[' | '{' => KeyCode::BracketLeft,
-        ']' | '}' => KeyCode::BracketRight,
-        '\\' | '|' => KeyCode::Backslash,
-        ';' | ':' => KeyCode::Semicolon,
-        '\'' | '"' => KeyCode::Quote,
-        ',' | '<' => KeyCode::Comma,
-        '.' | '>' => KeyCode::Period,
-        '/' | '?' => KeyCode::Slash,
-        '`' | '~' => KeyCode::Backquote,
-        _ => return None,
-    })
+    PUNCTUATION
+        .iter()
+        .find(|(_, legends)| legends.contains(&first))
+        .map(|(key, _)| *key)
 }
 
 /// The key to dispatch on, given what winit reported and what the layout says
@@ -751,8 +763,28 @@ pub fn key_from_id(id: &str) -> Option<KeyCode> {
     BINDABLE.iter().copied().find(|k| key_id(*k) == id)
 }
 
-/// The printable name of a physical key.
+/// The printable name of a physical key, as the user's own keyboard has it.
+///
+/// Bindings are positions and the stored form names positions, but a *label*
+/// has to name a key somebody can find. `keylayout` asks the platform what this
+/// keyboard prints and answers `None` where it cannot say — on macOS and Linux,
+/// for a dead key, and for anything with no legend at all — so the US name
+/// below is the floor. A label is never empty and never guesses.
+///
+/// Only the display varies. [`Chord::id`] is untouched, for the reason its own
+/// documentation gives.
 pub fn key_name(key: KeyCode) -> String {
+    crate::keylayout::key_name(key).unwrap_or_else(|| us_key_name(key))
+}
+
+/// The name winit's own `KeyCode` is written for: the legend a *US* keyboard
+/// prints at that position.
+///
+/// What every label said before layouts were asked, and still the fallback
+/// whenever the platform will not answer. Deliberately not layout-aware — this
+/// is the fixed point [`key_name`] falls back to, so it must not itself depend
+/// on the keyboard.
+pub fn us_key_name(key: KeyCode) -> String {
     let named = match key {
         KeyCode::Space => "Space",
         KeyCode::BracketLeft => "[",
@@ -1018,8 +1050,16 @@ mod tests {
         // The primary modifier is named for the platform, so the expectation
         // is composed rather than hard-coded — otherwise this test would fail
         // on macOS, where the very same binding reads "Cmd+Z".
+        //
+        // The *key* half is composed for the same reason one step further on:
+        // what a key is called now depends on the keyboard this is running on,
+        // and hard-coding "Z" would fail on a German machine and pass on CI.
+        // `keylayout`'s tests pin the naming itself, against readings taken
+        // from layouts nobody here has. What is under test here is the
+        // composition — that the modifiers are spelled and ordered as designed.
         let ctrl = primary_modifier_name();
         let alt = alt_modifier_name();
+        let key = key_name;
         let by = |action: Action| -> String {
             defaults()
                 .into_iter()
@@ -1028,11 +1068,16 @@ mod tests {
                 .chord()
                 .display()
         };
-        assert_eq!(by(Action::Undo), format!("{ctrl}+Z"));
-        assert_eq!(by(Action::Redo), format!("{ctrl}+Shift+Z"));
-        assert_eq!(by(Action::SizeDown), "[");
-        assert_eq!(by(Action::SizeUp), "]");
-        assert_eq!(by(Action::BrushTool), "B");
+        assert_eq!(by(Action::Undo), format!("{ctrl}+{}", key(KeyCode::KeyZ)));
+        assert_eq!(
+            by(Action::Redo),
+            format!("{ctrl}+Shift+{}", key(KeyCode::KeyZ))
+        );
+        assert_eq!(by(Action::SizeDown), key(KeyCode::BracketLeft));
+        assert_eq!(by(Action::SizeUp), key(KeyCode::BracketRight));
+        assert_eq!(by(Action::BrushTool), key(KeyCode::KeyB));
+        // A digit and a named key are the two no layout renames, so these stay
+        // written out.
         assert_eq!(by(Action::FitView), format!("{ctrl}+0"));
 
         let space = binding(Action::PanTool, KeyCode::Space, false, false, false);
@@ -1040,8 +1085,22 @@ mod tests {
         let everything = binding(Action::PanTool, KeyCode::KeyH, true, true, true);
         assert_eq!(
             everything.chord().display(),
-            format!("{ctrl}+Shift+{alt}+H")
+            format!("{ctrl}+Shift+{alt}+{}", key(KeyCode::KeyH))
         );
+    }
+
+    #[test]
+    fn a_label_is_never_empty_and_the_stored_form_never_moves() {
+        // The two halves of the rule. A label may follow the keyboard; the id
+        // may not, or a preferences file would stop parsing when copied to a
+        // machine with a different layout.
+        for key in BINDABLE.iter().copied() {
+            assert!(!key_name(key).is_empty(), "{key:?} named itself nothing");
+            assert_eq!(key_id(key), format!("{key:?}"));
+        }
+        let chord = Chord::new(KeyCode::Equal, true, false, false);
+        assert_eq!(chord.id(), "Ctrl+Equal");
+        assert_eq!(Chord::from_id(&chord.id()), Some(chord));
     }
 
     #[test]

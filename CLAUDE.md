@@ -632,6 +632,15 @@ design shows a whole row of them.
 - **Shortcuts live in `shortcuts.rs`, not in a `match`.** The settings dialog
   enumerates them, which a match arm cannot do. `resolve` compares ctrl/shift/alt
   exactly — that is what stops plain `Z` (zoom tool) also firing on `Ctrl+Z`.
+- **A shortcut *label* follows the user's keyboard; the stored form never may.**
+  `keylayout` asks the platform what the layout prints and `key_name` falls back
+  to `us_key_name` where it cannot say, so Zoom in reads "Ctrl++" on a Nordic
+  board — the key that actually zooms in. `Chord::id` and `key_id` are untouched,
+  for the reason `Chord::id` gives: the file has to parse on the next machine.
+  Precedent: `display` already prints "Cmd" where the id says "Ctrl".
+  `keylayout::name_for` is a pure function of an injected reading, which is the
+  only way the Norwegian and German answers are tested at all, and the reading is
+  cached — the platform is asked from the *input* path, never while painting.
 - **A widget revealed on hover must not be what decides the hover.** egui stops
   its hover search at the topmost *interactive* widget, so a `Sense::hover()`
   row reads as not-hovered the moment the pointer is over a button inside it —
