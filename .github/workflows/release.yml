@@ -135,6 +135,58 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # --- Flatpak --------------------------------------------------------------
+  #
+  # The format most Linux users install a painting application through — Krita,
+  # GIMP and Inkscape are all reached that way. A job of its own because the
+  # runtime and SDK are a gigabyte of download that the build matrix has no use
+  # for.
+  #
+  # This produces the bundle attached to the release. It is **not** a Flathub
+  # submission: Flathub builds from source on its own infrastructure and that is
+  # a separate piece of work.
+  flatpak:
+    name: build Flatpak
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Install flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder desktop-file-utils
+          flatpak remote-add --if-not-exists --user \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub \
+            org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+      - name: Build
+        run: |
+          set -eu
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          # Staged under a fixed name so the manifest need not know the version.
+          cp "dist/umber-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            packaging/linux/umber-linux.tar.gz
+          mkdir -p out
+          cd packaging/linux
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --repo=repo build-dir io.github.spillebulle.umber.yml
+          flatpak build-bundle repo \
+            "../../out/umber-${version}-x86_64.flatpak" \
+            io.github.spillebulle.umber --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: out/*
+          if-no-files-found: error
+
   # --- Arch package ---------------------------------------------------------
   #
   # A job of its own because makepkg needs an Arch userland, which no runner
@@ -180,7 +232,7 @@ jobs:
   # --- publish ---------------------------------------------------------------
   publish:
     name: publish
-    needs: [build, arch]
+    needs: [build, arch, flatpak]
     runs-on: ubuntu-latest
     # A manual run builds and packages but must not publish: there is no tag to
     # attach a release to, and inventing one would be a release nobody asked

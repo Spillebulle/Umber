@@ -581,6 +581,40 @@ cannot half-publish; `.github/workflows/release.yml` does the rest.
 - The MSI's `UpgradeCode` in `packaging/windows/umber.wxs` must never change. It
   is what tells Windows the next version replaces this one rather than
   installing beside it.
+- **RPM requirements are sonames, not package names.** Fedora calls a library
+  `libX11` and openSUSE calls it `libX11-6`, so an rpm naming one refuses to
+  install on the other; every rpm distribution records the sonames it provides,
+  so `libvulkan.so.1()(64bit)` resolves on all of them. Debian's names are
+  stable across its derivatives, so the `.deb` may name packages.
+
+### What is built, and what is deliberately not
+
+| | x86-64 | ARM64 |
+|---|---|---|
+| Windows MSI | ✔ | ✔ |
+| macOS archive | ✔ | ✔ |
+| `.deb`, `.rpm`, AppImage, tarball | ✔ | ✔ |
+| Flatpak bundle | ✔ | — |
+| Arch `.pkg.tar.zst` | ✔ | — |
+
+- **Arch is x86-64 only because Arch Linux is.** ARM is Arch Linux ARM, a
+  separate distribution with its own repositories and no official container
+  image; packaging for it would mean trusting a third party's image to build
+  something nobody here can test.
+- **No RISC-V.** There is no hosted riscv64 runner, so it could only be
+  cross-compiled and never executed, and neither wgpu's Vulkan path nor winit
+  has been verified on the architecture. Shipping a binary nobody has run is
+  the thing `docs/brush-sources.md` and the importer rules both refuse to do
+  elsewhere.
+- **No Snap.** It would sandbox and auto-update, which is exactly what the
+  Flatpak already does, on more distributions; Ubuntu users have the `.deb`.
+  Two sandboxed formats is two to keep working for one benefit.
+- **No musl or static build.** The application `dlopen`s the Vulkan loader and
+  the display client, and `dlopen` under statically linked musl does not work.
+- **The Flatpak is a bundle, not a Flathub listing.** Flathub builds from source
+  on its own infrastructure, which is a separate submission and a good idea; the
+  bundle attached to a release is not a substitute and must not be described as
+  one.
 
 ## Conventions
 

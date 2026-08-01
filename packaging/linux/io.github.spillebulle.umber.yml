@@ -1,0 +1,56 @@
+# Flatpak manifest.
+#
+# Built from the release binary rather than from source. A Flathub submission
+# would have to build from source — that is their rule, and a reasonable one —
+# so this manifest is for the bundle attached to a GitHub release, not for
+# Flathub. Getting onto Flathub is a separate submission and is worth doing;
+# this is not a substitute for it and should not be described as one.
+#
+# The tarball is staged as `umber-linux.tar.gz` by the workflow so that nothing
+# here has to know the version. See `.github/workflows/release.yml`.
+
+app-id: io.github.spillebulle.umber
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: umber
+
+finish-args:
+  # The GPU. Without it wgpu finds no adapter and the canvas cannot start —
+  # which is the whole application.
+  - --device=dri
+  # Both display protocols: Wayland where there is one, X11 where there is not.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Opening and saving pictures. `home` rather than `host`: a painting
+  # application has no business reading /etc, and the portal covers the rest.
+  - --filesystem=home
+  - --filesystem=xdg-pictures
+
+modules:
+  - name: umber
+    buildsystem: simple
+    sources:
+      - type: archive
+        path: umber-linux.tar.gz
+        strip-components: 1
+    build-commands:
+      - install -Dm755 umber /app/bin/umber
+
+      # Flatpak requires the desktop file, the icons and the AppStream data to
+      # be named for the application ID, so the shared copies are renamed on
+      # the way in and the desktop file's Icon key is rewritten to match.
+      # Leaving it as `umber` gives an application with no icon anywhere.
+      - install -Dm644 packaging/umber.desktop
+        /app/share/applications/io.github.spillebulle.umber.desktop
+      - desktop-file-edit --set-icon=io.github.spillebulle.umber
+        /app/share/applications/io.github.spillebulle.umber.desktop
+      - install -Dm644 packaging/io.github.spillebulle.umber.metainfo.xml
+        /app/share/metainfo/io.github.spillebulle.umber.metainfo.xml
+      - for s in 16 32 48 64 128 256; do
+        install -Dm644 "icons/umber-$s.png"
+        "/app/share/icons/hicolor/${s}x${s}/apps/io.github.spillebulle.umber.png";
+        done
+
+      - install -Dm644 LICENSE /app/share/licenses/umber/LICENSE

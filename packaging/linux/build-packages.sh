@@ -54,7 +54,19 @@ fi
 # of them. A package that omitted them would install cleanly and then fail to
 # open a window, which is the worst shape a packaging bug can take.
 DEB_DEPENDS="libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon0, libwayland-client0, libvulkan1"
-RPM_REQUIRES="libX11 libXcursor libXrandr libXi libxkbcommon libwayland-client vulkan-loader"
+
+# RPM requirements are stated as **sonames**, not as package names.
+#
+# Package names differ between rpm distributions for the same library — Fedora
+# calls it `libX11` and `vulkan-loader`, openSUSE calls the same things
+# `libX11-6` and `libvulkan1` — so a package naming one will refuse to install
+# on the other. Every rpm distribution, though, records the sonames a package
+# provides, so requiring `libvulkan.so.1` resolves correctly on all of them
+# without this script knowing which one it is being installed on.
+#
+# The `()(64bit)` marker is rpm's own way of distinguishing a 64-bit provider
+# from a 32-bit one, and both architectures Umber builds for are 64-bit.
+RPM_SONAMES="libX11.so.6 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxkbcommon.so.0 libwayland-client.so.0 libvulkan.so.1"
 
 # --- the shared install tree -------------------------------------------------
 #
@@ -121,7 +133,7 @@ stage_tree "$buildroot/usr"
     echo "License:        GPL-3.0-or-later"
     echo "URL:            https://github.com/Spillebulle/umber"
     echo "BuildArch:      $rpm_arch"
-    for req in $RPM_REQUIRES; do echo "Requires:       $req"; done
+    for so in $RPM_SONAMES; do echo "Requires:       ${so}()(64bit)"; done
     # The binary is already built and stripped; rpm's debuginfo pass would try
     # to rebuild it from sources that are not here.
     echo "%global debug_package %{nil}"

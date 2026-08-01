@@ -13,6 +13,28 @@ moving and pixels changing.
 > layout, input and shortcut bindings — persist across runs. There is no mobile
 > packaging yet. See [Roadmap](#roadmap).
 
+## Installing
+
+Every [release](https://github.com/Spillebulle/umber/releases) carries built
+packages for x86-64 and ARM64:
+
+| Platform | |
+|---|---|
+| Windows | `.msi` installer |
+| macOS | `.tar.gz` |
+| Debian, Ubuntu, Mint | `.deb` |
+| Fedora, RHEL, openSUSE | `.rpm` |
+| Any Linux | `.flatpak` bundle, or an AppImage that needs nothing installed |
+| Arch | `.pkg.tar.zst` (x86-64) |
+
+The Linux packages name the libraries Umber opens at runtime — the Vulkan
+loader, libxkbcommon and the Wayland and X11 clients — so your package manager
+will pull them in. The AppImage carries what it can and uses the host's Vulkan
+loader, because bundling that one would mean talking to the wrong driver.
+
+There is no RISC-V build. It could only be cross-compiled and never run, and
+nothing here has been tested on the architecture.
+
 ## Building
 
 Requires a recent stable Rust toolchain (1.92+) and a GPU with Vulkan, D3D12 or
