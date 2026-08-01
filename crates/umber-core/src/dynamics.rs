@@ -21,9 +21,10 @@
 //! stays `Copy`, and serialises to nothing at all when it is empty.
 //!
 //! The cap is not free: a brush with more live mappings than fit loses the
-//! narrowest ones. [`Modulations::push`] keeps the widest, which is the
-//! ordering that discards least. Measured against the shipped MyPaint pack the
-//! busiest brush uses 6 slots, so nothing in the library is truncated.
+//! faintest ones. [`Modulations::push`] keeps the ones that move the mark most,
+//! which is the ordering that discards least. Measured against the shipped
+//! MyPaint pack the busiest brush uses 9 slots, so nothing in the library is
+//! truncated.
 //!
 //! # The units are MyPaint's, not Umber's
 //!
@@ -105,11 +106,14 @@ impl DabInput {
     /// The span of input values a mapping is written across, in MyPaint's
     /// units — its `soft_min` and `soft_max` from `brushsettings.json`.
     ///
-    /// Values outside it are held rather than extrapolated. MyPaint
-    /// extrapolates the end segment instead; within the range the two agree
-    /// exactly, and outside it holding is the conservative direction. A speed
-    /// mapping extrapolated off the end of its curve is how a single fast flick
-    /// turns into a dab the size of the canvas.
+    /// The importer samples a mapping across exactly this range, extrapolating
+    /// the way libmypaint does, and a live value outside it is clamped back to
+    /// the edge. That combination is what keeps a brush faithful inside the
+    /// range MyPaint's own editor draws while making it impossible for a single
+    /// fast flick — or a bad timestamp — to run a mapping off to infinity.
+    ///
+    /// `speed1`'s floor is a soft one: at a standstill the input actually reads
+    /// about −0.4, so a stationary pen sits pinned at the low edge.
     pub fn domain(self) -> (f32, f32) {
         match self {
             Self::Pressure | Self::Stroke | Self::Random => (0.0, 1.0),
@@ -118,19 +122,26 @@ impl DabInput {
         }
     }
 
-    /// Where the input sits when nothing is driving it.
+    /// Where the input sits when nothing in particular is happening —
+    /// MyPaint's own `normal` from `brushsettings.json`, which is the value its
+    /// editor shows a slider resting at.
     ///
     /// Used at import to decide what a mapping *contributes*: MyPaint adds
-    /// `mapping(x)` to the base, so the part of it already accounted for in the
-    /// base value is `mapping(neutral)`.
+    /// `mapping(x)` to the base, so the part already accounted for in the base
+    /// value is `mapping(neutral)`. When a modulation is created the choice
+    /// cancels exactly — `base + map(x) - map(neutral) + map(neutral)` — so it
+    /// only shows for a mapping too faint to be worth a slot, and there
+    /// "typical" is plainly the right value to keep.
     ///
-    /// Zero for everything with a natural floor — a stroke starts at its
-    /// beginning, a pointer starts at rest — and 0.5 for `random`, whose
-    /// average is the honest answer.
+    /// Taking the low end instead was tried and is worse in a specific way:
+    /// `experimental/pick_and_drag` states an opacity that is *negative* until
+    /// half way through a mark, so reading its base at stroke zero imported a
+    /// brush that paints nothing at all.
     pub fn neutral(self) -> f32 {
         match self {
-            Self::Random => 0.5,
-            _ => 0.0,
+            Self::Speed | Self::SlowSpeed | Self::Stroke | Self::Random => 0.5,
+            Self::Pressure => 0.4,
+            Self::Direction => 0.0,
         }
     }
 
@@ -296,9 +307,11 @@ impl Default for Modulations {
 }
 
 impl Modulations {
-    /// Slots per brush. Six is the most any brush in the shipped MyPaint pack
-    /// needs; eight leaves room for a user to add a couple by hand.
-    pub const MAX: usize = 8;
+    /// Slots per brush. Nine is the most any brush in the shipped MyPaint pack
+    /// needs — `classic/long_grass` — and twelve leaves room for a user to add
+    /// a few by hand. `cargo run -p umber-core --example survey-mypaint`
+    /// reports the figure, and says so when a brush is truncated.
+    pub const MAX: usize = 12;
 
     pub const EMPTY: Self = Self {
         entries: [Modulation::EMPTY; Self::MAX],
@@ -582,12 +595,7 @@ mod tests {
     fn a_full_table_keeps_the_widest_entries() {
         let mut t = Modulations::EMPTY;
         for i in 0..Modulations::MAX {
-            assert!(t.push(m(
-                DabTarget::Hardness,
-                DabInput::Speed,
-                0.0,
-                (i + 1) as f32
-            )));
+            assert!(t.push(m(DabTarget::Hardness, DabInput::Speed, 0.0, (i + 1) as f32)));
         }
         assert_eq!(t.len(), Modulations::MAX);
         // Narrower than the narrowest present: refused.
@@ -617,7 +625,10 @@ mod tests {
     fn an_input_outside_its_domain_holds_rather_than_extrapolating() {
         let e = m(DabTarget::Size, DabInput::Speed, 0.0, 2.0);
         assert!((e.at_raw(4.0) - 2.0).abs() < 1e-5);
-        assert!((e.at_raw(40.0) - 2.0).abs() < 1e-5, "a flick must not blow up");
+        assert!(
+            (e.at_raw(40.0) - 2.0).abs() < 1e-5,
+            "a flick must not blow up"
+        );
         assert!(e.at_raw(-5.0).abs() < 1e-5);
     }
 

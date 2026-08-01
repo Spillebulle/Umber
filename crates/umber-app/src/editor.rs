@@ -504,7 +504,12 @@ impl Editor {
             // must not change mid-stroke: dabs already stamped without a colour
             // recorded would commit as the flat palette colour while the rest
             // smudged.
-            per_dab_color: self.brush.smudges(),
+            //
+            // Colour pickup is no longer the only thing that colours a dab: a
+            // hue, saturation or brightness modulation does too. This must
+            // agree with `StrokeBuilder::is_coloured`, which is what decides
+            // which dab pipeline the frame uses.
+            per_dab_color: self.brush.colours_dabs(),
         };
         self.stroke_slot = self.layers.active_slot();
         self.pressure.reset();

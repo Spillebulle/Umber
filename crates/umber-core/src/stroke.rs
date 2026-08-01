@@ -503,7 +503,12 @@ impl StrokeBuilder {
             stroke: self.stroke_pos.min(1.0),
             // Undirected, like MyPaint's: a line pulled left and the same line
             // pulled right are the same stroke as far as a brush is concerned.
-            direction: self.heading.y.atan2(self.heading.x).to_degrees().rem_euclid(180.0),
+            direction: self
+                .heading
+                .y
+                .atan2(self.heading.x)
+                .to_degrees()
+                .rem_euclid(180.0),
             random,
         };
         self.brush.modulations.evaluate(&inputs)
@@ -642,6 +647,8 @@ fn tint(rgb: [f32; 3], m: &Modulated) -> [f32; 3] {
 mod tests {
     use super::*;
     use crate::brush::Brush;
+    use crate::curve::ResponseCurve;
+    use crate::dynamics::{DabTarget, Modulation};
     use glam::vec2;
 
     const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
@@ -1335,6 +1342,267 @@ mod tests {
             assert_eq!(d.angle, 0.0);
             assert_eq!(d.pos[1], 0.0);
         }
+    }
+
+    fn modulated(entries: &[Modulation]) -> Brush {
+        Brush {
+            modulations: entries.iter().copied().collect(),
+            ..unsmoothed(20.0, 0.2)
+        }
+    }
+
+    fn entry(target: DabTarget, input: DabInput, low: f32, high: f32) -> Modulation {
+        Modulation {
+            target,
+            input,
+            low,
+            high,
+            curve: ResponseCurve::LINEAR,
+        }
+    }
+
+    /// The RNG invariant, extended to the new random input. A brush that reads
+    /// `random` draws once per dab; a brush that does not must not draw at all,
+    /// or every scatter in the suite shifts. The failure this guards is silent:
+    /// nothing errors, the marks simply move.
+    #[test]
+    fn a_modulation_that_reads_no_randomness_leaves_the_rng_alone() {
+        let scatter_only = scattered(1.5, 0.0);
+        let plus_speed = Brush {
+            modulations: [entry(DabTarget::Hardness, DabInput::Speed, -0.2, 0.2)]
+                .into_iter()
+                .collect(),
+            ..scatter_only
+        };
+
+        let run = |brush: Brush| {
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(100.0, 0.0), 1.0, 0.1));
+            s.drain_pending().map(|d| d.pos).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(scatter_only),
+            run(plus_speed),
+            "a non-random modulation moved the scatter stream"
+        );
+
+        // And one that *does* read randomness takes exactly one draw per dab,
+        // which is what shifts it.
+        let plus_random = Brush {
+            modulations: [entry(DabTarget::Hardness, DabInput::Random, 0.0, 0.3)]
+                .into_iter()
+                .collect(),
+            ..scatter_only
+        };
+        assert_ne!(run(scatter_only), run(plus_random));
+    }
+
+    /// Speed is measured, filtered and fed in on MyPaint's own log scale. The
+    /// direction of the effect is the thing worth pinning: a brush that thins
+    /// when flicked must not thicken.
+    #[test]
+    fn a_speed_modulation_thins_a_fast_stroke_and_not_a_slow_one() {
+        let brush = modulated(&[entry(DabTarget::Size, DabInput::Speed, 0.0, -0.7)]);
+        let radius_at_speed = |pixels_per_second: f32| {
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.drain_pending();
+            // Several samples, because the filter has a 40 ms time constant
+            // and one report would only move it part of the way.
+            for i in 1..=20 {
+                let t = i as f64 * 0.01;
+                s.extend(InputPoint::new(
+                    vec2(pixels_per_second * t as f32, 0.0),
+                    1.0,
+                    t,
+                ));
+            }
+            s.drain_pending().next_back().expect("a dab").radius
+        };
+        let slow = radius_at_speed(20.0);
+        let fast = radius_at_speed(2000.0);
+        assert!(fast < slow * 0.8, "slow {slow}, fast {fast}");
+        // And it must stay a brush rather than vanishing.
+        assert!(fast > 0.5);
+    }
+
+    /// The stroke input is a ramp measured in dab radii, so the same brush
+    /// scaled up runs through its cycle over a proportionally longer mark. Two
+    /// things have to hold: it moves, and it wraps.
+    #[test]
+    fn the_stroke_input_ramps_over_its_span_and_then_wraps() {
+        let brush = Brush {
+            // 10 radii of travel — a 20 px brush has a radius of 10, so a
+            // full cycle is 100 document pixels.
+            stroke_span: 10.0,
+            // Kept clear of the 0..1 clamp on hardness, so the ramp shows as a
+            // ramp rather than as a plateau.
+            ..modulated(&[entry(DabTarget::Hardness, DabInput::Stroke, 0.0, 0.4)])
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.drain_pending();
+
+        // Ten samples of 20 px, so two full cycles of the 100 px ramp.
+        let mut hardness = Vec::new();
+        for i in 1..=10 {
+            let x = i as f32 * 20.0;
+            s.extend(InputPoint::new(vec2(x, 0.0), 1.0, i as f64 * 0.05));
+            hardness.push(s.drain_pending().next_back().expect("a dab").hardness);
+        }
+        // Rising over the first cycle...
+        assert!(hardness[0] < hardness[1], "{hardness:?}");
+        assert!(hardness[1] < hardness[2], "{hardness:?}");
+        // ...then back to the bottom once past 100 px of travel...
+        assert!(hardness[4] < hardness[0], "did not wrap: {hardness:?}");
+        // ...and the second cycle repeats the first exactly.
+        assert_eq!(&hardness[0..5], &hardness[5..10], "{hardness:?}");
+    }
+
+    /// `offset_by_speed` throws the dab *along* the direction of travel, which
+    /// is what makes a brush trail. Scatter would have been the easy reading
+    /// and the wrong one.
+    #[test]
+    fn a_speed_offset_leads_the_dab_along_the_line_of_travel() {
+        let brush = Brush {
+            speed_offset: 1.0,
+            ..unsmoothed(20.0, 0.5)
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.drain_pending();
+        // 4000 px/s along +x for long enough for the 10 ms filter to settle.
+        for i in 1..=10 {
+            let t = i as f64 * 0.01;
+            s.extend(InputPoint::new(vec2(4000.0 * t as f32, 0.0), 1.0, t));
+        }
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        let last = dabs.last().expect("a dab");
+        // A tenth of a second at 4000 px/s is 400 px of lead — ahead of the
+        // pointer, and exactly on the line rather than beside it.
+        assert!(last.pos[0] > 4000.0 * 0.1 + 100.0, "{:?}", last.pos);
+        assert_eq!(last.pos[1], 0.0, "a lead is not a spray");
+        // The damaged rect has to cover where the dab actually went, or the
+        // lead is never committed and ghosts onto the next stroke.
+        let bounds = s.bounds();
+        for d in &dabs {
+            assert!(
+                bounds.min.x <= d.pos[0] - d.radius && bounds.max.x >= d.pos[0] + d.radius,
+                "dab at {:?} escapes {bounds:?}",
+                d.pos
+            );
+        }
+    }
+
+    /// A speed spike — two samples a microsecond apart, which Windows does
+    /// produce — must not fling a dab across the canvas and damage the whole
+    /// layer with it.
+    #[test]
+    fn a_velocity_spike_cannot_throw_a_dab_off_the_canvas() {
+        let brush = Brush {
+            speed_offset: 10.0,
+            ..unsmoothed(20.0, 0.5)
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.drain_pending();
+        s.extend(InputPoint::new(vec2(50.0, 0.0), 1.0, 0.000_001));
+        for d in s.drain_pending() {
+            assert!(
+                d.pos[0].abs() < MAX_SPEED_OFFSET + 100.0,
+                "dab flew to {:?}",
+                d.pos
+            );
+        }
+    }
+
+    /// Colour dynamics ride the per-dab colour path smudging already built.
+    /// Hue is stated in turns, and a half-turn from white is still white — so
+    /// the test uses a colour with a hue to rotate.
+    #[test]
+    fn a_colour_modulation_tints_each_dab_differently() {
+        let brush = modulated(&[entry(DabTarget::Value, DabInput::Random, -0.4, 0.4)]);
+        assert!(brush.colours_dabs(), "the stroke needs its colour scratch");
+
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            brush,
+            [0.5, 0.2, 0.2],
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert!(dabs.len() > 20);
+
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for d in &dabs {
+            assert!(
+                d.color.iter().all(|c| (0.0..=1.0).contains(c)),
+                "{:?}",
+                d.color
+            );
+            lo = lo.min(d.color[0]);
+            hi = hi.max(d.color[0]);
+        }
+        assert!(hi - lo > 0.1, "brightness did not vary: {lo}..{hi}");
+    }
+
+    /// Saturation is scaled rather than offset, which is libmypaint's own form
+    /// and the reason a grey stays grey. A brush that turned neutrals coloured
+    /// would be unusable for shading.
+    #[test]
+    fn a_saturation_modulation_leaves_a_grey_grey() {
+        let brush = modulated(&[entry(DabTarget::Saturation, DabInput::Random, -1.0, 1.0)]);
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            brush,
+            [0.3, 0.3, 0.3],
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        for d in s.drain_pending() {
+            assert!((d.color[0] - d.color[1]).abs() < 1e-3, "{:?}", d.color);
+            assert!((d.color[1] - d.color[2]).abs() < 1e-3, "{:?}", d.color);
+        }
+    }
+
+    /// Ellipticity per dab. 46 brushes vary it and it costs nothing to render:
+    /// `Dab::aspect` was already an instance field.
+    #[test]
+    fn a_ratio_modulation_reshapes_every_dab() {
+        let brush = Brush {
+            dab_ratio: 3.0,
+            ..modulated(&[entry(DabTarget::Ratio, DabInput::Random, -2.0, 2.0)])
+        };
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let aspects: Vec<f32> = s.drain_pending().map(|d| d.aspect).collect();
+        let lo = aspects.iter().copied().fold(f32::MAX, f32::min);
+        let hi = aspects.iter().copied().fold(f32::MIN, f32::max);
+        assert!(hi - lo > 1.0, "the dab did not change shape: {lo}..{hi}");
+        // Never inside out: below 1.0 the long and short axes swap and the
+        // ellipse would turn a quarter turn rather than flattening back out.
+        assert!(lo >= 1.0, "aspect went below a circle: {lo}");
+    }
+
+    /// One stroke still has to redraw identically with the new random input in
+    /// play, or every pixel test involving one of these brushes goes flaky.
+    #[test]
+    fn a_modulated_stroke_is_still_reproducible() {
+        let brush = modulated(&[entry(DabTarget::Ratio, DabInput::Random, -1.0, 1.0)]);
+        let run = |s: &mut StrokeBuilder| {
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(100.0, 0.0), 1.0, 0.1));
+            let out: Vec<f32> = s.drain_pending().map(|d| d.aspect).collect();
+            s.end();
+            out
+        };
+        let mut a = StrokeBuilder::new();
+        let mut b = StrokeBuilder::new();
+        assert_eq!(run(&mut a), run(&mut b));
     }
 
     #[test]

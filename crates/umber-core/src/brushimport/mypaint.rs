@@ -113,11 +113,9 @@
 //!   the whole stroke and applies opacity once at commit — that is the
 //!   wet-layer design in `CLAUDE.md`.
 //!
-//! One deliberate deviation: `mypaint_mapping_calculate` *extrapolates* the end
-//! segment of a mapping past its last control point, and this holds the end
-//! value instead. Inside the range they agree exactly. Outside it, holding is
-//! the safe direction — a speed mapping extrapolated off the end of its curve
-//! is how one fast flick becomes a dab the size of the canvas.
+//! A mapping is evaluated exactly as `mypaint_mapping_calculate` does,
+//! extrapolation of the end segments included — see [`piecewise`] for why that
+//! detail is worth a paragraph of its own.
 
 use std::collections::HashMap;
 
@@ -168,7 +166,10 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // the pressure mapping is an offset *in log space*, so the radius at
     // pressure p is exp(base + map(p)). Reading the base value as a radius
     // directly is the classic mistake: it would make a 2.6 px pen 0.96 px wide.
-    let radius_at = |p: f32| file.eval("radius_logarithmic", &env.with(DabInput::Pressure, p)).exp();
+    let radius_at = |p: f32| {
+        file.eval("radius_logarithmic", &env.with(DabInput::Pressure, p))
+            .exp()
+    };
     let radii: Vec<f32> = sample_points().map(radius_at).collect();
     let r_max = radii.iter().copied().fold(f32::MIN, f32::max);
     let r_min = radii.iter().copied().fold(f32::MAX, f32::min);
@@ -267,9 +268,12 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     let a_min = alphas.iter().copied().fold(f32::MAX, f32::min);
     let peak_pressure = sample_points()
         .zip(&alphas)
-        .fold((1.0f32, f32::MIN), |acc, (p, a)| {
-            if *a > acc.1 { (p, *a) } else { acc }
-        })
+        .fold(
+            (1.0f32, f32::MIN),
+            |acc, (p, a)| {
+                if *a > acc.1 { (p, *a) } else { acc }
+            },
+        )
         .0;
 
     let opacity_varies = (file.is_driven("opaque", DabInput::Pressure)
@@ -322,7 +326,8 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // the two terms are added as though the radii were equal — true at full
     // pressure, and increasingly wrong at light pressure for the few brushes
     // that use `dabs_per_basic_radius`.
-    let per_radius = file.eval("dabs_per_actual_radius", &env) + file.eval("dabs_per_basic_radius", &env);
+    let per_radius =
+        file.eval("dabs_per_actual_radius", &env) + file.eval("dabs_per_basic_radius", &env);
     let spacing = if per_radius > 0.0 {
         (1.0 / (2.0 * per_radius)).clamp(0.01, 0.5)
     } else {
@@ -395,12 +400,19 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // a charcoal and a grain brush into combs — every stamp lying the same way
     // down the stroke. MyPaint's `random` input runs 0..1, so the span of the
     // mapping *is* the full width of the rotation, in degrees.
-    let dab_angle_jitter = file.span("elliptical_dab_angle", "random").clamp(0.0, 360.0);
+    let dab_angle_jitter = file
+        .span("elliptical_dab_angle", "random")
+        .clamp(0.0, 360.0);
 
     // `direction` and `random` are excluded here: both already have a dedicated
     // reading above, and taking them twice would turn a rake into a rake that
     // also swings.
-    for input in [DabInput::Pressure, DabInput::Speed, DabInput::SlowSpeed, DabInput::Stroke] {
+    for input in [
+        DabInput::Pressure,
+        DabInput::Speed,
+        DabInput::SlowSpeed,
+        DabInput::Stroke,
+    ] {
         mods.extend(modulation(
             &file,
             "elliptical_dab_angle",
@@ -432,8 +444,9 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // Absolute, because the interesting case is a brush that scatters by 0.4
     // radii at one end and not at all at the other — no relative threshold can
     // see that without also firing on rounding noise near zero.
-    let pressure_scatter =
-        file.is_driven("offset_by_random", DabInput::Pressure) && s_max > 0.0 && s_max - s_min > 0.01;
+    let pressure_scatter = file.is_driven("offset_by_random", DabInput::Pressure)
+        && s_max > 0.0
+        && s_max - s_min > 0.01;
     let (min_scatter_ratio, scatter_curve) = if pressure_scatter {
         (s_min / s_max, normalised_curve(&scatters, s_min, s_max))
     } else {
@@ -471,7 +484,13 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         .chain(EXTRA_INPUTS)
         .chain([DabInput::Direction])
     {
-        mods.extend(modulation(&file, "change_color_h", DabTarget::Hue, input, &env));
+        mods.extend(modulation(
+            &file,
+            "change_color_h",
+            DabTarget::Hue,
+            input,
+            &env,
+        ));
         // HSL's lightness read as HSV's value, and HSL's saturation as HSV's.
         // They are not the same axis — a fully saturated hue is L 0.5 and V 1 —
         // so the *amount* of a `change_color_l` shift is approximate while its
@@ -670,11 +689,9 @@ fn normalised_curve(values: &[f32], min: f32, max: f32) -> ResponseCurve {
 
 /// Where every MyPaint input sits while a setting is being read.
 ///
-/// Two of them are resolved to their true constant value — `brush_radius` is
-/// the brush's own base radius and `viewzoom` is zero at 100% — and the rest
-/// sit at rest: a stroke starts at its beginning, from a standstill, with the
-/// pointer travelling along +x. `random` sits at its mean rather than at an end,
-/// because half is the honest description of a die nobody has rolled.
+/// Two are resolved to their true constant value — `brush_radius` is the
+/// brush's own base radius and `viewzoom` is zero at 100% — and the rest sit at
+/// [`DabInput::neutral`], MyPaint's own idea of a typical value.
 #[derive(Clone, Copy)]
 struct Env {
     pressure: f32,
@@ -689,12 +706,12 @@ struct Env {
 impl Env {
     fn resting(brush_radius: f32) -> Self {
         Self {
-            pressure: 0.0,
-            speed1: 0.0,
-            speed2: 0.0,
-            stroke: 0.0,
-            direction: 0.0,
-            random: 0.5,
+            pressure: DabInput::Pressure.neutral(),
+            speed1: DabInput::Speed.neutral(),
+            speed2: DabInput::SlowSpeed.neutral(),
+            stroke: DabInput::Stroke.neutral(),
+            direction: DabInput::Direction.neutral(),
+            random: DabInput::Random.neutral(),
             brush_radius,
         }
     }
@@ -794,8 +811,13 @@ impl MybFile {
 /// other setting defaults to zero, which is what the fallthrough gives.
 fn default_base(name: &str) -> f32 {
     match name {
-        "opaque" | "anti_aliasing" | "gridmap_scale_x" | "gridmap_scale_y" | "paint_mode"
-        | "offset_by_speed_slowness" | "elliptical_dab_ratio" => 1.0,
+        "opaque"
+        | "anti_aliasing"
+        | "gridmap_scale_x"
+        | "gridmap_scale_y"
+        | "paint_mode"
+        | "offset_by_speed_slowness"
+        | "elliptical_dab_ratio" => 1.0,
         "opaque_linearize" => 0.9,
         "radius_logarithmic" | "dabs_per_actual_radius" | "direction_filter" => 2.0,
         "hardness" => 0.8,
@@ -817,33 +839,40 @@ struct MybSetting {
     inputs: HashMap<String, Vec<(f32, f32)>>,
 }
 
-/// Evaluate MyPaint's piecewise-linear mapping, holding the end values outside
-/// the control points' range. An empty or single-point mapping contributes
-/// nothing, which matches MyPaint refusing to treat one point as a curve.
+/// Evaluate MyPaint's piecewise-linear mapping, line for line with
+/// `mypaint_mapping_calculate`.
+///
+/// The part that is easy to get wrong is the ends. libmypaint picks the segment
+/// whose right-hand point is the first one past `x`, falling back to the first
+/// or last segment, and then **extrapolates** along it. It does not hold the
+/// end value. The difference is not academic: `classic/pen` states its speed
+/// mapping over `0..1` while the speed input runs to 4, so holding makes a fast
+/// flick thin the nib by 14% where MyPaint thins it by 45%.
+///
+/// Extrapolation is bounded by the input's domain, which
+/// [`DabInput::normalise`] clamps, so no mapping can run away.
+///
+/// A segment with equal x or equal y contributes its left value flat — that is
+/// libmypaint's own guard, and it is also what stops a step mapping (two points
+/// sharing an x, which is how a brush spells an on/off threshold) dividing by
+/// zero. An empty or single-point mapping contributes nothing.
 fn piecewise(points: &[(f32, f32)], x: f32) -> f32 {
     if points.len() < 2 {
         return 0.0;
     }
-    if x <= points[0].0 {
-        return points[0].1;
-    }
-    let last = points[points.len() - 1];
-    if x >= last.0 {
-        return last.1;
-    }
-    for pair in points.windows(2) {
-        let (x0, y0) = pair[0];
-        let (x1, y1) = pair[1];
+    let (mut x0, mut y0) = points[0];
+    let (mut x1, mut y1) = points[1];
+    for &(px, py) in &points[2..] {
         if x <= x1 {
-            // MyPaint allows two points to share an x, which is how a brush
-            // spells a step. Guard the division rather than producing NaN.
-            if (x1 - x0).abs() < f32::EPSILON {
-                return y1;
-            }
-            return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            break;
         }
+        (x0, y0) = (x1, y1);
+        (x1, y1) = (px, py);
     }
-    last.1
+    if (x1 - x0).abs() < f32::EPSILON || (y1 - y0).abs() < f32::EPSILON {
+        return y0;
+    }
+    (y1 * (x - x0) + y0 * (x1 - x)) / (x1 - x0)
 }
 #[cfg(test)]
 mod tests {
@@ -898,14 +927,35 @@ mod tests {
         }
     }"#;
 
+    /// Rebuild a brush's radius the way [`crate::stroke::StrokeBuilder`] does:
+    /// the pressure curve, times the exponential of every `Size` modulation.
+    /// Written out here rather than borrowed from the stroke builder so the two
+    /// have to agree by construction rather than by hope.
+    fn radius_of(b: &Brush, pressure: f32, speed1: f32) -> f32 {
+        let mut r = b.radius_at(pressure);
+        for m in b.modulations.as_slice() {
+            if m.target != DabTarget::Size {
+                continue;
+            }
+            let x = match m.input {
+                DabInput::Speed | DabInput::SlowSpeed => speed1,
+                _ => m.input.neutral(),
+            };
+            r *= m.at_raw(x).exp();
+        }
+        r
+    }
+
     #[test]
     fn a_pen_imports_with_a_believable_shape() {
         let b = from_myb(PEN).expect("import");
 
-        // radius_logarithmic is a natural log: the pen is exp(0.96) = 2.61 px
-        // in radius at zero pressure and exp(0.96 + 0.5) = 4.31 at full, so the
-        // diameter Umber stores is 8.62 px, not 0.96 or 1.92.
-        assert!((b.size - 8.61).abs() < 0.05, "size was {}", b.size);
+        // radius_logarithmic is a natural log, and the pen states two mappings
+        // on it: +0.5 over pressure and -0.15 over speed. `size` is the radius
+        // at full pressure and typical speed, doubled — exp(0.96 - 0.075 + 0.5)
+        // × 2 = 7.99 px, not 0.96, not 1.92, and not the 8.61 that reading the
+        // pressure term alone would give.
+        assert!((b.size - 7.99).abs() < 0.05, "size was {}", b.size);
         assert!(b.pressure_size);
         assert!(
             (b.min_size_ratio - 0.6065).abs() < 0.01,
@@ -921,19 +971,237 @@ mod tests {
 
     #[test]
     fn the_imported_radius_matches_mypaint_at_every_sample() {
-        // The whole point of the size/min_ratio/curve triple: rebuilding the
-        // radius through Umber's own `radius_at` must land back on
-        // exp(base + map(p)).
+        // The whole point of the size/min_ratio/curve triple *and* of the
+        // modulation table: rebuilding the radius the way the stroke builder
+        // does must land back on MyPaint's own
+        //
+        //     exp(base + map_pressure(p) + map_speed1(s))
+        //
+        // at every one of the points the curves are sampled at, for both
+        // inputs at once. This is the test that would have caught the speed
+        // term being dropped, and it did not exist before.
         let b = from_myb(PEN).expect("import");
         for i in 0..=4 {
             let p = i as f32 / 4.0;
-            let expected = (0.96 + 0.5 * p).exp();
-            let got = b.radius_at(p);
-            assert!(
-                (got - expected).abs() < 0.02,
-                "at pressure {p}: expected {expected}, got {got}"
-            );
+            for j in 0..=4 {
+                let s = j as f32;
+                let expected = (0.96 + 0.5 * p - 0.15 * s).exp();
+                let got = radius_of(&b, p, s);
+                assert!(
+                    (got - expected).abs() < 0.02,
+                    "at pressure {p}, speed {s}: expected {expected}, got {got}"
+                );
+            }
         }
+    }
+
+    /// `brush_radius` is libmypaint's `BASEVAL(RADIUS_LOGARITHMIC)` — the
+    /// brush's own base radius fed back as an input, and therefore a constant
+    /// for the whole stroke. Thirteen brushes in the pack map it, some over
+    /// seven log units, and dropping the contribution imported every one of
+    /// them at the wrong size. It needs no runtime support at all; it just has
+    /// to be evaluated.
+    #[test]
+    fn a_brush_radius_mapping_is_folded_into_the_size() {
+        let json = r#"{ "version": 3, "settings": {
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {
+                "brush_radius": [[-2.0, 0.0], [6.0, 8.0]] } } } }"#;
+        let b = from_myb(json).expect("imports");
+        // The input reads 2.0, a quarter of the way from -2 to 6, so the
+        // mapping contributes +4 and the radius is exp(6), not exp(2).
+        assert!((b.size - 2.0 * 6f32.exp()).abs() < 1.0, "size {}", b.size);
+        // And it must not have cost a modulation slot: it cannot vary.
+        assert!(b.modulations.is_empty());
+    }
+
+    /// The fault that shipped three brushes completely invisible. MyPaint
+    /// evaluates `opaque` as a full expression like every other setting, and
+    /// several brushes state a base of about 2.5e-05 with the whole of their
+    /// opacity on a pressure mapping.
+    #[test]
+    fn opaque_is_evaluated_rather_than_read_off_its_base() {
+        let json = r#"{ "version": 3, "settings": {
+            "opaque": { "base_value": 0.0000254, "inputs": {
+                "pressure": [[0.0, 0.0], [1.0, 1.0]] } },
+            "opaque_multiply": { "base_value": 0.0, "inputs": {
+                "pressure": [[0.0, 0.0], [1.0, 1.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert!(b.opacity > 0.99, "opacity was {}", b.opacity);
+        assert!(b.pressure_opacity);
+        // alpha(p) = p * p, so a light touch is nearly nothing and full
+        // pressure is solid.
+        assert!(b.coverage_at(0.5) < 0.3, "{}", b.coverage_at(0.5));
+        assert!((b.coverage_at(1.0) - 1.0).abs() < 1e-4);
+    }
+
+    /// libmypaint's exact arithmetic, from `prepare_and_draw_dab`:
+    ///
+    /// ```c
+    /// opaque = MAX(0.0, SETTING(OPAQUE));
+    /// opaque = CLAMP(opaque * opaque_fac, 0.0, 1.0);
+    /// ```
+    ///
+    /// Neither setting is first clamped to the range its editor shows. A brush
+    /// whose `opaque` reaches 1.5 really does reach full coverage at two thirds
+    /// of its multiplier, and clamping on the way past would under-paint it —
+    /// `classic/long_grass` is exactly this shape and shipped at 0.748.
+    #[test]
+    fn only_the_product_is_clamped_not_each_half() {
+        let json = r#"{ "version": 3, "settings": {
+            "opaque": { "base_value": 1.1, "inputs": {
+                "pressure": [[0.0, 0.4], [1.0, 0.4]] } },
+            "opaque_multiply": { "base_value": 0.68, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        // 1.5 × 0.68 = 1.02, clamped to 1.0. Clamping `opaque` to 1.0 first
+        // would give 0.68 instead.
+        assert!((from_myb(json).unwrap().opacity - 1.0).abs() < 1e-4);
+    }
+
+    /// A speed mapping is written on MyPaint's own log-speed scale, so it is
+    /// only meaningful alongside `speed1_gamma`. This pins the whole chain:
+    /// the domain the mapping is sampled over, the curve, and the arithmetic
+    /// the stroke builder uses to put it back together.
+    #[test]
+    fn a_speed_mapping_reproduces_mypaints_value_at_every_sample() {
+        let json = r#"{ "version": 3, "settings": {
+            "hardness": { "base_value": 0.5, "inputs": {
+                "speed1": [[0.0, 0.0], [4.0, 0.4]] } },
+            "opaque": { "base_value": 1.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        let m = b
+            .modulations
+            .as_slice()
+            .iter()
+            .find(|m| m.target == DabTarget::Hardness)
+            .expect("a hardness modulation");
+        assert_eq!(m.input, DabInput::Speed);
+        for i in 0..=4 {
+            let s = i as f32;
+            // MyPaint: hardness = 0.5 + 0.1 * s. Umber holds the value at the
+            // input's neutral (speed 0.5 → +0.05) in the field, so the
+            // modulation carries the difference.
+            let want = 0.5 + 0.1 * s;
+            let got = b.hardness_at(0.4) + m.at_raw(s);
+            assert!((got - want).abs() < 1e-3, "at speed {s}: {want} vs {got}");
+        }
+    }
+
+    /// `radius_logarithmic <- random` is the splotchy-spray brush. It arrives
+    /// as a modulation rather than as `radius_jitter` because MyPaint draws it
+    /// from the *same* uniform every other `random` mapping on the brush reads,
+    /// where `radius_jitter` is an independent gaussian.
+    #[test]
+    fn a_random_radius_mapping_becomes_a_size_modulation() {
+        let json = r#"{ "version": 3, "settings": {
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {
+                "random": [[0.0, -0.98], [1.0, 0.98]] } } } }"#;
+        let b = from_myb(json).expect("imports");
+        let m = b.modulations.as_slice()[0];
+        assert_eq!((m.target, m.input), (DabTarget::Size, DabInput::Random));
+        // exp(1.96) is a 7× swing in radius from one stamp to the next.
+        assert!((m.low + 0.98).abs() < 1e-3 && (m.high - 0.98).abs() < 1e-3);
+        assert_eq!(b.radius_jitter, 0.0, "not confused with radius_by_random");
+    }
+
+    /// 46 brushes vary their ellipticity and 15 state a round base, so before
+    /// this they arrived as perfect circles whatever else they did.
+    #[test]
+    fn a_ratio_driven_by_an_input_no_longer_arrives_round() {
+        let json = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 1.0, "inputs": {
+                "random": [[0.0, 0.0], [1.0, 4.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert!(b.is_shaped(), "a ratio that varies is a shaped dab");
+        assert!(b.dab_has_angle(), "and it has an angle worth showing");
+        let m = b.modulations.as_slice()[0];
+        assert_eq!((m.target, m.input), (DabTarget::Ratio, DabInput::Random));
+        // Neutral is 0.5, so the base already carries +2 and the modulation
+        // runs -2..+2 around it. Their sum is MyPaint's 0..4.
+        assert!((b.dab_ratio - 3.0).abs() < 1e-3, "{}", b.dab_ratio);
+        assert!((b.dab_ratio + m.low - 1.0).abs() < 1e-3);
+        assert!((b.dab_ratio + m.high - 5.0).abs() < 1e-3);
+    }
+
+    /// 42 brushes state colour pickup entirely as a pressure mapping — an oil
+    /// brush that mixes when you lean on it. Reading the base alone made every
+    /// one of them deposit flat paint for the whole stroke.
+    #[test]
+    fn smudge_stated_only_as_a_mapping_still_makes_the_brush_blend() {
+        let json = r#"{ "version": 3, "settings": {
+            "smudge": { "base_value": 0.0, "inputs": {
+                "pressure": [[0.0, 0.0], [1.0, 0.9]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert!(b.smudges(), "the field is nearly zero but the brush blends");
+        assert!(b.colours_dabs(), "so the stroke needs its colour scratch");
+        let m = b.modulations.as_slice()[0];
+        assert_eq!(m.target, DabTarget::Smudge);
+        assert!((b.smudge + m.high - 0.9).abs() < 1e-3);
+    }
+
+    /// `offset_by_speed` is a *directed* lead along the smoothed velocity, not
+    /// a spray. Importing it as scatter would turn a trailing brush into
+    /// confetti, which is why it has a field of its own.
+    #[test]
+    fn offset_by_speed_becomes_a_lead_not_scatter() {
+        let json = r#"{ "version": 3, "settings": {
+            "offset_by_speed": { "base_value": 0.8, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert!((b.speed_offset - 0.8).abs() < 1e-5);
+        assert!(b.leads_with_speed());
+        assert_eq!(b.scatter, 0.0, "a lead is not a spray");
+    }
+
+    /// The colour modulations take the *variation*, never the constant part.
+    /// MyPaint's brushes carry their own colour and a fixed hue shift is part
+    /// of it; here the palette belongs to the user, and a brush that silently
+    /// repainted their choice would read as a bug.
+    #[test]
+    fn colour_dynamics_take_the_variation_and_not_the_constant() {
+        let json = r#"{ "version": 3, "settings": {
+            "change_color_h": { "base_value": 0.25, "inputs": {
+                "random": [[0.0, -0.05], [1.0, 0.05]] } },
+            "change_color_v": { "base_value": 0.4, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert_eq!(b.modulations.len(), 1, "the constant shift is not a slot");
+        let m = b.modulations.as_slice()[0];
+        assert_eq!((m.target, m.input), (DabTarget::Hue, DabInput::Random));
+        assert!((m.low + 0.05).abs() < 1e-4 && (m.high - 0.05).abs() < 1e-4);
+        assert!(b.colours_dabs(), "a hue wobble needs the colour scratch");
+    }
+
+    /// The `stroke` input's ramp is stated as a log of how many dab radii it
+    /// takes. MyPaint's default of 4 is about 55 radii, and a brush that
+    /// shortens it is asking for a cycle you can see inside one mark.
+    #[test]
+    fn the_stroke_ramp_comes_from_its_own_setting() {
+        let json = r#"{ "version": 3, "settings": {
+            "stroke_duration_logarithmic": { "base_value": 1.0, "inputs": {} },
+            "stroke_holdtime": { "base_value": 2.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let b = from_myb(json).expect("imports");
+        assert!((b.stroke_span - std::f32::consts::E).abs() < 1e-3);
+        assert!((b.stroke_hold - 2.0).abs() < 1e-5);
+        // A file that says nothing gets MyPaint's default of exp(4).
+        let plain = from_myb(PEN).expect("import");
+        assert!((plain.stroke_span - 54.598).abs() < 0.01);
+    }
+
+    /// A brush that reads nothing but pressure must arrive with an empty table,
+    /// because an empty table is the fast path: no random draw, no filters, no
+    /// per-dab evaluation. Most of the pack is on it and has to stay there.
+    #[test]
+    fn a_plain_brush_carries_no_modulations_at_all() {
+        let b = from_myb(ERASER).expect("import");
+        assert!(b.modulations.is_empty());
+        assert!(!b.is_modulated());
+        assert!(!b.leads_with_speed());
+        assert!(!b.colours_dabs());
     }
 
     #[test]
@@ -1245,12 +1513,29 @@ mod tests {
     }
 
     #[test]
-    fn the_mapping_holds_its_end_values() {
+    fn the_mapping_extrapolates_its_end_segments_like_libmypaint() {
+        // Not "holds the end value" — libmypaint carries the end segment's
+        // slope onwards, and a brush that states a speed mapping over 0..1
+        // while the input runs to 4 is relying on exactly that.
         let points = [(0.2, 1.0), (0.8, 2.0)];
-        assert_eq!(piecewise(&points, 0.0), 1.0);
-        assert_eq!(piecewise(&points, 1.0), 2.0);
         assert!((piecewise(&points, 0.5) - 1.5).abs() < 1e-5);
+        assert!((piecewise(&points, 0.0) - 0.6667).abs() < 1e-3);
+        assert!((piecewise(&points, 1.0) - 2.3333).abs() < 1e-3);
+        // A flat segment contributes its value and nothing more, which is what
+        // keeps a step mapping — two points sharing an x — finite.
+        assert_eq!(piecewise(&[(0.0, 3.0), (1.0, 3.0)], 9.0), 3.0);
+        assert_eq!(piecewise(&[(0.5, 0.0), (0.5, 1.0)], 0.9), 0.0);
         assert_eq!(piecewise(&[], 0.5), 0.0);
         assert_eq!(piecewise(&[(0.0, 5.0)], 0.5), 0.0);
+    }
+
+    /// The three-segment case, where the loop has to pick the right segment
+    /// rather than the first or the last.
+    #[test]
+    fn the_mapping_picks_the_segment_x_falls_in() {
+        let points = [(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)];
+        assert!((piecewise(&points, 0.25) - 0.5).abs() < 1e-5);
+        assert!((piecewise(&points, 0.75) - 0.5).abs() < 1e-5);
+        assert!((piecewise(&points, 0.5) - 1.0).abs() < 1e-5);
     }
 }
