@@ -962,6 +962,158 @@ fn a_non_square_tip_keeps_its_proportions() {
     );
 }
 
+/// Paint one straight stroke of `brush` into `slot` and leave it committed.
+///
+/// Driven from a `Brush` through a real `StrokeBuilder` rather than from
+/// hand-built dabs, because the claim being tested spans the whole chain: the
+/// brush says the dab may turn, the builder works out the angle from the
+/// heading it is travelling on, and the vertex shader builds the quad — and the
+/// tip with it — rotated.
+fn stroke_into(h: &mut Harness, brush: Brush, slot: u32, from: Vec2, to: Vec2) {
+    let mut s = StrokeBuilder::new();
+    s.begin(brush, [1.0, 1.0, 1.0], InputPoint::new(from, 1.0, 0.0));
+    s.extend(InputPoint::new(to, 1.0, 0.1));
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    h.stamp(&dabs);
+    h.commit_to(slot, Color::WHITE, 1.0, BrushMode::Paint);
+}
+
+/// A 4:1 landscape mask, solid: a bar 24 px long and 6 px tall at radius 12.
+///
+/// Deliberately the *only* asymmetry in the brushes below — `dab_ratio` stays
+/// at 1.0, so a round dab would paint the same disc whichever way it was
+/// turned, and every one of these assertions is about the bitmap.
+fn bar_tip() -> TipMask {
+    TipMask::new(4, 1, vec![255; 4]).expect("tip")
+}
+
+#[test]
+fn a_stamp_turns_to_follow_the_stroke() {
+    // The brush the whole "does a custom tip follow the stroke" question is
+    // about. A bitmap is not rotationally symmetric, so `dab_angle_follows_
+    // stroke` is live for a stamp whatever its roundness — and the mask has to
+    // turn with the quad, not merely be sampled inside a quad that turned.
+    //
+    // Asserted as the *width of the mark across the line of travel*: a bar
+    // dragged along its own length leaves a band as narrow as the mask is tall,
+    // and one dragged sideways leaves a band as wide as the mask is long. Those
+    // are 6 px and 24 px, so 10 px off the line tells them apart with room to
+    // spare either way.
+    let mut h = harness_or_skip!();
+    h.set_tip(Some(bar_tip()));
+
+    let rake = Brush {
+        size: 24.0,
+        spacing: 0.25,
+        stabilization: 0.0,
+        pressure_size: false,
+        dab_angle_follows_stroke: true,
+        ..Default::default()
+    };
+
+    // Travelling down the canvas. The first dab of a stroke is laid before any
+    // direction exists and points along +x, so the far end of the stroke is
+    // where the heading has taken effect.
+    stroke_into(
+        &mut h,
+        rake,
+        0,
+        Vec2::new(32.0, 16.0),
+        Vec2::new(32.0, 48.0),
+    );
+    assert_eq!(h.pixel_in(0, 32, 40)[3], 255, "the stroke should paint");
+    assert_eq!(
+        h.pixel_in(0, 42, 40)[3],
+        0,
+        "10 px to the side of a downward stroke: the stamp did not turn with it"
+    );
+
+    // The same brush pulled the other way. Nothing about the mask changed, so
+    // if the mark is narrow this time as well it is the *stroke* deciding.
+    stroke_into(
+        &mut h,
+        rake,
+        1,
+        Vec2::new(16.0, 32.0),
+        Vec2::new(48.0, 32.0),
+    );
+    assert_eq!(h.pixel_in(1, 40, 32)[3], 255, "the stroke should paint");
+    assert_eq!(
+        h.pixel_in(1, 40, 42)[3],
+        0,
+        "10 px below a rightward stroke should be clear"
+    );
+
+    // The control, and the reason the first assertion means anything: with the
+    // dab held at a fixed angle the downward stroke really does reach 10 px to
+    // the side, because the bar is lying across it.
+    let nib = Brush {
+        dab_angle_follows_stroke: false,
+        ..rake
+    };
+    stroke_into(&mut h, nib, 2, Vec2::new(32.0, 16.0), Vec2::new(32.0, 48.0));
+    assert_eq!(
+        h.pixel_in(2, 42, 40)[3],
+        255,
+        "a fixed-angle stamp should lie across the downward stroke"
+    );
+}
+
+#[test]
+fn a_stamp_rolls_to_a_new_angle_on_every_dab() {
+    // The third angle state, and the one a charcoal, a fringe or a grain brush
+    // is made of. `a_jittered_angle_spreads_a_stroke_the_way_a_fixed_one_cannot`
+    // makes this claim for an *elliptical* dab; this is the bitmap half of it,
+    // with `dab_ratio` left at 1.0 so the quad is square and the only thing that
+    // can reach off the line is the mask being turned.
+    //
+    // Without it a stamp repeated down a stroke lands the same way up every
+    // time, which reads as machined ruling rather than as a loaded brush.
+    let mut h = harness_or_skip!();
+    h.set_tip(Some(bar_tip()));
+
+    let comb = Brush {
+        size: 24.0,
+        spacing: 0.25,
+        stabilization: 0.0,
+        pressure_size: false,
+        dab_ratio: 1.0,
+        ..Default::default()
+    };
+    // 10 px above the line: outside the bar's 3 px half-height, well inside its
+    // 12 px half-length.
+    let reach = |h: &Harness, slot: u32| (16..48).map(|x| h.pixel_in(slot, x, 22)[3]).max();
+
+    stroke_into(
+        &mut h,
+        comb,
+        0,
+        Vec2::new(14.0, 32.0),
+        Vec2::new(50.0, 32.0),
+    );
+    assert_eq!(
+        reach(&h, 0),
+        Some(0),
+        "stamps all lying along the stroke should not reach 10 px off it"
+    );
+
+    let charcoal = Brush {
+        dab_angle_jitter: 360.0,
+        ..comb
+    };
+    stroke_into(
+        &mut h,
+        charcoal,
+        1,
+        Vec2::new(14.0, 32.0),
+        Vec2::new(50.0, 32.0),
+    );
+    assert!(
+        reach(&h, 1).unwrap_or(0) > 0,
+        "a stamp free to roll should reach out towards its long side"
+    );
+}
+
 /// A rotated stamp must not lose its corners to the damaged rect.
 ///
 /// The failure this guards has happened twice in this project and is nasty both
