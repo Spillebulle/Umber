@@ -269,6 +269,20 @@ when nobody asked for it.
   and reading a whole 16 MB layer in one go cost 5 ms. As it stands the worst
   frame is about a millisecond. `a_capture_of_a_large_document_never_costs_a_
   frame` pins it.
+- **Every readback goes in bands, because a document can be larger than the
+  largest buffer the device will make.** `downlevel_defaults` caps
+  `max_buffer_size` at 256 MB and `using_resolution` raises only the texture
+  dimensions, so a 10000² canvas is paintable and was then not readable:
+  `create_buffer` refuses 400 MB, and a validation error aborts the process.
+  Raising the limit is the wrong fix twice — it breaks the rule that a desktop
+  build may not depend on what a mobile GPU refuses, and 256 MB is a limit real
+  hardware has. `band_rows` decides the band and returns the whole document
+  whenever it fits, so nothing changes for an ordinary canvas. The blocking
+  readbacks share `read_texture_rows`; the capture bands *across frames*, which
+  is why `Capture` carries a row cursor and why the flattened preview is
+  composited once per step rather than once per band. Driven in the tests by
+  `set_readback_limit`, because reaching the real limit needs a canvas too large
+  to ask a CI runner for.
 - **A cancelled capture is marked, not dropped**, for the reason `reset_probes`
   gives. Both halves have to be told — the renderer gives its buffer back, the
   scheduler stops waiting — which is what `app.rs`'s `stop_autosave_of` is for.

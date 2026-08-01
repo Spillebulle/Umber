@@ -308,6 +308,29 @@ enum StepState {
 /// (microseconds) or one layer's memcpy, and the staging cost is one buffer
 /// rather than one per layer. The price is that the capture takes a couple of
 /// frames per layer, which for a five-minute timer is no price at all.
+/// How many rows of a `padded`-byte-wide copy fit in one staging buffer.
+///
+/// A document can be far larger than the biggest buffer the device will make.
+/// `Limits::downlevel_defaults` caps `max_buffer_size` at 256 MB and
+/// `using_resolution` raises only the texture dimensions, so a 10000² canvas —
+/// perfectly paintable, 400 MB of RGBA — could be drawn on and then not read
+/// back: `create_buffer` refuses the size, and a validation error aborts the
+/// process. That is exactly what happened, on the undo capture at the end of
+/// the first stroke.
+///
+/// Raising the limit instead would be the wrong fix twice over: it would break
+/// the rule that a desktop build may not depend on what a mobile GPU refuses,
+/// and 256 MB is a limit real hardware has. So every readback goes a band of
+/// rows at a time, and this decides how tall a band is.
+///
+/// Returns at least one row. A single row wider than the whole limit would
+/// still be refused, but that needs a canvas 67 million pixels across — far
+/// beyond `max_texture_dimension_2d`, which is checked long before this.
+fn band_rows(limit: u64, padded: u32, height: u32) -> u32 {
+    let rows = limit / u64::from(padded).max(1);
+    rows.min(u64::from(height)).max(1) as u32
+}
+
 struct Capture {
     size: UVec2,
     /// Bytes per row of the copy, rounded up to the copy alignment.
@@ -318,6 +341,14 @@ struct Capture {
     draws: Vec<LayerDraw>,
     /// The one staging buffer, allocated on the first step and reused.
     buffer: Option<wgpu::Buffer>,
+    /// Rows per staging buffer, from [`band_rows`]. A whole layer where the
+    /// device's limit allows it, which is every ordinary document; a large
+    /// canvas is read a band at a time instead. Set on the first
+    /// [`CanvasRenderer::drive_capture`], which is the first place with a
+    /// device to ask.
+    band: u32,
+    /// The first row of the band in flight, within the step's layer.
+    row: u32,
     /// One of the `PROBE_*` constants, for the reason [`Probe::outcome`] is.
     outcome: Arc<AtomicU8>,
     state: StepState,
@@ -358,8 +389,21 @@ impl Capture {
         self.state == StepState::Waiting
     }
 
+    /// The rows the band in flight covers, as `[first, last)`.
+    fn band_span(&self) -> (usize, usize) {
+        let first = self.row as usize;
+        let last = (first + self.band.max(1) as usize).min(self.size.y as usize);
+        (first, last)
+    }
+
+    /// True once every band of this step has been copied out.
+    fn step_done(&self) -> bool {
+        self.partial.as_ref().map(Vec::len).unwrap_or(0)
+            >= (self.size.x * 4) as usize * self.size.y as usize
+    }
+
     /// Take the next slice of rows out of the mapped buffer. Returns true once
-    /// the whole step is out of it.
+    /// the band in flight is out of it.
     ///
     /// Bounded because reading a mapped staging buffer reads *uncached* memory
     /// — a 16 MB layer measured about 5 ms on a mid-range discrete card, which
@@ -373,20 +417,29 @@ impl Capture {
     fn copy_chunk(&mut self) -> bool {
         let row = (self.size.x * 4) as usize;
         let height = self.size.y as usize;
+        let (band_first, band_last) = self.band_span();
         let buffer = self.buffer.as_ref().expect("a mapped step has its buffer");
-        let mapped = buffer.slice(..).get_mapped_range();
+        // Only what the band actually wrote. The buffer is a full band long and
+        // the last band is usually short, so mapping all of it would read the
+        // previous band's rows back out of the tail.
+        let mapped = buffer
+            .slice(..(self.padded as u64) * ((band_last - band_first) as u64))
+            .get_mapped_range();
 
         let out = self
             .partial
             .get_or_insert_with(|| Vec::with_capacity(row * height));
+        // Absolute, because `partial` accumulates across every band of the step.
         let from = out.len() / row;
         let rows = (CAPTURE_CHUNK_BYTES / self.padded as usize).max(1);
-        let to = (from + rows).min(height);
+        let to = (from + rows).min(band_last);
         for y in from..to {
-            let start = y * self.padded as usize;
+            // Band-relative: row `band_first` of the layer is row 0 of the
+            // buffer.
+            let start = (y - band_first) * self.padded as usize;
             out.extend_from_slice(&mapped[start..start + row]);
         }
-        to >= height
+        to >= band_last
     }
 }
 
@@ -702,6 +755,13 @@ pub struct CanvasRenderer {
     /// per document: a second would double the staging cost for a job that is
     /// already going to be repeated in five minutes.
     capture: Option<Capture>,
+    /// The largest staging buffer this device will create, in bytes.
+    ///
+    /// Taken from the device rather than assumed, and honoured by every
+    /// readback here — see [`band_rows`]. Held as a field so a test can lower
+    /// it and drive the banded path on a document small enough to check by
+    /// hand; on a real device it would take a 8192² canvas to reach.
+    readback_limit: u64,
 
     dab_bind_group: wgpu::BindGroup,
     dab_uniforms: wgpu::Buffer,
@@ -1105,6 +1165,7 @@ impl CanvasRenderer {
                 })
                 .collect(),
             capture: None,
+            readback_limit: device.limits().max_buffer_size,
             dab_bind_group,
             dab_uniforms,
             dab_instances,
@@ -1846,51 +1907,23 @@ impl CanvasRenderer {
             label: Some("export"),
         });
         self.render_export(queue, &mut encoder, &view, layers);
+        // Submitted before the readback rather than sharing its encoder: the
+        // readback may take several submits, and the flatten has to happen once
+        // and before all of them.
+        queue.submit(Some(encoder.finish()));
 
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = (w * 4).div_ceil(align) * align;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export-readback"),
-            size: (padded * h) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
+        self.read_texture_rows(
+            device,
+            queue,
+            "export",
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-
-        let mapped = slice.get_mapped_range();
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for row in 0..h {
-            let start = (row * padded) as usize;
-            out.extend_from_slice(&mapped[start..start + (w * 4) as usize]);
-        }
-        drop(mapped);
-        staging.unmap();
-        out
+            (w, h),
+        )
     }
 
     /// Sample the flattened stack at one document pixel.
@@ -2250,6 +2283,8 @@ impl CanvasRenderer {
             slots: slots.to_vec(),
             draws: draws.to_vec(),
             buffer: None,
+            band: 0,
+            row: 0,
             outcome: Arc::new(AtomicU8::new(PROBE_PENDING)),
             state: StepState::Waiting,
             step: 0,
@@ -2287,14 +2322,16 @@ impl CanvasRenderer {
         }
 
         let index = job.step;
-        let height = job.size.y;
-        // Allocated once and reused for every step. A buffer per layer would be
-        // the document's own size in staging memory on top of the copy of it
-        // being assembled.
+        job.band = band_rows(self.readback_limit, job.padded, job.size.y);
+        let (band_first, band_last) = job.band_span();
+        let height = band_last as u32 - band_first as u32;
+        // Allocated once and reused for every band of every step. A buffer per
+        // layer would be the document's own size in staging memory on top of the
+        // copy of it being assembled.
         let buffer = job.buffer.take().unwrap_or_else(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("umber-capture"),
-                size: (job.padded * height) as u64,
+                size: (job.padded as u64) * (job.band as u64),
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
@@ -2318,7 +2355,7 @@ impl CanvasRenderer {
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: 0,
-                    y: 0,
+                    y: band_first as u32,
                     z: slot,
                 },
                 aspect: wgpu::TextureAspect::All,
@@ -2329,15 +2366,26 @@ impl CanvasRenderer {
             // A second copy of the blend maths here would be a second thing to
             // keep in step, and a preview that disagreed with the screen is the
             // bug that arrangement produces.
-            let target = self.export_target(device);
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            self.render_export(queue, encoder, &view, &job.draws);
-            job.merged_target = Some(target);
+            //
+            // Drawn once per *step*, not once per band: the later bands of a
+            // banded capture read further down the same flattened image, so
+            // re-compositing would be the whole document's blend maths run again
+            // to fetch rows that are already sitting there.
+            if job.merged_target.is_none() {
+                let target = self.export_target(device);
+                let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+                self.render_export(queue, encoder, &view, &job.draws);
+                job.merged_target = Some(target);
+            }
             wgpu::TexelCopyTextureInfo {
                 // Held in `job.merged_target` for the rest of this function.
                 texture: job.merged_target.as_ref().expect("just set"),
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: band_first as u32,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             }
         };
@@ -2396,10 +2444,11 @@ impl CanvasRenderer {
                 };
                 outcome.store(code, Ordering::Release);
             });
-        // The preview's offscreen target has served its purpose the moment the
-        // copy out of it is submitted; holding it would keep a canvas-sized
-        // texture alive for the rest of the readback.
-        job.merged_target = None;
+        // The preview's offscreen target is dropped by `take_capture` once the
+        // last band has been copied out of it; holding it any longer would keep
+        // a canvas-sized texture alive for the rest of the readback. It cannot
+        // go here any more, because a banded capture comes back for the rows
+        // below this one.
     }
 
     /// Collect the step that has come home, and hand back the document once the
@@ -2418,20 +2467,34 @@ impl CanvasRenderer {
                 PROBE_MAPPED => {
                     // A capture that has been abandoned still has to unmap, but
                     // there is no point reading sixteen megabytes out of it.
-                    let done = if job.abandoned || job.failed {
+                    let dropped = job.abandoned || job.failed;
+                    let band_done = if dropped {
                         job.partial = None;
                         true
                     } else {
                         job.copy_chunk()
                     };
-                    if done {
+                    if band_done {
                         job.buffer
                             .as_ref()
                             .expect("a mapped step has its buffer")
                             .unmap();
-                        if let Some(bytes) = job.partial.take() {
-                            job.results[job.step] = Some(bytes);
-                            job.step += 1;
+                        // A step is one band on any ordinary document and
+                        // several on one too large for the device's staging
+                        // limit. Only when the last of them is out does the
+                        // layer count as read.
+                        if !dropped {
+                            job.row += job.band;
+                            if job.step_done() {
+                                job.row = 0;
+                                if let Some(bytes) = job.partial.take() {
+                                    job.results[job.step] = Some(bytes);
+                                    job.step += 1;
+                                }
+                                // The flattened preview has been read out of;
+                                // give the canvas-sized texture back.
+                                job.merged_target = None;
+                            }
                         }
                         job.state = StepState::Waiting;
                     }
@@ -2489,6 +2552,18 @@ impl CanvasRenderer {
         }
     }
 
+    /// Pretend this device will not allocate a staging buffer larger than
+    /// `bytes`, so the banded readback path can be driven on a document small
+    /// enough to check by hand.
+    ///
+    /// Exists for the tests. Reaching the real limit takes a canvas of about
+    /// 8192², which is more memory than a test should ask a CI runner for — and
+    /// an untested path that only the largest documents take is the one that
+    /// silently returns a sheared picture.
+    pub fn set_readback_limit(&mut self, bytes: u64) {
+        self.readback_limit = bytes;
+    }
+
     /// Read a rectangle of one layer back to the CPU, for the undo stack.
     ///
     /// This blocks until the GPU catches up. That is acceptable because it runs
@@ -2501,7 +2576,6 @@ impl CanvasRenderer {
         slot: u32,
         rect: PixelRect,
     ) -> Vec<u8> {
-        let unpadded = rect.width * 4;
         // A copy naming a slice the array does not have is a validation error,
         // and a validation error aborts the process. It should not happen —
         // `ensure_slots` runs before a layer is ever painted — but "should not"
@@ -2513,22 +2587,12 @@ impl CanvasRenderer {
                 "read from slot {slot} beyond capacity {}",
                 self.layers.capacity
             );
-            return vec![0; (unpadded as u64 * rect.height as u64) as usize];
+            return vec![0; (rect.width as u64 * 4 * rect.height as u64) as usize];
         }
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = unpadded.div_ceil(align) * align;
-
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("undo-readback"),
-            size: (padded * rect.height) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("undo"),
-        });
-        encoder.copy_texture_to_buffer(
+        self.read_texture_rows(
+            device,
+            queue,
+            "undo",
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layers.texture,
                 mip_level: 0,
@@ -2539,35 +2603,86 @@ impl CanvasRenderer {
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(rect.height),
+            (rect.width, rect.height),
+        )
+    }
+
+    /// Copy a rectangle of a texture back to the CPU, blocking, and return it
+    /// tightly packed — the 256-byte row padding the copy requires stripped.
+    ///
+    /// Goes a band of rows at a time, because a document can be larger than the
+    /// largest buffer the device will allocate; see [`band_rows`]. One buffer is
+    /// made and reused for every band, so the banded path costs extra submits
+    /// and nothing else. Both blocking readbacks share this: a second copy of
+    /// the padding arithmetic is a second place for a document to come back
+    /// sheared.
+    fn read_texture_rows(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &str,
+        source: wgpu::TexelCopyTextureInfo<'_>,
+        size: (u32, u32),
+    ) -> Vec<u8> {
+        let (width, height) = size;
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let band = band_rows(self.readback_limit, padded, height);
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{label}-readback")),
+            size: (padded as u64) * (band as u64),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut out = Vec::with_capacity((unpadded as usize) * (height as usize));
+        let mut first = 0;
+        while first < height {
+            let rows = band.min(height - first);
+            let mut encoder = device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    origin: wgpu::Origin3d {
+                        y: source.origin.y + first,
+                        ..source.origin
+                    },
+                    ..source
                 },
-            },
-            wgpu::Extent3d {
-                width: rect.width,
-                height: rect.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(encoder.finish()));
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            // Only the rows this band wrote: the buffer is a whole band long and
+            // the last one is usually short, so mapping all of it would append
+            // whatever the previous band left behind.
+            let slice = staging.slice(..(padded as u64) * (rows as u64));
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
-        let mapped = slice.get_mapped_range();
-        // Strip the 256-byte row padding the copy required.
-        let mut out = Vec::with_capacity((unpadded * rect.height) as usize);
-        for row in 0..rect.height {
-            let start = (row * padded) as usize;
-            out.extend_from_slice(&mapped[start..start + unpadded as usize]);
+            let mapped = slice.get_mapped_range();
+            for row in 0..rows {
+                let start = (row * padded) as usize;
+                out.extend_from_slice(&mapped[start..start + unpadded as usize]);
+            }
+            drop(mapped);
+            staging.unmap();
+            first += rows;
         }
-        drop(mapped);
-        staging.unmap();
         out
     }
 
@@ -2880,5 +2995,50 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         visibility: wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_band_is_the_whole_document_when_it_fits() {
+        // The ordinary case, and the one that must not change: every readback
+        // stays a single copy for every document a device can hold in one
+        // buffer. 2048² at four bytes is 16 MB against a 256 MB limit.
+        assert_eq!(band_rows(256 << 20, 2048 * 4, 2048), 2048);
+    }
+
+    #[test]
+    fn a_document_larger_than_the_limit_is_split() {
+        // The canvas that crashed: 10000², 40 KB a row, against 256 MB.
+        let padded = 10_000 * 4;
+        let band = band_rows(256 << 20, padded, 10_000);
+        assert!(band < 10_000, "should have been split, got {band}");
+        assert!(
+            u64::from(band) * u64::from(padded) <= 256 << 20,
+            "a band of {band} rows is over the limit"
+        );
+        // And the band after it must still reach the bottom of the document.
+        assert!(band * 2 >= 10_000, "{band} rows would need three passes");
+    }
+
+    #[test]
+    fn a_band_is_never_zero_rows() {
+        // A row wider than the whole limit cannot be honoured, and returning
+        // zero would be an infinite loop rather than a refusal. It takes a
+        // canvas 67 million pixels across, which `max_texture_dimension_2d`
+        // stops long before this is asked.
+        assert_eq!(band_rows(16, 4096, 100), 1);
+        assert_eq!(band_rows(0, 4, 100), 1);
+    }
+
+    #[test]
+    fn a_band_never_overshoots_the_document() {
+        // The copy's extent comes from this; a band taller than what is left
+        // would name rows past the bottom of the texture, which is a validation
+        // error and therefore an abort.
+        assert_eq!(band_rows(u64::MAX, 256, 7), 7);
     }
 }

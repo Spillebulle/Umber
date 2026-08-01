@@ -2427,6 +2427,92 @@ fn a_capture_reads_back_exactly_what_the_blocking_path_does() {
 }
 
 #[test]
+fn a_document_too_large_for_one_staging_buffer_is_read_back_in_bands() {
+    // `downlevel_defaults` caps a buffer at 256 MB, which a 10000² canvas —
+    // 400 MB of RGBA — sails past. `create_buffer` refuses the size and the
+    // validation error aborts the process, which is exactly how a real
+    // document died on its first undo capture. Every readback therefore goes a
+    // band of rows at a time.
+    //
+    // Driven here by lowering the limit rather than by making a document that
+    // reaches the real one: an 8192² canvas is a gigabyte of GPU memory to ask
+    // a CI runner for, and an untested path that only the largest documents
+    // take is precisely the one that returns a sheared picture in silence.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    h.fill(0, Color::from_srgb_u8(200, 40, 40, 255));
+    h.stamp(&[dab(20.0, 20.0, 10.0, 1.0)]);
+    h.commit_to(
+        1,
+        Color::from_srgb_u8(30, 60, 220, 255),
+        0.5,
+        BrushMode::Paint,
+    );
+
+    let draws = vec![
+        LayerDraw {
+            slot: 0,
+            opacity: 1.0,
+            blend: 0,
+            visible: true,
+        },
+        LayerDraw {
+            slot: 1,
+            opacity: 1.0,
+            blend: 0,
+            visible: true,
+        },
+    ];
+    let full = PixelRect {
+        x: 0,
+        y: 0,
+        width: DOC,
+        height: DOC,
+    };
+
+    // The truth, read in one go the way every ordinary document is.
+    let whole_layer = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, full);
+    let whole_export = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
+
+    // Seven bands of ten rows and a last band of four, so the short final band
+    // and the reused buffer are both exercised. A limit that divided the
+    // document evenly would leave the interesting case untested.
+    let row = (DOC * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    h.canvas.set_readback_limit((row * 10) as u64);
+
+    let banded_layer = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, full);
+    assert_eq!(
+        banded_layer, whole_layer,
+        "the banded undo readback differs from the single-buffer one"
+    );
+
+    let banded_export = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &draws);
+    assert_eq!(
+        banded_export, whole_export,
+        "the banded export differs from the single-buffer one"
+    );
+
+    // And the capture, which bands *across frames* — the hard half, because a
+    // step is then several buffers and the flattened preview has to survive
+    // between them.
+    let (captured, _, _) = run_capture(h.gpu, &mut h.canvas, &[0, 1], &draws);
+    assert_eq!(captured.size, UVec2::splat(DOC));
+    assert_eq!(
+        captured.layers[0], whole_layer,
+        "a banded capture's layer differs"
+    );
+    assert_eq!(
+        captured.merged, whole_export,
+        "a banded capture's flattened preview differs"
+    );
+}
+
+#[test]
 fn a_capture_of_a_large_document_never_costs_a_frame() {
     // The measurement the whole feature rests on. A save's blocking readback is
     // one `poll(wait)` per layer, which on a full 2048-square stack is tens of
