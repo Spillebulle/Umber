@@ -33,6 +33,7 @@ use super::{
     srgb,
 };
 use crate::docformat;
+use crate::document::Background;
 use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
@@ -95,6 +96,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         size,
         layers,
         active,
+        background: Background::Transparent,
+        dpi: None,
         warnings,
     })
 }
@@ -330,6 +333,8 @@ fn flattened_fallback(
             pixels,
         }],
         active: None,
+        background: Background::Transparent,
+        dpi: None,
         warnings,
     })
 }

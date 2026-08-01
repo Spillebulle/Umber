@@ -25,6 +25,7 @@ use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
     lzf, srgb,
 };
+use crate::document::Background;
 use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::Krita;
@@ -99,6 +100,8 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         size: doc.size,
         layers,
         active: None,
+        background: Background::Transparent,
+        dpi: doc.dpi,
         warnings,
     })
 }
@@ -109,6 +112,10 @@ struct MainDoc {
     size: UVec2,
     colourspace: String,
     profile: String,
+    /// `x-res`, when the file states it. Krita writes a resolution on every
+    /// document, so this is nearly always present; `None` opens at Umber's
+    /// default rather than at a number nobody chose.
+    dpi: Option<f32>,
     /// Bottom first.
     layers: Vec<LayerSpec>,
 }
@@ -137,6 +144,7 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
     let mut size = None;
     let mut colourspace = String::new();
     let mut profile = String::new();
+    let mut dpi = None;
     let mut specs: Vec<LayerSpec> = Vec::new();
     // One entry per open `<layer>` element: its name, and whether it pushed a
     // group. Krita hangs `<masks>` inside the layer they belong to, so the name
@@ -165,6 +173,12 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                             attrs.parse("width").unwrap_or(0),
                             attrs.parse("height").unwrap_or(0),
                         ));
+                        // Krita's resolution is per axis. Umber holds one
+                        // number, so a document with non-square pixels — which
+                        // Krita allows and nothing here can represent — takes
+                        // the horizontal one rather than an average nobody
+                        // wrote down.
+                        dpi = attrs.parse::<f32>("x-res").filter(|v| *v > 0.0);
                     }
                     b"layer" => {
                         let attrs = Attrs::read(e).map_err(malformed)?;
@@ -254,6 +268,7 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
         size,
         colourspace,
         profile,
+        dpi,
         layers: specs,
     })
 }
@@ -446,6 +461,8 @@ fn flattened_fallback(
             pixels,
         }],
         active: None,
+        background: Background::Transparent,
+        dpi: None,
         warnings,
     })
 }
