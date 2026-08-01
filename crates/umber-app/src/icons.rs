@@ -49,6 +49,10 @@ pub enum Icon {
     Corner,
     // Picker
     HalfCircle,
+    // History
+    /// A sheet with its corner turned down: the document itself, as opposed to
+    /// something done to it.
+    Document,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -234,6 +238,20 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             // Resize grip: stepped diagonals in the bottom-right corner.
             line(at(20.0, 10.0), at(10.0, 20.0));
             line(at(20.0, 15.0), at(15.0, 20.0));
+        }
+
+        Icon::Document => {
+            // The turned-down corner is what separates a document from a plain
+            // rectangle at 12 px, where the aspect ratio alone does not.
+            path(vec![
+                at(6.0, 3.5),
+                at(14.0, 3.5),
+                at(18.5, 8.0),
+                at(18.5, 20.5),
+                at(6.0, 20.5),
+                at(6.0, 3.5),
+            ]);
+            path(vec![at(14.0, 3.5), at(14.0, 8.0), at(18.5, 8.0)]);
         }
 
         Icon::HalfCircle => {
