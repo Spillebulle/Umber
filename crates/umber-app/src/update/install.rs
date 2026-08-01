@@ -234,9 +234,10 @@ pub fn detect(probe: &Probe<'_>) -> InstallKind {
     let Some(exe) = probe.exe.as_deref() else {
         return InstallKind::Unknown;
     };
-    let Some(dir) = exe.parent() else {
+    let Some(dir) = parent_dir(probe.os, exe) else {
         return InstallKind::Unknown;
     };
+    let dir = dir.as_path();
 
     match probe.os {
         Os::Windows => {
@@ -342,8 +343,38 @@ fn system_prefix(dir: &Path) -> bool {
 /// Folding is decided by the *probe's* platform rather than by `cfg!(windows)`,
 /// so the Windows answers are the same whichever machine the tests run on.
 fn within_windows_dir(dir: &Path, root: &Path) -> bool {
-    let fold = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase().replace('\\', "/"));
-    fold(dir).starts_with(fold(root))
+    fold_windows(dir).starts_with(fold_windows(root))
+}
+
+/// A Windows path as `Path` components the *host* will also split.
+///
+/// `\` is a separator on Windows and an ordinary character everywhere else, so
+/// a `Path` built from `C:\Program Files\Umber` is three components on Windows
+/// and one on Linux. Everything here is fed by [`Probe`], whose whole purpose
+/// is that one machine can answer for every platform, so the splitting has to
+/// come from the probe's OS rather than from the host's `Path` implementation.
+/// Lower-cased in the same pass because the file system is case-insensitive
+/// and both spellings occur in the wild.
+fn fold_windows(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase().replace('\\', "/"))
+}
+
+/// The directory holding `exe`, split the way `os` splits paths.
+///
+/// Not `Path::parent`: that splits the way the *running* machine does, so a
+/// Windows path tested on Linux has no separators in it at all and comes back
+/// as a single component with an empty parent — which classified every Windows
+/// installation as portable, including one under Program Files. Windows CI
+/// passed and both Unix runners failed, which is exactly the shape of a bug
+/// that only a cross-platform test matrix finds.
+fn parent_dir(os: Os, exe: &Path) -> Option<PathBuf> {
+    match os {
+        Os::Windows => {
+            let folded = fold_windows(exe);
+            folded.parent().map(Path::to_path_buf)
+        }
+        Os::Mac | Os::Linux => exe.parent().map(Path::to_path_buf),
+    }
 }
 
 #[cfg(test)]
