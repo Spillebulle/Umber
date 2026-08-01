@@ -177,10 +177,24 @@ their brush.
 scatter off the stroke and vary its own size — so a chisel is a chisel, a spray
 can sprays, and a charcoal stick catches on the paper. 109 of the 196 shipped
 brushes use at least one of those; before, every one of them painted a round
-dot whatever its name promised. Where the angle is driven by stroke direction
-the dab turns to follow the line, which is what separates a rake from a broad
-nib: a nib holds its angle through a curve, and that is what makes calligraphy
-thick and thin.
+dot whatever its name promised. The angle has three states rather than two: held
+fixed (a broad nib, which is what makes calligraphy thick and thin), turned to
+follow the stroke (a rake, keeping its bristles across the line of travel), or
+rolled per dab (grain, a watercolour fringe, charcoal). 31 brushes want the
+third, and without it a long dab repeated down a stroke reads as machined ruling
+rather than as a loaded brush.
+
+**Pressure drives more than size and opacity.** Hardness and scatter follow it
+too, each through a curve of its own. That is not a refinement: 69 of the 196
+shipped brushes soften their edge under a light hand, and 38 change how much
+they scatter — 16 of them stating *no* constant scatter at all, so before this
+they imported as perfectly smooth lines wearing the name of something granular.
+
+**The brush editor reaches all of it.** Tip, Dynamics, Scatter and Blending:
+every field a brush has, colour pickup and dab shape and jitter and airbrush
+rate included. The samples in the brush list are stamped from each preset's own
+settings under a pressure ramp rather than drawn from its opacity and hardness,
+so in a list two hundred entries long a spray looks like a spray.
 
 **Blenders work.** A brush with MyPaint's `smudge` picks colour up off the
 canvas and carries it, and because the sample is taken through the same
@@ -223,7 +237,10 @@ Taken from the design but not implemented, roughly by size:
 - **Drag-to-reorder tools** in the rail, and **saved workspaces**: the two
   parts of the design's layout edit mode still outstanding. The rest of it is
   built — see [Layout edit mode](#layout-edit-mode).
-- The brush editor's **Texture** tab. Tip and Dynamics are built.
+- The brush editor's **Texture** and **Wet edges** sections. Tip, Dynamics,
+  Scatter and Blending are built; the other two have no engine behind them —
+  paper grain multiplied into dab coverage does not exist — so they are not
+  drawn rather than drawn empty.
 - A document format of Umber's own. Other applications' files open (see
   [Documents](#documents)) and PNG export works, but nothing can be saved and
   reopened with its layers intact.
@@ -381,10 +398,16 @@ Next, roughly in order:
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop
-- **Shape driven by pressure or randomness.** The dab is an ellipse with scatter
-  and jitter now, but only from fixed values: 23 brushes vary their ellipticity
-  through an input mapping and still import as round ones, and scatter that
-  reacts to pen speed is ignored.
+- **Ellipticity driven by an input.** Scatter, hardness and the dab's angle all
+  respond to pressure or chance now; the dab's *ratio* still comes from a fixed
+  value, so 15 brushes that state it only as a mapping import as round ones.
+  `docs/brushes.md` records why lifting a constant out of those mappings would
+  make them wrong in a new way rather than right.
+- **`lock_alpha`** — painting only where the layer already has coverage. Nothing
+  in the shipped library needs it; it is worth building as a painting feature in
+  its own right.
+- Scatter that reacts to pen speed
+- Per-brush blend modes
 - Tilt support
 - Stroke prediction to hide remaining latency
 

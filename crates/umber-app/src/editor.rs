@@ -66,10 +66,22 @@ pub struct UiState {
 }
 
 /// Tabs of the brush editor dialog.
+///
+/// The design lists six sections — Tip, Dynamics, Texture, Scatter, Wet edges,
+/// Stabiliser — and these are the four Umber can fill. Texture (paper grain
+/// multiplied into coverage) and Wet edges have no engine behind them, so they
+/// are not drawn at all rather than drawn empty; Stabilisation is one slider
+/// and rides on Tip rather than getting a section to itself.
+///
+/// `Blending` is not one of the design's names. Colour pickup needs a home and
+/// none of the six is one: filing it under "Wet edges" would be borrowing a
+/// term that means something else in every application that has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushTab {
     Tip,
     Dynamics,
+    Scatter,
+    Blending,
 }
 
 impl Default for UiState {

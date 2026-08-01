@@ -24,38 +24,62 @@
 //! | MyPaint | Umber | Notes |
 //! |---|---|---|
 //! | `radius_logarithmic` | `size`, `min_size_ratio`, `size_curve` | exact, see below |
-//! | `hardness` | `hardness` | direct; the falloff *shape* differs |
+//! | `hardness` | `hardness`, `min_hardness_ratio`, `hardness_curve` | the falloff *shape* differs |
 //! | `opaque` × `opaque_multiply` | `opacity`, `opacity_curve` | see below |
 //! | `dabs_per_actual_radius`, `dabs_per_basic_radius` | `spacing` | |
 //! | `eraser` | `mode` | |
 //! | `slow_tracking` | `stabilization` | ordering preserved, feel differs |
 //! | `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius` | the sample lags a frame or two |
 //! | `dabs_per_second` | `dabs_per_second` | direct |
-//! | `elliptical_dab_ratio`, `elliptical_dab_angle` | `dab_ratio`, `dab_angle`, `dab_angle_follows_stroke` | a `direction` input becomes "follows the stroke" |
-//! | `offset_by_random` | `scatter` | |
-//! | `radius_by_random` | `radius_jitter` | |
+//! | `elliptical_dab_ratio` | `dab_ratio` | base value only, see below |
+//! | `elliptical_dab_angle` | `dab_angle`, `dab_angle_follows_stroke`, `dab_angle_jitter` | a `direction` input becomes "follows the stroke", a `random` one becomes jitter |
+//! | `offset_by_random` | `scatter`, `min_scatter_ratio`, `scatter_curve` | pressure mapping carried |
+//! | `radius_by_random` | `radius_jitter` | base value only |
+//!
+//! Three settings — `radius_logarithmic`, `hardness` and `offset_by_random` —
+//! are read across the five pressures a [`ResponseCurve`] samples at rather
+//! than off the base value, because MyPaint states most of what a brush *does*
+//! as a mapping on top of a base of zero. Umber's form is `peak × (min_ratio +
+//! (1 - min_ratio) × curve(p))`, which reproduces the mapping exactly at those
+//! five points for a monotonic one and degrades gracefully otherwise.
 //!
 //! Dropped, and where that shows:
 //!
+//! - **`elliptical_dab_ratio` driven by an input.** 46 brushes map it, and 15
+//!   of those state a round base, so they arrive round. It is deliberately not
+//!   approximated by a constant taken from the mapping: the inputs it is
+//!   actually driven by are `random` (16), `speed1` (14), `stroke` (9),
+//!   `pressure` (8) and `tilt_declination` (7), and for three of those five the
+//!   input sits at its neutral on a desktop with a mouse — where the base value
+//!   is exactly what MyPaint would render. Substituting the mapping's peak
+//!   would make those brushes wrong in a new way rather than right.
+//! - **`radius_by_random` driven by an input** — 9 brushes, all with a round
+//!   base and all but one driven by `custom` or `attack_angle`, neither of
+//!   which Umber has.
 //! - **`offset_by_speed`** — scatter that grows with how fast the pen is
-//!   moving. The constant part of a brush's scatter is imported; the part that
-//!   reacts to speed is not, so a fast flick spreads less than it should.
+//!   moving. 14 brushes; the constant part of their scatter is imported, the
+//!   speed-reactive part is not, so a fast flick spreads less than it should.
 //! - **`colorize`, `change_color_*`** — the dab pass modulates a colour, it does
 //!   not recolour what is under it, so a brush that shifts the hue of the paint
-//!   beneath has no equivalent.
+//!   beneath has no equivalent. Two brushes name `colorize` and both leave it
+//!   at zero.
 //! - **`lock_alpha`** — painting only where the layer already has coverage
 //!   needs the layer read at composite time as a mask; the stroke scratch has
-//!   no channel for it.
+//!   no channel for it. No brush in the pack sets it.
 //! - **`opaque_linearize`** — MyPaint uses it to compensate for dabs
 //!   compounding as they overlap. Umber's wet layer takes a `max` of coverage,
 //!   so there is nothing to compensate for.
+//! - **`paint_mode`** — MyPaint 2's spectral pigment mixing, a different
+//!   colour model rather than a brush setting. 19 brushes ask for it.
 //! - **`tracking_noise`, `direction_filter`, `snap_to_pixel`, `anti_aliasing`,
 //!   `stroke_*`, `custom_input`, `speed*`, `pressure_gain_log`** — no
 //!   equivalent, and no visible loss for most brushes.
 //!
-//! Inputs other than `pressure` (`speed1`, `speed2`, `random`, `stroke`,
-//! `direction`, `tilt`, …) are ignored. Umber's `Brush` has exactly two
-//! pressure-driven parameters, so there is nowhere to put them.
+//! Of MyPaint's inputs, `pressure` is read as a curve, `direction` and `random`
+//! are read on the dab angle only, and `speed1`, `speed2`, `stroke`, `tilt_*`,
+//! `custom`, `brush_radius` and the rest are ignored. Umber's `Brush` is a
+//! `Copy` struct of fixed-size curves, so every input it gains costs a curve on
+//! every brush.
 
 use std::collections::HashMap;
 
@@ -105,13 +129,37 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     let varies = radius.has_pressure && span > r_max * 0.01;
 
     let (min_size_ratio, size_curve) = if varies {
-        let mut points = [0.0f32; ResponseCurve::N];
-        for (i, r) in radii.iter().enumerate() {
-            points[i] = ((r - r_min) / span).clamp(0.0, 1.0);
-        }
-        ((r_min / r_max).clamp(0.01, 1.0), ResponseCurve { points })
+        (
+            (r_min / r_max).clamp(0.01, 1.0),
+            normalised_curve(&radii, r_min, r_max),
+        )
     } else {
         (Brush::default().min_size_ratio, ResponseCurve::LINEAR)
+    };
+
+    // --- hardness -----------------------------------------------------------
+    //
+    // The third pressure dynamic, and by count the most used: 69 of the pack's
+    // 196 brushes map hardness onto pressure, more than map scatter or shape.
+    // Reading only the base value made every one of them stamp the same edge
+    // whatever the hand was doing, which is most of the difference between a
+    // pencil that feathers and one that rules lines.
+    let hardness = file.setting("hardness");
+    let hardnesses: Vec<f32> = sample_points()
+        .map(|p| hardness.value_at(p).clamp(0.0, 1.0))
+        .collect();
+    let h_max = hardnesses.iter().copied().fold(f32::MIN, f32::max);
+    let h_min = hardnesses.iter().copied().fold(f32::MAX, f32::min);
+    // An absolute threshold, not a relative one: a brush whose hardness runs
+    // 0.02..0.05 varies by 150% and is soft mush at both ends.
+    let hardness_varies = hardness.has_pressure && h_max > 0.0 && h_max - h_min > 0.02;
+    let (min_hardness_ratio, hardness_curve) = if hardness_varies {
+        (
+            (h_min / h_max).clamp(0.0, 1.0),
+            normalised_curve(&hardnesses, h_min, h_max),
+        )
+    } else {
+        (Brush::default().min_hardness_ratio, ResponseCurve::LINEAR)
     };
 
     // --- opacity ------------------------------------------------------------
@@ -204,11 +252,42 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // thin. Reading a rake as a nib, or the reverse, is immediately visible.
     let dab_angle_follows_stroke = angle.has_direction;
 
+    // A `random` mapping on the angle is the third case, and the pack's most
+    // common shape mapping after direction: 31 brushes ask for it and 29 of
+    // those have an elongated dab, so ignoring it turned a watercolour fringe,
+    // a charcoal and a grain brush into combs — every stamp lying the same way
+    // down the stroke. MyPaint's `random` input runs 0..1, so the span of the
+    // mapping *is* the full width of the rotation, in degrees.
+    let dab_angle_jitter = angle.random_span.clamp(0.0, 360.0);
+
     // `offset_by_random` is a standard deviation in "basic radius" units, and
     // `radius_by_random` one in log-radius — both exactly what `Brush` holds.
     // These are what make a spray can spray and a charcoal catch on the paper;
     // without them those brushes import as smooth, even lines.
-    let scatter = file.setting("offset_by_random").base.clamp(0.0, 8.0);
+    //
+    // Scatter is read across the pressure samples rather than off the base
+    // value. 38 brushes map it, and 16 state *only* the mapping — a base of
+    // zero and the whole of the scatter on pressure — so reading the base alone
+    // imported them as clean lines. Negative offsets are clamped away: MyPaint
+    // treats the setting as a magnitude, and a mapping that dips below zero
+    // means "no scatter here", not "scatter the other way".
+    let offset = file.setting("offset_by_random");
+    let scatters: Vec<f32> = sample_points()
+        .map(|p| offset.value_at(p).clamp(0.0, 8.0))
+        .collect();
+    let s_max = scatters.iter().copied().fold(f32::MIN, f32::max);
+    let s_min = scatters.iter().copied().fold(f32::MAX, f32::min);
+    let scatter = s_max;
+    // Absolute, because the interesting case is a brush that scatters by 0.4
+    // radii at one end and not at all at the other — no relative threshold can
+    // see that without also firing on rounding noise near zero.
+    let pressure_scatter = offset.has_pressure && s_max > 0.0 && s_max - s_min > 0.01;
+    let (min_scatter_ratio, scatter_curve) = if pressure_scatter {
+        (s_min / s_max, normalised_curve(&scatters, s_min, s_max))
+    } else {
+        (Brush::default().min_scatter_ratio, ResponseCurve::LINEAR)
+    };
+
     let radius_jitter = file.setting("radius_by_random").base.clamp(0.0, 3.0);
 
     // --- the rest -----------------------------------------------------------
@@ -230,13 +309,16 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     Ok(Brush {
         size,
         min_size_ratio,
-        hardness: file.setting("hardness").base.clamp(0.0, 1.0),
+        hardness: h_max,
         opacity,
         spacing,
         pressure_size: varies,
         pressure_opacity: opacity_varies,
+        pressure_hardness: hardness_varies,
         size_curve,
         opacity_curve,
+        hardness_curve,
+        min_hardness_ratio,
         stabilization,
         mode,
         smudge,
@@ -246,7 +328,11 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         dab_ratio,
         dab_angle,
         dab_angle_follows_stroke,
+        dab_angle_jitter,
         scatter,
+        pressure_scatter,
+        min_scatter_ratio,
+        scatter_curve,
         radius_jitter,
     })
 }
@@ -280,6 +366,25 @@ fn sample_points() -> impl Iterator<Item = f32> {
     (0..ResponseCurve::N).map(ResponseCurve::x_of)
 }
 
+/// Rescale five sampled values onto the curve's `0..=1`.
+///
+/// Umber states every pressure dynamic as `peak × (min_ratio + (1 - min_ratio)
+/// × curve(p))`, so the curve carries only the *shape* and the two ratios carry
+/// the range. Written once because size, hardness and scatter all do it, and
+/// three copies of the same normalisation is three chances to get one of them
+/// backwards.
+fn normalised_curve(values: &[f32], min: f32, max: f32) -> ResponseCurve {
+    let span = max - min;
+    let mut points = [0.0f32; ResponseCurve::N];
+    if span <= 0.0 {
+        return ResponseCurve::LINEAR;
+    }
+    for (point, value) in points.iter_mut().zip(values) {
+        *point = ((value - min) / span).clamp(0.0, 1.0);
+    }
+    ResponseCurve { points }
+}
+
 #[derive(Deserialize)]
 struct MybFile {
     version: u32,
@@ -304,16 +409,35 @@ impl MybFile {
                     .inputs
                     .get("direction")
                     .is_some_and(|points| points.len() >= 2),
+                random_span: span(s.inputs.get("random")),
                 pressure: s.inputs.get("pressure").map(Vec::as_slice).unwrap_or(&[]),
             },
             None => Setting {
                 base: 0.0,
                 has_pressure: false,
                 has_direction: false,
+                random_span: 0.0,
                 pressure: &[],
             },
         }
     }
+}
+
+/// How far a mapping's output travels from end to end.
+///
+/// MyPaint's editor writes a two-point mapping for every input a brush has ever
+/// touched, most of them flat — 24 of the 55 brushes that "map"
+/// `elliptical_dab_ratio` map it to a constant zero. A flat mapping contributes
+/// nothing, so measuring the span rather than the presence of points is what
+/// separates a real setting from an editor artefact.
+fn span(points: Option<&Vec<(f32, f32)>>) -> f32 {
+    let Some(points) = points else { return 0.0 };
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let lo = points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+    let hi = points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+    (hi - lo).max(0.0)
 }
 
 #[derive(Deserialize)]
@@ -330,6 +454,9 @@ struct Setting<'a> {
     /// Whether the setting is driven by stroke direction, which is how MyPaint
     /// spells "this dab turns to follow the line".
     has_direction: bool,
+    /// How far the `random` mapping's output travels, in the setting's own
+    /// units. Zero when there is no such mapping or it is flat.
+    random_span: f32,
     /// Piecewise-linear control points, x ascending, in MyPaint's input units —
     /// for pressure that is already 0..1.
     pressure: &'a [(f32, f32)],
@@ -633,6 +760,141 @@ mod tests {
             !from_myb(PEN).unwrap().is_timed(),
             "a pen is distance-driven"
         );
+    }
+
+    /// The pack's most common shape mapping after `direction`. Without it the
+    /// 29 elongated brushes that ask for a random angle stamp every dab the
+    /// same way up, which reads as machined ruling rather than as grain.
+    #[test]
+    fn a_random_angle_mapping_becomes_dab_jitter() {
+        let fringe = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 10.0, "inputs": {} },
+            "elliptical_dab_angle": { "base_value": 0.0,
+                "inputs": { "random": [[0.0, -180.0], [1.0, 180.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(fringe).expect("imports");
+        assert!((brush.dab_angle_jitter - 360.0).abs() < 1e-4);
+        // Random is not direction: this dab points anywhere, it does not lie
+        // along the line of travel.
+        assert!(!brush.dab_angle_follows_stroke);
+    }
+
+    /// MyPaint's editor writes a two-point mapping for every input a brush has
+    /// ever been shown, and most of them are flat. Reading "has points" as
+    /// "is driven" would give a third of the pack a jitter of zero degrees
+    /// spelled as a live setting, and would have made the counts meaningless.
+    #[test]
+    fn a_flat_mapping_is_not_a_setting() {
+        let inert = r#"{ "version": 3, "settings": {
+            "elliptical_dab_ratio": { "base_value": 4.0, "inputs": {} },
+            "elliptical_dab_angle": { "base_value": 30.0,
+                "inputs": { "random": [[0.0, 0.0], [1.0, 0.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(inert).expect("imports");
+        assert_eq!(brush.dab_angle_jitter, 0.0);
+        assert!((brush.dab_angle - 30.0).abs() < 1e-5);
+    }
+
+    /// 16 brushes state no constant scatter at all and put the whole of it on
+    /// pressure. Reading the base value alone imported them as clean lines.
+    #[test]
+    fn scatter_stated_only_as_a_pressure_mapping_still_arrives() {
+        let dry = r#"{ "version": 3, "settings": {
+            "offset_by_random": { "base_value": 0.0,
+                "inputs": { "pressure": [[0.0, 0.0], [1.0, 1.4]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(dry).expect("imports");
+        assert!(brush.pressure_scatter);
+        assert!((brush.scatter - 1.4).abs() < 1e-5, "{}", brush.scatter);
+        assert_eq!(brush.min_scatter_ratio, 0.0);
+        assert!(brush.scatter_at(0.0).abs() < 1e-5);
+        assert!((brush.scatter_at(1.0) - 1.4).abs() < 1e-4);
+        assert!(brush.is_shaped());
+    }
+
+    /// The other direction, and the more common one: a pencil that lays a
+    /// solid line when pressed and skips across the tooth when it is not.
+    #[test]
+    fn scatter_that_falls_with_pressure_keeps_its_shape() {
+        let pencil = r#"{ "version": 3, "settings": {
+            "offset_by_random": { "base_value": 1.6,
+                "inputs": { "pressure": [[0.0, 0.0], [1.0, -1.4]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(pencil).expect("imports");
+        assert!(brush.pressure_scatter);
+        assert!((brush.scatter - 1.6).abs() < 1e-5);
+        for i in 0..=4 {
+            let p = i as f32 / 4.0;
+            let want = 1.6 - 1.4 * p;
+            let got = brush.scatter_at(p);
+            assert!(
+                (got - want).abs() < 0.01,
+                "at pressure {p}: expected {want}, got {got}"
+            );
+        }
+    }
+
+    /// A mapping that dips below zero means "no scatter here". Letting it
+    /// through would make `scatter` negative and the ratio nonsense.
+    #[test]
+    fn a_negative_scatter_mapping_clamps_to_none() {
+        let odd = r#"{ "version": 3, "settings": {
+            "offset_by_random": { "base_value": 0.5,
+                "inputs": { "pressure": [[0.0, -3.0], [1.0, 0.0]] } },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(odd).expect("imports");
+        assert!(brush.scatter >= 0.0);
+        assert!(brush.min_scatter_ratio >= 0.0);
+        for i in 0..=4 {
+            assert!(brush.scatter_at(i as f32 / 4.0) >= 0.0);
+        }
+    }
+
+    /// The largest single dynamic in the pack: 69 of 196 brushes soften their
+    /// edge under a light hand, and reading only the base made every one of
+    /// them rule lines.
+    #[test]
+    fn hardness_follows_pressure_when_the_brush_asks() {
+        let pencil = r#"{ "version": 3, "settings": {
+            "hardness": { "base_value": 0.9,
+                "inputs": { "pressure": [[0.0, -0.6], [1.0, 0.0]] } },
+            "opaque": { "base_value": 1.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(pencil).expect("imports");
+        assert!(brush.pressure_hardness);
+        assert!((brush.hardness - 0.9).abs() < 1e-5);
+        for i in 0..=4 {
+            let p = i as f32 / 4.0;
+            let want = 0.9 - 0.6 * (1.0 - p);
+            let got = brush.hardness_at(p);
+            assert!(
+                (got - want).abs() < 0.01,
+                "at pressure {p}: expected {want}, got {got}"
+            );
+        }
+        // A brush with no mapping keeps its flat edge, and `hardness_at` must
+        // return exactly the setting rather than a curve that nearly does.
+        let pen = from_myb(PEN).expect("import");
+        assert!(!pen.pressure_hardness);
+        assert_eq!(pen.hardness_at(0.0), pen.hardness);
+        assert_eq!(pen.hardness_at(1.0), pen.hardness);
+    }
+
+    /// MyPaint clamps hardness to 0..1 and several brushes state mappings that
+    /// overshoot. Letting the peak through would produce a hardness above 1,
+    /// which the shader reads as a divide-by-nothing edge.
+    #[test]
+    fn an_overshooting_hardness_mapping_stays_inside_the_range() {
+        let loud = r#"{ "version": 3, "settings": {
+            "hardness": { "base_value": 0.8,
+                "inputs": { "pressure": [[0.0, -0.8], [1.0, 1.7]] } },
+            "opaque": { "base_value": 1.0, "inputs": {} },
+            "radius_logarithmic": { "base_value": 2.0, "inputs": {} } } }"#;
+        let brush = from_myb(loud).expect("imports");
+        assert!((0.0..=1.0).contains(&brush.hardness));
+        for i in 0..=4 {
+            assert!((0.0..=1.0).contains(&brush.hardness_at(i as f32 / 4.0)));
+        }
     }
 
     #[test]

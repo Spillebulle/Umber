@@ -678,8 +678,7 @@ fn list(
                 } else {
                     ""
                 },
-                opacity: preset.brush.opacity,
-                hardness: preset.brush.hardness,
+                brush: &preset.brush,
                 selected: ed.active_preset == Some(i),
                 user,
                 height,

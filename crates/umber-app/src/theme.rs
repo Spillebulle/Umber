@@ -273,6 +273,12 @@ pub mod metrics {
     /// A brush in the library browser, where a second line carries the
     /// attribution the shipped presets come with.
     pub const BRUSH_ROW_DETAIL: f32 = 40.0;
+    /// The brush editor dialog. Wider than the other modals because the design
+    /// lays its Tip section out as two columns and its Dynamics section as a
+    /// row of curve panels, and neither survives being narrowed.
+    pub const BRUSH_EDITOR_WIDTH: f32 = 560.0;
+    /// One dynamics curve panel, square.
+    pub const CURVE_PANEL: f32 = 150.0;
 }
 
 /// Install Archivo, the typeface the design specifies.

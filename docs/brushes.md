@@ -105,11 +105,17 @@ value = base_value + Σ mapping_i(input_i)
 | MyPaint | Umber |
 |---|---|
 | `radius_logarithmic` | `size`, `min_size_ratio`, `size_curve` |
-| `hardness` | `hardness` |
+| `hardness` | `hardness`, `min_hardness_ratio`, `hardness_curve` |
 | `opaque` × `opaque_multiply` | `opacity`, `opacity_curve`, `pressure_opacity` |
 | `dabs_per_actual_radius` + `dabs_per_basic_radius` | `spacing` |
 | `eraser` | `mode` |
 | `slow_tracking` | `stabilization` |
+| `elliptical_dab_ratio` | `dab_ratio` |
+| `elliptical_dab_angle` | `dab_angle`, `dab_angle_follows_stroke`, `dab_angle_jitter` |
+| `offset_by_random` | `scatter`, `min_scatter_ratio`, `scatter_curve` |
+| `radius_by_random` | `radius_jitter` |
+| `smudge`, `smudge_length`, `smudge_radius_log` | `smudge`, `smudge_length`, `smudge_radius` |
+| `dabs_per_second` | `dabs_per_second` |
 
 `radius_logarithmic` is the natural log of the dab radius **in pixels**, and its
 pressure mapping is an offset in log space, so the radius at pressure *p* is
@@ -120,30 +126,63 @@ minimum ratio of `exp(-0.5) = 0.607`, and a size curve that reproduces
 MyPaint's radius exactly at all five sample points. There is a test for that:
 `the_imported_radius_matches_mypaint_at_every_sample`.
 
+### Three settings are read as a curve, not as a number
+
+`radius_logarithmic`, `hardness` and `offset_by_random` are evaluated at the
+five pressures a `ResponseCurve` samples at, rather than read off `base_value`.
+That matters because MyPaint states most of what a brush *does* as a mapping on
+top of a base of zero: 69 of the 196 brushes vary hardness with pressure, and 38
+vary scatter — 16 of those with no constant scatter at all, so reading the base
+alone imported a granular brush as a perfectly smooth line.
+
+Umber's form is `peak × (min_ratio + (1 − min_ratio) × curve(p))`. It reproduces
+MyPaint's value exactly at those five points for a monotonic mapping, and
+degrades gracefully — same range, same ordering, different shape between the
+samples — for one that is not.
+
+MyPaint's editor writes a two-point mapping for *every* input a brush has ever
+been shown, and most of those are flat. "Has control points" is therefore not
+the same question as "is driven by this input": 24 of the 55 brushes that appear
+to map `elliptical_dab_ratio` map it to a constant zero. The importer measures
+the span of a mapping's output, which is what makes the counts above mean
+anything.
+
 ## What conversion loses
 
 Documented in full in the module docs of
 `crates/umber-core/src/brushimport/mypaint.rs`. The short version, worst first:
 
-- **Shape driven by an input rather than a base value.** The dab is now an
-  ellipse with scatter and radius jitter, so most shaped brushes arrive shaped —
-  109 of the 196. What does not carry across is a brush whose `elliptical_dab_
-  ratio`, `offset_by_random` or `radius_by_random` is driven by a *mapping*
-  (pressure, random, speed) rather than stated as a base value: the importer
-  reads the base and ignores the mapping, so 23 brushes that vary their
-  ellipticity dynamically import as round ones. `Brush` has exactly two
-  pressure-driven curves and nowhere to put a third.
-- **`offset_by_speed`.** Scatter that grows with pen speed. The constant part of
-  a brush's scatter is imported; the speed-reactive part is not, so a fast flick
-  spreads less than it should.
+- **`elliptical_dab_ratio` driven by an input.** 46 brushes map it and 15 of
+  those state a round base, so they arrive round. This is *deliberately* not
+  approximated by lifting a constant out of the mapping. The inputs it is
+  actually driven by are `random` (16 brushes), `speed1` (14), `stroke` (9),
+  `pressure` (8) and `tilt_declination` (7) — and for three of those five the
+  input sits at its neutral on a desktop with a mouse, which is precisely the
+  case where the base value is what MyPaint itself would render. Substituting
+  the mapping's peak would make those brushes wrong in a new way rather than
+  right. A ratio that varies genuinely needs a sixth shape parameter, and the
+  handful of brushes it would rescue are mostly ones whose range is 0.9 to 1.1.
+- **`radius_by_random` driven by an input** — 9 brushes, all with a round base
+  and all but one driven by `custom` or `attack_angle`, neither of which exists
+  here.
+- **`offset_by_speed`.** Scatter that grows with pen speed. 14 brushes. The
+  constant part of their scatter is imported; the speed-reactive part is not, so
+  a fast flick spreads less than it should.
+- **`paint_mode`.** MyPaint 2's spectral pigment mixing — a different colour
+  model rather than a brush setting. 19 brushes ask for it.
 - **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
   nothing is lost here. The engine now has them (see below); it is the Krita
   and GIMP packs they exist for.
-- **Non-pressure inputs.** `speed1`, `speed2`, `random`, `stroke`, `tilt`.
-  `Brush` has exactly two pressure-driven parameters and nowhere to put the
-  rest. `direction` is the one exception: it is not read as a curve, but a
-  `direction` mapping on `elliptical_dab_angle` is taken as "this dab turns to
-  follow the stroke", which is the difference between a rake and a broad nib.
+- **Non-pressure inputs.** `speed1`, `speed2`, `stroke`, `tilt_*`, `custom`,
+  `brush_radius`. `Brush` is a `Copy` struct of fixed-size curves, so every
+  input it gains costs a curve on every brush. Two are exceptions, both on
+  `elliptical_dab_angle`: a `direction` mapping is read as "this dab turns to
+  follow the stroke", the difference between a rake and a broad nib, and a
+  `random` one is read as `dab_angle_jitter`. Neither is read as a curve.
+- **Tilt.** 9 brushes map it, and desktop reports it as `(0, 0)` regardless —
+  see the pressure section of `CLAUDE.md`. Supporting the setting without a
+  device to drive it would change nothing on any machine Umber currently runs
+  on.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
   darkens as a stroke crosses itself. Umber takes a `max` of coverage across the
   whole stroke and applies opacity once at commit — that is the wet-layer design
@@ -198,12 +237,46 @@ caught by the length check rather than producing garbage.
 - **Elliptical tips.** The tip is stretched over the dab's bounding square, so a
   non-square mask loses its aspect ratio. The dab carries a single radius and
   has nowhere to record one.
-- **Grain / paper texture** multiplied into dab coverage.
-- **Elliptical and rotating dabs**, which would recover a quarter of the MyPaint
-  set properly rather than approximately.
+- **Grain / paper texture** multiplied into dab coverage. This is the design's
+  Texture section of the brush editor, which is why that section is not drawn.
+- **Ellipticity driven by an input**, and scatter driven by pen speed — see
+  "What conversion loses" above for why each was left alone rather than
+  approximated.
+- **`lock_alpha`, `colorize` and `change_color_*`.** No brush in the shipped
+  pack sets any of them to a live value, so nothing in the library is waiting on
+  them. They are worth building as painting features in their own right —
+  `lock_alpha` especially — not as import fidelity.
+- **Per-brush blend modes.**
 - **A `.kpp` importer.** Krita presets are PNG files with the settings in a
   text chunk, and most of them lean on a bitmap tip, so they need the tip work
   first.
+
+## What a user can set
+
+The brush editor has four sections, following the design's naming where it has
+a name for the thing:
+
+| Section | Holds |
+|---|---|
+| Tip | size, hardness, opacity, spacing, airbrush rate, roundness, angle, angle-follows-stroke, stabilisation |
+| Dynamics | pressure source, and pressure → size / opacity / hardness with their curves and floors |
+| Scatter | scatter, size jitter, angle jitter, pressure → scatter |
+| Blending | colour pickup, smear length, pickup radius |
+
+That is every field of `Brush` except `mode`, which is the tool choice (Brush
+or Eraser) rather than a brush setting, and is on the tool rail.
+
+Two of the design's six sections are not drawn at all rather than drawn empty:
+**Texture** has no engine behind it (see above) and **Wet edges** has none
+either. **Stabiliser** is one slider and rides on Tip. Colour pickup needed a
+home and none of the design's names is one, so **Blending** is a name of our
+own — filing it under "Wet edges" would have borrowed a term that means
+something else in every application that has it.
+
+Roundness is shown rather than `dab_ratio`, because that is the design's word
+and every other paint application's; the two are reciprocals. Angle and angle
+jitter are disabled on a round dab, with a line saying why, since a circle has
+no angle.
 
 See `docs/brush-sources.md` for the packs that were considered and why the ones
 that are missing are missing.
