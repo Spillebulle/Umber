@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
-use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch, PixelRect};
+use umber_core::{Brush, Color, Dab, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect};
 use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -173,9 +173,14 @@ impl UmberApp {
         // Capture undo state first. `read_layer_rect` submits and blocks on its
         // own encoder, so it observes the layer before `enc` commits anything.
         let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
-        self.editor
-            .history
-            .record(PixelPatch::new(rect, slot, before));
+        // Labelled from the *snapshotted* style rather than from the brush in
+        // hand, for the same reason the commit is: switching tool mid-stroke
+        // must not change what the stroke that is ending turns out to have
+        // been, in the history list any more than on the canvas.
+        self.editor.history.record(Edit::new(
+            EditKind::for_mode(self.editor.stroke_style.mode),
+            PixelPatch::new(rect, slot, before),
+        ));
 
         canvas.commit_stroke(
             &gfx.gpu.queue,
@@ -273,15 +278,20 @@ impl UmberApp {
         };
         // The history is the live document's own, so this can only ever undo
         // work done on the canvas the user is looking at.
-        let Some(patch) = self.editor.history.take_undo() else {
+        let Some(edit) = self.editor.history.take_undo() else {
             return;
         };
+        let patch = edit.patch;
         let current =
             canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
-        self.editor
-            .history
-            .push_redo(PixelPatch::new(patch.rect, patch.slot, current));
+        // The label travels with the entry rather than being recomputed, so an
+        // undone stroke keeps its name on the far side of the cursor and the
+        // list does not renumber itself as it is stepped through.
+        self.editor.history.push_redo(Edit::new(
+            edit.kind,
+            PixelPatch::new(patch.rect, patch.slot, current),
+        ));
         self.editor.mark_modified();
     }
 
@@ -291,16 +301,46 @@ impl UmberApp {
         let Some(canvas) = gfx.canvases.get(&id) else {
             return;
         };
-        let Some(patch) = self.editor.history.take_redo() else {
+        let Some(edit) = self.editor.history.take_redo() else {
             return;
         };
+        let patch = edit.patch;
         let current =
             canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
         canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
-        self.editor
-            .history
-            .push_undo(PixelPatch::new(patch.rect, patch.slot, current));
+        self.editor.history.push_undo(Edit::new(
+            edit.kind,
+            PixelPatch::new(patch.rect, patch.slot, current),
+        ));
         self.editor.mark_modified();
+    }
+
+    /// Move the document to `position` in the history — the number of recorded
+    /// edits that should be applied — which is what clicking a row of the
+    /// History module asks for.
+    ///
+    /// Carried out as that many single steps rather than as one jump. Each is a
+    /// blocking read and write of one damaged rect, so a jump of eight costs
+    /// exactly what eight presses of undo cost; a "jump" that restored a
+    /// snapshot instead would need the snapshots this history exists not to
+    /// keep. Acceptable on an explicit click and nowhere near the drawing loop.
+    ///
+    /// [`umber_core::History::steps_to`] clamps the count to what is held, so
+    /// a click on a list drawn a frame ago cannot run past the end.
+    fn jump_history(&mut self, position: usize) {
+        match self.editor.history.steps_to(position) {
+            Jump::Stay => {}
+            Jump::Undo(steps) => {
+                for _ in 0..steps {
+                    self.undo();
+                }
+            }
+            Jump::Redo(steps) => {
+                for _ in 0..steps {
+                    self.redo();
+                }
+            }
+        }
     }
 
     /// Erase the active layer, leaving the rest of the stack alone.
@@ -887,6 +927,9 @@ impl UmberApp {
         }
         if actions.redo {
             self.redo();
+        }
+        if let Some(position) = actions.history_jump {
+            self.jump_history(position);
         }
         if actions.clear {
             self.clear_active_layer();

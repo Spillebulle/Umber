@@ -46,6 +46,10 @@ pub struct UiActions {
     pub save_and_close: Option<usize>,
     pub undo: bool,
     pub redo: bool,
+    /// Move the document to this position in the history — a click on a row of
+    /// the History module. Carried out by the caller as that many undo or redo
+    /// steps, since each one reads and writes a rect on the GPU.
+    pub history_jump: Option<usize>,
     pub fit_view: bool,
     pub reset_zoom: bool,
     pub add_layer: bool,

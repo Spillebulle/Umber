@@ -34,7 +34,7 @@ pub use docimport::{ImportError, ImportedDocument, ImportedLayer};
 pub use document::Document;
 pub use dynamics::{DabInput, DabTarget, Modulation, Modulations};
 pub use geom::{PixelRect, Rect};
-pub use history::{History, PixelPatch};
+pub use history::{Edit, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
