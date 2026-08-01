@@ -9,8 +9,8 @@
 use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
-    BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget, InputPoint, Modulation,
-    PixelRect, ResponseCurve, StrokeBuilder, TipMask,
+    Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget, InputPoint,
+    Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, Gpu, LayerDraw, ProbeParams, StrokeStyle,
@@ -157,6 +157,10 @@ impl Harness {
             &self.gpu.queue,
             grain.map(|(tile, strength, scale)| (Arc::new(tile), strength, scale)),
         );
+    }
+
+    fn set_background(&mut self, background: Background) {
+        self.canvas.set_background(background);
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -1485,6 +1489,130 @@ fn export_leaves_unpainted_pixels_transparent() {
     );
     let corner = ((2 * DOC + 2) * 4) as usize;
     assert_eq!(pixels[corner + 3], 0, "corner should be transparent");
+}
+
+// ---------------------------------------------------------------------------
+// Document background
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_transparent_background_leaves_the_checkerboard_alone() {
+    // The identity case, and the one that must stay exactly what it was: with
+    // an all-zero background the composite's `acc + bg * (1 - acc.a)` adds
+    // nothing, so an unpainted canvas is still the transparency checkerboard.
+    let mut h = harness_or_skip!();
+    h.set_background(Background::Transparent);
+
+    let px = h.composite_pixel(&[layer(0, 1.0, BlendMode::Normal)], 2, 2);
+    // The lighter of the checker's two greys, sRGB 0.88.
+    assert_near(px, [224, 224, 224], 3, "unpainted, no background");
+}
+
+#[test]
+fn a_document_background_shows_where_the_stack_does_not() {
+    let mut h = harness_or_skip!();
+    h.set_background(Background::WHITE);
+
+    let px = h.composite_pixel(&[layer(0, 1.0, BlendMode::Normal)], 2, 2);
+    assert_near(px, [255, 255, 255], 2, "white background, nothing painted");
+    assert_eq!(px[3], 255, "the screen is always opaque");
+
+    h.set_background(Background::BLACK);
+    let px = h.composite_pixel(&[layer(0, 1.0, BlendMode::Normal)], 2, 2);
+    assert_near(px, [0, 0, 0], 2, "black background, nothing painted");
+}
+
+#[test]
+fn the_background_is_under_the_stack_and_not_over_it() {
+    // The test that tells the two apart. A half-opaque white layer over a black
+    // background is 0.5 in *linear* light, which displays as sRGB ~188 — the
+    // same identity `layer_opacity_blends_toward_what_is_beneath` uses. Drawn
+    // over the stack instead, the background would simply be black.
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::WHITE);
+    h.set_background(Background::BLACK);
+
+    let px = h.composite_pixel(&[layer(0, 0.5, BlendMode::Normal)], 32, 32);
+    assert_near(px, [188, 188, 188], 4, "50% white over a black background");
+}
+
+#[test]
+fn an_opaque_layer_hides_the_background_entirely() {
+    // Source-over with an opaque source is the exact identity, whatever is
+    // beneath — so a painted pixel must not shift by a level when the document
+    // gains a background.
+    let mut h = harness_or_skip!();
+    let ink = Color::from_srgb_u8(120, 60, 30, 255);
+    h.fill(0, ink);
+
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+    let bare = h.composite_pixel(&stack, 32, 32);
+    h.set_background(Background::WHITE);
+    assert_eq!(
+        h.composite_pixel(&stack, 32, 32),
+        bare,
+        "an opaque pixel must not move when a background is added under it"
+    );
+}
+
+#[test]
+fn export_carries_the_background_without_a_path_of_its_own() {
+    // `export_rgba` reuses the screen composite with an export flag, and the
+    // background is applied before that branch — so both halves fall out of one
+    // line: a transparent document still exports with its alpha, and a
+    // white-backed one exports opaque white.
+    let mut h = harness_or_skip!();
+    h.stamp(&[dab(32.0, 32.0, 6.0, 1.0)]);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+    let corner = ((2 * DOC + 2) * 4) as usize;
+    let centre = ((32 * DOC + 32) * 4) as usize;
+    let at = |px: &[u8], i: usize| [px[i], px[i + 1], px[i + 2], px[i + 3]];
+
+    h.set_background(Background::Transparent);
+    let clear = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &stack);
+    assert_eq!(
+        at(&clear, corner),
+        [0, 0, 0, 0],
+        "a transparent document must still export with its alpha"
+    );
+
+    h.set_background(Background::WHITE);
+    let white = h.canvas.export_rgba(&h.gpu.device, &h.gpu.queue, &stack);
+    assert_eq!(
+        at(&white, corner),
+        [255, 255, 255, 255],
+        "a white-backed document must export opaque white"
+    );
+    // Straight alpha, so the ink is unchanged by what is behind it.
+    assert_eq!(
+        at(&white, centre),
+        at(&clear, centre),
+        "the painted pixel must not move when the background does"
+    );
+}
+
+#[test]
+fn the_eyedropper_can_pick_the_background_up() {
+    // `pick_colour` reuses the same pass, so this is the same line of shader
+    // rather than a second implementation — but it is worth pinning, because
+    // picking on blank canvas used to mean "nothing there" and now legitimately
+    // means "the paper".
+    let mut h = harness_or_skip!();
+    h.set_background(Background::Colour(Color::from_srgb_u8(200, 40, 40, 255)));
+
+    let px = h.canvas.pick_colour(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &[layer(0, 1.0, BlendMode::Normal)],
+        Vec2::new(8.0, 8.0),
+    );
+    assert_eq!(
+        px[3], 255,
+        "the background is opaque, so there is something"
+    );
+    assert_near(px, [200, 40, 40], 3, "picked background");
 }
 
 /// Drive the smudge probe the way `app.rs` does — record, submit, collect —

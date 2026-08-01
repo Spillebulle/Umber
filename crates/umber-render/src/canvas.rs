@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use umber_core::{BrushMode, Camera, Color, Dab, PixelRect, TipMask};
+use umber_core::{Background, BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use wgpu::util::DeviceExt;
 
 /// Layer storage format.
@@ -412,6 +412,10 @@ struct ViewUniforms {
     pivot: [f32; 2],
     stroke_color: [f32; 4],
     backdrop: [f32; 4],
+    /// Premultiplied linear; see the WGSL struct. `vec4` is 16-aligned on both
+    /// sides and sits on a 16-byte boundary here, so this insertion moves
+    /// nothing after it.
+    background: [f32; 4],
     layer_count: u32,
     stroke_mode: u32,
     active_index: u32,
@@ -533,6 +537,15 @@ struct Shared {
 
 pub struct CanvasRenderer {
     doc_size: UVec2,
+    /// The document background, premultiplied linear.
+    ///
+    /// A field rather than a [`CompositeParams`] member because it belongs to
+    /// the *document*, and a renderer already is one document's. That is not
+    /// tidiness: `export_rgba`, `pick_colour` and `probe_canvas` all build
+    /// their own `CompositeParams`, and a per-frame parameter would have to be
+    /// threaded into each of them — three more places for the export to stop
+    /// matching the screen. Held here, they cannot disagree.
+    background: [f32; 4],
     shared: Shared,
 
     layers: LayerStore,
@@ -841,7 +854,8 @@ impl CanvasRenderer {
     ///
     /// The new renderer's textures hold whatever the allocation contained, so
     /// the caller must clear them before the first composite, exactly as it
-    /// does after [`CanvasRenderer::new`].
+    /// does after [`CanvasRenderer::new`] — and set the new document's
+    /// background, which is its own and not this one's.
     pub fn for_document(&self, device: &wgpu::Device, doc_size: UVec2) -> Self {
         Self::with_shared(device, doc_size, self.shared.clone())
     }
@@ -938,6 +952,9 @@ impl CanvasRenderer {
 
         Self {
             doc_size,
+            // Transparent until the caller says otherwise, which is what the
+            // canvas looked like before documents had a background at all.
+            background: Background::Transparent.premultiplied(),
             shared,
             layers,
             stroke,
@@ -979,6 +996,15 @@ impl CanvasRenderer {
 
     pub fn doc_size(&self) -> UVec2 {
         self.doc_size
+    }
+
+    /// Set what lies under this document's layer stack.
+    ///
+    /// Costs a field write: the value reaches the GPU with the rest of the view
+    /// uniforms on the next composite, so changing it mid-frame is free and
+    /// dragging a colour picker over it does not touch a buffer.
+    pub fn set_background(&mut self, background: Background) {
+        self.background = background.premultiplied();
     }
 
     pub fn slot_capacity(&self) -> u32 {
@@ -1351,6 +1377,7 @@ impl CanvasRenderer {
                     params.backdrop[2],
                     1.0,
                 ],
+                background: self.background,
                 layer_count: count as u32,
                 stroke_mode: mode_index(params.stroke.mode),
                 active_index: params.active_index,
@@ -1479,6 +1506,10 @@ impl CanvasRenderer {
     /// Runs the same composite pass the screen uses, with its export flag set,
     /// so what lands in the file is what the canvas showed. A separate export
     /// path would be a second copy of the blend maths to keep in step.
+    ///
+    /// The document background is part of that, so a white-backed document
+    /// exports opaque and a transparent one keeps its alpha, without this
+    /// function knowing which it is.
     pub fn export_rgba(
         &self,
         device: &wgpu::Device,

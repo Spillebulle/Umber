@@ -1,9 +1,14 @@
 // Draws the visible frame: the whole layer stack plus the in-progress stroke,
-// over a checkerboard.
+// over the document background, over a checkerboard.
 //
 // The entire stack composites in ONE pass. Layers live in a texture array and
 // this shader walks them bottom to top, so adding layers costs a loop iteration
-// rather than a render pass and a full-screen bandwidth round trip each.
+// rather than a render pass and a full-screen bandwidth round trip each. The
+// document background joins that pass rather than getting one of its own: it is
+// one multiply-add after the loop, and doing it here is what makes the PNG
+// export, the eyedropper and a smudging brush's canvas probe — all of which
+// reuse this shader — see the same thing the screen does, with no second copy
+// of the maths to keep in step.
 //
 // The stroke maths here must match commit.wgsl exactly. If they diverge, the
 // stroke visibly jumps at pointer-up when the preview is replaced by the
@@ -25,6 +30,13 @@ struct View {
     // Surround colour in *display* space, written straight out so it matches
     // the egui panels exactly.
     backdrop: vec4<f32>,
+    // The document background, premultiplied linear, composited UNDER the
+    // stack. All zeroes means transparent, and the blend below is then the
+    // exact identity — which is why this needs no flag of its own.
+    //
+    // Not to be confused with `backdrop`, which is the surround *outside* the
+    // document and is display-space.
+    background: vec4<f32>,
     layer_count: u32,
     stroke_mode: u32,     // 0 = paint, 1 = erase
     active_index: u32,    // stack position receiving the stroke
@@ -187,6 +199,17 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // Scaling a premultiplied colour by opacity is correct as-is.
         acc = composite_over(acc, lay * opacity, mode);
     }
+
+    // The document background, under everything the stack put down. Both sides
+    // are premultiplied, so source-over is an add — and with an all-zero
+    // background it is `acc + 0`, exactly what this shader did before there was
+    // one. It is applied before the export branch on purpose: an export of a
+    // white-backed document must come out opaque white, and a transparent one
+    // must still come out with its alpha, and both fall out of the same line.
+    acc = vec4<f32>(
+        acc.rgb + v.background.rgb * (1.0 - acc.a),
+        acc.a + v.background.a * (1.0 - acc.a),
+    );
 
     if (v.is_export == 1u) {
         // PNG wants straight alpha, so undo the premultiply. Fully transparent
