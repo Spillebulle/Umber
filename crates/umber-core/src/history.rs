@@ -179,6 +179,17 @@ impl History {
         self.used_bytes
     }
 
+    /// The ceiling this history keeps itself under.
+    ///
+    /// Read by the History module so it can say what the limit *is* once
+    /// [`History::dropped`] is non-zero. "Earlier edits discarded" is true and
+    /// explains nothing, and the explanation is not guessable: nothing else on
+    /// screen says undo has a size at all. Exposed rather than retyped in the
+    /// panel so the note cannot come to name a figure this no longer holds.
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
     // --- the timeline ------------------------------------------------------
     //
     // The two stacks read as one list: everything applied, oldest first, then
@@ -587,5 +598,27 @@ mod tests {
         assert_eq!(h.dropped() + h.len(), 8);
         h.clear();
         assert_eq!(h.dropped(), 0, "a cleared history reaches its beginning");
+    }
+
+    /// A patch is the *rectangle* a stroke covered, so its size follows the
+    /// canvas and not the mark. On a 10000² document a stroke drawn across the
+    /// picture damages the whole of it — 400 MB — and the default budget then
+    /// holds exactly one, which is why the second such stroke ages the first
+    /// out and the panel starts saying "Earlier edits discarded".
+    ///
+    /// Pinned because the History module states that as the reason. An
+    /// explanation that had quietly stopped being arithmetically true would be
+    /// worse than no explanation at all. Arithmetic rather than two recorded
+    /// patches: the point is the ratio, and proving it by allocating 800 MB
+    /// would be a test nobody can run on a small machine.
+    #[test]
+    fn one_broad_stroke_on_a_large_canvas_all_but_fills_the_budget() {
+        let budget = History::default().budget_bytes();
+        let patch = 10_000usize * 10_000 * 4;
+        assert!(patch < budget, "not even one such stroke is held");
+        assert!(
+            patch * 2 > budget,
+            "two now fit, so the panel's note names the wrong reason"
+        );
     }
 }

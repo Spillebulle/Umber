@@ -893,6 +893,31 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
         .color(p.text_dim)
         .line_height(Some(12.0)),
     );
+
+    // "Earlier edits discarded" is true and says nothing about why, and the why
+    // is not guessable — nothing else on screen mentions that undo has a size
+    // at all. An entry is the whole *rectangle* a stroke covered, so its cost
+    // follows the canvas rather than the mark: on a 10000² document a stroke
+    // drawn across the picture is 400 MB on its own and the second one ages the
+    // first out. Without this the list reads as a bug, and it was read as one.
+    //
+    // Same rule as the note above it: say where the edge is rather than leave
+    // it to be discovered. The figure comes off the history rather than being
+    // written down here, so the two cannot drift.
+    if dropped > 0 {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "The history holds {} MB of pixels. An entry is the whole \
+                 rectangle a stroke covered, so on a large canvas a few broad \
+                 strokes fill it.",
+                ed.history.budget_bytes() / (1024 * 1024)
+            ))
+            .size(9.5)
+            .color(p.text_dim)
+            .line_height(Some(12.0)),
+        );
+    }
 }
 
 /// Which mark stands for an edit of this kind.
