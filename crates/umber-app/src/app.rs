@@ -47,6 +47,45 @@ const WHEEL_ZOOM_STEP: f32 = 1.12;
 /// distance. Panning uses the distance as it stands.
 const WHEEL_PIXELS_PER_NOTCH: f32 = 60.0;
 
+/// Whether the interface, rather than the document, owns a press at `screen`
+/// (physical window pixels).
+///
+/// **Takes a position rather than reading `Editor::cursor`**, and that is the
+/// whole point of it being a function of one. `cursor` is written by
+/// `CursorMoved`, which is a *mouse* event; a pen on Windows Ink arrives as
+/// `WindowEvent::Touch` through `WM_POINTER` and never produces one. Asking
+/// this about the stale cursor tested every pen press against wherever the
+/// mouse happened to be last — `(0, 0)` on a fresh launch, which is the menu
+/// bar — so the press was ruled the interface's and dropped, and a tablet drew
+/// nothing at all.
+///
+/// A free function because the caller holds `Graphics` mutably for the whole of
+/// `window_event`, and the two things this needs are separate fields.
+///
+/// Three parts. This used to ask egui, via `response.consumed` and
+/// `egui_wants_pointer_input()`. Both are built on
+/// `Context::is_pointer_over_egui`, which since egui 0.35 answers *true
+/// everywhere*: `CentralPanel` now consumes the root `Ui`'s cursor, so the
+/// unused rect it tests against is empty by the end of the pass. With it true,
+/// `egui_wants_pointer_input()` is true on every fresh press — and the press
+/// that begins a stroke was being swallowed. So decide it here:
+///
+/// * `egui_is_using_pointer` — a slider or a scrollbar has the drag. The one
+///   part of egui's answer that does not depend on the broken test, and the one
+///   part that is not about a position.
+/// * a non-background layer at `screen` — a menu, a popup, or a floating panel,
+///   all of which are `Area`s and all of which sit over the canvas rather than
+///   beside it.
+/// * `pointer_over_canvas` — the canvas region itself, minus whatever the
+///   layout and the scrollbars have claimed, computed from the same rect the
+///   composite pass is given.
+fn ui_owns_pointer(editor: &Editor, ctx: &egui::Context, screen: Vec2) -> bool {
+    let over_area = ctx
+        .layer_id_at(editor.to_points(screen))
+        .is_some_and(|layer| layer.order != egui::Order::Background);
+    ctx.egui_is_using_pointer() || over_area || !editor.pointer_over_canvas(screen)
+}
+
 /// Everything tied to a live window and GPU surface.
 ///
 /// Kept in an `Option` on [`UmberApp`] because Android destroys and recreates
@@ -1642,34 +1681,10 @@ impl ApplicationHandler<Wake> for UmberApp {
         if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             gfx.window.request_redraw();
         }
-        // Who owns the pointer, in three parts.
-        //
-        // This used to ask egui, via `response.consumed` and
-        // `egui_wants_pointer_input()`. Both are built on
-        // `Context::is_pointer_over_egui`, which since egui 0.35 answers *true
-        // everywhere*: `CentralPanel` now consumes the root `Ui`'s cursor, so
-        // the unused rect it tests against is empty by the end of the pass.
-        // With it true, `egui_wants_pointer_input()` is true on every fresh
-        // press — and the press that begins a stroke was being swallowed.
-        //
-        // So decide it here instead:
-        //
-        // * `egui_is_using_pointer` — a slider or scrollbar has the drag. This
-        //   is the one part of egui's answer that does not depend on the broken
-        //   test.
-        // * a non-background layer under the cursor — a menu, a popup, or a
-        //   floating panel, all of which are `Area`s and all of which sit over
-        //   the canvas rather than beside it.
-        // * `pointer_over_canvas` — the canvas region itself, minus whatever
-        //   the layout has claimed, computed from the same rect the composite
-        //   pass is given.
-        let over_area = gfx
-            .egui_ctx
-            .layer_id_at(self.editor.to_points(self.editor.cursor))
-            .is_some_and(|layer| layer.order != egui::Order::Background);
-        let ui_has_pointer = gfx.egui_ctx.egui_is_using_pointer()
-            || over_area
-            || !self.editor.pointer_over_canvas(self.editor.cursor);
+        // The mouse's answer, from the position `CursorMoved` last reported.
+        // Anything carrying its own position — a touch, a pen — must ask
+        // `ui_owns_pointer` about *that* instead. See there.
+        let ui_has_pointer = ui_owns_pointer(&self.editor, &gfx.egui_ctx, self.editor.cursor);
         let pivot = self.editor.canvas_pivot;
 
         match event {
@@ -1852,25 +1867,60 @@ impl ApplicationHandler<Wake> for UmberApp {
                 // winit reports Force in either normalised or calibrated form;
                 // `normalized` flattens both to 0..=1.
                 let reported = touch.force.map(|f| f.normalized() as f32);
+                // The one place to look when a tablet does nothing:
+                // `RUST_LOG=umber_app=trace` says whether the pen is reaching
+                // the application at all, and with what pressure. A driver in
+                // "mouse mode" sends no touches and shows nothing here.
+                log::trace!(
+                    "touch {:?} id={} at {pos:?} force={reported:?}",
+                    touch.phase,
+                    touch.id
+                );
 
                 match touch.phase {
                     TouchPhase::Started => {
                         self.editor.touches.insert(touch.id, pos);
-                        if self.editor.touches.len() == 1 && !ui_has_pointer {
-                            self.editor.cursor = pos;
-                            self.editor.last_cursor = pos;
-                            let point = self.editor.sample(pos, reported);
-                            self.start_stroke(point);
-                            self.editor.drawing_touch = Some(touch.id);
-                        } else {
+                        if self.editor.touches.len() > 1 {
                             // A second finger means the gesture was a pinch,
                             // not a stroke. Abandon the stroke in progress.
                             self.cancel_stroke();
                             self.editor.drawing_touch = None;
                             self.update_pinch();
+                        } else if !self
+                            .gfx
+                            .as_ref()
+                            .is_none_or(|g| ui_owns_pointer(&self.editor, &g.egui_ctx, pos))
+                        {
+                            // Against the touch's *own* position. It carries
+                            // one and `Editor::cursor` does not follow it, so
+                            // the mouse's answer would be about somewhere else
+                            // entirely — see `ui_owns_pointer`.
+                            self.editor.cursor = pos;
+                            self.editor.last_cursor = pos;
+                            let point = self.editor.sample(pos, reported);
+                            self.start_stroke(point);
+                            self.editor.drawing_touch = Some(touch.id);
                         }
+                        // Otherwise it landed on the interface, which egui has
+                        // already been handed. Deliberately *not* the pinch
+                        // branch: one finger on a panel is not a gesture, and
+                        // cancelling the stroke there threw away a stroke the
+                        // other hand was in the middle of.
                     }
                     TouchPhase::Moved => {
+                        // An update for an id that never started is a **hover** —
+                        // a pen in range but off the glass, which Windows reports
+                        // as a pointer update with no down flag. It is not a
+                        // contact and must not be recorded as one: a pen that
+                        // hovers and is then carried out of range leaves no
+                        // "up", so the entry would sit there for ever, and the
+                        // next real press — Windows gives each contact session a
+                        // fresh pointer id — would look like a second finger and
+                        // be taken for a pinch. A finger always starts before it
+                        // moves, so nothing is lost by requiring it.
+                        if !self.editor.touches.contains_key(&touch.id) {
+                            return;
+                        }
                         self.editor.touches.insert(touch.id, pos);
                         if self.editor.drawing_touch == Some(touch.id) {
                             self.editor.last_cursor = self.editor.cursor;

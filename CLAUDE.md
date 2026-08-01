@@ -789,11 +789,30 @@ Do not claim mobile support works — it has never been built or run.
 
 ### Pressure
 
-Touch screens report real pressure via winit's `Force`. **Desktop pen tablets do
-not report pressure through winit's mouse events**, so desktop falls back to a
-flat 1.0 or a speed-derived approximation. The `PressureSource` enum exists so a
-native tablet path (Windows Ink / `WM_POINTER`) can be added without touching the
-brush engine. Do not describe desktop pen pressure as working.
+Touch screens report real pressure via winit's `Force`, and so — on Windows —
+does a pen: winit's `WM_POINTER` handler calls `GetPointerPenInfo` and hands the
+pressure over as `Force`. **A pen therefore arrives as `WindowEvent::Touch`, not
+as mouse events**, and produces no `CursorMoved` at all, because winit consumes
+the pointer messages and Windows never promotes them to legacy mouse ones.
+
+Two things follow, and both were bugs:
+
+- **Anything deciding whether a press belongs to the document must take the
+  position from the event**, not from `Editor::cursor`. `cursor` is written by
+  `CursorMoved`, so under a pen it holds wherever the mouse was last left —
+  `(0, 0)` on a fresh launch, which is the menu bar. That is what
+  `ui_owns_pointer` takes a position for.
+- **A `Moved` for a touch id that never `Started` is a hover**, a pen in range
+  and off the glass. It must not go in `Editor::touches`: a pen carried out of
+  range sends no "up", so the entry would never be removed, and the next press
+  — Windows issues a fresh pointer id per contact session — would count as a
+  second finger and be read as a pinch.
+
+The pressure resolution is 1024 levels, which is what the `WM_POINTER` API
+carries however many the tablet itself distinguishes. `PressureSource::Device`
+is the default and passes it straight through; the enum's other arms are the
+mouse-only fallbacks. macOS and Linux have no equivalent path yet — do not
+describe pen pressure as working there.
 
 ## Releasing
 
