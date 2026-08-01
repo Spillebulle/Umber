@@ -173,6 +173,15 @@ was dropped. The generated library holds itself to the stricter rule and refuses
 those outright, since nothing shipped under an author's name should paint unlike
 their brush.
 
+**Dabs have shape.** A dab is an ellipse with an angle, not a circle, and it can
+scatter off the stroke and vary its own size — so a chisel is a chisel, a spray
+can sprays, and a charcoal stick catches on the paper. 109 of the 196 shipped
+brushes use at least one of those; before, every one of them painted a round
+dot whatever its name promised. Where the angle is driven by stroke direction
+the dab turns to follow the line, which is what separates a rake from a broad
+nib: a nib holds its angle through a curve, and that is what makes calligraphy
+thick and thin.
+
 **Blenders work.** A brush with MyPaint's `smudge` picks colour up off the
 canvas and carries it, and because the sample is taken through the same
 composite pass the screen uses, scrubbing back and forth blends a brush's own
@@ -372,11 +381,10 @@ Next, roughly in order:
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop
-- **Elliptical dabs**, and scatter. These are now the largest gap between an
-  imported brush and its original: about a quarter of the MyPaint set is
-  elliptical and imports as a round brush with no line-weight variation, and
-  the spray and "bulk" brushes come out as smooth lines. Bitmap tips and colour
-  pickup are built; these two are what is left.
+- **Shape driven by pressure or randomness.** The dab is an ellipse with scatter
+  and jitter now, but only from fixed values: 23 brushes vary their ellipticity
+  through an input mapping and still import as round ones, and scatter that
+  reacts to pen speed is ignored.
 - Tilt support
 - Stroke prediction to hide remaining latency
 

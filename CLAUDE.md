@@ -194,6 +194,28 @@ and the UI will be wrong again.
 `Camera` converts between them. `zoom_at` keeps the document point under the
 cursor pinned — without that correction the canvas slides away as you zoom.
 
+### Dab shape
+
+A dab is an ellipse with an angle, and may be scattered off the stroke and have
+its radius jittered. `Brush::size` always describes the **long** axis, so
+raising `dab_ratio` narrows the dab rather than growing it.
+
+- **The quad is built rotated and squashed in the vertex shader**, so `local`
+  stays the fragment's position in the dab's own frame and `length(local) <= 1`
+  still means "inside". That is what keeps the fragment falloff identical to
+  when every dab was a circle, and it means a 20:1 chisel rasterises a thin
+  quad rather than the square containing it.
+- **Antialiasing is sized from the *short* axis.** It is the demanding one: a
+  chisel two pixels across needs the same softening a two-pixel round brush
+  does.
+- **Scatter must widen the damaged rect.** `StrokeBuilder::bounds` unions the
+  circumscribing circle of the *scattered* dab. Too tight and the edge of a
+  spray is never committed — it redraws as a live preview and is then baked in
+  by the next stroke, in that stroke's colour.
+- **The scatter RNG is seeded per stroke, never from the clock.** A stroke has
+  to redraw identically, or every pixel test involving a scattering brush
+  becomes flaky and undo/redo would not reproduce the same marks.
+
 ### Colour pickup
 
 A smudging brush needs to know what the canvas holds under it, every frame of a

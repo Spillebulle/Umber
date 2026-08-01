@@ -125,18 +125,25 @@ MyPaint's radius exactly at all five sample points. There is a test for that:
 Documented in full in the module docs of
 `crates/umber-core/src/brushimport/mypaint.rs`. The short version, worst first:
 
-- **Elliptical dabs.** `elliptical_dab_ratio` and `elliptical_dab_angle` have no
-  equivalent — Umber's dab is a circle. Around a quarter of the MyPaint set is
-  elliptical, and those brushes import as round ones with no line-weight
-  variation. This is the single biggest loss.
-- **Scatter and jitter.** `offset_by_random`, `radius_by_random`,
-  `offset_by_speed`. Spray, splatter and "bulk" brushes come out as smooth lines.
+- **Shape driven by an input rather than a base value.** The dab is now an
+  ellipse with scatter and radius jitter, so most shaped brushes arrive shaped —
+  109 of the 196. What does not carry across is a brush whose `elliptical_dab_
+  ratio`, `offset_by_random` or `radius_by_random` is driven by a *mapping*
+  (pressure, random, speed) rather than stated as a base value: the importer
+  reads the base and ignores the mapping, so 23 brushes that vary their
+  ellipticity dynamically import as round ones. `Brush` has exactly two
+  pressure-driven curves and nowhere to put a third.
+- **`offset_by_speed`.** Scatter that grows with pen speed. The constant part of
+  a brush's scatter is imported; the speed-reactive part is not, so a fast flick
+  spreads less than it should.
 - **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
   nothing is lost here. The engine now has them (see below); it is the Krita
   and GIMP packs they exist for.
-- **Non-pressure inputs.** `speed1`, `speed2`, `random`, `stroke`, `direction`,
-  `tilt`. `Brush` has exactly two pressure-driven parameters and nowhere to put
-  the rest.
+- **Non-pressure inputs.** `speed1`, `speed2`, `random`, `stroke`, `tilt`.
+  `Brush` has exactly two pressure-driven parameters and nowhere to put the
+  rest. `direction` is the one exception: it is not read as a curve, but a
+  `direction` mapping on `elliptical_dab_angle` is taken as "this dab turns to
+  follow the stroke", which is the difference between a rake and a broad nib.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
   darkens as a stroke crosses itself. Umber takes a `max` of coverage across the
   whole stroke and applies opacity once at commit — that is the wet-layer design
