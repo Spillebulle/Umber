@@ -21,6 +21,7 @@ mod dock;
 pub mod docshot;
 mod editor;
 mod icons;
+mod localtime;
 mod logo;
 mod panels;
 mod prefs;

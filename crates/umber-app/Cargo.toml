@@ -65,6 +65,16 @@ zip = { workspace = true }
 tar = "0.4"
 flate2 = "1"
 
+# Local time. `umber-core` stores UTC and knows how to spell a moment out
+# given an offset; finding that offset is the platform's job, and both of these
+# are already in the tree underneath winit and wgpu, so neither is a new build.
+# See `src/localtime.rs` for why this is not a date crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }
 android_logger = "0.15"

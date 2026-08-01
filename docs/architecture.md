@@ -147,10 +147,14 @@ layer would otherwise preview wrongly and then jump on release.
   entry from a document written before timestamps existed keeps `None` all the
   way to an empty column. Calendar arithmetic is Hinnant's `civil_from_days`,
   about twenty lines, tested across 1970, 2000 and 2100 and against an
-  independent calendar for every day of forty years — no date crate, because
-  the only thing one would add over this is *local* time, and `time`'s
-  local-offset declines to answer in a multi-threaded process, which Umber is.
-  Everything shown is labelled UTC for that reason.
+  independent calendar for every day of forty years — no date crate. The one
+  thing one would add over this is *local* time, and that is a platform
+  question rather than a calendar one: `umber-app/src/localtime.rs` asks the
+  operating system for the offset **at that instant**, so a document spanning a
+  daylight-saving change does not gain an hour halfway through an afternoon. It
+  goes through `libc` and `windows-sys`, both already in the tree, so it adds
+  no crate to the build. A platform that will not answer falls back to UTC, and
+  both forms name the zone they are in.
 - **GPU limits are `downlevel_defaults`**, so a desktop build cannot silently
   start depending on capabilities an Android or iOS device will refuse.
 

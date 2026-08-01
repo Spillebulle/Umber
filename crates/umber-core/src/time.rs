@@ -18,14 +18,12 @@
 //! exact dates, because an off-by-one across a leap day is precisely the bug
 //! this kind of code has.
 //!
-//! A dependency would be a supply-chain decision taken for a tooltip, and it
-//! would not even buy the thing that would justify it. What we cannot do
-//! ourselves is **local** time, which needs the platform's time-zone database:
-//! `chrono` carries one, and `time` needs its `local-offset` feature, which on
-//! Unix refuses to answer in a multi-threaded process — and Umber is one, wgpu
-//! sees to that. So the realistic choice was between UTC computed here and UTC
-//! computed by a crate. Everything shown is therefore **labelled UTC**, which
-//! is unambiguous; an unlabelled time that is two hours out is not.
+//! A dependency would be a supply-chain decision taken for a tooltip, and the
+//! one thing it would buy — **local** time — does not live here anyway. A zone
+//! offset is a platform question, so `umber-app/src/localtime.rs` asks it and
+//! hands the answer to [`Timestamp::describe_at`]; everything stored stays UTC,
+//! and only the reading moves. Both forms name their zone, because an
+//! unlabelled time that is two hours out looks exactly like a correct one.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -77,11 +75,16 @@ impl Timestamp {
         Civil::from_unix_millis(self.0)
     }
 
-    /// The whole moment, spelled out: `1 August 2026, 14:32:07 UTC`.
+    /// The whole moment in UTC, spelled out: `1 August 2026, 14:32:07 UTC`.
     ///
     /// Day before month, so the order cannot be misread the way `08/01/2026`
     /// can. This allocates, which is why it is called only when a tooltip is
     /// actually being shown and never for a row simply being drawn.
+    ///
+    /// Kept separate from [`Timestamp::describe_at`] rather than delegating to
+    /// it with a zero offset: this is what a reader sees when the platform
+    /// could not say what zone they are in, and `UTC` states that plainly where
+    /// `(UTC+00:00)` would imply somebody had established they are in it.
     pub fn describe(self) -> String {
         let c = self.civil();
         format!(
@@ -92,6 +95,38 @@ impl Timestamp {
             c.hour,
             c.minute,
             c.second
+        )
+    }
+
+    /// The same, shifted into a zone `offset` seconds from UTC and labelled
+    /// with it: `1 August 2026, 16:32:07 (UTC+02:00)`.
+    ///
+    /// The offset is the caller's to supply because finding it is a platform
+    /// question and this crate has no business asking one — see
+    /// `umber-app/src/localtime.rs`, which does. Everything stored stays UTC;
+    /// only the reading moves.
+    ///
+    /// The zone is named even when it is UTC. An unlabelled time that is two
+    /// hours out looks exactly like a correct one, and this is the one place a
+    /// reader might be comparing against a clock on the wall.
+    pub fn describe_at(self, offset: i32) -> String {
+        // Shift the instant and read it as though it were UTC: a zone offset is
+        // exactly that translation. Saturating rather than wrapping, so a
+        // nonsense offset cannot turn a date in 2026 into one in 1907.
+        let shifted = Self(self.0.saturating_add(offset as i64 * 1_000));
+        let c = shifted.civil();
+        let sign = if offset < 0 { '-' } else { '+' };
+        let away = offset.unsigned_abs();
+        format!(
+            "{} {} {}, {:02}:{:02}:{:02} (UTC{sign}{:02}:{:02})",
+            c.day,
+            c.month_name(),
+            c.year,
+            c.hour,
+            c.minute,
+            c.second,
+            away / 3600,
+            (away % 3600) / 60,
         )
     }
 }
@@ -393,6 +428,48 @@ mod tests {
         // 2026-08-01 14:32:07 UTC.
         let t = Timestamp::from_unix_millis((1_785_542_400 + 14 * 3600 + 32 * 60 + 7) * 1000);
         assert_eq!(t.describe(), "1 August 2026, 14:32:07 UTC");
+    }
+
+    /// A zone offset is a translation of the instant, so the awkward cases are
+    /// the ones that carry it over a boundary — and the reader has to be able
+    /// to tell which zone they are looking at.
+    #[test]
+    fn a_moment_reads_in_the_zone_it_is_asked_for() {
+        // 2026-08-01 14:32:07 UTC.
+        let t = Timestamp::from_unix_millis((1_785_542_400 + 14 * 3600 + 32 * 60 + 7) * 1000);
+        assert_eq!(t.describe_at(0), "1 August 2026, 14:32:07 (UTC+00:00)");
+        // Norway in summer.
+        assert_eq!(
+            t.describe_at(2 * 3600),
+            "1 August 2026, 16:32:07 (UTC+02:00)"
+        );
+        // Los Angeles: back over midnight into the previous day.
+        assert_eq!(
+            t.describe_at(-7 * 3600),
+            "1 August 2026, 07:32:07 (UTC-07:00)"
+        );
+        // Kathmandu, to prove the minutes are not assumed to be zero.
+        assert_eq!(
+            t.describe_at(5 * 3600 + 45 * 60),
+            "1 August 2026, 20:17:07 (UTC+05:45)"
+        );
+
+        // Just before midnight UTC, pushed into the next day and the next
+        // month — the case an offset applied to the clock rather than to the
+        // instant would get wrong.
+        let midnight = Timestamp::from_unix_millis((1_785_542_400 + 23 * 3600 + 30 * 60) * 1000);
+        assert_eq!(
+            midnight.describe_at(0),
+            "1 August 2026, 23:30:00 (UTC+00:00)"
+        );
+        assert_eq!(
+            midnight.describe_at(3600),
+            "2 August 2026, 00:30:00 (UTC+01:00)"
+        );
+
+        // A nonsense offset saturates rather than wrapping the year.
+        let _ = t.describe_at(i32::MIN);
+        let _ = t.describe_at(i32::MAX);
     }
 
     #[test]

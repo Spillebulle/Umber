@@ -1005,7 +1005,16 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
         _ => false,
     };
     match (over_time, row.at) {
-        (true, Some(at)) => response.on_hover_text(at.describe()),
+        // In the reader's own zone, because the one thing they might be doing
+        // with this is comparing it against a clock in the room. The offset is
+        // asked for at *that* moment, not now, so a document spanning a
+        // daylight-saving change does not gain an hour halfway through an
+        // afternoon. A platform that will not say falls back to UTC, and the
+        // label says which they are looking at either way.
+        (true, Some(at)) => response.on_hover_text(match crate::localtime::offset_at(at) {
+            Some(offset) => at.describe_at(offset),
+            None => at.describe(),
+        }),
         _ => response.on_hover_text(if row.applied {
             "Go back to this point"
         } else {

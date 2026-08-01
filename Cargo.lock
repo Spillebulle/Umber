@@ -2778,6 +2778,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "glam",
+ "libc",
  "log",
  "png",
  "pollster 1.0.1",
@@ -2791,6 +2792,7 @@ dependencies = [
  "umber-render",
  "ureq",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
  "zip",
 ]
