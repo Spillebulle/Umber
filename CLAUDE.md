@@ -715,6 +715,20 @@ sizes, the config round trip and the drop rules be tested without a window.
   the workspace holds, and the alternative (bumping `umber-layout`) discards
   every arrangement anybody has made. Adding a kind therefore needs no version
   bump; adding one to `DEFAULT_DOCK` would.
+- **`PanelKind::Tools` is the one exception to that, and only because a pre-
+  columns file names the rail.** The tool rail used to be chrome — always
+  present, with a side of its own — so an old config records `rail <side>`.
+  `from_config` reads that as a Tools column at that edge, the outermost, which
+  is where the rail was drawn; so a fresh install and an upgraded one agree
+  without the version moving. The writer no longer emits `rail`, and its
+  absence is what tells a later load that a *removed* Tools module was meant.
+  `a_config_written_before_the_rail_was_a_module_still_has_a_rail` and
+  `a_removed_tool_rail_stays_removed_across_a_save` are the pair.
+- **A column's minimum width is the widest `PanelKind::min_width` in it**, not
+  one number for every column. The rail's whole point is being narrow and every
+  other module is unusable there, so `metrics::TOOL_RAIL` is the Tools floor and
+  `limits::SIDEBAR_MIN_WIDTH` everybody else's — and dropping Colour into the
+  rail's column widens it rather than leaving a picker three buttons across.
 - **A side is a list of `Column`s, ordered from the window edge inwards**, and a
   column is exactly what a whole sidebar used to be: a stack with a width. Index
   0 is against the window on *either* edge, so nothing downstream has to ask

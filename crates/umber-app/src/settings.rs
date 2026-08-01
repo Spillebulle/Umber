@@ -633,13 +633,14 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             .color(p.text_dim),
     );
     ui.add_space(6.0);
-    // The left-handed mirror that used to live here is gone. Every part of the
-    // workspace, the tool rail included, now moves by being dragged in layout
-    // edit mode, so a global handedness flag has nothing left to do.
+    // The left-handed mirror that used to live here is gone, and so is the tool
+    // rail's own side setting that outlived it: the rail is a module now, and
+    // every part of the workspace moves by being dragged in layout edit mode.
     ui.label(
         egui::RichText::new(
-            "Panels, sidebars and the tool rail are arranged by dragging them. \
-             Turn on Window, Customise layout to move them; the same menu resets \
+            "Every module, the tool rail included, is arranged by dragging it. \
+             Turn on Window, Customise layout to move them; drop one at the edge \
+             of a column to start a new column beside it. The same menu resets \
              the layout if it goes wrong.",
         )
         .size(10.0)

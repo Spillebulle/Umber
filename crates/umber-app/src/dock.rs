@@ -30,6 +30,27 @@
 //! symmetric: index 0 is always the one against the window, on either edge, so
 //! nothing downstream has to ask which way round this side counts.
 //!
+//! ## Why the tool rail is an ordinary module
+//!
+//! It used to be chrome — a fixed strip with a side of its own, its own
+//! `egui::Panel` and its own drag handle. The one thing it could do, move to
+//! the other edge, the dock model already did for four other modules; and
+//! everything it could not do — be resized, share a column, float, be closed
+//! and come back from the module library — the dock model gives away for free.
+//! So [`PanelKind::Tools`] is a module like the rest, and the rail's side is no
+//! longer a setting.
+//!
+//! It is also the one addition to [`PanelKind::DEFAULT_DOCK`] that does not
+//! need the config's version bumped, and the reason is particular to it. The
+//! rule elsewhere is that a file written before a module existed does not name
+//! it, so a default containing it would make a fresh install and an upgraded
+//! one disagree. A pre-columns file *does* name the rail: it always existed,
+//! and the file records which edge it was on. `from_config` reads that `rail`
+//! line as a Tools column at that edge, so an upgraded workspace opens exactly
+//! as it closed and matches what a fresh install ships with. The writer no
+//! longer emits `rail`, and its absence is therefore also what tells a later
+//! load that a *closed* Tools module was meant rather than an old file.
+//!
 //! ## Why a drag lifts the panel out of the layout
 //!
 //! [`Layout::begin_drag`] removes the panel from wherever it was. The stack it
@@ -61,7 +82,9 @@ use std::path::PathBuf;
 pub mod limits {
     /// Enough for a header plus a usable sliver of content.
     pub const PANEL_MIN_HEIGHT: f32 = 96.0;
-    /// The narrowest a column may be dragged.
+    /// The narrowest a column holding an ordinary module may be dragged. A
+    /// column holding only the tool rail may go narrower — see
+    /// [`super::PanelKind::min_width`].
     pub const SIDEBAR_MIN_WIDTH: f32 = 190.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 460.0;
     /// What is always left for the document, however many columns are docked.
@@ -88,6 +111,7 @@ pub mod limits {
 /// A module that can be docked, floated or closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PanelKind {
+    Tools,
     Colour,
     Brushes,
     Layers,
@@ -95,10 +119,16 @@ pub enum PanelKind {
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 4] = [Self::Colour, Self::Brushes, Self::Layers, Self::History];
+    pub const ALL: [PanelKind; 5] = [
+        Self::Tools,
+        Self::Colour,
+        Self::Brushes,
+        Self::Layers,
+        Self::History,
+    ];
 
-    /// The arrangement Umber ships with: the design's three modules, in one
-    /// column at the right-hand edge.
+    /// The arrangement Umber ships with, a column per side: the tool rail alone
+    /// at the left, the design's three modules stacked at the right.
     ///
     /// History is deliberately *not* among them, and that is the same answer a
     /// layout file written before History existed gets — an absent panel is a
@@ -109,10 +139,16 @@ impl PanelKind {
     /// alternative to that, bumping the version, would throw away every
     /// arrangement anybody has made to add one module they can reach from the
     /// Window menu in two clicks.
-    pub const DEFAULT_DOCK: [PanelKind; 3] = [Self::Colour, Self::Brushes, Self::Layers];
+    ///
+    /// Tools *is* among them, and is the exception the module comment argues
+    /// for: an old file records the rail's edge, so it opens with the rail
+    /// where it was rather than without one.
+    pub const DEFAULT_DOCK: [&'static [PanelKind]; 2] =
+        [&[Self::Tools], &[Self::Colour, Self::Brushes, Self::Layers]];
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::Tools => "Tools",
             Self::Colour => "Colour",
             Self::Brushes => "Brushes",
             Self::Layers => "Layers",
@@ -129,6 +165,10 @@ impl PanelKind {
     /// missing match arm rather than a card with a blank half.
     pub fn description(self) -> &'static str {
         match self {
+            Self::Tools => {
+                "The tools, and the painting and background colours with the \
+                 swap between them."
+            }
             Self::Colour => {
                 "Choose the painting colour — a hue ring, a saturation square \
                  or RGB sliders."
@@ -149,6 +189,7 @@ impl PanelKind {
     /// so retitling a panel in the UI cannot silently invalidate saved layouts.
     fn key(self) -> &'static str {
         match self {
+            Self::Tools => "tools",
             Self::Colour => "colour",
             Self::Brushes => "brushes",
             Self::Layers => "layers",
@@ -164,10 +205,37 @@ impl PanelKind {
     /// picker is the tallest thing in the dock, so it gets the most.
     fn default_weight(self) -> f32 {
         match self {
+            Self::Tools => 1.0,
             Self::Colour => 3.0,
             Self::Brushes => 1.3,
             Self::Layers => 2.2,
             Self::History => 2.0,
+        }
+    }
+
+    /// How wide a column holding only this module starts out.
+    ///
+    /// The rail is a grid of tool buttons rather than a column of labelled
+    /// controls, and it reads as chrome at the width the design draws it. Every
+    /// other module wants the design's panel width.
+    fn default_width(self) -> f32 {
+        match self {
+            Self::Tools => metrics::TOOL_RAIL,
+            _ => metrics::PANEL,
+        }
+    }
+
+    /// The narrowest a column holding this module may be dragged.
+    ///
+    /// Per module rather than one number for every column, because the tool
+    /// rail's whole point is being narrow and every other module is unusable
+    /// there. A column takes the widest minimum among the modules in it, so
+    /// dropping Colour into the rail's column widens it rather than leaving a
+    /// picker three buttons across.
+    pub fn min_width(self) -> f32 {
+        match self {
+            Self::Tools => metrics::TOOL_RAIL,
+            _ => limits::SIDEBAR_MIN_WIDTH,
         }
     }
 }
@@ -236,8 +304,19 @@ impl Column {
                 kind,
                 weight: kind.default_weight(),
             }],
-            width: metrics::PANEL,
+            width: kind.default_width(),
         }
+    }
+
+    /// The widest minimum among the modules in it. An empty column is a ghost
+    /// left behind by a drag and is about to be pruned; the ordinary floor is
+    /// the honest answer for one.
+    pub fn min_width(&self) -> f32 {
+        self.panels
+            .iter()
+            .map(|d| d.kind.min_width())
+            .reduce(f32::max)
+            .unwrap_or(limits::SIDEBAR_MIN_WIDTH)
     }
 }
 
@@ -332,7 +411,6 @@ pub struct ColumnGeometry {
 pub struct Geometry {
     /// Below the options strip, above the status bar, full window width.
     pub workspace: Rect,
-    pub rail: Rect,
     /// Per side, one entry per column, ordered from the window edge inwards.
     pub sides: [Vec<ColumnGeometry>; 2],
     /// What is left for the document. Floating panels do **not** come out of
@@ -524,7 +602,6 @@ pub struct Layout {
     sides: [Vec<Column>; 2],
     /// Draw order, and therefore z-order: the last one is on top.
     floating: Vec<Floating>,
-    rail_side: Side,
     drag: Option<Drag>,
     /// The design's layout edit mode. Panels are only draggable while it is on,
     /// and the canvas is paused for as long as it is — see [`Self::blocks_canvas`].
@@ -539,22 +616,31 @@ pub struct Layout {
 
 impl Default for Layout {
     fn default() -> Self {
+        let side = |index: usize| -> Vec<Column> {
+            let kinds = PanelKind::DEFAULT_DOCK[index];
+            if kinds.is_empty() {
+                return Vec::new();
+            }
+            vec![Column {
+                panels: kinds
+                    .iter()
+                    .map(|kind| Docked {
+                        kind: *kind,
+                        weight: kind.default_weight(),
+                    })
+                    .collect(),
+                // What the widest module in it asks for, so the shipped rail is
+                // rail-width and the shipped dock is panel-width without either
+                // number being written down a second time.
+                width: kinds
+                    .iter()
+                    .map(|kind| kind.default_width())
+                    .fold(0.0_f32, f32::max),
+            }]
+        };
         Self {
-            sides: [
-                Vec::new(),
-                vec![Column {
-                    panels: PanelKind::DEFAULT_DOCK
-                        .into_iter()
-                        .map(|kind| Docked {
-                            kind,
-                            weight: kind.default_weight(),
-                        })
-                        .collect(),
-                    width: metrics::PANEL,
-                }],
-            ],
+            sides: [side(0), side(1)],
             floating: Vec::new(),
-            rail_side: Side::Left,
             drag: None,
             edit_mode: false,
             dirty: false,
@@ -584,10 +670,6 @@ impl Layout {
         self.sides[side.index()]
             .get(column)
             .map_or(metrics::PANEL, |c| c.width)
-    }
-
-    pub fn rail_side(&self) -> Side {
-        self.rail_side
     }
 
     pub fn drag(&self) -> Option<Drag> {
@@ -666,33 +748,11 @@ impl Layout {
     /// drop zones, panel bodies, the canvas the camera pivot comes from — is
     /// derived from these by subtraction, so one inverted rect here turns into
     /// widgets painted somewhere they were never asked for.
-    pub fn geometry(&self, workspace: Rect, rail_width: f32) -> Geometry {
+    pub fn geometry(&self, workspace: Rect) -> Geometry {
         // The strips above and below claim their height first, so on a window
         // shorter than the sum of them what arrives here is already inverted.
         let workspace = Rect::from_min_size(workspace.min, workspace.size().max(Vec2::ZERO));
-        // A window narrower than the rail itself. The rail wins — it is the one
-        // piece of chrome with no way to hide it — and the canvas gets nothing.
-        let rail_width = rail_width.clamp(0.0, workspace.width());
         let mut canvas = workspace;
-        let rail = match self.rail_side {
-            Side::Left => {
-                let r = Rect::from_min_max(
-                    canvas.left_top(),
-                    pos2(canvas.left() + rail_width, canvas.bottom()),
-                );
-                canvas.min.x = r.right();
-                r
-            }
-            Side::Right => {
-                let r = Rect::from_min_max(
-                    pos2(canvas.right() - rail_width, canvas.top()),
-                    canvas.right_bottom(),
-                );
-                canvas.max.x = r.left();
-                r
-            }
-        };
-
         let mut sides = [Vec::new(), Vec::new()];
         for side in Side::ALL {
             for column in &self.sides[side.index()] {
@@ -742,7 +802,6 @@ impl Layout {
 
         Geometry {
             workspace,
-            rail,
             sides,
             canvas,
         }
@@ -789,7 +848,7 @@ impl Layout {
             return;
         };
         let width = width
-            .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH)
+            .clamp(col.min_width(), limits::SIDEBAR_MAX_WIDTH)
             .round();
         if col.width != width {
             col.width = width;
@@ -865,14 +924,6 @@ impl Layout {
         }
         let f = self.floating.remove(index);
         self.floating.push(f);
-        self.dirty = true;
-    }
-
-    pub fn set_rail_side(&mut self, side: Side) {
-        if self.rail_side == side {
-            return;
-        }
-        self.rail_side = side;
         self.dirty = true;
     }
 
@@ -1129,13 +1180,16 @@ impl Layout {
                 }
             }
             DropTarget::NewColumn { side, column } => {
-                // A panel that had a column keeps its width, so moving one
-                // along does not silently resize it.
+                // A panel that had a column keeps its width, so moving the tool
+                // rail one place along does not silently widen it into an
+                // ordinary module column. Clamped to what the module itself
+                // will accept, since the width may have come from a column it
+                // was sharing with something wider.
                 let width = match drag.origin {
                     Origin::Dock { width, .. } => width,
-                    Origin::Float(_) | Origin::Closed => metrics::PANEL,
+                    Origin::Float(_) | Origin::Closed => drag.kind.default_width(),
                 }
-                .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH);
+                .clamp(drag.kind.min_width(), limits::SIDEBAR_MAX_WIDTH);
                 let columns = &mut self.sides[side.index()];
                 let at = column.min(columns.len());
                 columns.insert(
@@ -1175,13 +1229,13 @@ impl Layout {
     /// a parser that can be read in one screen is worth more here than a
     /// dependency plus derive macros on types that also carry drag state.
     ///
-    /// The version header has not moved, and the line that used to be written
-    /// and is not any more is why it did not have to: `width` said how wide a
-    /// side was, which a `column` now says for each of its columns. It is
-    /// still *read* — see [`Self::from_config`].
+    /// The version header has not moved, and the two lines that used to be
+    /// written and are not any more are why it did not have to. `width` said
+    /// how wide a side was, which a `column` now says for each of its columns;
+    /// `rail` said which edge the tool rail was on, and the rail is a module.
+    /// Both are still *read* — see [`Self::from_config`].
     pub fn to_config(&self) -> String {
         let mut out = String::from("umber-layout 1\n");
-        out.push_str(&format!("rail {}\n", self.rail_side.key()));
         for side in Side::ALL {
             for column in &self.sides[side.index()] {
                 // A column with nothing in it is a ghost a drag left behind and
@@ -1222,11 +1276,20 @@ impl Layout {
     /// version header *is* fatal, because silently reinterpreting an older
     /// format is how a layout ends up subtly wrong instead of obviously reset.
     ///
-    /// **`width <side> <points>`** is read and no longer written, and it is the
-    /// whole of why columns cost nobody their arrangement. It said how wide
-    /// that side was, back when a side *was* one column; it now sets the width
-    /// of the column a side implicitly has, so a file with no `column` line at
-    /// all loads as exactly the single column it describes.
+    /// Two line shapes are read and no longer written, and between them they
+    /// are the whole of why columns and the tool rail's promotion to a module
+    /// cost nobody their arrangement:
+    ///
+    /// * **`width <side> <points>`** — how wide that side was, back when a side
+    ///   *was* one column. It sets the width of the column a side implicitly
+    ///   has, so a file with no `column` line at all loads as exactly the
+    ///   single column it describes.
+    /// * **`rail <side>`** — which edge the tool rail was on. The rail was
+    ///   chrome and always present, so a file that names it is a file from
+    ///   before it was a module, and it becomes a Tools column at that edge:
+    ///   the outermost, which is where the rail was drawn. A file this build
+    ///   writes never names it, so a Tools module the user has *removed* stays
+    ///   removed rather than reappearing every launch.
     pub fn from_config(text: &str) -> Option<Self> {
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
         if lines.next()? != "umber-layout 1" {
@@ -1236,7 +1299,6 @@ impl Layout {
         let mut layout = Self {
             sides: [Vec::new(), Vec::new()],
             floating: Vec::new(),
-            rail_side: Side::Left,
             drag: None,
             edit_mode: false,
             dirty: false,
@@ -1245,15 +1307,12 @@ impl Layout {
         // The width a side's implicit column takes, from a pre-columns `width`
         // line. Only ever consulted by a file that has no `column` line at all.
         let mut implied_width = [metrics::PANEL; 2];
+        let mut legacy_rail: Option<Side> = None;
 
         for line in lines {
             let f: Vec<&str> = line.split_whitespace().collect();
             match f.as_slice() {
-                ["rail", side] => {
-                    if let Some(side) = Side::from_key(side) {
-                        layout.rail_side = side;
-                    }
-                }
+                ["rail", side] => legacy_rail = Side::from_key(side),
                 ["width", side, value] => {
                     if let (Some(side), Ok(value)) = (Side::from_key(side), value.parse::<f32>()) {
                         implied_width[side.index()] = value
@@ -1271,9 +1330,10 @@ impl Layout {
                     }
                     layout.sides[side.index()].push(Column {
                         panels: Vec::new(),
-                        width: width
-                            .clamp(limits::SIDEBAR_MIN_WIDTH, limits::SIDEBAR_MAX_WIDTH)
-                            .round(),
+                        // The floor is applied once the column's panels are
+                        // known, below: a Tools column is legitimately narrower
+                        // than any other, and which it is cannot be told yet.
+                        width: width.clamp(0.0, limits::SIDEBAR_MAX_WIDTH).round(),
                     });
                 }
                 ["dock", side, kind, weight] => {
@@ -1336,10 +1396,29 @@ impl Layout {
             }
         }
 
+        // A file from before the rail was a module. It says the rail exists and
+        // which edge it was on, so it opens with one — outermost on that side,
+        // which is where it was drawn.
+        if let Some(side) = legacy_rail
+            && !seen.contains(&PanelKind::Tools)
+        {
+            layout.sides[side.index()].insert(0, Column::of(PanelKind::Tools));
+        }
+
         // A `column` line with nothing under it — a truncated write, or a file
         // somebody edited. An empty strip in the workspace is worse than a
         // column that was never there.
         layout.prune();
+        // And now that every column's contents are known, hold each to the
+        // floor of the widest module in it.
+        for side in &mut layout.sides {
+            for column in side.iter_mut() {
+                column.width = column
+                    .width
+                    .clamp(column.min_width(), limits::SIDEBAR_MAX_WIDTH)
+                    .round();
+            }
+        }
 
         Some(layout)
     }
@@ -1534,17 +1613,18 @@ mod tests {
     }
 
     #[test]
-    fn geometry_leaves_the_canvas_between_the_rails() {
+    fn geometry_leaves_the_canvas_between_the_columns() {
         let layout = Layout::default();
-        let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0), 76.0);
-        assert_eq!(geo.rail.left(), 0.0);
-        assert_eq!(geo.rail.width(), 76.0);
-        assert!(geo.sidebar(Side::Left).is_none());
+        let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0));
+        let rail = geo.columns(Side::Left);
+        assert_eq!(rail.len(), 1, "the shipped rail");
+        assert_eq!(rail[0].rect.left(), 0.0);
+        assert_eq!(rail[0].rect.width(), metrics::TOOL_RAIL.round());
         let right = geo
             .sidebar(Side::Right)
             .expect("default docks on the right");
         assert_eq!(right.right(), 1440.0);
-        assert_eq!(geo.canvas.left(), 76.0);
+        assert_eq!(geo.canvas.left(), rail[0].rect.right());
         assert_eq!(geo.canvas.right(), right.left());
         assert_eq!(geo.columns(Side::Right)[0].slots.len(), 3);
     }
@@ -1560,7 +1640,7 @@ mod tests {
             vec![PanelKind::Colour, PanelKind::Brushes]
         );
 
-        let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0), 76.0);
+        let geo = layout.geometry(rect(0.0, 70.0, 1440.0, 800.0));
         let cols = geo.columns(Side::Right);
         assert_eq!(cols[0].rect.right(), 1440.0, "column 0 is at the edge");
         assert_eq!(cols[1].rect.right(), cols[0].rect.left());
@@ -1612,8 +1692,8 @@ mod tests {
             // Shorter than the strips: what reaches `geometry` is inverted.
             (900.0, -60.0),
         ] {
-            let geo = layout.geometry(rect(0.0, 70.0, w, h), 76.0);
-            let mut all = vec![geo.workspace, geo.rail, geo.canvas];
+            let geo = layout.geometry(rect(0.0, 70.0, w, h));
+            let mut all = vec![geo.workspace, geo.canvas];
             for side in Side::ALL {
                 all.extend(geo.sidebar(side));
                 all.push(geo.drop_zone(side));
@@ -1645,14 +1725,14 @@ mod tests {
         // cursor.
         let mut layout = Layout::default();
         let workspace = rect(0.0, 70.0, 1440.0, 800.0);
-        let before = layout.geometry(workspace, 76.0).canvas;
+        let before = layout.geometry(workspace).canvas;
 
         layout.close(PanelKind::Layers);
         layout.floating.push(Floating {
             kind: PanelKind::Layers,
             rect: rect(600.0, 300.0, 260.0, 300.0),
         });
-        let after = layout.geometry(workspace, 76.0).canvas;
+        let after = layout.geometry(workspace).canvas;
 
         assert_eq!(before, after);
     }
@@ -1660,7 +1740,7 @@ mod tests {
     #[test]
     fn dropping_over_a_column_picks_the_slot_under_the_pointer() {
         let layout = Layout::default();
-        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0));
         let slots = &geo.columns(Side::Right)[0].slots;
 
         // Top half of the first slot inserts above it. Horizontally in the
@@ -1693,7 +1773,7 @@ mod tests {
     #[test]
     fn the_edge_of_a_column_asks_for_a_new_one() {
         let layout = two_columns_on_the_right();
-        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0));
         let cols = geo.columns(Side::Right);
 
         // Hard against the window edge: outside everything docked.
@@ -1728,8 +1808,9 @@ mod tests {
 
     #[test]
     fn an_empty_side_still_accepts_a_drop() {
-        let layout = Layout::default();
-        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        let mut layout = Layout::default();
+        layout.close(PanelKind::Tools);
+        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0));
         assert!(geo.columns(Side::Left).is_empty());
         let zone = geo.drop_zone(Side::Left);
         assert_eq!(
@@ -1744,7 +1825,7 @@ mod tests {
     #[test]
     fn the_middle_of_the_canvas_floats() {
         let layout = Layout::default();
-        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0), 76.0);
+        let geo = layout.geometry(rect(0.0, 0.0, 1440.0, 900.0));
         assert_eq!(geo.drop_target(geo.canvas.center()), DropTarget::Float);
     }
 
@@ -1894,7 +1975,6 @@ mod tests {
     fn config_round_trips() {
         let mut layout = Layout::default();
         layout.set_edit_mode(true);
-        layout.set_rail_side(Side::Right);
         layout.set_width(Side::Right, DOCK, 300.0);
         layout.begin_drag(
             PanelKind::Colour,
@@ -1916,7 +1996,6 @@ mod tests {
         let text = layout.to_config();
         let back = Layout::from_config(&text).expect("valid config");
         assert_eq!(back.to_config(), text);
-        assert_eq!(back.rail_side(), layout.rail_side());
         assert_eq!(back.columns(Side::Left), layout.columns(Side::Left));
         assert_eq!(back.columns(Side::Right), layout.columns(Side::Right));
         assert_eq!(back.floating(), layout.floating());
@@ -1968,7 +2047,6 @@ mod tests {
                     column left 250\n\
                     nonsense here\n";
         let layout = Layout::from_config(text).expect("still loads");
-        assert_eq!(layout.rail_side(), Side::Left, "bad side falls back");
         assert_eq!(layout.width(Side::Right, 0), 300.0);
         assert_eq!(
             layout.docked(Side::Right, 0).len(),
@@ -2102,7 +2180,6 @@ mod tests {
                     dock right layers 2.2\n";
         let layout = Layout::from_config(text).expect("still loads");
 
-        assert_eq!(layout.rail_side(), Side::Left);
         assert_eq!(
             layout.columns(Side::Right).len(),
             1,
@@ -2116,9 +2193,80 @@ mod tests {
         // The stack's own proportions come back untouched.
         assert_eq!(weights(&layout, Side::Right, 0), vec![3.0, 1.3, 2.2]);
 
-        assert_eq!(layout.columns(Side::Left).len(), 1);
-        assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::History]);
-        assert_eq!(layout.width(Side::Left, 0), 264.0);
+        // The left side had the rail *and* a module, and the rail was drawn
+        // outside the sidebar, so it arrives as the outer column of two.
+        assert_eq!(layout.columns(Side::Left).len(), 2);
+        assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::Tools]);
+        assert_eq!(kinds(&layout, Side::Left, 1), vec![PanelKind::History]);
+        assert_eq!(layout.width(Side::Left, 1), 264.0);
+    }
+
+    /// The tool rail used to be chrome, so a file from before it was a module
+    /// says only which edge it was on. It must open with the rail on that edge:
+    /// an upgraded workspace losing its tools would be exactly the divergence
+    /// the version header exists to prevent, and it is the reason Tools could
+    /// join `DEFAULT_DOCK` without one.
+    #[test]
+    fn a_config_written_before_the_rail_was_a_module_still_has_a_rail() {
+        for (side, other) in [(Side::Left, Side::Right), (Side::Right, Side::Left)] {
+            let text = format!(
+                "umber-layout 1\nrail {}\nwidth right 264\ndock right colour 3\n",
+                side.key()
+            );
+            let layout = Layout::from_config(&text).expect("still loads");
+            assert!(layout.is_open(PanelKind::Tools), "{side:?}");
+            assert_eq!(
+                kinds(&layout, side, 0),
+                vec![PanelKind::Tools],
+                "outermost on {side:?}, which is where it was drawn",
+            );
+            assert_eq!(
+                layout.width(side, 0),
+                PanelKind::Tools.default_width().round(),
+                "at rail width",
+            );
+            // And nothing was invented on the other edge.
+            assert!(!kinds(&layout, other, 0).contains(&PanelKind::Tools));
+        }
+    }
+
+    /// The other half of the same rule: once the rail is a module, removing it
+    /// has to stick. Nothing this build writes names a rail, so nothing
+    /// resurrects it on the next launch.
+    #[test]
+    fn a_removed_tool_rail_stays_removed_across_a_save() {
+        let mut layout = Layout::default();
+        layout.close(PanelKind::Tools);
+        let text = layout.to_config();
+        assert!(!text.contains("rail"), "{text}");
+        let back = Layout::from_config(&text).expect("valid config");
+        assert!(!back.is_open(PanelKind::Tools));
+    }
+
+    /// The rail's column may be dragged narrower than any other, because that
+    /// is the whole of what a rail is — and dropping an ordinary module into it
+    /// raises the floor again, so a picker is never three buttons across.
+    #[test]
+    fn the_rails_column_may_be_narrower_than_a_modules() {
+        let mut layout = Layout::default();
+        assert!(PanelKind::Tools.min_width() < limits::SIDEBAR_MIN_WIDTH);
+
+        layout.set_width(Side::Left, 0, 10.0);
+        assert_eq!(layout.width(Side::Left, 0), PanelKind::Tools.min_width());
+
+        layout.set_edit_mode(true);
+        layout.begin_drag(
+            PanelKind::Colour,
+            pos2(1200.0, 200.0),
+            rect(1176.0, 180.0, 264.0, 340.0),
+        );
+        layout.end_drag(DropTarget::Dock {
+            side: Side::Left,
+            column: 0,
+            index: 1,
+        });
+        layout.set_width(Side::Left, 0, 0.0);
+        assert_eq!(layout.width(Side::Left, 0), limits::SIDEBAR_MIN_WIDTH);
     }
 
     /// The edit-mode remove control. Whatever else it does, a removed module
