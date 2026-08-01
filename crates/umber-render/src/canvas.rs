@@ -4,7 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{UVec2, Vec2};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{BrushMode, Camera, Color, Dab, PixelRect, TipMask};
 use wgpu::util::DeviceExt;
 
@@ -159,14 +159,26 @@ enum ProbeState {
     Mapping,
 }
 
+/// `map_async` has not called back yet.
+const PROBE_PENDING: u8 = 0;
+/// The buffer is mapped and holds a sample.
+const PROBE_MAPPED: u8 = 1;
+/// The map failed. Nothing to read, and nothing to unmap either.
+const PROBE_FAILED: u8 = 2;
+
 /// One slot in the smudge probe's rotation: a staging buffer and where it is
 /// up to.
 struct Probe {
     buffer: wgpu::Buffer,
     state: ProbeState,
-    /// Set by the map callback, which runs on whichever thread polls the
-    /// device — hence the atomic rather than a plain `bool`.
-    ready: Arc<AtomicBool>,
+    /// One of the `PROBE_*` constants, written by the map callback — which runs
+    /// on whichever thread polls the device, hence the atomic. Tri-state rather
+    /// than a flag because a *failed* map leaves the buffer unmapped, and
+    /// unmapping it anyway is as wrong as never returning the slot to service.
+    outcome: Arc<AtomicU8>,
+    /// The stroke this sample was taken for has ended, so whatever comes back
+    /// must be thrown away rather than smeared into the next stroke.
+    stale: bool,
 }
 
 /// Average a probe readback into one linear RGBA.
@@ -806,7 +818,8 @@ impl CanvasRenderer {
                         mapped_at_creation: false,
                     }),
                     state: ProbeState::Idle,
-                    ready: Arc::new(AtomicBool::new(false)),
+                    outcome: Arc::new(AtomicU8::new(PROBE_PENDING)),
+                    stale: false,
                 })
                 .collect(),
             dab_bind_group,
@@ -1489,6 +1502,9 @@ impl CanvasRenderer {
             doc_point,
             radius,
         } = *params;
+        // A slot disowned by the previous stroke can come back into service as
+        // soon as its map has settled, which is usually by now.
+        self.reclaim_stale();
         // By index rather than by reference: `composite` below needs `&self`,
         // and a live `&mut` into `self.probes` would still be outstanding.
         let Some(index) = self.probes.iter().position(|p| p.state == ProbeState::Idle) else {
@@ -1576,14 +1592,22 @@ impl CanvasRenderer {
                 continue;
             }
             slot.state = ProbeState::Mapping;
-            let done = slot.ready.clone();
+            slot.outcome.store(PROBE_PENDING, Ordering::Release);
+            let outcome = slot.outcome.clone();
             slot.buffer
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, move |result| {
-                    // On failure the slot simply never reports ready and is
-                    // recycled below; a smudge that misses a sample is a
-                    // cosmetic loss, not a reason to take the app down.
-                    done.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                    // A failed map is recorded rather than ignored: the slot
+                    // still has to go back into service, but unmapping a buffer
+                    // that was never mapped is itself an error. A smudge that
+                    // misses a sample is a cosmetic loss, not a reason to take
+                    // the app down.
+                    let code = if result.is_ok() {
+                        PROBE_MAPPED
+                    } else {
+                        PROBE_FAILED
+                    };
+                    outcome.store(code, Ordering::Release);
                 });
         }
     }
@@ -1597,39 +1621,78 @@ impl CanvasRenderer {
 
         let mut out = None;
         for slot in &mut self.probes {
-            if slot.state != ProbeState::Mapping
-                || !slot.ready.swap(false, std::sync::atomic::Ordering::Acquire)
-            {
+            if slot.state != ProbeState::Mapping {
                 continue;
             }
-            {
-                let mapped = slot.buffer.slice(..).get_mapped_range();
-                out = Some(average_probe(&mapped));
+            match slot.outcome.load(Ordering::Acquire) {
+                PROBE_MAPPED => {
+                    // A sample belonging to a stroke that has already ended is
+                    // read back and thrown away: the buffer still has to be
+                    // unmapped before the slot can be used again.
+                    if !slot.stale {
+                        let mapped = slot.buffer.slice(..).get_mapped_range();
+                        out = Some(average_probe(&mapped));
+                    }
+                    slot.buffer.unmap();
+                }
+                PROBE_FAILED => {}
+                // Still in flight. Leaving it alone is the whole point — see
+                // `reset_probes`.
+                _ => continue,
             }
-            slot.buffer.unmap();
+            slot.outcome.store(PROBE_PENDING, Ordering::Release);
+            slot.stale = false;
             slot.state = ProbeState::Idle;
         }
         out
     }
 
-    /// Return every probe slot to service, discarding anything in flight.
+    /// Disown every probe in flight, so no sample of the stroke that is ending
+    /// can reach the next one.
     ///
-    /// Called when a stroke ends: a sample of the *previous* stroke arriving
-    /// during the next one would smear a colour picked up somewhere else.
+    /// Note what this does *not* do: return a slot whose `map_async` is still
+    /// outstanding to service. Doing that was a real crash. `probe_canvas`
+    /// would hand the next stroke that slot, record a copy into it, and
+    /// `queue.submit` refuses any submission touching a buffer that is mapped
+    /// or awaiting a map — which is a validation error, and a validation error
+    /// aborts the process. It is also the ordinary case rather than a rare one:
+    /// a map only completes on a poll, so a stroke that ends between frames
+    /// almost always leaves one behind.
+    ///
+    /// So the slot stays where it is and is merely marked stale;
+    /// [`Self::take_probe`] unmaps it and returns it to service once the GPU is
+    /// done with it.
     pub fn reset_probes(&mut self) {
         for slot in &mut self.probes {
-            if slot.state == ProbeState::Mapping
-                && slot.ready.swap(false, std::sync::atomic::Ordering::Acquire)
-            {
-                slot.buffer.unmap();
+            // `Rendering` means a copy is recorded but `map_async` has not been
+            // called yet; the next `submit_probes` maps it and `take_probe`
+            // then discards it, for the same reason.
+            if slot.state != ProbeState::Idle {
+                slot.stale = true;
             }
-            // A slot still `Rendering` has a copy recorded against it that may
-            // not have been submitted. Leaving it there is safe: it is never
-            // mapped, and the next `submit_probes` will map and then collect it
-            // into a stroke that has already been told to ignore stale samples.
-            if slot.state != ProbeState::Rendering {
-                slot.state = ProbeState::Idle;
+        }
+        self.reclaim_stale();
+    }
+
+    /// Free any disowned slot whose map has already settled.
+    ///
+    /// Without this a stale slot would wait on [`Self::take_probe`], which
+    /// `app.rs` only calls while a *smudging* stroke is live. Ending a smudge
+    /// and then picking an ordinary brush would leave both slots parked for the
+    /// rest of the session, and the next blender would never sample anything.
+    fn reclaim_stale(&mut self) {
+        for slot in &mut self.probes {
+            if slot.state != ProbeState::Mapping || !slot.stale {
+                continue;
             }
+            match slot.outcome.load(Ordering::Acquire) {
+                PROBE_MAPPED => slot.buffer.unmap(),
+                PROBE_FAILED => {}
+                _ => continue,
+            }
+            slot.outcome.store(PROBE_PENDING, Ordering::Release);
+            slot.stale = false;
+            slot.state = ProbeState::Idle;
         }
     }
 
@@ -1645,6 +1708,19 @@ impl CanvasRenderer {
         rect: PixelRect,
     ) -> Vec<u8> {
         let unpadded = rect.width * 4;
+        // A copy naming a slice the array does not have is a validation error,
+        // and a validation error aborts the process. It should not happen —
+        // `ensure_slots` runs before a layer is ever painted — but "should not"
+        // is not a reason to make it fatal, and the resume path rebuilds
+        // storage from scratch with the stack already deep. An all-zero patch
+        // is the same thing an untouched layer would have read back.
+        if slot >= self.layers.capacity {
+            log::error!(
+                "read from slot {slot} beyond capacity {}",
+                self.layers.capacity
+            );
+            return vec![0; (unpadded as u64 * rect.height as u64) as usize];
+        }
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = unpadded.div_ceil(align) * align;
 
@@ -1704,6 +1780,26 @@ impl CanvasRenderer {
     /// Write a previously captured rectangle back into one layer.
     pub fn write_layer_rect(&self, queue: &wgpu::Queue, slot: u32, rect: PixelRect, bytes: &[u8]) {
         debug_assert_eq!(bytes.len() as u64, rect.area() * 4);
+        // As in `read_layer_rect`: refuse rather than abort. See there.
+        if slot >= self.layers.capacity {
+            log::error!(
+                "write to slot {slot} beyond capacity {}",
+                self.layers.capacity
+            );
+            return;
+        }
+        // The importers promise canvas-sized pixels and the undo stack promises
+        // rect-sized ones, but both come from files, and a short buffer here is
+        // a validation error rather than a wrong picture.
+        if (bytes.len() as u64) < rect.area() * 4 {
+            log::error!(
+                "layer write has {} bytes for a {}x{} rect",
+                bytes.len(),
+                rect.width,
+                rect.height
+            );
+            return;
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.layers.texture,

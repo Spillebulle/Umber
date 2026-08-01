@@ -16,7 +16,7 @@ use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -48,11 +48,17 @@ impl Graphics {
     /// Built from an existing renderer where there is one: pipelines and
     /// shaders are shared, so this is a few textures rather than three shader
     /// compilations on the frame the user opened a document.
-    fn add_canvas(&mut self, id: DocId, size: UVec2) {
-        let canvas = match self.canvases.values().next() {
+    /// `slots` is the document's slot high-water mark, not its layer count —
+    /// see [`umber_core::LayerStack::slot_capacity_needed`]. A renderer starts
+    /// with room for a handful of slices, and a document that already has more
+    /// layers than that would otherwise hand the commit and undo paths a slice
+    /// index the texture array does not have.
+    fn add_canvas(&mut self, id: DocId, size: UVec2, slots: u32) {
+        let mut canvas = match self.canvases.values().next() {
             Some(existing) => existing.for_document(&self.gpu.device, size),
             None => CanvasRenderer::new(&self.gpu.device, size, self.config.format),
         };
+        canvas.ensure_slots(&self.gpu.device, &self.gpu.queue, slots);
 
         // Fresh textures hold whatever the allocation contained.
         let mut enc = self
@@ -78,6 +84,13 @@ pub struct UmberApp {
     /// an actual change.
     applied_theme: Option<ThemeKind>,
     bindings: Vec<shortcuts::Binding>,
+    /// When egui next wants to be redrawn, if it does — a fading hover, a
+    /// blinking caret. `None` means "sleep until something happens".
+    ///
+    /// Kept here rather than acted on inside [`Self::render`] because setting
+    /// the control flow needs the [`ActiveEventLoop`], which only the handler
+    /// methods are given.
+    repaint_at: Option<std::time::Instant>,
 }
 
 impl Default for UmberApp {
@@ -89,18 +102,12 @@ impl Default for UmberApp {
             last_frame: None,
             applied_theme: None,
             bindings: shortcuts::defaults(),
+            repaint_at: None,
         }
     }
 }
 
 impl UmberApp {
-    fn viewport(&self) -> Vec2 {
-        match &self.gfx {
-            Some(g) => Vec2::new(g.config.width as f32, g.config.height as f32),
-            None => Vec2::ONE,
-        }
-    }
-
     /// Finish the current stroke: capture undo state, bake it into the layer.
     ///
     /// The layer is untouched until this point, so reading it here captures
@@ -418,7 +425,12 @@ impl UmberApp {
 
     /// Two-finger pinch: pan by the midpoint delta, zoom by the spread ratio.
     fn update_pinch(&mut self) {
-        let viewport = self.viewport();
+        // The pivot, not the viewport size. `zoom_at` keeps the document point
+        // under the anchor pinned, and it can only do that against the same
+        // pivot the composite pass is given — the centre of the canvas region.
+        // Handing it the window size instead made a pinch drag the canvas away
+        // from the fingers doing it.
+        let pivot = self.editor.canvas_pivot;
         let pts: Vec<Vec2> = self.editor.touches.values().copied().collect();
         if pts.len() != 2 {
             self.editor.pinch = None;
@@ -431,7 +443,7 @@ impl UmberApp {
             self.editor.camera.pan_by_screen(mid - prev_mid);
             if prev_dist > 1.0 && dist > 1.0 {
                 let factor = dist / prev_dist;
-                self.editor.camera.zoom_at(mid, factor, viewport);
+                self.editor.camera.zoom_at(mid, factor, pivot);
             }
         }
         self.editor.pinch = Some((dist, mid));
@@ -474,10 +486,31 @@ impl UmberApp {
             textures_delta,
             shapes,
             pixels_per_point,
-            ..
+            viewport_output,
         } = full_output;
         gfx.egui_state
             .handle_platform_output(&gfx.window, platform_output);
+
+        // What egui itself wants next, which is the *only* thing that should
+        // schedule a frame with no input behind it.
+        //
+        // This used to be missing, and `window_event` used to request a redraw
+        // whenever egui-winit set `repaint`. egui-winit sets it for
+        // `RedrawRequested` — so painting a frame asked for another one, for
+        // ever. `ControlFlow::Wait` never got to wait: the app burned a fifth
+        // of a core sitting still, vsync being the only thing holding it back.
+        self.repaint_at = viewport_output
+            .get(&gfx.egui_ctx.viewport_id())
+            .and_then(|out| {
+                if out.repaint_delay.is_zero() {
+                    gfx.window.request_redraw();
+                    None
+                } else {
+                    // `Duration::MAX` is egui's "nothing pending"; anything
+                    // shorter is an animation asking to be continued.
+                    std::time::Instant::now().checked_add(out.repaint_delay)
+                }
+            });
 
         // egui works in points; the canvas works in physical pixels.
         self.editor.pixels_per_point = pixels_per_point;
@@ -490,24 +523,58 @@ impl UmberApp {
             canvas_rect.height() * pixels_per_point,
         );
 
-        let surface_texture = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
+        // Tessellation and egui's texture uploads happen *before* the surface
+        // is acquired, because every path below this can decide not to draw the
+        // frame — a resize, a minimise, a lost swapchain.
+        //
+        // A skipped frame used to drop `textures_delta` on the floor. egui
+        // sends a whole image when the font atlas is created and only the new
+        // region as glyphs are added to it, so losing the first delta leaves
+        // egui-wgpu with a partial update for a texture it never allocated —
+        // which it meets with `.expect("Tried to update a texture that has not
+        // been allocated yet.")`. Resizing the window while a new glyph is
+        // rasterised was enough.
+        let paint_jobs = gfx.egui_ctx.tessellate(shapes, pixels_per_point);
+        for (id, delta) in &textures_delta.set {
+            gfx.egui_renderer
+                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
+        }
+
+        let acquired = match gfx.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
             // Suboptimal still gives a usable texture; reconfiguring is a
             // next-frame concern, so draw this one rather than dropping it.
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                 gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                t
+                Some(t)
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                return;
+                None
             }
             // Minimised or hidden — skip the frame entirely.
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => return,
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => None,
             other => {
                 log::warn!("could not acquire surface texture: {other:?}");
-                return;
+                None
             }
+        };
+
+        // The renderer of the document in front. Every other open document has
+        // one of its own, holding its pixels, untouched until it is switched to.
+        let has_canvas = gfx.canvases.contains_key(&self.editor.session.active_id());
+        if !has_canvas {
+            log::error!("the active document has no canvas renderer");
+        }
+
+        let Some(surface_texture) = acquired.filter(|_| has_canvas) else {
+            // Frees are applied even though nothing was drawn: they name
+            // textures egui has finished with, which the jobs just discarded
+            // above cannot reference.
+            for id in &textures_delta.free {
+                gfx.egui_renderer.free_texture(id);
+            }
+            return;
         };
         let view = surface_texture
             .texture
@@ -521,10 +588,10 @@ impl UmberApp {
             });
 
         // --- canvas ---
-        // The renderer of the document in front. Every other open document has
-        // one of its own, holding its pixels, untouched until it is switched to.
+        // Presence was established above, before the surface was acquired, so
+        // that a missing renderer is not a frame abandoned with a swapchain
+        // image in hand.
         let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id()) else {
-            log::error!("the active document has no canvas renderer");
             return;
         };
         canvas.begin_frame();
@@ -579,15 +646,11 @@ impl UmberApp {
         );
 
         // --- egui on top ---
-        let paint_jobs = gfx.egui_ctx.tessellate(shapes, pixels_per_point);
+        // Tessellated and uploaded above, before the surface was acquired.
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gfx.config.width, gfx.config.height],
             pixels_per_point,
         };
-        for (id, delta) in &textures_delta.set {
-            gfx.egui_renderer
-                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
-        }
         gfx.egui_renderer.update_buffers(
             &gfx.gpu.device,
             &gfx.gpu.queue,
@@ -706,8 +769,9 @@ impl UmberApp {
         self.finish_stroke();
         let id = self.editor.new_document();
         let size = self.editor.doc.size;
+        let slots = self.editor.layers.slot_capacity_needed();
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.add_canvas(id, size);
+            gfx.add_canvas(id, size, slots);
         }
         self.request_redraw();
     }
@@ -801,9 +865,8 @@ impl UmberApp {
         );
 
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.add_canvas(id, size);
+            gfx.add_canvas(id, size, slots);
             if let Some(canvas) = gfx.canvases.get_mut(&id) {
-                canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, slots);
                 for upload in &uploads {
                     canvas.write_layer_rect(
                         &gfx.gpu.queue,
@@ -906,10 +969,19 @@ impl ApplicationHandler for UmberApp {
         splash.show(splash::Stage::Shaders);
         // Compiled once here; every further document clones the pipeline
         // handles out of this one. See `Graphics::add_canvas`.
-        let canvas = CanvasRenderer::new(
+        let mut canvas = CanvasRenderer::new(
             &gpu.device,
             UVec2::new(self.editor.doc.size.x, self.editor.doc.size.y),
             config.format,
+        );
+        // At start-up this is one layer and does nothing. It matters on the
+        // Android path, where `resumed` runs again with a session already open:
+        // the live document can have any number of layers, and its slots have
+        // to exist before the first stroke commits into one.
+        canvas.ensure_slots(
+            &gpu.device,
+            &gpu.queue,
+            self.editor.layers.slot_capacity_needed(),
         );
 
         // Start blank rather than showing whatever the allocation held.
@@ -982,12 +1054,18 @@ impl ApplicationHandler for UmberApp {
             );
         }
         if let Some(gfx) = self.gfx.as_mut() {
-            for (id, size) in documents {
+            for (id, size, slots) in documents {
                 if id != active {
-                    gfx.add_canvas(id, size);
+                    gfx.add_canvas(id, size, slots);
                 }
             }
         }
+
+        // Ask for the first frame explicitly. The platform usually sends one
+        // unprompted as the window is shown, but "usually" is not a thing to
+        // rest a blank window on — and nothing else here would ever wake the
+        // loop, now that painting a frame no longer asks for another.
+        self.request_redraw();
 
         // Split, because the two halves have very different characters and only
         // one of them is ours to improve: window creation is fast and constant,
@@ -1001,6 +1079,28 @@ impl ApplicationHandler for UmberApp {
         );
     }
 
+    /// Decide how long to sleep for.
+    ///
+    /// [`ControlFlow::Wait`] unless egui asked for a frame at a particular
+    /// time — a hover fading, a caret blinking. Without this the only thing
+    /// keeping those animations moving would be a redraw loop that never idles,
+    /// which is what this replaced.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.repaint_at {
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        // The deadline set above has come round: egui wants the frame it asked
+        // for. Nothing else wakes the loop on a timer.
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            self.repaint_at = None;
+            self.request_redraw();
+        }
+    }
+
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Drop the surface but keep editor state; Android tears the window
         // down when backgrounded.
@@ -1011,7 +1111,11 @@ impl ApplicationHandler for UmberApp {
         let Some(gfx) = self.gfx.as_mut() else { return };
 
         let response = gfx.egui_state.on_window_event(&gfx.window, &event);
-        if response.repaint {
+        // egui-winit reports `repaint` for `RedrawRequested` itself, which is a
+        // tautology: acting on it means every painted frame asks for the next
+        // one, and `ControlFlow::Wait` never gets to wait. What egui genuinely
+        // wants next is read from its `viewport_output` in `render`.
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             gfx.window.request_redraw();
         }
         // Who owns the pointer, in three parts.

@@ -949,6 +949,105 @@ fn the_probe_reports_bare_canvas_as_nothing_to_pick_up() {
     assert_eq!(sample[3], 0.0, "empty canvas should report no coverage");
 }
 
+/// Ending a stroke must not put a probe buffer back into service while the GPU
+/// still owns it.
+///
+/// `reset_probes` used to mark every slot idle, including ones whose
+/// `map_async` had not called back — and a map only completes on a poll, so a
+/// stroke ending between frames leaves one behind almost every time. The next
+/// stroke was then handed that slot, recorded a copy into it, and `submit`
+/// refuses any submission touching a buffer that is mapped or awaiting a map.
+/// A validation error aborts the process, so this was "smudge, lift the pen,
+/// smudge again" and the app was gone.
+#[test]
+fn a_probe_still_in_flight_is_not_reused_by_the_next_stroke() {
+    let mut h = harness_or_skip!();
+    h.fill(0, Color::from_srgb_u8(200, 20, 20, 255));
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+
+    // Fill the rotation and deliberately never poll, so every map is still
+    // outstanding — the state a stroke ends in.
+    for _ in 0..4 {
+        let mut enc = h.encoder();
+        record_probe(&mut h, &stack, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.submit_probes();
+    }
+    h.canvas.reset_probes();
+
+    let scope = h.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut enc = h.encoder();
+    record_probe(&mut h, &stack, &mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    let error = pollster::block_on(scope.pop());
+    assert!(
+        error.is_none(),
+        "the next stroke reused a buffer the GPU still owns: {error:?}"
+    );
+
+    // And the rotation must come back: disowning a slot cannot mean losing it,
+    // or the second blender of a session would never sample anything.
+    let sample = probe_until_ready(&mut h, &stack, Vec2::new(32.0, 32.0), 6.0);
+    assert!(
+        sample[3] > 0.9,
+        "probes stopped working after a reset: {sample:?}"
+    );
+}
+
+/// Record one probe into `enc`, with the parameters the other probe tests use.
+fn record_probe(h: &mut Harness, stack: &[LayerDraw], enc: &mut wgpu::CommandEncoder) {
+    h.canvas.probe_canvas(
+        &h.gpu.device,
+        &h.gpu.queue,
+        enc,
+        &ProbeParams {
+            layers: stack,
+            active_index: 0,
+            stroke: StrokeStyle {
+                opacity: 0.0,
+                ..Default::default()
+            },
+            doc_point: Vec2::new(32.0, 32.0),
+            radius: 6.0,
+        },
+    );
+}
+
+/// A slot the texture array does not have must be refused, not passed to wgpu.
+///
+/// It should not arise — `ensure_slots` runs before a layer is painted — but a
+/// copy naming a missing slice is a validation error, and a validation error
+/// takes the process down. The resume path rebuilds storage from scratch with
+/// the stack already deep, which is close enough to this to be worth a guard.
+#[test]
+fn a_layer_copy_beyond_the_array_is_refused_rather_than_fatal() {
+    let h = harness_or_skip!();
+    let beyond = h.canvas.slot_capacity();
+    let rect = PixelRect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+
+    let scope = h.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let bytes = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, beyond, rect);
+    h.canvas
+        .write_layer_rect(&h.gpu.queue, beyond, rect, &bytes);
+    let error = pollster::block_on(scope.pop());
+    assert!(
+        error.is_none(),
+        "wgpu was handed a missing slice: {error:?}"
+    );
+
+    // The size has to be right whatever else happens: `PixelPatch` asserts the
+    // byte count matches the rect, and the undo stack is built out of these.
+    assert_eq!(bytes.len(), (rect.width * rect.height * 4) as usize);
+    assert!(bytes.iter().all(|b| *b == 0), "a missing slice reads blank");
+}
+
 /// Every offscreen pass must work when the *window* is a different format.
 ///
 /// This is the shape of a real crash. A render pipeline is compiled against its

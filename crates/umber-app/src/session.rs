@@ -94,10 +94,19 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Canvas size, for the tab's tooltip and for sizing GPU storage. `None`
-    /// for the active tab, whose document the caller already has.
+    /// Canvas size, for the tab's tooltip. `None` for the active tab, whose
+    /// document the caller already has.
     pub fn parked_size(&self) -> Option<UVec2> {
         self.parked.as_ref().map(|s| s.doc.size)
+    }
+
+    /// Everything needed to rebuild this document's GPU storage: canvas size
+    /// and how many texture-array slices its layers occupy. `None` for the
+    /// active tab, as [`Tab::parked_size`].
+    pub fn parked_storage(&self) -> Option<(UVec2, u32)> {
+        self.parked
+            .as_ref()
+            .map(|s| (s.doc.size, s.layers.slot_capacity_needed()))
     }
 }
 
@@ -306,6 +315,37 @@ mod tests {
             session.tabs()[0].parked_size().map(|s| s.x),
             Some(8),
             "the document that was live should now be parked in tab 0",
+        );
+    }
+
+    #[test]
+    fn a_parked_document_reports_the_slots_its_layers_occupy() {
+        // The resume path rebuilds every document's GPU storage from this, and
+        // a renderer starts with room for only a handful of slices. Reporting
+        // the size alone left a deep stack pointing at slices the texture array
+        // did not have — which the commit and undo paths would have handed
+        // straight to wgpu.
+        let mut deep = state(8);
+        for _ in 0..6 {
+            deep.layers.add().expect("under the layer cap");
+        }
+        let wanted = deep.layers.slot_capacity_needed();
+        assert!(
+            wanted > 4,
+            "the test needs more layers than a fresh renderer"
+        );
+
+        let mut session = Session::default();
+        session.open("second".into(), None, deep);
+
+        assert_eq!(
+            session.tabs()[0].parked_storage(),
+            Some((UVec2::splat(8), wanted)),
+        );
+        assert_eq!(
+            session.active_tab().parked_storage(),
+            None,
+            "the live document's storage is the caller's own",
         );
     }
 
