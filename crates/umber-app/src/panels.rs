@@ -14,7 +14,7 @@
 
 use crate::brushlib;
 use crate::colorpicker::{self, PickerMode};
-use crate::dock::{DropTarget, Floating, Geometry, HEADER, PanelKind, Side, limits};
+use crate::dock::{DropTarget, Floating, Geometry, PanelKind, Side, limits};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
@@ -62,6 +62,11 @@ pub fn sidebars(
         panel
             .exact_size(rect.width())
             .frame(frame)
+            // `width_splitter` draws this edge itself, and lights it up in the
+            // accent while it is being dragged. egui's separator lands on the
+            // same pixel and is painted afterwards, so leaving it on put a dim
+            // rule over the highlight and the resize affordance never showed.
+            .show_separator_line(false)
             .show(root, |ui| sidebar(ui, p, ed, actions, side, geo));
     }
 
@@ -308,7 +313,16 @@ fn panel(
     let mut events = PanelEvents::default();
     let pad = f32::from(metrics::PANEL_PAD);
 
-    let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER + 8.0));
+    // `Layout::geometry` gives a sidebar no width at all rather than let the two
+    // of them eat a narrow window's canvas, and the header's own controls are
+    // laid out from `rect.center().x` to `rect.right() - pad` — which on a rect
+    // this narrow is a rectangle with its right edge left of its left one.
+    // Nothing useful can be drawn in it either way.
+    if rect.width() < pad * 2.0 + 8.0 {
+        return events;
+    }
+
+    let header = Rect::from_min_size(rect.min, vec2(rect.width(), metrics::PANEL_HEADER));
 
     // The whole header is the drag handle — but only in edit mode, as the
     // design has it. Outside it the header is inert, so reaching for a slider
@@ -548,7 +562,7 @@ pub fn drag_overlay(root: &mut Ui, p: &Palette, ed: &mut Editor, geo: &Geometry)
     // egui reasonably objects to.
     let tab = Rect::from_min_size(
         drag.pointer - drag.grab,
-        vec2(drag.float_size.x, HEADER + 8.0),
+        vec2(drag.float_size.x, metrics::PANEL_HEADER),
     );
     painter.rect_filled(tab, metrics::RADIUS_LARGE, p.popover);
     painter.rect_stroke(
@@ -636,8 +650,16 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     ui.add_space(4.0);
 
     // Blend and opacity for the selected layer, on one row.
+    //
+    // Both change the picture, so both have to mark the document modified —
+    // otherwise the close prompt, which asks only about modified documents,
+    // would let a tab holding a carefully set stack of opacities close without
+    // a word. Collected and applied below the borrow rather than inside it,
+    // since `mark_modified` also wants `ed`.
+    let mut changed = false;
     ui.horizontal(|ui| {
         let layer = ed.layers.active_mut();
+        let before = (layer.blend, layer.opacity);
         egui::ComboBox::from_id_salt("layer-blend")
             .selected_text(
                 egui::RichText::new(layer.blend.label())
@@ -652,6 +674,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             });
         let value = layer.opacity;
         widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
+        changed = before != (layer.blend, layer.opacity);
         ui.label(
             egui::RichText::new(format!("{:.0}", value * 100.0))
                 .monospace()
@@ -673,6 +696,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             ui,
             p,
             &layer.name,
+            layer.slot(),
             layer.visible,
             index == active,
             layer.blend.label(),
@@ -687,9 +711,13 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         && let Some(layer) = ed.layers.get_mut(index)
     {
         layer.visible = !layer.visible;
+        changed = true;
     }
     if let Some(index) = select {
         ed.layers.set_active(index);
+    }
+    if changed {
+        ed.mark_modified();
     }
 }
 
@@ -807,7 +835,7 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         ..Default::default()
     };
     egui::Panel::top("layout-edit-bar")
-        .exact_size(HEADER + 8.0)
+        .exact_size(metrics::EDIT_BAR)
         .frame(frame)
         .show(root, |ui| {
             ui.horizontal_centered(|ui| {

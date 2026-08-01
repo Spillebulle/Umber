@@ -21,10 +21,11 @@
 //! - **State lives in egui's temporary store**, keyed by an `Id`, exactly the
 //!   way `settings.rs` keeps what its shortcut table is in the middle of. It is
 //!   the interaction state of a dialog, not state of the document.
-//! - **Key dispatch happens at the winit level, before egui sees a keystroke.**
-//!   Every text field here therefore has to suspend it, or typing "brush" into
-//!   the search box selects the brush, then the eraser, on the way past. See
-//!   [`suspend_shortcuts`].
+//! - **Key dispatch happens at the winit level, before egui sees a keystroke**,
+//!   so typing "brush" into the search box would otherwise select the brush,
+//!   then the eraser, on the way past. Nothing here has to do anything about
+//!   it: `ui::draw` suspends dispatch for whatever field holds the keyboard,
+//!   for the whole interface at once. See [`crate::shortcuts::set_typing`].
 //! - **[`resync`] carries the bitmap tips across too.** `BrushPreset::tip` is
 //!   the *name* of a mask in the user's library, and the drawing path has no
 //!   business reaching into a library; `Editor::tips` is where
@@ -40,7 +41,6 @@
 use crate::controls;
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
-use crate::shortcuts;
 use crate::theme::{Palette, metrics, text};
 use crate::ui::icon_button;
 use crate::widgets::{self, BrushRow};
@@ -155,9 +155,6 @@ struct State {
     /// brush cannot be undone — the history covers painting only — so it asks.
     confirming: Option<String>,
     notice: Option<Notice>,
-    /// Whether *this* module is the one currently holding key dispatch down.
-    /// Tracked so the lever is only ever pulled on a change.
-    suspending: bool,
 }
 
 impl State {
@@ -233,7 +230,6 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         renaming: None,
         confirming: None,
         notice,
-        suspending: false,
     }
 }
 
@@ -454,24 +450,6 @@ fn write<T>(
             state.notice = Some(Notice::bad(e.to_string()));
             None
         }
-    }
-}
-
-/// Suspend key dispatch while a field here has the keyboard.
-///
-/// `app.rs` reads keys straight off the winit event, before egui is asked, so
-/// without this a name typed into any of these fields also drives the tool
-/// shortcuts — "brush" would select the brush, then the eraser, and a couple
-/// more on the way to the end of the word. `shortcuts::set_capturing` is the
-/// same lever the settings dialog's capture field pulls.
-///
-/// Pulled only on a *change*, and never at all while the settings dialog is
-/// open, so the two can never take it off one another.
-fn suspend_shortcuts(state: &mut State, ctx: &egui::Context, settings_open: bool) {
-    let wanted = !settings_open && ctx.egui_wants_keyboard_input();
-    if state.suspending != wanted {
-        state.suspending = wanted;
-        shortcuts::set_capturing(wanted);
     }
 }
 
@@ -1210,7 +1188,6 @@ fn file_label(path: &Path) -> String {
 pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(root.ctx(), ed);
     browser(root, p, ed, &mut state);
-    suspend_shortcuts(&mut state, root.ctx(), ed.ui.settings_open);
     store(root.ctx(), state);
 }
 

@@ -2,7 +2,9 @@
 //!
 //! The design puts a 30 px strip of tabs between the menu bar and the tool
 //! options: one tab per open document, a dot on the ones with unsaved work, and
-//! a `+` at the end. That is what [`strip`] paints.
+//! a `+` at the end. That is what [`strip`] paints, with [`tab_layout`] deciding
+//! how the room is divided — the design draws two documents in a 1440 px window
+//! and says nothing about what a dozen in a narrow one should do.
 //!
 //! The dialogs are here rather than in `ui.rs` because they are about
 //! documents, not about the workspace: [`close_prompt`], which is the last
@@ -16,19 +18,75 @@ use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 
-/// Height of the tab strip.
-///
-/// A design metric, and it belongs in `theme::metrics` beside `MENU_BAR` and
-/// `OPTIONS_STRIP`. It sits here only because that file is being changed by
-/// another piece of work in flight.
-pub const STRIP: f32 = 30.0;
-
-/// Height of a tab within the strip. They sit on the bottom border, as the
-/// design has them, so the active one runs into the strip below.
-const TAB: f32 = 24.0;
-
 /// Diameter of the modified dot, which the close mark replaces on hover.
 const MARK: f32 = 14.0;
+
+/// Padding either side of a tab's label.
+const TAB_PAD: f32 = 12.0;
+
+/// Gap between tabs.
+const TAB_GAP: f32 = 2.0;
+
+/// Narrowest a tab is allowed to get before the strip stops shrinking them.
+///
+/// Below this there is no room for even an ellipsis beside the dot, and a row of
+/// identical stubs is no more useful than a row that runs off the edge.
+const TAB_MIN: f32 = 64.0;
+
+/// Which tabs the strip can show, and how wide to draw each of them.
+///
+/// Returns the index of the first tab drawn and a width per tab from there on.
+///
+/// Tabs are placed by hand rather than by a layout, so nothing stops them
+/// running past the right edge — and when they did, the `+` went with them and
+/// there was no way to open a document from the strip at all. So the `+` and the
+/// outer padding come off the top, and this divides what is left.
+///
+/// Three rules, in order:
+///
+/// * While they all fit, tabs keep their natural width. A strip whose tabs
+///   resize every time a document is opened is unsettling to read.
+/// * Past that they share equally, down to [`TAB_MIN`] — but never wider than a
+///   tab actually wants, so shrinking the long names does not stretch the short
+///   ones to meet them.
+/// * Past *that* some cannot be drawn at all, and the run shown is slid along to
+///   keep the active document in it. Dropping the tail unconditionally would put
+///   the document you are looking at off the end of its own tab strip, with no
+///   other way to reach it.
+fn tab_layout(natural: &[f32], room: f32, active: usize) -> (usize, Vec<f32>) {
+    if natural.is_empty() {
+        return (0, Vec::new());
+    }
+    let gaps = TAB_GAP * natural.len() as f32;
+    if natural.iter().sum::<f32>() + gaps <= room {
+        return (0, natural.to_vec());
+    }
+
+    let share = ((room - gaps) / natural.len() as f32).max(TAB_MIN);
+    let squeezed: Vec<f32> = natural.iter().map(|w| w.min(share)).collect();
+
+    // How many fit, starting from `first`.
+    let run = |first: usize| {
+        let mut used = 0.0;
+        let mut n = 0usize;
+        for w in &squeezed[first..] {
+            if used + w + TAB_GAP > room {
+                break;
+            }
+            used += w + TAB_GAP;
+            n += 1;
+        }
+        n
+    };
+
+    // Slide the window along so the active tab is the last one in it, then
+    // re-measure — the run from there may hold a different number, since the
+    // tabs are not all the same width.
+    let fits = run(0);
+    let first = active.saturating_sub(fits.saturating_sub(1));
+    let count = run(first).min(natural.len() - first);
+    (first, squeezed[first..first + count].to_vec())
+}
 
 /// What the strip was asked to do this frame.
 #[derive(Default, Clone, Copy)]
@@ -64,18 +122,51 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
 
     let active = ed.session.active_index();
     let closable = ed.session.len() > 1;
+    let font = FontId::proportional(text::SMALL);
+
+    // The `+` is placed first, at a fixed distance from the right edge, so it
+    // stays reachable however many documents are open. The tabs then divide
+    // what is left of the strip.
+    let plus = Rect::from_min_size(
+        pos2(
+            full.right() - 8.0 - metrics::TAB,
+            full.bottom() - metrics::TAB,
+        ),
+        vec2(metrics::TAB, metrics::TAB),
+    );
+    let natural: Vec<f32> = ed
+        .session
+        .tabs()
+        .iter()
+        .map(|tab| {
+            let label_w = ui
+                .painter()
+                .layout_no_wrap(tab.title.clone(), font.clone(), p.text)
+                .size()
+                .x;
+            label_w + MARK + TAB_PAD * 2.0 + 8.0
+        })
+        .collect();
+    let (first, widths) = tab_layout(&natural, plus.left() - 4.0 - (full.left() + 8.0), active);
+    let hidden = natural.len() - widths.len();
+
     let mut x = full.left() + 8.0;
 
-    for (index, tab) in ed.session.tabs().iter().enumerate() {
-        let font = FontId::proportional(text::SMALL);
-        let label_w = ui
-            .painter()
-            .layout_no_wrap(tab.title.clone(), font.clone(), p.text)
-            .size()
-            .x;
-        let width = label_w + MARK + 12.0 * 2.0 + 8.0;
-        let rect = Rect::from_min_size(pos2(x, full.bottom() - TAB), vec2(width, TAB));
-        x += width + 2.0;
+    for (offset, tab) in ed
+        .session
+        .tabs()
+        .iter()
+        .skip(first)
+        .take(widths.len())
+        .enumerate()
+    {
+        let index = first + offset;
+        let width = widths[offset];
+        let rect = Rect::from_min_size(
+            pos2(x, full.bottom() - metrics::TAB),
+            vec2(width, metrics::TAB),
+        );
+        x += width + TAB_GAP;
 
         let response = ui.interact(rect, ui.id().with(("doc-tab", index)), Sense::click());
         let is_active = index == active;
@@ -103,11 +194,14 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
         } else {
             p.text_dim
         };
+        // The mark's place is reserved whether or not it is drawn, so a name
+        // that has been squeezed ends in an ellipsis rather than under the dot.
+        let room = rect.width() - TAB_PAD * 2.0 - MARK;
         painter.text(
-            pos2(rect.left() + 12.0, rect.center().y),
+            pos2(rect.left() + TAB_PAD, rect.center().y),
             Align2::LEFT_CENTER,
-            &tab.title,
-            font,
+            crate::widgets::elide(painter, &tab.title, text::SMALL, room),
+            font.clone(),
             ink,
         );
 
@@ -115,7 +209,7 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
         // Hovering turns it into the close mark, so the tab needs no extra
         // width for a control that is only wanted momentarily.
         let mark = Rect::from_center_size(
-            pos2(rect.right() - 12.0 - MARK * 0.5, rect.center().y),
+            pos2(rect.right() - TAB_PAD - MARK * 0.5, rect.center().y),
             vec2(MARK, MARK),
         );
         let over_mark = response
@@ -162,8 +256,8 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
         response.on_hover_text(tip);
     }
 
-    // The design's `+`, drawn rather than typed: Archivo has no such glyph.
-    let plus = Rect::from_min_size(pos2(x + 4.0, full.bottom() - TAB), vec2(TAB, TAB));
+    // The design's `+`, drawn rather than typed: Archivo has no such glyph. It
+    // keeps its place at the right whatever the tabs did.
     let response = ui.interact(plus, ui.id().with("doc-tab-new"), Sense::click());
     icons::draw(
         ui.painter(),
@@ -177,6 +271,33 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
     );
     if response.on_hover_text("New document").clicked() {
         actions.new_document = true;
+    }
+
+    // Documents the strip could not fit. Saying how many beats letting them
+    // disappear, since there is no other sign that a tab is open — and the
+    // File menu can still reach the one you want.
+    if hidden > 0 {
+        let label = format!("+{hidden}");
+        let overflow = Rect::from_min_max(
+            pos2(x, full.bottom() - metrics::TAB),
+            pos2(plus.left() - 4.0, full.bottom()),
+        );
+        if overflow.width() > 4.0 {
+            ui.painter().text(
+                overflow.right_center(),
+                Align2::RIGHT_CENTER,
+                &label,
+                FontId::proportional(text::TINY),
+                p.text_dim,
+            );
+            ui.interact(overflow, ui.id().with("doc-tab-overflow"), Sense::hover())
+                .on_hover_text(format!(
+                    "{hidden} more document{} open — the window is too narrow to \
+                     show {}. File, Close document makes room.",
+                    if hidden == 1 { "" } else { "s" },
+                    if hidden == 1 { "it" } else { "them" },
+                ));
+        }
     }
 
     actions
@@ -392,6 +513,71 @@ fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Total width the strip would need to draw `widths`.
+    fn spans(widths: &[f32]) -> f32 {
+        widths.iter().sum::<f32>() + TAB_GAP * widths.len() as f32
+    }
+
+    #[test]
+    fn tabs_that_fit_keep_the_width_their_names_want() {
+        let natural = [120.0, 90.0, 150.0];
+        let (first, widths) = tab_layout(&natural, 1000.0, 0);
+        assert_eq!(first, 0);
+        assert_eq!(widths, natural);
+    }
+
+    #[test]
+    fn a_crowded_strip_shrinks_the_long_names_and_leaves_the_short_ones() {
+        // Six tabs into 500 points: the share is ~81, so the 70 wide one is
+        // already narrower than its share and must not be stretched up to it.
+        let natural = [200.0, 200.0, 200.0, 200.0, 200.0, 70.0];
+        let (_, widths) = tab_layout(&natural, 500.0, 0);
+        assert_eq!(*widths.last().expect("a tab"), 70.0, "{widths:?}");
+        assert!(widths[0] < 200.0, "{widths:?}");
+        assert!(spans(&widths) <= 500.0, "{widths:?}");
+    }
+
+    #[test]
+    fn nothing_is_ever_drawn_past_the_room_it_was_given() {
+        // The failure this replaces: tabs ran off the right edge and took the
+        // `+` with them, so a document could not be opened from the strip.
+        for count in 1..24usize {
+            for room in [0.0, 40.0, 130.0, 400.0, 900.0] {
+                let natural = vec![180.0; count];
+                let (first, widths) = tab_layout(&natural, room, count - 1);
+                assert!(first + widths.len() <= count);
+                assert!(
+                    spans(&widths) <= room.max(0.0) + 1e-3,
+                    "{count} tabs in {room}: {widths:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_active_document_is_always_one_of_the_tabs_drawn() {
+        // Otherwise the tab strip hides the very document it is describing, and
+        // there is nothing else in the interface that switches documents.
+        let natural = vec![180.0; 12];
+        for active in 0..12 {
+            let (first, widths) = tab_layout(&natural, 300.0, active);
+            assert!(!widths.is_empty(), "room for at least one");
+            assert!(
+                (first..first + widths.len()).contains(&active),
+                "active {active} fell outside {first}..{}",
+                first + widths.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_strip_with_no_room_at_all_draws_nothing_rather_than_a_negative_tab() {
+        let (first, widths) = tab_layout(&[180.0, 180.0], 10.0, 1);
+        assert!(widths.is_empty(), "{widths:?}");
+        assert!(first <= 2);
+        assert_eq!(tab_layout(&[], 400.0, 0), (0, Vec::new()));
+    }
 
     fn mask(layer: &str) -> ImportWarning {
         ImportWarning::MaskIgnored {
