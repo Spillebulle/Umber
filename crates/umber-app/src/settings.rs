@@ -14,14 +14,17 @@
 //! the dialog is open or not, so its first call is where stored settings are
 //! read, and the frame after a change is where they are written.
 
+use crate::autosave;
 use crate::controls::{self, CapState, Captured, Glyph};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::prefs;
 use crate::shortcuts::{self, Action, Binding};
 use crate::theme::{Accent, Palette, ThemeKind, metrics, text};
+use crate::ui::UiActions;
 use crate::widgets;
 use egui::{Align2, Color32, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
+use std::time::Duration;
 use umber_core::input::PressureSource;
 
 /// The panes of the settings dialog, in the design's rail order.
@@ -73,7 +76,7 @@ const RAIL_WIDTH: f32 = 190.0;
 const CORNER: u8 = 10;
 
 /// Draw the dialog if it is open, and keep the preferences file in step.
-pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     let ctx = root.ctx().clone();
 
     if prefs::ensure_loaded(&ctx, ed) {
@@ -121,7 +124,7 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 ui.allocate_ui_with_layout(
                     vec2(width - RAIL_WIDTH, height),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| pane(ui, p, ed),
+                    |ui| pane(ui, p, ed, actions),
                 );
             });
         });
@@ -206,7 +209,7 @@ fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         });
 }
 
-fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     Frame::NONE
         .inner_margin(Margin::symmetric(28, 24))
         .show(ui, |ui| {
@@ -263,7 +266,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.add_space(10.0);
 
             match ed.ui.settings_tab {
-                SettingsTab::General => general_pane(ui, p, ed),
+                SettingsTab::General => general_pane(ui, p, ed, actions),
                 SettingsTab::Pressure => pressure_pane(ui, p, ed),
                 SettingsTab::Themes => themes_pane(ui, p, ed),
                 SettingsTab::Shortcuts => shortcuts_pane(ui, p),
@@ -284,7 +287,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 // General
 // ---------------------------------------------------------------------------
 
-fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     controls::section(ui, p, "Interface");
     ui.scope(|ui| {
         ui.set_max_width(320.0);
@@ -377,6 +380,143 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
          strokes are dropped. Switching this off makes saving quicker and the \
          file smaller, and costs only the history.",
     );
+
+    ui.add_space(16.0);
+    autosave_section(ui, p, ed, actions);
+}
+
+/// Autosave: whether, how often, how long the internal copies are kept, and the
+/// way to go and look at them.
+fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    controls::section(ui, p, "Autosave");
+
+    let mut on = ed.autosave.enabled;
+    controls::row(ui, p, "Save open documents automatically", |ui| {
+        if widgets::toggle(ui, p, &mut on).clicked() {
+            ed.autosave.enabled = on;
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Waits for a gap between strokes, so it never interrupts one — “every \
+         five minutes” means at the first quiet moment after five minutes. A \
+         document you have saved somewhere is written back to that file, \
+         replacing it without asking; one you have never saved goes only to \
+         Umber's own folder.",
+    );
+
+    if !on {
+        return;
+    }
+
+    ui.add_space(8.0);
+    ui.scope(|ui| {
+        ui.set_max_width(320.0);
+        let mut minutes = (ed.autosave.interval.as_secs() / 60).max(1) as f32;
+        if widgets::slider_row(
+            ui,
+            p,
+            "How often",
+            &mut minutes,
+            autosave::MIN_INTERVAL_MINUTES as f32..=autosave::MAX_INTERVAL_MINUTES as f32,
+            true,
+            |v| {
+                let m = v.round() as u32;
+                if m == 1 {
+                    "every minute".to_string()
+                } else {
+                    format!("every {m} minutes")
+                }
+            },
+        ) {
+            ed.autosave.interval = Duration::from_secs(minutes.round().max(1.0) as u64 * 60);
+            prefs::mark_dirty();
+        }
+
+        ui.add_space(8.0);
+        // A ladder rather than a free slider: the useful answers are a handful
+        // of round durations, and nobody wants to land on exactly 30 days by
+        // dragging. The preferences file still takes any number of hours.
+        let hours = ed
+            .autosave
+            .expiry
+            .map(|d| (d.as_secs() / 3600) as u32)
+            .unwrap_or(0);
+        let nearest = autosave::EXPIRY_LADDER
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| h.abs_diff(hours))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut step = nearest as f32;
+        if widgets::slider_row(
+            ui,
+            p,
+            "Keep Umber's own copies for",
+            &mut step,
+            0.0..=(autosave::EXPIRY_LADDER.len() - 1) as f32,
+            false,
+            |v| expiry_label(autosave::EXPIRY_LADDER[ladder_index(v)]),
+        ) {
+            let chosen = autosave::EXPIRY_LADDER[ladder_index(step)];
+            ed.autosave.expiry = (chosen > 0).then(|| Duration::from_secs(chosen as u64 * 3600));
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Only Umber's own copies are ever deleted. Nothing here can reach a file \
+         you chose the place for — a document saved to your own folder stays \
+         there whatever this says.",
+    );
+
+    ui.add_space(8.0);
+    let where_they_go = autosave::internal_dir_label();
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("Copies are kept in {where_they_go}"))
+                    .size(10.0)
+                    .color(p.text_dim),
+            )
+            .truncate(),
+        )
+        .on_hover_text(where_they_go.as_str());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if controls::text_button(ui, p, "Open the folder", false, true)
+                .on_hover_text("Show Umber's autosave folder in the file manager.")
+                .clicked()
+            {
+                actions.reveal_autosaves = true;
+            }
+        });
+    });
+}
+
+/// A ladder step, clamped — a slider's value is a float and the ends can land
+/// a hair outside.
+fn ladder_index(value: f32) -> usize {
+    (value.round().max(0.0) as usize).min(autosave::EXPIRY_LADDER.len() - 1)
+}
+
+/// A number of hours as the dialog says it: for ever, in hours, or in days.
+fn expiry_label(hours: u32) -> String {
+    match hours {
+        0 => "for ever".to_string(),
+        1 => "1 hour".to_string(),
+        h if h < 48 => format!("{h} hours"),
+        h => {
+            let days = h / 24;
+            if days == 1 {
+                "1 day".to_string()
+            } else {
+                format!("{days} days")
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

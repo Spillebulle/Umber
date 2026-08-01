@@ -181,6 +181,10 @@ pub struct Editor {
     /// was installed. Kept out of [`UiState`] because it holds a channel and a
     /// downloaded release, neither of which is `Copy`.
     pub updates: crate::update::Updates,
+    /// The autosave: its schedule, the capture in flight and the thread that
+    /// writes. Out of [`UiState`] for the same reason `updates` is — it holds
+    /// channels and a map of every open document.
+    pub autosave: crate::autosave::Autosave,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -255,6 +259,7 @@ impl Default for Editor {
             ui: UiState::default(),
             canvas_form: crate::canvasdlg::CanvasForm::default(),
             updates: crate::update::Updates::default(),
+            autosave: crate::autosave::Autosave::default(),
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),

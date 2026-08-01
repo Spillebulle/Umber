@@ -6,6 +6,7 @@
 
 mod about;
 mod app;
+mod autosave;
 mod brushlib;
 mod canvasdlg;
 mod colorpicker;

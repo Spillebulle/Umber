@@ -124,9 +124,16 @@ impl UmberApp {
     /// Umber reaches the loop through a window event.
     pub fn new(proxy: EventLoopProxy<Wake>) -> Self {
         let mut editor = Editor::default();
+        let updates_proxy = proxy.clone();
         editor.updates.set_waker(std::sync::Arc::new(move || {
             // The loop is gone once the window has closed, which is an ordinary
             // way for a check still in flight to end. Nothing to do about it.
+            let _ = updates_proxy.send_event(Wake);
+        }));
+        // The autosave answers off the main thread too, and for the same reason
+        // needs a way to say so: a tab's dot coming off is a frame nothing else
+        // would ask for.
+        editor.autosave.set_waker(std::sync::Arc::new(move || {
             let _ = proxy.send_event(Wake);
         }));
         Self {
@@ -505,8 +512,32 @@ impl UmberApp {
     ///
     /// `always_ask` is Save as…: the file is chosen even when the document
     /// already has one.
+    /// Drop any autosave capture reading `id`, because what it is reading is
+    /// about to stop being what the document holds.
+    ///
+    /// Called wherever an autosave could otherwise finish *after* something
+    /// that supersedes it: an explicit Save, a resize, a document closing. The
+    /// renderer half and the scheduler half both have to be told — the first
+    /// gives the staging buffer back, the second stops waiting for pixels that
+    /// are not coming.
+    fn stop_autosave_of(&mut self, id: DocId) {
+        if self.editor.autosave.capturing_id() != Some(id) {
+            return;
+        }
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(canvas) = gfx.canvases.get_mut(&id)
+        {
+            canvas.cancel_capture();
+        }
+        self.editor.autosave.abandon();
+    }
+
     fn save_document(&mut self, always_ask: bool) -> bool {
         let id = self.editor.session.active_id();
+        // An autosave already reading this document would land on the file
+        // about to be written, a stroke or two behind it. The explicit save
+        // wins: it is the one the painter asked for.
+        self.stop_autosave_of(id);
         let existing = self.editor.session.active_tab().path.clone();
         let path = match existing {
             Some(path) if !always_ask => path,
@@ -626,6 +657,11 @@ impl UmberApp {
                     self.editor.layers.len(),
                 );
                 self.editor.mark_saved(path);
+                // The document has just been written, so its autosave clock
+                // starts again from here. Without this the very next brush
+                // stroke would trigger a full autosave of a document saved a
+                // second ago.
+                self.editor.autosave.defer(id, std::time::Instant::now());
                 // Anything the format could not carry exactly is said out loud,
                 // for the same reason an import says what it dropped.
                 if !warnings.is_empty() {
@@ -851,6 +887,28 @@ impl UmberApp {
                 label: Some("frame"),
             });
 
+        // --- autosave ---
+        // Into this frame's own encoder, so a document being read back off the
+        // GPU costs one recorded copy rather than a submission of its own. It
+        // may be reading a document that is not the one in front: every open
+        // document is autosaved, in turn, and a background document's pixels
+        // are in its own renderer.
+        //
+        // `quiet` is what keeps this out of a stroke. Nothing starts while the
+        // pointer is doing anything at all — so "every five minutes" is really
+        // "at the first quiet moment after five minutes", which is also what a
+        // painter would choose.
+        let quiet = self.editor.interaction == Interaction::Idle
+            && !self.editor.stroke.is_active()
+            && self.editor.touches.is_empty();
+        crate::autosave::drive(
+            &mut self.editor,
+            &gfx.gpu,
+            &mut gfx.canvases,
+            &mut encoder,
+            quiet,
+        );
+
         // --- canvas ---
         // Presence was established above, before the surface was acquired, so
         // that a missing renderer is not a frame abandoned with a swapchain
@@ -964,9 +1022,21 @@ impl UmberApp {
             }
         }
 
+        // The autosave's own readback, mapped now that the frame holding its
+        // copy has been submitted, and collected by a poll that never waits.
+        // Anything the writer thread has finished is applied here too.
+        if let Some(notice) =
+            crate::autosave::collect(&mut self.editor, &gfx.gpu, &mut gfx.canvases)
+        {
+            self.editor.notice = Some(notice);
+        }
+
         // Keep the frames coming while a stroke is live; otherwise the app
-        // goes back to sleep until the next input event.
-        if self.editor.interaction == Interaction::Drawing {
+        // goes back to sleep until the next input event. A capture in flight
+        // needs the same: under `ControlFlow::Wait` a document being read back
+        // would otherwise stop dead the moment the painter took their hand off
+        // the mouse, which is exactly when it started.
+        if self.editor.interaction == Interaction::Drawing || self.editor.autosave.capturing() {
             gfx.window.request_redraw();
         }
 
@@ -1043,6 +1113,15 @@ impl UmberApp {
         if let Some(index) = actions.close_tab {
             self.close_document(index);
         }
+        if actions.reveal_autosaves
+            && let Some(dir) = crate::autosave::internal_dir()
+            && let Err(e) = crate::autosave::reveal(&dir)
+        {
+            // Logged rather than shown: the settings dialog prints the path
+            // beside the button, so somebody whose desktop has no file manager
+            // still has what they need.
+            log::warn!("could not open {}: {e}", dir.display());
+        }
 
         // Last, and after the interface has run at least once: the preferences
         // file is read by `settings::show`, so this is the first point at which
@@ -1093,6 +1172,11 @@ impl UmberApp {
     fn apply_canvas(&mut self, change: canvasdlg::CanvasChange) {
         self.finish_stroke();
         let id = self.editor.session.active_id();
+        // A resize throws the layer textures away and rebuilds them, so a
+        // capture part-way through would assemble a file out of layers of two
+        // different sizes. `CanvasRenderer::resize` cancels its own half; this
+        // is the scheduler's.
+        self.stop_autosave_of(id);
         let doc = change.doc;
         let resized = self.editor.apply_canvas(doc);
 
@@ -1111,6 +1195,13 @@ impl UmberApp {
     fn close_document(&mut self, index: usize) {
         self.finish_stroke();
         self.editor.ui.close_prompt = None;
+        // Before the tab goes: the renderer is about to be dropped, and the
+        // scheduler would otherwise wait for ever for a document that no longer
+        // exists — which would stop every *other* document being autosaved,
+        // since only one capture runs at a time.
+        if let Some(id) = self.editor.session.tabs().get(index).map(|t| t.id) {
+            self.stop_autosave_of(id);
+        }
         let Some(closed) = self.editor.close_tab(index) else {
             return;
         };

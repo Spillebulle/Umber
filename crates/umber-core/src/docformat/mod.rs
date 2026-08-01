@@ -358,14 +358,31 @@ impl std::error::Error for SaveError {
 /// used to be, which is the one failure a save must not have.
 pub fn save(path: &Path, doc: &SaveDocument<'_>) -> Result<Vec<SaveWarning>, SaveError> {
     let (bytes, warnings) = encode(doc)?;
+    write_encoded(path, &bytes)?;
+    Ok(warnings)
+}
 
+/// Put an already-[`encode`]d archive at `path`, whole or not at all.
+///
+/// The file is written to a temporary neighbour and renamed into place. A write
+/// that fails halfway — a full disk, a pulled USB stick — would otherwise leave
+/// a truncated archive where the artist's last good version used to be, which
+/// is the one failure a save must not have. That matters more for an autosave
+/// than for a save, because nobody is watching it happen.
+///
+/// Separate from [`save`] because the autosave writes one archive to *two*
+/// places — the document's own file and an internal copy — and encoding a
+/// document twice to do it would double the only expensive part. Having the
+/// atomic write in one place is what stops the second caller reinventing it
+/// slightly differently.
+pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let temporary = path.with_extension(format!("{EXTENSION}.saving"));
-    std::fs::write(&temporary, &bytes)?;
+    std::fs::write(&temporary, bytes)?;
     if let Err(e) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(SaveError::Io(e));
     }
-    Ok(warnings)
+    Ok(())
 }
 
 /// Build the archive in memory.

@@ -69,6 +69,8 @@ pub struct UiActions {
     pub canvas_change: Option<crate::canvasdlg::CanvasChange>,
     pub new_document: bool,
     pub open_file: bool,
+    /// Open the internal autosave location in the system file manager.
+    pub reveal_autosaves: bool,
 }
 
 pub struct UiOutput {
@@ -168,7 +170,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     }
 
     brush_editor(root, &p, ed);
-    crate::settings::show(root, &p, ed);
+    crate::settings::show(root, &p, ed, &mut actions);
     // About, the first-run notice about the update check, and the prompt the
     // check raises. Drawn from here rather than from the Help menu, for the
     // same reason the brush library's modals are drawn from `panels`: a menu

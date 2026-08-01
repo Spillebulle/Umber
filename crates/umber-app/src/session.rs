@@ -84,6 +84,16 @@ pub struct Tab {
     /// [`Session::mark_saved`]. What it really tracks is whether closing the
     /// tab would *lose* anything, which is the question the close prompt asks.
     pub modified: bool,
+    /// How many times this document has been changed, ever.
+    ///
+    /// A counter rather than a flag because the autosave needs to know whether
+    /// the document moved *while it was being written*. Its readback spans
+    /// several frames and its encode a background thread, so a stroke can
+    /// easily land in between — and clearing the tab's dot then would claim the
+    /// file holds a stroke it does not. Compared against the number taken when
+    /// the capture began; never reset, so it cannot wrap round to a stale
+    /// match.
+    pub revision: u64,
     /// What the import could not represent, already phrased for the user by
     /// `umber_core::docimport`. Kept on the tab so the notice can be reopened
     /// after it has been dismissed.
@@ -135,6 +145,7 @@ impl Default for Session {
             title,
             path: None,
             modified: false,
+            revision: 0,
             notes: Vec::new(),
             parked: None,
         });
@@ -175,7 +186,45 @@ impl Session {
 
     /// Note that the live document has been changed.
     pub fn mark_modified(&mut self) {
-        self.active_tab_mut().modified = true;
+        let tab = self.active_tab_mut();
+        tab.modified = true;
+        tab.revision += 1;
+    }
+
+    /// The tab holding a particular document, whether or not it is in front.
+    ///
+    /// The autosave works by id rather than by position: its readback spans
+    /// frames and its write spans a thread, and a tab index taken before either
+    /// means nothing by the time they finish.
+    pub fn tab_of(&self, id: DocId) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    /// The state of a document that is *not* in front.
+    ///
+    /// `None` for the active tab, whose state is live in the editor. Read-only,
+    /// unlike [`Session::take_parked`]: the autosave needs to read a background
+    /// document's stack without disturbing it.
+    pub fn parked(&self, index: usize) -> Option<&DocumentState> {
+        self.tabs.get(index)?.parked.as_ref()
+    }
+
+    /// Note that an autosave has written this document to the file it already
+    /// had, so the tab no longer holds anything the file does not.
+    ///
+    /// `revision` is the number the tab carried when the capture began. If it
+    /// has moved since, the file is one stroke behind and the dot **stays** —
+    /// an autosave that claimed work was safe when it was not would be worse
+    /// than no autosave at all.
+    ///
+    /// Takes no path and changes no title, unlike [`Session::mark_saved`]: an
+    /// autosave never chooses a file, so it has no business renaming a tab.
+    pub fn mark_autosaved(&mut self, id: DocId, revision: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
+            && tab.revision == revision
+        {
+            tab.modified = false;
+        }
     }
 
     /// Note that the live document now exists on disk at `path`.
@@ -205,6 +254,7 @@ impl Session {
             title,
             path,
             modified: false,
+            revision: 0,
             notes: Vec::new(),
             parked: None,
         });
