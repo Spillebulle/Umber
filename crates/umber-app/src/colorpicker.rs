@@ -50,6 +50,30 @@ const RING_THICKNESS: f32 = 20.0;
 /// the picker is drawn small and useless, which is honest, rather than wrong.
 const MIN_PICKER: f32 = 48.0;
 
+/// How wide a shape's edge is faded over, in points.
+///
+/// One physical pixel, which is what egui's own tessellator uses.
+///
+/// Every shape in this picker is a hand-built [`Mesh`] rather than a
+/// [`Shape`] egui tessellates, because none of them is one flat colour and a
+/// tessellated shape has exactly one. The cost of that is antialiasing: the
+/// tessellator antialiases by extruding a shape's outline into a one-pixel
+/// skirt that fades to nothing, and a mesh handed to it whole never goes
+/// through that step. So the meshes here carry their own skirt. Without it the
+/// hue ring's two circular edges and the triangle's three diagonals come out as
+/// visible stair-steps.
+fn feather(ui: &Ui) -> f32 {
+    1.0 / ui.ctx().pixels_per_point().max(0.5)
+}
+
+/// The same colour with nothing left of it — the outer edge of a skirt.
+///
+/// Mesh vertex colours are premultiplied, so this is all zeroes and the
+/// interpolation from the opaque vertex to it is a plain linear fade.
+fn faded(colour: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 0)
+}
+
 fn hue_colour(h: f32) -> Color32 {
     let [r, g, b, _] = Hsv::new(h, 1.0, 1.0).to_color(1.0).to_srgb_u8();
     Color32::from_rgb(r, g, b)
@@ -118,30 +142,47 @@ fn wheel(
         }
     }
 
+    let f = feather(ui);
+    // Enough segments that the facets are shorter than the feather is wide,
+    // otherwise a smooth edge is drawn along a visibly polygonal outline. Scaled
+    // to the wheel rather than fixed: a picker in a narrow panel does not need
+    // the segments a wide one does, and a wide one needed more than the flat 96
+    // this used to draw.
+    let segments = ((outer * 0.9) as usize).clamp(RING_SEGMENTS, 320);
+
     let painter = ui.painter();
     let mut mesh = Mesh::default();
-    for i in 0..RING_SEGMENTS {
-        let a0 = (i as f32 / RING_SEGMENTS as f32) * std::f32::consts::TAU;
-        let a1 = ((i + 1) as f32 / RING_SEGMENTS as f32) * std::f32::consts::TAU;
-        let c0 = hue_colour(a0.to_degrees());
-        let c1 = hue_colour(a1.to_degrees());
+    // Four radii across the ring: a transparent skirt, the ring itself, and
+    // another skirt. See `feather`.
+    let radii = [
+        ((inner - f).max(0.0), false),
+        (inner, true),
+        (outer, true),
+        (outer + f, false),
+    ];
+    for i in 0..segments {
+        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
 
         let base = mesh.vertices.len() as u32;
-        for (angle, colour) in [(a0, c0), (a1, c1)] {
+        for angle in [a0, a1] {
             let dir = vec2(angle.cos(), angle.sin());
-            mesh.vertices.push(Vertex {
-                pos: centre + dir * outer,
-                uv: egui::epaint::WHITE_UV,
-                color: colour,
-            });
-            mesh.vertices.push(Vertex {
-                pos: centre + dir * inner,
-                uv: egui::epaint::WHITE_UV,
-                color: colour,
-            });
+            let colour = hue_colour(angle.to_degrees());
+            for (radius, solid) in radii {
+                mesh.vertices.push(Vertex {
+                    pos: centre + dir * radius,
+                    uv: egui::epaint::WHITE_UV,
+                    color: if solid { colour } else { faded(colour) },
+                });
+            }
         }
-        mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        // Three bands between the four radii, each a quad spanning the segment.
+        for band in 0..radii.len() as u32 - 1 {
+            let l = base + band;
+            let r = base + radii.len() as u32 + band;
+            mesh.indices
+                .extend_from_slice(&[l, l + 1, r, l + 1, r + 1, r]);
+        }
     }
     painter.add(Shape::mesh(mesh));
 
@@ -229,20 +270,53 @@ fn sv_triangle(ui: &mut Ui, centre: Pos2, radius: f32, rotate: bool, hsv: &mut H
         }
     }
 
-    let painter = ui.painter();
-    let mut mesh = Mesh::default();
-    for (pt, colour) in [
+    let f = feather(ui);
+    let corners = [
         (hue_pt, hue_colour(hsv.h)),
         (white_pt, Color32::WHITE),
         (black_pt, Color32::BLACK),
-    ] {
+    ];
+    // The centroid is the direction to push each corner out along for the
+    // skirt. Exact for the ring, which is radial; for a triangle it makes the
+    // skirt a fraction wider at the corners than along the edges, which at one
+    // pixel nobody can see.
+    let centroid = pos2(
+        corners.iter().map(|(pt, _)| pt.x).sum::<f32>() / 3.0,
+        corners.iter().map(|(pt, _)| pt.y).sum::<f32>() / 3.0,
+    );
+
+    let painter = ui.painter();
+    let mut mesh = Mesh::default();
+    // 0..3 is the triangle; 3..6 is the transparent skirt outside it. See
+    // `feather` for why it is here rather than left to egui.
+    for (pt, colour) in corners {
         mesh.vertices.push(Vertex {
             pos: pt,
             uv: egui::epaint::WHITE_UV,
             color: colour,
         });
     }
+    for (pt, colour) in corners {
+        let away = pt - centroid;
+        // A triangle squashed to nothing has no outward direction, and
+        // normalising it would put NaN into the mesh.
+        let out = if away.length() > 1e-3 {
+            pt + away.normalized() * f
+        } else {
+            pt
+        };
+        mesh.vertices.push(Vertex {
+            pos: out,
+            uv: egui::epaint::WHITE_UV,
+            color: faded(colour),
+        });
+    }
     mesh.indices.extend_from_slice(&[0, 1, 2]);
+    for i in 0..3u32 {
+        let j = (i + 1) % 3;
+        mesh.indices
+            .extend_from_slice(&[i, j, j + 3, i, j + 3, i + 3]);
+    }
     painter.add(Shape::mesh(mesh));
 
     // Marker: rebuild the point from the current saturation and value.
