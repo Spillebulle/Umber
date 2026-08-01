@@ -32,7 +32,7 @@ Four crates, layered so each can be tested in isolation:
 
 | Crate | Contains | Must not depend on |
 |---|---|---|
-| `umber-core` | document, brush, dab generation, camera, layers, undo | wgpu, winit, egui |
+| `umber-core` | document, brush, dab generation, camera, layers, undo, file formats | wgpu, winit, egui |
 | `umber-render` | textures, pipelines, WGSL shaders | winit, egui |
 | `umber-app` | event loop, input translation, egui panel | — |
 | `umber-desktop` | binary entry point | — |
@@ -124,6 +124,40 @@ moves that block in and out of `Editor` wholesale.
   one.** That path is Android's: the surface dies on suspend and the session
   survives it. Pixels do not survive, and never have; a document with no
   renderer would be a blank window with no way out.
+
+### The document format
+
+**Umber's format is OpenRaster.** `umber-core::docformat` writes `.ora` and
+`docimport::openraster` reads it — the same reader that opens Krita's and
+MyPaint's files. `docs/document-format.md` has the whole argument.
+
+- **There must never be a second ORA reader.** The point of choosing a format
+  Umber already read is that saving and opening share one decoder. A "native"
+  path that parsed `stack.xml` again would be the exact drift this avoids.
+- **`docimport::srgb`'s two directions must stay exact inverses.** Layer
+  textures hold premultiplied linear colour; ORA holds straight alpha. If
+  `encode_pixel` and `decode_pixel` stop agreeing, a document moves a level
+  every time it is saved and reopened.
+  `saving_and_reopening_does_not_move_a_pixel` drives every reachable
+  (colour, alpha) pair through both.
+- **Three `umber-` attributes are the extension mechanism**, and every other ORA
+  reader ignores them, which is what keeps the file a plain `.ora`.
+  `umber-blend` exists because Add's nearest SVG name (`svg:plus`) is only
+  approximate — without it, reopening Umber's own file reports a loss that did
+  not happen. `umber-version` is bumped only when a revision stores something an
+  older build would drop silently, and an older build then **refuses** the file
+  rather than opening it with pieces missing.
+- **`mergedimage.png` is the caller's, not `docformat`'s.** Flattening means
+  blend modes, and the blend maths lives in the composite shader. A software
+  copy here would be a second implementation to keep in step, and a file whose
+  preview disagreed with the screen is the bug that produces.
+- **A save writes to a temporary neighbour and renames.** A write that dies
+  halfway must not replace the artist's last good file with a truncated archive.
+- **`read_layer_rect` blocks and a save calls it once per layer.** That is
+  acceptable on an explicit Save and nowhere else; it must not migrate towards
+  the drawing loop, and an autosave will have to solve it first.
+- **Save must close a tab only when a file was actually written.** A cancelled
+  file dialog is not permission to discard a document.
 
 ### Importing other applications' files
 

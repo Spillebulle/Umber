@@ -73,16 +73,16 @@ impl DocumentState {
 pub struct Tab {
     pub id: DocId,
     pub title: String,
-    /// The file this document was imported from, if any. Kept for the tab's
-    /// tooltip — it is *not* somewhere to save back to, because there is
-    /// nothing to save with.
-    pub path: Option<PathBuf>,
-    /// True once anything has changed the pixels.
+    /// The file this document was opened from or last saved to.
     ///
-    /// Deliberately not called "unsaved": Umber has no document format, so no
-    /// document is ever saved and every one of them is unsaved. What this
-    /// tracks is whether closing the tab would *lose* anything, which is the
-    /// only question the close prompt can honestly ask.
+    /// `None` for a document that has never been written, which is what makes
+    /// Save ask for a file the first time and not the second.
+    pub path: Option<PathBuf>,
+    /// True once anything has changed the pixels since the last save.
+    ///
+    /// Set by [`Session::mark_modified`] and cleared only by
+    /// [`Session::mark_saved`]. What it really tracks is whether closing the
+    /// tab would *lose* anything, which is the question the close prompt asks.
     pub modified: bool,
     /// What the import could not represent, already phrased for the user by
     /// `umber_core::docimport`. Kept on the tab so the notice can be reopened
@@ -175,6 +175,20 @@ impl Session {
     /// Note that the live document has been changed.
     pub fn mark_modified(&mut self) {
         self.active_tab_mut().modified = true;
+    }
+
+    /// Note that the live document now exists on disk at `path`.
+    ///
+    /// The tab takes the file's own name, so a Save as… is visible in the strip
+    /// rather than leaving the tab claiming to be the document it was copied
+    /// from.
+    pub fn mark_saved(&mut self, path: PathBuf) {
+        let tab = self.active_tab_mut();
+        if let Some(name) = path.file_name() {
+            tab.title = name.to_string_lossy().into_owned();
+        }
+        tab.path = Some(path);
+        tab.modified = false;
     }
 
     /// Add a tab for a document whose state the caller is about to make live.
@@ -413,6 +427,32 @@ mod tests {
         session.open(name, None, state(8));
         session.remove(1).unwrap();
         assert_eq!(session.next_untitled_title(), "Untitled 3");
+    }
+
+    #[test]
+    fn saving_clears_the_flag_and_takes_the_file_name() {
+        let mut session = Session::default();
+        session.mark_modified();
+        session.mark_saved(PathBuf::from("/work/studies/hands.ora"));
+
+        let tab = session.active_tab();
+        assert!(!tab.modified, "a saved document has nothing left to lose");
+        assert_eq!(tab.title, "hands.ora", "the tab kept its old name");
+        assert!(tab.path.is_some());
+    }
+
+    #[test]
+    fn saving_is_per_document() {
+        // The flag and the path both belong to the tab, not to the session:
+        // saving one document must not mark another as safe to close.
+        let mut session = Session::default();
+        session.mark_modified();
+        session.open("second".into(), None, state(8));
+        session.mark_modified();
+        session.mark_saved(PathBuf::from("second.ora"));
+
+        assert!(session.tabs()[0].modified, "the first document was cleared");
+        assert!(!session.tabs()[1].modified);
     }
 
     #[test]

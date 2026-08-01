@@ -428,6 +428,11 @@ impl Editor {
         self.session.mark_modified();
     }
 
+    /// Note that the live document has been written to `path`.
+    pub fn mark_saved(&mut self, path: PathBuf) {
+        self.session.mark_saved(path);
+    }
+
     /// Every open document, its canvas size and how many texture-array slices
     /// its layers occupy. The live document is included.
     ///

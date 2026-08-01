@@ -39,7 +39,7 @@ mod krita;
 mod lzf;
 mod openraster;
 mod photoshop;
-mod srgb;
+pub(crate) mod srgb;
 
 #[cfg(test)]
 mod fixtures;
@@ -86,6 +86,18 @@ pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
         _ => unreachable!("extension was checked against supported_extensions"),
     }?;
 
+    doc.validate()?;
+    Ok(doc)
+}
+
+/// Read an OpenRaster archive already in memory.
+///
+/// The same reader [`import`] uses, without the filesystem. Public because ORA
+/// is also what [`crate::docformat`] writes, so this is the other half of the
+/// document round trip — and because a caller with the bytes in hand should not
+/// have to write them to a temporary file to read them.
+pub fn read_openraster(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
+    let doc = openraster::read(bytes)?;
     doc.validate()?;
     Ok(doc)
 }
@@ -147,6 +159,14 @@ pub struct ImportedDocument {
     pub size: UVec2,
     /// Bottom to top, matching [`LayerStack`]'s own order.
     pub layers: Vec<ImportedLayer>,
+    /// Which layer was selected when the document was written.
+    ///
+    /// `None` for every format but Umber's own, which is nearly all of them:
+    /// ORA, KRA and PSD each have a notion of a current layer, but it lives in
+    /// application-private data rather than in the part of the file this module
+    /// reads. `None` means the top layer, which is what a painter expects to
+    /// land on when opening someone else's document anyway.
+    pub active: Option<usize>,
     /// Everything the import could not represent. Empty means nothing was lost.
     pub warnings: Vec<ImportWarning>,
 }
@@ -196,8 +216,13 @@ impl ImportedDocument {
             });
         }
 
-        // The top layer is the one an artist expects to be painting on.
-        stack.set_active(stack.len() - 1);
+        // Umber's own documents remember which layer was selected; for
+        // everything else the top one is what an artist expects to land on.
+        let active = self
+            .active
+            .filter(|i| *i < stack.len())
+            .unwrap_or(stack.len() - 1);
+        stack.set_active(active);
         (document, stack, uploads)
     }
 
@@ -338,6 +363,18 @@ pub enum ImportError {
         format: SourceFormat,
         detail: String,
     },
+    /// Written by a later version of Umber than this one.
+    ///
+    /// Refused rather than read as far as it goes: a newer format revision
+    /// exists precisely because it stores something this build has no idea it
+    /// is dropping, and opening the file anyway would show the artist a picture
+    /// that is quietly missing part of their work. The message points at the
+    /// two ways out — update, or use another OpenRaster application, which can
+    /// still read the file because that is all it is.
+    NewerVersion {
+        version: u32,
+        supported: u32,
+    },
     /// More layers than the texture array has slices.
     TooManyLayers {
         found: usize,
@@ -383,6 +420,12 @@ impl fmt::Display for ImportError {
                     format.label()
                 )
             }
+            Self::NewerVersion { version, supported } => write!(
+                f,
+                "This document was saved by a newer version of Umber (document format \
+                 {version}; this build reads up to {supported}). Update Umber to open it, \
+                 or open it in another OpenRaster application."
+            ),
             Self::TooManyLayers { found, max } => write!(
                 f,
                 "The document has {found} layers; Umber supports at most {max}."
@@ -466,6 +509,7 @@ mod tests {
                 layer("middle", size),
                 layer("top", size),
             ],
+            active: None,
             warnings: vec![],
         };
         let (document, stack, uploads) = doc.into_stack();
@@ -484,6 +528,24 @@ mod tests {
     }
 
     #[test]
+    fn a_remembered_selection_is_honoured_and_a_nonsensical_one_is_not() {
+        let size = UVec2::new(1, 1);
+        let build = |active| ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers: vec![layer("a", size), layer("b", size), layer("c", size)],
+            active,
+            warnings: vec![],
+        };
+
+        assert_eq!(build(Some(0)).into_stack().1.active_index(), 0);
+        // Out of range means the file disagrees with itself — a layer that
+        // failed to load, say. The top layer is the safe answer, not a panic.
+        assert_eq!(build(Some(9)).into_stack().1.active_index(), 2);
+        assert_eq!(build(None).into_stack().1.active_index(), 2);
+    }
+
+    #[test]
     fn a_single_layer_import_does_not_add_a_spare() {
         // LayerStack::new() already has one layer; adding one per import layer
         // would leave an empty layer at the bottom of every import.
@@ -492,6 +554,7 @@ mod tests {
             format: SourceFormat::Png,
             size,
             layers: vec![layer("only", size)],
+            active: None,
             warnings: vec![],
         };
         let (_, stack, uploads) = doc.into_stack();
@@ -577,6 +640,7 @@ mod tests {
             layers: (0..LayerStack::MAX + 1)
                 .map(|i| layer(&format!("L{i}"), size))
                 .collect(),
+            active: None,
             warnings: vec![],
         };
         assert!(matches!(

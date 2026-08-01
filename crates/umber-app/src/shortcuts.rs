@@ -14,6 +14,8 @@ use winit::keyboard::{KeyCode, ModifiersState};
 /// bindings and is still one action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Save,
+    SaveAs,
     Undo,
     Redo,
     BrushTool,
@@ -33,7 +35,9 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 13] = [
+        Action::Save,
+        Action::SaveAs,
         Action::Undo,
         Action::Redo,
         Action::BrushTool,
@@ -50,6 +54,8 @@ impl Action {
     /// Human-readable, British spelling, e.g. "Swap colours".
     pub fn label(self) -> &'static str {
         match self {
+            Action::Save => "Save",
+            Action::SaveAs => "Save as…",
             Action::Undo => "Undo",
             Action::Redo => "Redo",
             Action::BrushTool => "Brush tool",
@@ -67,6 +73,7 @@ impl Action {
     /// Grouping for the settings list.
     pub fn category(self) -> &'static str {
         match self {
+            Action::Save | Action::SaveAs => "File",
             Action::Undo | Action::Redo => "Edit",
             Action::BrushTool | Action::EraserTool | Action::PanTool | Action::ZoomTool => "Tools",
             Action::SizeDown | Action::SizeUp => "Brush",
@@ -207,6 +214,9 @@ impl Binding {
 /// The default set, grouped sensibly and ordered by category.
 pub fn defaults() -> Vec<Binding> {
     vec![
+        // File
+        binding(Action::Save, KeyCode::KeyS, true, false, false),
+        binding(Action::SaveAs, KeyCode::KeyS, true, true, false),
         // Edit
         binding(Action::Undo, KeyCode::KeyZ, true, false, false),
         binding(Action::Redo, KeyCode::KeyZ, true, true, false),
@@ -685,6 +695,15 @@ mod tests {
         // The whole point of exact modifier matching: an unmodified binding
         // must not fire while Ctrl is held.
         assert_eq!(hit(KeyCode::KeyZ, CTRL), Some(Action::Undo));
+    }
+
+    #[test]
+    fn ctrl_s_saves_and_ctrl_shift_s_asks_where() {
+        // Two commands one Shift apart, which only works because every
+        // modifier is compared exactly — otherwise Save as… would also save.
+        assert_eq!(hit(KeyCode::KeyS, CTRL), Some(Action::Save));
+        assert_eq!(hit(KeyCode::KeyS, CTRL | SHIFT), Some(Action::SaveAs));
+        assert_eq!(hit(KeyCode::KeyS, NONE), None);
     }
 
     #[test]

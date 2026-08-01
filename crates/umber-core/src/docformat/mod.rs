@@ -1,0 +1,915 @@
+//! Writing documents — Umber's own saved-file format.
+//!
+//! ```no_run
+//! # use std::path::Path;
+//! # use glam::UVec2;
+//! # let layers: Vec<umber_core::docformat::SaveLayer> = vec![];
+//! # let merged = vec![];
+//! let doc = umber_core::docformat::SaveDocument {
+//!     size: UVec2::new(2048, 2048),
+//!     layers: &layers,
+//!     active: 0,
+//!     merged: &merged,
+//! };
+//! let warnings = umber_core::docformat::save(Path::new("sketch.ora"), &doc)?;
+//! # Ok::<(), umber_core::docformat::SaveError>(())
+//! ```
+//!
+//! # The format is OpenRaster
+//!
+//! Umber's document format is **`.ora`** — the same OpenRaster that
+//! [`crate::docimport`] already reads. That is a deliberate refusal to invent a
+//! format, and it is worth writing down why, because a painting application
+//! having a container of its own is very nearly a reflex:
+//!
+//! * Everything Umber can hold — a canvas size, a bottom-to-top stack of
+//!   layers, each with a name, an opacity, a visibility and a blend mode, and
+//!   RGBA8 pixels — is *exactly* what ORA stores. A private format would be a
+//!   re-spelling of a published one.
+//! * The reader already exists and is under test. One format means one reader,
+//!   and no second decoder to keep in step with the first.
+//! * A `.ora` is a ZIP of PNGs and one small XML file. It can be opened with a
+//!   file manager, and it can be read by Krita, GIMP, MyPaint, Drawpile and
+//!   Pinta. Work made in Umber is therefore not hostage to Umber — which
+//!   matters more for a young application than for an established one.
+//!
+//! # What Umber adds, and how it stays an ORA
+//!
+//! Three things Umber knows have nowhere to go in baseline ORA, so they are
+//! written as extra attributes. XML readers ignore attributes they do not
+//! recognise, so a file carrying them is still an ordinary `.ora` everywhere
+//! else; the `umber-` prefix keeps them out of the way of anything the
+//! specification may add later.
+//!
+//! * **[`VERSION_ATTR`]** on `<image>` — the revision of *these extensions*,
+//!   not of ORA. A file whose number is higher than [`VERSION`] is refused on
+//!   the way in, because a later revision exists precisely to store something
+//!   this build would drop without knowing it had.
+//! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
+//! * **[`BLEND_ATTR`]** on a layer whose Umber mode has no exact SVG name.
+//!   Only [`BlendMode::Add`] needs it: `svg:plus` is Porter-Duff addition on
+//!   premultiplied colour and Umber's Add clamps straight colour, so they part
+//!   company at soft edges. Without the hint, reopening a document Umber wrote
+//!   would report an approximation that never happened.
+//!
+//! # Pixels
+//!
+//! [`SaveLayer::pixels`] is what a layer texture holds — sRGB-encoded with
+//! alpha premultiplied in linear space — because that is what the renderer
+//! reads back. ORA stores straight alpha, so this module converts, using the
+//! exact inverse of the transform [`crate::docimport`] applies on the way in.
+//! On the bytes a layer texture can actually contain the two round-trip
+//! exactly, so saving and reopening moves nothing.
+//!
+//! # What is not saved
+//!
+//! Undo history and the camera. Neither belongs in an interchange format, and
+//! an undo stack pinned to a texture slot would be meaningless in a file. A
+//! reopened document starts with an empty history, framed to fit.
+
+use std::io::Write;
+use std::path::Path;
+
+use glam::UVec2;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
+
+use crate::docimport::srgb;
+use crate::layer::{BlendMode, LayerStack};
+
+/// Extension Umber saves with, without the dot.
+pub const EXTENSION: &str = "ora";
+
+/// Revision of Umber's ORA extensions that this build writes and reads.
+///
+/// Bumped only when a new revision stores something an older Umber would drop
+/// silently — a mask, a group, a layer effect. Additions an older build can
+/// safely ignore do not need it.
+pub const VERSION: u32 = 1;
+
+/// `<image>` attribute naming [`VERSION`].
+pub const VERSION_ATTR: &str = "umber-version";
+
+/// `<layer>` attribute marking the selected layer, spelled `"true"`.
+pub const SELECTED_ATTR: &str = "umber-selected";
+
+/// `<layer>` attribute naming an Umber blend mode outright.
+pub const BLEND_ATTR: &str = "umber-blend";
+
+/// The `version` every OpenRaster file declares. Not Umber's — the format's.
+const ORA_VERSION: &str = "0.0.3";
+
+/// Longest edge of the thumbnail the specification asks every writer to include.
+const THUMBNAIL_MAX: u32 = 256;
+
+/// One layer on its way to disk.
+pub struct SaveLayer<'a> {
+    pub name: &'a str,
+    pub visible: bool,
+    /// `0.0..=1.0`.
+    pub opacity: f32,
+    pub blend: BlendMode,
+    /// `width * height * 4` bytes in layer-texture form — sRGB-encoded with
+    /// alpha premultiplied in linear space. See the module docs.
+    pub pixels: &'a [u8],
+}
+
+/// A document on its way to disk.
+pub struct SaveDocument<'a> {
+    pub size: UVec2,
+    /// Bottom to top, matching [`LayerStack`]'s own order.
+    pub layers: &'a [SaveLayer<'a>],
+    /// Index into `layers` of the one being painted on.
+    pub active: usize,
+    /// The flattened composite, straight-alpha sRGB, canvas-sized.
+    ///
+    /// Required by the specification, and supplied by the caller rather than
+    /// computed here **on purpose**: flattening means blend modes, and the
+    /// blend maths lives in one place — the composite shader. A software copy
+    /// of it in this module would be a second implementation to keep in step,
+    /// and a saved file whose preview disagreed with the screen is exactly the
+    /// bug that arrangement produces.
+    pub merged: &'a [u8],
+}
+
+/// Something a save could not carry across in full.
+///
+/// Typed for the same reason [`crate::docimport::ImportWarning`] is: so the UI
+/// can count and group them rather than print a paragraph per layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveWarning {
+    /// The layer's mode has no exact OpenRaster name, so other applications
+    /// will composite it a little differently. Umber's own reader will not —
+    /// see [`BLEND_ATTR`].
+    BlendApproximated {
+        layer: String,
+        mode: &'static str,
+        used: &'static str,
+    },
+}
+
+impl std::fmt::Display for SaveWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BlendApproximated { layer, mode, used } => write!(
+                f,
+                "Layer “{layer}”: OpenRaster has no exact equivalent of {mode}, so it is \
+                 written as {used}. Umber reopens it as {mode}; other applications will \
+                 composite it slightly differently where the layer is partly transparent."
+            ),
+        }
+    }
+}
+
+/// Why a save failed.
+#[derive(Debug)]
+pub enum SaveError {
+    Io(std::io::Error),
+    /// A document with nothing in it. Cannot happen from the editor, which
+    /// never lets the last layer go, but the format would be invalid.
+    Empty,
+    /// More layers than [`LayerStack`] could ever open again. Refused while the
+    /// file on disk is still the old one, rather than written and then found
+    /// unopenable.
+    TooManyLayers {
+        found: usize,
+        max: usize,
+    },
+    /// A buffer that is not the canvas size. A caller bug, but one worth
+    /// naming: the alternative is a file whose layers are silently sheared.
+    WrongSize {
+        what: String,
+        found: usize,
+        expected: usize,
+    },
+}
+
+impl From<std::io::Error> for SaveError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<zip::result::ZipError> for SaveError {
+    fn from(e: zip::result::ZipError) -> Self {
+        // Every variant that can arise while *writing* an archive we control is
+        // an I/O failure underneath — a full disk, a disconnected drive.
+        Self::Io(std::io::Error::other(e))
+    }
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "The file could not be written: {e}"),
+            Self::Empty => write!(
+                f,
+                "The document has no layers, so there is nothing to save."
+            ),
+            Self::TooManyLayers { found, max } => write!(
+                f,
+                "The document has {found} layers; Umber can only reopen {max}, so it was \
+                 not saved."
+            ),
+            Self::WrongSize {
+                what,
+                found,
+                expected,
+            } => write!(
+                f,
+                "The {what} came back as {found} bytes where {expected} were expected, so \
+                 the document was not saved."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Write `doc` to `path`.
+///
+/// Returns whatever the format could not carry exactly; an empty list means the
+/// file holds everything the document did.
+///
+/// The file is written whole to a temporary neighbour and renamed into place.
+/// A save that fails halfway — a full disk, a pulled USB stick — would
+/// otherwise leave a truncated archive where the artist's last good version
+/// used to be, which is the one failure a save must not have.
+pub fn save(path: &Path, doc: &SaveDocument<'_>) -> Result<Vec<SaveWarning>, SaveError> {
+    let (bytes, warnings) = encode(doc)?;
+
+    let temporary = path.with_extension(format!("{EXTENSION}.saving"));
+    std::fs::write(&temporary, &bytes)?;
+    if let Err(e) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(SaveError::Io(e));
+    }
+    Ok(warnings)
+}
+
+/// Build the archive in memory.
+///
+/// Separate from [`save`] so the round-trip tests can write and read without
+/// touching a disk.
+pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), SaveError> {
+    if doc.layers.is_empty() {
+        return Err(SaveError::Empty);
+    }
+    if doc.layers.len() > LayerStack::MAX {
+        return Err(SaveError::TooManyLayers {
+            found: doc.layers.len(),
+            max: LayerStack::MAX,
+        });
+    }
+    let expected = doc.size.x as usize * doc.size.y as usize * 4;
+    for layer in doc.layers {
+        if layer.pixels.len() != expected {
+            return Err(SaveError::WrongSize {
+                what: format!("pixels of layer “{}”", layer.name),
+                found: layer.pixels.len(),
+                expected,
+            });
+        }
+    }
+    if doc.merged.len() != expected {
+        return Err(SaveError::WrongSize {
+            what: "flattened image".to_string(),
+            found: doc.merged.len(),
+            expected,
+        });
+    }
+
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+
+    // The specification requires `mimetype` first and uncompressed, and real
+    // readers — Umber's own included — check it.
+    zip.start_file("mimetype", stored())?;
+    zip.write_all(b"image/openraster")?;
+
+    let mut warnings = Vec::new();
+    let mut entries = Vec::with_capacity(doc.layers.len());
+
+    // Top first, which is the order `stack.xml` wants. The `src` numbering
+    // follows the same order so a file listing reads the way the layers panel
+    // does.
+    for (i, layer) in doc.layers.iter().rev().enumerate() {
+        let src = format!("data/layer{i:03}.png");
+        let placed = trim(layer.pixels, doc.size);
+        let png = encode_png(placed.size, &placed.pixels)?;
+        zip.start_file(&src, stored())?;
+        zip.write_all(&png)?;
+
+        let (op, exact) = composite_op(layer.blend);
+        if !exact {
+            warnings.push(SaveWarning::BlendApproximated {
+                layer: layer.name.to_string(),
+                mode: layer.blend.label(),
+                used: op,
+            });
+        }
+        // `doc.active` indexes the bottom-first stack; this loop runs top first.
+        let selected = doc.layers.len() - 1 - i == doc.active;
+        entries.push(layer_xml(layer, &src, placed.at, op, exact, selected));
+    }
+
+    zip.start_file("stack.xml", deflated())?;
+    zip.write_all(stack_xml(doc.size, &entries).as_bytes())?;
+
+    // Both are required of a conforming writer, and both are what gives a file
+    // manager something to show.
+    zip.start_file("mergedimage.png", stored())?;
+    zip.write_all(&encode_png(doc.size, doc.merged)?)?;
+
+    let (thumb_size, thumb) = thumbnail(doc.merged, doc.size);
+    zip.start_file("Thumbnails/thumbnail.png", stored())?;
+    zip.write_all(&encode_png(thumb_size, &thumb)?)?;
+
+    Ok((zip.finish()?.into_inner(), warnings))
+}
+
+/// Umber's mode as an OpenRaster `composite-op`, and whether it is exact.
+///
+/// See [`BLEND_ATTR`] for why Add is the one that is not.
+pub fn composite_op(mode: BlendMode) -> (&'static str, bool) {
+    match mode {
+        BlendMode::Normal => ("svg:src-over", true),
+        BlendMode::Multiply => ("svg:multiply", true),
+        BlendMode::Screen => ("svg:screen", true),
+        BlendMode::Overlay => ("svg:overlay", true),
+        BlendMode::Add => ("svg:plus", false),
+    }
+}
+
+/// Stable name for [`BLEND_ATTR`]. The debug spelling, so it cannot drift out
+/// of step with the enum the way a second hand-written table would.
+pub fn blend_id(mode: BlendMode) -> String {
+    format!("{mode:?}")
+}
+
+/// Inverse of [`blend_id`]. An unrecognised name comes from a version that has
+/// modes this one does not, and yields `None` so the reader falls back to the
+/// `composite-op` every ORA also carries.
+pub fn blend_from_id(id: &str) -> Option<BlendMode> {
+    BlendMode::ALL.into_iter().find(|m| blend_id(*m) == id)
+}
+
+// --- the XML ---------------------------------------------------------------
+
+fn stack_xml(size: UVec2, layers: &[String]) -> String {
+    let mut out = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
+    out.push_str(&format!(
+        "<image w=\"{}\" h=\"{}\" version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\">\n \
+         <stack>\n",
+        size.x, size.y
+    ));
+    for layer in layers {
+        out.push_str("  ");
+        out.push_str(layer);
+        out.push('\n');
+    }
+    out.push_str(" </stack>\n</image>\n");
+    out
+}
+
+fn layer_xml(
+    layer: &SaveLayer<'_>,
+    src: &str,
+    at: (u32, u32),
+    op: &str,
+    exact: bool,
+    selected: bool,
+) -> String {
+    let mut out = format!(
+        "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" \
+         visibility=\"{}\" composite-op=\"{op}\"",
+        attribute(layer.name),
+        at.0,
+        at.1,
+        layer.opacity.clamp(0.0, 1.0),
+        if layer.visible { "visible" } else { "hidden" },
+    );
+    if !exact {
+        out.push_str(&format!(" {BLEND_ATTR}=\"{}\"", blend_id(layer.blend)));
+    }
+    if selected {
+        out.push_str(&format!(" {SELECTED_ATTR}=\"true\""));
+    }
+    out.push_str("/>");
+    out
+}
+
+/// Escape a layer name for an attribute value.
+///
+/// Control characters are dropped rather than escaped: they are not legal in
+/// XML 1.0 at all, so a name carrying one — pasted from somewhere odd — would
+/// make the file unreadable by every parser including Umber's.
+fn attribute(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    quick_xml::escape::escape(&cleaned).into_owned()
+}
+
+// --- the pixels ------------------------------------------------------------
+
+/// A layer's pixels reduced to the rectangle that actually holds anything.
+struct Placed {
+    size: UVec2,
+    at: (u32, u32),
+    /// Straight-alpha sRGB, `size.x * size.y * 4` bytes.
+    pixels: Vec<u8>,
+}
+
+/// Crop a canvas-sized layer to its non-transparent bounding box.
+///
+/// ORA stores each layer at its own rectangle with an offset, and Umber's
+/// reader already places them back. It is worth doing rather than writing the
+/// whole canvas every time: a sketch is mostly empty, and the difference on a
+/// 2048² document with eight layers is a file of a few hundred kilobytes
+/// instead of a few megabytes — plus seven-eighths less PNG encoding, which is
+/// what the save actually spends its time on.
+fn trim(pixels: &[u8], canvas: UVec2) -> Placed {
+    let (w, h) = (canvas.x as usize, canvas.y as usize);
+    let mut min = (w, h);
+    let mut max = (0usize, 0usize);
+    for y in 0..h {
+        let row = &pixels[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            if row[x * 4 + 3] != 0 {
+                min = (min.0.min(x), min.1.min(y));
+                max = (max.0.max(x + 1), max.1.max(y + 1));
+            }
+        }
+    }
+
+    // A layer nobody has painted on yet. A zero-sized PNG is not a PNG, so it
+    // becomes one transparent pixel — which is also what makes an empty layer
+    // survive a round trip rather than vanishing from the stack.
+    if min.0 >= max.0 {
+        return Placed {
+            size: UVec2::ONE,
+            at: (0, 0),
+            pixels: vec![0; 4],
+        };
+    }
+
+    let (tw, th) = (max.0 - min.0, max.1 - min.1);
+    let mut out = Vec::with_capacity(tw * th * 4);
+    for y in min.1..max.1 {
+        let start = (y * w + min.0) * 4;
+        out.extend_from_slice(&pixels[start..start + tw * 4]);
+    }
+    srgb::decode_buffer(&mut out);
+
+    Placed {
+        size: UVec2::new(tw as u32, th as u32),
+        at: (min.0 as u32, min.1 as u32),
+        pixels: out,
+    }
+}
+
+/// Box-average the flattened image down to something a file browser can show.
+///
+/// Averaging is done on the sRGB bytes deliberately. A thumbnail is not a
+/// colour operation the engine will ever composite with; it is a preview, and
+/// the specification's readers show it beside PNGs from every other
+/// application, all of which do the same thing.
+fn thumbnail(merged: &[u8], canvas: UVec2) -> (UVec2, Vec<u8>) {
+    let scale = (canvas.x.max(canvas.y) as f32 / THUMBNAIL_MAX as f32).max(1.0);
+    let tw = ((canvas.x as f32 / scale).round() as u32).max(1);
+    let th = ((canvas.y as f32 / scale).round() as u32).max(1);
+    if tw == canvas.x && th == canvas.y {
+        return (canvas, merged.to_vec());
+    }
+
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    for ty in 0..th as usize {
+        // Source band for this output row, at least one pixel tall.
+        let y0 = ty * canvas.y as usize / th as usize;
+        let y1 = (((ty + 1) * canvas.y as usize) / th as usize).max(y0 + 1);
+        for tx in 0..tw as usize {
+            let x0 = tx * canvas.x as usize / tw as usize;
+            let x1 = (((tx + 1) * canvas.x as usize) / tw as usize).max(x0 + 1);
+
+            let mut sum = [0u32; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let px = (y * canvas.x as usize + x) * 4;
+                    for c in 0..4 {
+                        sum[c] += merged[px + c] as u32;
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let dst = (ty * tw as usize + tx) * 4;
+            for c in 0..4 {
+                out[dst + c] = (sum[c] / n) as u8;
+            }
+        }
+    }
+    (UVec2::new(tw, th), out)
+}
+
+fn encode_png(size: UVec2, rgba: &[u8]) -> Result<Vec<u8>, SaveError> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, size.x, size.y);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // ORA specifies sRGB, and so does Umber's engine at its edges.
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    // `Fast` is fdeflate, which is tuned for PNG and beats libpng's default
+    // ratio anyway. A save already blocks on eight GPU readbacks; spending
+    // seconds more squeezing the last few per cent out of a working file — one
+    // that will be written again in a minute — is the wrong trade. Exports are
+    // a different question, and are a different function.
+    encoder.set_compression(png::Compression::Fast);
+    encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(rgba))
+        .map_err(|e| SaveError::Io(std::io::Error::other(e)))?;
+    Ok(out)
+}
+
+// --- the container ---------------------------------------------------------
+
+/// Entries that are already compressed.
+///
+/// PNG data is deflated by definition, so deflating it again in the ZIP costs
+/// time and gains nothing. `mimetype` must be stored, by the specification.
+fn stored() -> SimpleFileOptions {
+    SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+}
+
+fn deflated() -> SimpleFileOptions {
+    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docimport::{self, ImportError};
+
+    /// Layer-texture bytes: a solid colour over the whole canvas.
+    fn solid(size: UVec2, px: [u8; 4]) -> Vec<u8> {
+        px.iter()
+            .copied()
+            .cycle()
+            .take(size.x as usize * size.y as usize * 4)
+            .collect()
+    }
+
+    fn empty(size: UVec2) -> Vec<u8> {
+        vec![0; size.x as usize * size.y as usize * 4]
+    }
+
+    fn layer<'a>(name: &'a str, pixels: &'a [u8]) -> SaveLayer<'a> {
+        SaveLayer {
+            name,
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            pixels,
+        }
+    }
+
+    /// Write a document and read it straight back through the importer, which
+    /// is the only round trip that matters: the file is only worth anything if
+    /// Umber's own reader gets the document back out of it.
+    fn round_trip(doc: &SaveDocument<'_>) -> docimport::ImportedDocument {
+        let (bytes, _) = encode(doc).expect("encode");
+        docimport::read_openraster(&bytes).expect("read back")
+    }
+
+    #[test]
+    fn a_stack_survives_a_round_trip() {
+        let size = UVec2::new(4, 4);
+        let bottom = solid(size, [200, 30, 30, 255]);
+        let top = solid(size, [10, 10, 240, 255]);
+        let merged = solid(size, [10, 10, 240, 255]);
+
+        let layers = vec![
+            SaveLayer {
+                name: "Paper",
+                visible: true,
+                opacity: 0.5,
+                blend: BlendMode::Multiply,
+                pixels: &bottom,
+            },
+            SaveLayer {
+                name: "Ink",
+                visible: false,
+                opacity: 1.0,
+                blend: BlendMode::Screen,
+                pixels: &top,
+            },
+        ];
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &merged,
+        });
+
+        assert_eq!(doc.size, size);
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        // Bottom first on both sides of the trip.
+        assert_eq!(doc.layers[0].name, "Paper");
+        assert_eq!(doc.layers[0].opacity, 0.5);
+        assert_eq!(doc.layers[0].blend, BlendMode::Multiply);
+        assert!(doc.layers[0].visible);
+        assert_eq!(doc.layers[1].name, "Ink");
+        assert_eq!(doc.layers[1].blend, BlendMode::Screen);
+        assert!(!doc.layers[1].visible, "visibility was lost");
+
+        assert_eq!(doc.active, Some(0), "the selected layer was lost");
+        assert_eq!(doc.layers[0].pixels, bottom);
+        assert_eq!(doc.layers[1].pixels, top);
+    }
+
+    #[test]
+    fn partly_transparent_pixels_come_back_byte_for_byte() {
+        // The one thing a document format has to get right. These are stored
+        // premultiplied and ORA is straight alpha, so every one of them makes
+        // the trip through a conversion and back.
+        let size = UVec2::new(4, 1);
+        let mut pixels = Vec::new();
+        for a in [0u8, 1, 40, 128, 254] {
+            pixels.extend_from_slice(&srgb::encode_pixel([220, 90, 15, a]));
+        }
+        pixels.truncate(size.x as usize * 4);
+
+        let layers = vec![layer("Wash", &pixels)];
+        let merged = empty(size);
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &merged,
+        });
+        assert_eq!(doc.layers[0].pixels, pixels);
+    }
+
+    #[test]
+    fn a_layer_painted_in_one_corner_lands_back_in_that_corner() {
+        // Layers are written cropped to their content, so the offset has to be
+        // right or the whole layer moves.
+        let size = UVec2::new(8, 8);
+        let mut pixels = empty(size);
+        let at = (5 * 8 + 6) * 4;
+        pixels[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+
+        let layers = vec![layer("Dot", &pixels)];
+        let merged = empty(size);
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &merged,
+        });
+        assert_eq!(doc.layers[0].pixels, pixels);
+    }
+
+    #[test]
+    fn an_untouched_layer_survives_rather_than_vanishing() {
+        let size = UVec2::new(4, 4);
+        let blank = empty(size);
+        let painted = solid(size, [1, 2, 3, 255]);
+        let layers = vec![layer("Blank", &blank), layer("Painted", &painted)];
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 1,
+            merged: &painted,
+        });
+
+        assert_eq!(doc.layers.len(), 2, "the empty layer was dropped");
+        assert_eq!(doc.layers[0].name, "Blank");
+        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn add_is_written_as_plus_and_read_back_as_add() {
+        // `svg:plus` is the nearest ORA has, and it is not exact — so the save
+        // says so, and writes the hint that stops the *reload* claiming a loss
+        // that did not happen.
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [90, 90, 90, 255]);
+        let layers = vec![SaveLayer {
+            name: "Glow",
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Add,
+            pixels: &pixels,
+        }];
+        let doc = SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &pixels,
+        };
+
+        let (bytes, warnings) = encode(&doc).unwrap();
+        assert_eq!(
+            warnings,
+            vec![SaveWarning::BlendApproximated {
+                layer: "Glow".into(),
+                mode: "Add",
+                used: "svg:plus",
+            }]
+        );
+
+        let back = docimport::read_openraster(&bytes).unwrap();
+        assert_eq!(back.layers[0].blend, BlendMode::Add);
+        assert!(
+            back.warnings.is_empty(),
+            "reopening Umber's own file must not report a loss: {:?}",
+            back.warnings
+        );
+    }
+
+    #[test]
+    fn a_name_with_xml_in_it_does_not_break_the_file() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [5, 5, 5, 255]);
+        let layers = vec![layer("<ink> & \"paper\"", &pixels)];
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &pixels,
+        });
+        assert_eq!(doc.layers[0].name, "<ink> & \"paper\"");
+    }
+
+    #[test]
+    fn a_newer_document_is_refused_rather_than_half_read() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [5, 5, 5, 255]);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &pixels,
+        })
+        .unwrap();
+
+        // Rewrite the archive with the version bumped past this build's.
+        let doctored = with_stack_xml(&bytes, |xml| {
+            xml.replace(
+                &format!("{VERSION_ATTR}=\"{VERSION}\""),
+                &format!("{VERSION_ATTR}=\"{}\"", VERSION + 1),
+            )
+        });
+        let err = docimport::read_openraster(&doctored).unwrap_err();
+        assert!(
+            matches!(err, ImportError::NewerVersion { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("newer version of Umber"));
+    }
+
+    #[test]
+    fn the_file_is_a_plain_openraster() {
+        // Everything the specification requires of a writer. If this stops
+        // holding, work saved from Umber stops opening in Krita and GIMP —
+        // which is the whole reason the format is this one.
+        let size = UVec2::new(300, 200);
+        let pixels = solid(size, [40, 60, 80, 255]);
+        let layers = vec![layer("Ink", &pixels)];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &pixels,
+        })
+        .unwrap();
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        for required in [
+            "mimetype",
+            "stack.xml",
+            "mergedimage.png",
+            "Thumbnails/thumbnail.png",
+        ] {
+            assert!(names.contains(&required.to_string()), "missing {required}");
+        }
+
+        let first = zip.by_index(0).unwrap();
+        assert_eq!(first.name(), "mimetype", "mimetype must come first");
+        assert_eq!(
+            first.compression(),
+            CompressionMethod::Stored,
+            "mimetype must be stored uncompressed"
+        );
+        drop(first);
+
+        // The thumbnail is bounded on its long edge and keeps its shape.
+        let mut thumb = Vec::new();
+        std::io::Read::read_to_end(
+            &mut zip.by_name("Thumbnails/thumbnail.png").unwrap(),
+            &mut thumb,
+        )
+        .unwrap();
+        let decoded = png::Decoder::new(std::io::Cursor::new(thumb))
+            .read_info()
+            .unwrap();
+        let info = decoded.info();
+        assert_eq!((info.width, info.height), (256, 171));
+    }
+
+    #[test]
+    fn a_document_too_tall_for_the_stack_is_refused_before_anything_is_written() {
+        let size = UVec2::new(1, 1);
+        let pixels = solid(size, [0, 0, 0, 255]);
+        let layers: Vec<SaveLayer> = (0..LayerStack::MAX + 1)
+            .map(|_| layer("L", &pixels))
+            .collect();
+        let err = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &pixels,
+        })
+        .unwrap_err();
+        assert!(matches!(err, SaveError::TooManyLayers { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_mismatched_buffer_is_refused_rather_than_sheared() {
+        let size = UVec2::new(4, 4);
+        let short = vec![0u8; 8];
+        let full = empty(size);
+        let layers = vec![layer("Ink", &short)];
+        let err = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            merged: &full,
+        })
+        .unwrap_err();
+        assert!(matches!(err, SaveError::WrongSize { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn blend_names_survive_their_own_round_trip() {
+        for mode in BlendMode::ALL {
+            assert_eq!(blend_from_id(&blend_id(mode)), Some(mode));
+        }
+        assert_eq!(blend_from_id("Dissolve"), None);
+    }
+
+    #[test]
+    fn save_replaces_the_file_only_once_it_has_written_all_of_it() {
+        let dir = std::env::temp_dir().join("umber-docformat-save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sketch.ora");
+
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [7, 7, 7, 255]);
+        let layers = vec![layer("Ink", &pixels)];
+        save(
+            &path,
+            &SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                merged: &pixels,
+            },
+        )
+        .unwrap();
+
+        assert!(docimport::import(&path).is_ok());
+        assert!(
+            !path.with_extension("ora.saving").exists(),
+            "the temporary file was left behind"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rebuild an archive with `stack.xml` passed through `f`.
+    fn with_stack_xml(bytes: &[u8], f: impl Fn(String) -> String) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut out = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+            if name == "stack.xml" {
+                body = f(String::from_utf8(body).unwrap()).into_bytes();
+            }
+            out.start_file(&name, stored()).unwrap();
+            out.write_all(&body).unwrap();
+        }
+        out.finish().unwrap().into_inner()
+    }
+}

@@ -13,6 +13,15 @@
 //!
 //! Krita, GIMP, MyPaint, Drawpile and Pinta all write `.ora`, which makes it
 //! the recommended way into Umber from anything this module declines.
+//!
+//! # Umber's own documents come through here
+//!
+//! [`crate::docformat`] writes ORA, so this is also the reader for Umber's own
+//! saved files. Three extra attributes carry what baseline ORA has nowhere to
+//! put — `umber-version`, `umber-selected` and `umber-blend`, all documented
+//! there — and they are read here rather than in a second reader, because two
+//! readers for one format is two things to keep in step. A file written by
+//! anything else simply has none of them.
 
 use glam::UVec2;
 use quick_xml::events::Event;
@@ -23,6 +32,8 @@ use super::{
     ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
     srgb,
 };
+use crate::docformat;
+use crate::layer::BlendMode;
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
 
@@ -37,6 +48,11 @@ struct LayerSpec {
     opacity: f32,
     visible: bool,
     composite_op: String,
+    /// `umber-blend`, when Umber wrote this file and the SVG name it had to use
+    /// is not an exact match for the mode it meant.
+    umber_blend: Option<BlendMode>,
+    /// `umber-selected`: the layer that was being painted on when it was saved.
+    selected: bool,
 }
 
 pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
@@ -49,9 +65,17 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     check_bounds(FORMAT, size.x, size.y, specs.len())?;
 
     let mut layers = Vec::with_capacity(specs.len());
+    // Tracked against the layers that actually loaded, not against the specs:
+    // a skipped layer shifts every position after it.
+    let mut active = None;
     for spec in specs {
         match load_layer(&mut zip, &spec, size, &mut warnings) {
-            Ok(layer) => layers.push(layer),
+            Ok(layer) => {
+                if spec.selected {
+                    active = Some(layers.len());
+                }
+                layers.push(layer);
+            }
             Err(reason) => warnings.push(ImportWarning::LayerSkipped {
                 layer: spec.name.clone(),
                 reason,
@@ -70,6 +94,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         format: FORMAT,
         size,
         layers,
+        active,
         warnings,
     })
 }
@@ -121,6 +146,17 @@ fn parse_stack(
                         let w = attrs.parse("w").unwrap_or(0);
                         let h = attrs.parse("h").unwrap_or(0);
                         size = Some(UVec2::new(w, h));
+
+                        // Checked before a single pixel is decoded, so a file
+                        // from a future Umber costs nothing to refuse.
+                        if let Some(version) = attrs.parse::<u32>(docformat::VERSION_ATTR)
+                            && version > docformat::VERSION
+                        {
+                            return Err(ImportError::NewerVersion {
+                                version,
+                                supported: docformat::VERSION,
+                            });
+                        }
                     }
                     b"stack" => {
                         depth += 1;
@@ -186,6 +222,13 @@ fn parse_stack(
                             opacity: opacity(&attrs) * group.opacity,
                             visible: visible(&attrs) && group.visible,
                             composite_op: composite_op(&attrs),
+                            umber_blend: attrs
+                                .get(docformat::BLEND_ATTR)
+                                .and_then(docformat::blend_from_id),
+                            // A layer inside a group can carry it too, and the
+                            // group is flattened away, so it still points at
+                            // the right layer.
+                            selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
                         });
                     }
                     _ => {}
@@ -219,7 +262,14 @@ fn load_layer(
         .ok_or_else(|| format!("`{}` is not in the file", spec.src))?;
     let image = flat::decode_png(&png, FORMAT).map_err(|e| e.to_string())?;
 
-    let (mode, fidelity) = blend::nearest(&spec.composite_op);
+    // An Umber document says outright which of Umber's own modes it meant. That
+    // matters for Add, whose nearest SVG name — `svg:plus` — is only
+    // approximate: without the hint, reopening a document Umber itself wrote
+    // would report a loss that did not happen.
+    let (mode, fidelity) = match spec.umber_blend {
+        Some(mode) => (mode, Fidelity::Exact),
+        None => blend::nearest(&spec.composite_op),
+    };
     match fidelity {
         Fidelity::Exact => {}
         Fidelity::Approximate => warnings.push(ImportWarning::BlendApproximated {
@@ -276,9 +326,10 @@ fn flattened_fallback(
             name: "Merged image".to_string(),
             visible: true,
             opacity: 1.0,
-            blend: crate::layer::BlendMode::Normal,
+            blend: BlendMode::Normal,
             pixels,
         }],
+        active: None,
         warnings,
     })
 }

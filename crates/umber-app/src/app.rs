@@ -10,9 +10,10 @@ use crate::theme::{self, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch};
+use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch, PixelRect};
 use umber_render::{CanvasRenderer, CompositeParams, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -349,6 +350,12 @@ impl UmberApp {
         };
 
         match action {
+            Action::Save => {
+                self.save_document(false);
+            }
+            Action::SaveAs => {
+                self.save_document(true);
+            }
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
             Action::BrushTool => self.editor.set_tool(Tool::Brush),
@@ -395,10 +402,148 @@ impl UmberApp {
             .set_color(Color::from_srgb_u8(px[0], px[1], px[2], 255));
     }
 
+    /// Write the whole layered document out, and remember where it went.
+    ///
+    /// Returns whether a file was actually written, which is what lets the
+    /// close prompt treat a cancelled dialog as "not yet" rather than as
+    /// permission to discard the document.
+    ///
+    /// `always_ask` is Save as…: the file is chosen even when the document
+    /// already has one.
+    fn save_document(&mut self, always_ask: bool) -> bool {
+        let id = self.editor.session.active_id();
+        let existing = self.editor.session.active_tab().path.clone();
+        let path = match existing {
+            Some(path) if !always_ask => path,
+            existing => {
+                let suggested = match &existing {
+                    Some(path) => path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    None => format!(
+                        "{}.{}",
+                        self.editor.session.active_title(),
+                        docformat::EXTENSION
+                    ),
+                };
+                let Some(picked) = rfd::FileDialog::new()
+                    .set_title(if always_ask {
+                        "Save document as"
+                    } else {
+                        "Save document"
+                    })
+                    .add_filter("OpenRaster document", &[docformat::EXTENSION])
+                    .set_file_name(suggested)
+                    .save_file()
+                else {
+                    return false;
+                };
+                with_extension(picked)
+            }
+        };
+
+        let name = file_name_of(&path);
+        let size = self.editor.doc.size;
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        };
+
+        // Scoped so every borrow of the editor and the GPU is released before
+        // the outcome is acted on, which needs `&mut self`.
+        let outcome = {
+            let Some(gfx) = self.gfx.as_ref() else {
+                return false;
+            };
+            let Some(canvas) = gfx.canvases.get(&id) else {
+                return false;
+            };
+            let stack = self.editor.layers.layers();
+
+            // Every layer comes off the GPU whole, and all of them are held at
+            // once — 16 MB each at 2048², so a full stack is a few hundred
+            // megabytes for as long as the save takes. That is the price of a
+            // format that keeps layers, and `read_layer_rect` blocks, which is
+            // why this is only ever reached from an explicit Save and never
+            // from the drawing loop.
+            let pixels: Vec<Vec<u8>> = stack
+                .iter()
+                .map(|layer| {
+                    canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, layer.slot(), rect)
+                })
+                .collect();
+            // The flattened preview the format requires comes from the same
+            // composite pass the screen uses, so it cannot disagree with it.
+            let merged =
+                canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &self.editor.layer_draws());
+
+            let layers: Vec<SaveLayer<'_>> = stack
+                .iter()
+                .zip(&pixels)
+                .map(|(layer, px)| SaveLayer {
+                    name: &layer.name,
+                    visible: layer.visible,
+                    opacity: layer.opacity,
+                    blend: layer.blend,
+                    pixels: px,
+                })
+                .collect();
+
+            docformat::save(
+                &path,
+                &SaveDocument {
+                    size,
+                    layers: &layers,
+                    active: self.editor.layers.active_index(),
+                    merged: &merged,
+                },
+            )
+        };
+
+        match outcome {
+            Ok(warnings) => {
+                log::info!(
+                    "saved {} — {} × {}, {} layer(s)",
+                    path.display(),
+                    size.x,
+                    size.y,
+                    self.editor.layers.len(),
+                );
+                self.editor.mark_saved(path);
+                // Anything the format could not carry exactly is said out loud,
+                // for the same reason an import says what it dropped.
+                if !warnings.is_empty() {
+                    self.editor.notice = Some(Notice {
+                        title: format!("“{name}” saved with changes"),
+                        lines: warnings.iter().map(ToString::to_string).collect(),
+                    });
+                }
+                true
+            }
+            Err(error) => {
+                log::error!("could not save {}: {error}", path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not save “{name}”"),
+                    lines: vec![error.to_string()],
+                });
+                false
+            }
+        }
+    }
+
     /// Flatten the visible stack and write it to a PNG the user picks.
     fn export_png(&mut self) {
         let id = self.editor.session.active_id();
-        let suggested = format!("{}.png", self.editor.session.active_title());
+        // The tab is named after its file once it has one, so the suggestion
+        // has to lose that extension or it comes out as `sketch.ora.png`.
+        let stem = self.editor.session.active_title();
+        let stem = stem
+            .strip_suffix(&format!(".{}", docformat::EXTENSION))
+            .unwrap_or(stem);
+        let suggested = format!("{stem}.png");
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
             return;
@@ -713,6 +858,25 @@ impl UmberApp {
         }
         if actions.export {
             self.export_png();
+        }
+        if actions.save {
+            self.save_document(false);
+        }
+        if actions.save_as {
+            self.save_document(true);
+        }
+        if let Some(index) = actions.save_and_close {
+            // The prompt is always raised on the document in front, but the
+            // pairing is made explicit here: saving one tab and closing another
+            // would lose work in the most confusing way available. A switch to
+            // the tab that is already active costs nothing.
+            self.switch_document(index);
+            // Closed only on a written file. A cancelled dialog or a failed
+            // write leaves the tab open, still holding what it was about to
+            // lose.
+            if self.save_document(false) {
+                self.close_document(index);
+            }
         }
         if actions.add_layer {
             self.add_layer();
@@ -1324,6 +1488,36 @@ impl ApplicationHandler for UmberApp {
     }
 }
 
+/// The file's own name, for a message written to the user.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Make sure a chosen path ends in the extension Umber saves with.
+///
+/// Not every platform's save dialog appends the filter's extension, and a
+/// document written as plain `sketch` would never open again: `docimport`
+/// dispatches on the extension, so a file with none is refused by name before
+/// it is ever read.
+///
+/// The suffix is appended rather than substituted. `with_extension` would turn
+/// a deliberate `sketch.v2` into `sketch.ora`, quietly renaming the file the
+/// user asked for.
+fn with_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(docformat::EXTENSION))
+    {
+        return path;
+    }
+    let mut name = path.into_os_string();
+    name.push(".");
+    name.push(docformat::EXTENSION);
+    PathBuf::from(name)
+}
+
 /// Write straight-alpha RGBA8 out as a PNG.
 fn write_png(
     path: &std::path::Path,
@@ -1339,4 +1533,31 @@ fn write_png(
     encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
     encoder.write_header()?.write_image_data(pixels)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_file_always_ends_up_openable() {
+        // `docimport` dispatches on the extension, so a document saved as plain
+        // `sketch` would be refused by name the next time it was opened.
+        assert_eq!(with_extension("sketch".into()), PathBuf::from("sketch.ora"));
+        assert_eq!(
+            with_extension("sketch.ora".into()),
+            PathBuf::from("sketch.ora"),
+            "an extension already there must not be doubled"
+        );
+        assert_eq!(
+            with_extension("sketch.ORA".into()),
+            PathBuf::from("sketch.ORA"),
+            "the case of an extension is not Umber's to change"
+        );
+        assert_eq!(
+            with_extension("sketch.v2".into()),
+            PathBuf::from("sketch.v2.ora"),
+            "the name the user typed must survive whole"
+        );
+    }
 }

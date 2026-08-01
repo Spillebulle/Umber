@@ -7,11 +7,11 @@ decision below trades convenience for the shortest possible path between a pen
 moving and pixels changing.
 
 > **Status: early.** The canvas, brush, eraser, layers, colour picker, brush
-> editor, brush library, settings and PNG export work on desktop, and documents
-> written by Krita, Photoshop and any OpenRaster application can be opened.
-> Preferences — theme, layout, input and shortcut bindings — persist across
-> runs. Umber has no document format of its own and no mobile packaging yet.
-> See [Roadmap](#roadmap).
+> editor, brush library, settings and PNG export work on desktop; layered
+> documents can be saved and reopened, and documents written by Krita,
+> Photoshop and any OpenRaster application can be opened. Preferences — theme,
+> layout, input and shortcut bindings — persist across runs. There is no mobile
+> packaging yet. See [Roadmap](#roadmap).
 
 ## Building
 
@@ -194,6 +194,28 @@ holding the pen still keeps spraying.
 
 ### Documents
 
+**Umber saves to OpenRaster** (`.ora`) — the same format it reads. It has no
+container of its own and deliberately did not grow one: everything an Umber
+document holds is a canvas size and a stack of layers with a name, an opacity, a
+visibility and a blend mode, which is exactly what ORA is, and inventing a
+second spelling of it would have meant a second reader to keep in step. A `.ora`
+is a ZIP of PNGs and a small XML file, so a document made here opens in Krita,
+GIMP, MyPaint, Drawpile and Pinta as well. Three extra attributes carry what
+baseline ORA cannot — the selected layer, a document-format version, and Umber's
+own name for a blend mode where the SVG one is only approximate — and every
+other application ignores them, as XML readers do.
+
+**Ctrl+S** saves, **Ctrl+Shift+S** saves under a new name, and the tab strip's
+dot clears when it lands. Layers are written cropped to what they actually
+contain, so a sketch is a few hundred kilobytes rather than a few megabytes. The
+file is built whole and renamed into place, so a save interrupted by a full disk
+cannot leave a broken file where the last good one was. Closing a document with
+unsaved work offers to save it, and closes the tab only if a file was really
+written. What does not go in the file: undo history, the camera, and — since
+Umber has none — groups, masks and adjustment layers.
+`docs/document-format.md` records the whole of it, including why the round trip
+is byte-exact and where the format will have to grow.
+
 **File → Open**, or a file dropped on the window, reads documents written by
 other applications: **OpenRaster** (`.ora`), **Krita** (`.kra`), **Photoshop**
 (`.psd`) and flat **PNG**. Layers, names, opacity, visibility and blend modes
@@ -212,9 +234,8 @@ layers, history and camera, and its own GPU storage — switching tabs moves tha
 state wholesale rather than reloading anything. Closing a document with unsaved
 work asks first, and shows you the document before it asks.
 
-There is still no way to *write* a layered file: PNG export is flat, and Save
-is drawn disabled with a tooltip saying so. Reading someone else's format never
-needed a format of our own; writing one does.
+**Export flat PNG** is still there and still means what it says: one image, for
+showing people. Save is what keeps the layers.
 
 ### Not built yet
 
@@ -224,11 +245,10 @@ Taken from the design but not implemented, roughly by size:
   parts of the design's layout edit mode still outstanding. The rest of it is
   built — see [Layout edit mode](#layout-edit-mode).
 - The brush editor's **Texture** tab. Tip and Dynamics are built.
-- A document format of Umber's own. Other applications' files open (see
-  [Documents](#documents)) and PNG export works, but nothing can be saved and
-  reopened with its layers intact.
 - The Navigator overlay, Palette and Harmony colour modes, and per-brush blend
   modes.
+- **Autosave and recovery.** Saving works and does not lose work when it fails;
+  it does not yet protect you from not having done it.
 - The design shows a sixteen-tool rail; Umber has four. The missing twelve are
   not drawn rather than shown as buttons that do nothing.
 
@@ -255,6 +275,7 @@ them at a different weight and size on each OS.
 | Wheel | Zoom at cursor |
 | `Ctrl` + `0` / `1` | Fit to window / 100% |
 | `Ctrl` + `Z`, `Ctrl` + `Shift` + `Z` | Undo / redo |
+| `Ctrl` + `S`, `Ctrl` + `Shift` + `S` | Save / save as… |
 | Two-finger drag (touch) | Pan and pinch-zoom |
 | Drag a panel header (layout edit mode) | Move that module to a sidebar, or over the canvas |
 | `Esc` while dragging | Put the module back where it came from |
@@ -362,7 +383,8 @@ cargo test
 ```
 
 The engine tests are pure CPU and cover dab spacing, camera transforms, colour
-conversion and undo accounting. The renderer tests are **headless GPU tests**:
+conversion, undo accounting, and the document round trip — a stack built in
+memory, written to an `.ora` and read back byte for byte. The renderer tests are **headless GPU tests**:
 they create a device with no surface, stamp real dabs, commit, and read pixels
 back to assert on them. They skip rather than fail on a machine with no adapter.
 
@@ -375,9 +397,11 @@ rather than removing it.
 
 Next, roughly in order:
 
-- A document format — saving and reopening a layered file. Reading other
-  applications' files already works; this is the writing half.
 - Structural undo, so layer add/delete/reorder joins the history
+- Getting the save off the drawing thread. It reads every layer back from the
+  GPU with a blocking call, so a large document pauses for a moment — the one
+  place left where Umber does the thing it exists not to do.
+- Autosave and crash recovery, now that there is a format to write them in
 - Tile-based sparse canvas storage, for very large and infinite canvases
 - Android and iOS build scaffolding
 - Native tablet pressure on desktop

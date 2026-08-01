@@ -1,4 +1,5 @@
-//! Turning imported pixels into the exact bytes a layer texture holds.
+//! Turning imported pixels into the exact bytes a layer texture holds, and
+//! back again.
 //!
 //! Every format this module reads — ORA, KRA, PSD, PNG — stores **sRGB-encoded,
 //! straight-alpha** RGBA8. Umber's layer textures do not hold that. They are
@@ -20,6 +21,14 @@
 //! Note the premultiply happens in **linear** space and the encode after it.
 //! Multiplying the sRGB byte by alpha instead — the tempting one-liner — is
 //! wrong by a full gamma curve on every partly transparent pixel.
+//!
+//! # The other direction
+//!
+//! [`decode_pixel`] inverts all of that, because saving a document has to write
+//! the straight-alpha sRGB that every interchange format — ORA included —
+//! stores. The two must remain exact inverses on the bytes a layer texture can
+//! actually hold, or a document would drift a little every time it was saved and
+//! reopened; `saving_and_reopening_does_not_move_a_pixel` pins that down.
 
 use std::sync::OnceLock;
 
@@ -73,6 +82,50 @@ pub fn encode_buffer(buf: &mut [u8]) {
     }
 }
 
+/// `[alpha][stored] -> straight byte`. The inverse of [`TABLE`].
+static UNTABLE: OnceLock<Box<[u8; 256 * 256]>> = OnceLock::new();
+
+fn untable() -> &'static [u8; 256 * 256] {
+    UNTABLE.get_or_init(|| {
+        let mut t = Box::new([0u8; 256 * 256]);
+        for a in 1..256usize {
+            let alpha = a as f32 / 255.0;
+            for s in 0..256usize {
+                let linear = srgb_to_linear(s as f32 / 255.0);
+                // A stored value above its own alpha cannot come from a real
+                // layer — premultiplied colour is bounded by it — but a file
+                // damaged in transit could produce one, and `linear_to_srgb`
+                // of something over 1.0 is not a colour.
+                let straight = (linear / alpha).min(1.0);
+                t[a * 256 + s] = (linear_to_srgb(straight) * 255.0 + 0.5) as u8;
+            }
+        }
+        // Alpha 0 stays at the zeroed row: there is no colour to recover, and
+        // inventing one would put ink into pixels the artist erased.
+        t
+    })
+}
+
+/// Convert one layer-texture pixel back to straight-alpha sRGB.
+pub fn decode_pixel(px: [u8; 4]) -> [u8; 4] {
+    let t = untable();
+    let a = px[3] as usize * 256;
+    [
+        t[a + px[0] as usize],
+        t[a + px[1] as usize],
+        t[a + px[2] as usize],
+        px[3],
+    ]
+}
+
+/// Convert a whole RGBA8 buffer in place, layer-texture form to straight alpha.
+pub fn decode_buffer(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % 4, 0, "not a whole number of RGBA pixels");
+    for px in buf.chunks_exact_mut(4) {
+        px.copy_from_slice(&decode_pixel([px[0], px[1], px[2], px[3]]));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,10 +175,54 @@ mod tests {
     }
 
     #[test]
+    fn saving_and_reopening_does_not_move_a_pixel() {
+        // The invariant the document format rests on. Every byte a layer
+        // texture can hold is written out as straight alpha and read back, and
+        // has to land on itself: a document that drifted by one level per save
+        // would be visibly wrong after an afternoon's work.
+        //
+        // Not every straight-alpha value survives the other way round — a
+        // premultiplied byte at alpha 1 has only fourteen reachable values, so
+        // colour there is quantised on the way *in*. That loss belongs to the
+        // texture, not to the format, and it has already happened by the time
+        // anything here is asked to save.
+        // Driven from `encode_pixel` rather than from every (byte, alpha) pair,
+        // because those are the values a layer texture can actually contain:
+        // premultiplied colour never exceeds its own alpha, and asserting on
+        // pairs that cannot occur would only pin down arithmetic on rubbish.
+        for a in 0..=255u8 {
+            for v in 0..=255u8 {
+                let stored = encode_pixel([v, v, v, a]);
+                let round = encode_pixel(decode_pixel(stored));
+                assert_eq!(round, stored, "colour {v} at alpha {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn erased_pixels_stay_erased() {
+        assert_eq!(decode_pixel([0, 0, 0, 0]), [0, 0, 0, 0]);
+        // Opaque is the identity in both directions.
+        assert_eq!(decode_pixel([12, 200, 7, 255]), [12, 200, 7, 255]);
+    }
+
+    #[test]
+    fn half_alpha_white_comes_back_white() {
+        // The inverse of `half_alpha_white_is_linear_not_srgb_half`: the stored
+        // ~188 is linear 0.5 premultiplied, which is white at half alpha. A
+        // decode that divided in sRGB would give ~215 instead.
+        let out = decode_pixel([188, 188, 188, 128]);
+        assert!((out[0] as i32 - 255).abs() <= 1, "got {}", out[0]);
+    }
+
+    #[test]
     fn buffer_and_pixel_paths_agree() {
         let mut buf = vec![10, 20, 30, 40, 255, 128, 0, 200];
         encode_buffer(&mut buf);
         assert_eq!(&buf[0..4], encode_pixel([10, 20, 30, 40]));
         assert_eq!(&buf[4..8], encode_pixel([255, 128, 0, 200]));
+
+        decode_buffer(&mut buf);
+        assert_eq!(&buf[0..4], decode_pixel(encode_pixel([10, 20, 30, 40])));
     }
 }

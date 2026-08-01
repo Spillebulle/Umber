@@ -27,7 +27,7 @@ reported in `ImportedDocument::warnings`, which the UI shows.
 
 | Format | Verdict | Notes |
 |---|---|---|
-| `.ora` OpenRaster | **Landed, exact** | Open specification; layers, offsets, opacity, visibility and blend modes all arrive. |
+| `.ora` OpenRaster | **Landed, exact** | Open specification; layers, offsets, opacity, visibility and blend modes all arrive. Also what Umber *writes* — see `document-format.md`. |
 | `.kra` Krita | **Landed, layer-aware** | 8-bit RGBA documents read tile by tile. Anything else falls back to the embedded composite, with a warning. |
 | `.psd` Photoshop | **Landed, lossy** | 8-bit RGB only. Groups flatten, masks and clipping are dropped, and every loss is reported. |
 | `.png` | **Landed, exact** | A single layer. Also the decoder ORA uses. |
@@ -330,12 +330,14 @@ transposing the Krita tile planes each make the suite fail.
 
 ```rust
 pub fn import(path: &Path) -> Result<ImportedDocument, ImportError>;
+pub fn read_openraster(bytes: &[u8]) -> Result<ImportedDocument, ImportError>;
 pub fn supported_extensions() -> &'static [&'static str];  // ["ora", "kra", "psd", "png"]
 
 pub struct ImportedDocument {
     pub format: SourceFormat,
     pub size: UVec2,
     pub layers: Vec<ImportedLayer>,   // bottom first, like LayerStack
+    pub active: Option<usize>,        // only Umber's own files say; None means the top
     pub warnings: Vec<ImportWarning>, // empty means nothing was lost
 }
 
