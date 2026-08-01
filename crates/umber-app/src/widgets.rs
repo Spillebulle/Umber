@@ -36,11 +36,66 @@ pub fn slider_row(
     log: bool,
     display: impl Fn(f32) -> String,
 ) -> bool {
+    slider_body(ui, p, label, value, range, log, display).0
+}
+
+/// [`slider_row`], but the value is only handed back when the drag ends.
+///
+/// For the one case where the slider is drawn *inside* the thing it changes.
+/// The interface scale is that case: applying it every frame rescales the
+/// dialog under the pointer, which moves the track, which changes the value the
+/// pointer is now over — so the knob runs away from the cursor and the setting
+/// is impossible to land on. Every other slider in Umber changes something the
+/// slider is not part of, and those want the immediate version; this is not a
+/// better default, it is a different situation.
+///
+/// The in-progress value lives in egui's temporary store rather than in the
+/// caller. It has to: the caller reads its copy back out of the thing being
+/// set, which by construction has not been set yet, so a caller-held value
+/// would snap back to the old scale on the very next frame.
+pub fn slider_row_deferred(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    log: bool,
+    display: impl Fn(f32) -> String,
+) -> bool {
+    let id = ui.id().with(("deferred-slider", label));
+    let mut shown = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(*value);
+    let (_, response) = slider_body(ui, p, label, &mut shown, range, log, display);
+
+    // Still held. Keep drawing where the pointer is and tell the caller
+    // nothing, so the interface stays at the scale the drag started from.
+    if response.is_pointer_button_down_on() {
+        ui.ctx().data_mut(|d| d.insert_temp(id, shown));
+        return false;
+    }
+
+    ui.ctx().data_mut(|d| d.remove::<f32>(id));
+    if shown != *value {
+        *value = shown;
+        true
+    } else {
+        false
+    }
+}
+
+fn slider_body(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    log: bool,
+    display: impl Fn(f32) -> String,
+) -> (bool, Response) {
     let (lo, hi) = (*range.start(), *range.end());
     let log = log && lo > 0.0 && hi > lo;
     let mut changed = false;
 
-    ui.scope(|ui| {
+    let response = ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
 
         // A panel squeezed to its minimum can leave nothing here at all, and a
@@ -86,9 +141,10 @@ pub fn slider_row(
             to_t(*value, lo, hi, log),
             metrics::SLIDER_KNOB,
         );
+        response
     });
 
-    changed
+    (changed, response.inner)
 }
 
 /// Pill toggle, 28×16 with a sliding knob.

@@ -68,6 +68,9 @@ const WIDTH: f32 = 1000.0;
 const HEIGHT: f32 = 640.0;
 /// The design's left rail.
 const RAIL_WIDTH: f32 = 190.0;
+/// The dialog's corner radius. Shared with the rail, which reaches both left
+/// corners and has to round with it.
+const CORNER: u8 = 10;
 
 /// Draw the dialog if it is open, and keep the preferences file in step.
 pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
@@ -98,7 +101,7 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Frame::NONE
                 .fill(p.window)
                 .stroke(Stroke::new(1.0, p.popover_border))
-                .corner_radius(10)
+                .corner_radius(CORNER)
                 .inner_margin(Margin::ZERO),
         )
         .show(root.ctx(), |ui| {
@@ -129,10 +132,34 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     }
 }
 
+/// Height the footer — the hairline, the path and the reset button — claims at
+/// the bottom of every pane.
+///
+/// Named because two places have to agree on it: the pane, which pushes the
+/// footer down by whatever is left, and the Shortcuts list, which grows to fill
+/// that same space and would otherwise slide underneath it.
+const FOOTER_RESERVE: f32 = 34.0;
+
+/// Breathing space between a pane's last control and the footer's hairline.
+const LIST_GAP: f32 = 12.0;
+
+/// Gap between the theme cards.
+const CARD_GAP: f32 = 12.0;
+
 /// The design's left rail: title, tabs, then the version at the foot.
 fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     Frame::NONE
         .fill(p.chrome)
+        // The rail is the full height of the dialog and runs into both left
+        // corners, so it has to carry the dialog's own radius there. A square
+        // fill under a rounded frame does not get clipped by it — it paints
+        // over the corner, and the chrome pokes out past the border.
+        .corner_radius(egui::CornerRadius {
+            nw: CORNER,
+            sw: CORNER,
+            ne: 0,
+            se: 0,
+        })
         .inner_margin(Margin::symmetric(8, 16))
         .show(ui, |ui| {
             ui.set_min_height(ui.available_height());
@@ -247,7 +274,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 }
             }
 
-            let left = (ui.available_height() - 34.0).max(0.0);
+            let left = (ui.available_height() - FOOTER_RESERVE).max(0.0);
             ui.allocate_space(vec2(0.0, left));
             storage_footer(ui, p, ed);
         });
@@ -264,7 +291,11 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         // egui's zoom factor is the single source of truth for this; keeping a
         // second copy alongside it is how the two end up disagreeing.
         let mut scale = ui.ctx().zoom_factor();
-        if widgets::slider_row(
+        // The one deferred slider in the application. This one is drawn inside
+        // the thing it scales, so applying it per frame moves the track out
+        // from under the pointer and the knob runs away; see
+        // `widgets::slider_row_deferred`.
+        if widgets::slider_row_deferred(
             ui,
             p,
             "Interface scale",
@@ -414,6 +445,11 @@ fn pressure_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 
 fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.horizontal(|ui| {
+        // The dialog butts its rail against its pane with no gutter, and that
+        // zero horizontal spacing is inherited all the way down here — which
+        // left the theme cards touching. Set rather than left to the default,
+        // because the default is whatever the enclosing layout last said.
+        ui.spacing_mut().item_spacing.x = CARD_GAP;
         for kind in ThemeKind::ALL {
             if theme_card(ui, p, kind, ed.ui.theme == kind) {
                 ed.ui.theme = kind;
@@ -455,13 +491,44 @@ fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -
 
     let painter = ui.painter();
     let body = Rect::from_min_size(rect.min, vec2(rect.width(), 74.0));
+
+    // Every band has to round wherever it meets the card's edge and stay square
+    // everywhere else. egui clips rectangularly, so a rounded frame does not
+    // trim what is painted inside it — a square band simply covers the corner,
+    // and the theme's colour appears outside the card's outline.
+    let r = metrics::RADIUS_LARGE as u8;
+    let top = egui::CornerRadius {
+        nw: r,
+        ne: r,
+        sw: 0,
+        se: 0,
+    };
+    let bottom = egui::CornerRadius {
+        nw: 0,
+        ne: 0,
+        sw: r,
+        se: r,
+    };
+    let top_left = egui::CornerRadius {
+        nw: r,
+        ne: 0,
+        sw: 0,
+        se: 0,
+    };
+    let top_right = egui::CornerRadius {
+        nw: 0,
+        ne: r,
+        sw: 0,
+        se: 0,
+    };
+
     painter.rect_filled(rect, metrics::RADIUS_LARGE, swatch.window);
-    painter.rect_filled(body, metrics::RADIUS_LARGE, swatch.backdrop);
+    painter.rect_filled(body, top, swatch.backdrop);
 
     // Rail, canvas, dock — the design's three-band miniature.
     painter.rect_filled(
         Rect::from_min_size(body.left_top(), vec2(14.0, body.height())),
-        0.0,
+        top_left,
         swatch.chrome,
     );
     painter.rect_filled(
@@ -469,7 +536,7 @@ fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -
             egui::pos2(body.right() - 26.0, body.top()),
             vec2(26.0, body.height()),
         ),
-        0.0,
+        top_right,
         swatch.dock,
     );
     painter.rect_filled(
@@ -492,7 +559,7 @@ fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -
         egui::pos2(rect.left(), body.bottom()),
         vec2(rect.width(), rect.height() - body.height()),
     );
-    painter.rect_filled(strip, 0.0, swatch.chrome);
+    painter.rect_filled(strip, bottom, swatch.chrome);
     painter.text(
         strip.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
@@ -820,13 +887,19 @@ fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette) {
     // 3. The list.
     let query = editing.query.trim().to_lowercase();
     let mut request: Option<(Action, RowRequest)> = None;
+    // Fill the pane down to the footer rather than stopping at a fixed height.
+    // This is the longest list in the dialog and the only one worth scrolling,
+    // so a third of the pane sitting empty below it was wasted on the one tab
+    // that could use it. The frame's own 1 px border is inside this, hence the
+    // two; `LIST_GAP` is the breathing space above the footer's hairline.
     Frame::NONE
         .fill(p.window)
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(metrics::RADIUS_LARGE)
         .show(ui, |ui| {
+            let height = (ui.available_height() - FOOTER_RESERVE - LIST_GAP - 2.0).max(140.0);
             egui::ScrollArea::vertical()
-                .max_height(232.0)
+                .max_height(height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
