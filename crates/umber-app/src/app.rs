@@ -344,6 +344,16 @@ impl UmberApp {
             // by identity and returns without touching the GPU.
             canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
 
+            // The selection, on exactly the same footing and for the same
+            // reasons: one binding covers a whole dab pass, and a selection
+            // changed mid-stroke would leave the coverage already in the
+            // scratch clipped by one that has gone. Compared by `Arc`
+            // identity, so an unchanged selection costs a pointer comparison —
+            // and this is also what re-binds it after a tab switch or an
+            // Android resume, where the renderer is a different object.
+            let selection = self.editor.selection.clone();
+            canvas.set_selection(&gfx.gpu.device, &gfx.gpu.queue, selection);
+
             // The paper, on the same footing and for the same reasons: one
             // binding per pass, changed only between strokes. Read off the
             // *snapshotted* brush, so changing the Texture sliders mid-stroke
@@ -512,6 +522,22 @@ impl UmberApp {
             return false;
         }
 
+        // Escape abandons the outline being drawn and Enter closes it. Neither
+        // is in the binding table: they are answers to "there is a gesture in
+        // progress", not commands, and a rebindable Escape that sometimes
+        // meant nothing would be a row in the settings list that lies. They
+        // are also claimed only while a draft exists, so Escape goes on
+        // reaching whatever else wants it.
+        if matches!(key, KeyCode::Escape) && self.editor.cancel_selection_draft() {
+            return true;
+        }
+        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter)
+            && self.editor.selection_draft.is_some()
+        {
+            self.editor.finish_selection();
+            return true;
+        }
+
         let Some(action) = shortcuts::resolve(&self.bindings, key, self.modifiers) else {
             return false;
         };
@@ -525,8 +551,10 @@ impl UmberApp {
             }
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
+            Action::Deselect => self.editor.deselect(),
             Action::BrushTool => self.editor.set_tool(Tool::Brush),
             Action::EraserTool => self.editor.set_tool(Tool::Eraser),
+            Action::SelectTool => self.editor.set_tool(Tool::Select),
             Action::PanTool => self.editor.set_tool(Tool::Pan),
             Action::ZoomTool => self.editor.set_tool(Tool::Zoom),
             Action::SwapColours => self.editor.swap_colors(),
@@ -1389,6 +1417,10 @@ impl UmberApp {
                 doc,
                 layers,
                 history,
+                // Nothing in any format Umber reads carries one, and a
+                // selection invented at import would be a claim about the
+                // artist's intent that the file did not make.
+                selection: None,
             },
             name.clone(),
             Some(path.to_path_buf()),
@@ -1746,6 +1778,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                         let point = self.editor.sample(pos, None);
                         self.editor.stroke.extend(point);
                     }
+                    Interaction::Selecting => {
+                        let doc = self.editor.screen_to_doc(pos);
+                        self.editor.selection_moved(doc);
+                    }
                     Interaction::Panning => {
                         let delta = pos - self.editor.last_cursor;
                         self.editor.camera.pan_by_screen(delta);
@@ -1758,7 +1794,18 @@ impl ApplicationHandler<Wake> for UmberApp {
                         let anchor = self.editor.zoom_anchor;
                         self.editor.camera.zoom_at(anchor, factor, pivot);
                     }
-                    Interaction::Idle => {}
+                    // A polygon whose gesture was interrupted — by a middle
+                    // drag to pan, say, which takes the interaction over
+                    // without abandoning the outline. The rubber band still
+                    // has to follow the pointer, or the tool looks dead until
+                    // the next click lands a vertex somewhere unexpected.
+                    Interaction::Idle => {
+                        if self.editor.selection_draft.is_some() {
+                            let doc = self.editor.screen_to_doc(pos);
+                            self.editor.selection_moved(doc);
+                            self.editor.interaction = Interaction::Selecting;
+                        }
+                    }
                 }
                 if self.editor.interaction != Interaction::Idle
                     && let Some(g) = self.gfx.as_ref()
@@ -1793,6 +1840,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                                 let point = self.editor.sample(pos, None);
                                 self.start_stroke(point);
                             }
+                            Tool::Select => {
+                                let doc = self.editor.screen_to_doc(pos);
+                                self.editor.selection_press(doc);
+                            }
                             Tool::Pan => self.editor.interaction = Interaction::Panning,
                             Tool::Zoom => {
                                 self.editor.zoom_anchor = pos;
@@ -1802,6 +1853,15 @@ impl ApplicationHandler<Wake> for UmberApp {
                     } else if !pressed {
                         match self.editor.interaction {
                             Interaction::Drawing => self.finish_stroke(),
+                            // The polygon is the one gesture a release does not
+                            // end — it is a sequence of clicks, and stopping on
+                            // the first button-up would make it a line every
+                            // time. `selection_release` is what knows that, so
+                            // the interaction is left alone here.
+                            Interaction::Selecting => {
+                                let doc = self.editor.screen_to_doc(self.editor.cursor);
+                                self.editor.selection_release(doc);
+                            }
                             _ => self.editor.interaction = Interaction::Idle,
                         }
                     }

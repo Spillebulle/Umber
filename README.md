@@ -12,8 +12,8 @@ Umber paints on the GPU, reads brushes written for MyPaint, GIMP, Krita and
 Photoshop, opens documents from Krita and Photoshop, and saves to OpenRaster, so
 nothing you make here is trapped here.
 
-> **Early days.** Painting, layers, brushes, documents and settings all work on
-> desktop. There is no mobile build yet, and no selection, text or transform
+> **Early days.** Painting, layers, brushes, documents, selections and settings
+> all work on desktop. There is no mobile build yet, and no text or transform
 > tools. [What is not there yet](#what-is-not-there-yet) is honest about the
 > rest.
 
@@ -250,12 +250,35 @@ for.
 Closing the window with unsaved work asks first, and names every document at
 risk.
 
+## Selections
+
+The **Select** tool marks out where edits may land, in one of three ways,
+chosen from the dropdown in the tool options strip:
+
+| | |
+|---|---|
+| **Rectangle** | Drag a box |
+| **Lasso** | Draw round it freehand |
+| **Polygon** | Click point to point; click the first point again, or press `Enter`, to close |
+
+Everything the brush and the eraser do is then clipped to it, edges included:
+the outline is antialiased, so a diagonal is a diagonal rather than a staircase.
+A click on the canvas with nothing enclosed clears the selection, as does
+`Ctrl` + `D`.
+
+The outline stays drawn whatever tool you pick up, because it is how you know
+your painting is being held back. It is a plain dashed line rather than
+animated marching ants: animating it means asking for a new frame for ever, and
+Umber sits still when you do.
+
 ## Controls
 
 | Input | Action |
 |---|---|
 | Left drag | Use the selected tool |
-| `B` / `E` / `H` / `Z` | Brush / eraser / pan / zoom |
+| `B` / `E` / `S` / `H` / `Z` | Brush / eraser / select / pan / zoom |
+| `Ctrl` + `D` | Deselect |
+| `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
 | `[` / `]` | Decrease / increase brush size |
@@ -281,7 +304,10 @@ Settings → Pressure. A native tablet path is on the roadmap.
 
 ## What is not there yet
 
-- **Selections, text, shapes and transforms.** The tool rail has four tools.
+- **Text, shapes and transforms.** The tool rail has five tools. Selections
+  work — rectangle, freehand lasso and polygon, and painting is clipped to them
+  — but there is nothing yet to move, scale or rotate what one holds, no way to
+  add to or subtract from one, and no feather.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
   been built or run. Do not believe anyone who says otherwise.
 - **Automatic crash recovery.** Autosave keeps copies and Settings will open the

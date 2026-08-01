@@ -18,8 +18,10 @@ pub enum Action {
     SaveAs,
     Undo,
     Redo,
+    Deselect,
     BrushTool,
     EraserTool,
+    SelectTool,
     PanTool,
     ZoomTool,
     SizeDown,
@@ -37,13 +39,15 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 17] = [
         Action::Save,
         Action::SaveAs,
         Action::Undo,
         Action::Redo,
+        Action::Deselect,
         Action::BrushTool,
         Action::EraserTool,
+        Action::SelectTool,
         Action::PanTool,
         Action::ZoomTool,
         Action::SizeDown,
@@ -62,8 +66,10 @@ impl Action {
             Action::SaveAs => "Save as…",
             Action::Undo => "Undo",
             Action::Redo => "Redo",
+            Action::Deselect => "Deselect",
             Action::BrushTool => "Brush tool",
             Action::EraserTool => "Eraser tool",
+            Action::SelectTool => "Selection tool",
             Action::PanTool => "Pan tool",
             Action::ZoomTool => "Zoom tool",
             Action::SizeDown => "Decrease brush size",
@@ -80,8 +86,12 @@ impl Action {
     pub fn category(self) -> &'static str {
         match self {
             Action::Save | Action::SaveAs => "File",
-            Action::Undo | Action::Redo => "Edit",
-            Action::BrushTool | Action::EraserTool | Action::PanTool | Action::ZoomTool => "Tools",
+            Action::Undo | Action::Redo | Action::Deselect => "Edit",
+            Action::BrushTool
+            | Action::EraserTool
+            | Action::SelectTool
+            | Action::PanTool
+            | Action::ZoomTool => "Tools",
             Action::SizeDown | Action::SizeUp => "Brush",
             Action::SwapColours => "Colour",
             Action::FitView | Action::ActualSize | Action::ZoomIn | Action::ZoomOut => "View",
@@ -230,9 +240,11 @@ pub fn defaults() -> Vec<Binding> {
         // list is a `Vec<Binding>`, not a map keyed by action, precisely so an
         // action can carry more than one.
         binding(Action::Redo, KeyCode::KeyY, true, false, false),
+        binding(Action::Deselect, KeyCode::KeyD, true, false, false),
         // Tools
         binding(Action::BrushTool, KeyCode::KeyB, false, false, false),
         binding(Action::EraserTool, KeyCode::KeyE, false, false, false),
+        binding(Action::SelectTool, KeyCode::KeyS, false, false, false),
         binding(Action::PanTool, KeyCode::KeyH, false, false, false),
         binding(Action::ZoomTool, KeyCode::KeyZ, false, false, false),
         // Brush
@@ -844,7 +856,9 @@ mod tests {
         // modifier is compared exactly — otherwise Save as… would also save.
         assert_eq!(hit(KeyCode::KeyS, CTRL), Some(Action::Save));
         assert_eq!(hit(KeyCode::KeyS, CTRL | SHIFT), Some(Action::SaveAs));
-        assert_eq!(hit(KeyCode::KeyS, NONE), None);
+        // And plain S is the selection tool, not a third spelling of Save —
+        // the same pairing plain Z and Ctrl+Z have, and the same reason.
+        assert_eq!(hit(KeyCode::KeyS, NONE), Some(Action::SelectTool));
     }
 
     #[test]
