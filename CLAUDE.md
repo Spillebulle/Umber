@@ -830,6 +830,50 @@ is the default and passes it straight through; the enum's other arms are the
 mouse-only fallbacks. macOS and Linux have no equivalent path yet — do not
 describe pen pressure as working there.
 
+**1024 levels is not a limit worth lifting, and this has been measured.** A pen
+display resolving 8192 or 16384 is the standing reason to reach for WinTab —
+`wintab32.dll` does report the device's native axis through
+`WTInfo(WTI_DEVICES, DVC_NPRESSURE, …)`, and that is why Photoshop, Krita and
+Clip Studio all carry a WinTab/Windows Ink switch. The route exists. What it
+would reach does not, and `examples/measure-pressure.rs` is what says so —
+re-run it before anyone rebuilds this argument from memory:
+
+- **Coverage gains exactly nothing.** The scratch is `R8Unorm`, so a dab has 256
+  expressible coverages, and sweeping the shipped library at 1024 levels already
+  produces all 256 — median *and* maximum. At 16384 the count is the same 256.
+  These are not levels that are hard to see; they are levels with nowhere in the
+  pipeline to be put. `max` and build-up both blend inside that same target, and
+  commit writes `Rgba8UnormSrgb`, so neither overlap nor accumulation widens the
+  set.
+- **Size gains less than a pixel.** Across the 142 shipped brushes whose size
+  follows pressure, one level of 1024 moves the diameter by a median of 0.0245
+  document pixels — 41 levels per pixel — and 0.28 px at the ninetieth
+  percentile. Only the largest brush in the library exceeds a pixel, at 1.56 px
+  on a dab 1045 px wide, which is 0.15% of its own width and narrower than its
+  antialiased edge. The count of distinct whole-pixel diameters over the whole
+  sweep is identical at both resolutions: `Brush::size` and `min_size_ratio`
+  bound it, not the input.
+- **The light-touch end is compressed by design, so it is the weakest case
+  rather than the strongest.** Resolution near zero is the usual argument for a
+  finer axis, but `min_size_ratio` (median 0.08) puts a floor under the radius,
+  `radius_at` clamps at 0.5 px, and `EASE_IN` — the "light hand stays thin"
+  curve — has a slope of 0.24 there. Over the lightest twentieth of the axis the
+  median brush reaches three distinct quarter-pixel diameters at 1024 levels and
+  the same three at 16384.
+- **Two things downstream would blunt a real gain anyway.**
+  `StrokeBuilder::emit_segment` lerps pressure between consecutive samples, so
+  the dabs between two reports already get continuous floats and a stroke's ramp
+  is never a staircase of the input quantisation. And the event rate is the
+  coarser axis: a half-second ramp at ~200 Hz is about a hundred samples for a
+  thousand available levels, so the granularity a painter can actually meet is
+  in *time*, not in the value.
+
+So do not add a WinTab path *for pressure resolution*. If one is ever built it
+has to be justified by something else it carries — barrel buttons, tilt and
+rotation, or a driver whose Windows Ink path is broken — and `wintab32.dll` must
+be `dlopen`ed rather than linked, for the reason the Vulkan loader is: a machine
+with no tablet driver does not have the library and must still start.
+
 ## Releasing
 
 ```sh
