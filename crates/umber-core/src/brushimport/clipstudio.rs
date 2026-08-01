@@ -1345,6 +1345,61 @@ mod tests {
         assert!(err.to_string().contains("no brushes"), "{err}");
     }
 
+    /// A `.sut` is somebody else's binary file, and this reader is a hand-written
+    /// walk over a page tree with offsets taken out of that file. Every slice it
+    /// cuts is one a corrupt header could aim past the end.
+    ///
+    /// So the standard is the same one the importers are all held to: a file
+    /// that makes no sense is **refused**, never fatal. A panic here would take
+    /// the whole application down — with every unsaved document in it — because
+    /// somebody opened the wrong file. That is a far worse outcome than a
+    /// refusal, and it is not a theoretical risk: the failure would arrive as a
+    /// bug report saying "Umber closes when I import my brushes".
+    ///
+    /// Truncations walk the length; the corruptions concentrate on the first
+    /// kilobyte, where the file header, the schema and the root page live and
+    /// where a wrong number does the most damage. Deterministic rather than
+    /// random, so a failure can be reproduced from the seed alone.
+    #[test]
+    fn a_corrupt_file_is_refused_and_never_panics() {
+        let good = sut(
+            &[
+                ("Sketch", Variant::plain(1082).real("BrushSize", 6.5)),
+                ("Ink", Variant::plain(1082).real("BrushSize", 22.0)),
+            ],
+            &[],
+        );
+
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for i in 0..good.len().min(256) {
+            cases.push(good[..good.len() * i / 256].to_vec());
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..512 {
+            let mut c = good.clone();
+            for _ in 0..6 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let reach = c.len().min(1024);
+                let at = (seed >> 33) as usize % reach;
+                c[at] ^= ((seed >> 11) & 0xff) as u8;
+            }
+            cases.push(c);
+        }
+
+        for (i, case) in cases.iter().enumerate() {
+            // Whatever it decides, it must decide it — `from_sut` returning
+            // either arm is a pass; unwinding is not.
+            let verdict = std::panic::catch_unwind(|| from_sut(case).is_ok());
+            assert!(
+                verdict.is_ok(),
+                "case {i} ({} bytes) panicked instead of being refused",
+                case.len()
+            );
+        }
+    }
+
     #[test]
     fn a_file_that_is_not_a_database_is_refused() {
         assert!(from_sut(b"this is not a sub tool").is_err());
