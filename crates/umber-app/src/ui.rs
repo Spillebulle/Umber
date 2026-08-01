@@ -19,6 +19,7 @@ use crate::dock::Side;
 use crate::editor::{BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
+use crate::shortcuts::{self, Action};
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
@@ -30,6 +31,15 @@ use umber_core::{Brush, ResponseCurve, input::PressureSource};
 pub struct UiActions {
     pub clear: bool,
     pub export: bool,
+    /// Write the document to the file it came from, asking for one if it has
+    /// none yet.
+    pub save: bool,
+    /// Always ask for a file, even when the document already has one.
+    pub save_as: bool,
+    /// Save, and close this document if — and only if — the save succeeds.
+    /// Cancelling the file dialog therefore leaves the tab open, which is the
+    /// only safe reading of "Save" on a prompt about losing work.
+    pub save_and_close: Option<usize>,
     pub undo: bool,
     pub redo: bool,
     pub fit_view: bool,
@@ -137,9 +147,12 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
 
     match tabs::close_prompt(root, &p, ed) {
         Some(tabs::CloseChoice::Close) => actions.close_tab = ed.ui.close_prompt.take(),
-        // Export is the one thing that can preserve the work, so the prompt
-        // stays open behind it — exporting is not itself an answer to
-        // "close this?".
+        // The prompt closes now, but the tab only closes if the save succeeds —
+        // a cancelled file dialog must not be a silent discard. See
+        // `UiActions::save_and_close`.
+        Some(tabs::CloseChoice::Save) => actions.save_and_close = ed.ui.close_prompt.take(),
+        // Export keeps a copy of the picture but is not an answer to "close
+        // this?", so the prompt stays open behind it.
         Some(tabs::CloseChoice::Export) => actions.export = true,
         Some(tabs::CloseChoice::Cancel) | None => {}
     }
@@ -188,6 +201,16 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.open_file = true;
                     ui.close();
                 }
+                ui.separator();
+                if menu_item(ui, "Save", Action::Save).clicked() {
+                    actions.save = true;
+                    ui.close();
+                }
+                if menu_item(ui, "Save as…", Action::SaveAs).clicked() {
+                    actions.save_as = true;
+                    ui.close();
+                }
+                ui.separator();
                 // Only offered while there is another document to fall back to;
                 // Umber has nowhere to go with nothing open.
                 if ui
@@ -207,18 +230,16 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.clear = true;
                     ui.close();
                 }
-                if ui.button("Export flat PNG…").clicked() {
+                if ui
+                    .button("Export flat PNG…")
+                    .on_hover_text(
+                        "One flattened image, for showing people. Save keeps the layers.",
+                    )
+                    .clicked()
+                {
                     actions.export = true;
                     ui.close();
                 }
-                ui.separator();
-                // Shown but inert: reading other applications' files works, but
-                // Umber has no format of its own to write, and a Save that
-                // cannot save would be worse than the gap it papers over.
-                ui.add_enabled(false, egui::Button::new("Save"))
-                    .on_disabled_hover_text(
-                        "Umber has no document format yet — export a flat PNG instead",
-                    );
             });
 
             ui.menu_button("Edit", |ui| {
@@ -294,6 +315,21 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
             );
         });
     });
+}
+
+/// A menu entry that shows the chord currently bound to it.
+///
+/// Read out of the live binding table rather than typed next to the label, so a
+/// rebind in the settings dialog reaches the menu as well — and an action left
+/// unbound shows no chord instead of a stale one. `published` clones the table,
+/// which is only ever paid while a menu is open.
+fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui::Response {
+    let chord = shortcuts::published()
+        .iter()
+        .find(|b| b.action == action)
+        .map(|b| b.chord().display())
+        .unwrap_or_default();
+    ui.add(egui::Button::new(label).shortcut_text(chord))
 }
 
 /// The horizontal strip of settings for the current tool.
@@ -505,13 +541,18 @@ fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
                 .color(p.accent),
             );
         } else {
-            // The document is named rather than saved: there is no file behind
-            // it, so the line says what it is instead of pretending a path.
+            // The file the document lives in, named in full: the tab strip only
+            // has room for the file name, and knowing *which* sketch.ora is
+            // being painted on is exactly what a status bar is for. A document
+            // with no file yet says so rather than pretending a path.
             let tab = ed.session.active_tab();
+            let where_it_lives = match &tab.path {
+                Some(path) => path.display().to_string(),
+                None => format!("{} · not saved yet", tab.title),
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "{}{} · panels locked — Window, Customise layout",
-                    tab.title,
+                    "{where_it_lives}{} · panels locked — Window, Customise layout",
                     if tab.modified { " · unsaved" } else { "" },
                 ))
                 .size(text::TINY)

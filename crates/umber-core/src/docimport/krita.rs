@@ -98,6 +98,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         format: FORMAT,
         size: doc.size,
         layers,
+        active: None,
         warnings,
     })
 }
@@ -444,6 +445,7 @@ fn flattened_fallback(
             blend: BlendMode::Normal,
             pixels,
         }],
+        active: None,
         warnings,
     })
 }

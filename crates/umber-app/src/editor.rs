@@ -428,6 +428,11 @@ impl Editor {
         self.session.mark_modified();
     }
 
+    /// Note that the live document has been written to `path`.
+    pub fn mark_saved(&mut self, path: PathBuf) {
+        self.session.mark_saved(path);
+    }
+
     /// Every open document and its canvas size, live one included.
     ///
     /// Used to rebuild GPU storage after the surface has been destroyed and

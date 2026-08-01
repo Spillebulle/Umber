@@ -189,6 +189,7 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         format: FORMAT,
         size,
         layers,
+        active: None,
         warnings,
     })
 }
@@ -205,6 +206,7 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
             blend: BlendMode::Normal,
             pixels,
         }],
+        active: None,
         warnings,
     }
 }

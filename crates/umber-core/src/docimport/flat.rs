@@ -101,6 +101,7 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
             blend: BlendMode::Normal,
             pixels,
         }],
+        active: None,
         warnings: Vec::new(),
     })
 }

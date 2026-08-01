@@ -5,9 +5,9 @@
 //! a `+` at the end. That is what [`strip`] paints.
 //!
 //! The dialogs are here rather than in `ui.rs` because they are about
-//! documents, not about the workspace: [`close_prompt`], which has to be honest
-//! that closing a document destroys it, and [`notice`], which shows what an
-//! import could not bring across.
+//! documents, not about the workspace: [`close_prompt`], which is the last
+//! thing between unsaved work and nothing, and [`notice`], which shows what an
+//! import or a save could not carry across.
 
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use umber_core::docimport::ImportWarning;
@@ -153,7 +153,11 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
             tip.push_str(&path.display().to_string());
         }
         if tab.modified {
-            tip.push_str("\nUnsaved — Umber cannot save documents yet");
+            tip.push_str(if tab.path.is_some() {
+                "\nUnsaved changes"
+            } else {
+                "\nNever saved"
+            });
         }
         response.on_hover_text(tip);
     }
@@ -182,16 +186,18 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CloseChoice {
     Cancel,
-    /// Export a flat PNG — the only way to keep any of the work.
+    /// Write the document out, keeping its layers, and then close it.
+    Save,
+    /// Export a flat PNG — everything visible, but as one image.
     Export,
     Close,
 }
 
 /// Ask before closing a document that holds work.
 ///
-/// There is no Save button here, and there cannot be one: Umber has no document
-/// format, so nothing on this canvas can be written to disk and read back. The
-/// prompt says so, and offers the one thing that does work — a flat PNG export.
+/// Save is the affirmative answer and Discard is the destructive one, so Save
+/// gets the emphasis: this dialog is the last thing between an afternoon's work
+/// and nothing, and the button that keeps it should be the one the eye lands on.
 pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option<CloseChoice> {
     let index = ed.ui.close_prompt?;
     let Some(tab) = ed.session.tabs().get(index) else {
@@ -200,35 +206,36 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
     };
 
     let title = tab.title.clone();
-    let imported = tab.path.is_some();
+    // Whether Save will need to ask for a file, which is worth saying before
+    // the click rather than surprising the user with a dialog.
+    let has_file = tab.path.is_some();
     let mut choice = None;
 
     let modal = egui::Modal::new(egui::Id::new("close-document"))
         .frame(dialog_frame(p))
         .show(root.ctx(), |ui| {
-            ui.set_width(400.0);
+            ui.set_width(420.0);
             ui.label(
-                egui::RichText::new(format!("Close “{title}”?"))
+                egui::RichText::new(format!("Save “{title}” before closing?"))
                     .size(text::CONTROL)
                     .color(p.text_strong)
                     .strong(),
             );
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new(if imported {
-                    "This document has been painted on since it was opened. Umber \
-                     cannot save documents yet, so those changes will be lost — the \
-                     file it came from is untouched."
+                egui::RichText::new(if has_file {
+                    "This document has been painted on since it was last saved. \
+                     Closing without saving discards those changes for good."
                 } else {
-                    "Umber cannot save documents yet, so there is nothing to save \
-                     this to: closing the tab discards the painting for good."
+                    "This document has never been saved, so closing the tab \
+                     discards the painting for good."
                 })
                 .size(text::SMALL)
                 .color(p.text),
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Exporting a flat PNG is the only way to keep it.")
+                egui::RichText::new("Saving keeps every layer. A flat PNG keeps only the picture.")
                     .size(text::SMALL)
                     .color(p.text_dim),
             );
@@ -238,12 +245,15 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
                 if button(ui, p, "Cancel", false) {
                     choice = Some(CloseChoice::Cancel);
                 }
-                if button(ui, p, "Export PNG…", false) {
-                    choice = Some(CloseChoice::Export);
+                if button(ui, p, "Discard and close", false) {
+                    choice = Some(CloseChoice::Close);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if button(ui, p, "Discard and close", true) {
-                        choice = Some(CloseChoice::Close);
+                    if button(ui, p, if has_file { "Save" } else { "Save…" }, true) {
+                        choice = Some(CloseChoice::Save);
+                    }
+                    if button(ui, p, "Export PNG…", false) {
+                        choice = Some(CloseChoice::Export);
                     }
                 });
             });
