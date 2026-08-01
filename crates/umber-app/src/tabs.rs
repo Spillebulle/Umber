@@ -462,7 +462,13 @@ pub fn summarise(warnings: &[ImportWarning]) -> Vec<String> {
     out
 }
 
-fn dialog_frame(p: &Palette) -> Frame {
+/// The frame every modal in this application uses.
+///
+/// Shared out of here rather than copied: the About dialog and the update
+/// prompts are the same kind of thing as the close prompt and the import
+/// notice, and two spellings of one border is how a set of dialogs starts
+/// drifting apart.
+pub fn dialog_frame(p: &Palette) -> Frame {
     Frame::NONE
         .fill(p.popover)
         .stroke(Stroke::new(1.0, p.popover_border))
@@ -471,7 +477,7 @@ fn dialog_frame(p: &Palette) -> Frame {
 }
 
 /// A dialog button. `strong` marks the one that carries out the action.
-fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
+pub fn button(ui: &mut egui::Ui, p: &Palette, label: &str, strong: bool) -> bool {
     let font = FontId::proportional(text::SMALL);
     let text_w = ui
         .painter()

@@ -154,6 +154,10 @@ pub struct Editor {
     /// that could not be represented in full, or one that failed outright.
     pub notice: Option<Notice>,
     pub ui: UiState,
+    /// The update check: whether it runs, what it last said, and how this copy
+    /// was installed. Kept out of [`UiState`] because it holds a channel and a
+    /// downloaded release, neither of which is `Copy`.
+    pub updates: crate::update::Updates,
     /// Where the dockable modules are. Kept out of [`UiState`] so that stays
     /// `Copy`; it also has its own lifetime, being loaded from and saved to a
     /// config file rather than living only for the session.
@@ -226,6 +230,7 @@ impl Default for Editor {
             session: Session::default(),
             notice: None,
             ui: UiState::default(),
+            updates: crate::update::Updates::default(),
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
             layout: Layout::load_or_default(),

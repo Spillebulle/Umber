@@ -17,7 +17,7 @@ use umber_core::{Brush, Color, Dab, InputPoint, PixelPatch, PixelRect};
 use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -76,6 +76,16 @@ impl Graphics {
     }
 }
 
+/// The only thing that ever arrives on the event loop's user channel.
+///
+/// A background job has something to say. Under [`ControlFlow::Wait`] the loop
+/// sleeps until an event arrives, and a value appearing in a channel is not an
+/// event — so the thread sends one of these and the loop wakes to collect it.
+/// It carries nothing: the value itself is in the channel, and the wake-up only
+/// has to make a frame happen.
+#[derive(Clone, Copy, Debug)]
+pub struct Wake;
+
 pub struct UmberApp {
     gfx: Option<Graphics>,
     editor: Editor,
@@ -99,11 +109,22 @@ pub struct UmberApp {
     repaint_at: Option<std::time::Instant>,
 }
 
-impl Default for UmberApp {
-    fn default() -> Self {
+impl UmberApp {
+    /// Build the application around an event loop it can wake.
+    ///
+    /// The proxy is handed straight to the update check, which is the only
+    /// thing that ever answers from off the main thread. Everything else in
+    /// Umber reaches the loop through a window event.
+    pub fn new(proxy: EventLoopProxy<Wake>) -> Self {
+        let mut editor = Editor::default();
+        editor.updates.set_waker(std::sync::Arc::new(move || {
+            // The loop is gone once the window has closed, which is an ordinary
+            // way for a check still in flight to end. Nothing to do about it.
+            let _ = proxy.send_event(Wake);
+        }));
         Self {
             gfx: None,
-            editor: Editor::default(),
+            editor,
             modifiers: ModifiersState::default(),
             last_frame: None,
             applied_theme: None,
@@ -111,9 +132,7 @@ impl Default for UmberApp {
             repaint_at: None,
         }
     }
-}
 
-impl UmberApp {
     /// Finish the current stroke: capture undo state, bake it into the layer.
     ///
     /// The layer is untouched until this point, so reading it here captures
@@ -624,6 +643,11 @@ impl UmberApp {
     }
 
     fn render(&mut self) {
+        // Before the interface is built, so an answer that arrived while the
+        // loop was asleep is on screen in the frame the wake-up produced rather
+        // than in the one after it.
+        self.editor.updates.poll();
+
         let Some(gfx) = self.gfx.as_mut() else { return };
 
         let now = std::time::Instant::now();
@@ -945,6 +969,12 @@ impl UmberApp {
         if let Some(index) = actions.close_tab {
             self.close_document(index);
         }
+
+        // Last, and after the interface has run at least once: the preferences
+        // file is read by `settings::show`, so this is the first point at which
+        // "does the user want this check?" has an answer. Returns immediately
+        // on every frame but one.
+        self.editor.updates.start_if_due();
     }
 
     // --- documents -------------------------------------------------------
@@ -1108,7 +1138,7 @@ impl UmberApp {
     }
 }
 
-impl ApplicationHandler for UmberApp {
+impl ApplicationHandler<Wake> for UmberApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_some() {
             return;
@@ -1284,7 +1314,20 @@ impl ApplicationHandler for UmberApp {
     /// time — a hover fading, a caret blinking. Without this the only thing
     /// keeping those animations moving would be a redraw loop that never idles,
     /// which is what this replaced.
+    /// A background job has reported. [`Self::render`] is what collects it; all
+    /// this has to do is make a frame happen.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+        self.request_redraw();
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The Windows installer cannot replace a program that is running, so
+        // handing it the package is only half of the update — the other half is
+        // getting out of its way, which the user asks for in the About dialog.
+        if self.editor.updates.take_quit_request() {
+            event_loop.exit();
+            return;
+        }
         match self.repaint_at {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),

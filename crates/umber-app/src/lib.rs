@@ -4,6 +4,7 @@
 //! a library so the desktop binary, the Android `NativeActivity` entry point
 //! and the iOS host can all drive the same code.
 
+mod about;
 mod app;
 mod brushlib;
 mod colorpicker;
@@ -22,21 +23,30 @@ mod splash;
 mod tabs;
 mod theme;
 mod ui;
+mod update;
 mod widgets;
 
-pub use app::UmberApp;
+pub use app::{UmberApp, Wake};
 pub use editor::Editor;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Run Umber. Blocks until the window closes.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
+    // Before anything else: a Windows update leaves the binary it displaced
+    // beside the new one, because a running executable cannot be deleted. This
+    // is the first moment it can go.
+    update::sweep_previous_binary();
+
+    // `with_user_event` rather than a plain loop: the update check answers from
+    // a thread, and under `ControlFlow::Wait` there is nothing else to make the
+    // loop notice. See `UmberApp::user_event`.
+    let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     // Wait rather than Poll: a paint app should be idle when nothing is
     // happening. Redraws are requested explicitly on input.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = UmberApp::default();
+    let mut app = UmberApp::new(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -51,12 +61,12 @@ pub extern "C" fn android_main(android_app: winit::platform::android::activity::
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
-    let event_loop = EventLoop::builder()
+    let event_loop = EventLoop::<Wake>::with_user_event()
         .with_android_app(android_app)
         .build()
         .expect("failed to build event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = UmberApp::default();
+    let mut app = UmberApp::new(event_loop.create_proxy());
     let _ = event_loop.run_app(&mut app);
 }
