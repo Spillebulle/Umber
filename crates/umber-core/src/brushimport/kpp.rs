@@ -109,7 +109,19 @@
 //!   `drawingangle`, `tilt` or `time` has no input here, with two exceptions
 //!   that are read for what they mean rather than as curves: a `drawingangle`
 //!   rotation is "this dab follows the stroke", and a `fuzzy` one is
-//!   [`Brush::dab_angle_jitter`].
+//!   [`Brush::dab_angle_jitter`]. A **rotation** driven by anything else —
+//!   `ascension` (tilt direction) or `rotation` (barrel rotation), neither of
+//!   which a desktop pointer reports — is switched on and does nothing, so it
+//!   is named.
+//!
+//! # Approximated rather than dropped
+//!
+//! - **Fan corners.** Krita adds extra dabs through a sharp corner so that a
+//!   rake fans round it instead of jumping; Umber's dab turns with the heading
+//!   and the heading turns at the corner. Six presets in the fetched packs ask
+//!   for it. A stroke differs from Krita's only where it changes direction
+//!   abruptly, and only for a dab or two — the same register as the HSL-in-HSV
+//!   approximation in [`super::mypaint`], and stated for the same reason.
 
 use std::collections::BTreeMap;
 
@@ -299,14 +311,47 @@ pub fn from_kpp_in(
     // sensor on rotation, and "point it anywhere" as a `fuzzy` one. Neither is
     // a curve; both are what the dab *is*. A rake read as a nib is immediately
     // visible in a curve, which is why they are worth this much attention.
-    let rotation = preset.sensor_id("Rotation");
+    //
+    // Every sensor the option names, not the first: Krita also writes a
+    // *compound* `<params id="sensorslist">` with a `<ChildSensor>` per input,
+    // and five presets in the fetched packs rotate that way. Reading the first
+    // id called those "sensorslist", matched neither branch, and imported a
+    // brush that turns every stamp as one that lays them all the same way up —
+    // which for a bitmap tip is a comb.
+    let rotation = preset.sensor_ids("Rotation");
     let rotates = preset.flag("PressureRotation");
-    let dab_angle_follows_stroke = rotates && rotation.as_deref() == Some("drawingangle");
-    let dab_angle_jitter = if rotates && rotation.as_deref() == Some("fuzzy") {
+    let dab_angle_follows_stroke = rotates && rotation.contains(&"drawingangle");
+    let dab_angle_jitter = if rotates && rotation.contains(&"fuzzy") {
         360.0
     } else {
         0.0
     };
+    // The rake's lean. `angleOffset` is stated in degrees and Krita adds it to
+    // the drawing angle *inside the sensor* —
+    // `0.5 + drawingAngle / 2π + angleOffset / 360` — so it goes through
+    // exactly the transformation the heading itself does. Umber composes the
+    // same two terms the same way, `angle = heading + dab_angle`, so the offset
+    // carries across as degrees on `dab_angle` with the sign the heading
+    // already has. Four presets in the fetched packs lean their rake between
+    // 92° and 139°, and without this every one of them arrives dragging its
+    // bristles along the stroke instead of across it.
+    let angle_offset = if dab_angle_follows_stroke {
+        preset
+            .sensor_number("Rotation", "angleOffset")
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    // A rotation driven by something else is switched on and does nothing.
+    // `ascension` is tilt direction and `rotation` is barrel rotation, neither
+    // of which any desktop pointer reports here (see the pressure section of
+    // `CLAUDE.md`); `pressure` would need an `Angle` modulation this reader
+    // does not build. Named for the same reason the other foreign sensors are:
+    // those brushes feel dead rather than wrong, and a stamp that was meant to
+    // turn is the most visible case of it there is.
+    if rotates && !dab_angle_follows_stroke && dab_angle_jitter == 0.0 {
+        dropped.push("dab rotation driven by tilt, pen rotation or pressure");
+    }
 
     // A smudging brush picks colour up off the canvas. Krita states the pickup
     // and the deposit separately (`SmudgeRate` and `ColorRate`); Umber has one
@@ -339,11 +384,24 @@ pub fn from_kpp_in(
         dropped.push("dynamics driven by speed, tilt or stroke position");
     }
 
+    let spacing = tip_spec.spacing.unwrap_or(default.spacing);
+    // Whether a `max` stroke of this stamp is the mark its author drew or a
+    // fraction of it. Krita composites every dab, so a sparse tip builds to
+    // solid along a stroke where Umber's `max` caps it at the mask's brightest
+    // texel — see `crate::tip::stroke_coverage`. Measured, exactly as
+    // [`super::gbr::to_brush`] and [`super::abr::to_brush`] measure it, and for
+    // the same reason: a photographic stamp looks dense and is not. A generated
+    // dab is solid, so this is the identity for every brush without a tip.
+    let build_up = tip
+        .as_ref()
+        .is_some_and(|mask| crate::tip::stroke_coverage(mask, spacing).needs_build_up());
+
     let brush = Brush {
         size: (base_size * size.peak).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
         min_size_ratio,
         size_curve,
         pressure_size,
+        build_up,
         // A bitmap tip *replaces* the procedural falloff, so hardness has
         // nothing left to shape and the file states none for a predefined
         // brush either.
@@ -351,11 +409,11 @@ pub fn from_kpp_in(
         opacity: (opacity_peak * flow * opacity.peak).clamp(0.0, 1.0),
         opacity_curve,
         pressure_opacity,
-        spacing: tip_spec.spacing.unwrap_or(default.spacing),
+        spacing,
         mode,
         dabs_per_second,
         dab_ratio: tip_spec.dab_ratio,
-        dab_angle: tip_spec.angle,
+        dab_angle: (tip_spec.angle + angle_offset).rem_euclid(360.0),
         dab_angle_follows_stroke,
         dab_angle_jitter,
         // `ScatterValue` only means anything when Krita's scatter option is
@@ -596,6 +654,37 @@ impl Preset {
         let at = sensor.find("id=\"")? + 4;
         let end = sensor[at..].find('"')?;
         Some(sensor[at..at + end].to_string())
+    }
+
+    /// **Every** id the sensor names, in the order it names them.
+    ///
+    /// Usually there is one — `<params id="pressure">` — and this and
+    /// [`Preset::sensor_id`] agree. Krita also writes a *compound* sensor,
+    /// `<params id="sensorslist">` holding a `<ChildSensor id="…">` per input,
+    /// whose first id is the wrapper's own and matches nothing. Five presets in
+    /// the fetched packs drive their rotation that way.
+    fn sensor_ids(&self, name: &str) -> Vec<&str> {
+        let Some(sensor) = self.params.get(&format!("{name}Sensor")) else {
+            return Vec::new();
+        };
+        sensor
+            .match_indices("id=\"")
+            .filter_map(|(at, _)| {
+                let rest = &sensor[at + 4..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// A numeric attribute off a sensor, such as `angleOffset` on
+    /// `drawingangle`. The sensor is a scrap of XML inside a parameter, and the
+    /// attribute is read the same way its id is.
+    fn sensor_number(&self, name: &str, attribute: &str) -> Option<f32> {
+        let sensor = self.params.get(&format!("{name}Sensor"))?;
+        let key = format!("{attribute}=\"");
+        let at = sensor.find(&key)? + key.len();
+        let end = sensor[at..].find('"')?;
+        sensor[at..at + end].parse().ok()
     }
 
     /// One of Krita's curve-driven settings, read the way Umber states a
@@ -1298,6 +1387,49 @@ mod tests {
         assert_eq!(preset.brush.size, 4.0);
     }
 
+    /// Whether a Krita stamp builds up is **measured**, not assumed.
+    ///
+    /// Krita composites every dab, so a faint tip builds to solid along a
+    /// stroke; Umber's `max` caps a stroke at the mask's brightest texel and
+    /// paints a fraction of the author's mark. `.gbr` and `.abr` have measured
+    /// this since build-up existed and `.kpp` did not, which meant a Krita
+    /// stamp — Raghukamath's "Drybrush" is one — shipped at 88% of the strength
+    /// it was drawn at.
+    #[test]
+    fn a_krita_stamp_is_measured_for_build_up() {
+        let stamp = |level: u8| {
+            // Krita's convention: 0 is full paint, 255 is none. A flat grey of
+            // 130 is a mask whose strongest texel is just under half.
+            let mut png = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut png, 8, 8);
+                encoder.set_color(png::ColorType::Grayscale);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder.write_header().expect("header");
+                writer.write_image_data(&[level; 64]).expect("data");
+            }
+            let xml = format!(
+                "<Preset embedded_resources=\"1\" name=\"Stamp\" paintopid=\"paintbrush\">\
+                 <resources><resource name=\"t\" filename=\"t.png\" type=\"brushes\">\
+                 <![CDATA[{}]]></resource></resources>{}</Preset>",
+                encode_base64(&png),
+                param(
+                    "brush_definition",
+                    "<Brush type=\"png_brush\" filename=\"t.png\" spacing=\"0.1\" \
+                     angle=\"0\" scale=\"1\"/>"
+                ),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush.build_up
+        };
+
+        assert!(stamp(130), "a faint stamp has to be allowed to accumulate");
+        assert!(!stamp(0), "a solid one paints the same either way");
+
+        // A generated dab is solid by construction, so the `max` path stays the
+        // default for every brush without a tip.
+        assert!(!from_kpp(&kpp(&oval())).expect("decode").brush.build_up);
+    }
+
     /// A caller with the file elsewhere — a `.bundle`'s `brushes/` — must be
     /// able to supply it.
     #[test]
@@ -1417,6 +1549,120 @@ mod tests {
         assert!(with("drawingangle").dab_angle_follows_stroke);
         assert_eq!(with("fuzzy").dab_angle_jitter, 360.0);
         assert!(!with("fuzzy").dab_angle_follows_stroke);
+    }
+
+    /// A rotation sensor spelled the compound way.
+    ///
+    /// Krita writes `<params id="sensorslist">` with a `<ChildSensor>` per
+    /// input when a dynamic is driven by more than one. Reading only the first
+    /// id gives "sensorslist", which matches neither branch above, so five
+    /// presets in the fetched packs — GDQuest's cloud and rock brushes among
+    /// them — imported as stamps that all lie the same way up.
+    #[test]
+    fn a_compound_rotation_sensor_is_read_through() {
+        let with = |sensors: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"0.2\" hfade=\"0\"/></Brush>"
+                ),
+                param(
+                    "RotationSensor",
+                    &format!("<params id=\"sensorslist\">{sensors}</params>")
+                ),
+                "<param type=\"internal\" name=\"PressureRotation\">true</param>",
+            );
+            from_kpp(&kpp(&xml)).expect("decode")
+        };
+
+        let fuzzy = with("<ChildSensor id=\"fuzzy\"/><ChildSensor id=\"pressure\"/>");
+        assert_eq!(fuzzy.brush.dab_angle_jitter, 360.0);
+        assert!(fuzzy.dropped.is_empty(), "{:?}", fuzzy.dropped);
+
+        // Both at once is a rake that also rolls, which Umber states natively:
+        // the jitter is an offset on whichever angle applies.
+        let both = with("<ChildSensor id=\"fuzzy\"/><ChildSensor id=\"drawingangle\"/>");
+        assert!(both.brush.dab_angle_follows_stroke);
+        assert_eq!(both.brush.dab_angle_jitter, 360.0);
+    }
+
+    /// The rake's lean.
+    ///
+    /// Krita adds `angleOffset` to the drawing angle inside the sensor, so it
+    /// travels with the heading and lands on `dab_angle`, which Umber adds to
+    /// the heading in exactly the same place. Four presets in the fetched packs
+    /// state one, between 92° and 139°, and without it every one of them drags
+    /// its bristles along the stroke instead of across it.
+    #[test]
+    fn a_rake_keeps_the_angle_it_leans_at() {
+        let with = |offset: &str, angle: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    &format!(
+                        "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"{angle}\">\
+                         <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"0.2\" \
+                         hfade=\"0\"/></Brush>"
+                    )
+                ),
+                param(
+                    "RotationSensor",
+                    &format!(
+                        "<params id=\"drawingangle\" angleOffset=\"{offset}\" \
+                         fanCornersEnabled=\"0\"/>"
+                    )
+                ),
+                "<param type=\"internal\" name=\"PressureRotation\">true</param>",
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush
+        };
+
+        let leaning = with("92", "0");
+        assert!(leaning.dab_angle_follows_stroke);
+        assert!((leaning.dab_angle - 92.0).abs() < 1e-3, "{leaning:?}");
+
+        // The tip's own angle and the sensor's offset are two terms of one sum,
+        // and both are measured from the heading once the dab follows it.
+        let both = with("30", "1.5707963");
+        assert!((both.dab_angle - 120.0).abs() < 0.1, "{}", both.dab_angle);
+
+        // An offset means nothing when the dab does not follow the stroke:
+        // Krita never reads the sensor, so neither does this.
+        assert_eq!(with("0", "0").dab_angle, 0.0);
+    }
+
+    /// A rotation switched on and driven by something no desktop pointer
+    /// reports is a dynamic that does nothing, and the generator has to know.
+    /// Two of Revoy's stamps rotate by tilt direction and four of GDQuest's by
+    /// barrel rotation.
+    #[test]
+    fn a_rotation_umber_cannot_drive_is_named() {
+        let with = |sensor: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"0.2\" hfade=\"0\"/></Brush>"
+                ),
+                param("RotationSensor", &format!("<params id=\"{sensor}\"/>")),
+                "<param type=\"internal\" name=\"PressureRotation\">true</param>",
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+
+        for sensor in ["ascension", "rotation", "pressure"] {
+            assert!(
+                with(sensor).contains(&"dab rotation driven by tilt, pen rotation or pressure"),
+                "{sensor} should be named: {:?}",
+                with(sensor)
+            );
+        }
+        assert!(with("drawingangle").is_empty());
+        assert!(with("fuzzy").is_empty());
     }
 
     /// All three of PNG's text chunks turn up in one real pack, and a reader
