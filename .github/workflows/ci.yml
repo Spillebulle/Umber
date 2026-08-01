@@ -52,7 +52,14 @@ jobs:
       - name: Desktop entry
         run: |
           sudo apt-get update && sudo apt-get install -y desktop-file-utils
-          desktop-file-validate packaging/umber.desktop
+          desktop-file-validate packaging/io.github.spillebulle.umber.desktop
+
+      # The application id has to be the same name in the AppStream file, the
+      # desktop entry, the icons and all three packaging scripts. Nothing but
+      # the Flatpak build notices when it is not, and that is the slowest place
+      # to find out — see the header of the script.
+      - name: Metadata consistency
+        run: sh packaging/check.sh
 
   check:
     name: ${{ matrix.os }}

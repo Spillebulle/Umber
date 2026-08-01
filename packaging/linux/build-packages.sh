@@ -68,6 +68,13 @@ DEB_DEPENDS="libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkb
 # from a 32-bit one, and both architectures Umber builds for are 64-bit.
 RPM_SONAMES="libX11.so.6 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxkbcommon.so.0 libwayland-client.so.0 libvulkan.so.1"
 
+# The application ID. The desktop entry, the icons and the AppStream file are
+# all named for it, and the AppStream `launchable` points at that desktop entry.
+# `appstreamcli compose` follows that reference to find the icon, so a name that
+# does not line up costs the whole component: `gui-app-without-icon`, and the
+# build fails. It reads as pedantry right up until it does that.
+APP_ID=io.github.spillebulle.umber
+
 # --- the shared install tree -------------------------------------------------
 #
 # One layout, used by all three formats. /usr for the packages; the AppImage
@@ -75,13 +82,13 @@ RPM_SONAMES="libX11.so.6 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxkbcommon.
 stage_tree() {
     local prefix=$1
     install -Dm755 "$binary" "$prefix/bin/umber"
-    install -Dm644 "$root/packaging/umber.desktop" \
-        "$prefix/share/applications/umber.desktop"
-    install -Dm644 "$root/packaging/io.github.spillebulle.umber.metainfo.xml" \
-        "$prefix/share/metainfo/io.github.spillebulle.umber.metainfo.xml"
+    install -Dm644 "$root/packaging/$APP_ID.desktop" \
+        "$prefix/share/applications/$APP_ID.desktop"
+    install -Dm644 "$root/packaging/$APP_ID.metainfo.xml" \
+        "$prefix/share/metainfo/$APP_ID.metainfo.xml"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "$root/assets/icons/umber-$size.png" \
-            "$prefix/share/icons/hicolor/${size}x${size}/apps/umber.png"
+            "$prefix/share/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
     done
     install -Dm644 "$root/LICENSE" "$prefix/share/doc/umber/LICENSE"
     install -Dm644 "$root/README.md" "$prefix/share/doc/umber/README.md"
@@ -147,9 +154,9 @@ stage_tree "$buildroot/usr"
     echo
     echo "%files"
     echo "/usr/bin/umber"
-    echo "/usr/share/applications/umber.desktop"
-    echo "/usr/share/metainfo/io.github.spillebulle.umber.metainfo.xml"
-    echo "/usr/share/icons/hicolor/*/apps/umber.png"
+    echo "/usr/share/applications/$APP_ID.desktop"
+    echo "/usr/share/metainfo/$APP_ID.metainfo.xml"
+    echo "/usr/share/icons/hicolor/*/apps/$APP_ID.png"
     echo "/usr/share/doc/umber/"
 } > "$rpmroot/SPECS/umber.spec"
 
@@ -170,8 +177,8 @@ echo "==> building Umber-${version}-${appimage_arch}.AppImage"
 appdir="$work/AppDir"
 stage_tree "$appdir/usr"
 # linuxdeploy wants these at the AppDir root as well as under usr/share.
-cp "$root/packaging/umber.desktop" "$appdir/umber.desktop"
-cp "$root/assets/icons/umber-256.png" "$appdir/umber.png"
+cp "$root/packaging/$APP_ID.desktop" "$appdir/$APP_ID.desktop"
+cp "$root/assets/icons/umber-256.png" "$appdir/$APP_ID.png"
 
 tools="${APPIMAGE_TOOL_DIR:-$work/tools}"
 mkdir -p "$tools"
@@ -192,8 +199,8 @@ export OUTPUT="$outdir/Umber-${version}-${appimage_arch}.AppImage"
 export VERSION="$version"
 "$tools/linuxdeploy" \
     --appdir "$appdir" \
-    --desktop-file "$appdir/umber.desktop" \
-    --icon-file "$appdir/umber.png" \
+    --desktop-file "$appdir/$APP_ID.desktop" \
+    --icon-file "$appdir/$APP_ID.png" \
     --output appimage
 
 echo

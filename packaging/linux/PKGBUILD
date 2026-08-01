@@ -41,13 +41,13 @@ package() {
     [ -d "$stage" ] || stage=$(find "$srcdir" -maxdepth 1 -type d -name 'umber-*' | head -1)
 
     install -Dm755 "${stage}/umber" "${pkgdir}/usr/bin/umber"
-    install -Dm644 "${stage}/packaging/umber.desktop" \
-        "${pkgdir}/usr/share/applications/umber.desktop"
+    install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.desktop" \
+        "${pkgdir}/usr/share/applications/io.github.spillebulle.umber.desktop"
     install -Dm644 "${stage}/packaging/io.github.spillebulle.umber.metainfo.xml" \
         "${pkgdir}/usr/share/metainfo/io.github.spillebulle.umber.metainfo.xml"
     for size in 16 32 48 64 128 256; do
         install -Dm644 "${stage}/icons/umber-${size}.png" \
-            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/umber.png"
+            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/io.github.spillebulle.umber.png"
     done
     install -Dm644 "${stage}/LICENSE" \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"

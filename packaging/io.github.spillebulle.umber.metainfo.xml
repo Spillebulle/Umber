@@ -7,7 +7,7 @@
 -->
 <component type="desktop-application">
   <id>io.github.spillebulle.umber</id>
-  <launchable type="desktop-id">umber.desktop</launchable>
+  <launchable type="desktop-id">io.github.spillebulle.umber.desktop</launchable>
 
   <name>Umber</name>
   <summary>GPU-accelerated painting application built for latency</summary>

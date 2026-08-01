@@ -38,13 +38,13 @@ modules:
     build-commands:
       - install -Dm755 umber /app/bin/umber
 
-      # Flatpak requires the desktop file, the icons and the AppStream data to
-      # be named for the application ID, so the shared copies are renamed on
-      # the way in and the desktop file's Icon key is rewritten to match.
-      # Leaving it as `umber` gives an application with no icon anywhere.
-      - install -Dm644 packaging/umber.desktop
-        /app/share/applications/io.github.spillebulle.umber.desktop
-      - desktop-file-edit --set-icon=io.github.spillebulle.umber
+      # Everything is already named for the application ID in `packaging/`, so
+      # these are plain copies. They were renames here once, with the desktop
+      # file's Icon key rewritten in passing, and the AppStream `launchable`
+      # was left pointing at the old name — which `appstreamcli compose`
+      # follows to find the icon, so it reported `gui-app-without-icon` and
+      # threw the component away. One name everywhere is what fixed it.
+      - install -Dm644 packaging/io.github.spillebulle.umber.desktop
         /app/share/applications/io.github.spillebulle.umber.desktop
       - install -Dm644 packaging/io.github.spillebulle.umber.metainfo.xml
         /app/share/metainfo/io.github.spillebulle.umber.metainfo.xml
