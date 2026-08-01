@@ -5,10 +5,17 @@
 //! the right. Themes and Shortcuts are the two the design draws in full; the
 //! rest it marks as outside the prototype.
 //!
-//! Here, a tab is live only if there is something behind it that works. General,
-//! Pressure, Themes and Shortcuts are; Input & pen and Performance are shown
-//! disabled, with a tooltip saying why, rather than opening onto a pane of
-//! controls that do nothing.
+//! Here, a tab is live only if there is something behind it that works. All but
+//! Performance are; that one is shown disabled, with a tooltip saying why,
+//! rather than opening onto a pane of controls that do nothing.
+//!
+//! Input & pen is the exception that proves the rule, and is not a page of
+//! settings at all. There is genuinely nothing to *configure* about the pointer
+//! — Umber takes what the window system sends and has no tablet driver of its
+//! own — so instead the pane reports, live, what is arriving and what the
+//! pressure model makes of it. That is the one thing the machine this is
+//! written on cannot answer: nobody working on Umber has a pen, so the two pen
+//! fixes it exists to verify shipped unproven. See [`crate::inputlog`].
 //!
 //! The page also owns the preferences file. [`show`] runs every frame whether
 //! the dialog is open or not, so its first call is where stored settings are
@@ -18,6 +25,7 @@ use crate::autosave;
 use crate::controls::{self, CapState, Captured, Glyph};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
+use crate::inputlog;
 use crate::prefs;
 use crate::shortcuts::{self, Action, Binding};
 use crate::theme::{Accent, Palette, ThemeKind, metrics, text};
@@ -33,7 +41,8 @@ use umber_core::input::PressureSource;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
-    /// Designed but not built — nothing behind it works yet.
+    /// A live reading of the pointer stream rather than a page of settings —
+    /// see the module docs.
     InputAndPen,
     Pressure,
     Themes,
@@ -46,13 +55,7 @@ impl SettingsTab {
     /// The rail, in the design's order, with the reason a tab is dead.
     const RAIL: [(SettingsTab, &'static str, &'static str); 6] = [
         (SettingsTab::General, "General", ""),
-        (
-            SettingsTab::InputAndPen,
-            "Input & pen",
-            "Umber reads pointer events from the window system, which carries no \
-             pen tilt or button mapping on desktop. There is nothing to configure \
-             until a native tablet path exists.",
-        ),
+        (SettingsTab::InputAndPen, "Input & pen", ""),
         (SettingsTab::Pressure, "Pressure", ""),
         (SettingsTab::Themes, "Themes", ""),
         (SettingsTab::Shortcuts, "Shortcuts", ""),
@@ -87,6 +90,15 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
         ctx.request_repaint();
     }
     prefs::flush_if_idle(&ctx, ed);
+
+    // The test strip resolves pointer events through its own copy of the
+    // pressure model for as long as it is being dragged, and the drag is ended
+    // by a release the strip only hears about while it is on screen. Shutting
+    // the dialog or changing tab mid-drag would otherwise leave it resolving
+    // every event in the application for the rest of the session.
+    if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::InputAndPen {
+        ed.input.end_probe();
+    }
 
     if !ed.ui.settings_open {
         // Closing the dialog while a field was listening would otherwise leave
@@ -222,6 +234,11 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
                         "General",
                         "How the workspace itself behaves, before any document is open.",
                     ),
+                    SettingsTab::InputAndPen => (
+                        "Input & pen",
+                        "A live reading of what the window system is sending. Move the \
+                         pointer, then draw in the strip.",
+                    ),
                     SettingsTab::Pressure => (
                         "Pressure",
                         "Where a stroke's pressure comes from, and how it responds.",
@@ -235,7 +252,7 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
                         "Click any binding to rebind it. Conflicts are flagged, never \
                          silently dropped.",
                     ),
-                    SettingsTab::InputAndPen | SettingsTab::Performance => ("", ""),
+                    SettingsTab::Performance => ("", ""),
                 };
                 ui.vertical(|ui| {
                     ui.label(
@@ -267,14 +284,13 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
 
             match ed.ui.settings_tab {
                 SettingsTab::General => general_pane(ui, p, ed, actions),
+                SettingsTab::InputAndPen => input_pane(ui, p, ed),
                 SettingsTab::Pressure => pressure_pane(ui, p, ed),
                 SettingsTab::Themes => themes_pane(ui, p, ed),
                 SettingsTab::Shortcuts => shortcuts_pane(ui, p),
-                // The rail cannot select these; a preferences file naming one
-                // could, so they land somewhere rather than on a blank pane.
-                SettingsTab::InputAndPen | SettingsTab::Performance => {
-                    ed.ui.settings_tab = SettingsTab::General;
-                }
+                // The rail cannot select this; a preferences file naming it
+                // could, so it lands somewhere rather than on a blank pane.
+                SettingsTab::Performance => ed.ui.settings_tab = SettingsTab::General,
             }
 
             let left = (ui.available_height() - FOOTER_RESERVE).max(0.0);
@@ -516,6 +532,410 @@ fn expiry_label(hours: u32) -> String {
                 format!("{days} days")
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input & pen
+// ---------------------------------------------------------------------------
+
+/// Height of the trace, and of the strip drawn under it.
+const TRACE_HEIGHT: f32 = 92.0;
+const STRIP_HEIGHT: f32 = 88.0;
+
+/// Widest the test strip's mark gets, in points, at full pressure.
+const NIB_MAX: f32 = 9.0;
+
+/// A live reading of the pointer stream. Not a page of settings — see the
+/// module docs for why this one is different.
+///
+/// Everything drawn here comes out of [`crate::inputlog`], which records the
+/// events as they arrive at the window. Nothing on this page asks the pressure
+/// model anything: the resolved figure is the one the real call answered, and
+/// the strip runs on a copy. Reading a diagnostic must not be able to change
+/// what it is reading.
+fn input_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    // The pane is taller than the dialog on a small window, and the strip at
+    // the foot is the part somebody has come here to use — so it scrolls rather
+    // than being cut off.
+    let height = (ui.available_height() - FOOTER_RESERVE - LIST_GAP).max(200.0);
+    egui::ScrollArea::vertical()
+        .max_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            // Every instrument first and every paragraph after it, rather than
+            // each reading with its own explanation underneath. The prose is
+            // read once and the readings are watched, so the arrangement that
+            // fits all four on screen together is the one that works — and what
+            // falls below the fold is then the part it does no harm to scroll
+            // to.
+            route_section(ui, p, ed);
+            ui.add_space(12.0);
+            pressure_section(ui, p, ed);
+            ui.add_space(12.0);
+            strip_section(ui, p, ed);
+            ui.add_space(16.0);
+            guide_section(ui, p, ed);
+        });
+}
+
+/// Which route the events are arriving by, and what the last one was.
+///
+/// The first question, and the one that separates "the tablet driver is in
+/// mouse mode" from "the pen is reaching Umber and something later is wrong".
+fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.horizontal(|ui| {
+        controls::section(ui, p, "What is arriving");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if controls::text_button(ui, p, "Clear", false, true)
+                .on_hover_text("Throw away everything recorded so far and start again.")
+                .clicked()
+            {
+                ed.input.clear();
+            }
+        });
+    });
+
+    ui.horizontal(|ui| {
+        widgets::chip(
+            ui,
+            p,
+            "Mouse events",
+            &ed.input.mouse_events.to_string(),
+            "CursorMoved and MouseInput. A mouse sends these — and so does a pen \
+             whose tablet driver is in mouse mode, which is the usual reason a \
+             pen behaves like one.",
+        );
+        widgets::chip(
+            ui,
+            p,
+            "Touch / pen events",
+            &ed.input.touch_events.to_string(),
+            "WindowEvent::Touch. On Windows a pen arrives here, through WM_POINTER, \
+             and sends no mouse events at all. Zero of these while you draw with a \
+             pen means the pen is not reaching Umber as a pen.",
+        );
+        widgets::chip(
+            ui,
+            p,
+            "…carrying pressure",
+            &ed.input.with_force.to_string(),
+            "How many of those touches carried a force reading. Touches arriving \
+             with none is a driver or platform limit, not something Umber can \
+             work around.",
+        );
+    });
+
+    ui.add_space(4.0);
+    let last = ed.input.ring.newest();
+    controls::row(ui, p, "Last event", |ui| {
+        // Right to left, so the position goes on first and ends up on the far
+        // right, reading "Touch / pen — hovering    812, 430 px". Omitted
+        // entirely before the first event rather than drawn as a dash: there is
+        // no position, and a placeholder beside "nothing yet" only reads as one
+        // more thing that is missing.
+        if let Some(s) = last {
+            ui.label(
+                egui::RichText::new(format!("{:.0}, {:.0} px", s.pos.x, s.pos.y))
+                    .monospace()
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+            ui.add_space(12.0);
+        }
+        ui.label(
+            egui::RichText::new(match last {
+                Some(s) => format!("{} — {}", s.route.label(), s.motion.label()),
+                None => "nothing yet".to_string(),
+            })
+            .size(text::SMALL)
+            .color(if last.is_some() { p.text } else { p.text_dim }),
+        );
+    });
+}
+
+/// The two pressure figures, and the trace of them.
+fn pressure_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "Pressure");
+
+    let last = ed.input.ring.newest();
+    widgets::value_meter(
+        ui,
+        p,
+        "Reported by the device",
+        last.and_then(|s| s.reported),
+        "none",
+    );
+    widgets::value_meter(
+        ui,
+        p,
+        "Resolved by Umber",
+        last.and_then(|s| s.resolved),
+        "not resolved",
+    );
+
+    ui.add_space(8.0);
+    widgets::pressure_graph(
+        ui,
+        p,
+        TRACE_HEIGHT,
+        inputlog::Ring::CAP,
+        ed.input
+            .ring
+            .recent(inputlog::Ring::CAP)
+            .map(|s| widgets::TracePoint {
+                reported: s.reported,
+                resolved: s.resolved,
+            }),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        legend(ui, p, p.accent, "reported");
+        ui.add_space(10.0);
+        legend(ui, p, p.text_muted, "resolved");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("last {} events", inputlog::Ring::CAP))
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+        });
+    });
+}
+
+/// A short bar of colour and a name, for the trace's two lines.
+fn legend(ui: &mut egui::Ui, p: &Palette, colour: Color32, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(14.0, 10.0), Sense::hover());
+    ui.painter().rect_filled(
+        Rect::from_center_size(rect.center(), vec2(14.0, 2.5)),
+        1.25,
+        colour,
+    );
+    ui.label(
+        egui::RichText::new(label)
+            .size(text::TINY)
+            .color(p.text_muted),
+    );
+}
+
+/// The scribble strip: somewhere to drag that draws the live pressure.
+///
+/// The source it is running under is named on the same line, and the way to
+/// change it beside that: the strip behaves completely differently on Device,
+/// Speed and Off, and somebody comparing the three should not have to remember
+/// which they last chose two tabs ago.
+fn strip_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.horizontal(|ui| {
+        controls::section(ui, p, "Try it");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if controls::text_button(ui, p, "Change", false, true)
+                .on_hover_text(
+                    "The setting lives on the Pressure tab; this page only reports \
+                     what it does.",
+                )
+                .clicked()
+            {
+                ed.ui.settings_tab = SettingsTab::Pressure;
+            }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "pressure from {}",
+                    source_label(ed.pressure.source)
+                ))
+                .size(text::TINY)
+                .color(p.text_dim),
+            );
+        });
+    });
+    test_strip(ui, p, ed);
+}
+
+/// The Pressure tab's own name for a source, so the two pages agree.
+fn source_label(source: PressureSource) -> &'static str {
+    match source {
+        PressureSource::Device => "Device",
+        PressureSource::Simulated => "Speed",
+        PressureSource::Constant => "Off",
+    }
+}
+
+/// What all of the above means, and what is not on the page at all.
+///
+/// One block rather than a caption under each reading. The readings are watched
+/// and this is read once, so keeping them apart is what lets all four
+/// instruments sit on screen together — and the tilt statement belongs here for
+/// the same reason it is a sentence rather than a meter: a tilt readout sitting
+/// at zero would look like a device answering, when in fact nothing ever asks.
+fn guide_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "What to look for");
+
+    controls::note(
+        ui,
+        p,
+        "Hover a pen over the tablet without touching it. “Touch / pen — hovering” \
+         means Umber can see it. If only the mouse counter moves, the driver is \
+         sending the pen as a mouse and no pressure will ever arrive — that is a \
+         tablet setting, not an Umber one.",
+    );
+    ui.add_space(6.0);
+    controls::note(
+        ui,
+        p,
+        "Reported and resolved are two different numbers and the difference is the \
+         point. “Reported” is exactly what the device sent, and “none” means it \
+         sent no reading at all — which the window system cannot tell apart from a \
+         pen a hair off the glass, so Umber has to decide between them itself. \
+         “Resolved” is what the brush was actually given, recorded from the one \
+         real call rather than worked out again for the display.",
+    );
+    ui.add_space(6.0);
+    controls::note(
+        ui,
+        p,
+        "A gap in a line is a sample with no figure, never a zero. Draw a stroke \
+         and lift off slowly: the reported line should slope down to nothing. If \
+         it instead stops partway and the resolved line jumps back to the top, \
+         pressure is not reaching zero and every stroke will end in a blob.",
+    );
+    ui.add_space(6.0);
+    controls::note(
+        ui,
+        p,
+        "The strip is its own picture. It goes through no document, no layer and \
+         no undo history, and it resolves through a copy of the pressure model \
+         reset on each press — asking the real one a second time would disturb the \
+         stroke it is driving. On Speed the copy measures the strip's own pixels \
+         rather than document pixels, so the threshold reads a little differently \
+         here than on the canvas.",
+    );
+
+    ui.add_space(6.0);
+    // Reported at all because a value that does arrive is worth showing, and the
+    // only way anyone will ever find out that one does is by looking. iOS is the
+    // single platform whose force is `Calibrated`, and the stylus altitude rides
+    // inside that; Windows Ink sends `Normalized`, which has nowhere to carry
+    // one.
+    match ed.input.ring.newest().and_then(|s| s.altitude) {
+        Some(radians) => {
+            controls::row(ui, p, "Stylus altitude", |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{:.1} degrees", radians.to_degrees()))
+                        .monospace()
+                        .size(text::TINY)
+                        .color(p.text),
+                );
+            });
+            controls::note(
+                ui,
+                p,
+                "90 is upright. No brush setting follows tilt yet, so nothing is \
+                 done with this — but it is arriving.",
+            );
+        }
+        None => controls::note(
+            ui,
+            p,
+            "There is no tilt reading. The only place winit has for one is the \
+             stylus altitude inside a calibrated force, which is iOS's form; \
+             Windows Ink sends a normalised force with nowhere to put an angle, \
+             and macOS and Linux send no pen events at all. Tilt needs a native \
+             tablet path, which is not built — so this says so rather than showing \
+             a zero.",
+        ),
+    }
+}
+
+/// A strip to draw in, painted from what the pointer stream is doing.
+///
+/// Self-contained on purpose: it is its own picture, drawn straight out of the
+/// sample ring. It reaches no document, no layer, no undo history and no GPU —
+/// somebody testing a tablet should not have to open a document first, nor find
+/// their canvas scribbled on afterwards.
+fn test_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), STRIP_HEIGHT),
+        Sense::click_and_drag(),
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, metrics::RADIUS_LARGE, p.backdrop);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS_LARGE,
+        Stroke::new(
+            1.0,
+            if ed.input.probing() {
+                p.accent
+            } else {
+                p.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    // A press starts the strip's own model and a release ends it. Both from
+    // egui's drag state rather than from the sample ring, because the ring
+    // records what the *window* is doing and this has to be about this widget.
+    let now = ed.now();
+    if response.drag_started() || response.is_pointer_button_down_on() && !ed.input.probing() {
+        let model = ed.pressure;
+        ed.input.begin_probe(model, now);
+    } else if !response.is_pointer_button_down_on() && ed.input.probing() {
+        ed.input.end_probe();
+    }
+
+    if !ed.input.probing() && ed.input.probe_started == f64::MAX {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Drag here",
+            FontId::proportional(text::SMALL),
+            p.text_dim,
+        );
+        return;
+    }
+
+    // Only this drag: `begin_probe` stamps the moment it started, so the
+    // previous scribble goes as soon as a new one begins rather than
+    // accumulating into an unreadable tangle.
+    let started = ed.input.probe_started;
+    let scale = ed.pixels_per_point.max(1e-3);
+    let mut previous: Option<(egui::Pos2, f32)> = None;
+    for sample in ed.input.ring.iter() {
+        if sample.at < started {
+            continue;
+        }
+        // Resolved is what the strip is showing; reported is the fallback for a
+        // sample nothing resolved, so a pen still draws something on the frame
+        // its press was noticed.
+        let Some(pressure) = sample.resolved.or(sample.reported) else {
+            previous = None;
+            continue;
+        };
+        let at = egui::pos2(sample.pos.x / scale, sample.pos.y / scale);
+        let half = inputlog::nib_half_width(pressure, NIB_MAX);
+        if let Some((from, from_half)) = previous {
+            // A tapered quad between the two dots, so the width follows the
+            // pressure along the segment rather than stepping at each sample.
+            let along = at - from;
+            let length = along.length();
+            if length > 1e-3 {
+                let across = egui::vec2(-along.y, along.x) / length;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        from + across * from_half,
+                        at + across * half,
+                        at - across * half,
+                        from - across * from_half,
+                    ],
+                    p.text_strong,
+                    Stroke::NONE,
+                ));
+            }
+        }
+        painter.circle_filled(at, half, p.text_strong);
+        previous = Some((at, half));
     }
 }
 

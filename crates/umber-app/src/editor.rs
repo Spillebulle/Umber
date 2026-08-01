@@ -230,6 +230,16 @@ pub struct Editor {
     pub stroke: StrokeBuilder,
     pub history: History,
     pub pressure: PressureModel,
+    /// What the pointer stream has been doing lately, for Settings → Input &
+    /// pen. Transient telemetry of the *window*, not of a document — it
+    /// describes the tablet plugged into this machine, and a tab switch has
+    /// nothing to do with it — so it belongs above the `--- documents ---`
+    /// line and is deliberately not part of [`DocumentState`].
+    ///
+    /// Written by [`Editor::note_input`] and [`Editor::sample`]; read only by
+    /// the settings pane. Nothing on the stroke path may start reading it, or
+    /// the diagnostic becomes part of what it is meant to be observing.
+    pub input: crate::inputlog::InputLog,
 
     pub interaction: Interaction,
     /// Cursor in physical window pixels.
@@ -296,6 +306,7 @@ impl Default for Editor {
             stroke: StrokeBuilder::new(),
             history: History::default(),
             pressure: PressureModel::default(),
+            input: crate::inputlog::InputLog::default(),
             interaction: Interaction::Idle,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
@@ -334,8 +345,23 @@ impl Editor {
         // the same at every zoom level.
         let distance = (doc - self.screen_to_doc(self.last_cursor)).length();
         let pressure = self.pressure.resolve(reported, distance, dt);
+        // Record what that one call answered. `resolve` mutates the model — it
+        // carries the simulated value forward and latches whether the device
+        // has been heard from this stroke — so the diagnostic must take the
+        // real answer rather than ask again for a number to draw.
+        self.input.note_resolved(pressure);
 
         InputPoint::new(doc, pressure, now)
+    }
+
+    /// Note a window event for the input diagnostic.
+    ///
+    /// Observation only: nothing downstream reads what this records, and the
+    /// stroke path behaves identically whether Settings → Input & pen is open
+    /// or not. See [`crate::inputlog`].
+    pub fn note_input(&mut self, event: &winit::event::WindowEvent) {
+        let now = self.now();
+        self.input.note(event, now);
     }
 
     /// True when the layout, rather than the canvas, owns the pointer.

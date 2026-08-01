@@ -830,6 +830,49 @@ is the default and passes it straight through; the enum's other arms are the
 mouse-only fallbacks. macOS and Linux have no equivalent path yet — do not
 describe pen pressure as working there.
 
+**A reported `None` and a reported `0.0` are the same event to winit**, and the
+two readings of it are opposites: a mouse has no sensor and must paint at full
+pressure, a pen just off the glass is reporting zero and must paint nothing.
+winit's Windows path runs the raw value through a normaliser accepting `1..=1024`
+and answers `None` for everything else, so the last samples of every pen stroke
+arrive looking exactly like a mouse. `PressureModel::resolve` settles it with a
+latch: once a stroke has carried one real reading, a later gap is a zero. **Per
+stroke, never per session** — a session-wide latch would let one pen stroke make
+every later mouse stroke paint nothing, which is far worse than the blob it
+fixes.
+
+### Settings, Input & pen
+
+`umber-app/src/inputlog.rs` records the pointer stream and `settings.rs`'s
+`input_pane` draws it. It exists because **nobody working on Umber has a pen**,
+so everything above shipped unverified; the pane is how somebody with the
+hardware settles it. The rules it lives by:
+
+- **It is observation, and nothing downstream may read it.** A stroke must
+  behave identically whether the pane is open or not. `Editor::input` is
+  therefore above the `--- documents ---` line — it describes the tablet plugged
+  into this machine, not a document — and `Editor::note_input` is called once,
+  from `window_event`, before the match.
+- **The resolved figure is recorded, never recomputed.** `resolve` mutates the
+  model, so calling it again to have a number to draw would corrupt the one
+  driving the real stroke. `note` pushes the event's sample and `Editor::sample`
+  amends it with what the one real call answered — which is why the note has to
+  run before the event is dispatched.
+- **The test strip runs on a private copy of the model**, reset per press,
+  because it is dragged while no stroke exists and there is no real call to
+  record. `settings::show` ends the probe whenever the pane is not in front, or
+  a drag interrupted by closing the dialog would go on resolving every event in
+  the application.
+- **An absent reading is never drawn as a zero.** `value_meter` takes an
+  `Option` and `pressure_graph` breaks its line at a gap. Printing `0.00` for
+  "the device said nothing" would put the exact ambiguity the latch exists to
+  resolve back on the page.
+- **The ring is fixed-capacity**, because it is written once per pointer event,
+  which is the drawing path.
+- **Tilt is a sentence, not a meter.** winit carries one only as the stylus
+  altitude inside a `Force::Calibrated`, which is iOS's form; a readout sitting
+  at zero would look like a device answering.
+
 ## Releasing
 
 ```sh
