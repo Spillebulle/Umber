@@ -795,7 +795,8 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
     } else {
         "Opened"
     };
-    if history_row(ui, p, base, true, position == 0, follow).clicked() {
+    let at_start = position == 0;
+    if history_row(ui, p, base, true, at_start, at_start && follow).clicked() {
         jump = Some(0);
     }
 
