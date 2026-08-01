@@ -68,8 +68,11 @@ panel, and never again.
 ## Refreshing the shipped library
 
 ```sh
+git show HEAD:crates/umber-core/assets/builtin-brushes.ron > /tmp/before.ron
 pwsh tools/fetch-brushes.ps1     # or: sh tools/fetch-brushes.sh
 cargo run -p umber-core --example build-brush-library
+cargo run -p umber-core --example diff-brush-library -- \
+    /tmp/before.ron crates/umber-core/assets/builtin-brushes.ron
 cargo run -p umber-core --example survey-mypaint   # the tables below
 ```
 
@@ -80,19 +83,37 @@ deliberate acts rather than a `build.rs`: the packs are not in the repository,
 so a build script would make a clean checkout unbuildable, and a generated file
 that lands in a commit is a file whose diff can be read.
 
+**The generator is reproducible**, and was not until it was checked. Running it
+twice on an unchanged tree rewrote about a hundred lines in the last decimal
+place, because MyPaint's `value = base + Σ mapping(input)` was summed in
+`HashMap` order and floating-point addition is not associative — so Rust's
+per-process hash seed moved the last bit. The inputs are a `BTreeMap` now.
+Regenerating with nothing behind it produces byte-identical output, which is
+what a committed generated file has to do before its diff means anything.
+
+**The third step is what makes that true.** Fifteen thousand lines of
+pretty-printed RON is not readable by hand: one field of one brush and every
+field of every brush look alike in `git diff`. `diff-brush-library` answers the
+four questions that matter instead — did a preset appear or vanish, which
+*fields* moved and in how many brushes, did anything change collection, and is
+the resulting spread of values sane. The regeneration that found the Krita
+faults below moved 23 fields across 191 of 215 presets, and no reading of the
+raw diff would have separated the deliberate changes from the two that were
+bugs.
+
 Preview thumbnails are never downloaded. In the MyPaint pack the brush
 *settings* are CC0 but some of the previews are CC-BY, and not having the files
 is the surest way not to ship them.
 
 ## What is in it today
 
-**222 presets**: Umber's own five, all 196 MyPaint brushes, and 21 out of four
-more packs — David Revoy's 2025-01 Krita bundle, Raghavendra Kamath's v2.1,
-GDQuest's, and rubberduck's 60 GIMP stamps. All CC0 except GDQuest's, which is
-CC-BY and therefore carries its credit.
+**221 presets**: Umber's own six, all 196 MyPaint brushes, and 19 out of four
+more packs — David Revoy's 2025-01 Krita bundle (8), Raghavendra Kamath's v2.1
+(4), GDQuest's (7), and rubberduck's 60 GIMP stamps (none). All CC0 except
+GDQuest's, which is CC-BY and therefore carries its credit.
 
-Those 21 are the Krita brushes whose dab is *generated* rather than stamped, so
-they convert exactly. The rest of what those packs hold — 269 stamps and about
+Those 19 are the Krita brushes whose dab is *generated* rather than stamped, so
+they convert exactly. The rest of what those packs hold — 338 stamps and about
 90 more presets — needs a bitmap tip, and the shipped library has nowhere to put
 one. `docs/brush-sources.md` has the counts, the measurements and the reason.
 Every one of them imports.
@@ -137,7 +158,7 @@ pack ever need it.
 
 Twelve collections, in the order the picker lists them:
 
-Counted over the 217 the generator converts; Umber's own five are on top of
+Counted over the 215 the generator converts; Umber's own six are on top of
 these and sort the same way.
 
 | Collection | Count |
@@ -146,14 +167,14 @@ these and sort the same way.
 | Inks & pens | 32 |
 | Markers | 5 |
 | Charcoal, chalk & pastel | 6 |
-| Paint & brushes | 50 |
+| Paint & brushes | 51 |
 | Watercolour & wet media | 22 |
 | Airbrush & spray | 13 |
-| Blenders & smudge | 23 |
+| Blenders & smudge | 22 |
 | Erasers | 9 |
 | Texture & grain | 13 |
 | Foliage & fur | 8 |
-| Effects & experimental | 22 |
+| Effects & experimental | 20 |
 
 Adding the stamp packs meant teaching `RULES` the words they use. They name a
 brush after the mark — "Cracks", "Vegetation", "Exploding Sparks", "Waterfall" —
@@ -161,6 +182,14 @@ rather than after a medium, so without those rules rubberduck's pack arrives as
 269 brushes in "Paint & brushes". None of the 196 MyPaint brushes moved
 collection as a result, which is the check that the new rules are additions
 rather than a reshuffle.
+
+Exactly one brush has changed collection since, and not because a rule changed:
+`classic/modelling2` reads its colour pickup entirely as a pressure mapping, so
+once that was imported as a modulation instead of a base value its `smudge`
+field fell below the half that the last-resort rule tests, and a brush called
+"Modelling2" moved from "Blenders & smudge" to "Paint & brushes". That is the
+right answer — it is a modelling brush — and it is a reminder that the settings
+rule is the weakest evidence there is, which is why it sits last.
 
 The generator prints this table on every run, because a classifier is a
 judgement and judgements have to be looked at rather than asserted. The first
@@ -411,17 +440,48 @@ Documented in full in the module docs of
 
 Three things look like faults and are not:
 
-- **`color_h` / `color_s` / `color_v`** are non-default in 52 brushes, and the
-  values are simply whatever colour was on the canvas when the file was saved —
-  the same triple repeats verbatim across a dozen unrelated brushes. MyPaint
-  only applies them when `restore_color` is set, which two brushes do. Ignoring
-  them is correct.
-- **`opaque_linearize`** is non-default in 123 brushes. It is MyPaint reducing
-  per-dab alpha so that dabs compounding at the brush's spacing reach the
-  requested opacity. Umber's `max` coverage reaches exactly `opacity` already.
+- **`color_h` / `color_s` / `color_v`** are non-default in 52 brushes each — 63
+  brushes set at least one — and the values are simply whatever colour was on
+  the canvas when the file was saved. `(0.1006, 0.2536, 0.8196)` repeats
+  verbatim in eleven unrelated brushes and `(0.002, 0.9615, 0.3833)` in nine,
+  which is the whole story in two lines. MyPaint only applies them when
+  `restore_color` is set, which **two** brushes do. Ignoring them is correct.
+- **`opaque_linearize`** is non-default in 123 brushes, and 94 of those set it
+  to **zero** — they are switching it off. It is MyPaint reducing per-dab alpha
+  so that dabs compounding at the brush's spacing reach the requested opacity.
+  Umber's `max` coverage reaches exactly `opacity` already.
 - **`anti_aliasing`** is non-default in 100 brushes. It is a minimum edge
   fadeout in pixels, and Umber's dab shader applies one unconditionally, sized
   from the dab's short axis. Nothing is lost.
+
+### The fields no source fills
+
+Some of `Brush` has no counterpart in any format the library is built from, so
+every imported preset carries Umber's own default there. That is only right when
+the field is *dead* for that brush, and it was worth checking one by one which
+of them are:
+
+| Field | Default in | Live in | Verdict |
+|---|---|---|---|
+| `min_size_ratio` | 89 of 215 | the other 126, all of which set `pressure_size` | dead where defaulted |
+| `min_hardness_ratio` | 147 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
+| `grain`, `grain_scale`, `grain_pattern` | 215 | none | nothing in any pack asks for paper |
+| `build_up` | 215 | none | deliberate — see below |
+| `stroke_span` | 159 | 37 read the `Stroke` input | 19 carry a span nothing reads; the editor draws it dead |
+| `stabilization` | 19 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
+
+The two ratios are the useful result: the counts add up to 215 exactly, so no
+brush that varies with pressure is falling back on a default, and the ones that
+do not vary are carrying a number nothing reads. `smudge_length` and
+`smudge_radius` look like the same case at a glance — 153 and 195 presets sit on
+Umber's default — and are not: those *are* MyPaint's defaults, read out of the
+file through the same evaluation as everything else.
+
+Krita's is the one place a default is doing real work. Its stabiliser belongs to
+the freehand tool rather than to the preset, so there is nothing in a `.kpp` to
+import and Umber's 0.35 is as good an answer as exists — but it does mean a
+Krita brush arrives with smoothing its author never asked for, while a MyPaint
+brush arrives with exactly what it did ask for, which is usually none.
 
 ### Approximations, stated
 
@@ -589,7 +649,8 @@ wrong, and all three were got wrong first:
 - **`Pressure<Name>` is not "pressure drives this".** It is Krita's historical
   spelling of "the `<Name>` dynamic is switched on"; *which* input drives it is
   in `<Name>Sensor`. Read the obvious way, every speed- and angle-driven
-  dynamic becomes a pressure one.
+  dynamic becomes a pressure one. It also gates the setting's **value**, not
+  only its curve — see "What the first Krita imports got wrong" below.
 - **A Krita PNG brush is inverted relative to a `.gbr`.** White is no paint and
   black is full — the opposite of `TipMask`'s convention. Read the `.gbr` way it
   gives a solid square with a hole in it.
@@ -598,16 +659,52 @@ wrong, and all three were got wrong first:
 |---|---|
 | `brush_definition` `MaskGenerator@diameter` × the size curve's peak | `size` |
 | `MaskGenerator@ratio` | `dab_ratio`, **reciprocated** — Krita scales the short axis |
-| `MaskGenerator@hfade` | `hardness`, **inverted** — fade is softness |
+| `MaskGenerator@hfade` | `hardness`, **directly** — fade is the opaque fraction of the radius |
+| `MaskGenerator@softness_curve` (`id="soft"`) | `hardness`, from where the curve crosses a half |
 | `Brush@angle`, in **radians** | `dab_angle` |
 | `Brush@spacing` | `spacing` |
 | `OpacityValue` × `FlowValue` × the opacity curve's peak | `opacity` |
 | `Pressure<X>` + `<X>Sensor` + `<X>commonCurve` | `pressure_*`, `min_*_ratio`, `*_curve` |
 | `RotationSensor` `id="drawingangle"` / `"fuzzy"` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
-| `ScatterValue` | `scatter` |
+| `PressureScatter` × `ScatterValue` | `scatter` |
 | `EraserMode`, `CompositeOp` | `mode` |
-| `isAirbrushing` + `rate` | `dabs_per_second` |
+| `AirbrushOption/` **or** `PaintOpSettings/` `isAirbrushing` + `rate` | `dabs_per_second` |
 | `SmudgeRateValue`, `SmudgeRadiusValue` (colorsmudge) | `smudge`, `smudge_radius` |
+
+#### What the first Krita imports got wrong
+
+Three faults, all found by auditing the shipped presets against their sources
+rather than by a test, and all of the same shape: a value read without the thing
+that decides whether Krita reads it at all.
+
+- **`hfade` is hardness, not softness**, and it was inverted. Every generated
+  Krita brush in the library arrived inside out — GDQuest's and Raghukamath's
+  ink brushes as diffuse clouds, Revoy's "Eraser Kneaded Soft" and both GDQuest
+  airbrushes as hard discs. What settled it is that a `.kpp` *is* a PNG and the
+  image is **Krita's own preview of the brush**, so the pack answers the
+  question directly; the seven presets that pin the direction are tabulated in
+  the module docs of `brushimport/kpp.rs`. Three mask generators share the
+  attribute: `default` fades inward from `hfade` of the radius, `gauss` blurs by
+  `1 - hfade`, and `soft` ignores `hfade` altogether and states its falloff in
+  `softness_curve`, which is now read instead.
+- **`ScatterValue` was applied whether or not Krita's scatter option was on.**
+  Krita writes the value at its default of 1 into every preset regardless, and
+  `KisScatterOption` returns the unscattered position when the option is
+  unchecked — so 93 of the 119 presets in the fetched packs were being sprayed,
+  including an ink brush that got five radii of it. The enable flag is
+  `PressureScatter`, the very rule stated two bullets above; it was being
+  applied to the curve and not to the value.
+- **Krita has spelled the airbrush option two ways** — `PaintOpSettings/` and
+  `AirbrushOption/` — and both are in the packs, 45 presets and 52. Knowing only
+  the first imported GDQuest's "Airbrush", which asks for a thousand dabs a
+  second, as an ordinary distance-driven brush.
+
+A fourth thing was being dropped in silence rather than got wrong. **Krita's
+Sharpness** thresholds the finished mask into a hard, aliased edge; `dab.wgsl`
+antialiases unconditionally and has nothing to switch off. It is the whole of a
+pixel-art brush, so it is now named — which costs the library GDQuest's two
+pixel-art presets, correctly: a one-pixel brush that paints a soft grey dot is
+not the brush its author drew.
 
 **Only two of Krita's paint engines are accepted**: `paintbrush` and
 `colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an

@@ -138,11 +138,11 @@ fights the design.
 
 ### Brushes
 
-Umber ships **222 presets**. Five are its own; 196 are the whole of
+Umber ships **221 presets**. Six are its own; 196 are the whole of
 [mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes), and the
-rest are the procedural brushes out of three CC0 and CC-BY Krita packs. Every
-one carries its author and licence through the conversion and shows them in the
-library.
+remaining 19 are the procedural brushes out of three CC0 and CC-BY Krita packs.
+Every one carries its author and licence through the conversion and shows them
+in the library.
 
 They are grouped by **style** — pencils, inks, markers, charcoal, paint,
 watercolour, airbrush, blenders, erasers, texture, foliage, effects — rather
@@ -206,7 +206,7 @@ shipped under an author's name should paint unlike their brush.
 **Five packs are fetched**, four of them new: MyPaint's, David Revoy's 2025-01
 Krita bundle, Raghavendra Kamath's, GDQuest's — CC-BY, so every one of those
 carries its credit — and rubberduck's 60 GIMP stamps. That is 269 stamps and 116
-Krita presets you can import today, and 21 more brushes in the shipped library.
+Krita presets you can import today, and 19 more brushes in the shipped library.
 
 **A stamp brush can build up.** A sparse photographic texture stamp is not a
 solid disc: GIMP and Krita composite every dab, so the mark is the *overlap* of
