@@ -1,4 +1,9 @@
-<!-- BANNER -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/banner-paper.png">
+    <img src="docs/images/banner.png" alt="Umber" width="560">
+  </picture>
+</p>
 
 A painting application built for one thing above all others: **latency** — the
 shortest possible path between a pen moving and pixels changing.
@@ -177,12 +182,13 @@ switches it off, with the trade stated in megabytes rather than in adverbs.
 
 ## The workspace
 
-<!-- PICKERS -->
+The Colour panel offers four ways to pick a colour. The wheel's triangle can
+follow the hue as you turn it or hold still, whichever you prefer, and Umber
+remembers which one you left it on.
 
-The Colour panel offers a hue ring with a triangle or square centre, a
-saturation/value square with a hue bar, and RGB sliders. The triangle can follow
-the hue as you turn it or hold still, whichever you prefer — and Umber remembers
-which picker you left it on.
+| Wheel, triangle | Wheel, square | Saturation / value | Sliders |
+|---|---|---|---|
+| ![](docs/images/picker-wheel.png) | ![](docs/images/picker-wheel-square.png) | ![](docs/images/picker-square.png) | ![](docs/images/picker-sliders.png) |
 
 Panels are **locked while you paint** and rearranged in a mode of their own:
 **Window → Customise layout**. In that mode every module is draggable by its
@@ -200,16 +206,18 @@ Your arrangement is saved between runs.
 
 ### Settings
 
-<!-- SETTINGS -->
-
 **Edit → Settings**. Interface scale, where pressure comes from, the two themes
 — **Graphite** and **Paper** — and a four-way accent choice.
+
+![The settings dialog, Themes pane](docs/images/settings-themes.png)
 
 **Shortcuts** lists every command with a search field, and lets you rebind:
 click a key to listen for a new one, add a second key for the same command, or
 put one — or the whole table — back to its defaults. Giving a chord to a second
 command does not quietly take it off the first; the clash is flagged on both
 rows and left for you to settle.
+
+![The settings dialog, Shortcuts pane](docs/images/settings-shortcuts.png)
 
 Settings are a plain `key = value` file you can read, in
 `%APPDATA%\Umber\config`, `~/.config/umber` or
