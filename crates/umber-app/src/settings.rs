@@ -1213,7 +1213,23 @@ fn shortcut_row(
     const ROW_HEIGHT: f32 = 34.0;
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
-    let hovered = response.hovered();
+    // `contains_pointer`, never `hovered`. egui stops the hover search at the
+    // topmost *interactive* widget under the pointer, so a `Sense::hover()`
+    // rectangle allocated before a button inside it reads as not-hovered the
+    // moment the pointer is over that button. The buttons below exist only
+    // while the row is lit, so `hovered` would make the answer depend on
+    // itself: lit, so the `+` is allocated; over the `+`, so not lit; not lit,
+    // so no `+`; over the row, so lit — a one-frame oscillation.
+    //
+    // `contains_pointer` is decided by geometry alone — is the pointer inside
+    // this rectangle, in this layer — and the rectangle is allocated
+    // unconditionally at a fixed height *before* anything is put in it. So
+    // nothing drawn as a consequence of the answer can change the answer. That
+    // is the property to keep: taking the union of the row's and the buttons'
+    // responses only damps the loop, because the buttons still have to exist
+    // to be asked, and testing a response that is itself contested leaves the
+    // feedback path in place.
+    let hovered = response.contains_pointer();
 
     let painter = ui.painter();
     if armed {
