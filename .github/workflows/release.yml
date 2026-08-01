@@ -1,0 +1,223 @@
+name: Release
+
+# Cutting a release is pushing a tag; everything below follows from that, so
+# there is no button to press and no step that can be done in the wrong order.
+# `tools/release.ps1` (or `tools/release.sh`) is what pushes it, after checking
+# the tree and running the same gates CI runs.
+#
+# `workflow_dispatch` builds and packages everything but publishes nothing,
+# which is how a change to this file gets rehearsed without spending a tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: write
+
+jobs:
+  # --- the binaries ---------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  arch: amd64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, arch: arm64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    arch: x64   }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   arch: arm64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      arch: arm64 }
+          - { os: macos-13,         target: x86_64-apple-darwin,       arch: x64   }
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Ubuntu 22.04 rather than latest, deliberately: a binary built against an
+      # older glibc runs on newer distributions, and one built against a newer
+      # glibc does not run on older ones. The oldest supported runner is
+      # therefore the widest compatible build.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-dev libxrandr-dev libxi-dev \
+            mesa-vulkan-drivers vulkan-tools
+
+      # The same gates CI runs on every push. Repeated because a tag can point
+      # at a commit CI never saw, and a release built from an untested tree is
+      # exactly what a release process exists to prevent.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p umber-desktop
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -eu
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          stage="umber-${version}-${{ matrix.target }}"
+          mkdir -p "staging/$stage"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/umber.exe "staging/$stage/"
+          else
+            cp target/release/umber "staging/$stage/"
+          fi
+          cp README.md CHANGELOG.md LICENSE "staging/$stage/"
+          # Carried so the Arch package can install the same desktop entry,
+          # metadata and icons the .deb and .rpm do, without a second checkout.
+          cp -r packaging "staging/$stage/"
+          cp -r assets/icons "staging/$stage/icons"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd staging && 7z a "../dist/${stage}.zip" "$stage" > /dev/null)
+          else
+            tar czf "dist/${stage}.tar.gz" -C staging "$stage"
+          fi
+
+      # --- Windows installer (WiX 5, per-architecture MSI) ------------------
+      - name: Build MSI
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          dotnet tool install --global wix --version 5.0.2
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+
+          # WiX's licence page wants RTF. Wrapping the plain text is enough:
+          # the point is that the text shown is the licence that ships, not
+          # that it is typeset.
+          mkdir -p wixassets
+          cp assets/icons/umber.ico wixassets/umber.ico
+          {
+            printf '{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fnil Courier New;}}\\fs16\n'
+            sed -e 's/\\/\\\\/g; s/{/\\{/g; s/}/\\}/g; s/$/\\par/' LICENSE
+            printf '}\n'
+          } > wixassets/licence.rtf
+
+          wix build packaging/windows/umber.wxs \
+            -arch ${{ matrix.arch }} \
+            -ext WixToolset.UI.wixext \
+            -d Version="$VERSION" \
+            -d BinDir="target/release" \
+            -d DocDir="." \
+            -d AssetDir="wixassets" \
+            -o "dist/umber-${VERSION}-${{ matrix.arch }}.msi"
+
+      # --- Linux packages ---------------------------------------------------
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y rpm file desktop-file-utils
+          chmod +x packaging/linux/build-packages.sh
+          packaging/linux/build-packages.sh \
+            "$VERSION" target/release/umber "${{ matrix.arch }}" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --- Arch package ---------------------------------------------------------
+  #
+  # A job of its own because makepkg needs an Arch userland, which no runner
+  # image provides; a container is the cheapest way to get one.
+  arch:
+    name: build Arch package
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Build
+        run: |
+          set -eu
+          pacman -Sy --noconfirm --needed git
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+
+          # makepkg refuses to run as root, and a container is root by default.
+          useradd -m builder
+          work=/home/builder/build
+          install -d -o builder "$work"
+          cp packaging/linux/PKGBUILD "$work/"
+          cp "dist/umber-${version}-x86_64-unknown-linux-gnu.tar.gz" "$work/"
+          sed -i "s/^pkgver=.*/pkgver=${version}/" "$work/PKGBUILD"
+          chown -R builder "$work"
+
+          su builder -c "cd $work && makepkg --noconfirm --nodeps"
+          mkdir -p out
+          cp "$work"/*.pkg.tar.zst out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: out/*
+          if-no-files-found: error
+
+  # --- publish ---------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [build, arch]
+    runs-on: ubuntu-latest
+    # A manual run builds and packages but must not publish: there is no tag to
+    # attach a release to, and inventing one would be a release nobody asked
+    # for. This is what makes `workflow_dispatch` safe to use as a rehearsal.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The notes come out of CHANGELOG.md rather than being written here, so
+      # what GitHub shows and what the repository says cannot drift apart.
+      # `crates/umber-desktop/tests/release.rs` fails CI if the section for this
+      # version is missing, empty, or not the newest.
+      - name: Release notes
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml's ${manifest}" >&2
+            exit 1
+          fi
+          sh tools/release-notes.sh "$version" > notes.md
+          echo '--- notes to be published ---'
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la artifacts
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Umber $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            artifacts/*

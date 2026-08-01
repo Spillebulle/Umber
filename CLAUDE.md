@@ -535,6 +535,53 @@ flat 1.0 or a speed-derived approximation. The `PressureSource` enum exists so a
 native tablet path (Windows Ink / `WM_POINTER`) can be added without touching the
 brush engine. Do not describe desktop pen pressure as working.
 
+## Releasing
+
+```sh
+pwsh tools/release.ps1 0.0.2 -DryRun   # or: sh tools/release.sh 0.0.2 --dry-run
+pwsh tools/release.ps1 0.0.2           # for real
+```
+
+**Cutting a release is pushing a tag.** Everything else follows from that, which
+is what stops a release being a sequence somebody has to remember. The script
+checks the tree, the version and the notes, runs the same gates CI runs, then
+pushes `main` and an annotated `v<version>` tag. It uploads nothing, so it
+cannot half-publish; `.github/workflows/release.yml` does the rest.
+
+- **`CHANGELOG.md` is the release notes**, published verbatim. There is no
+  second place to write them and therefore no way for GitHub and the repository
+  to disagree. A section starts at `## <version>` — alone or followed by a
+  date — and runs to the next `## `. That rule is stated three times, in
+  `tools/release-notes.sh`, in `tools/release.ps1` and in
+  `crates/umber-desktop/tests/release.rs`; the test is the one that matters,
+  because it runs on every CI push rather than only at tag time.
+- **The version lives in one place**, `[workspace.package]` in the root
+  `Cargo.toml`; every crate takes `version.workspace = true`. Bump it and write
+  the changelog section in the same commit — `the_changelog_describes_this_
+  version` and `this_version_is_the_newest_entry` fail the build otherwise, so a
+  release cannot be cut without notes and cannot publish the *previous*
+  release's notes.
+- **The workflow tests before it builds.** A tag can point at a commit CI never
+  saw, so the gates are repeated there rather than assumed.
+- **`workflow_dispatch` is the rehearsal.** It builds and packages everything on
+  every platform and publishes nothing — the `publish` job requires
+  `refs/tags/v`. Change the workflow, dispatch it, and only tag once it is
+  green; a tag spent on a broken workflow is one somebody may already have
+  fetched.
+- **Linux binaries build on the oldest runner, not the newest.** A binary built
+  against an old glibc runs on newer distributions and not the other way round.
+- **The libraries that matter are `dlopen`ed, not linked** — the Vulkan loader,
+  libxkbcommon, the Wayland and X11 clients. No automatic dependency scanner
+  will find them, so `packaging/linux/build-packages.sh` and the `PKGBUILD`
+  state them by hand. A package that omits one installs cleanly and then fails
+  to open a window, which is the worst shape a packaging bug takes.
+- **Packaging is a script, not workflow steps.** `build-packages.sh` runs on any
+  Debian-ish machine, so the packages can be rehearsed locally; a release
+  process only a robot can run cannot be debugged.
+- The MSI's `UpgradeCode` in `packaging/windows/umber.wxs` must never change. It
+  is what tells Windows the next version replaces this one rather than
+  installing beside it.
+
 ## Conventions
 
 - **Commit after every change, and say in the message what changed and why.**
