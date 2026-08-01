@@ -69,15 +69,6 @@ desktop-only and has never been built for mobile.
   camera.
 - A save writes to a temporary neighbour and renames, so an interrupted write
   cannot replace your last good file with a truncated one.
-- **Autosave**, every five minutes and configurable. It waits for a gap between
-  strokes and never pauses the canvas: the pixels come off the graphics card a
-  little at a time and the file is written on a thread. A document with a file
-  is written back to it; every document, saved or not, also gets a copy in a
-  folder of Umber's own, which Settings can open. Those copies expire after a
-  month by default — and nothing Umber deletes is ever a file you chose the
-  place for.
-- Closing the window with unsaved work asks first, and names every document at
-  risk rather than counting them.
 
 ### Interface
 
@@ -96,12 +87,8 @@ desktop-only and has never been built for mobile.
 - **Pen pressure is not read from graphics tablets.** Touch screens report real
   pressure; on desktop the fallback is a flat value or a speed-derived
   approximation. A native tablet path is not built.
-- **An explicit save blocks the frame.** A large document pauses visibly while
-  it is written. Autosave does not — it reads the document a piece at a time —
-  but Save itself has not been moved onto that path yet.
-- **Crash recovery is not automatic.** The autosave copies are written and can
-  be opened by hand from the folder Settings points at; nothing offers them to
-  you on the next start.
+- **Saving blocks the frame.** A large document pauses visibly while it is
+  written, and there is no autosave or crash recovery.
 - Deleting a layer clears the undo history.
 - 338 brushes out of the fetched packs import but do not ship, because they need
   a bitmap tip and the masks are far larger than the library.

@@ -294,7 +294,10 @@ fn settings_shot(
         SETTINGS_SCALE,
         &palette,
         palette.backdrop,
-        |ui| settings::show(ui, &palette, &mut ed),
+        // The dialog reports what it was asked to do — reveal the autosave
+        // folder, for one — and here there is nobody to carry that out. A
+        // picture of a dialog is not a session, so the requests are discarded.
+        |ui| settings::show(ui, &palette, &mut ed, &mut crate::ui::UiActions::default()),
     );
     write_png(&dir.join(name), &image)
 }

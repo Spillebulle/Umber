@@ -1662,7 +1662,13 @@ mod tests {
             gpu.queue.submit(Some(enc.finish()));
             let notice = collect(&mut editor, &gpu, &mut canvases);
             assert!(notice.is_none(), "{:?}", notice.map(|n| n.lines));
-            if theirs.exists() && ours.exists() {
+            // Wait for the dot as well as for the files. The writing happens on
+            // a thread and the dot comes off when its report is *collected*,
+            // which is earlier in this same iteration — so stopping the moment
+            // both files appear can leave one frame's worth of bookkeeping
+            // undone and fail an assertion the application would never fail,
+            // since it collects on every frame.
+            if theirs.exists() && ours.exists() && !editor.session.active_tab().modified {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
