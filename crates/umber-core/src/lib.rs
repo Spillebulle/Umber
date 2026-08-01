@@ -20,6 +20,7 @@ pub mod input;
 pub mod layer;
 mod pattern_table;
 pub mod preset;
+mod sqlite;
 pub mod stroke;
 pub mod style;
 pub mod time;

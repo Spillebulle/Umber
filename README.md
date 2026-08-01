@@ -96,6 +96,7 @@ formats:
 | `.kpp` | Krita presets |
 | `.bundle` | Krita resource bundles — a whole pack at once, tips and all |
 | `.abr` | Photoshop 1, 2, 6.1 and 6.2 |
+| `.sut`, `.sutg` | Clip Studio Paint sub-tools — a group arrives whole |
 | `.ron` | an Umber library |
 
 A stamp arrives as a working brush — its picture, its spacing, its proportions —

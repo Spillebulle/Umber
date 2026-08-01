@@ -1061,13 +1061,14 @@ fn import(state: &mut State, ed: &mut Editor) {
         .add_filter(
             "Brush files",
             &[
-                "myb", "gbr", "gpb", "gih", "vbr", "kpp", "bundle", "abr", "ron",
+                "myb", "gbr", "gpb", "gih", "vbr", "kpp", "bundle", "abr", "sut", "sutg", "ron",
             ],
         )
         .add_filter("MyPaint brush", &["myb"])
         .add_filter("GIMP brush", &["gbr", "gpb", "gih", "vbr"])
         .add_filter("Krita brush", &["kpp", "bundle"])
         .add_filter("Photoshop brush", &["abr"])
+        .add_filter("Clip Studio sub-tool", &["sut", "sutg"])
         .add_filter("Umber brush library", &["ron"])
         // Deliberately present, and deliberately last: picking the wrong kind
         // of file gives a sentence naming it and the reason, which is a better

@@ -15,14 +15,17 @@
 //! | `.kpp` | Krita paintop preset | [`kpp`] |
 //! | `.bundle` | Krita resource bundle | [`bundle`] |
 //! | `.abr` | Photoshop | [`abr`] |
+//! | `.sut`, `.sutg` | Clip Studio Paint | [`clipstudio`] |
 //! | `.ron` | an Umber library | [`crate::preset::parse_library`] |
 //!
-//! Two of those are **containers** — a `.gih` holds a sequence of stamps and a
-//! `.bundle` holds a whole pack — so [`read_file`] returns a `Vec`, and the
-//! caller has to report "twenty brushes arrived" as readily as "one did".
+//! Three of those are **containers** — a `.gih` holds a sequence of stamps, a
+//! `.bundle` holds a whole pack and a `.sutg` holds a group of sub-tools — so
+//! [`read_file`] returns a `Vec`, and the caller has to report "twenty brushes
+//! arrived" as readily as "one did".
 
 pub mod abr;
 pub mod bundle;
+pub mod clipstudio;
 pub mod gbr;
 pub mod gih;
 pub mod kpp;
@@ -218,6 +221,45 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                 })
                 .collect())
         }
+        // The third container, and the only one whose single-brush and
+        // whole-group forms are the same file with one node in it instead of
+        // fifteen — so both extensions land on one reader.
+        "sut" | "sutg" => {
+            let bytes = preset::read_bytes(path)?;
+            let file = clipstudio::from_sut(&bytes).map_err(|e| e.at(path))?;
+            let base = display_name(&stem);
+            let many = file.tools.len() > 1;
+            Ok(file
+                .tools
+                .into_iter()
+                .enumerate()
+                .map(|(i, tool)| {
+                    // A sub-tool carries its own name and a group's are what
+                    // the artist reads in the palette. Numbered off the file
+                    // only where a node was saved without one.
+                    let name = if tool.name.is_empty() {
+                        if many {
+                            format!("{base} {}", i + 1)
+                        } else {
+                            base.clone()
+                        }
+                    } else {
+                        display_name(&tool.name)
+                    };
+                    let mut dropped = tool.dropped;
+                    for loss in &file.dropped {
+                        if !dropped.contains(loss) {
+                            dropped.push(loss);
+                        }
+                    }
+                    Imported {
+                        preset: preset_for("clipstudio", name, tool.brush),
+                        tip: tool.tip,
+                        dropped,
+                    }
+                })
+                .collect())
+        }
         "ron" => {
             let text = preset::read_to_string(path)?;
             let presets = preset::parse_library(&text).map_err(|e| e.at(path))?;
@@ -347,6 +389,7 @@ pub fn dropped_features(path: &Path) -> Vec<&'static str> {
         }
         "bundle" => bundle::dropped_features(&bytes()),
         "abr" => abr::dropped_features(&bytes()),
+        "sut" | "sutg" => clipstudio::dropped_features(&bytes()),
         // An Umber library holds Umber brushes; there is nothing in it that
         // Umber cannot render.
         _ => Vec::new(),
