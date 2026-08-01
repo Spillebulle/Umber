@@ -441,6 +441,7 @@ fn panel(
                     PanelKind::Colour => colour_body(ui, p, ed),
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
+                    PanelKind::History => history_body(ui, p, ed, actions),
                 });
         },
     );
@@ -721,6 +722,134 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     if changed {
         ed.mark_modified();
     }
+}
+
+/// The History module: what has been painted on this document, and a click to
+/// go back to any point in it.
+///
+/// What it deliberately does *not* show is anything it cannot restore. Umber's
+/// history covers painting only — adding, deleting or reordering a layer is not
+/// recorded, and deleting one clears the list outright — so a row appears only
+/// where a patch was captured, and the note at the foot says so rather than
+/// leaving the gap to be discovered. A list that named a structural action it
+/// could not undo would be worse than one that admits its own edges.
+fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
+    let position = ed.history.position();
+    let count = ed.history.len();
+
+    // Keep the current entry in view when the position moves under the list —
+    // a jump of eight entries otherwise scrolls nothing and appears to have
+    // done nothing. Held in egui's temporary store rather than in `UiState`,
+    // which is per-application where this is per-list.
+    let memo = Id::new("history-follow");
+    let follow = ui.ctx().data(|d| d.get_temp::<usize>(memo)) != Some(position);
+
+    let mut jump = None;
+
+    // Row zero is the document with none of the edits applied, and it is the
+    // only way back to a blank start, so it is a row like any other rather than
+    // a caption. Once the budget has aged entries out it is no longer the
+    // beginning of the document, and it says so — see `History::dropped`.
+    let dropped = ed.history.dropped();
+    let base = if dropped > 0 {
+        "Earlier edits discarded"
+    } else {
+        "Opened"
+    };
+    if history_row(ui, p, base, true, position == 0, follow).clicked() {
+        jump = Some(0);
+    }
+
+    for index in 0..count {
+        let Some(kind) = ed.history.kind_at(index) else {
+            continue;
+        };
+        // Applied entries read as ink, undone ones as the ghost they are: a
+        // click on one of those is a redo.
+        let applied = index < position;
+        let current = position == index + 1;
+        if history_row(ui, p, kind.label(), applied, current, current && follow).clicked() {
+            jump = Some(index + 1);
+        }
+    }
+
+    if let Some(target) = jump {
+        actions.history_jump = Some(target);
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(memo, position));
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(if count == 0 {
+            "Nothing painted on this document yet. Strokes are recorded here; \
+             layers are not."
+        } else {
+            "Strokes only. Adding, deleting or reordering a layer is not \
+             recorded, and deleting one clears this list."
+        })
+        .size(9.5)
+        .color(p.text_dim)
+        .line_height(Some(12.0)),
+    );
+}
+
+/// One entry in that list: a marker, then what the edit was.
+///
+/// Nothing here allocates and nothing off screen is painted. The list is as
+/// long as the session is, and both of those show up in a frame time before
+/// anything else about it does.
+fn history_row(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &'static str,
+    applied: bool,
+    current: bool,
+    scroll_here: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), metrics::HISTORY_ROW),
+        Sense::click(),
+    );
+    if scroll_here {
+        response.scroll_to_me(Some(Align::Center));
+    }
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    if current {
+        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+    } else if response.hovered() {
+        painter.rect_filled(rect, metrics::RADIUS, p.control);
+    }
+
+    // The marker is the cursor: filled and accented where the document stands,
+    // hollow behind it, and hollow and dim ahead of it.
+    let ink = match (current, applied) {
+        (true, _) => p.accent,
+        (false, true) => p.text,
+        (false, false) => p.text_dim.gamma_multiply(0.55),
+    };
+    let dot = pos2(rect.left() + 8.0, rect.center().y);
+    if current {
+        painter.circle_filled(dot, 3.5, ink);
+    } else {
+        painter.circle_stroke(dot, 3.0, Stroke::new(1.0, ink));
+    }
+    painter.text(
+        pos2(dot.x + 9.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(text::SMALL),
+        ink,
+    );
+
+    response.on_hover_text(if applied {
+        "Go back to this point"
+    } else {
+        "Put this back"
+    })
 }
 
 /// The Colour panel's picker-type switch: a half-filled disc, the mode name,

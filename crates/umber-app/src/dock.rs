@@ -54,16 +54,32 @@ pub enum PanelKind {
     Colour,
     Brushes,
     Layers,
+    History,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 3] = [Self::Colour, Self::Brushes, Self::Layers];
+    pub const ALL: [PanelKind; 4] = [Self::Colour, Self::Brushes, Self::Layers, Self::History];
+
+    /// The arrangement Umber ships with: the design's three modules, in the
+    /// right-hand sidebar.
+    ///
+    /// History is deliberately *not* among them, and that is the same answer a
+    /// layout file written before History existed gets — an absent panel is a
+    /// closed one, so an old config opens with it closed too. Putting it in the
+    /// default instead would have made a fresh install and an upgraded one
+    /// disagree about what the workspace contains, which is exactly the silent
+    /// divergence the config's version header exists to prevent; and the
+    /// alternative to that, bumping the version, would throw away every
+    /// arrangement anybody has made to add one module they can reach from the
+    /// Window menu in two clicks.
+    pub const DEFAULT_DOCK: [PanelKind; 3] = [Self::Colour, Self::Brushes, Self::Layers];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Colour => "Colour",
             Self::Brushes => "Brushes",
             Self::Layers => "Layers",
+            Self::History => "History",
         }
     }
 
@@ -74,6 +90,7 @@ impl PanelKind {
             Self::Colour => "colour",
             Self::Brushes => "brushes",
             Self::Layers => "layers",
+            Self::History => "history",
         }
     }
 
@@ -88,6 +105,7 @@ impl PanelKind {
             Self::Colour => 3.0,
             Self::Brushes => 1.3,
             Self::Layers => 2.2,
+            Self::History => 2.0,
         }
     }
 }
@@ -317,7 +335,7 @@ impl Default for Layout {
         Self {
             sides: [
                 Vec::new(),
-                PanelKind::ALL
+                PanelKind::DEFAULT_DOCK
                     .into_iter()
                     .map(|kind| Docked {
                         kind,
@@ -1078,9 +1096,22 @@ mod tests {
     /// in the wrong place, or fills the panel it was meant to sit inside — so
     /// this is the kind of bug that only shows up as "the interface looked odd
     /// for a moment while I resized".
+    ///
+    /// Run over the default layout *and* over one holding every module there
+    /// is, since the stack's minimum height is per panel: a fourth module is a
+    /// fourth minimum to fit into the same sliver of window.
     #[test]
     fn a_window_too_small_for_the_chrome_still_produces_sane_rects() {
-        let layout = Layout::default();
+        let mut crowded = Layout::default();
+        for kind in PanelKind::ALL {
+            crowded.open(kind);
+        }
+        for layout in [Layout::default(), crowded] {
+            small_window_sweep(&layout);
+        }
+    }
+
+    fn small_window_sweep(layout: &Layout) {
         for (w, h) in [
             (0.0, 0.0),
             (10.0, 400.0),
@@ -1384,6 +1415,61 @@ mod tests {
         layout.set_edit_mode(false);
         assert!(!layout.is_dragging());
         assert_eq!(layout.to_config(), before, "the panel went back");
+    }
+
+    /// The module Umber does not ship in the default arrangement still has to
+    /// survive being placed and written out.
+    #[test]
+    fn the_history_module_round_trips_through_the_config() {
+        let mut layout = Layout::default();
+        assert!(
+            !layout.is_open(PanelKind::History),
+            "History is not in the shipped arrangement",
+        );
+        layout.set_edit_mode(true);
+        layout.open(PanelKind::History);
+        layout.begin_drag(
+            PanelKind::History,
+            pos2(1200.0, 700.0),
+            rect(1176.0, 680.0, 264.0, 200.0),
+        );
+        layout.end_drag(DropTarget::Dock {
+            side: Side::Left,
+            index: 0,
+        });
+
+        let text = layout.to_config();
+        assert!(text.contains("history"), "{text}");
+        let back = Layout::from_config(&text).expect("valid config");
+        assert_eq!(back.to_config(), text);
+        assert_eq!(back.docked(Side::Left)[0].kind, PanelKind::History);
+    }
+
+    /// A layout file written before the History module existed names three
+    /// panels and knows nothing of a fourth. It must load exactly as it did —
+    /// with History closed, which is where the shipped arrangement puts it too,
+    /// so an upgraded workspace and a fresh one agree. That is the reason the
+    /// version header did not have to move; see `PanelKind::DEFAULT_DOCK`.
+    #[test]
+    fn a_config_written_before_the_history_module_still_loads() {
+        let text = "umber-layout 1\n\
+                    rail left\n\
+                    width left 264\n\
+                    width right 300\n\
+                    dock right colour 3\n\
+                    dock right brushes 1.3\n\
+                    dock right layers 2.2\n";
+        let layout = Layout::from_config(text).expect("still loads");
+        assert_eq!(layout.docked(Side::Right).len(), 3);
+        assert_eq!(layout.width(Side::Right), 300.0);
+        assert!(
+            !layout.is_open(PanelKind::History),
+            "an absent panel is a closed one",
+        );
+        // And it is reachable, so nothing has been lost by not being named.
+        let mut layout = layout;
+        layout.open(PanelKind::History);
+        assert!(layout.is_open(PanelKind::History));
     }
 
     #[test]
