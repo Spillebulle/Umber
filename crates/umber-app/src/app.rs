@@ -1689,8 +1689,17 @@ impl ApplicationHandler<Wake> for UmberApp {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Punctuation dispatches on what the user's layout *prints*,
+                // not on the US position winit names it by — otherwise Ctrl and
+                // the key marked `+` zooms out on half the keyboards in Europe.
+                // See `shortcuts::key_for_text`. A named or dead key reports no
+                // character and keeps its position.
+                let typed = match &event.logical_key {
+                    winit::keyboard::Key::Character(text) => Some(text.as_str()),
+                    _ => None,
+                };
                 if let PhysicalKey::Code(code) = event.physical_key
-                    && self.handle_keys(code, event.state.is_pressed())
+                    && self.handle_keys(shortcuts::typed_key(code, typed), event.state.is_pressed())
                     && let Some(g) = self.gfx.as_ref()
                 {
                     g.window.request_redraw();

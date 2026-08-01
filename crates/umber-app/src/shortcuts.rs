@@ -677,6 +677,66 @@ pub const BINDABLE: &[KeyCode] = &[
     KeyCode::ArrowRight,
 ];
 
+/// The bindable key a layout prints `typed` on, for the punctuation keys.
+///
+/// Bindings are *physical* positions: winit's `KeyCode` names the key where a
+/// US layout has that legend, whatever the user's keyboard actually prints on
+/// it. For letters that is the right answer — B is in the same place on nearly
+/// every Latin layout, and a tool shortcut is a place your hand goes.
+///
+/// For punctuation it is emphatically not. A Nordic layout gives `+` a key of
+/// its own, in the position a US layout prints `-` at, and `-` moves to where
+/// US has `/`:
+///
+/// ```text
+/// Nordic:  1 2 3 4 5 6 7 8 9 0 + ´
+/// US:      1 2 3 4 5 6 7 8 9 0 - =
+/// ```
+///
+/// So Ctrl and the key marked `+` zoomed *out*, and the key marked `-` did
+/// nothing at all. Nobody thinks of Ctrl+= as a position; they think of it as
+/// the key with a plus on it. This folds a press onto the US position printing
+/// the same character, so a punctuation binding follows the legend on the
+/// user's own keyboard.
+///
+/// Both legends of each key are listed, because which one is unshifted is
+/// itself layout-dependent: `+` is Shift+= on a US board and unshifted on a
+/// Nordic one, and both must reach [`KeyCode::Equal`].
+///
+/// Returns `None` for anything not a single bindable punctuation character —
+/// letters and digits included, deliberately, so they keep their positions.
+pub fn key_for_text(typed: &str) -> Option<KeyCode> {
+    let mut chars = typed.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(match first {
+        '-' | '_' => KeyCode::Minus,
+        '=' | '+' => KeyCode::Equal,
+        '[' | '{' => KeyCode::BracketLeft,
+        ']' | '}' => KeyCode::BracketRight,
+        '\\' | '|' => KeyCode::Backslash,
+        ';' | ':' => KeyCode::Semicolon,
+        '\'' | '"' => KeyCode::Quote,
+        ',' | '<' => KeyCode::Comma,
+        '.' | '>' => KeyCode::Period,
+        '/' | '?' => KeyCode::Slash,
+        '`' | '~' => KeyCode::Backquote,
+        _ => return None,
+    })
+}
+
+/// The key to dispatch on, given what winit reported and what the layout says
+/// that key prints. See [`key_for_text`].
+///
+/// `typed` is the event's *logical* key where that is a character, and `None`
+/// for everything else — a named key, or a dead key such as the `´` a Nordic
+/// layout puts where US has `=`.
+pub fn typed_key(physical: KeyCode, typed: Option<&str>) -> KeyCode {
+    typed.and_then(key_for_text).unwrap_or(physical)
+}
+
 /// Stable identifier for the preferences file, e.g. "KeyZ", "BracketLeft".
 pub fn key_id(key: KeyCode) -> String {
     format!("{key:?}")
@@ -840,6 +900,62 @@ mod tests {
         // Unmodified, they are free for anyone to bind.
         assert_eq!(hit(KeyCode::Equal, NONE), None);
         assert_eq!(hit(KeyCode::Minus, NONE), None);
+    }
+
+    #[test]
+    fn punctuation_follows_the_legend_on_the_users_keyboard() {
+        // A Nordic layout puts `+` on the key US layouts print `-` at, and `-`
+        // where US has `/`. Dispatching on the physical position made Ctrl and
+        // the key marked `+` zoom *out*.
+        let nordic_plus = typed_key(KeyCode::Minus, Some("+"));
+        let nordic_minus = typed_key(KeyCode::Slash, Some("-"));
+        assert_eq!(hit(nordic_plus, CTRL), Some(Action::ZoomIn));
+        assert_eq!(hit(nordic_minus, CTRL), Some(Action::ZoomOut));
+
+        // A US board is unchanged: the character it prints is the one its
+        // position is named for, so every press folds onto itself.
+        assert_eq!(typed_key(KeyCode::Equal, Some("=")), KeyCode::Equal);
+        assert_eq!(typed_key(KeyCode::Minus, Some("-")), KeyCode::Minus);
+        // Shift+= is `+` there, and must reach the same key rather than a
+        // second one.
+        assert_eq!(typed_key(KeyCode::Equal, Some("+")), KeyCode::Equal);
+        assert_eq!(
+            hit(typed_key(KeyCode::Equal, Some("+")), CTRL | SHIFT),
+            Some(Action::ZoomIn)
+        );
+    }
+
+    #[test]
+    fn letters_and_digits_keep_their_positions() {
+        // Deliberate: a letter shortcut is a place the hand goes, and B is in
+        // the same place on nearly every Latin layout. Folding those onto the
+        // legend as well would be a larger change than punctuation needs.
+        assert_eq!(typed_key(KeyCode::KeyB, Some("b")), KeyCode::KeyB);
+        assert_eq!(typed_key(KeyCode::KeyY, Some("z")), KeyCode::KeyY);
+        assert_eq!(typed_key(KeyCode::Digit1, Some("&")), KeyCode::Digit1);
+        // A named key or a dead key reports no character at all — `´` sits
+        // where US has `=` on a Nordic board and must not become one.
+        assert_eq!(typed_key(KeyCode::Equal, None), KeyCode::Equal);
+        assert_eq!(typed_key(KeyCode::Space, None), KeyCode::Space);
+    }
+
+    #[test]
+    fn only_single_bindable_punctuation_is_folded() {
+        assert_eq!(key_for_text(""), None);
+        assert_eq!(key_for_text("++"), None);
+        assert_eq!(key_for_text("€"), None);
+        // Every character named must land on a key the capture field can also
+        // produce, or a fold would reach a binding nobody could ever set.
+        for text in [
+            "-", "_", "=", "+", "[", "{", "]", "}", "\\", "|", ";", ":", "'", "\"", ",", "<", ".",
+            ">", "/", "?", "`", "~",
+        ] {
+            let key = key_for_text(text).expect("listed above");
+            assert!(
+                BINDABLE.contains(&key),
+                "{text} folds onto an unbindable key"
+            );
+        }
     }
 
     #[test]
