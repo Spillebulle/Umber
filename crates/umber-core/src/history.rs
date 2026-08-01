@@ -5,15 +5,18 @@
 //! stroke actually touched. A typical stroke damages a small fraction of the
 //! canvas, so this keeps a deep history in a modest budget.
 //!
-//! Every entry also carries an [`EditKind`], which is what lets the history be
-//! *listed* rather than only stepped through. The two stacks together are a
-//! timeline — everything applied, then everything undone — and
-//! [`History::steps_to`] turns a position in that timeline into the number of
-//! single steps needed to reach it, so a click on a row costs the caller the
-//! same work as that many presses of undo and no new pixel path.
+//! Every entry also carries an [`EditKind`] and the moment it was made, which
+//! is what lets the history be *listed* rather than only stepped through. The
+//! two stacks together are a timeline — everything applied, then everything
+//! undone — and [`History::steps_to`] turns a position in that timeline into
+//! the number of single steps needed to reach it, so a click on a row costs the
+//! caller the same work as that many presses of undo and no new pixel path.
+
+use std::time::Duration;
 
 use crate::brush::BrushMode;
 use crate::geom::PixelRect;
+use crate::time::Timestamp;
 
 /// What one recorded edit was, so a list of them can be named.
 ///
@@ -51,16 +54,41 @@ impl EditKind {
     }
 }
 
-/// One undoable edit: what it was, and the pixels it replaced.
+/// One undoable edit: what it was, when it happened, and the pixels it
+/// replaced.
 #[derive(Clone, Debug)]
 pub struct Edit {
     pub kind: EditKind,
+    /// When the edit was made, on the wall clock.
+    ///
+    /// `None` where that is genuinely not known — an entry read out of a
+    /// document written before histories carried times. A list shows nothing
+    /// for it rather than a plausible-looking time it made up, because a wrong
+    /// timestamp is indistinguishable from a right one.
+    pub at: Option<Timestamp>,
     pub patch: PixelPatch,
 }
 
 impl Edit {
+    /// An edit made *now*.
     pub fn new(kind: EditKind, patch: PixelPatch) -> Self {
-        Self { kind, patch }
+        Self {
+            kind,
+            at: Some(Timestamp::now()),
+            patch,
+        }
+    }
+
+    /// An edit whose time is already settled.
+    ///
+    /// Two callers, and both of them matter. Undo and redo rebuild an entry as
+    /// they move it between the stacks, and it must keep the time it was
+    /// painted — recomputing it would make stepping through the history
+    /// rewrite the history's own clock, so the gaps in the list would churn
+    /// every time the user pressed Ctrl+Z. The reader of a saved document is
+    /// the other, and it is where `None` comes from.
+    pub fn made_at(kind: EditKind, at: Option<Timestamp>, patch: PixelPatch) -> Self {
+        Self { kind, at, patch }
     }
 
     fn byte_len(&self) -> usize {
@@ -191,6 +219,27 @@ impl History {
     /// What the edit at `index` in the timeline was, for a list to name.
     pub fn kind_at(&self, index: usize) -> Option<EditKind> {
         self.entry_at(index).map(|edit| edit.kind)
+    }
+
+    /// When the edit at `index` was made, where that is known.
+    pub fn time_at(&self, index: usize) -> Option<Timestamp> {
+        self.entry_at(index)?.at
+    }
+
+    /// How long passed between the edit at `index` and the one before it.
+    ///
+    /// The gap, not the age: what the list shows is how long the artist spent
+    /// between one mark and the next, which is a property of the pair and does
+    /// not change as the afternoon wears on. An age would have every row
+    /// counting up, so a still panel would need repainting every second to stay
+    /// truthful.
+    ///
+    /// `None` at index 0 — there is nothing before it — for an entry either
+    /// side of which has no recorded time, and for a pair the clock puts in the
+    /// wrong order. See [`Timestamp::since`] for that last one.
+    pub fn gap_at(&self, index: usize) -> Option<Duration> {
+        let previous = self.time_at(index.checked_sub(1)?)?;
+        self.time_at(index)?.since(previous)
     }
 
     /// How many entries the budget has discarded, which is how far short of
@@ -395,7 +444,7 @@ mod tests {
         // Undo two, moving them onto the redo stack.
         for _ in 0..2 {
             let e = h.take_undo().unwrap();
-            h.push_redo(Edit::new(e.kind, patch(4, 4, 9)));
+            h.push_redo(Edit::made_at(e.kind, e.at, patch(4, 4, 9)));
         }
         assert_eq!(h.position(), 1);
         assert_eq!(h.len(), 3, "undoing does not discard anything");
@@ -420,7 +469,7 @@ mod tests {
 
         for _ in 0..3 {
             let e = h.take_undo().unwrap();
-            h.push_redo(Edit::new(e.kind, patch(4, 4, 0)));
+            h.push_redo(Edit::made_at(e.kind, e.at, patch(4, 4, 0)));
         }
         assert_eq!(h.position(), 1);
         assert_eq!(h.steps_to(4), Jump::Redo(3));
@@ -441,7 +490,7 @@ mod tests {
         original.record(Edit::new(EditKind::Paint, patch(4, 4, 3)));
         // Step back one, so the timeline straddles both stacks.
         let undone = original.take_undo().unwrap();
-        original.push_redo(Edit::new(undone.kind, patch(4, 4, 9)));
+        original.push_redo(Edit::made_at(undone.kind, undone.at, patch(4, 4, 9)));
 
         let timeline: Vec<Edit> = (0..original.len())
             .map(|i| original.entry_at(i).unwrap().clone())
@@ -456,6 +505,7 @@ mod tests {
         for i in 0..original.len() {
             let (a, b) = (original.entry_at(i).unwrap(), restored.entry_at(i).unwrap());
             assert_eq!(a.kind, b.kind, "entry {i}");
+            assert_eq!(a.at, b.at, "entry {i}");
             assert_eq!(a.patch.rect, b.patch.rect, "entry {i}");
             assert_eq!(a.patch.slot, b.patch.slot, "entry {i}");
             assert_eq!(a.patch.bytes, b.patch.bytes, "entry {i}");
@@ -476,6 +526,53 @@ mod tests {
         assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
         assert!(h.dropped() > 0, "the budget dropped nothing");
         assert_eq!(h.dropped() + h.len(), 8);
+    }
+
+    /// What the list's time column reads off: the distance from one entry to
+    /// the one before it, and nothing at all where that is not a distance.
+    #[test]
+    fn a_gap_is_measured_against_the_entry_before_it() {
+        let at = |secs: i64| Some(Timestamp::from_unix_millis(secs * 1000));
+        let mut h = History::default();
+        h.record(Edit::made_at(EditKind::Paint, at(100), patch(4, 4, 1)));
+        h.record(Edit::made_at(EditKind::Paint, at(101), patch(4, 4, 2)));
+        h.record(Edit::made_at(EditKind::Erase, at(191), patch(4, 4, 3)));
+        // No time at all — a document written before histories carried one.
+        h.record(Edit::made_at(EditKind::Paint, None, patch(4, 4, 4)));
+        // And after it, one whose predecessor has none.
+        h.record(Edit::made_at(EditKind::Paint, at(400), patch(4, 4, 5)));
+        // A clock put back between two strokes.
+        h.record(Edit::made_at(EditKind::Paint, at(200), patch(4, 4, 6)));
+
+        assert_eq!(h.gap_at(0), None, "nothing precedes the first entry");
+        assert_eq!(h.gap_at(1), Some(Duration::from_secs(1)));
+        assert_eq!(h.gap_at(2), Some(Duration::from_secs(90)));
+        assert_eq!(h.gap_at(3), None, "the entry itself has no time");
+        assert_eq!(h.gap_at(4), None, "the entry before it has no time");
+        assert_eq!(h.gap_at(5), None, "the clock ran backwards");
+        assert_eq!(h.gap_at(6), None, "off the end");
+
+        assert_eq!(h.time_at(2), at(191));
+        assert_eq!(h.time_at(3), None);
+    }
+
+    /// Stepping through the history must not rewrite its clock. An entry moved
+    /// between the stacks keeps the moment it was painted, or the gaps in the
+    /// list would churn every time the user pressed Ctrl+Z.
+    #[test]
+    fn undoing_does_not_restamp_an_entry() {
+        let made = Timestamp::from_unix_millis(1_700_000_000_000);
+        let mut h = History::default();
+        h.record(Edit::made_at(EditKind::Paint, Some(made), patch(4, 4, 1)));
+
+        let e = h.take_undo().unwrap();
+        assert_eq!(e.at, Some(made));
+        h.push_redo(Edit::made_at(e.kind, e.at, patch(4, 4, 2)));
+        assert_eq!(h.time_at(0), Some(made), "the redo entry lost its time");
+
+        let e = h.take_redo().unwrap();
+        h.push_undo(Edit::made_at(e.kind, e.at, patch(4, 4, 3)));
+        assert_eq!(h.time_at(0), Some(made), "redoing lost it");
     }
 
     /// The list must be able to say that it does not reach the beginning.

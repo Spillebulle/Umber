@@ -97,6 +97,7 @@ use super::{SaveError, deflated, encode_png, stored};
 use crate::geom::PixelRect;
 use crate::history::{EditKind, History};
 use crate::layer::LayerStack;
+use crate::time::Timestamp;
 
 /// `<image>` attribute naming the history manifest inside the archive.
 ///
@@ -118,6 +119,17 @@ pub const MANIFEST: &str = "umber/history/index.json";
 /// document opens exactly as it would have before histories were saved at all.
 /// That is why saving a history does not bump the document version — see the
 /// module docs of [`super`].
+///
+/// The bar for raising it is the same one [`super::VERSION`] answers to, one
+/// level down: a revision an older build would **misread**. Adding the
+/// per-entry timestamp did not qualify and deliberately did not bump this.
+/// `ManifestEdit::at` is an optional field, and serde ignores a field it has
+/// never heard of, so a build that predates it restores every patch and every
+/// position exactly as before and merely shows no times. Bumping would instead
+/// have made that build throw the whole history away — all the pixels, to
+/// avoid losing the clock — which is a plainly worse trade. The test
+/// `a_manifest_from_a_newer_revision_is_discarded_and_not_refused` pins the
+/// behaviour a bump would rely on, for whenever one is genuinely earned.
 pub const VERSION: u32 = 1;
 
 /// How much encoded patch data a document will carry.
@@ -141,6 +153,9 @@ pub struct SaveEdit<'a> {
     /// texture slot** — see the module docs.
     layer: usize,
     kind: EditKind,
+    /// When it was painted. `None` for an entry that came out of a document
+    /// written before this was recorded and is on its way back into one.
+    at: Option<Timestamp>,
     rect: PixelRect,
     /// Layer-texture bytes, `rect.area() * 4` of them.
     bytes: &'a [u8],
@@ -182,6 +197,7 @@ impl<'a> SaveHistory<'a> {
             entries.push(SaveEdit {
                 layer,
                 kind: edit.kind,
+                at: edit.at,
                 rect: edit.patch.rect,
                 bytes: &edit.patch.bytes,
             });
@@ -231,6 +247,19 @@ pub(crate) struct ManifestEdit {
     pub h: u32,
     /// Archive entry holding the patch.
     pub src: String,
+    /// When the edit was made, in milliseconds since the Unix epoch, UTC.
+    ///
+    /// Optional in both directions, and that is the whole compatibility story
+    /// for it — see [`VERSION`]. `default` so a manifest written before this
+    /// existed reads as "not known" rather than failing to parse and costing
+    /// the document its whole history; `skip_serializing_if` so a history read
+    /// out of such a file and saved again writes exactly the bytes it did
+    /// before, instead of a column of nulls.
+    ///
+    /// A number, not a formatted date: parsing a date is a place to be wrong,
+    /// and every consumer of this field wants the integer anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
 }
 
 /// Stable name for an [`EditKind`]. The debug spelling, like
@@ -300,6 +329,7 @@ pub(crate) fn write(
                     w: edit.rect.width,
                     h: edit.rect.height,
                     src: patch_src(n),
+                    at: edit.at.map(Timestamp::unix_millis),
                 }
             })
             .collect(),
@@ -395,26 +425,44 @@ mod tests {
     }
 
     /// The one test that matters: a document saved mid-timeline comes back
-    /// mid-timeline, with both stacks intact and every patch byte for byte.
-    /// Restoring only the undo half would silently throw away work the artist
-    /// had undone and meant to come back to; restoring it in the wrong order
-    /// would replay the wrong pixels.
+    /// mid-timeline, with both stacks intact, every patch byte for byte and
+    /// every entry still carrying the moment it was painted. Restoring only the
+    /// undo half would silently throw away work the artist had undone and meant
+    /// to come back to; restoring it in the wrong order would replay the wrong
+    /// pixels; losing the times would leave the History list unable to say how
+    /// long any of it took the moment a document was reopened.
     #[test]
     fn a_history_survives_a_round_trip() {
         let stack = stack(&["Paper", "Ink"]);
         let (a, b) = (stack.get(0).unwrap().slot(), stack.get(1).unwrap().slot());
 
+        // Fixed stamps rather than the clock, so the assertions below are
+        // equality rather than a tolerance — and so the gaps between them are
+        // known values a reopened list would have to reproduce.
+        let at = |secs: i64| Some(Timestamp::from_unix_millis(secs * 1000 + 250));
         let mut history = History::default();
-        history.record(Edit::new(EditKind::Paint, patch(a, 5, 3, 11)));
-        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
-        history.record(Edit::new(EditKind::Paint, patch(b, 6, 2, 33)));
+        history.record(Edit::made_at(
+            EditKind::Paint,
+            at(1_785_542_400),
+            patch(a, 5, 3, 11),
+        ));
+        history.record(Edit::made_at(
+            EditKind::Erase,
+            at(1_785_542_403),
+            patch(b, 4, 4, 22),
+        ));
+        history.record(Edit::made_at(
+            EditKind::Paint,
+            at(1_785_542_500),
+            patch(b, 6, 2, 33),
+        ));
         // Step back one, so the timeline straddles both stacks and the redo
         // side has something in it.
         let undone = history.take_undo().unwrap();
-        history.push_redo(Edit::new(undone.kind, patch(b, 6, 2, 44)));
+        history.push_redo(Edit::made_at(undone.kind, undone.at, patch(b, 6, 2, 44)));
         assert_eq!((history.len(), history.position()), (3, 2));
 
-        let (_, doc) = round_trip(&stack, &history);
+        let (bytes, doc) = round_trip(&stack, &history);
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
         let opened = doc.open();
         let back = &opened.history;
@@ -422,9 +470,26 @@ mod tests {
         assert_eq!(back.len(), history.len());
         assert_eq!(back.position(), history.position());
         assert_eq!(back.dropped(), history.dropped());
+        // The gaps the History list reads off, which is the point of storing
+        // the times at all.
+        assert_eq!(back.gap_at(0), None);
+        assert_eq!(back.gap_at(1), Some(std::time::Duration::from_secs(3)));
+        assert_eq!(back.gap_at(2), Some(std::time::Duration::from_secs(97)));
+        // Millisecond resolution really made it into the file, rather than
+        // being rounded away by a seconds-wide field.
+        assert_eq!(back.time_at(0).unwrap().unix_millis() % 1000, 250);
+        // And the manifest is still revision 1: adding an optional field is
+        // something an older build ignores, so bumping would only have made it
+        // throw away pixels it can read perfectly well. See `VERSION`.
+        assert!(
+            manifest_of(&bytes).contains("\"version\":1"),
+            "the manifest revision moved without a reason"
+        );
+
         for i in 0..history.len() {
             let (before, after) = (history.entry_at(i).unwrap(), back.entry_at(i).unwrap());
             assert_eq!(after.kind, before.kind, "entry {i}");
+            assert_eq!(after.at, before.at, "entry {i} lost the moment it was made");
             assert_eq!(after.patch.rect, before.patch.rect, "entry {i}");
             assert_eq!(after.patch.bytes, before.patch.bytes, "entry {i}");
             // The same *layer*, which is what the slot has to mean again.
@@ -680,6 +745,70 @@ mod tests {
             assert_eq!(kind_from_id(&kind_id(kind)), Some(kind));
         }
         assert_eq!(kind_from_id("Smudge"), None);
+    }
+
+    /// Both halves of the timestamp's compatibility story, which is why it did
+    /// not bump [`VERSION`].
+    ///
+    /// An entry with no time writes a manifest with no `at` at all — byte for
+    /// byte what a build predating this wrote — so a document opened by an
+    /// older Umber and saved again is not quietly filled with nulls. And a
+    /// manifest that never had the field reads back as "not known" rather than
+    /// failing to parse, which would have cost the document its whole history
+    /// over a column the picture does not depend on.
+    #[test]
+    fn a_manifest_without_times_is_written_and_read_as_one() {
+        let stack = stack(&["Ink"]);
+        let mut history = History::default();
+        history.record(Edit::made_at(EditKind::Paint, None, patch(0, 4, 4, 7)));
+
+        let (bytes, doc) = round_trip(&stack, &history);
+        let manifest = manifest_of(&bytes);
+        assert!(
+            !manifest.contains("\"at\""),
+            "an untimed entry wrote a time field: {manifest}"
+        );
+
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.time_at(0), None, "a time was invented on the way in");
+        assert_eq!(back.gap_at(0), None);
+    }
+
+    /// The property a future bump of [`VERSION`] would rely on, and the reason
+    /// this one is safe to raise when something genuinely earns it: a manifest
+    /// from a revision this build does not know is **discarded**, not refused.
+    /// The document opens, the picture is whole, and only the history is lost.
+    #[test]
+    fn a_manifest_from_a_newer_revision_is_discarded_and_not_refused() {
+        let stack = stack(&["Paper", "Ink"]);
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(0, 4, 4, 5)));
+        let (bytes, _) = round_trip(&stack, &history);
+
+        let newer = with_entry(&bytes, MANIFEST, |json| {
+            json.replace("\"version\":1", "\"version\":99")
+        });
+        let doc = docimport::read_openraster(&newer).expect("the document must still open");
+        assert!(doc.history.is_none(), "a newer manifest was trusted");
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::HistoryDropped { .. })),
+            "the drop was not reported"
+        );
+        assert_eq!(doc.layers.len(), 2, "the picture was refused with it");
+        assert!(doc.open().history.is_empty());
+    }
+
+    /// The manifest JSON out of a built archive, as text.
+    fn manifest_of(bytes: &[u8]) -> String {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut entry = zip.by_name(MANIFEST).expect("the archive has a manifest");
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut json).unwrap();
+        json
     }
 
     /// Rebuild an archive with one entry passed through `f`.

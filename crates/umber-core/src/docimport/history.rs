@@ -21,6 +21,7 @@ use super::{ImportWarning, SourceFormat, flat};
 use crate::docformat::history::{self as fmt, Manifest};
 use crate::geom::PixelRect;
 use crate::history::EditKind;
+use crate::time::Timestamp;
 
 /// One recorded edit as it came out of a file.
 ///
@@ -30,6 +31,14 @@ use crate::history::EditKind;
 pub struct ImportedEdit {
     pub layer: usize,
     pub kind: EditKind,
+    /// When the edit was made, where the file says.
+    ///
+    /// `None` for a document written before the manifest carried times, and
+    /// that stays `None` all the way to the History list, which shows an empty
+    /// column for it. A time invented at import — the file's own modification
+    /// date, say — would be indistinguishable from a recorded one and would
+    /// make the list assert something nobody measured.
+    pub at: Option<Timestamp>,
     pub rect: PixelRect,
     /// Layer-texture bytes, `rect.area() * 4` of them — sRGB-encoded with alpha
     /// premultiplied, exactly as `write_layer_rect` wants them.
@@ -136,6 +145,12 @@ fn load(
         entries.push(ImportedEdit {
             layer: entry.layer,
             kind,
+            // Not validated beyond being a number. There is no range a
+            // timestamp can be *wrong* in — a clock really can be set to 1904
+            // — and the one thing an absurd value could do downstream is make a
+            // gap come out negative, which `Timestamp::since` already answers
+            // by declining to report one.
+            at: entry.at.map(Timestamp::from_unix_millis),
             rect: PixelRect {
                 x: entry.x,
                 y: entry.y,
