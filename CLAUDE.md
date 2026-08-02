@@ -226,15 +226,22 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
     Patches are PNG at `Compression::Fast`: measured, that beats the ZIP's own
     Deflate on size everywhere but a sketch and on time by 10×. Re-measure with
     `examples/measure-history.rs` before changing any of it.
-  - **This did not bump `umber-version`**, and the argument is in
-    `docformat`'s module docs. An older build ignores an entry it has never
-    heard of and opens with an empty history — exactly what every build before
-    this did. `history::VERSION` governs the manifest, and an unreadable one is
-    *discarded* rather than refused.
-  - **It is a preference, `ui.save_history`.** A full-canvas session saturates
-    the budget and takes a 9.7 MB document to 41.5 MB; that is a trade the user
-    has to be able to refuse. Nothing here touches the GPU — the patches have
-    been in memory since commit time.
+  - **An entry carries its *pieces*, and that is what raised
+    `history::VERSION` to 2** — the first revision to earn a bump. A build
+    reading only revision 1 would take an entry's first PNG for the whole
+    rectangle and write it back over pixels that were never part of the edit,
+    which is a document quietly damaged by an undo. It now discards the history
+    and opens the picture whole instead. This build still reads revision 1: an
+    entry with no `pieces` is one piece covering the rect.
+  - **Saving a history still did not bump `umber-version`**, and the argument
+    is in `docformat`'s module docs. An older build ignores an entry it has
+    never heard of and opens with an empty history — exactly what every build
+    before this did. `history::VERSION` governs the manifest, and an unreadable
+    one is *discarded* rather than refused.
+  - **It is a preference, `ui.save_history`.** A full-canvas session takes a
+    9.7 MB document to 22.1 MB, and a heavily grained one 21.3 MB to 52.1 MB;
+    that is a trade the user has to be able to refuse. Nothing here touches the
+    GPU — the patches have been in memory since commit time.
 - **`mergedimage.png` is the caller's, not `docformat`'s.** Flattening means
   blend modes, and the blend maths lives in the composite shader. A software
   copy here would be a second implementation to keep in step, and a file whose
@@ -454,6 +461,10 @@ raising `dab_ratio` narrows the dab rather than growing it.
   bounding square at any angle, which is why the circle held until bitmap tips
   arrived: **a tip paints into the corners**, and a quad turned 45° reaches
   `radius * sqrt(2)`.
+- **The same box goes into `StrokeBuilder::damage`, from the same numbers.**
+  The cell mask is what the undo patch and the commit are both cut to, so a
+  mask that did not cover what the bounding box covers is the under-tight
+  damaged rect above, back again and much harder to see. Feed both or neither.
 - **The scatter RNG is seeded per stroke, never from the clock.** A stroke has
   to redraw identically, or every pixel test involving a scattering brush
   becomes flaky and undo/redo would not reproduce the same marks.
@@ -545,13 +556,49 @@ it records a small composite into a rotation of staging buffers, and
 
 ### Undo
 
-Stores the RGBA bytes of the rectangle a stroke damaged, not whole layers (a
-full 2048² snapshot per stroke would exhaust a gigabyte in ~60 strokes).
+Stores the RGBA bytes a stroke replaced, not whole layers (a full 2048²
+snapshot per stroke would exhaust a gigabyte in ~60 strokes).
 
 The capture happens at **commit** time, not stroke start: the layer is untouched
 until commit, so reading it there yields exactly the pre-stroke pixels, and by
-then the damaged rect is known. `read_layer_rect` blocks on the GPU, which is
-acceptable once per stroke but must never move into the drawing loop.
+then the damage is known. The readback blocks on the GPU, which is acceptable
+once per stroke but must never move into the drawing loop.
+
+- **A patch is the *cells* a stroke reached, not the box it spans.**
+  `umber_core::damage::TileMask` accumulates a 64-pixel grid beside
+  `StrokeBuilder::bounds`, and `pieces` merges neighbours along each row and
+  clips them to the box. A thin diagonal across a 10000² canvas cost 381 MB as
+  a rectangle and costs 6.8 MB as cells — depth 1 against 75. **Clipping to the
+  box is what makes it free of regressions**: the pixels kept are always a
+  subset of what the box held, so a small mark can never cost more than it used
+  to. Do not "simplify" the clip away for whole cells.
+- **This is a large improvement and not an unlimited history, and the
+  difference must not be blurred.** A wash that genuinely covers a 10000²
+  canvas is 381 MB of pixels however they are described, so its depth is still
+  one. The measured depths against the 512 MB budget are in
+  `examples/measure-undo.rs`, which is the file to re-run before quoting any of
+  them.
+- **The commit pass is scissored to the same pieces the patch was captured
+  from.** Not an optimisation: committing the whole box would run untouched
+  pixels through the blend, which is an identity in floating point written back
+  through an sRGB encode — a promise about rounding rather than about pixels.
+  Scissoring makes "an undo restores every pixel the stroke changed" structural.
+  `an_undo_restores_every_pixel_a_tiled_stroke_changed` reads the whole layer
+  back twice and is what guards it.
+- **`read_layer_pieces` is one submission and one wait for all of them.** A
+  hundred and fifty calls to `read_layer_rect` would be a hundred and fifty
+  fences at pointer-up. It batches to the device's buffer limit and falls
+  through to the banded reader for a piece too large for it — which cell runs
+  never are, because they are never merged downwards.
+- **A piece whose pixels are all identical is held as that one pixel.** Blank
+  canvas and flat fills are most of what a stroke on a fresh layer captures, and
+  the scan stops at the first pixel that differs, so busy paint pays four
+  comparisons to be told it is not flat.
+- **In-memory compression was measured and rejected.** PNG at `Fast` on the
+  pieces of one full-canvas stroke on a 10000² canvas is 1.75 s, and Deflate is
+  6.9 s — on pointer-up, with the artist waiting, for a factor that does not
+  change the order of magnitude tiling already did. If it is ever wanted it
+  belongs on a background thread compressing *older* entries, not on the commit.
 
 - **Every entry is an `Edit` — a patch, an `EditKind` and a `Timestamp`** — and
   both the kind and the time travel with it across an undo, via `Edit::made_at`.

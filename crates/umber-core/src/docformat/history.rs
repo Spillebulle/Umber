@@ -43,19 +43,26 @@
 //! and level the layer images use. `examples/measure-history.rs` is where these
 //! numbers come from and is checked in so they can be re-measured; it paints
 //! synthetic sessions on a 2048² canvas and captures exactly what `History`
-//! would hold.
+//! would hold — through the same [`TileMask`](crate::damage::TileMask) a real
+//! stroke does, so the raw column is the pieces and not the boxes round them.
 //!
-//! | session | raw patches | Deflate | PNG (fast) |
+//! | session (arguments) | raw patches | Deflate | PNG (fast) |
 //! |---|---|---|---|
-//! | 120 full-canvas strokes | 221 MB | 68 MB (3.3×), 4.2 s | 42 MB (5.2×), 0.35 s |
-//! | the same, heavily grained | 237 MB | 108 MB (2.2×), 5.6 s | 93 MB (2.6×), 0.41 s |
-//! | 300 small sketching strokes | 7.5 MB | 0.33 MB (23×), 0.02 s | 0.38 MB (20×), 0.00 s |
+//! | 120 full-canvas strokes (`120 0 1.0`) | 54.8 MB | 18.3 MB (3.0×), 0.85 s | 12.3 MB (4.5×), 0.12 s |
+//! | the same, heavily grained (`120 1.0 1.0`) | 61.2 MB | 30.9 MB (2.0×), 1.44 s | 30.6 MB (2.0×), 0.19 s |
+//! | 300 small sketching strokes (`300 0 0.25`) | 2.6 MB | 0.34 MB (7.7×), 0.10 s | 0.38 MB (6.8×), 0.01 s |
 //!
-//! PNG wins on size everywhere but the sketch — where the difference is 50 kB —
+//! PNG wins on size everywhere but the sketch — where the difference is 40 kB —
 //! and wins on *time* by an order of magnitude everywhere, because it filters
 //! each row against the one above before it deflates and then has far less left
 //! to compress. Deflate is what the ZIP would have done for free, so it is the
 //! alternative worth measuring, and it loses.
+//!
+//! The ratios are lower than they were before patches were cut to the cells a
+//! stroke reached, and that is the tiling working rather than the compressor
+//! failing: what a patch used to hold and PNG used to squeeze out for nothing
+//! was mostly canvas the stroke never went near. The bytes on disk are
+//! unchanged or better; it is the raw column that fell.
 //!
 //! Encoding runs **newest first** and stops at the budget, so a session far
 //! over it pays neither the time nor the space for the entries it will not
@@ -63,19 +70,19 @@
 //!
 //! | session | file | save | open |
 //! |---|---|---|---|
-//! | 300 small strokes | 2.67 → 3.09 MB | 0.09 → 0.08 s | 0.03 → 0.04 s |
-//! | 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 → 0.15 s | 0.04 → 0.10 s |
-//! | 120 full-canvas strokes | 9.68 → 41.53 MB | 0.12 → 0.39 s | 0.04 → 0.28 s |
+//! | 300 small strokes | 2.67 → 3.15 MB | 0.07 → 0.09 s | 0.03 → 0.04 s |
+//! | 40 full-canvas strokes | 5.28 → 6.97 MB | 0.12 → 0.14 s | 0.05 → 0.07 s |
+//! | 120 full-canvas strokes | 9.68 → 22.13 MB | 0.13 → 0.25 s | 0.05 → 0.18 s |
 //!
 //! Opening is in there because the patches have to be decoded before the
 //! document appears, and that is time the artist spends waiting.
 //!
-//! The last row is the budget saturating, and it is why saving the history is a
-//! **preference** rather than a policy: an afternoon of full-canvas painting
-//! makes the document four times the size, and somebody synchronising their
-//! work to a network drive is entitled to say no. It is on by default because
-//! the common case is the first row — sixteen per cent, and free — and because
-//! a feature nobody knows to switch on is one nobody gets.
+//! Saving the history is still a **preference** rather than a policy, and the
+//! last row is still why: an afternoon of full-canvas painting more than
+//! doubles the document, and somebody synchronising their work to a network
+//! drive is entitled to say no. It is on by default because the common case is
+//! the first row — eighteen per cent, and free — and because a feature nobody
+//! knows to switch on is one nobody gets.
 //!
 //! # Pixels
 //!
@@ -146,12 +153,17 @@ pub const VERSION: u32 = 2;
 
 /// How much encoded patch data a document will carry.
 ///
-/// 32 MB, against 512 MB in memory. At the 2.6–5× that painted patches compress
-/// by, that is 80–170 MB of raw history — measured, the newest 62 of 120
-/// full-canvas strokes, 26 of 120 heavily grained ones, and all 300 of a
-/// sketching session with room to spare. It bounds the extra size of the file,
-/// the extra time a save takes and the extra time an *open* takes; the module
-/// docs have what those measure at.
+/// 32 MB, against 512 MB in memory. At the 2–7× that painted patches compress
+/// by, that is 64–220 MB of raw history — measured, **all** of 120 full-canvas
+/// strokes (12.3 MB encoded), all of 120 heavily grained ones (30.6 MB, only
+/// just), and all 300 of a sketching session with room to spare. It bounds the
+/// extra size of the file, the extra time a save takes and the extra time an
+/// *open* takes; the module docs have what those measure at.
+///
+/// It used to bind at 62 of those 120 strokes. Cutting patches to the cells a
+/// stroke reached is what moved it, and the number was left where it is: what
+/// a file will carry is a judgement about documents on somebody's disk, not a
+/// consequence of how well this release happens to pack them.
 ///
 /// One number rather than a fraction of the document, because a rule nobody can
 /// predict is worse than a limit everybody can. A larger one would not help the

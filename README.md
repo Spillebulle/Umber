@@ -180,7 +180,7 @@ still be stepped back through, redo included, with the times intact. It rides as
 private entries every other OpenRaster reader walks straight past, so the file is
 still an ordinary `.ora`. The limit is the newest 32 MB of edits: on a sketching
 session that is under half a megabyte and free, and on an afternoon of
-full-canvas painting it is the difference between a 9.7 MB file and a 41.5 MB
+full-canvas painting it is the difference between a 9.7 MB file and a 22.1 MB
 one. **Settings → General** switches it off, with the trade stated in megabytes
 rather than in adverbs.
 

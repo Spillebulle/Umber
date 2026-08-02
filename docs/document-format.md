@@ -169,34 +169,42 @@ filters each row against the one above before it deflates:
 
 | session (2048² canvas) | raw patches | Deflate | PNG (fast) |
 |---|---|---|---|
-| 120 full-canvas strokes | 221 MB | 68 MB (3.3×), 4.2 s | 42 MB (5.2×), 0.35 s |
-| the same, heavily grained | 237 MB | 108 MB (2.2×), 5.6 s | 93 MB (2.6×), 0.41 s |
-| 300 small sketching strokes | 7.5 MB | 0.33 MB (23×), 0.02 s | 0.38 MB (20×), 0.00 s |
+| 120 full-canvas strokes | 54.8 MB | 18.3 MB (3.0×), 0.85 s | 12.3 MB (4.5×), 0.12 s |
+| the same, heavily grained | 61.2 MB | 30.9 MB (2.0×), 1.44 s | 30.6 MB (2.0×), 0.19 s |
+| 300 small sketching strokes | 2.6 MB | 0.34 MB (7.7×), 0.10 s | 0.38 MB (6.8×), 0.01 s |
 
 Deflate is what the ZIP would have done for nothing, so it is the alternative
 worth measuring, and it loses on size everywhere but the sketch — where the
-difference is 50 kB — and on time by an order of magnitude everywhere.
+difference is 40 kB — and on time by an order of magnitude everywhere.
 `cargo run --release -p umber-core --example measure-history` is where those
 numbers came from, and it is checked in so they can be re-measured rather than
 trusted.
+
+The raw column is smaller than it once was, and the ratios with it: a patch is
+now the cells a stroke reached rather than the rectangle round them, so most of
+what PNG used to squeeze out for nothing — canvas the stroke never went near —
+is no longer stored in the first place. The bytes on disk are unchanged or
+better.
 
 What it costs end to end, on a one-layer 2048² document:
 
 | session | file | save | open |
 |---|---|---|---|
-| 300 small strokes | 2.67 → 3.09 MB | 0.09 → 0.08 s | 0.03 → 0.04 s |
-| 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 → 0.15 s | 0.04 → 0.10 s |
-| 120 full-canvas strokes | 9.68 → 41.53 MB | 0.12 → 0.39 s | 0.04 → 0.28 s |
+| 300 small strokes | 2.67 → 3.15 MB | 0.07 → 0.09 s | 0.03 → 0.04 s |
+| 40 full-canvas strokes | 5.28 → 6.97 MB | 0.12 → 0.14 s | 0.05 → 0.07 s |
+| 120 full-canvas strokes | 9.68 → 22.13 MB | 0.13 → 0.25 s | 0.05 → 0.18 s |
 
 Opening is in there because the patches have to be decoded before the document
-appears, and that is time the artist spends waiting. The budget kept the newest
-62 of those 120 strokes, 26 of 120 heavily grained ones, and all 300 of the
-sketching session with room to spare.
+appears, and that is time the artist spends waiting. The budget now keeps all
+120 of those strokes, all 120 heavily grained ones — 30.6 MB, only just — and
+all 300 of the sketching session with room to spare. It used to bind at 62 of
+the 120, and the number was left where it is: what a file will carry is a
+judgement about documents on somebody's disk, not a consequence of how well
+this release happens to pack them.
 
-The last row is the budget saturating, and it is why this is a **preference**
-rather than a policy: an afternoon of full-canvas painting makes the document
-four times the size, and somebody synchronising their work to a network drive is
-entitled to refuse that. Settings, General has the switch. It is on by default,
+The last row is still why this is a **preference** rather than a policy: an
+afternoon of full-canvas painting more than doubles the document, and somebody
+synchronising their work to a network drive is entitled to refuse that. Settings, General has the switch. It is on by default,
 because the common case is the first row and because a feature nobody knows to
 switch on is one nobody gets.
 
@@ -255,6 +263,16 @@ throw the whole history away — all the pixels, to avoid losing the clock. The
 test `a_manifest_from_a_newer_revision_is_discarded_and_not_refused` pins the
 behaviour a genuine bump would rely on, so that raising the number stays a safe
 thing to do when something eventually earns it.
+
+Revision **2** is the first thing that earned it. A patch became a set of
+pieces — the cells of the canvas a stroke actually reached, rather than the
+rectangle round them — and an entry now lists them. A build reading only
+revision 1 would ignore that list, take the entry's first PNG for the whole
+rectangle, and write it back over pixels that were never part of the edit:
+a document quietly damaged by an undo, which is the one outcome worth losing a
+history over. It discards the history and opens the picture whole instead.
+This build still reads revision 1, where an entry with no pieces is one piece
+covering its rectangle.
 
 ## The background, and why it is a real layer in the file
 
