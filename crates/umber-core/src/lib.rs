@@ -44,7 +44,7 @@ pub use history::{Edit, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
 pub use layer::{BlendMode, Layer, LayerStack};
 pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
-pub use selection::{Selection, SelectionDraft, SelectionMode};
+pub use selection::{Selection, SelectionDraft, SelectionMode, SelectionOp};
 pub use stroke::{Dab, StrokeBuilder};
 pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, stroke_coverage};

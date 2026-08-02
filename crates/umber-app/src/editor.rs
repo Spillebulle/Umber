@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
     Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, Handle, History, Hsv, InputPoint,
-    LayerStack, Selection, SelectionDraft, SelectionMode, StrokeBuilder, TipMask, Transform,
+    LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp, StrokeBuilder, TipMask,
+    Transform,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -321,6 +322,15 @@ pub struct Editor {
     /// `SelectionDraft::outline_into` takes a buffer at all: drawing the
     /// outline is the one part of the selection path that runs every frame.
     pub selection_outline: Vec<glam::Vec2>,
+    /// The same ring in screen points, and the dashes cut from it.
+    ///
+    /// Two more buffers for the same reason, and a stronger one since the ants
+    /// march: a document with a selection asks for a frame several times a
+    /// second for as long as it is open, so anything this path allocates it
+    /// allocates for ever. `Shape::dashed_line` returns a fresh `Vec` per ring
+    /// per frame; `dashed_line_many_with_offset` fills these instead.
+    pub selection_screen: Vec<egui::Pos2>,
+    pub selection_dashes: Vec<egui::Shape>,
     pub history: History,
     pub pressure: PressureModel,
     /// What the pointer stream has been doing lately, for Settings → Input &
@@ -422,6 +432,8 @@ impl Default for Editor {
             clipboard: None,
             selection_draft: None,
             selection_outline: Vec::new(),
+            selection_screen: Vec::new(),
+            selection_dashes: Vec::new(),
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
@@ -862,7 +874,12 @@ impl Editor {
     /// Only the polygon can see a second press: the other two modes are one
     /// press, a drag and a release, and their draft is gone by the time
     /// another arrives.
-    pub fn selection_press(&mut self, doc: Vec2) {
+    ///
+    /// `op` is therefore read from the press that *starts* the gesture and
+    /// ignored on every one after it — a polygon spans several clicks and must
+    /// not change its mind between two of them. See
+    /// [`SelectionDraft::combining`].
+    pub fn selection_press(&mut self, doc: Vec2, op: SelectionOp) {
         // A screen distance, divided by the zoom. A fixed *document* distance
         // would be impossible to hit at 10% and impossible to avoid at 800%.
         let close = SELECT_CLOSE_PIXELS / self.camera.zoom.max(1e-3);
@@ -873,7 +890,8 @@ impl Editor {
                 }
             }
             None => {
-                self.selection_draft = Some(SelectionDraft::new(self.ui.selection_mode, doc));
+                self.selection_draft =
+                    Some(SelectionDraft::new(self.ui.selection_mode, doc).combining(op));
                 self.interaction = Interaction::Selecting;
             }
         }
@@ -899,18 +917,22 @@ impl Editor {
         }
     }
 
-    /// Close the outline being drawn and adopt it.
+    /// Close the outline being drawn and combine it with whatever was already
+    /// selected.
     ///
-    /// A gesture that encloses nothing **clears** the selection rather than
-    /// leaving the previous one standing. A bare click on the canvas is how
-    /// every paint application spells "deselect", and keeping the old one
-    /// would look like the tool had stopped answering.
+    /// A *plain* gesture that encloses nothing **clears** the selection rather
+    /// than leaving the previous one standing. A bare click on the canvas is
+    /// how every paint application spells "deselect", and keeping the old one
+    /// would look like the tool had stopped answering. What an empty add or
+    /// subtract does instead is [`Selection::combined`]'s to say.
     pub fn finish_selection(&mut self) {
         let Some(draft) = self.selection_draft.take() else {
             return;
         };
         self.interaction = Interaction::Idle;
-        self.selection = draft.finish(self.doc.size).map(Arc::new);
+        let shape = draft.finish(self.doc.size);
+        self.selection =
+            Selection::combined(self.selection.as_deref(), shape, draft.op()).map(Arc::new);
     }
 
     /// Abandon the outline being drawn, keeping whatever was selected before

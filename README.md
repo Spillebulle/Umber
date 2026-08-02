@@ -279,10 +279,18 @@ the outline is antialiased, so a diagonal is a diagonal rather than a staircase.
 A click on the canvas with nothing enclosed clears the selection, as does
 `Ctrl` + `D`.
 
+Hold `Shift` while you draw and the new shape is **added** to what is already
+selected — two separate areas can both be live, and two that touch become one.
+Hold `Ctrl` (`Cmd` on a Mac) and it is **taken away** instead. `Alt` is not the
+subtract key here as it is in some applications, because on Umber's canvas it
+already picks up a colour and resizes the brush. The modifier is read when the
+gesture starts, so you can let go of it part way through a lasso.
+
 The outline stays drawn whatever tool you pick up, because it is how you know
-your painting is being held back. It is a plain dashed line rather than
-animated marching ants: animating it means asking for a new frame for ever, and
-Umber sits still when you do.
+your painting is being held back, and its dashes travel — the classic marching
+ants. They march at sixteen frames a second rather than your monitor's rate,
+and only while something is selected, so a document you are not touching still
+sits still.
 
 ## Moving things about
 
@@ -321,6 +329,7 @@ own: it carries between tabs but not yet to and from other applications.
 | `B` / `E` / `S` / `T` / `H` / `Z` | Brush / eraser / select / transform / pan / zoom |
 | `Ctrl` + `D` | Deselect |
 | `Ctrl` + `C` / `Ctrl` + `V` | Copy / paste |
+| `Shift` / `Ctrl` + drag with Select | Add the new shape to the selection / take it away |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `Enter` / `Esc` while transforming | Put the picture down / throw the move away |
 | `X` | Swap foreground and background colours |
@@ -353,8 +362,9 @@ platforms is on the roadmap.
 ## What is not there yet
 
 - **Text and shapes.** The tool rail has six tools where the design draws
-  sixteen. Selections and transforms work; there is no way yet to add to or
-  subtract from a selection, and no feather.
+  sixteen. Selections work — rectangle, freehand lasso and polygon, painting is
+  clipped to them, and they can be added to and subtracted from — and what one
+  holds can be moved, scaled and rotated. There is no intersect and no feather.
 - **The system clipboard.** Copy and paste work inside Umber and between its
   tabs. Nothing goes to or comes from other applications yet.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
