@@ -27,6 +27,11 @@ const MIN_TRACK: f32 = 8.0;
 /// Returns true when the value changed. `log` maps the rail logarithmically,
 /// which is what makes a 1–400 px brush size usable — half the travel covers
 /// 1–20 px, where the useful sizes actually live.
+///
+/// The rail is immediate: the value is handed back as the knob moves. The one
+/// case that cannot be — a rail drawn *inside* the thing it scales, which moves
+/// out from under the pointer if it is applied per frame — is
+/// [`NumberRow::deferred`], on the row that also lets the figure be typed.
 pub fn slider_row(
     ui: &mut Ui,
     p: &Palette,
@@ -36,66 +41,11 @@ pub fn slider_row(
     log: bool,
     display: impl Fn(f32) -> String,
 ) -> bool {
-    slider_body(ui, p, label, value, range, log, display).0
-}
-
-/// [`slider_row`], but the value is only handed back when the drag ends.
-///
-/// For the one case where the slider is drawn *inside* the thing it changes.
-/// The interface scale is that case: applying it every frame rescales the
-/// dialog under the pointer, which moves the track, which changes the value the
-/// pointer is now over — so the knob runs away from the cursor and the setting
-/// is impossible to land on. Every other slider in Umber changes something the
-/// slider is not part of, and those want the immediate version; this is not a
-/// better default, it is a different situation.
-///
-/// The in-progress value lives in egui's temporary store rather than in the
-/// caller. It has to: the caller reads its copy back out of the thing being
-/// set, which by construction has not been set yet, so a caller-held value
-/// would snap back to the old scale on the very next frame.
-pub fn slider_row_deferred(
-    ui: &mut Ui,
-    p: &Palette,
-    label: &str,
-    value: &mut f32,
-    range: RangeInclusive<f32>,
-    log: bool,
-    display: impl Fn(f32) -> String,
-) -> bool {
-    let id = ui.id().with(("deferred-slider", label));
-    let mut shown = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(*value);
-    let (_, response) = slider_body(ui, p, label, &mut shown, range, log, display);
-
-    // Still held. Keep drawing where the pointer is and tell the caller
-    // nothing, so the interface stays at the scale the drag started from.
-    if response.is_pointer_button_down_on() {
-        ui.ctx().data_mut(|d| d.insert_temp(id, shown));
-        return false;
-    }
-
-    ui.ctx().data_mut(|d| d.remove::<f32>(id));
-    if shown != *value {
-        *value = shown;
-        true
-    } else {
-        false
-    }
-}
-
-fn slider_body(
-    ui: &mut Ui,
-    p: &Palette,
-    label: &str,
-    value: &mut f32,
-    range: RangeInclusive<f32>,
-    log: bool,
-    display: impl Fn(f32) -> String,
-) -> (bool, Response) {
     let (lo, hi) = (*range.start(), *range.end());
     let log = log && lo > 0.0 && hi > lo;
     let mut changed = false;
 
-    let response = ui.scope(|ui| {
+    ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
 
         // A panel squeezed to its minimum can leave nothing here at all, and a
@@ -141,10 +91,9 @@ fn slider_body(
             to_t(*value, lo, hi, log),
             metrics::SLIDER_KNOB,
         );
-        response
     });
 
-    (changed, response.inner)
+    changed
 }
 
 /// Pill toggle, 28×16 with a sliding knob.
@@ -492,11 +441,22 @@ pub struct NumberRow<'a> {
     pub suffix: &'a str,
     /// Places after the point, in the readout and in what a field starts from.
     pub decimals: usize,
-    /// Hand the value back only when the drag ends, as
-    /// [`slider_row_deferred`] does and for the same one reason: a rail drawn
-    /// inside the thing it scales moves out from under the pointer if it is
-    /// applied per frame. A typed figure is applied at once either way — the
-    /// pointer is nowhere near the track, so there is nothing to run away from.
+    /// Hand the value back only when the drag ends, for the one case where the
+    /// rail is drawn *inside* the thing it changes: the interface scale.
+    /// Applying that per frame rescales the dialog under the pointer, which
+    /// moves the track, which changes the value the pointer is now over — so
+    /// the knob runs away from the cursor and the setting is impossible to land
+    /// on. Every other rail in Umber changes something it is not part of, and
+    /// those want the immediate answer; this is not a better default, it is a
+    /// different situation.
+    ///
+    /// The in-progress figure lives in egui's temporary store rather than in
+    /// the caller. It has to: the caller reads its copy back out of the thing
+    /// being set, which by construction has not been set yet, so a caller-held
+    /// value would snap back to the old scale on the very next frame.
+    ///
+    /// A typed figure is applied at once either way — the pointer is nowhere
+    /// near the track, so there is nothing to run away from.
     pub deferred: bool,
 }
 
@@ -1635,9 +1595,16 @@ pub fn pressure_graph(
 mod tests {
     use super::*;
 
-    /// The colour wheel's Angle control, and Settings' Interface scale: the two
-    /// call sites, stated once so the tests drive what the interface draws
-    /// rather than a copy of it.
+    /// Settings' Interface scale, as the dialog itself states it — not a copy
+    /// of its numbers. A range typed out again here would go on passing while
+    /// the control it stands for was changed underneath it, which is the whole
+    /// reason `scale_row` is a function at its call site rather than seven
+    /// arguments at a call.
+    use crate::settings::scale_row as scale;
+
+    /// The colour wheel's Angle control. The one figure that is still stated
+    /// twice: `colorpicker::angle_row` is private to its module, and widening
+    /// it to be read here would be widening an interface for a test.
     fn angle() -> NumberRow<'static> {
         NumberRow {
             label: "Angle",
@@ -1650,15 +1617,42 @@ mod tests {
         }
     }
 
-    fn scale() -> NumberRow<'static> {
-        NumberRow {
-            label: "Interface scale",
-            range: 0.5..=2.0,
-            snap: 0.25,
-            per_unit: 100.0,
-            suffix: "%",
-            decimals: 0,
-            deferred: true,
+    /// A row must be sized by the space it is given, never the other way round.
+    ///
+    /// The settings dialog is one fixed size and everything in it is clipped to
+    /// that, so a control reporting itself wider than its column is the trap
+    /// the module docs there describe — a label in a horizontal layout
+    /// extending rather than wrapping, and with it the pane and the window.
+    /// This row puts a `TextEdit` where the readout used to be painted, which
+    /// is the widget most likely to ask for room it was not offered, so the
+    /// Interface scale's own column width is what it is driven at here.
+    #[test]
+    fn a_number_row_is_no_wider_than_the_column_it_is_drawn_in() {
+        // The width `settings::general_pane` gives the control.
+        const COLUMN: f32 = 320.0;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+
+        // Twice: the first pass builds the font atlas and the field's stored
+        // state, and a control that only misbehaves once it has been laid out
+        // before would otherwise go unseen.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                let p = Palette::of(crate::theme::ThemeKind::Graphite);
+                let scope = ui.scope(|ui| {
+                    ui.set_max_width(COLUMN);
+                    let mut value = 1.25;
+                    number_row(ui, &p, &mut value, scale());
+                });
+                let width = scope.response.rect.width();
+                assert!(
+                    width <= COLUMN + 0.5,
+                    "the row claimed {width} px of a {COLUMN} px column"
+                );
+            });
         }
     }
 
@@ -1694,9 +1688,11 @@ mod tests {
     fn a_snap_never_reaches_outside_the_range() {
         // 360° is the nearest multiple to 359° and is not on this rail.
         assert_eq!(snapped(359.0, 45.0, 0.0, 359.0), 359.0);
-        // Nor is 0.25 below a scale that starts at 0.5.
-        assert_eq!(snapped(0.51, 0.25, 0.5, 2.0), 0.5);
-        assert_eq!(snapped(0.5, 0.25, 0.5, 2.0), 0.5);
+        // Nor is 0.5 on a rail that starts just above it: close enough to be
+        // pulled, and nowhere the control can actually go.
+        assert_eq!(snapped(0.52, 0.25, 0.51, 2.0), 0.52);
+        // Where the rung *is* on the rail — the scale's own bottom — it lands.
+        assert_eq!(snapped(0.76, 0.25, 0.75, 2.0), 0.75);
     }
 
     /// Every rail but this one passes no step, and must be untouched by the
@@ -1721,11 +1717,67 @@ mod tests {
             assert_eq!(row.parse(&row.format(degrees)), Some(degrees));
             assert_eq!(row.parse(&row.bare(degrees)), Some(degrees));
         }
-        for factor in [0.5, 1.0, 1.25, 1.75, 2.0] {
+        for factor in [0.75, 1.0, 1.25, 1.75, 2.0] {
             let row = scale();
             assert_eq!(row.parse(&row.format(factor)), Some(factor));
             assert_eq!(row.parse(&row.bare(factor)), Some(factor));
         }
+    }
+
+    /// The Interface scale's own half of that, on the rungs somebody actually
+    /// asks for: 100% to get back to where it started, and 125% or 150% on a
+    /// high-density screen. Exact in both directions, so typing the figure the
+    /// readout is showing is not a change — a scale that came back as 1.2499999
+    /// would rescale the whole interface for a round trip that meant nothing.
+    #[test]
+    fn the_scales_own_ladder_is_exact_in_both_directions() {
+        let row = scale();
+        for (factor, shown) in [(1.0, "100%"), (1.25, "125%"), (1.5, "150%")] {
+            assert_eq!(row.format(factor), shown);
+            assert_eq!(row.bare(factor), shown.trim_end_matches('%'));
+            assert_eq!(row.parse(shown), Some(factor));
+            assert_eq!(row.parse(&row.bare(factor)), Some(factor));
+        }
+        // And both ends of the rail, which a percentage has to reach whole:
+        // a readout of "75.0%" on a control set in quarters is a decimal place
+        // that can never say anything.
+        assert_eq!(row.format(*row.range.start()), "75%");
+        assert_eq!(row.format(*row.range.end()), "200%");
+    }
+
+    /// The scale's rail lands on each 25%, so 125% is reachable with a hand as
+    /// well as with the keyboard. In the value's own units — a quarter of a
+    /// factor, not 25 of anything — which is the units the whole struct is in.
+    #[test]
+    fn the_scale_rail_lands_on_each_quarter() {
+        let row = scale();
+        let (lo, hi) = (*row.range.start(), *row.range.end());
+        // Within an eighth of a quarter — 0.03125 — either side of a rung.
+        for (near, rung) in [
+            (1.0, 1.0),
+            (0.98, 1.0),
+            (1.02, 1.0),
+            (1.24, 1.25),
+            (1.27, 1.25),
+            (1.48, 1.5),
+            (1.76, 1.75),
+            (1.99, 2.0),
+        ] {
+            assert_eq!(
+                snapped(near, row.snap, lo, hi),
+                rung,
+                "{near} should have been pulled onto {rung}"
+            );
+        }
+        // And three quarters of the travel is still free, or the rail would be
+        // a segmented picker in a slider's clothes.
+        for free in [0.9, 1.1, 1.375, 1.6, 1.9] {
+            assert_eq!(snapped(free, row.snap, lo, hi), free);
+        }
+        // Both ends of the rail are themselves rungs, so a drag pinned at
+        // either end lands on one rather than a hair off it.
+        assert_eq!(snapped(lo, row.snap, lo, hi), lo);
+        assert_eq!(snapped(hi, row.snap, lo, hi), hi);
     }
 
     /// The suffix is the readout's and never the field's: "125" is what a scale

@@ -395,19 +395,7 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
         // egui's zoom factor is the single source of truth for this; keeping a
         // second copy alongside it is how the two end up disagreeing.
         let mut scale = ui.ctx().zoom_factor();
-        // The one deferred slider in the application. This one is drawn inside
-        // the thing it scales, so applying it per frame moves the track out
-        // from under the pointer and the knob runs away; see
-        // `widgets::slider_row_deferred`.
-        if widgets::slider_row_deferred(
-            ui,
-            p,
-            "Interface scale",
-            &mut scale,
-            prefs::MIN_SCALE..=prefs::MAX_SCALE,
-            false,
-            |v| format!("{:.0}%", v * 100.0),
-        ) {
+        if widgets::number_row(ui, p, &mut scale, scale_row()) {
             ui.ctx().set_zoom_factor(scale);
             prefs::mark_dirty();
         }
@@ -487,6 +475,37 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
 
     ui.add_space(16.0);
     autosave_section(ui, p, ed, actions);
+}
+
+/// The Interface scale control's shape: a factor shown as a percentage, landing
+/// on each 25%, handed back only when the drag ends.
+///
+/// Split out so the tests drive the control the dialog actually draws rather
+/// than a copy of its numbers — the same reason [`crate::colorpicker`]'s angle
+/// row is its own function.
+///
+/// Every figure anybody actually asks for here is on a quarter: 100% back to
+/// where it started, 125% and 150% on a high-density screen. Landing on one by
+/// dragging a rail 320 px wide across a range of 1.25 is a matter of luck, so
+/// the rail snaps to each 25% and the figure beside it can be typed — somebody
+/// who wants exactly 125% types 125.
+pub(crate) fn scale_row() -> widgets::NumberRow<'static> {
+    widgets::NumberRow {
+        label: "Interface scale",
+        range: prefs::MIN_SCALE..=prefs::MAX_SCALE,
+        snap: 0.25,
+        // The value is egui's zoom factor, a factor around 1; the readout is
+        // the percentage everybody states a scale in.
+        per_unit: 100.0,
+        suffix: "%",
+        decimals: 0,
+        // The one deferred row in the application. This one is drawn inside the
+        // thing it scales, so applying it per frame moves the track out from
+        // under the pointer and the knob runs away from the hand holding it. A
+        // *typed* figure is applied at once either way — the pointer is nowhere
+        // near the track, so there is nothing to run away from.
+        deferred: true,
+    }
 }
 
 /// How much memory one document's undo history may hold.
