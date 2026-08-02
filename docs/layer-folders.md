@@ -272,6 +272,44 @@ which ignored folders would be off by one.
 
 This is the part that needs care, and none of it exists.
 
+### Pass-through and isolated have to coexist
+
+**This is the correction the rest of this section is built on, and the first
+draft of this design missed it.** It is not enough to give every folder an
+accumulator of its own and set the opacity to 1 where nobody asked for one.
+
+Source-over is associative, so a group at opacity 1 in Normal mode composites
+identically whether its children go into their own accumulator or straight into
+the stack's. That much is safe. What is *not* safe is a child with a blend mode:
+a Multiply layer inside a group would multiply against the group's own
+accumulator — which starts transparent — instead of against the backdrop below
+the group. That is precisely the difference Photoshop and Krita call
+pass-through versus isolated, and turning every folder isolated would silently
+change every document this build has already written.
+
+So both have to exist:
+
+- **Pass-through** folders keep doing exactly what they do now: flattened away
+  in `Editor::layer_draws`, absent from the shader, absent from
+  `required_version`, and still opening plainly in every older reader.
+- **Isolated** folders become entries in the shader's array and get the
+  accumulator treatment below.
+
+A folder is isolated **iff its opacity is below 1 or its blend mode is not
+Normal**. Deriving it rather than storing an explicit flag is what keeps this in
+step with the version rule — the same test decides whether the file needs
+revision 3 — and it means no new field, no migration, and no way for the two to
+disagree. The cost is that a folder cannot be isolated *and* transparent-looking
+at opacity 1, which Photoshop offers and nobody has asked for; if it is ever
+wanted, the flag and the version clause have to move together.
+
+Note the consequence for clipping. Today a clipped layer at the bottom of a
+group answers to whatever unclipped layer is beneath the group, and that is
+correct for a pass-through folder. Inside an *isolated* one it would have to
+answer to nothing, which is a behaviour change confined to folders that did not
+previously exist — but it does mean `clip_alpha` has to be pushed and popped
+with the accumulator rather than left running.
+
 `composite.wgsl` walks `layers: array<vec4<f32>, MAX_LAYERS>` bottom to top into
 one `acc`, carrying a running `clip_alpha` for clipped layers. Two properties of
 that loop are load-bearing and are what an isolated folder disturbs:
@@ -300,11 +338,26 @@ restored `acc` with the folder's own opacity and blend mode, through
 `composite_over` — the same function every layer already goes through, which is
 what keeps there from being a second copy of the blend maths.
 
+**Where the open and the close come from.** A folder sits *above* its contents,
+so walking bottom to top the contents arrive first and the folder last. The
+folder entry is therefore the **close**, and it is what carries the opacity and
+the blend mode to composite the finished group with. The **open** is not an
+entry at all: it is a depth increase. Carry each entry's depth in the array and
+push an accumulator for every level `depth[i]` exceeds the running depth. An
+*empty* isolated folder then closes a group that was never opened, so the pop
+must be guarded on the running depth actually being deeper — and an empty group
+composites nothing, which `composite_over` already handles for a transparent
+source.
+
 Four notes on making that real:
 
 - **The entries can be encoded in the array that exists.** `extra[i].w` is
-  unused (`(mask slot, has mask, clipped, unused)`), so a folder's open/close
-  marker fits with no new uniform and no new binding.
+  unused (`(mask slot, has mask, clipped, unused)`), so the depth fits with no
+  new uniform and no new binding — and a folder needs no flag of its own beside
+  it, because it is the entry with no slot: writing `-1` into `layers[i].z`
+  says so, and every real slot is non-negative. Whatever is chosen, the Rust
+  `#[repr(C)]` struct and the WGSL one still have to agree byte for byte; see
+  CLAUDE.md's "Uniform layout".
 - **The markers must travel in `LayerDraw`.** `export_rgba`, `pick_colour`,
   `probe_canvas` and the autosave's capture take a `&[LayerDraw]` and pass it
   through, so as a field they stay untouched; as a second argument to
@@ -315,11 +368,22 @@ Four notes on making that real:
 - **`LayerStack::MAX` already counts folders**, so the uniform array is already
   sized for them. That part is done too.
 
-The new GPU test to write is the one that catches the whole point: two
-overlapping opaque children in a folder at 50%, against the same two children at
-50% each outside a folder. The two must differ, and the first must equal the
-flattened-then-faded result. `composite_pixel` in `gpu_pipeline.rs` is the
-harness for it.
+Two GPU tests to write, and the second is the one that would otherwise be
+found by a painter:
+
+- **The point of the feature.** Two overlapping opaque children in a folder at
+  50%, against the same two children at 50% each outside a folder. The two must
+  differ, and the first must equal the flattened-then-faded result.
+- **The thing that must not change.** A Multiply child inside a *pass-through*
+  folder must composite exactly as it does with no folder at all. That is the
+  regression the pass-through/isolated split above exists to prevent, and it is
+  invisible in any test built only out of Normal layers.
+
+`composite_pixel` in `gpu_pipeline.rs` is the harness for both.
+
+Also worth pinning without a GPU: `Editor::active_draw_index` has to count the
+isolated folders that now *do* reach the draw list, where today it counts only
+layers. That mapping is already the one thing in this area that fails silently.
 
 ### The file
 
@@ -329,6 +393,14 @@ opacity into each child, and a group of overlapping children then composites
 differently — a document that opens showing something else. That is exactly the
 masks-and-clipping case that took the version to 2. A document of pass-through
 folders must go on declaring 1 or 2 and go on opening everywhere.
+
+The writer then emits `opacity` and `composite-op` on the `<stack>` — which it
+deliberately does not today — and the reader stops folding a group's opacity
+into the children and puts it on the folder instead. That fold and its
+`GroupOpacityFolded` warning stay for the case they were written for: a `.kra`
+or an ORA from another application, read by a build whose folders can carry an
+opacity, still needs no fold; but one nested deeper than `MAX_DEPTH`, whose
+group is flattened away, does.
 
 Other applications' ORA readers flatten Umber's folders in exactly the way an
 older Umber would, so the same argument makes an isolated folder a real
