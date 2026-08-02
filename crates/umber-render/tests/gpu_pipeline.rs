@@ -366,6 +366,53 @@ fn overlapping_dabs_do_not_compound() {
     );
 }
 
+#[test]
+fn a_pressure_step_finer_than_the_layer_makes_no_mark() {
+    // How wide the wet-layer path actually is, end to end — and therefore what
+    // widening the scratch would and would not buy.
+    //
+    // The scratch is `R8Unorm` and the layer is `Rgba8UnormSrgb`, whose *alpha*
+    // channel is linear (sRGB formats encode RGB only). Both are 256 levels, so
+    // the scratch is exactly as wide as its destination and adds no loss of its
+    // own. That is the whole answer to "can a 16-bit scratch carry the pen's
+    // 1024 pressure levels": no, because commit re-quantises to the same 256
+    // whatever the scratch held. See the pressure note in CLAUDE.md.
+    //
+    // Base 0.4 rather than 0.5 deliberately: 0.4 * 255 is exactly 102, so
+    // neither expectation sits on a rounding tie a driver may break either way.
+    let mut h = harness_or_skip!();
+
+    let base = 0.4f32;
+    h.stamp(&[
+        // One step of the pen's 1024 levels.
+        dab(12.0, 12.0, 6.0, base),
+        dab(12.0, 40.0, 6.0, base + 1.0 / 1023.0),
+        // One step of the layer's 256.
+        dab(40.0, 12.0, 6.0, base + 1.0 / 255.0),
+    ]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+
+    let plain = h.pixel(12, 12)[3];
+    let pressure_step = h.pixel(12, 40)[3];
+    let storage_step = h.pixel(40, 12)[3];
+
+    assert_eq!(
+        pressure_step, plain,
+        "a 1/1024 pressure step must be invisible — the layer holds 256 alpha \
+         levels, so a 16-bit scratch would not rescue it"
+    );
+    assert!(
+        storage_step > plain,
+        "a 1/255 step must still resolve: expected more than {plain}, got \
+         {storage_step} — the path has become lossier than eight bits"
+    );
+    assert!(
+        storage_step - plain <= 2,
+        "a 1/255 step is one level, not {}",
+        storage_step - plain
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Build-up
 // ---------------------------------------------------------------------------
@@ -458,9 +505,10 @@ fn a_building_stroke_saturates_rather_than_overflowing() {
     // the next dab contributes `0.5/255` and rounds to nothing: a partial dab
     // asymptotes one level short of solid. A dab of full coverage does reach
     // 255 — `a + 1(1 - a)` is exactly 1 — so this is the floor of the
-    // quantisation and not a leak in the formula. Sixteen-bit coverage would
-    // close it, at four times the bandwidth of the hottest texture in the
-    // frame, to remove a difference of 0.4%.
+    // quantisation and not a leak in the formula. An `R16Float` scratch would
+    // close it, at twice the bandwidth of the hottest texture in the frame, to
+    // remove a difference of 0.4%. See the pressure note in CLAUDE.md for the
+    // measurement that decided against it.
     assert!(
         h.pixel(32, 32)[3] >= 254,
         "forty half-coverage dabs should be solid, got {}",

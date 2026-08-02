@@ -71,6 +71,12 @@ Invariants that are easy to break:
   paints. This was a real bug; `erasing_removes_coverage` guards it.
 - **The dab pass loads rather than clears.** The scratch accumulates across
   frames for the whole stroke; only new dabs are drawn each frame.
+- **The scratch stays `R8Unorm`, and that is a measured decision, not an
+  oversight.** It is exactly as wide as the layer alpha it commits into, so it
+  adds no loss of its own and widening it cannot carry the pen's 1024 pressure
+  levels to the canvas. `R16Unorm` is not even a legal render target on the
+  feature set Umber requests. The measurements are under "Pressure" in Platform
+  support — read them before proposing this again.
 - **`Brush::build_up` is the one exception to the `max`, and it is a *blend
   state*, not a shader branch.** A sparse texture stamp's mark is the overlap of
   many faint stamps — GIMP and Krita composite every dab — so a `max` caps a
@@ -813,6 +819,78 @@ carries however many the tablet itself distinguishes. `PressureSource::Device`
 is the default and passes it straight through; the enum's other arms are the
 mouse-only fallbacks. macOS and Linux have no equivalent path yet — do not
 describe pen pressure as working there.
+
+#### Why widening the scratch does not deliver those 1024 levels
+
+This has been asked twice. The answer is no, and the reason is not the scratch.
+
+**Pressure is only quantised where it drives opacity.** Size, hardness, scatter,
+angle and every `dynamics` target take it as an `f32` all the way to the dab, so
+1024 levels already reach them intact. `coverage_at` is the one that ends up in
+a texture.
+
+**The scratch is exactly as wide as its destination, so it adds no loss.**
+`LAYER_FORMAT` is `Rgba8UnormSrgb` and an sRGB format encodes *RGB only* — its
+alpha channel is linear 8-bit. Commit therefore re-quantises coverage to 256
+levels whatever the scratch held. Measured on the GPU: 1024 pressure levels
+produce **256 distinct committed alphas**, and that number is unchanged by an
+exact-float or an `R16Float` scratch. `a_pressure_step_finer_than_the_layer_
+makes_no_mark` pins both halves — a 1/1024 step is invisible, a 1/255 step is
+exactly one level. **Only a wider layer could change this**, which is the last
+point below.
+
+**`R16Unorm` is not available anyway**, and this is the point to check first.
+It requires `Features::TEXTURE_FORMAT_16BIT_NORM`, which Umber does not request
+because device limits are `downlevel_defaults`; and even *with* the feature,
+wgpu's `guaranteed_format_features` gives it `storage` usage, **not**
+`RENDER_ATTACHMENT`. It cannot be a render target on the guaranteed set at all.
+`R16Float` is the only single-channel 16-bit candidate left — `R16Uint` and
+`R16Sint` are attachments but integer formats do not blend at all. It is
+`(msaa_resolve, attachment)` on `Features::empty()` and BLENDABLE because its
+sample type is filterable float, so `max` and the build-up blend would both
+work. `Rgba16Float` is already used for the colour scratch, which is the
+existence proof.
+
+**The one thing a 16-bit scratch would buy is build-up accumulation**, where
+`a = cov + a(1 − cov)` compounds rounding inside the scratch. `max` gains
+nothing — it is monotone and idempotent under round-to-nearest. Build-up's
+failure mode is a *stall*: once `cov * (1 − a)` falls below half a level the
+accumulator stops moving, so a constant coverage of `1/255` asymptotes at 0.5
+rather than 1.0, and one below `1/510` never builds at all.
+
+**Measured, that is worth at most 3 levels of 255.** Stamping the one shipped
+preset that sets `build_up` (`pack01-drybrush`) along a stroke at its own
+spacing, 50 dabs deep, against exact arithmetic: `R8Unorm` is at most 3 levels
+out, mean 0.5, with 2.8% of the stroke's pixels more than one level out;
+`R16Float` is at most 1. The stall needs a *constant* faint coverage on one
+pixel for a hundred-odd dabs, and a bitmap tip cannot produce that: the mask
+slides under the stroke, so a pixel sees a different texel every dab, and the
+mask is itself an 8-bit `R8Unorm` texture with no *stored* value below `1/255`
+for a wider scratch to recover. A user could still build the adversarial
+brush (build-up plus a low pressure-opacity ramp, painting very lightly), where
+the error reaches tens of levels; no shipped preset combines them, and the
+remedy is a wider *layer* for that too.
+
+**The cost is real:** the scratch is canvas-sized, so `R16Float` doubles it —
+200 MB instead of 100 MB on a 10000² canvas — on the texture the dab pass
+read-modify-writes per fragment and the composite samples every frame. Nothing
+reads the scratch back to the CPU, so no readback path is involved.
+`STROKE_FORMAT` is shared with the tip and grain masks, which are genuinely
+8-bit source data and would have to be split off first.
+
+**Raising the layer to 16-bit is the only answer that would work, and is not
+worth it now.** It doubles every layer slice (400 MB → 800 MB per layer at
+10000², against `MAX_LAYERS` of 64), halves the reach of undo's 512 MB budget
+since a `PixelPatch` would carry 8 bytes per pixel, and lands on the file
+format: ORA is 8-bit PNG, so a 16-bit layer either truncates on save — making
+`saving_and_reopening_does_not_move_a_pixel` false — or writes 16-bit PNG that
+other ORA readers may refuse, against the whole point of the format choice. It
+also changes `ImportedLayer::pixels`' contract and every readback
+(`read_layer_rect`, the autosave capture's 4 MB/frame budget, `export_rgba`,
+`pick_colour`, `probe_canvas`). Note it would *fix* rather than break the
+`LAYER_FORMAT` sRGB argument, since `Rgba16Float` has the mantissa 8-bit linear
+lacked. It is a coherent future change and a large one; it is not a pressure fix
+worth 256→1024 levels of alpha nobody has yet shown they can see.
 
 ## Releasing
 
