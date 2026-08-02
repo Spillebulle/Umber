@@ -344,6 +344,15 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+- **The stack is flat, and folders are designed but not built.**
+  `docs/layer-folders.md` is the design; the two things to know before starting
+  are that a *pass-through* folder needs no change to `composite.wgsl` and no
+  `umber-version` bump, and that a folder with its own opacity or blend mode
+  needs both — an accumulator stack in the composite loop, because a group at
+  50% over two overlapping children is not two children at 50%, and revision 3,
+  because an older build folding that opacity into each child opens the document
+  showing something else. Do not draw a folder's opacity control before the
+  second exists.
 - **A tick is a field on the layer and is never written to the file.** Every
   other flag is a property of the picture; a tick says what the painter is
   *about to do*, and reopening a document to find four layers still ticked is an

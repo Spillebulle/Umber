@@ -109,6 +109,12 @@ The in-progress stroke is blended *inside* the stack at the active layer's
 position, not on top of the finished composite. Painting underneath a Multiply
 layer would otherwise preview wrongly and then jump on release.
 
+The stack is **flat** — there are no folders. Layers can be ticked and operated
+on together, and a *link group* carries its members through the stack as a unit,
+which covers much of what folders are reached for; nesting and a folder's own
+opacity and blend applying to its contents do not exist.
+`docs/layer-folders.md` has the design and what it would cost.
+
 ### Other decisions worth knowing
 
 - **Colour is linear everywhere** inside the engine. Blending in sRGB space
@@ -204,6 +210,12 @@ Next, roughly in order:
   standing behind a download today is HTTPS and a length check. A signature and
   a public key compiled into the application is what would make that a
   guarantee; until then About says exactly what is and is not promised.
+- **Layer folders.** The stack is flat. A *pass-through* folder — a container
+  that groups and hides, with no opacity or blend of its own — needs no shader
+  change and no file-format version bump, and is where this should first ship;
+  a folder that fades or blends its contents is group compositing and needs an
+  accumulator stack in `composite.wgsl`. `docs/layer-folders.md` is the whole
+  design, the invariants it collides with and the order to build it in.
 - Structural undo, so layer add/delete/reorder joins the history — and stops
   the History module having to explain that it lists strokes and not layers
 - Getting the *explicit* save off the drawing thread. It still reads every
@@ -276,3 +288,4 @@ pwsh tools/release.ps1 0.0.2
 | [`brush-sources.md`](brush-sources.md) | Where the shipped brushes come from, and every pack considered |
 | [`document-format.md`](document-format.md) | Why OpenRaster, and exactly what Umber writes into one |
 | [`document-import.md`](document-import.md) | What each importer reads, and why some formats are refused |
+| [`layer-folders.md`](layer-folders.md) | The folder design, what it collides with, and why it is not built yet |

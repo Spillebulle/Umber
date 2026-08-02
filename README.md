@@ -446,6 +446,8 @@ platforms is on the roadmap.
 - **Layer folders.** The stack is flat. Ticking several layers and acting on all
   of them covers most of what folders are reached for; nesting, and a folder's
   own visibility and opacity applying to what is inside it, do not exist.
+  [`docs/layer-folders.md`](docs/layer-folders.md) is the design and what it
+  would cost.
 - **Layer masks from other applications.** Umber reads and writes its own; a
   `.kra` or `.psd` mask is still reported as lost rather than converted.
 - **Pen pressure on macOS and Linux**, as above. Windows works.

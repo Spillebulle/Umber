@@ -101,6 +101,8 @@ them clear of anything the specification may add later.
 | `umber-blend` | a `<layer>` | Umber's own mode name, where the SVG one is inexact. |
 | `umber-background` | the bottom `<layer>` | That layer *is* the document background, and this is its colour. |
 | `umber-history` | `<image>` | Names the entry describing a saved undo history. |
+| `umber-clip`, `umber-lock`, `umber-link` | a `<layer>` | Clipped to the one below; locked; in a link group. Written only when set. |
+| `umber-link-group` | a linked `<layer>` | *Which* link group, as a number — see below. |
 
 **Resolution is deliberately not one of them.** ORA's `<image>` already carries
 `xres` and `yres`, in whole pixels per inch, and that is where a document's DPI
@@ -119,6 +121,14 @@ which is right for a file from another application and wrong for one Umber wrote
 itself. The attribute lets the reader take Umber at its word, so reopening your
 own document does not announce a loss that never happened. Saving one still
 warns, because other applications *will* composite it slightly differently.
+
+`umber-link-group` is written **beside** `umber-link` rather than instead of it,
+and neither moved `umber-version`. A link decides what travels with what when a
+layer is dragged; it changes no pixel. So a build that reads only the old flag
+opens the same picture and merely has one linked set where this build has three
+— which is exactly what that build did with the file *it* wrote. Read the other
+way, a file carrying the flag and no group is one written before groups existed,
+and every linked layer in it joins group zero: the single set it always was.
 
 `umber-version` is bumped only when a revision stores something an older Umber
 would drop without knowing it had. A file whose number is higher than the
