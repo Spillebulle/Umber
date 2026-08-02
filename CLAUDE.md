@@ -1053,6 +1053,30 @@ cannot half-publish; `.github/workflows/release.yml` does the rest.
 - The MSI's `UpgradeCode` in `packaging/windows/umber.wxs` must never change. It
   is what tells Windows the next version replaces this one rather than
   installing beside it.
+- **Three icon mechanisms were not enough; the fourth is identity.** With the
+  executable's `RT_GROUP_ICON`, `ICON_SMALL` and `ICON_BIG` all in place, the
+  taskbar still drew the generic paper icon. Windows groups taskbar buttons by
+  **AppUserModelID**, and a process that never sets one is given a derived
+  identity belonging to whatever launched it — so a terminal, Cargo and an
+  installer's shortcut produce three different ones. `taskbar::claim_identity`
+  takes `io.github.spillebulle.umber` explicitly, and it must run **before the
+  first window exists**: the shell reads the identity when it creates the
+  button, and setting it later does not move a button already on screen.
+- **On Linux the window icon is not used at all.** Wayland matches the window's
+  **app id** against an installed `.desktop` file and takes the icon named
+  there; X11 matches the entry's `StartupWMClass` against the window's class.
+  Umber set neither, so there was nothing to match and no icon, in every Linux
+  package. The two platforms genuinely want different strings — the reverse-DNS
+  app id for Wayland, `umber` for X11 — and `taskbar`'s tests pin both against
+  `packaging/`, so renaming one and not the other fails in `cargo test` rather
+  than in a package nobody opens until it is released.
+- **`taskbar::APP_ID` is one name across every platform** — the Windows
+  identity, the Wayland app id, the Flatpak app id, the desktop entry's
+  filename and the installed icon names are all that string. A second spelling
+  of it is a mismatch waiting to happen.
+- **Windows caches taskbar icons per executable path**, which can pin a stale
+  icon for a dev build long after the cause is fixed. A change here is not
+  disproved by one look at the taskbar.
 - **Windows keeps two icons per window and Umber has to set both.**
   `with_window_icon` is `ICON_SMALL`, the title bar's; the taskbar and Alt-Tab
   draw `ICON_BIG`, which is winit's separate `with_taskbar_icon`. winit
