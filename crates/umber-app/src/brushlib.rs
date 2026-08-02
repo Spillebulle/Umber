@@ -295,11 +295,12 @@ impl Index {
     }
 }
 
+/// The heading this brush sits under: what the user put it in, or failing that
+/// what it arrived with.
 fn collection_of(preset: &BrushPreset) -> &str {
-    if preset.category.is_empty() {
-        "Uncategorised"
-    } else {
-        &preset.category
+    match preset.collection() {
+        "" => "Uncategorised",
+        name => name,
     }
 }
 
@@ -335,10 +336,15 @@ fn visit<'a>(
 }
 
 /// Name or collection contains `query`, which the caller has already lowered.
+///
+/// The collection searched is the one the row is *filed under*, not the style
+/// underneath it: a brush the user has moved has to be findable where they put
+/// it, and a search that still answered to the old heading would be pointing at
+/// a row that is not there.
 fn matches(preset: &BrushPreset, query: &str) -> bool {
     query.is_empty()
         || contains_ignore_case(&preset.name, query)
-        || contains_ignore_case(&preset.category, query)
+        || contains_ignore_case(collection_of(preset), query)
 }
 
 /// Case-insensitive substring, without lowering a copy of the haystack.
@@ -369,11 +375,11 @@ fn credit_line(preset: &BrushPreset) -> String {
             (false, false) => format!("{} · {}", credit.author, credit.licence),
             (false, true) => credit.author.clone(),
             (true, false) => credit.licence.clone(),
-            (true, true) => preset.category.clone(),
+            (true, true) => collection_of(preset).to_owned(),
         },
         // A brush the user made or imported carries no credit, and inventing
         // one would be worse than saying where it sits.
-        None => preset.category.clone(),
+        None => collection_of(preset).to_owned(),
     }
 }
 
@@ -1703,6 +1709,7 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
             category: category.to_owned(),
+            collection: None,
             credit: None,
             brush: umber_core::Brush::default(),
             tip: None,
@@ -1754,6 +1761,34 @@ mod tests {
         // quietly hide brushes.
         let members: usize = index.groups.iter().map(|g| g.members.len()).sum();
         assert_eq!(members, presets.len());
+    }
+
+    /// An import has to be findable the moment it arrives, which the classifier
+    /// cannot manage: it files a pack of twenty across six collections, all of
+    /// them already holding two hundred shipped brushes.
+    #[test]
+    fn an_import_is_filed_under_imported_rather_than_by_its_style() {
+        let mut presets = preset::builtin().to_vec();
+        let mut arrived = preset("mypaint/charcoal-4", "Charcoal 4", style::Style::CHARCOAL);
+        arrived.collection = Some(preset::IMPORTED.to_owned());
+        presets.push(arrived);
+        let last = presets.len() - 1;
+        let index = Index::build(&presets);
+
+        // Not with the charcoals its name would have put it among…
+        let charcoal = index
+            .groups
+            .iter()
+            .find(|g| g.name == style::Style::CHARCOAL)
+            .expect("the shipped library has charcoals");
+        assert!(!charcoal.members.contains(&last));
+        // …but in one collection of its own, at the top of the rail with
+        // everything else that is the user's rather than Umber's.
+        assert_eq!(index.groups[0].name, preset::IMPORTED);
+        assert_eq!(index.groups[0].members, vec![last]);
+        // And the search answers to where it is filed, not to what it is.
+        assert!(matches(&presets[last], "imported"));
+        assert!(!matches(&presets[last], "chalk"));
     }
 
     /// A library grouped by author put the pencils in six places. This is the
