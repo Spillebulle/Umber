@@ -1081,6 +1081,37 @@ design shows a whole row of them.
   and if that button only exists while the row is hovered, the two oscillate
   once a frame. Allocate the row unconditionally and test `contains_pointer`,
   which is geometry alone. This was a real bug on the Shortcuts page's `+`.
+- **egui's finished textures are given back *after* `Queue::submit`, never
+  before**, and `app::submit_frame` is the one place that does both so the two
+  cannot be put the wrong way round. `egui_wgpu::Renderer::free_texture` calls
+  `wgpu::Texture::destroy`, which takes effect immediately rather than when the
+  last reference goes — so a texture named in `textures_delta.free` and also
+  named by a draw already recorded this frame fails validation at submit, and
+  wgpu's default handler makes that a panic that takes the application down.
+  A same-frame free is legitimate and unavoidable: egui frees a texture when
+  the last `TextureHandle` to it drops, and a cache replacing an entry mid-pass
+  does that after an earlier widget has already queued a `Shape` carrying the
+  id. After the submit no deferral is needed — wgpu keeps the resource alive
+  for the submission using it — so this is the ordering, not a frame of grace.
+  `egui_wgpu`'s own painter says the same thing in the same place. This was a
+  real bug: opening the brush library crashed the application.
+- **A texture cache keyed on an address must have the *shape* it drew in in the
+  key too.** The Brushes panel and the library browser show the same presets at
+  two row heights and are on screen together — the browser is a modal over the
+  panel — so one preset is one `&Brush` drawn twice in one pass. Sharing one
+  entry, the second row evicted the first's live texture, which is the free
+  above, and it also re-rasterised and re-uploaded every preset visible in both,
+  every frame. Comparing the size and rebuilding on a mismatch is not enough:
+  that *is* the eviction.
+  `a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws`
+  reads egui's own texture delta against the pass's tessellated meshes. It is a
+  CPU test for a bug that otherwise only appears as a wgpu panic, and it is the
+  only place it can live — `umber-render` may not depend on egui, so
+  `gpu_pipeline.rs` cannot see any of this.
+  The single-consumer caches — `brushlib::tip_preview`, `ui::paper_preview` —
+  are safe because each is drawn once per pass with one value. That is the
+  property to check before giving either a second call site, not a rule they
+  state.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.

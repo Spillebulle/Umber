@@ -210,6 +210,51 @@ pub struct UmberApp {
 /// would commit instead of turning.
 const PUT_DOWN_SLOP: f32 = 4.0;
 
+/// Submit the frame's commands, and only then destroy the textures egui has
+/// finished with.
+///
+/// The two are one function because putting them the other way round is a
+/// crash, and a crash that reads like somebody else's bug.
+/// `egui_wgpu::Renderer::free_texture` calls `wgpu::Texture::destroy`, which
+/// takes effect **immediately** rather than when the last reference to the
+/// texture goes: from that moment every recorded command naming it is invalid.
+///
+/// And a texture may legitimately be freed in the same pass that draws it. egui
+/// frees one when the last `TextureHandle` to it is dropped, and a cache
+/// replacing an entry mid-pass does exactly that — after an earlier widget has
+/// already queued a `Shape` carrying the id. So this frame's paint jobs can and
+/// do reference what this frame's `textures_delta.free` names. Destroying first
+/// meant `Queue::submit` failing validation with "Texture with
+/// 'egui_texid_Managed(N)' label has been destroyed", which under wgpu's
+/// default handler is a panic that takes the application down with it. Opening
+/// the brush library was enough: the Brushes panel and the browser draw the
+/// same preset at two different row heights, and the second evicted the first's
+/// preview texture after it had been painted.
+///
+/// After the submit it is safe, and needs no deferring by a frame: wgpu keeps
+/// the underlying resource alive for as long as the submission using it. This
+/// is what `egui_wgpu`'s own painter does, for the same reason, stated in the
+/// same place.
+fn submit_frame(
+    gpu: &Gpu,
+    renderer: &mut egui_wgpu::Renderer,
+    encoder: wgpu::CommandEncoder,
+    finished: &[egui::TextureId],
+) {
+    gpu.queue.submit(Some(encoder.finish()));
+    release_finished_textures(renderer, finished);
+}
+
+/// Hand egui's finished textures back.
+///
+/// Only ever called with nothing recorded and unsubmitted: [`submit_frame`] is
+/// the one caller that has a command buffer, and it submits first.
+fn release_finished_textures(renderer: &mut egui_wgpu::Renderer, finished: &[egui::TextureId]) {
+    for id in finished {
+        renderer.free_texture(id);
+    }
+}
+
 impl UmberApp {
     /// Build the application around an event loop it can wake.
     ///
@@ -1736,12 +1781,11 @@ impl UmberApp {
         }
 
         let Some(surface_texture) = acquired.filter(|_| has_canvas) else {
-            // Frees are applied even though nothing was drawn: they name
-            // textures egui has finished with, which the jobs just discarded
-            // above cannot reference.
-            for id in &textures_delta.free {
-                gfx.egui_renderer.free_texture(id);
-            }
+            // Frees are applied even though nothing was drawn, and here — and
+            // only here — they may be applied at once: no command buffer was
+            // recorded, so nothing can be holding a draw against them. See
+            // `submit_frame` for why the ordering matters everywhere else.
+            release_finished_textures(&mut gfx.egui_renderer, &textures_delta.free);
             return;
         };
         let view = surface_texture
@@ -1891,11 +1935,14 @@ impl UmberApp {
             gfx.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
         }
-        for id in &textures_delta.free {
-            gfx.egui_renderer.free_texture(id);
-        }
-
-        gfx.gpu.queue.submit(Some(encoder.finish()));
+        // Submit, and only then give egui's finished textures back. The two are
+        // one call because they must not be separable — see `submit_frame`.
+        submit_frame(
+            &gfx.gpu,
+            &mut gfx.egui_renderer,
+            encoder,
+            &textures_delta.free,
+        );
         surface_texture.present();
 
         // The probe's copy is only submitted now, so mapping it has to wait
