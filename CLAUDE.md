@@ -405,6 +405,49 @@ when nobody asked for it.
 - **A pre-tips `brushes.ron` is migrated and the original is left in place.** A
   migration that deletes the only copy of somebody's collection has to be right
   first time. Guarded by `a_flat_library_is_migrated_into_the_directory`.
+- **Grouping is derived from `BrushPreset::category`, and the user's own filing
+  overrides it through `BrushPreset::collection`.** Two fields, because they
+  answer different questions: `category` is what the brush arrived with — the
+  pack's grouping or `style::classify`'s reading of the name — and it is what
+  the brush falls back to the moment the user's choice is taken off. Overwriting
+  it would throw that away. An import sets `collection` to `preset::IMPORTED`
+  ("Imported"), because twenty brushes filed correctly across six collections
+  are twenty brushes somebody has to go and find.
+- **A user's filing of a *shipped* brush cannot live on the preset**, and this is
+  the one thing here that is easy to get wrong. `preset::builtin` is
+  `include_str!`'d into the binary and replaced wholesale by every update, so a
+  choice written there would survive until the next release and then vanish —
+  silently, months later. It goes in `Library::collections`, a table beside the
+  presets in the user's own `brushes.ron`, keyed by the brush's **stable id**:
+  the file is in the user's data directory, which an update never touches, and
+  an id survives a release adding, removing or reordering shipped brushes where
+  a position would not. `UserLibrary::assign` routes by ownership — a brush the
+  library holds carries its collection on the preset, so it travels into an
+  export — and `resync` stamps the table back on every time the merged list is
+  rebuilt. `a_shipped_brushs_collection_survives_the_shipped_library_being_
+  replaced` is the guard. A dangling entry is **kept**: this module cannot
+  enumerate the shipped library, and a brush that has gone may come back.
+- **`Index::rank`'s "yours first" reads the collection's *name*, not its
+  members.** A name `style::classify` could never produce — "My brushes",
+  "Imported", one somebody typed — is one somebody chose. Reading it off the
+  members ("every brush in here is the user's") looks equivalent and is not:
+  dragging one shipped brush into "My brushes" would send the collection you use
+  most to the bottom of the rail.
+- **The drag that moves a brush between collections is a model, `brushdrag.rs`,
+  with no drawing in it** — the same division `dock.rs` keeps against
+  `panels.rs`. It decides which rail row the pointer is over and refuses the one
+  target that would do nothing, the collection the brush is already in; a "lands
+  here" mark over something that will not happen is worse than no mark.
+  `brushlib.rs` supplies this frame's pointer and the rectangles the rows landed
+  in, and the highlight is drawn from the *previous* frame's aim so it can be
+  part of the row rather than painted over its label.
+- **A notice must wrap at a width it is given.** A label in an egui horizontal
+  layout defaults to `TextWrapMode::Extend`, so `brushlib::notice_bar` and
+  `controls::banner` used to size the strip — and with it the modal and the
+  window — instead of being sized by it. `set_max_width` does not fix it; an
+  extending label overruns the ui. An import that dropped several features is
+  the longest text in the interface and put the browser wider than the screen.
+  The browser's own size is in `theme::metrics` for the same reason.
 - **`set_tip` is called from `start_stroke` and nowhere else**, and skips the
   upload when the mask is the same `Arc`. Identity, not equality: comparing a
   megabyte of coverage would put back the cost the check exists to avoid.
@@ -434,6 +477,11 @@ when nobody asked for it.
 - **The library's modals are drawn from `panels::sidebars`, not from the
   Brushes panel body.** The layout can hide that panel, and a modal that goes
   with its panel cannot be shut and cannot be reopened.
+- **The way into the brush editor is a mark in the Brushes *header*, not a link
+  under the list.** The design draws `✎ Edit "<name>"…` at the foot of the panel
+  body; a panel dragged short scrolls that out of sight, taking the only way to
+  change a brush with it. Import stays a link, because it opens a file dialog
+  and a mark cannot say which four applications' brushes Umber reads.
 - Nothing on the drawing path allocates per frame: the grouping and credit lines
   are built once per change, search folds case in place, and rows scrolled out
   of view skip painting. At 201 presets the naive version of each shows up in a
