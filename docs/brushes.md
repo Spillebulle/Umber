@@ -845,11 +845,8 @@ one that would only show up when a release was cut, since the desktop build
 everybody develops against has a C compiler. Its module docs carry the argument
 and the list of what it deliberately will not do.
 
-**The tip comes out of a thumbnail, and that is the honest limit.**
-`MaterialFile.FileData` is a USTAR tar; the full-resolution pixels inside it are
-in Clip Studio's own C2F container (magic `\x89C2F\r\n\x1a\n`, chunks of
-`[u32 le size][tag][payload][u32 checksum]`) whose data chunks carry a flag
-saying they are compressed by a codec documented nowhere. Beside them sits
+**The tip comes out of a thumbnail, which is a limit and no longer a mystery.**
+`MaterialFile.FileData` is a USTAR tar. Beside the full-resolution pixels sits
 `thumbnail/thumbnail.png`, a real PNG of the real material with a longest side
 of 300 — plenty for a mask that is scaled to the dab anyway. Coverage is
 `alpha × (1 − luminance)` and has to be both terms: a brush tip is black on
@@ -859,17 +856,86 @@ loss of resolution is named all the same. Build-up is then **measured** off the
 mask by `tip::stroke_coverage`, the same function that decides it for the
 shipped library — Clip Studio composites every dab as GIMP and Krita do.
 
-**Effect sources are read for pressure and randomness only.** Every setting
+#### Where the full-resolution pixels actually are
+
+Recorded here because it took a day to find and because nothing else writes it
+down. **There is no proprietary codec.** `data/material_0.layer` is a C2F
+container — magic `\x89C2F\r\n\x1a\n`, then chunks of `[u32 le size][4-byte
+tag][payload][u32 checksum]` tagged `HEAD`, `dATA`, `TAIL` — and its `dATA`
+payloads open with a `u16` flag. The one with flag 1 is a fixed 5128 bytes of
+something with no structure left in it. **The one with flag 0 is an ordinary
+SQLite database**, and everything is inside it:
+
+- Page size 1024, and **the file header and the first six pages are absent**:
+  the payload begins at page 7, so a page number `n` names the byte range
+  `(n − 6) × 1024`. Every page in it is a leaf, an interior node or an overflow
+  page, and overflow chains resolve exactly once that offset is applied.
+- One row carries the material's true size as plain integers — `501 × 501` for
+  a paper whose thumbnail is 300 × 300, `1174 × 1120` for a spatter brush whose
+  thumbnail is 300 × 286. That is the resolution actually being given up.
+- Another row's blob is the pixels, as a sequence introduced by the UTF-16BE
+  string `BlockDataBeginChunk` and then, per block, `u32 index`,
+  `u32 uncompressed bytes`, `u32 256`, `u32 256`, `u32 present`,
+  `u32 compressed bytes`, four more, and a **plain zlib stream** — `78 01`,
+  nothing exotic. Blocks are 256 × 256, laid out row-major over
+  `ceil(width / 256)` columns, and their channels are **planar**: channel 0 is
+  the first 65536 bytes and is the coverage, which is the only one a tip needs.
+- Round-tripped against all three materials in the sample files: decoded,
+  downscaled and compared with the shipped thumbnail, the mean absolute
+  difference is 0.0000, 0.0229 and 0.0428 on a 0..1 scale — the last two being
+  the resampling, since those two thumbnails are downscales and the first is
+  not.
+
+What stands between that and this importer is not knowledge: it is a second
+SQLite entry point (`umber_core::sqlite` opens files that have a header and
+finds tables through `sqlite_master`, and this has neither), a `flate2`
+dependency `umber-core` does not yet take directly, and fixtures for all of it
+built by hand in the test module. Until that exists the thumbnail is what is
+used, and the loss is reported.
+
+**Effect sources are read for pressure, speed and randomness.** Every setting
 carries a bitmask of which inputs drive it, a floor per input and a control-point
-curve. Bit 4 is pen pressure: it is set on the size effector of every
-pressure-sensitive brush in the samples and nothing else. Bit 7 is the per-dab
-random draw: it is the only bit ever set on the hue, saturation and brightness
-effectors — which is what colour jitter is — and it is set on exactly the brushes
-whose rotation randomness is not left at its default. Bits 5, 6 and 8 are pen
-tilt, pen bearing and stroke speed in an order the files to hand cannot settle,
-so they are named and dropped. Umber *has* a speed input, and wiring tilt into it
-would give a brush behaviour that looked deliberate and was wrong — which is the
-one thing the import rules refuse.
+curve. Clip Studio's Dynamics dialog lists its sources as **Pen pressure, Tilt,
+Velocity, Random**, and the bits are that list from bit 4 up: `0x10`, `0x20`,
+`0x40`, `0x80`. Three things agree. Bit 4 is set on the size effector of every
+pressure-sensitive brush in the samples and nothing else; bit 7 is the only bit
+ever set on the hue, saturation and brightness effectors, which is what colour
+jitter is; and Ken Evans' `CSPBrushInfo`, an independent decoding of these same
+blobs, reads the four the same way. A fifth bit, `0x100`, is declared as
+supported by brush size and its neighbours and is never switched on in either
+sample file; it is named as unrecognised rather than guessed at.
+
+**Velocity is Umber's `Speed` input, and it reaches size and per-dab opacity.**
+The shape is the same in both engines: full at a standstill, falling towards the
+input's floor as the pen moves. So the modulation's `low` is that floor and its
+`high` is the untouched value — for size in log units, because that is how
+`DabTarget::Size` composes, and for opacity as a factor, because that is how
+`DabTarget::Opacity` composes. Velocity on any other setting has nowhere to land
+and is named. The two apps' speed *scales* are not the same number of pixels per
+second, so the mark thins in the right direction over roughly the right stretch
+of hand movement rather than exactly Clip Studio's.
+
+**Pen tilt is dropped, and not for want of knowing which bit it is.** Umber has
+no tilt input on any platform it runs on — winit carries tilt only inside iOS's
+`Force::Calibrated`, and the `WM_POINTER` path a Windows pen arrives through
+does not surface it — so a tilt modulation would be evaluated at a value the pen
+never produces, for ever. That is the "control that lies" the interface rules
+refuse, one level down. It becomes worth building the moment an input source
+exists; see the pressure section of `CLAUDE.md` for what that would take.
+
+**The taper arrives at the start of a stroke and not at its end.** `BrushUseIn`
+with `BrushInLength` is a size ramp over the first stretch of the mark, which is
+exactly `DabInput::Stroke`: `stroke_span` becomes the length in dab radii, so a
+brush scaled up tapers over a proportionally longer mark, and `stroke_hold` goes
+to its ceiling so the ramp never wraps — a taper happens once. `BrushUseOut`
+cannot follow: it is measured back from an end the engine does not know until
+the stroke is over. The floor is `DabTarget::Size`'s own `-2` in log units
+rather than zero, because a log offset cannot state zero; `exp(-2)` is a dab an
+eighth of its width, which reads as a point.
+
+**A sub-tool that is not a brush is skipped without a word.** A `.sutg` is a
+tool group and one holding a fill or a selection tool is the ordinary case, not
+a loss — the same argument the automatic dab interval gets below.
 
 What else carries: hardness, opacity, stabilisation (`FlickerReduction`), the
 dab's flatness (`BrushThickness`, as `1 / thickness`, since `Brush::size` names
