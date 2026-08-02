@@ -37,8 +37,12 @@
 //!
 //! # What is not here
 //!
-//! No flip, no perspective, no free distort, and no numeric entry. Each is a
-//! real feature and none is drawn in the interface.
+//! No perspective, no free distort, and no numeric entry. Each is a real
+//! feature and none is drawn in the interface.
+//!
+//! A **flip** is here, and is nothing more than a negative [`Transform::scale`]
+//! — see [`Transform::MIN_SCALE`] for why that used to be refused and is not
+//! any more.
 
 use crate::geom::{PixelRect, Rect};
 use glam::{Mat2, UVec2, Vec2};
@@ -64,8 +68,10 @@ pub struct Transform {
     source: Rect,
     /// Document pixels the source has been moved by.
     pub offset: Vec2,
-    /// Scale about the pivot, per axis. Negative is not reachable through the
-    /// handles — see [`Transform::MIN_SCALE`].
+    /// Scale about the pivot, per axis. **Negative is a flip**, and is reached
+    /// both by dragging a handle past the side opposite it and by
+    /// [`Transform::flip_x`] / [`Transform::flip_y`] — see
+    /// [`Transform::MIN_SCALE`].
     pub scale: Vec2,
     /// Rotation about the pivot, radians, clockwise on screen (document y is
     /// down).
@@ -86,8 +92,16 @@ pub enum Handle {
     /// component means that axis is not scaled, which is what makes an edge
     /// handle one-dimensional without a second variant.
     Scale { local: (i8, i8) },
-    /// Turn about the centre. Reached just *outside* a corner, which is where
-    /// every application puts it.
+    /// Turn about the centre. Reached **anywhere outside the box** that is not
+    /// on one of its handles.
+    ///
+    /// A ring just outside the four corners was tried first and is what most
+    /// applications draw, but the ring is invisible: nothing marks where it
+    /// begins or ends, so the whole gesture had to be discovered by waving the
+    /// pointer about near a corner. Outside-is-rotate needs no target at all,
+    /// and the only thing it takes away is "click away from the box to put it
+    /// down" — which is the pointer layer's to keep, by telling a click from a
+    /// drag. See `app.rs`.
     Rotate,
 }
 
@@ -118,13 +132,24 @@ impl Handle {
 }
 
 impl Transform {
-    /// The smallest scale a drag can reach, on either axis.
+    /// The smallest scale a drag can reach, on either axis — as a
+    /// **magnitude**. The sign is the drag's.
     ///
-    /// Not zero, and not negative. A zero-scale transform has no inverse, so
-    /// the shader's map would be a division by zero and the destination
-    /// rectangle would be a point; a negative one is a flip, which is a feature
-    /// with its own controls and not something a hand should stumble into by
-    /// dragging a corner past the middle of the box.
+    /// What has to be kept away from is *zero*, and only zero: a zero-scale
+    /// transform has no inverse, so the shader's map would be a division by
+    /// zero and the destination rectangle would collapse to a point.
+    ///
+    /// A negative scale used to be refused here as well, on the grounds that a
+    /// flip is a feature with its own controls rather than something a hand
+    /// should stumble into. That was wrong twice. Dragging the right edge past
+    /// the left is what every other application means by "flip it", so refusing
+    /// it makes the box stick against an invisible wall for no stated reason;
+    /// and there is nothing downstream that a negative scale breaks — the
+    /// matrix stays invertible (the determinant only changes sign), `quad`'s
+    /// corners stay in a cycle because an affine map takes adjacent corners to
+    /// adjacent corners, and the shader reads the inverse map without ever
+    /// asking which way round it is. So the magnitude is clamped and the sign
+    /// follows the hand.
     pub const MIN_SCALE: f32 = 0.01;
 
     /// A transform that has not moved anything yet.
@@ -153,6 +178,11 @@ impl Transform {
     /// What decides whether a gesture is worth committing at all: a click that
     /// picked the tool up and put it down again must not produce an undo entry
     /// naming an edit that changed nothing.
+    ///
+    /// A flip is not the identity even though the box has not moved: `scale` is
+    /// `(-1, 1)` rather than `(1, 1)`, and the pixels inside the box are
+    /// genuinely different ones. Falling out of the comparison is the point —
+    /// nothing here had to learn what a flip is.
     pub fn is_identity(&self) -> bool {
         self.offset == Vec2::ZERO && self.scale == Vec2::ONE && self.angle == 0.0
     }
@@ -190,8 +220,10 @@ impl Transform {
     /// The map the resampler wants: destination document pixels back to where
     /// they came from.
     ///
-    /// `scale` cannot be zero — see [`Transform::MIN_SCALE`] — so the matrix is
-    /// always invertible.
+    /// Neither component of `scale` can be zero — see
+    /// [`Transform::MIN_SCALE`] — so the matrix is always invertible. A flip
+    /// makes the determinant negative and leaves it invertible, which is why
+    /// nothing here has to know about one.
     pub fn inverse(&self) -> Affine {
         self.matrix().inverse()
     }
@@ -199,7 +231,10 @@ impl Transform {
     /// The four corners of the transformed source, clockwise from top-left.
     ///
     /// The order matters to the caller that draws the box: consecutive corners
-    /// have to share an edge, or the outline is a bow tie.
+    /// have to share an edge, or the outline is a bow tie. It survives a flip
+    /// without a special case, because an affine map takes adjacent corners to
+    /// adjacent corners — a negative scale reverses the winding and leaves the
+    /// cycle intact. `a_flipped_boxs_outline_is_not_a_bow_tie` pins it.
     pub fn quad(&self) -> [Vec2; 4] {
         let m = self.matrix();
         let (a, b) = (self.source.min, self.source.max);
@@ -221,33 +256,34 @@ impl Transform {
         self.matrix().apply(self.pivot() + local * self.half())
     }
 
-    /// Which handle a document-space point is grabbing, or `None` for a point
-    /// that has hold of nothing.
+    /// Which handle a document-space point is grabbing.
     ///
     /// `tolerance` is a screen distance divided by the zoom, exactly as the
     /// polygon lasso's close distance is: a fixed document distance would be
     /// impossible to hit at 10% and impossible to avoid at 800%.
     ///
     /// The order is the rule. A corner beats an edge (see [`Handle::BOX`]), a
-    /// handle beats the rotation ring around it, and the interior — tested by
-    /// the *quad*, not by its bounding box — is a move. Anything else is
-    /// outside the transform altogether, which is what lets a click there mean
-    /// "put this down".
-    pub fn grab(&self, point: Vec2, tolerance: f32) -> Option<Handle> {
+    /// handle beats the rotation around it, and the interior — tested by the
+    /// *quad*, not by its bounding box — is a move. **Everything else is a
+    /// rotation**, however far from the box it is.
+    ///
+    /// There is therefore no "hold of nothing" any more, which used to be how a
+    /// click away from the box said "put this down". That reading now belongs
+    /// to the pointer layer, where it can be told apart from the start of a
+    /// rotation by whether the pointer travels — a distinction this function
+    /// cannot make from one position, and one that has nothing to do with
+    /// geometry. See `app.rs`.
+    pub fn grab(&self, point: Vec2, tolerance: f32) -> Handle {
         for handle in Handle::BOX {
             if self.handle_at(handle).distance(point) <= tolerance {
-                return Some(handle);
+                return handle;
             }
         }
-        // Just outside a *corner* only. The rotation ring is not offered along
-        // an edge, where it would sit between two scale handles and be grabbed
-        // by anyone aiming at either.
-        for handle in Handle::BOX.iter().take(4) {
-            if self.handle_at(*handle).distance(point) <= tolerance * 2.5 {
-                return Some(Handle::Rotate);
-            }
+        if self.contains(point) {
+            Handle::Move
+        } else {
+            Handle::Rotate
         }
-        self.contains(point).then_some(Handle::Move)
     }
 
     /// Is this document point inside the transformed box?
@@ -321,17 +357,24 @@ impl Transform {
 
         let mut scale = self.scale;
         if local.x != 0.0 {
-            scale.x = wanted.x.max(Self::MIN_SCALE);
+            scale.x = Self::away_from_zero(wanted.x);
         }
         if local.y != 0.0 {
-            scale.y = wanted.y.max(Self::MIN_SCALE);
+            scale.y = Self::away_from_zero(wanted.y);
         }
         if uniform && local.x != 0.0 && local.y != 0.0 {
             // The larger of the two, so the box follows the hand rather than
             // shrinking away from it: a drag that asks for 2× on one axis and
             // 1.5× on the other wanted a bigger box.
-            let s = scale.x.max(scale.y);
-            scale = Vec2::splat(s);
+            //
+            // *Magnitudes*, and each axis keeps its own sign. A plain `max`
+            // was right only while both were positive: dragging a corner
+            // through the anchor makes one negative, and `max` would then
+            // always pick the axis that had not flipped and hand its sign to
+            // both — so a Shift-drag past the corner either refused to flip or
+            // flipped the axis that was not dragged that far.
+            let s = scale.x.abs().max(scale.y.abs());
+            scale = Vec2::new(s.copysign(scale.x), s.copysign(scale.y));
         }
         self.scale = scale;
 
@@ -342,6 +385,38 @@ impl Transform {
             - self.handle_at(Handle::Scale {
                 local: (-local.x as i8, -local.y as i8),
             });
+    }
+
+    /// `v`, pushed out to [`Self::MIN_SCALE`] if it is nearer zero than that,
+    /// **keeping its sign**.
+    ///
+    /// Zero itself goes positive. It is the boundary rather than a direction,
+    /// and a drag that lands exactly on the anchor has not said which side of
+    /// it the hand is going.
+    fn away_from_zero(v: f32) -> f32 {
+        if v.abs() >= Self::MIN_SCALE {
+            v
+        } else if v < 0.0 {
+            -Self::MIN_SCALE
+        } else {
+            Self::MIN_SCALE
+        }
+    }
+
+    /// Mirror the floating pixels left to right, about the box's own centre.
+    ///
+    /// The box does not move: the source rectangle is symmetric about the
+    /// pivot, so negating the x scale reflects the four corners onto each other
+    /// and leaves the region they enclose exactly where it was. Only what is
+    /// inside it turns round — which is the whole of what a flip is, and is why
+    /// this needs no compensating offset the way a scale does.
+    pub fn flip_x(&mut self) {
+        self.scale.x = -self.scale.x;
+    }
+
+    /// Mirror the floating pixels top to bottom. See [`Self::flip_x`].
+    pub fn flip_y(&mut self) {
+        self.scale.y = -self.scale.y;
     }
 
     /// The pixels of the canvas the transformed source can reach.
@@ -561,22 +636,159 @@ mod tests {
         );
     }
 
-    /// A corner dragged past the anchor must not flip the picture inside out,
-    /// and must never reach a scale of zero — the inverse map would be a
-    /// division by zero and the destination rectangle a point.
+    /// A corner dragged past the anchor flips the picture, and the scale never
+    /// reaches zero on the way through — the inverse map would be a division by
+    /// zero and the destination rectangle a point.
     #[test]
-    fn a_corner_dragged_through_the_anchor_stops_rather_than_flipping() {
+    fn a_corner_dragged_through_the_anchor_flips_rather_than_stopping() {
         let mut t = Transform::identity(source());
         let corner = Handle::Scale { local: (1, 1) };
         t.drag(corner, t.handle_at(corner), vec2(-100.0, -100.0), false);
-        assert!(t.scale.x >= Transform::MIN_SCALE, "{:?}", t.scale);
-        assert!(t.scale.y >= Transform::MIN_SCALE, "{:?}", t.scale);
+        assert!(t.scale.x < 0.0, "did not flip in x: {:?}", t.scale);
+        assert!(t.scale.y < 0.0, "did not flip in y: {:?}", t.scale);
+        assert!(t.scale.x.abs() >= Transform::MIN_SCALE, "{:?}", t.scale);
+        assert!(t.scale.y.abs() >= Transform::MIN_SCALE, "{:?}", t.scale);
         // Still invertible, which is the point.
         near(
             t.inverse().apply(t.matrix().apply(Vec2::ZERO)),
             Vec2::ZERO,
             "invertible",
         );
+        // And the handle still followed the hand, flip or no flip.
+        near(t.handle_at(corner), vec2(-100.0, -100.0), "the handle");
+    }
+
+    /// Dragging the right edge past the left flips, and the *left* edge — the
+    /// anchor — stays exactly where it was on the way through. A box that
+    /// slides sideways as it passes through zero is one nobody can aim.
+    #[test]
+    fn dragging_an_edge_past_the_opposite_one_flips_about_it() {
+        let right = Handle::Scale { local: (1, 0) };
+        let left = Handle::Scale { local: (-1, 0) };
+        let start = Transform::identity(source());
+        let anchor = start.handle_at(left);
+        let grabbed = start.handle_at(right);
+
+        // Through zero and out the far side, one absolute drag at a time.
+        for x in [25.0_f32, 10.0, 5.0, 0.0, -6.0, -20.0] {
+            let mut t = start;
+            t.drag(right, grabbed, vec2(x, grabbed.y), false);
+            near(t.handle_at(left), anchor, "the anchor moved");
+            assert!(
+                t.scale.y > 0.0 && (t.scale.y - 1.0).abs() < 1e-5,
+                "y followed x: {:?}",
+                t.scale
+            );
+            assert!(t.scale.x.abs() >= Transform::MIN_SCALE, "{:?}", t.scale);
+            let flipped = x < anchor.x;
+            assert_eq!(
+                t.scale.x < 0.0,
+                flipped,
+                "sign at x={x}: scale {:?}",
+                t.scale
+            );
+        }
+    }
+
+    /// A flip mirrors the pixels and leaves the box exactly where it is: the
+    /// four corners come back as the same four points, and the centre does not
+    /// move. Flipping twice is the identity.
+    #[test]
+    fn a_flip_mirrors_the_pixels_and_leaves_the_box_where_it_is() {
+        let mut t = Transform::identity(source());
+        t.offset = vec2(6.0, -2.0);
+        let before = t.quad();
+        let centre = t.pivot() + t.offset;
+
+        for flip in [Transform::flip_x as fn(&mut Transform), Transform::flip_y] {
+            let mut f = t;
+            flip(&mut f);
+            assert!(!f.is_identity(), "a flip is a change");
+            // The same four corners, in some order — the box is unmoved and
+            // only what is inside it is turned round.
+            for corner in f.quad() {
+                assert!(
+                    before.iter().any(|b| b.distance(corner) < 1e-3),
+                    "corner {corner:?} is not one of {before:?}"
+                );
+            }
+            let mid = f.quad().iter().fold(Vec2::ZERO, |a, b| a + *b) * 0.25;
+            near(mid, centre, "the pivot moved");
+
+            // And back again.
+            flip(&mut f);
+            assert_eq!(f.scale, t.scale, "flipping twice is not the identity");
+            assert_eq!(f.offset, t.offset);
+            for (a, b) in before.iter().zip(f.quad()) {
+                near(b, *a, "corner after flipping back");
+            }
+        }
+    }
+
+    /// Consecutive corners have to share an edge whatever the sign of the
+    /// scale, or the outline the interface draws is a bow tie.
+    #[test]
+    fn a_flipped_boxs_outline_is_not_a_bow_tie() {
+        let mut t = Transform::identity(source());
+        t.angle = 0.6;
+        for scale in [vec2(-1.5, 1.0), vec2(1.0, -0.8), vec2(-2.0, -0.5)] {
+            t.scale = scale;
+            let q = t.quad();
+            // Opposite sides of a parallelogram: 0→1 is the reverse of 2→3,
+            // and 1→2 the reverse of 3→0. A bow tie fails both.
+            near(q[1] - q[0], q[2] - q[3], "top and bottom edges");
+            near(q[2] - q[1], q[3] - q[0], "left and right edges");
+            // And the diagonals cross, which they cannot in a bow tie: the
+            // midpoints of both are the centre.
+            near((q[0] + q[2]) * 0.5, (q[1] + q[3]) * 0.5, "diagonals");
+        }
+    }
+
+    /// A Shift-drag past the corner flips both axes together rather than
+    /// letting the axis that did not flip hand its sign to the one that did.
+    #[test]
+    fn a_uniform_drag_through_the_corner_flips_both_axes() {
+        let mut t = Transform::identity(source());
+        let corner = Handle::Scale { local: (1, 1) };
+        let anchor = t.handle_at(Handle::Scale { local: (-1, -1) });
+        t.drag(corner, t.handle_at(corner), vec2(-40.0, -30.0), true);
+        assert!(t.scale.x < 0.0 && t.scale.y < 0.0, "{:?}", t.scale);
+        assert!((t.scale.x - t.scale.y).abs() < 1e-5, "{:?}", t.scale);
+        near(
+            t.handle_at(Handle::Scale { local: (-1, -1) }),
+            anchor,
+            "the anchor moved",
+        );
+    }
+
+    /// A flipped transform still maps both ways exactly. The determinant
+    /// changes sign and the matrix stays invertible, which is the whole reason
+    /// nothing downstream of here needed a special case.
+    #[test]
+    fn a_flipped_transform_and_its_inverse_are_still_exact_opposites() {
+        let mut t = Transform::identity(source());
+        t.scale = vec2(-1.75, 0.6);
+        t.angle = -0.4;
+        t.offset = vec2(3.0, 9.0);
+        let (f, g) = (t.matrix(), t.inverse());
+        for p in [vec2(0.0, 0.0), vec2(30.0, 30.0), vec2(-5.0, 63.0)] {
+            near(g.apply(f.apply(p)), p, "round trip");
+            near(f.apply(g.apply(p)), p, "round trip the other way");
+        }
+        // The destination is the bounding box of the quad, and a flip's quad is
+        // the same four points the unflipped one had — so the rectangle still
+        // covers every corner, with no branch anywhere for the sign.
+        let rect = t.dest_rect(DOC).expect("on the canvas");
+        for corner in t.quad() {
+            assert!(
+                corner.x >= rect.x as f32
+                    && corner.x <= (rect.x + rect.width) as f32
+                    && corner.y >= rect.y as f32
+                    && corner.y <= (rect.y + rect.height) as f32,
+                "corner {corner:?} outside {rect:?}"
+            );
+        }
+        assert!(t.damage(DOC, true).is_some());
     }
 
     /// Rotation turns about the centre the box has *now*, so a box that has
@@ -705,11 +917,11 @@ mod tests {
         );
     }
 
-    /// A corner beats the edge handle beside it, the rotation ring is only
-    /// outside a corner, and a point that has hold of nothing says so — that
-    /// last one is what lets a click away from the box mean "put it down".
+    /// A corner beats the edge handle beside it, the interior is a move, and
+    /// **everywhere else is a rotation** — beside a corner, beside an edge, and
+    /// right across the canvas alike.
     #[test]
-    fn a_corner_wins_over_the_edge_and_the_ring_sits_outside_it() {
+    fn a_corner_wins_over_the_edge_and_everywhere_outside_turns_the_box() {
         let t = Transform::identity(PixelRect {
             x: 20,
             y: 20,
@@ -719,15 +931,41 @@ mod tests {
         let tol = 3.0;
         assert_eq!(
             t.grab(vec2(20.0, 20.0), tol),
-            Some(Handle::Scale { local: (-1, -1) })
+            Handle::Scale { local: (-1, -1) }
         );
         assert_eq!(
             t.grab(vec2(30.0, 20.0), tol),
-            Some(Handle::Scale { local: (0, -1) })
+            Handle::Scale { local: (0, -1) }
         );
-        assert_eq!(t.grab(vec2(15.0, 15.0), tol), Some(Handle::Rotate));
-        assert_eq!(t.grab(vec2(30.0, 30.0), tol), Some(Handle::Move));
-        assert_eq!(t.grab(vec2(0.0, 0.0), tol), None);
+        assert_eq!(t.grab(vec2(30.0, 30.0), tol), Handle::Move);
+        // Just outside a corner, just outside an edge, and far away: all the
+        // same gesture. The last one used to be `None`, which is what "click
+        // away from the box to put it down" was built on — see `Handle::Rotate`
+        // for where that reading went.
+        for outside in [
+            vec2(15.0, 15.0),
+            vec2(30.0, 14.0),
+            vec2(0.0, 0.0),
+            vec2(500.0, 500.0),
+        ] {
+            assert_eq!(t.grab(outside, tol), Handle::Rotate, "at {outside:?}");
+        }
+    }
+
+    /// A rotation is offered outside the *quad*, not outside its bounding box.
+    /// The corner of a turned box's bounding rectangle is outside the picture,
+    /// so a press there turns it rather than moving it.
+    #[test]
+    fn the_turned_corner_of_a_bounding_box_turns_rather_than_moves() {
+        let mut t = Transform::identity(PixelRect {
+            x: 20,
+            y: 20,
+            width: 20,
+            height: 20,
+        });
+        t.angle = std::f32::consts::FRAC_PI_4;
+        assert_eq!(t.grab(vec2(30.0, 30.0), 3.0), Handle::Move);
+        assert_eq!(t.grab(vec2(17.0, 17.0), 3.0), Handle::Rotate);
     }
 
     /// Coming back to where the drag began comes back to the transform it

@@ -300,6 +300,16 @@ pub struct Editor {
     /// `ui::draw`, and an array rather than a `Vec` because it is written on the
     /// drawing path.
     pub scroll_bars: [Option<egui::Rect>; 2],
+    /// The floating transform's two flip buttons as they were last drawn, in
+    /// points: horizontal then vertical, `None` when no transform is up.
+    ///
+    /// Recorded for exactly the reason [`Editor::scroll_bars`] is, and it is
+    /// the same problem: these are real buttons painted *inside* the canvas
+    /// region in egui's background layer, so without this a press on one would
+    /// also be a press on the canvas — which with the transform tool in hand
+    /// means putting the picture down, immediately, before the flip could take
+    /// effect.
+    pub transform_buttons: [Option<egui::Rect>; 2],
     /// egui points per physical pixel, from the last frame. Window events
     /// arrive in physical pixels and the layout works in points, so hit-testing
     /// a cursor position against a floating panel needs the conversion.
@@ -430,6 +440,7 @@ impl Default for Editor {
             canvas_pivot: Vec2::ZERO,
             canvas_size: Vec2::ONE,
             scroll_bars: [None, None],
+            transform_buttons: [None, None],
             pixels_per_point: 1.0,
             selection: None,
             stroke: StrokeBuilder::new(),
@@ -515,13 +526,15 @@ impl Editor {
         self.layout.blocks_canvas(self.to_points(screen))
     }
 
-    /// True when `screen` (physical pixels) is over one of the canvas
-    /// scrollbars, which sit inside the canvas region and are therefore not
-    /// covered by [`Editor::layout_owns_pointer`].
-    pub fn scrollbar_owns_pointer(&self, screen: Vec2) -> bool {
+    /// True when `screen` (physical pixels) is over one of the controls that
+    /// sit *inside* the canvas region — the scrollbars and the floating
+    /// transform's flip buttons — and are therefore not covered by
+    /// [`Editor::layout_owns_pointer`].
+    pub fn canvas_overlay_owns_pointer(&self, screen: Vec2) -> bool {
         let at = self.to_points(screen);
         self.scroll_bars
             .iter()
+            .chain(self.transform_buttons.iter())
             .flatten()
             .any(|bar| bar.contains(at))
     }
@@ -550,7 +563,7 @@ impl Editor {
         let max = self.canvas_pivot + half;
         let inside =
             screen.x >= min.x && screen.x <= max.x && screen.y >= min.y && screen.y <= max.y;
-        inside && !self.layout_owns_pointer(screen) && !self.scrollbar_owns_pointer(screen)
+        inside && !self.layout_owns_pointer(screen) && !self.canvas_overlay_owns_pointer(screen)
     }
 
     /// Select a tool, keeping the brush's paint/erase mode in step.
@@ -999,14 +1012,20 @@ impl Editor {
     }
 
     /// A press on the canvas with the transform tool in hand, in document
-    /// space. Returns what it took hold of, if anything.
+    /// space. Returns what it took hold of, or `None` if there is no float.
     ///
     /// Only ever called with a float already up: picking one up needs the GPU,
     /// so `app.rs` does that first.
+    ///
+    /// **A press always takes hold of something now.** `Transform::grab` reads
+    /// everywhere outside the box as a rotation, so the `None` that used to
+    /// mean "put it down" is gone from here; deciding whether an outside press
+    /// was a click or the start of a turn is `app.rs`'s, because it is a
+    /// question about travel rather than about geometry.
     pub fn transform_press(&mut self, doc: Vec2) -> Option<Handle> {
         let tolerance = self.handle_tolerance();
         let float = self.float.as_mut()?;
-        let handle = float.xf.grab(doc, tolerance)?;
+        let handle = float.xf.grab(doc, tolerance);
         float.drag = Some((handle, doc));
         Some(handle)
     }

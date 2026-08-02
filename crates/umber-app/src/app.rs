@@ -183,7 +183,31 @@ pub struct UmberApp {
     /// the control flow needs the [`ActiveEventLoop`], which only the handler
     /// methods are given.
     repaint_at: Option<std::time::Instant>,
+    /// Where a press landed that was *outside* the floating transform's box, in
+    /// physical window pixels — for as long as it might still turn out to have
+    /// been a click rather than a rotation.
+    ///
+    /// `Transform::grab` answers `Handle::Rotate` everywhere outside the box, so
+    /// the geometry can no longer say which of the two an outside press is; only
+    /// what the pointer does next can. Cleared the moment it travels past
+    /// [`PUT_DOWN_SLOP`], and until then no rotation is applied at all — a
+    /// release that puts the picture down must not first have nudged it a
+    /// degree.
+    ///
+    /// Here rather than on `Floating` because it is the *pointer's* state, in
+    /// physical pixels, and the same distinction the editor draws between a
+    /// gesture and a document. Nothing about it survives the release.
+    put_down_at: Option<Vec2>,
 }
+
+/// How far the pointer may travel from a press outside the transform box before
+/// that press stops being "put it down" and becomes a rotation, in physical
+/// window pixels.
+///
+/// Physical rather than points, and small: it is the hand's wobble on a click,
+/// not a deliberate movement. Anything much larger and a short deliberate turn
+/// would commit instead of turning.
+const PUT_DOWN_SLOP: f32 = 4.0;
 
 impl UmberApp {
     /// Build the application around an event loop it can wake.
@@ -213,6 +237,7 @@ impl UmberApp {
             applied_theme: None,
             bindings: shortcuts::defaults(),
             repaint_at: None,
+            put_down_at: None,
         }
     }
 
@@ -522,13 +547,22 @@ impl UmberApp {
     ///
     /// With no float up, a press inside the region picks it up and the same
     /// press starts dragging it — one gesture, as it would be with any other
-    /// tool. With one up, a press that has hold of nothing puts the pixels
-    /// down; the next press picks up again.
+    /// tool. With one up, a *click* outside the box puts the pixels down; the
+    /// next press picks up again.
+    ///
+    /// "Outside the box" is also where a rotation is grabbed, and the two are
+    /// the same press. Which it was is settled at the release, by whether the
+    /// pointer travelled — see [`PUT_DOWN_SLOP`]. That is why this cannot be
+    /// decided in `umber-core`: `Transform::grab` sees one position, and the
+    /// difference between a click and a drag is not in it.
     fn transform_press(&mut self, screen: Vec2) {
         let doc = self.editor.screen_to_doc(screen);
+        self.put_down_at = None;
         if self.editor.float.is_some() {
-            if self.editor.transform_press(doc).is_none() {
-                self.finish_transform();
+            // `Handle::Rotate` is returned for outside the quad and nowhere
+            // else, so this needs no second geometry test of its own.
+            if self.editor.transform_press(doc) == Some(umber_core::Handle::Rotate) {
+                self.put_down_at = Some(screen);
             }
             return;
         }
@@ -551,6 +585,9 @@ impl UmberApp {
     /// until this moment, so reading it now yields the pre-transform pixels —
     /// and only now is the damaged rectangle known.
     fn finish_transform(&mut self) {
+        // Whatever route got here — Enter, a tab switch, a save — there is no
+        // box left for a pending put-down to be outside of.
+        self.put_down_at = None;
         let Some(float) = self.editor.float.take() else {
             return;
         };
@@ -606,9 +643,41 @@ impl UmberApp {
         self.editor.mark_modified();
     }
 
+    /// The pointer moved with a transform handle held, in physical pixels.
+    ///
+    /// The half of the click-or-rotation question that watches the travel. A
+    /// press outside the box turns nothing at all until it has moved past
+    /// [`PUT_DOWN_SLOP`]; once it has, the drag is applied from the point it was
+    /// grabbed at — `Transform::drag` is absolute against that point, so no part
+    /// of the rotation is lost by having waited.
+    fn transform_moved(&mut self, screen: Vec2, uniform: bool) -> bool {
+        if let Some(from) = self.put_down_at {
+            if from.distance(screen) <= PUT_DOWN_SLOP {
+                return false;
+            }
+            self.put_down_at = None;
+        }
+        let doc = self.editor.screen_to_doc(screen);
+        self.editor.transform_moved(doc, uniform)
+    }
+
+    /// A transform handle let go of.
+    ///
+    /// The float itself stays up — the box is still there to be dragged again —
+    /// unless the gesture turned out to be a click outside it, which is the one
+    /// reading that puts the pixels down.
+    fn transform_release(&mut self) {
+        let put_down = self.put_down_at.take().is_some();
+        self.editor.transform_release();
+        if put_down {
+            self.finish_transform();
+        }
+    }
+
     /// Abandon a floating transform. The layer was never written to, so this is
     /// only giving the storage back.
     fn cancel_transform(&mut self) -> bool {
+        self.put_down_at = None;
         if self.editor.float.take().is_none() {
             return false;
         }
@@ -2340,9 +2409,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                             // needs Alt with nothing pressed. Shift constrains a
                             // corner to one scale on both axes, as it does
                             // everywhere else.
-                            let doc = self.editor.screen_to_doc(pos);
-                            dragging_float =
-                                self.editor.transform_moved(doc, self.modifiers.shift_key());
+                            dragging_float = self.transform_moved(pos, self.modifiers.shift_key());
                         }
                     }
                 }
@@ -2406,10 +2473,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                             }
                         }
                     } else if !pressed {
-                        // A handle let go of. The float itself stays up — the
-                        // box is still there to be dragged again — so this ends
-                        // the drag and not the transform.
-                        self.editor.transform_release();
+                        // A handle let go of. This ends the drag and not the
+                        // transform — unless it was a click outside the box,
+                        // which `Self::transform_release` is what knows.
+                        self.transform_release();
                         match self.editor.interaction {
                             Interaction::Drawing => self.finish_stroke(),
                             // The polygon is the one gesture a release does not
@@ -2515,6 +2582,12 @@ impl ApplicationHandler<Wake> for UmberApp {
                             // opposite of what they asked for.
                             self.cancel_stroke();
                             self.editor.cancel_selection_draft();
+                            // `Editor::transform_release` rather than this
+                            // type's: a second finger landing must drop the
+                            // drag *and* the pending "put it down", not carry
+                            // it out. Nobody pinching to look closer meant to
+                            // commit.
+                            self.put_down_at = None;
                             self.editor.transform_release();
                             self.editor.drawing_touch = None;
                             self.update_pinch();
@@ -2614,11 +2687,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                                     self.editor.selection_moved(doc);
                                 }
                                 Tool::Transform => {
-                                    let doc = self.editor.screen_to_doc(pos);
                                     // No Shift to hold on a touch screen, so a
                                     // corner drag is always free there. The
                                     // mouse keeps the constraint.
-                                    self.editor.transform_moved(doc, false);
+                                    self.transform_moved(pos, false);
                                 }
                                 Tool::Pan | Tool::Zoom => {}
                             }
@@ -2637,8 +2709,9 @@ impl ApplicationHandler<Wake> for UmberApp {
                                 }
                                 // The float stays up, exactly as it does when a
                                 // mouse button comes up: the box is still there
-                                // to be dragged again.
-                                Tool::Transform => self.editor.transform_release(),
+                                // to be dragged again — unless the tap was a
+                                // click outside it, which puts it down.
+                                Tool::Transform => self.transform_release(),
                                 Tool::Pan | Tool::Zoom => {}
                             }
                             self.editor.drawing_touch = None;

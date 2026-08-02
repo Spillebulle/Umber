@@ -390,20 +390,39 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     }
 }
 
-/// The box round a floating transform, and the handles that act on it.
+/// How far outside the box's right-hand edge the rotation mark sits, in points:
+/// where the dotted leader starts, and where the icon's near edge begins.
+///
+/// Clear of the edge handle's own 4-point disc and of the tolerance a press is
+/// tested against, so the mark never sits on top of a handle it is not.
+const ROTATE_LEADER: (f32, f32) = (9.0, 20.0);
+
+/// Side of the rotation mark, in points. The same 18 the interface's other bare
+/// icons are drawn at.
+const ROTATE_MARK: f32 = 18.0;
+
+/// Side of a flip button, and the gap between the pair and the top of the box.
+const FLIP_BUTTON: f32 = 22.0;
+const FLIP_GAP: f32 = 12.0;
+
+/// The box round a floating transform, and the controls that act on it.
 ///
 /// Every one of these handles does something: the four corners scale both axes,
-/// the four edges scale one, and the ring just outside a corner turns the box.
+/// the four edges scale one, and anywhere outside turns the box.
 /// `Transform::grab` is what decides which, so what is drawn here and what the
-/// pointer takes hold of are the same eight positions read out of the same
-/// function — a handle that was painted somewhere the hit test did not agree
-/// with would be the worst kind of control that lies.
+/// pointer takes hold of are the same positions read out of the same function —
+/// a handle painted somewhere the hit test did not agree with would be the
+/// worst kind of control that lies. The rotation mark holds to the same rule:
+/// it is not a button, it is a *label* for the gesture, and it is placed off
+/// `handle_at`'s own answers so it cannot end up somewhere a press would mean
+/// something else.
 ///
 /// A solid line, not the selection's dashes. The two are often on screen
 /// together and they mean different things: the dashes are where an edit may
 /// land, and this is a picture that has not been put down yet.
-fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &Editor, rect: Rect) {
-    let Some(float) = ed.float.as_ref() else {
+fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
+    ed.transform_buttons = [None, None];
+    let Some(float) = ed.float else {
         return;
     };
 
@@ -434,6 +453,151 @@ fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &Editor, rect: Rect) {
         let at = to_screen(float.xf.handle_at(handle));
         painter.circle_filled(at, 4.0, p.backdrop);
         painter.circle_filled(at, 3.0, p.accent);
+    }
+
+    rotate_mark(&painter, p, &float.xf, &to_screen);
+    flip_buttons(ui, p, ed, rect, &corners);
+}
+
+/// The rotation affordance: a small mark just outside the box's right-hand
+/// edge, joined to it by a dotted leader.
+///
+/// Instructive rather than interactive, and it has to be — `Handle::Rotate` is
+/// reached by pressing *anywhere* outside the box, so a button here would only
+/// be a smaller version of a target that is already the whole canvas. What the
+/// mark buys is that the gesture is discoverable at all, which is exactly what
+/// the ring-outside-a-corner it replaced never was.
+///
+/// Its position comes out of `handle_at`, not out of the screen rectangle the
+/// box happens to occupy: the outward direction is the box's own local +x,
+/// which is the middle-right handle minus the middle-left one. So it turns with
+/// the box, and it swaps sides when the picture is flipped — which is right,
+/// because it marks the box's right-hand side rather than the screen's.
+fn rotate_mark(
+    painter: &egui::Painter,
+    p: &Palette,
+    xf: &umber_core::Transform,
+    to_screen: &impl Fn(glam::Vec2) -> egui::Pos2,
+) {
+    use umber_core::Handle::Scale;
+    let edge = to_screen(xf.handle_at(Scale { local: (1, 0) }));
+    let inward = to_screen(xf.handle_at(Scale { local: (-1, 0) }));
+    let away = edge - inward;
+    // A box scaled to nothing on this axis has no outward direction to speak
+    // of. Nothing is drawn rather than something placed by a normalised zero.
+    if away.length_sq() < 1.0 {
+        return;
+    }
+    let away = away.normalized();
+
+    let (from, to) = ROTATE_LEADER;
+    painter.extend(egui::Shape::dotted_line(
+        &[edge + away * from, edge + away * to],
+        p.accent,
+        3.0,
+        0.8,
+    ));
+    let centre = edge + away * (to + ROTATE_MARK * 0.5);
+    let at = Rect::from_center_size(centre, vec2(ROTATE_MARK, ROTATE_MARK));
+    // Dark under light, as the box's own outline is: the mark lies over the
+    // artwork and neither colour can be assumed to read against it.
+    icons::draw(painter, at.expand(1.0), Icon::Rotate, p.backdrop);
+    icons::draw(painter, at, Icon::Rotate, p.accent);
+}
+
+/// The two flip buttons, above the box.
+///
+/// Real buttons, unlike the rotation mark: negating a scale is not a drag and
+/// there is no gesture for it to label. They therefore sit *over the canvas*
+/// where a press would otherwise start something, so their rectangles go into
+/// `Editor::transform_buttons` — the same answer `Editor::scroll_bars` is to
+/// the same problem, and for the same reason: these are painted into egui's
+/// background layer inside the canvas region, where neither `pointer_over_
+/// canvas` nor `app.rs`'s `layer_id_at` check would otherwise see them.
+///
+/// Placed above the box's screen bounding rectangle rather than on its top
+/// edge. They are buttons, so their hit rectangles are axis-aligned whatever
+/// the box is doing; a pair that turned with the box would have targets that
+/// disagreed with the marks drawn in them.
+fn flip_buttons(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    rect: Rect,
+    corners: &[egui::Pos2],
+) {
+    let bounds = Rect::from_points(corners);
+    let gap = 4.0;
+    let width = FLIP_BUTTON * 2.0 + gap;
+    let top = bounds.top() - FLIP_GAP - FLIP_BUTTON;
+    let strip = Rect::from_min_size(
+        pos2(bounds.center().x - width * 0.5, top),
+        vec2(width, FLIP_BUTTON),
+    );
+    // A box dragged up under the strips takes its buttons off the top of the
+    // canvas region with it. Drawing them clipped would leave live targets
+    // nobody can see, so they are simply not offered — the box can be dragged
+    // back down, and Enter still puts it down from anywhere.
+    if !rect.contains_rect(strip) {
+        return;
+    }
+
+    for (i, (icon, tip, flip)) in [
+        (
+            Icon::FlipHorizontal,
+            "Mirror the floating picture left to right",
+            true,
+        ),
+        (
+            Icon::FlipVertical,
+            "Mirror the floating picture top to bottom",
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = Rect::from_min_size(
+            pos2(strip.left() + i as f32 * (FLIP_BUTTON + gap), strip.top()),
+            egui::Vec2::splat(FLIP_BUTTON),
+        );
+        ed.transform_buttons[i] = Some(at);
+        let response = ui.interact(at, ui.id().with(("float-flip", i)), Sense::click());
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(
+            at,
+            metrics::RADIUS,
+            if response.hovered() {
+                p.control_hover
+            } else {
+                p.control
+            },
+        );
+        painter.rect_stroke(
+            at,
+            metrics::RADIUS,
+            Stroke::new(1.0, p.border),
+            egui::StrokeKind::Inside,
+        );
+        icons::draw(
+            &painter,
+            at.shrink(3.0),
+            icon,
+            if response.hovered() {
+                p.text_strong
+            } else {
+                p.text
+            },
+        );
+        if response.on_hover_text(tip).clicked()
+            && let Some(float) = ed.float.as_mut()
+        {
+            if flip {
+                float.xf.flip_x();
+            } else {
+                float.xf.flip_y();
+            }
+        }
     }
 }
 
@@ -870,11 +1034,15 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // than a row of controls: there is nothing here to set — the whole
             // gesture is the pointer's.
             let hint = if ed.float.is_some() {
-                "Drag inside the box to move it, a handle to scale, or just                  outside a corner to turn it. Shift keeps the proportions.                  Enter puts it down, Escape throws the move away."
+                "Drag inside the box to move it, a handle to scale, or \
+                 anywhere outside to turn it. Shift keeps the proportions. \
+                 Enter or a click outside puts it down, Escape throws the \
+                 move away."
             } else if ed.selection.is_some() {
                 "Press inside the selection to pick it up."
             } else {
-                "Press on the canvas to pick the whole layer up. Select                  something first to move only part of it."
+                "Press on the canvas to pick the whole layer up. Select \
+                 something first to move only part of it."
             };
             ui.label(
                 egui::RichText::new(hint)

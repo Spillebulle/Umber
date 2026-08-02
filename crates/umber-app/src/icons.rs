@@ -30,6 +30,13 @@ pub enum Icon {
     Transform,
     Pan,
     Zoom,
+    // The transform tool's own marks, drawn over the canvas beside the box.
+    /// An arrow curving round: drag outside the box to turn it.
+    Rotate,
+    /// Two shapes either side of a dashed axis, mirrored left to right.
+    FlipHorizontal,
+    /// The same, mirrored top to bottom.
+    FlipVertical,
     // Layers
     Plus,
     Trash,
@@ -143,6 +150,66 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
         Icon::Zoom => {
             painter.circle_stroke(at(10.0, 10.0), 5.5 * scale, stroke);
             line(at(14.2, 14.2), at(20.0, 20.0));
+        }
+
+        Icon::Rotate => {
+            // Most of a circle with a head on one end, the gap at the top.
+            // Deliberately not the pair of opposed arrows the same idea is
+            // often drawn with: at 16 px that reads as "swap these two".
+            const STEPS: usize = 20;
+            const R: f32 = 7.0;
+            let a0 = (-60.0_f32).to_radians();
+            let a1 = 240.0_f32.to_radians();
+            let mut pts = Vec::with_capacity(STEPS + 1);
+            for k in 0..=STEPS {
+                let a = a0 + (a1 - a0) * k as f32 / STEPS as f32;
+                let (s, c) = a.sin_cos();
+                pts.push(at(12.0 + c * R, 12.0 + s * R));
+            }
+            path(pts);
+            // The head sits on the *tangent* at the open end, which is what
+            // makes the ring read as travelling rather than as a circle
+            // somebody left unclosed.
+            let (s, c) = a1.sin_cos();
+            let tip = (12.0 + c * R, 12.0 + s * R);
+            let dir = (-s, c);
+            for turn in [140.0_f32, -140.0] {
+                let (ts, tc) = turn.to_radians().sin_cos();
+                let barb = (dir.0 * tc - dir.1 * ts, dir.0 * ts + dir.1 * tc);
+                line(
+                    at(tip.0, tip.1),
+                    at(tip.0 + barb.0 * 5.0, tip.1 + barb.1 * 5.0),
+                );
+            }
+        }
+
+        Icon::FlipHorizontal | Icon::FlipVertical => {
+            // Two arrowheads facing away from a dashed mirror line. The dashes
+            // are what say *mirror* rather than *move apart*: a solid rule
+            // between two shapes reads as a divider.
+            let horizontal = icon == Icon::FlipHorizontal;
+            // Along the mirror line, and across it. One pair of coordinates
+            // serves both icons by swapping which is which — the two marks are
+            // the same drawing a quarter turn apart, and writing it twice is
+            // how they end up subtly different weights.
+            let put = |along: f32, across: f32| {
+                if horizontal {
+                    at(across, along)
+                } else {
+                    at(along, across)
+                }
+            };
+            for (from, to) in [(4.0, 8.0), (10.5, 13.5), (16.0, 20.0)] {
+                line(put(from, 12.0), put(to, 12.0));
+            }
+            for side in [-1.0_f32, 1.0] {
+                path(vec![
+                    put(6.5, 12.0 + side * 2.0),
+                    put(17.5, 12.0 + side * 2.0),
+                    put(12.0, 12.0 + side * 8.5),
+                    put(6.5, 12.0 + side * 2.0),
+                ]);
+            }
         }
 
         Icon::Plus => {
