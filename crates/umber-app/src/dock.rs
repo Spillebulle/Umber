@@ -215,12 +215,20 @@ impl PanelKind {
 
     /// How wide a column holding only this module starts out.
     ///
-    /// The rail is a grid of tool buttons rather than a column of labelled
-    /// controls, and it reads as chrome at the width the design draws it. Every
-    /// other module wants the design's panel width.
+    /// The rail starts at [`limits::SIDEBAR_MIN_WIDTH`] — the narrowest an
+    /// ordinary column may be — rather than at [`metrics::TOOL_RAIL`], which is
+    /// only its *floor*. Starting a column on its own minimum is a column that
+    /// can only be dragged one way, and the rail arriving at the width the
+    /// chrome version happened to have said "this is what a rail is" about a
+    /// module whose whole point is that it is now the user's to size. A column
+    /// starting where every other column bottoms out is the smallest width that
+    /// leaves room to go either way, and it lines the rail's inner edge up with
+    /// a sidebar dragged to its narrowest.
+    ///
+    /// Every other module wants the design's panel width.
     fn default_width(self) -> f32 {
         match self {
-            Self::Tools => metrics::TOOL_RAIL,
+            Self::Tools => limits::SIDEBAR_MIN_WIDTH,
             _ => metrics::PANEL,
         }
     }
@@ -1619,7 +1627,7 @@ mod tests {
         let rail = geo.columns(Side::Left);
         assert_eq!(rail.len(), 1, "the shipped rail");
         assert_eq!(rail[0].rect.left(), 0.0);
-        assert_eq!(rail[0].rect.width(), metrics::TOOL_RAIL.round());
+        assert_eq!(rail[0].rect.width(), limits::SIDEBAR_MIN_WIDTH.round());
         let right = geo
             .sidebar(Side::Right)
             .expect("default docks on the right");
@@ -2222,8 +2230,8 @@ mod tests {
             );
             assert_eq!(
                 layout.width(side, 0),
-                PanelKind::Tools.default_width().round(),
-                "at rail width",
+                limits::SIDEBAR_MIN_WIDTH.round(),
+                "at the width a fresh install gives it, not the old rail's",
             );
             // And nothing was invented on the other edge.
             assert!(!kinds(&layout, other, 0).contains(&PanelKind::Tools));
@@ -2241,6 +2249,43 @@ mod tests {
         assert!(!text.contains("rail"), "{text}");
         let back = Layout::from_config(&text).expect("valid config");
         assert!(!back.is_open(PanelKind::Tools));
+    }
+
+    /// The rail's column opens at an ordinary column's minimum and is then the
+    /// user's, either way.
+    ///
+    /// It used to open at `metrics::TOOL_RAIL`, which is also its floor, so the
+    /// splitter had nowhere to go but outwards — the rail arrived at the width
+    /// the chrome version happened to have and half its handle did nothing.
+    /// Pinned in both directions because either alone would pass while the
+    /// column was still stuck: a start equal to the floor satisfies "it can be
+    /// widened", and a floor equal to the start satisfies "it starts at 190".
+    ///
+    /// Both routes in, because a fresh install and an upgraded workspace
+    /// arriving at different widths is the divergence the config's version
+    /// header exists to prevent — and the rail is the one module that reaches
+    /// `DEFAULT_DOCK` by both.
+    #[test]
+    fn the_rails_column_starts_where_a_column_bottoms_out_and_moves_both_ways() {
+        let migrated =
+            Layout::from_config("umber-layout 1\nrail left\ndock right colour 3\n").expect("loads");
+        for mut layout in [Layout::default(), migrated] {
+            assert_eq!(kinds(&layout, Side::Left, 0), vec![PanelKind::Tools]);
+            assert_eq!(layout.width(Side::Left, 0), limits::SIDEBAR_MIN_WIDTH);
+
+            layout.set_width(Side::Left, 0, limits::SIDEBAR_MIN_WIDTH + 60.0);
+            assert_eq!(
+                layout.width(Side::Left, 0),
+                limits::SIDEBAR_MIN_WIDTH + 60.0,
+                "and it widens",
+            );
+            layout.set_width(Side::Left, 0, limits::SIDEBAR_MIN_WIDTH - 40.0);
+            assert_eq!(
+                layout.width(Side::Left, 0),
+                limits::SIDEBAR_MIN_WIDTH - 40.0,
+                "and it narrows, because the floor is the rail's own",
+            );
+        }
     }
 
     /// The rail's column may be dragged narrower than any other, because that

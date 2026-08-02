@@ -274,9 +274,12 @@ pub mod metrics {
     /// costs around it — [`PANEL_PAD`] either side of the body, and room for
     /// the body's scroll bar.
     ///
-    /// It is both the width a Tools column starts at and the narrowest it may
-    /// be dragged, because below it the design's two-column tool grid wraps to
-    /// one and the rail stops reading as a rail.
+    /// It is the narrowest a Tools column may be dragged, and *only* that:
+    /// below it the design's two-column tool grid wraps to one and the rail
+    /// stops reading as a rail. What such a column starts at is
+    /// `dock::limits::SIDEBAR_MIN_WIDTH`, so that it has room to be dragged
+    /// both ways — a column that opens on its own floor is a column half of
+    /// whose splitter does nothing.
     pub const TOOL_RAIL: f32 = 100.0;
     pub const TOOL_BUTTON: f32 = 32.0;
     /// Gap between the rail's two columns.
