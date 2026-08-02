@@ -81,6 +81,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",
+    # `SetCurrentProcessExplicitAppUserModelID`, which is what gives the taskbar
+    # button an identity of its own. See `taskbar::claim_identity`.
+    "Win32_UI_Shell",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]

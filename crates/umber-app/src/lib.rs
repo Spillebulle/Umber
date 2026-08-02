@@ -33,6 +33,7 @@ mod settings;
 mod shortcuts;
 mod splash;
 mod tabs;
+mod taskbar;
 mod theme;
 mod ui;
 mod update;
@@ -49,6 +50,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // beside the new one, because a running executable cannot be deleted. This
     // is the first moment it can go.
     update::sweep_previous_binary();
+
+    // Before the event loop, because this has to precede the first window: the
+    // shell reads the application id when it creates the taskbar button, and
+    // setting it afterwards does not move a button already on screen. See
+    // `taskbar`.
+    taskbar::claim_identity();
 
     // `with_user_event` rather than a plain loop: the update check answers from
     // a thread, and under `ControlFlow::Wait` there is nothing else to make the

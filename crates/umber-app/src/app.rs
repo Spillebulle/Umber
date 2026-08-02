@@ -8,6 +8,8 @@ use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
 use crate::tabs::{self, Notice};
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+use crate::taskbar;
 use crate::theme::{self, Accent, ThemeKind};
 use crate::ui;
 use glam::{UVec2, Vec2};
@@ -1536,6 +1538,24 @@ impl ApplicationHandler<Wake> for UmberApp {
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs.with_taskbar_icon(logo::taskbar_icon())
+        };
+
+        // Linux takes its icon from an installed `.desktop` file rather than
+        // from the window, and finds that file by name — so a window with no
+        // application id has no icon to be found, which is what Umber shipped
+        // with. Wayland matches its app id against the entry's basename, which
+        // is why this is the reverse-DNS `taskbar::APP_ID` and not "Umber".
+        //
+        // X11 matches the entry's `StartupWMClass` against the window's class
+        // instead, and that file says `umber`, so the two platforms genuinely
+        // want different strings here. `taskbar`'s tests pin both against the
+        // packaging so a rename cannot quietly break either.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            WindowAttributesExtWayland::with_name(attrs, taskbar::APP_ID, "")
+                .with_name("umber", "umber")
         };
         let window = Arc::new(
             event_loop
