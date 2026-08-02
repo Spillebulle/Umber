@@ -935,7 +935,8 @@ enum Bulk {
     Lock(bool),
     Link,
     Unlink,
-    Untick,
+    /// Tick or untick every layer at once.
+    Tick(bool),
     Delete,
 }
 
@@ -1200,17 +1201,25 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 if icon_button(ui, p, Icon::Eye, true, "Show the ticked layers") {
                     act = Some(Bulk::Visible(true));
                 }
-                if ui
-                    .selectable_label(
-                        false,
-                        egui::RichText::new("None")
-                            .size(text::SMALL)
-                            .color(p.text_dim),
-                    )
-                    .on_hover_text("Untick every layer")
-                    .clicked()
-                {
-                    act = Some(Bulk::Untick);
+                // Words rather than marks, because "tick all of them" has no
+                // icon anybody would recognise and `icons::Icon` gaining one
+                // that has to be explained is worse than two short labels.
+                for (label, tip, all) in [
+                    ("None", "Untick every layer", false),
+                    ("All", "Tick every layer", true),
+                ] {
+                    if ui
+                        .selectable_label(
+                            false,
+                            egui::RichText::new(label)
+                                .size(text::SMALL)
+                                .color(p.text_dim),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        act = Some(Bulk::Tick(all));
+                    }
                 }
             });
         });
@@ -1242,7 +1251,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 ed.layers.unlink(&ed.layers.targets());
                 changed = true;
             }
-            Some(Bulk::Untick) => ed.layers.pick_all(false),
+            Some(Bulk::Tick(on)) => ed.layers.pick_all(on),
             // Slots go back on the free list, so this clears the undo history
             // and has to happen where the GPU is. `UiActions` is `Copy` and
             // cannot carry the list; the caller reads the ticks off the editor

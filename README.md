@@ -183,7 +183,8 @@ All four are written into the `.ora` and read back out of it.
 
 **Tick several rows and act on all of them at once.** Every row has a tick box;
 tick as many as you like and a strip appears saying how many, with show, hide,
-lock, unlock and delete. With nothing ticked those same operations reach the
+lock, unlock, link and delete, and All and None for ticking the whole stack at
+once. With nothing ticked those same operations reach the
 selected layer, so there is only ever one of each. Ticks belong to the layers
 rather than to the rows — they follow a layer that is dragged somewhere else,
 and go when it does — and they are never written into the file: a tick says what
