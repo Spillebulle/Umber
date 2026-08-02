@@ -34,6 +34,12 @@
 //!   `panels.rs`. Where the resulting choice is *stored* is
 //!   `preset::Library::collections`'s to explain, and it is not obvious: a
 //!   shipped brush has no preset that survives an update to write it on.
+//! - **Every collection but one is derived from a brush.** [`Index::build`]
+//!   reads them off the presets, so a collection exists exactly while something
+//!   is filed under it — which leaves no way to make the empty one a brush
+//!   would be dragged into first. The rail's `＋` makes one, and it has to be
+//!   recorded in `preset::Library::made_collections` rather than derived, or it
+//!   would be gone by the next [`resync`].
 //! - **[`resync`] carries the bitmap tips across too.** `BrushPreset::tip` is
 //!   the *name* of a mask in the user's library, and the drawing path has no
 //!   business reaching into a library; `Editor::tips` is where
@@ -59,7 +65,7 @@ use egui::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use umber_core::preset::{self, BrushPreset, PresetError, UserLibrary};
+use umber_core::preset::{self, BrushPreset, NewCollection, PresetError, UserLibrary};
 use umber_core::style;
 
 /// Width kept clear at the right of a browser row for its two controls.
@@ -157,6 +163,8 @@ struct State {
     /// The id of the user brush whose Delete has been pressed once. Deleting a
     /// brush cannot be undone — the history covers painting only — so it asks.
     confirming: Option<String>,
+    /// The name of the collection being made, while the rail's field is up.
+    creating: Option<Field>,
     /// The brush being carried from one collection to another, if any.
     /// [`crate::brushdrag`] decides what a release would do; this only holds
     /// the answer between frames.
@@ -186,6 +194,19 @@ impl State {
     }
 }
 
+/// The collections the user has made, which have no members to be derived from
+/// and so cannot come out of `Editor::presets`. See
+/// `preset::Library::made_collections`.
+///
+/// A free function rather than a method because [`Index::build`] is handed the
+/// store's contents while the state around it is being replaced.
+fn made_of(store: &Store) -> &[String] {
+    match store {
+        Store::Ready(library) => library.made_collections(),
+        Store::Broken(_) => &[],
+    }
+}
+
 fn state_id() -> Id {
     Id::new("brush-library")
 }
@@ -198,7 +219,8 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         // A rename changes only a name, and the index holds positions and
         // collection names rather than names.
         if state.index.total != ed.presets.len() {
-            state.index = Arc::new(Index::build(&ed.presets));
+            let index = Index::build(&ed.presets, made_of(&state.store));
+            state.index = Arc::new(index);
         }
         return state;
     }
@@ -228,7 +250,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         Err(e) => Store::Broken(e.to_string()),
     };
     State {
-        index: Arc::new(Index::build(&ed.presets)),
+        index: Arc::new(Index::build(&ed.presets, made_of(&store))),
         store,
         query: String::new(),
         scope: Scope::All,
@@ -236,6 +258,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         saving: None,
         renaming: None,
         confirming: None,
+        creating: None,
         drag: None,
         notice,
     }
@@ -272,7 +295,10 @@ struct Group {
 }
 
 impl Index {
-    fn build(presets: &[BrushPreset]) -> Self {
+    /// `made` is the collections the user created, which have no members yet
+    /// and so cannot be derived from `presets` — that is the whole reason
+    /// `preset::Library::made_collections` is written down.
+    fn build(presets: &[BrushPreset], made: &[String]) -> Self {
         let shipped = preset::builtin().len();
         let mut groups: Vec<Group> = Vec::new();
         for (i, preset) in presets.iter().enumerate() {
@@ -283,6 +309,24 @@ impl Index {
                     name: name.to_owned(),
                     members: vec![i],
                 }),
+            }
+        }
+        // A collection somebody made and has not filled yet, as a group with
+        // nothing in it. Added only where no preset has already produced one of
+        // the same name: a brush dragged into a made collection derives it too,
+        // and two rows of one name would be two places to drop a brush and one
+        // place to look for it. `same_collection` rather than `==` for the same
+        // reason `create_collection` refuses on it — the comparison that
+        // decides a clash and the one that merges the row have to agree.
+        for name in made {
+            if !groups
+                .iter()
+                .any(|group| preset::same_collection(&group.name, name))
+            {
+                groups.push(Group {
+                    name: name.clone(),
+                    members: Vec::new(),
+                });
             }
         }
         // Yours first, then the styles in the order `umber_core::style`
@@ -474,7 +518,10 @@ fn write<T>(
             };
             let library = Arc::clone(library);
             resync(ed, &library);
-            state.index = Arc::new(Index::build(&ed.presets));
+            // The made collections come off the library rather than out of the
+            // merged list: `resync` rebuilds that from the presets, and an
+            // empty collection has none.
+            state.index = Arc::new(Index::build(&ed.presets, library.made_collections()));
             Some(value)
         }
         Err(e) => {
@@ -793,10 +840,26 @@ fn list(
 
     if !any {
         ui.add_space(6.0);
-        controls::note(ui, p, "No brush matches that.");
+        controls::note(ui, p, empty_message(state));
         ui.add_space(6.0);
     }
     out
+}
+
+/// What the list says when it has nothing to show.
+///
+/// A collection somebody has just made is empty *because* it is new, and "No
+/// brush matches that" reads as a search that failed — which would be the one
+/// place in the interface saying the feature had not worked. The distinction is
+/// exact rather than a guess: a derived collection cannot be empty, because it
+/// exists only where a brush is filed under it.
+fn empty_message(state: &State) -> &'static str {
+    match (&state.scope, state.query.trim().is_empty()) {
+        (Scope::Category(_), true) => {
+            "Nothing here yet. Drag a brush onto this collection to file it here."
+        }
+        _ => "No brush matches that.",
+    }
 }
 
 /// Rename and delete, drawn over the right edge of a browser row.
@@ -1309,7 +1372,7 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 ui.allocate_ui_with_layout(
                     vec2(metrics::BRUSH_LIBRARY_RAIL, height),
                     Layout::top_down(Align::Min),
-                    |ui| browser_rail(ui, p, state),
+                    |ui| browser_rail(ui, p, ed, state),
                 );
                 ui.allocate_ui_with_layout(
                     vec2(width - metrics::BRUSH_LIBRARY_RAIL, height),
@@ -1371,12 +1434,168 @@ fn close_browser(state: &mut State) {
     state.browser_open = false;
     state.renaming = None;
     state.confirming = None;
+    // The rail is the only place a collection can be made, so a field left
+    // armed would come back over a dialog the user has since reopened for
+    // something else.
+    state.creating = None;
     // The rail goes with the browser, so a drag that outlived it would be a
     // brush being carried towards targets that are no longer on screen.
     state.drag = None;
 }
 
-fn browser_rail(ui: &mut Ui, p: &Palette, state: &mut State) {
+/// The field the rail's `＋` arms: name a collection, or back out of it.
+///
+/// Drawn nowhere unless a collection is being made, and shaped like the "Save
+/// this brush as" field for the same reason — one way of asking for a name in
+/// this module rather than two.
+///
+/// Nothing here touches [`crate::shortcuts`]. Dispatch is suspended for the
+/// whole interface by `ui::draw`, from `text_edit_focused`, which is
+/// deliberately one lever rather than one per field: a module that pulls it for
+/// its own fields only ever covers the fields it knows about.
+fn new_collection_field(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
+    let Some(field) = &mut state.creating else {
+        return;
+    };
+    let mut name = std::mem::take(&mut field.text);
+    let focus = std::mem::take(&mut field.focus);
+    let mut commit = false;
+    let mut cancel = false;
+
+    Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.accent_dim))
+        .corner_radius(metrics::RADIUS)
+        .inner_margin(Margin::symmetric(7, 6))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 5.0;
+            ui.label(
+                RichText::new("New collection")
+                    .size(text::TINY)
+                    .color(p.text_dim),
+            );
+            let edit = ui.add(
+                TextEdit::singleline(&mut name)
+                    .id(Id::new("brushlib-new-collection"))
+                    .desired_width(ui.available_width())
+                    .font(FontId::proportional(text::CONTROL))
+                    .text_color(p.text_strong),
+            );
+            if focus {
+                edit.request_focus();
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                commit = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let named = !name.trim().is_empty();
+                    if controls::text_button(ui, p, "Create", true, named)
+                        .on_hover_text(if named {
+                            "Add it to the rail, ready for brushes to be dragged onto it"
+                        } else {
+                            "Give the collection a name first."
+                        })
+                        .clicked()
+                    {
+                        commit = true;
+                    }
+                    if controls::text_button(ui, p, "Cancel", false, true).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+    ui.add_space(8.0);
+
+    if cancel {
+        state.creating = None;
+    } else if commit && !name.trim().is_empty() {
+        // Put the typed name back before trying, so a write that fails leaves
+        // the field holding what the user typed rather than empty.
+        if let Some(field) = &mut state.creating {
+            field.text = name.clone();
+        }
+        create_collection(state, ed, name.trim().to_owned());
+    } else if let Some(field) = &mut state.creating {
+        field.text = name;
+    }
+}
+
+/// Make the collection the field names, and say what came of it.
+///
+/// The clash rules are `UserLibrary::create_collection`'s, not this function's,
+/// which is what lets them be tested without a window. What this side supplies
+/// is the one thing the model cannot work out: the collections already on the
+/// rail. They are *derived* from the merged preset list, and the shipped half
+/// of that list lives in the binary — see `preset::Library::collections`.
+fn create_collection(state: &mut State, ed: &mut Editor, name: String) {
+    // Cloned rather than borrowed out of the index: `write` takes the state
+    // mutably. Once per press of Create, not per frame.
+    let existing: Vec<String> = state
+        .index
+        .groups
+        .iter()
+        .map(|group| group.name.clone())
+        .collect();
+    let asked = name.clone();
+    let Some(outcome) = write(state, ed, move |library| {
+        library.create_collection(&name, &existing)
+    }) else {
+        return;
+    };
+    match outcome {
+        NewCollection::Created => {
+            state.creating = None;
+            // Show it. A row appearing somewhere in a rail of fifteen is easy
+            // to miss, and an empty collection nobody is looking at reads as
+            // nothing having happened.
+            state.scope = Scope::Category(asked.clone());
+            state.query.clear();
+            state.notice = Some(Notice::good(format!(
+                "Made \"{asked}\". Drag brushes onto it to file them there."
+            )));
+        }
+        NewCollection::Exists => {
+            state.creating = None;
+            // The collection asked for is already there, so the useful answer
+            // is to go to it rather than to make a second row of the same name.
+            // Matched case-insensitively, like the refusal, and shown under the
+            // spelling the rail already uses.
+            let found = state
+                .index
+                .groups
+                .iter()
+                .find(|group| preset::same_collection(&group.name, &asked))
+                .map(|group| group.name.clone());
+            state.notice = Some(Notice::bad(match &found {
+                Some(name) => {
+                    format!("\"{name}\" is already a collection — showing that one instead.")
+                }
+                // Only reachable for a collection that exists as a rule rather
+                // than as a row: `preset::IMPORTED` is where every import
+                // lands, whether or not anything has been imported yet.
+                None => format!(
+                    "\"{asked}\" is where Umber files imported brushes, so it cannot be made by hand."
+                ),
+            }));
+            if let Some(name) = found {
+                state.scope = Scope::Category(name);
+                state.query.clear();
+            }
+        }
+        // The Create button is dead until the field has something in it, so
+        // this is only reachable by a stray Enter. Leave the field up.
+        NewCollection::Unnamed => {}
+    }
+}
+
+fn browser_rail(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
+    let writable = state.writable();
+    let why_not = state.why_not().to_owned();
     Frame::NONE
         .fill(p.chrome)
         .inner_margin(Margin::symmetric(8, 16))
@@ -1392,8 +1611,31 @@ fn browser_rail(ui: &mut Ui, p: &Palette, state: &mut State) {
                         .color(p.text_strong)
                         .strong(),
                 );
+                // The same `＋` the Brushes panel's header carries, and here for
+                // the same reason: every other collection on this rail is
+                // derived from a brush that is already in one, so without it
+                // there is no way to make the empty collection a brush would be
+                // dragged into first.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(
+                        ui,
+                        p,
+                        Icon::Plus,
+                        writable,
+                        if writable {
+                            "Make a new collection"
+                        } else {
+                            why_not.as_str()
+                        },
+                    ) {
+                        state.creating = Some(Field::new(String::new()));
+                        state.notice = None;
+                    }
+                });
             });
             ui.add_space(12.0);
+
+            new_collection_field(ui, p, ed, state);
 
             let mut chosen = None;
             let all = format!("All brushes ({})", state.index.total);
@@ -1944,7 +2186,7 @@ mod tests {
         let shipped = preset::builtin().len();
         let mut presets = preset::builtin().to_vec();
         presets.push(preset("user/mine", "Mine", "My brushes"));
-        let index = Index::build(&presets);
+        let index = Index::build(&presets, &[]);
 
         assert_eq!(index.groups[0].name, "My brushes");
         // Then `Style::ALL` order, which is roughly the order a painter works
@@ -1965,7 +2207,7 @@ mod tests {
         let mut with_a_shipped_one = presets.clone();
         with_a_shipped_one[0].collection = Some("My brushes".to_owned());
         assert_eq!(
-            Index::build(&with_a_shipped_one).groups[0].name,
+            Index::build(&with_a_shipped_one, &[]).groups[0].name,
             "My brushes"
         );
         assert_eq!(index.total, presets.len());
@@ -1985,7 +2227,7 @@ mod tests {
         arrived.collection = Some(preset::IMPORTED.to_owned());
         presets.push(arrived);
         let last = presets.len() - 1;
-        let index = Index::build(&presets);
+        let index = Index::build(&presets, &[]);
 
         // Not with the charcoals its name would have put it among…
         let charcoal = index
@@ -2001,6 +2243,87 @@ mod tests {
         // And the search answers to where it is filed, not to what it is.
         assert!(matches(&presets[last], "imported"));
         assert!(!matches(&presets[last], "chalk"));
+    }
+
+    /// A collection with nothing in it cannot be derived from the presets, so
+    /// it has to reach the rail from the library's own list — and it has to
+    /// land where the user's collections land, or the row they just made would
+    /// appear below two hundred shipped brushes' worth of styles.
+    #[test]
+    fn a_collection_the_user_made_is_a_row_of_its_own_with_nothing_in_it() {
+        let made = ["Comics".to_owned()];
+        let index = Index::build(preset::builtin(), &made);
+        let comics = index
+            .groups
+            .iter()
+            .find(|group| group.name == "Comics")
+            .expect("the made collection is on the rail");
+        assert!(comics.members.is_empty());
+        // Yours first: a name `style::classify` could never produce is one
+        // somebody chose.
+        assert_eq!(index.groups[0].name, "Comics");
+        // And it is a row, not a brush: the count in the footer must not move.
+        assert_eq!(index.total, preset::builtin().len());
+    }
+
+    /// Once a brush is dragged in, the collection is derived *and* recorded.
+    /// Two rows of one name would be two places to drop a brush and one place
+    /// to look for it afterwards.
+    #[test]
+    fn a_made_collection_that_has_gained_a_brush_is_still_one_row() {
+        let mut presets = preset::builtin().to_vec();
+        let mut moved = preset("user/nib", "Nib", "Inks & pens");
+        moved.collection = Some("Comics".to_owned());
+        presets.push(moved);
+        let last = presets.len() - 1;
+
+        let index = Index::build(&presets, &["Comics".to_owned()]);
+        let rows: Vec<&Group> = index
+            .groups
+            .iter()
+            .filter(|group| group.name == "Comics")
+            .collect();
+        assert_eq!(rows.len(), 1, "the collection was listed twice");
+        assert_eq!(rows[0].members, vec![last]);
+
+        // The spelling in the file need not match the one the brush carries;
+        // the two are still one collection.
+        let index = Index::build(&presets, &["comics".to_owned()]);
+        assert_eq!(
+            index
+                .groups
+                .iter()
+                .filter(|group| preset::same_collection(&group.name, "Comics"))
+                .count(),
+            1
+        );
+    }
+
+    /// The one place in the interface that would otherwise report the feature
+    /// as broken: a collection made a moment ago is empty because it is new,
+    /// and "No brush matches that" reads as a search that failed.
+    #[test]
+    fn an_empty_collection_says_what_to_do_with_it_rather_than_that_nothing_matched() {
+        let mut state = State {
+            store: Store::Broken(String::new()),
+            index: Arc::new(Index::build(&[], &[])),
+            query: String::new(),
+            scope: Scope::Category("Comics".to_owned()),
+            browser_open: true,
+            saving: None,
+            renaming: None,
+            confirming: None,
+            creating: None,
+            drag: None,
+            notice: None,
+        };
+        assert!(empty_message(&state).contains("Drag a brush"));
+        // A search that genuinely found nothing still says so.
+        state.query = "zzz".to_owned();
+        assert_eq!(empty_message(&state), "No brush matches that.");
+        state.query.clear();
+        state.scope = Scope::All;
+        assert_eq!(empty_message(&state), "No brush matches that.");
     }
 
     /// A library grouped by author put the pencils in six places. This is the
@@ -2019,7 +2342,7 @@ mod tests {
 
     #[test]
     fn every_shipped_preset_has_a_credit_line_to_show() {
-        let index = Index::build(preset::builtin());
+        let index = Index::build(preset::builtin(), &[]);
         for (i, preset) in preset::builtin().iter().enumerate() {
             assert!(
                 !index.details[i].is_empty(),

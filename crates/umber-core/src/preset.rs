@@ -22,6 +22,14 @@
 //! is; it is recorded against the brush's stable id in the user's own
 //! `brushes.ron`, which an update never touches.
 //!
+//! And a third half, for the collection with nothing in it yet:
+//! [`Library::made_collections`]. Every collection Umber shows is otherwise
+//! *derived* from some preset, so a collection somebody has just made — which
+//! is the only state it can be in before a brush is dragged into it — has
+//! nothing to be derived from and would not survive the next rebuild of the
+//! merged list. It is written down instead, and [`UserLibrary::create_collection`]
+//! is what makes one.
+//!
 //! Everything here is plain data: no GPU types, no file dialogs, no UI.
 
 use std::collections::BTreeMap;
@@ -314,12 +322,27 @@ struct LibraryFile {
     /// existed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     collections: BTreeMap<String, String>,
+    /// Collections the user made, which no brush need be in. See
+    /// [`Library::made_collections`].
+    ///
+    /// `#[serde(default)]` and skipped when empty, so a `brushes.ron` written
+    /// before this existed still loads and a library nobody has added a
+    /// collection to is written byte for byte as it was. That is why
+    /// [`FORMAT_VERSION`] did not move: an older Umber reading a newer file
+    /// ignores the field and opens the brushes, which is the same rule the dock
+    /// config lives by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    made_collections: Vec<String>,
 }
 
 /// Everything in a library file.
 ///
-/// The presets, and one thing that is not a preset: where the user has filed
-/// brushes that are *not in this file*. See [`Library::collections`].
+/// The presets, and two things that are not presets: where the user has filed
+/// brushes that are *not in this file* ([`Library::collections`]), and the
+/// collections they made that no brush is in yet
+/// ([`Library::made_collections`]). Both exist because a collection is
+/// otherwise derived from a preset, and neither of those has one to be derived
+/// from.
 #[derive(Clone, Debug, Default)]
 pub struct Library {
     pub presets: Vec<BrushPreset>,
@@ -342,6 +365,49 @@ pub struct Library {
     /// knows what is in it this release — and a brush that has gone might come
     /// back.
     pub collections: BTreeMap<String, String>,
+    /// Collections the user has made, in the order they made them.
+    ///
+    /// Every *other* collection Umber shows is derived: it exists because some
+    /// preset's [`BrushPreset::collection`] or [`BrushPreset::category`] names
+    /// it. A collection somebody has just made has no members yet, so there is
+    /// nothing to derive it from — and if it were not written down it would
+    /// vanish the moment the merged preset list was rebuilt, which happens on
+    /// every save, delete, import and move. Hence a list of its own.
+    ///
+    /// A name stays here once it is in. Dragging the last brush out of a
+    /// collection the user made is not the same act as unmaking it, and a
+    /// collection that disappeared from under a drag would take the drop target
+    /// with it.
+    pub made_collections: Vec<String>,
+}
+
+/// What came of asking for a new collection.
+///
+/// Three answers rather than a `bool`, because the two refusals need different
+/// sentences: a name already in use is a collection the user can go and use,
+/// and an empty one is a field they have not finished filling in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewCollection {
+    Created,
+    /// A collection of that name is already there — the one that was asked for,
+    /// found rather than made a second time.
+    Exists,
+    /// Nothing but whitespace.
+    Unnamed,
+}
+
+/// Whether two collection names are the same collection.
+///
+/// Trimmed and case-folded, because "my brushes" typed into the field and "My
+/// brushes" already on the rail are one collection to everybody except a byte
+/// comparison — and two rows with the same name are two places to drag a brush
+/// into and one place to look for it afterwards.
+///
+/// ASCII-only folding, which suits the data for the same reason the browser's
+/// search folds that way: the non-ASCII in a collection name is the same bytes
+/// in either case and matches regardless.
+pub fn same_collection(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// Read a RON brush library, presets and all.
@@ -354,6 +420,7 @@ pub fn parse(text: &str) -> Result<Library, PresetError> {
     Ok(Library {
         presets: file.presets,
         collections: file.collections,
+        made_collections: file.made_collections,
     })
 }
 
@@ -369,17 +436,19 @@ pub fn parse_library(text: &str) -> Result<Vec<BrushPreset>, PresetError> {
 /// Serialise a brush library to RON, pretty-printed so that a generated library
 /// gives a readable diff when it is regenerated.
 pub fn to_ron(presets: &[BrushPreset]) -> Result<String, PresetError> {
-    to_ron_file(presets, &BTreeMap::new())
+    to_ron_file(presets, &BTreeMap::new(), &[])
 }
 
 fn to_ron_file(
     presets: &[BrushPreset],
     collections: &BTreeMap<String, String>,
+    made_collections: &[String],
 ) -> Result<String, PresetError> {
     let file = LibraryFile {
         version: FORMAT_VERSION,
         presets: presets.to_vec(),
         collections: collections.clone(),
+        made_collections: made_collections.to_vec(),
     };
     let config = ron::ser::PrettyConfig::new().struct_names(false);
     ron::ser::to_string_pretty(&file, config)
@@ -431,6 +500,8 @@ pub struct UserLibrary {
     /// shipped ones. See [`Library::collections`], which is the argument for
     /// why this cannot live on the preset.
     collections: BTreeMap<String, String>,
+    /// Collections the user made. See [`Library::made_collections`].
+    made_collections: Vec<String>,
     /// Every mask in `tips/`, by name.
     ///
     /// `Arc` because the same mask is handed to the editor, then to the GPU,
@@ -502,6 +573,7 @@ impl UserLibrary {
             dir,
             presets: contents.presets,
             collections: contents.collections,
+            made_collections: contents.made_collections,
             tips: BTreeMap::new(),
             migrated,
             warnings: Vec::new(),
@@ -703,6 +775,57 @@ impl UserLibrary {
         &self.collections
     }
 
+    /// The collections the user has made, in the order they made them.
+    ///
+    /// The caller adds these to whatever the presets derive, so a collection
+    /// with nothing in it yet is still a row on the rail and still a thing a
+    /// brush can be dragged onto. See [`Library::made_collections`].
+    pub fn made_collections(&self) -> &[String] {
+        &self.made_collections
+    }
+
+    /// Make an empty collection.
+    ///
+    /// `existing` is every collection name already on screen, and it has to
+    /// come from the caller: collections are *derived* from the merged preset
+    /// list, and the shipped half of that list is not this module's to
+    /// enumerate — [`builtin`] is compiled into the binary and only the app
+    /// knows what is in it this release. [`IMPORTED`] is added to whatever is
+    /// passed, because an import can create that collection at any moment and a
+    /// name that would collide with it the first time somebody imports a brush
+    /// is a name to refuse now rather than later.
+    ///
+    /// A name already in use is [`NewCollection::Exists`] rather than a second
+    /// row of the same name — the collection the user asked for is already
+    /// there, so the honest outcome is to send them to it. Comparison is
+    /// [`same_collection`]'s, so case and surrounding space do not make a
+    /// second one.
+    ///
+    /// Nothing is written unless a collection was actually made.
+    pub fn create_collection(
+        &mut self,
+        name: &str,
+        existing: &[String],
+    ) -> Result<NewCollection, PresetError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(NewCollection::Unnamed);
+        }
+        let taken = existing
+            .iter()
+            .map(String::as_str)
+            .chain(self.made_collections.iter().map(String::as_str))
+            .chain(self.presets.iter().map(BrushPreset::collection))
+            .chain(std::iter::once(IMPORTED))
+            .any(|other| same_collection(other, name));
+        if taken {
+            return Ok(NewCollection::Exists);
+        }
+        self.made_collections.push(name.to_owned());
+        self.write()?;
+        Ok(NewCollection::Created)
+    }
+
     /// Change a brush's display name. The id deliberately does not follow, so
     /// anything holding a selection keeps it.
     pub fn rename(&mut self, id: &str, name: impl Into<String>) -> Result<bool, PresetError> {
@@ -821,7 +944,7 @@ impl UserLibrary {
 
     fn write(&mut self) -> Result<(), PresetError> {
         create_dir(&self.dir)?;
-        let text = to_ron_file(&self.presets, &self.collections)?;
+        let text = to_ron_file(&self.presets, &self.collections, &self.made_collections)?;
         let file = self.dir.join(Self::FILE_NAME);
 
         // Write beside the library and rename over it. A direct write that is
@@ -1398,6 +1521,162 @@ mod tests {
 
         let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
         assert_eq!(reloaded.get(&id).unwrap().collection(), "Comics");
+    }
+
+    /// A collection with nothing in it has nothing to derive it from, so the
+    /// only thing that can carry it across a restart is the file.
+    #[test]
+    fn a_collection_the_user_made_survives_the_file() {
+        let scratch = Scratch::new("made");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        assert_eq!(
+            library.create_collection("Comics", &[]).expect("create"),
+            NewCollection::Created
+        );
+        assert_eq!(library.made_collections(), ["Comics"]);
+        // Not by inventing a brush to hang it on.
+        assert!(library.presets().is_empty());
+
+        let text = std::fs::read_to_string(scratch.path().join("brushes.ron")).expect("read");
+        assert!(text.contains("Comics"), "not written down: {text}");
+
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert_eq!(reloaded.made_collections(), ["Comics"]);
+    }
+
+    /// Two rows of one name are two places to drag a brush into and one place
+    /// to look for it afterwards. Every way of arriving at the same name — the
+    /// caller's derived list, a brush already filed there, one made a moment
+    /// ago, and [`IMPORTED`], which an import can conjure at any time — has to
+    /// be refused.
+    #[test]
+    fn a_name_already_in_use_does_not_make_a_second_collection() {
+        let scratch = Scratch::new("made-clash");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+
+        let derived = vec!["Inks & pens".to_owned()];
+        assert_eq!(
+            library
+                .create_collection("Inks & pens", &derived)
+                .expect("derived"),
+            NewCollection::Exists
+        );
+        // Case and stray space are not a second collection either.
+        assert_eq!(
+            library
+                .create_collection("  inks & PENS ", &derived)
+                .expect("folded"),
+            NewCollection::Exists
+        );
+        assert_eq!(
+            library.create_collection(IMPORTED, &[]).expect("imported"),
+            NewCollection::Exists
+        );
+        // A collection a brush of the library's own is filed under is derived
+        // too, and the caller need not have said so.
+        library
+            .save(
+                BrushPreset {
+                    collection: Some("Comics".to_owned()),
+                    ..BrushPreset::unsaved("Nib", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
+        assert_eq!(
+            library.create_collection("Comics", &[]).expect("member"),
+            NewCollection::Exists
+        );
+
+        // And one made a moment ago is not made twice.
+        assert_eq!(
+            library.create_collection("Studies", &[]).expect("first"),
+            NewCollection::Created
+        );
+        assert_eq!(
+            library.create_collection("studies", &[]).expect("again"),
+            NewCollection::Exists
+        );
+        assert_eq!(library.made_collections(), ["Studies"]);
+
+        // An empty name is a field somebody has not finished filling in, not a
+        // collection called nothing.
+        assert_eq!(
+            library.create_collection("   ", &[]).expect("blank"),
+            NewCollection::Unnamed
+        );
+        assert_eq!(library.made_collections(), ["Studies"]);
+    }
+
+    /// The merged list is rebuilt on every save, delete, import and move, and
+    /// it is built from the presets — which an empty collection has none of.
+    /// The list the app groups by therefore has to come from here as well, or
+    /// the collection is gone before a brush can be dragged into it.
+    #[test]
+    fn an_empty_collection_outlives_a_rebuild_of_the_merged_list() {
+        let scratch = Scratch::new("made-resync");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        library.create_collection("Comics", &[]).expect("create");
+
+        // What `brushlib::resync` does: everything shipped, then everything
+        // here, with the recorded collections stamped back on. Nothing in it
+        // mentions "Comics", because no brush is in it yet.
+        let mut merged = builtin().to_vec();
+        merged.extend(library.presets().iter().cloned());
+        library.apply_collections(&mut merged);
+        assert!(!merged.iter().any(|p| p.collection() == "Comics"));
+        // …and the library still knows about it, which is what puts the row
+        // back on the rail.
+        assert_eq!(library.made_collections(), ["Comics"]);
+
+        // A brush dragged in afterwards files under it, and taking the brush
+        // out again leaves the collection where it was: making a collection and
+        // emptying it are not the same act.
+        let id = library
+            .save(BrushPreset::unsaved("Nib", Brush::default()), None)
+            .expect("save");
+        library.assign(&id, Some("Comics")).expect("assign");
+        assert_eq!(library.get(&id).unwrap().collection(), "Comics");
+        library.assign(&id, None).expect("unassign");
+        assert_eq!(library.made_collections(), ["Comics"]);
+    }
+
+    /// The field is new, so every `brushes.ron` in existence is written without
+    /// it. Refusing one would put somebody's whole collection out of reach over
+    /// a list of collections they have not made yet.
+    #[test]
+    fn a_library_from_before_made_collections_still_loads() {
+        let old = r#"(
+            version: 1,
+            presets: [(
+                id: "user/old",
+                name: "Old",
+                category: "Inks & pens",
+                brush: (size: 12.0),
+            )],
+        )"#;
+        let library = parse(old).expect("an older library still parses");
+        assert_eq!(library.presets.len(), 1);
+        assert!(library.made_collections.is_empty());
+    }
+
+    /// A library nobody has added a collection to must be written exactly as it
+    /// was, so the field costs nothing to have added.
+    #[test]
+    fn a_library_with_no_made_collections_does_not_write_the_field() {
+        let text = to_ron(builtin()).expect("serialise");
+        assert!(
+            !text.contains("made_collections"),
+            "an empty list should not reach the file"
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_collection_are_one_collection() {
+        assert!(same_collection("My brushes", "my brushes"));
+        assert!(same_collection(" Comics ", "Comics"));
+        assert!(!same_collection("Comics", "Comic"));
+        assert!(!same_collection("", "Comics"));
     }
 
     #[test]
