@@ -191,6 +191,33 @@ put on and take off.
   free; a second implementation called by nothing is the drift refused
   everywhere else. What `umber-core` owns is the *map*, and
   `a_transform_and_its_inverse_are_exact_opposites` pins it.
+- **A negative `scale` is a flip, and `MIN_SCALE` clamps magnitude only.** It
+  used to clamp positive, on the reasoning that a flip was a feature with its
+  own controls rather than something a hand should stumble into; there were no
+  such controls, and dragging an edge through the opposite one is how every
+  other application spells this. Nothing downstream needed a branch — the matrix
+  stays invertible with a negative determinant, an affine map keeps adjacent
+  corners adjacent so `quad` cannot become a bow tie, the anchor formula is
+  sign-agnostic, and `is_identity` correctly reads a flip as a change. The one
+  thing that did: the uniform-corner branch must compare *magnitudes* and
+  `copysign` per axis, or a Shift-drag past the corner hands the un-flipped
+  axis's sign to both.
+- **`Transform::grab` reads everywhere outside the box as `Handle::Rotate`, and
+  therefore never answers "nothing".** Rotation used to be a ring around the
+  corners alone, which is a target most people never find. "Click outside to put
+  it down" could not stay in core once that changed — `grab` sees one position,
+  and the difference between a click and a drag is not in it — so it is the
+  pointer layer's: an outside press turns nothing until it has travelled past
+  `PUT_DOWN_SLOP`, and the release commits only if it never did. `drag` being
+  absolute against the press rather than accumulated is what lets the rotation
+  wait without losing the degrees it spent waiting.
+- **The rotation mark is instructive, the flip buttons are real.** The mark is
+  placed off `handle_at`'s own answers rather than the screen bounding rect, so
+  it turns with the box and swaps sides on a flip and cannot be drawn where the
+  hit test disagrees with it. The buttons are the opposite case — controls over
+  the canvas — so their rectangles go in `Editor::transform_buttons` and through
+  `canvas_overlay_owns_pointer`, exactly as `Editor::scroll_bars` does, or a
+  press on one also starts a stroke.
 - **A float exists only with the transform tool in hand, on the layer it came
   from.** Checked once per frame in `render` rather than at the rail, the
   shortcuts, the layer list and the preset — an invariant enforced at five call
@@ -284,6 +311,26 @@ moves that block in and out of `Editor` wholesale.
   dab at the wrong place and the wrong scale, on a layer that still looks
   plausible.
 
+- **A flip keeps the undo history where a resize clears it.** The canvas size
+  does not change, so not one recorded rectangle stops being valid — see the
+  `EditBody` rule under Undo. `app.rs`'s `mirror_document` is the single route,
+  shared by the command and by both undo directions; a second implementation for
+  the undo would be a second thing to keep exact. Everything that has to be
+  quiet first is: the float is committed, the stroke is finished, and the
+  autosave capture is cancelled on both halves.
+- **The flip pass must stay an exact texel permutation.** Undoing a flip *is*
+  another flip, so any loss compounds every time somebody flips and undoes.
+  `flip.wgsl` reads with integer `textureLoad`, through **non-sRGB views** of
+  the `Rgba8UnormSrgb` layer array on both sides, with `blend: None` — a raw
+  `u8/255` round trip is exact where a decode to linear and a re-encode is a
+  promise about rounding. That is why `LAYER_FORMAT_LINEAR` is in the array's
+  `view_formats`. A texture cannot be its own attachment and
+  `copy_texture_to_texture` cannot mirror, hence the scratch and the copy back.
+  `a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly` guards it.
+- **The selection flips with the picture, through `Selection::flipped`** — rings
+  mirrored and rasterised again, exactly as the marquee travelling with a
+  transform commit does. Not a mirrored *mask*: that would be a second
+  rasteriser to keep in step about every antialiased edge.
 - **Nothing above the `--- documents ---` line in `editor.rs` is per-document.**
   That is what keeps a tab switch to four moves instead of an audit of every
   field. Adding per-document state means adding it to `DocumentState` too, or it
@@ -348,6 +395,12 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
     which is a document quietly damaged by an undo. It now discards the history
     and opens the picture whole instead. This build still reads revision 1: an
     entry with no `pieces` is one piece covering the rect.
+  - **A canvas flip is what raised `history::VERSION` to 3.** A build reading
+    only revision 2 would not merely be one entry short: every entry older than
+    the flip was recorded in the opposite orientation, so dropping it writes
+    each of those patches back *mirrored*. It discards the whole history and
+    opens the picture whole. A flip entry writes no PNG, so it can never be the
+    entry that reaches `BUDGET_BYTES`.
   - **Saving a history still did not bump `umber-version`**, and the argument
     is in `docformat`'s module docs. An older build ignores an entry it has
     never heard of and opens with an empty history — exactly what every build
@@ -506,6 +559,18 @@ when nobody asked for it.
   rebuilt. `a_shipped_brushs_collection_survives_the_shipped_library_being_
   replaced` is the guard. A dangling entry is **kept**: this module cannot
   enumerate the shipped library, and a brush that has gone may come back.
+- **A collection the user *made* has to be written down, because every other one
+  is derived.** A collection exists because some preset's `collection` or
+  `category` names it, so a brand new one has no members to be derived from and
+  would vanish at the next rebuild of the merged list.
+  `LibraryFile::made_collections` holds them, behind a serde default so an older
+  `brushes.ron` still loads and a library nobody has added one to is written
+  byte for byte as before. `same_collection` — trimmed, case-folded — is one
+  rule for "are these the same collection", used by both the model's refusal and
+  the rail's row merge, so a brush dragged into a new collection cannot produce
+  a second row beside it. `create_collection` takes the existing names from the
+  caller for the reason `Library::collections` exists: the shipped half of the
+  merged list is not that module's to enumerate.
 - **`Index::rank`'s "yours first" reads the collection's *name*, not its
   members.** A name `style::classify` could never produce — "My brushes",
   "Imported", one somebody typed — is one somebody chose. Reading it off the
@@ -770,8 +835,9 @@ once per stroke but must never move into the drawing loop.
   so switching tool mid-stroke cannot change what the stroke that is ending
   turns out to have been.
 - **`EditKind` has a variant only for something the engine can restore.** It is
-  Paint, Erase and Transform because an entry exists only where a patch was
-  captured. Adding "Clear layer" or "Delete layer" means making those undoable
+  Paint, Erase, Transform and the two canvas flips: an entry exists where a
+  patch was captured, or — the flips alone — where the edit is its own inverse.
+  Adding "Clear layer" or "Delete layer" means making those undoable
   *first*; a row naming an action that clicking it will not undo is worse than
   one the list stays quiet about, and the History module's footnote exists to
   say so. The same bound governs the icons: `panels::edit_icon` is exhaustive
@@ -803,6 +869,17 @@ once per stroke but must never move into the drawing loop.
   then everything undone in the order redoing would put it back. `kind_at`
   indexes it without allocating, and `position` is the count of applied edits,
   which is what a row of the list stands for.
+- **A flip stores no pixels, and that is sound only because undo is stepped
+  rather than seeked.** `steps_to` turns a jump into that many single `undo`
+  calls, so an older patch is always reached with the flip above it already
+  undone — the canvas is back in the orientation that patch was recorded in and
+  it applies verbatim at its own rectangle. No coordinate mapping, no mirrored
+  bytes, no marking of which entries fall on which side of a flip. `EditBody`
+  carries it: `Pixels` for everything that paints, `Flip` for the one edit that
+  is its own inverse. The axis lives in the `EditKind` and nowhere else, so a
+  row's icon and its pixels cannot disagree. A flip costs the budget nothing and
+  is still evicted in timeline order — what ages out is the oldest, not the
+  largest.
 - **A jump is a count of single steps, not a seek.** `steps_to` clamps to what
   is held and the app carries it out as that many `undo`/`redo` calls. There are
   no snapshots to jump to — that is the whole design — so an eight-row jump
@@ -813,8 +890,17 @@ once per stroke but must never move into the drawing loop.
   oldest surviving entry as though it were the beginning. It survives a save,
   because a history that did not reach the beginning when it was written does
   not reach it now either.
-- **The budget is a fixed 512 MB, not a fraction of the canvas — and the panel
-  names the figure once anything has been dropped.** A patch is the *rectangle*
+- **The budget is one figure the user sets, defaulting to 512 MB, and never a
+  fraction of the canvas — and the panel names whichever figure is in force once
+  anything has been dropped.** It reaches a `History` through
+  `history::set_default_budget` rather than an argument, because a `History` is
+  built by `DocumentState::blank`, `Editor::default` and `docimport`, none of
+  which can see a `Prefs` — threading it through would put the setting into the
+  signature of everything that opens a picture. Same shape as
+  `shortcuts::publish`. `set_budget` re-runs the eviction on the spot, and
+  `prefs::set_undo_budget` walks the parked tabs as well as the live document:
+  the limit is *per document*, so one lowered on the active tab alone gives back
+  a quarter of what the dialog promised. A patch is the *rectangle*
   a stroke covered, so its cost follows the canvas rather than the mark: on a
   10000² document a stroke drawn across the picture is 400 MB, the budget holds
   exactly one, and the second ages the first out. That is correct and it is
@@ -878,6 +964,21 @@ design shows a whole row of them.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
+- **A rail whose figure can be typed is `widgets::number_row`, and there is one
+  of it.** The readout is a real `TextEdit` dressed as the painted readout, the
+  drag lands on each multiple of `snap` within an eighth of a step, Alt
+  suppresses that, and a *typed* figure is clamped to the range and snapped to
+  nothing — the point of typing it is to say something the rail cannot. Every
+  number in `NumberRow` is in the value's own units, never the readout's, which
+  is what lets the wheel's angle (45°) and the interface scale (25%, shown as a
+  percentage of a 0.75..=2.0 value) be the same control. Two implementations of
+  "type it or drag it" is how the two end up disagreeing about what Escape does.
+- **A text field in the interface needs no `shortcuts::set_capturing`.**
+  `ui::draw` calls `shortcuts::set_typing(ctx.text_edit_focused())` once for the
+  whole interface, so any real `TextEdit` is covered. `set_capturing` belongs to
+  the chord recorder in Settings alone; a widget writing `false` to it every
+  frame would hand dispatch back to the canvas while a chord was still being
+  listened for.
 - **The canvas scrollbars are `ScrollSpan`'s geometry and `widgets.rs`'s
   paint**, the same division `dock.rs` and `panels.rs` keep. `ScrollSpan` lives
   in `umber-core` because it decides where the picture goes and is testable
@@ -936,6 +1037,14 @@ design shows a whole row of them.
   are. The anchor control appears **only** when the size is actually changing —
   on a New document there is nothing to anchor, and on an unchanged size it
   would be a live knob that does nothing.
+- **The settings dialog is one size, whatever page is in front.** A header, one
+  vertical `ScrollArea` with `auto_shrink([false, false])` and an explicit max
+  height, a footer. Each pane used to size itself — two had no scroll area at
+  all and simply stretched the modal, and the two that had one sized it from
+  whatever space was left over, which is a different number on every page. The
+  scroll area claiming its space whatever is in it is the whole fix, and being
+  vertical it also cannot produce a horizontal bar. Panes must not add scroll
+  areas of their own: nested scrolling makes the wheel mean two things.
 - **`egui::DragValue` is the one stock widget used on purpose.** The design has
   no numeric field, and a canvas size is one of the few values here that people
   type exactly rather than feel for on a rail. Everything else in those dialogs
