@@ -54,8 +54,13 @@ use super::report::Report;
 /// the screen with its buttons out of reach. The details scroll instead.
 const WINDOW: [f32; 2] = [560.0, 520.0];
 
-/// The tallest the details block grows before it scrolls.
-const DETAILS_HEIGHT: f32 = 200.0;
+/// What the footer takes: one row of buttons and the space above it.
+const FOOTER: f32 = 36.0;
+
+/// The least the scrolling body is ever given, however short the window is
+/// dragged. Below this it stops being readable and the box may as well not have
+/// opened.
+const MIN_BODY: f32 = 120.0;
 
 /// Show the report. Returns once the window has closed.
 pub fn show(report: &Report, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -149,7 +154,17 @@ impl ApplicationHandler for Reporter<'_> {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gfx) = self.gfx.as_mut() else { return };
-        let _ = gfx.egui_state.on_window_event(&gfx.window, &event);
+        // The answer matters, and forgetting it is a bug this had: under
+        // `ControlFlow::Wait` nothing draws unless a redraw is asked for, and a
+        // frame is the only thing that ever *reads* the input egui was just
+        // handed. Without this the pointer moved, the button went down and up,
+        // and the box sat there — every click swallowed, because the frame that
+        // would have seen it never happened. `app.rs` asks for its redraws from
+        // the input path for exactly this reason; there is no canvas here to
+        // hide it.
+        if gfx.egui_state.on_window_event(&gfx.window, &event).repaint {
+            gfx.window.request_redraw();
+        }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -160,7 +175,13 @@ impl ApplicationHandler for Reporter<'_> {
                 gfx.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                if self.render() {
+                // Named rather than tested inline. Clippy would rather this
+                // were a match guard — `RedrawRequested if self.render()` —
+                // which hides a frame being drawn inside a pattern, and a guard
+                // with a side effect is a worse thing to read than an extra
+                // line.
+                let dismissed = self.render();
+                if dismissed {
                     event_loop.exit();
                 }
             }
@@ -408,42 +429,55 @@ fn body(
             heading(ui, p, report);
             ui.add_space(12.0);
 
-            // What happened, in plain words. The heading is the greeting; this
-            // is the part somebody has to be able to act on.
-            paragraph(
-                ui,
-                p,
-                "Umber ran into a problem it could not carry on from and had to \
-                 stop. Nothing about this has left your machine: the report \
-                 below is a file on this computer and stays there unless you \
-                 send it.",
-            );
+            // The settings dialog's shape, and for its reason: a header, **one**
+            // vertical `ScrollArea` claiming an explicit height, a footer. Two
+            // things here are unbounded — the list of open documents and the
+            // backtrace — and letting either size the window means a box whose
+            // buttons are off the bottom of the screen. Expanding the details
+            // used to do exactly that, which is what this replaces.
+            //
+            // The height is what is left after the footer, taken before the
+            // body is drawn rather than after, so the buttons cannot be pushed
+            // anywhere by what goes above them.
+            let room = (ui.available_height() - FOOTER).max(MIN_BODY);
+            egui::ScrollArea::vertical()
+                .max_height(room)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // What happened, in plain words. The heading is the
+                    // greeting; this is the part somebody has to act on.
+                    paragraph(
+                        ui,
+                        p,
+                        "Umber ran into a problem it could not carry on from and \
+                         had to stop. Nothing about this has left your machine: \
+                         the report below is a file on this computer and stays \
+                         there unless you send it.",
+                    );
 
-            ui.add_space(14.0);
-            work(ui, p, report);
+                    ui.add_space(14.0);
+                    work(ui, p, report);
 
-            ui.add_space(14.0);
-            technical(ui, p, details, actions.expanded);
+                    ui.add_space(14.0);
+                    technical(ui, p, details, actions.expanded);
 
-            ui.add_space(10.0);
-            where_the_report_is(ui, p, report_path);
-
-            // The buttons sit at the foot of the window rather than under the
-            // last line, so they do not move as the details are opened and
-            // shut — a button that walks out from under the pointer as the
-            // thing above it grows is how a Close becomes a Restart.
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if tabs::button(ui, p, "Restart Umber", true) {
-                            *actions.restart = true;
-                            *actions.close = true;
-                        }
-                        if tabs::button(ui, p, "Close", false) {
-                            *actions.close = true;
-                        }
-                    });
+                    ui.add_space(12.0);
+                    where_the_report_is(ui, p, report_path);
                 });
+
+            // The footer, outside the scroll area, so the buttons stay where
+            // they are however long the details run — a control that walks out
+            // from under the pointer as the thing above it grows is how a Close
+            // becomes a Restart.
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if tabs::button(ui, p, "Restart Umber", true) {
+                    *actions.restart = true;
+                    *actions.close = true;
+                }
+                if tabs::button(ui, p, "Close", false) {
+                    *actions.close = true;
+                }
             });
         });
     });
@@ -565,53 +599,60 @@ fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool)
     }
 
     ui.add_space(6.0);
-    // Bounded and scrolling, never sizing the window. A backtrace is arbitrarily
-    // long, and an egui label left to `TextWrapMode::Extend` inside a horizontal
-    // layout is what put the brush browser wider than the screen — the same trap
-    // exactly, with worse text.
-    egui::ScrollArea::vertical()
-        .max_height(DETAILS_HEIGHT)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // Read-only, and therefore genuinely selectable: `&str` is a
-            // `TextBuffer` that reports itself immutable, so egui draws a real
-            // text field that cannot be edited. See the module docs for why
-            // there is no Copy button beside it.
-            let mut text = details;
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .font(egui::FontId::monospace(text::TINY))
-                    .desired_width(f32::INFINITY)
-                    .text_color(p.text_muted),
-            );
-        });
+    // Deliberately **no scroll area of its own**. This sits inside the body's
+    // one `ScrollArea`, and a second one nested in it would make the wheel mean
+    // two things depending on where the pointer happened to be — the rule the
+    // settings dialog's panes live by. The text is bounded instead, by
+    // `report::BACKTRACE_LIMIT` where it is captured, so "as tall as it needs"
+    // has a ceiling.
+    //
+    // Read-only, and therefore genuinely selectable: `&str` is a `TextBuffer`
+    // that reports itself immutable, so egui draws a real text field that
+    // cannot be edited. See the module docs for why there is no Copy button
+    // beside it.
+    let mut text = details;
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .font(egui::FontId::monospace(text::TINY))
+            .desired_width(f32::INFINITY)
+            .text_color(p.text_muted),
+    );
 }
 
 /// Where the file is, and the one control that gets it out of this window.
+///
+/// The path is on a line of its own, **wrapped explicitly**. A report path is
+/// the longest string in this window — the data directory plus a timestamped
+/// name — and an egui label defaults to `TextWrapMode::Extend`, which is what
+/// put the brush browser wider than the screen. Beside a button in a
+/// right-to-left row it does not widen the window, because the window is fixed;
+/// it runs off the *left* edge instead and the start of the path is lost, which
+/// is worse. `Label::wrap` is the fix, not `set_max_width`.
+///
+/// The button sits under it and to the left, with the dialog's own actions far
+/// away at the bottom right: this one belongs to the path above it, not to the
+/// question the box is asking.
 fn where_the_report_is(ui: &mut egui::Ui, p: &Palette, path: &Path) {
-    ui.horizontal(|ui| {
-        // The button first, so the label wraps into whatever is left rather
-        // than pushing the button off the edge — a path is the longest string
-        // in this window and `Extend` is the default.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(dir) = path.parent()
-                && tabs::button(ui, p, "Show the report", false)
-            {
-                // The same opener the settings dialog uses for the autosave
-                // directory. Best effort by construction — there is no portable
-                // way to ask — which is why the path is printed beside it.
-                if let Err(e) = crate::autosave::reveal(dir) {
-                    log::warn!("could not open {}: {e}", dir.display());
-                }
-            }
-            ui.label(
-                egui::RichText::new(format!("Saved to {}", path.display()))
-                    .size(9.5)
-                    .color(p.text_dim)
-                    .line_height(Some(12.5)),
-            );
-        });
-    });
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!("Saved to {}", path.display()))
+                .size(9.5)
+                .color(p.text_dim)
+                .line_height(Some(12.5)),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    if let Some(dir) = path.parent()
+        && tabs::button(ui, p, "Show the report", false)
+    {
+        // The same opener the settings dialog uses for the autosave directory.
+        // Best effort by construction — there is no portable way to ask — which
+        // is why the path is printed above it rather than only linked.
+        if let Err(e) = crate::autosave::reveal(dir) {
+            log::warn!("could not open {}: {e}", dir.display());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
