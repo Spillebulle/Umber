@@ -4,10 +4,11 @@
 // of one operation and drift between them would be a mask applied in one place
 // and not the other:
 //
-// * `fs_mask` writes coverage into the alpha channel and nothing into the
-//   colour. What it *does* is entirely the blend state's — `dst * cov` lifts
-//   the selected pixels into the floating copy, `dst * (1 - cov)` punches the
-//   hole they left. See `canvas.rs`.
+// * `fs_mask` writes a *share* into the alpha channel and nothing into the
+//   colour. What it *does* is entirely the blend state's — `dst * share` lifts
+//   the selected pixels into the floating copy, `dst * (1 - share)` punches the
+//   hole they left. See `canvas.rs`, and see `fs_mask` for why the share is not
+//   simply the selection's coverage.
 // * `fs_sample` is the resampler. It walks the destination rectangle and asks
 //   the **inverse** transform where each pixel came from, then takes one
 //   bilinear tap — the sampler is `Linear`, so the filter is free and is the
@@ -48,8 +49,12 @@ struct Xf {
 };
 
 @group(0) @binding(0) var<uniform> u: Xf;
-// The floating pixels at identity: canvas-sized, zero outside the region that
-// was lifted or pasted.
+// What the pass reads. For `fs_sample` it is the floating pixels at identity:
+// canvas-sized, zero outside the region that was lifted or pasted. For the two
+// mask passes it is the **layer's own slice**, untouched, because the share
+// they compute is a share of what is already there — and neither of their
+// targets, the base and the floating copy, may be bound for sampling while it
+// is a colour attachment.
 @group(0) @binding(1) var src_tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 // The selection's coverage over its own bounding rectangle, or a 1x1
@@ -85,9 +90,36 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-// The selection's coverage at this fragment, as alpha. The colour is zero
-// because both blend states this feeds zero the source factor — nothing here is
-// added to the target, only scaled out of it.
+// The share of what this fragment already holds that the selection lays claim
+// to, as alpha. The colour is zero because both blend states this feeds zero
+// the source factor — nothing here is added to the target, only scaled out of
+// it.
+//
+// **The share is not the selection's coverage**, and taking it to be was a real
+// bug: it left a one-pixel ghost of the outline behind every lift. Painting is
+// clipped by the same mask — that is `dab.wgsl`'s whole job — so a pixel the
+// selection half covers already holds half a stroke's alpha. Scaling that by a
+// half *again* carries a quarter into the float and leaves a quarter on the
+// layer, in a ring right round the selection. The mask was being applied twice.
+//
+// So the lift is a `min`, not a multiply. Of the alpha `a` that is there, the
+// part lying inside the selection can be no more than the selection's own
+// coverage `m`, and this takes it to be exactly `min(a, m)`: the paint sits in
+// the selected part of the pixel wherever it can. That is precisely true for
+// anything painted through this selection, and it can never take more than is
+// there. Three cases, and it is the same expression for all of them:
+//
+// * `a == m` — painted through this selection. The float takes all of it and
+//   the hole is exactly zero. No ghost.
+// * `a == 1` — opaque pixels lassoed out of a picture. `min(a, m)` is `m`, so
+//   this is the old behaviour unchanged: the moved edge carries the selection's
+//   own antialiasing and the hole carries its complement.
+// * `a < m` — the content's own soft edge inside the selection. The float takes
+//   it whole, with that falloff intact rather than multiplied by the mask's.
+//
+// One number drives both passes — the float is scaled by the share and the hole
+// by its complement — so the two cannot disagree about where the paint went,
+// for the same reason `render_float` is one function called twice.
 @fragment
 fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     let uv = (in.doc - u.mask_min) / u.mask_size;
@@ -97,7 +129,16 @@ fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     let inside = uv.x >= 0.0 && uv.y >= 0.0 && uv.x < 1.0 && uv.y < 1.0;
     let sampled = select(0.0, textureSampleLevel(mask_tex, samp, uv, 0.0).r, inside);
     let cov = select(1.0, sampled, u.use_mask != 0u);
-    return vec4<f32>(0.0, 0.0, 0.0, cov);
+    // Alpha survives the sRGB view unchanged — the transfer function is on the
+    // colour channels only — so this is the same linear 0..1 the coverage is.
+    let a = textureSampleLevel(src_tex, samp, in.doc / u.doc_size, 0.0).a;
+    // `max` in the divisor rather than a branch on `a > 0`: `min(a, cov)` is
+    // never above `a` and `a` is never above the divisor, so the share stays
+    // within 0..1, and a bare pixel gives `0 / eps` rather than a NaN that
+    // would carry across the whole quad. With no selection `cov` is 1.0 and the
+    // share is exactly 1.0, which is what lets the keep pass be skipped whole.
+    let share = min(a, cov) / max(a, 1.0e-6);
+    return vec4<f32>(0.0, 0.0, 0.0, share);
 }
 
 // One bilinear tap through the inverse transform.
