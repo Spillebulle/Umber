@@ -121,6 +121,26 @@ impl Rect {
         self.max = self.max.max(other.max);
     }
 
+    /// The part of this rectangle that is also inside `other`.
+    ///
+    /// `None` when they do not meet at all. A rectangle that only *touches*
+    /// another along an edge is still an answer — it has a position, which is
+    /// all [`crate::overlay`] asks of it — where two that miss each other have
+    /// nothing to say.
+    pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+        let min = self.min.max(other.min);
+        let max = self.max.min(other.max);
+        (min.x <= max.x && min.y <= max.y).then_some(Rect { min, max })
+    }
+
+    pub fn center(&self) -> Vec2 {
+        (self.min + self.max) * 0.5
+    }
+
+    pub fn size(&self) -> Vec2 {
+        self.max - self.min
+    }
+
     /// Snap outwards to whole pixels and clamp to a document of `size`.
     ///
     /// Returns `None` when the result would be zero-area, which lets callers

@@ -886,6 +886,40 @@ impl UmberApp {
         true
     }
 
+    /// Settle the document and answer what a copy or a cut should act on: the
+    /// rectangle to read, and the mask that clips it.
+    ///
+    /// **A float in hand is put down first, and that is one rule for all three
+    /// of copy, cut and paste.** The clipboard is a picture of the document, and
+    /// while pixels are in the air the document has no definite state to take a
+    /// picture of — the same reason every path that leaves it (a tab switch, a
+    /// save, an export, a resize, a close) commits first. Once committed those
+    /// pixels *are* the document, so what follows needs no special case.
+    ///
+    /// **And it deliberately gets none.** A float that arrived by *paste* did
+    /// not come out of the selection, so after the commit the marquee names
+    /// somewhere else and a copy answers "nothing to copy". Reading the float's
+    /// destination rectangle instead is the obvious repair and is wrong, in a
+    /// way that only shows up on the cut: `Transform::dest_rect` is the bounding
+    /// box of the **quad**, plus a skirt, and a rectangle is not the shape of
+    /// the picture. Cutting it with no mask clears every pixel in that box — the
+    /// four corners left over by a rotation, whatever showed through the clip's
+    /// own transparency, and the skirt — none of which the paste ever covered.
+    /// That is silent damage to the layer, recorded as one entry, and worse than
+    /// a Ctrl+C that does nothing. The clipboard already holds what was pasted,
+    /// which is what makes the missing case cheap; putting it back needs the
+    /// clip's own alpha as a mask, not its bounding box.
+    fn take_region(&mut self) -> (PixelRect, Option<Arc<umber_core::Selection>>) {
+        self.finish_transform();
+        self.finish_stroke();
+        // A *lift* carried the marquee with it at commit, so after that the
+        // selection is already over the pixels that were being held.
+        (
+            self.editor.transform_region(),
+            self.editor.selection.clone(),
+        )
+    }
+
     /// Take the selection — or the whole layer where there is none — onto
     /// Umber's clipboard.
     ///
@@ -893,11 +927,8 @@ impl UmberApp {
     /// it is acceptable in a save: this is an explicit action and is nowhere
     /// near the drawing loop.
     fn copy_selection(&mut self) {
-        self.finish_transform();
-        self.finish_stroke();
-        let rect = self.editor.transform_region();
+        let (rect, mask) = self.take_region();
         let slot = self.editor.layers.active_slot();
-        let mask = self.editor.selection.clone();
         let id = self.editor.session.active_id();
 
         let Some(gfx) = self.gfx.as_ref() else { return };
@@ -915,6 +946,73 @@ impl UmberApp {
             // canvas would lose whatever the artist actually meant to keep.
             None => log::info!("nothing to copy"),
         }
+    }
+
+    /// The same take, and then the pixels leave the layer.
+    ///
+    /// One readback serves three purposes — what goes on the clipboard, what is
+    /// written back, and the undo patch — because the bytes read here *are* the
+    /// pre-cut state of the rectangle. There is no second blocking read, and
+    /// `Clip::cut_from_layer` is what guarantees the removal is the exact
+    /// complement of what was taken rather than a second reading of the mask.
+    ///
+    /// **The entry is an `Erase`, and that is not a placeholder.** A cut
+    /// removes coverage and undoes by putting a rectangle of pixels back, which
+    /// is what an eraser stroke is and undoes as; `EditKind` carries a variant
+    /// only where the engine can restore something, and two rows that undo
+    /// identically must not have two names — the same rule that keeps a paste
+    /// filed under Transform.
+    ///
+    /// **The patch is the rectangle, not the cells a mark reached**, because a
+    /// cut has no `TileMask` to have accumulated one from. With nothing selected
+    /// that rectangle is the whole canvas, so on the 10000² document the Undo
+    /// section uses as its bound a bare Ctrl+X costs 400 MB and the 512 MB
+    /// budget holds exactly one — the history before it ages out. That follows
+    /// from the same rule a stroke across such a canvas follows and is said here
+    /// rather than left to look like a fault.
+    fn cut_selection(&mut self) {
+        // **The one gate a lock has on cutting.** An explicit command with one
+        // obvious outcome, so it says so, exactly as a paste onto a locked
+        // layer does.
+        if self.editor.layers.active_is_locked() {
+            self.editor.notice = Some(Notice {
+                title: "The layer is locked".to_string(),
+                lines: vec![
+                    "Nothing was cut. Unlock the layer in the Layers panel, or select \
+                     another one, and cut again."
+                        .to_string(),
+                ],
+            });
+            return;
+        }
+        let (rect, mask) = self.take_region();
+        let slot = self.editor.layers.active_slot();
+        let id = self.editor.session.active_id();
+
+        // Mutable because writing a slice bumps its thumbnail revision — the
+        // list has to redraw the row a cut just emptied.
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
+        let bytes = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
+        // `None` on exactly the terms a copy gets it: there was nothing under
+        // the selection. The layer is then left alone rather than written with
+        // a copy of itself and given a history entry that restores nothing.
+        let Some(cut) = umber_core::Clip::cut_from_layer(rect, &bytes, mask.as_deref()) else {
+            log::info!("nothing to cut");
+            return;
+        };
+        canvas.write_layer_rect(&gfx.gpu.queue, slot, rect, &cut.remainder);
+        log::info!("cut {} × {}", cut.clip.size().x, cut.clip.size().y);
+
+        self.editor.history.record(Edit::new(
+            EditKind::Erase,
+            PixelPatch::new(rect, slot, bytes),
+        ));
+        self.editor.clipboard = Some(cut.clip);
+        self.editor.mark_modified();
+        self.request_redraw();
     }
 
     /// Put the clipboard down as a floating transform, ready to be moved.
@@ -1219,6 +1317,7 @@ impl UmberApp {
             Action::Redo => self.redo(),
             Action::Deselect => self.editor.deselect(),
             Action::Copy => self.copy_selection(),
+            Action::Cut => self.cut_selection(),
             Action::Paste => self.paste(),
             Action::FlipCanvasHorizontal => self.flip_canvas(umber_core::FlipAxis::Horizontal),
             Action::FlipCanvasVertical => self.flip_canvas(umber_core::FlipAxis::Vertical),
@@ -2080,6 +2179,15 @@ impl UmberApp {
         }
         if actions.clear {
             self.clear_active_layer();
+        }
+        // The selection's own strip of controls. The GPU is what a copy and a
+        // cut need, so like every other entry here they come back as a request
+        // rather than being carried out where they were drawn.
+        if actions.copy_selection {
+            self.copy_selection();
+        }
+        if actions.cut_selection {
+            self.cut_selection();
         }
         if actions.open_export {
             self.editor.export_form.open = true;

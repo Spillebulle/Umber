@@ -34,6 +34,13 @@ use umber_core::{
 #[derive(Default, Clone, Copy)]
 pub struct UiActions {
     pub clear: bool,
+    /// Take the selection onto Umber's clipboard, and — for a cut — off the
+    /// layer. The caller's, because both block on a readback and a cut records
+    /// an undo entry. Raised by the selection's overlay strip, which is the only
+    /// control for either; the keyboard reaches the same two methods directly
+    /// rather than through here.
+    pub copy_selection: bool,
+    pub cut_selection: bool,
     /// Put the Export dialog up. Nothing is written by this: it only asks the
     /// format, and the answer comes back as `export`.
     pub open_export: bool,
@@ -281,6 +288,12 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .show(root, |ui| {
             let rect = ui.max_rect();
             selection_outline(ui, &p, ed, rect);
+            // Beside the outline it belongs to rather than beside the
+            // transform box, which is the other thing drawn here and is what
+            // takes its place: `selection_buttons` returns early while a float
+            // is up, so the two can never both be on screen and the order of
+            // these two calls does not matter.
+            selection_buttons(ui, &p, ed, rect, &mut actions);
             transform_box(ui, &p, ed, rect);
             canvas_scrollbars(ui, &p, ed, rect);
             brush_size_preview(ui, &p, ed);
@@ -462,9 +475,21 @@ const ROTATE_LEADER: (f32, f32) = (9.0, 20.0);
 /// icons are drawn at.
 const ROTATE_MARK: f32 = 18.0;
 
-/// Side of a flip button, and the gap between the pair and the top of the box.
-const FLIP_BUTTON: f32 = 22.0;
-const FLIP_GAP: f32 = 12.0;
+/// Side of a button drawn over the canvas, the clearance between a strip of
+/// them and the thing it acts on, and the gap between two of them.
+///
+/// One set of numbers for both strips — the floating transform's flip pair and
+/// the selection's Deselect / Copy / Cut — because they are the same control in
+/// the same kind of place, and two sets would let them drift apart on screen
+/// for no reason anybody could state.
+const CANVAS_BUTTON: f32 = 22.0;
+const CANVAS_BUTTON_GAP: f32 = 12.0;
+const CANVAS_BUTTON_SPACING: f32 = 4.0;
+
+/// The width a strip of `n` canvas buttons takes.
+fn strip_width(n: usize) -> f32 {
+    n as f32 * CANVAS_BUTTON + (n.saturating_sub(1)) as f32 * CANVAS_BUTTON_SPACING
+}
 
 /// The box round a floating transform, and the controls that act on it.
 ///
@@ -588,17 +613,20 @@ fn flip_buttons(
     corners: &[egui::Pos2],
 ) {
     let bounds = Rect::from_points(corners);
-    let gap = 4.0;
-    let width = FLIP_BUTTON * 2.0 + gap;
-    let top = bounds.top() - FLIP_GAP - FLIP_BUTTON;
+    let width = strip_width(2);
+    let top = bounds.top() - CANVAS_BUTTON_GAP - CANVAS_BUTTON;
     let strip = Rect::from_min_size(
         pos2(bounds.center().x - width * 0.5, top),
-        vec2(width, FLIP_BUTTON),
+        vec2(width, CANVAS_BUTTON),
     );
     // A box dragged up under the strips takes its buttons off the top of the
     // canvas region with it. Drawing them clipped would leave live targets
     // nobody can see, so they are simply not offered — the box can be dragged
     // back down, and Enter still puts it down from anywhere.
+    //
+    // Deliberately *not* the selection strip's rule, which pulls itself back on
+    // screen instead: a floating transform can be moved and a selection cannot,
+    // so there the artist would have no way of reaching the controls at all.
     if !rect.contains_rect(strip) {
         return;
     }
@@ -619,38 +647,21 @@ fn flip_buttons(
     .enumerate()
     {
         let at = Rect::from_min_size(
-            pos2(strip.left() + i as f32 * (FLIP_BUTTON + gap), strip.top()),
-            egui::Vec2::splat(FLIP_BUTTON),
+            pos2(
+                strip.left() + i as f32 * (CANVAS_BUTTON + CANVAS_BUTTON_SPACING),
+                strip.top(),
+            ),
+            egui::Vec2::splat(CANVAS_BUTTON),
         );
         ed.transform_buttons[i] = Some(at);
-        let response = ui.interact(at, ui.id().with(("float-flip", i)), Sense::click());
-        let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(
+        let button = CanvasButton {
             at,
-            metrics::RADIUS,
-            if response.hovered() {
-                p.control_hover
-            } else {
-                p.control
-            },
-        );
-        painter.rect_stroke(
-            at,
-            metrics::RADIUS,
-            Stroke::new(1.0, p.border),
-            egui::StrokeKind::Inside,
-        );
-        icons::draw(
-            &painter,
-            at.shrink(3.0),
+            clip: rect,
+            id: ("float-flip", i),
             icon,
-            if response.hovered() {
-                p.text_strong
-            } else {
-                p.text
-            },
-        );
-        if response.on_hover_text(tip).clicked()
+            enabled: true,
+        };
+        if canvas_button(ui, p, button, || tip.to_string())
             && let Some(float) = ed.float.as_mut()
         {
             if flip {
@@ -660,6 +671,215 @@ fn flip_buttons(
             }
         }
     }
+}
+
+/// The live selection's own controls: Deselect, Copy and Cut, in a strip beside
+/// the marquee.
+///
+/// **Real buttons over the canvas**, exactly as the flip pair above are, so
+/// their rectangles go into `Editor::selection_buttons` and through
+/// `canvas_overlay_owns_pointer` — otherwise a press on one is also a press on
+/// the canvas, which with a brush in hand is a dab painted under the button
+/// that was clicked, inside the very selection somebody was about to copy. That
+/// test is consulted on the pen's path as well as the mouse's, through
+/// `pointer_over_canvas`, so this cannot be a control that works with a mouse
+/// and paints with a pen.
+///
+/// **Gone the moment the pixels are picked up.** A float has the transform
+/// tool's own strip in that place, and a Copy beside it would be a control
+/// about a selection that is no longer what an edit acts on.
+///
+/// Where the strip goes is `umber_core::overlay`'s, with the reasoning there:
+/// the marquee can be scrolled half off the view, pushed under a docked panel
+/// or drawn round the whole canvas, and unlike a floating transform it cannot
+/// be dragged back into reach — so the strip comes to the pointer rather than
+/// declining to appear.
+fn selection_buttons(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    rect: Rect,
+    actions: &mut UiActions,
+) {
+    ed.selection_buttons = [None, None, None];
+    if ed.float.is_some() {
+        return;
+    }
+    let Some(bounds) = ed.selection.as_ref().map(|s| s.bounds()) else {
+        return;
+    };
+
+    // This frame's canvas rect, for the reason `selection_outline` gives:
+    // `Editor::canvas_pivot` is written after this runs and is a frame behind
+    // while the panels are being dragged.
+    let scale = ed.pixels_per_point.max(1e-3);
+    let pivot = glam::Vec2::new(rect.center().x, rect.center().y) * scale;
+    let camera = ed.camera;
+    let to_screen = |doc: glam::Vec2| {
+        let s = camera.doc_to_screen(doc, pivot);
+        glam::Vec2::new(s.x / scale, s.y / scale)
+    };
+
+    let anchor = umber_core::Rect::new(
+        to_screen(glam::Vec2::new(bounds.x as f32, bounds.y as f32)),
+        to_screen(glam::Vec2::new(
+            (bounds.x + bounds.width) as f32,
+            (bounds.y + bounds.height) as f32,
+        )),
+    );
+    let view = umber_core::Rect::new(
+        glam::Vec2::new(rect.left(), rect.top()),
+        glam::Vec2::new(rect.right(), rect.bottom()),
+    );
+    let size = glam::Vec2::new(strip_width(3), CANVAS_BUTTON);
+    let Some(strip) = umber_core::overlay::place_strip(anchor, view, size, CANVAS_BUTTON_GAP)
+    else {
+        return;
+    };
+
+    // Cut writes to the layer, so a locked one refuses it — and the control
+    // says so before the click rather than answering with a dialog, which is
+    // the rule "Clear layer" already follows against its own menu item. Copy
+    // and Deselect write nothing and are never refused.
+    let locked = ed.layers.active_is_locked();
+    let mut deselect = false;
+    for (i, (icon, enabled)) in [
+        (Icon::Deselect, true),
+        (Icon::Copy, true),
+        (Icon::Cut, !locked),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = Rect::from_min_size(
+            pos2(
+                strip.rect.min.x + i as f32 * (CANVAS_BUTTON + CANVAS_BUTTON_SPACING),
+                strip.rect.min.y,
+            ),
+            egui::Vec2::splat(CANVAS_BUTTON),
+        );
+        // Recorded whatever happens next — including for a *disabled* button,
+        // which still must not let a press through to the canvas underneath it.
+        ed.selection_buttons[i] = Some(at);
+        // The tooltip is built inside the closure, which egui calls only while
+        // the pointer is actually on the button. `shortcuts::labelled` formats
+        // a string and reads the binding table behind a lock, and this runs
+        // several times a second for as long as a selection is open — the same
+        // reason `Editor::selection_screen` exists.
+        let button = CanvasButton {
+            at,
+            clip: rect,
+            id: ("selection-strip", i),
+            icon,
+            enabled,
+        };
+        let clicked = canvas_button(ui, p, button, || match i {
+            0 => shortcuts::labelled("Deselect", Action::Deselect),
+            1 => shortcuts::labelled("Copy the selection", Action::Copy),
+            _ if locked => "The layer is locked, so nothing can be cut out of it. \
+                            Unlock it in the Layers panel."
+                .to_string(),
+            _ => shortcuts::labelled("Cut the selection", Action::Cut),
+        });
+        if clicked {
+            match i {
+                0 => deselect = true,
+                1 => actions.copy_selection = true,
+                _ => actions.cut_selection = true,
+            }
+        }
+    }
+    // After the loop, because it takes the selection this frame's rectangles
+    // were computed from.
+    //
+    // The rectangles are deliberately **left standing** for the rest of this
+    // frame. The buttons have already been painted into it, so clearing them
+    // would leave three marks on screen that the canvas owns — and a press
+    // there would paint a dab under a button the artist can still see. The
+    // opposite window costs a swallowed press over open canvas and no pixels,
+    // which is the cheaper of the two; the repaint below closes it next frame
+    // rather than waiting for egui to volunteer one.
+    if deselect {
+        ed.deselect();
+        ui.ctx().request_repaint();
+    }
+}
+
+/// One button of a strip drawn over the canvas.
+///
+/// Shared by the two strips so they cannot look like different controls. The
+/// caller records `at` before calling: whether the click is acted on is the
+/// caller's, but whether a *press* there belongs to the canvas is not, and a
+/// button whose rectangle was only recorded on the frame it happened to be
+/// clicked would paint underneath itself on every other one.
+///
+/// A disabled one still hovers and still shows its tooltip, matching
+/// [`icon_button`] and for the same reason: the tooltip is usually the
+/// *explanation*, and skipping the hover along with the click leaves a dead
+/// mark with nothing to say for itself.
+///
+/// `tip` is a closure because egui calls it only while the pointer is on the
+/// button. Building the text unconditionally would allocate on the drawing
+/// path, and a canvas overlay is drawn for as long as the thing it belongs to
+/// is on screen.
+struct CanvasButton {
+    /// Where it goes, in points.
+    at: Rect,
+    /// The canvas region. Painting is clipped to it, so a strip that reaches
+    /// the edge does not draw over a panel.
+    clip: Rect,
+    /// Unique within the frame; the strip and the index within it.
+    id: (&'static str, usize),
+    icon: Icon,
+    enabled: bool,
+}
+
+fn canvas_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    button: CanvasButton,
+    tip: impl FnOnce() -> String,
+) -> bool {
+    let CanvasButton {
+        at,
+        clip,
+        id,
+        icon,
+        enabled,
+    } = button;
+    let response = ui.interact(
+        at,
+        ui.id().with(id),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let lit = enabled && response.hovered();
+    let painter = ui.painter().with_clip_rect(clip);
+    painter.rect_filled(
+        at,
+        metrics::RADIUS,
+        if lit { p.control_hover } else { p.control },
+    );
+    painter.rect_stroke(
+        at,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    let ink = match (enabled, lit) {
+        (false, _) => p.text_dim,
+        (_, true) => p.text_strong,
+        _ => p.text,
+    };
+    icons::draw(&painter, at.shrink(3.0), icon, ink);
+    response
+        .on_hover_ui(|ui| {
+            ui.label(tip());
+        })
+        .clicked()
 }
 
 /// The canvas scrollbars, along the bottom and the right of the document

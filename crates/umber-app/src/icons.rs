@@ -92,6 +92,16 @@ pub enum Icon {
     /// circled `!` is a warning somebody can carry on past, and this is
     /// neither.
     Alert,
+    // The selection's own strip of controls, drawn over the canvas beside a
+    // marquee. Added at the end for the reason `BrushNew` was.
+    /// Two sheets, one behind the other: take a copy and leave the original.
+    Copy,
+    /// A pair of scissors: take it and leave nothing.
+    Cut,
+    /// `Select`'s dashed box with a stroke through it — not the box greyed, and
+    /// not `Close`'s cross: this clears one specific thing, and the mark has to
+    /// say *which*.
+    Deselect,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -473,6 +483,46 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             ]);
             line(at(12.0, 9.5), at(12.0, 15.0));
             painter.circle_filled(at(12.0, 18.0), 1.3 * scale, colour);
+        }
+
+        Icon::Copy => {
+            // The sheet behind is drawn as three sides rather than a whole
+            // rectangle: at 18 px a complete second box under the first reads
+            // as one thick-walled frame, where an open corner reads as depth.
+            path(vec![at(9.0, 5.0), at(19.0, 5.0), at(19.0, 15.0)]);
+            path(vec![
+                at(5.0, 9.0),
+                at(15.0, 9.0),
+                at(15.0, 19.0),
+                at(5.0, 19.0),
+                at(5.0, 9.0),
+            ]);
+        }
+
+        Icon::Cut => {
+            // Two blades crossing above two finger rings. The crossing point is
+            // above centre so the rings have room to be circles rather than
+            // dots — below about 14 px they merge with the blades otherwise,
+            // and what is left reads as a plus.
+            line(at(7.0, 4.0), at(15.5, 15.5));
+            line(at(17.0, 4.0), at(8.5, 15.5));
+            painter.circle_stroke(at(7.0, 18.0), 2.6 * scale, stroke);
+            painter.circle_stroke(at(17.0, 18.0), 2.6 * scale, stroke);
+        }
+
+        Icon::Deselect => {
+            // `Select`'s box, drawn a size smaller to leave room for the
+            // stroke, with its dash spans scaled to match so the two read as
+            // the same object with something done to it.
+            const LO: f32 = 6.0;
+            const HI: f32 = 18.0;
+            for (from, to) in [(0.0, 3.5), (5.0, 7.0), (8.5, 12.0)] {
+                line(at(LO + from, LO), at(LO + to, LO));
+                line(at(LO + from, HI), at(LO + to, HI));
+                line(at(LO, LO + from), at(LO, LO + to));
+                line(at(HI, LO + from), at(HI, LO + to));
+            }
+            line(at(4.0, 20.0), at(20.0, 4.0));
         }
 
         Icon::HalfCircle => {

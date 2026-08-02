@@ -388,6 +388,13 @@ ants. They march at sixteen frames a second rather than your monitor's rate,
 and only while something is selected, so a document you are not touching still
 sits still.
 
+Three buttons sit just above the marquee — **deselect**, **copy** and **cut** —
+and they follow it: scroll the picture until the selection is half off the view
+or under a panel and they come back on screen rather than going with it, because
+a button you cannot reach is worse than no button. They go away the moment you
+pick the pixels up with the transform tool, which has its own pair of controls
+in that place.
+
 ## Moving things about
 
 The **Transform** tool picks a region up and lets you move, scale and turn it
@@ -409,9 +416,15 @@ hole they came from, in a single step. The marquee travels with the picture it
 described. Scaling and rotation resample bilinearly, which is what the preview
 shows — the picture you are dragging is the picture that gets committed.
 
-`Ctrl` + `C` copies the selection, or the whole layer where there is none, and
-`Ctrl` + `V` pastes it back as a floating region the transform tool is already
-holding. A paste lands in the middle of the selection if there is one and
+`Ctrl` + `C` copies the selection, or the whole layer where there is none,
+`Ctrl` + `X` cuts it — the same pixels, taken off the layer in one undoable
+step — and `Ctrl` + `V` pastes it back as a floating region the transform tool
+is already holding. What a cut removes is exactly what it took, edge included,
+so a soft or diagonal selection leaves no ghost of itself behind. All three put
+a floating picture down first, because the clipboard holds a picture of the
+document and there is no such thing while pixels are still in the air.
+
+A paste lands in the middle of the selection if there is one and
 otherwise in the middle of what you are looking at, nudged back on to the canvas
 if it would hang off. Something copied from a larger canvas is cropped to what
 fits, and Umber says so rather than doing it quietly. The clipboard is Umber's
@@ -424,7 +437,7 @@ own: it carries between tabs but not yet to and from other applications.
 | Left drag | Use the selected tool |
 | `B` / `E` / `S` / `T` / `H` / `Z` | Brush / eraser / select / transform / pan / zoom |
 | `Ctrl` + `D` | Deselect |
-| `Ctrl` + `C` / `Ctrl` + `V` | Copy / paste |
+| `Ctrl` + `C` / `Ctrl` + `X` / `Ctrl` + `V` | Copy / cut / paste |
 | `Shift` / `Ctrl` + drag with Select | Add the new shape to the selection / take it away |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `Enter` / `Esc` while transforming | Put the picture down / throw the move away |
