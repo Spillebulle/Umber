@@ -232,7 +232,30 @@ pub const CLIP_ATTR: &str = "umber-clip";
 pub const LOCK_ATTR: &str = "umber-lock";
 
 /// `<layer>` attribute marking a linked layer, spelled `"true"`.
+///
+/// Still written, on every layer that belongs to any group, even though
+/// [`LINK_GROUP_ATTR`] beside it says more. It is what an Umber built before
+/// groups existed reads, and what it then does — treat every linked layer in
+/// the document as one set — is exactly what it did before, which is the
+/// behaviour that file was written by. See [`LINK_GROUP_ATTR`] for why neither
+/// attribute moved [`VERSION`].
 pub const LINK_ATTR: &str = "umber-link";
+
+/// `<layer>` attribute naming which link group the layer is in, spelled as a
+/// decimal number.
+///
+/// **This did not raise [`VERSION`]**, and the rule it is measured against is
+/// the one in this module's docs: a version is raised where an older build
+/// would drop something and show a picture that is *wrong*. A link changes no
+/// pixel — it decides what travels with what when a layer is dragged — so a
+/// build that reads only [`LINK_ATTR`] shows the same picture, and merely has
+/// one set where this build has three. That is the same allowance locks and
+/// links were given when [`VERSION`] went to 2.
+///
+/// Read in preference to [`LINK_ATTR`]; a file with the flag and no group is
+/// one written before groups existed, and every linked layer in it joins group
+/// zero — which is precisely the single set it was written as.
+pub const LINK_GROUP_ATTR: &str = "umber-link-group";
 
 /// Where a layer's mask goes inside the archive.
 pub fn mask_src(index: usize) -> String {
@@ -287,8 +310,8 @@ pub struct SaveLayer<'a> {
     pub clipped: bool,
     /// Refuses edits until unlocked.
     pub locked: bool,
-    /// Moves with the other linked layers.
-    pub linked: bool,
+    /// Which link group this layer belongs to, if any. See [`LINK_GROUP_ATTR`].
+    pub link: Option<u8>,
 }
 
 impl<'a> SaveLayer<'a> {
@@ -308,7 +331,7 @@ impl<'a> SaveLayer<'a> {
             mask: None,
             clipped: false,
             locked: false,
-            linked: false,
+            link: None,
         }
     }
 }
@@ -759,11 +782,15 @@ fn layer_xml(
     for (attr, on) in [
         (CLIP_ATTR, layer.clipped),
         (LOCK_ATTR, layer.locked),
-        (LINK_ATTR, layer.linked),
+        (LINK_ATTR, layer.link.is_some()),
     ] {
         if on {
             out.push_str(&format!(" {attr}=\"true\""));
         }
+    }
+    // Beside the old flag rather than instead of it — see [`LINK_GROUP_ATTR`].
+    if let Some(group) = layer.link {
+        out.push_str(&format!(" {LINK_GROUP_ATTR}=\"{group}\""));
     }
     out.push_str("/>");
     out
@@ -1085,7 +1112,7 @@ mod tests {
             SaveLayer {
                 mask: Some(&mask),
                 clipped: true,
-                linked: true,
+                link: Some(3),
                 ..SaveLayer::new("Ink", BlendMode::Normal, &pixels)
             },
         ];
@@ -1129,7 +1156,7 @@ mod tests {
         assert!(!doc.layers[0].clipped);
         assert_eq!(doc.layers[0].mask, None);
         assert!(doc.layers[1].clipped, "the clip was lost");
-        assert!(doc.layers[1].linked, "the link was lost");
+        assert_eq!(doc.layers[1].link, Some(3), "the link group was lost");
         assert_eq!(
             doc.layers[1].mask.as_deref(),
             Some(&mask[..]),
@@ -1148,6 +1175,109 @@ mod tests {
                 .any(|u| u.slot == mask_slot && u.pixels == mask),
             "the mask's pixels were not handed over for upload"
         );
+    }
+
+    /// Two independent link groups out and back, and the old spelling still
+    /// read.
+    ///
+    /// The second half is why neither attribute moved [`VERSION`]. The file
+    /// keeps writing `umber-link="true"` beside the group, so a build from
+    /// before groups existed reads a linked layer and treats every one of them
+    /// as one set — which changes no pixel and is exactly what that build did
+    /// with the file it wrote. This is the same allowance locks and links were
+    /// given when the version went to 2.
+    #[test]
+    fn link_groups_survive_a_round_trip_and_the_old_spelling_still_reads() {
+        let size = UVec2::new(4, 4);
+        let pixels = solid(size, [10, 20, 30, 255]);
+        let layers: Vec<SaveLayer<'_>> = [Some(0u8), Some(2), None, Some(0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, link)| SaveLayer {
+                link,
+                ..SaveLayer::new(
+                    match i {
+                        0 => "a",
+                        1 => "b",
+                        2 => "c",
+                        _ => "d",
+                    },
+                    BlendMode::Normal,
+                    &pixels,
+                )
+            })
+            .collect();
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: 72.0,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert_eq!(
+            doc.layers.iter().map(|l| l.link).collect::<Vec<_>>(),
+            vec![Some(0), Some(2), None, Some(0)],
+            "the groups did not come back as they went in"
+        );
+
+        // Every layer in a group still carries the pre-groups flag, so an older
+        // build reads three linked layers rather than none.
+        let xml = stack_xml(&bytes);
+        assert_eq!(xml.matches(&format!("{LINK_ATTR}=\"true\"")).count(), 3);
+
+        // And a file written *by* such a build — the flag with no group — reads
+        // as the one set it was.
+        let older = xml.replace(&format!(" {LINK_GROUP_ATTR}=\"0\""), "");
+        let older = older.replace(&format!(" {LINK_GROUP_ATTR}=\"2\""), "");
+        let rebuilt = rewrite_stack(&bytes, &older);
+        let doc = docimport::read_openraster(&rebuilt).expect("read back");
+        assert_eq!(
+            doc.layers.iter().map(|l| l.link).collect::<Vec<_>>(),
+            vec![Some(0), Some(0), None, Some(0)],
+            "a pre-groups file is one group, which is what it always was"
+        );
+    }
+
+    /// `stack.xml` out of an archive, as text.
+    fn stack_xml(bytes: &[u8]) -> String {
+        use std::io::{Cursor, Read};
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let mut entry = zip.by_name("stack.xml").expect("stack.xml");
+        let mut out = String::new();
+        entry.read_to_string(&mut out).expect("utf-8");
+        out
+    }
+
+    /// Replace `stack.xml` inside an archive, leaving every other entry alone.
+    ///
+    /// Only a test needs this: it is how a file written by an *older* Umber is
+    /// produced without keeping a binary fixture that would have to be rebuilt
+    /// every time the writer changed anything else.
+    fn rewrite_stack(bytes: &[u8], stack: &str) -> Vec<u8> {
+        use std::io::{Cursor, Read, Write};
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).expect("entry");
+            let name = entry.name().to_owned();
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(entry.compression());
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).expect("read");
+            out.start_file(&name, options).expect("start");
+            if name == "stack.xml" {
+                out.write_all(stack.as_bytes()).expect("write");
+            } else {
+                out.write_all(&buf).expect("write");
+            }
+        }
+        out.finish().expect("finish").into_inner()
     }
 
     #[test]

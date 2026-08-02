@@ -1717,7 +1717,10 @@ pub struct LayerRow<'a> {
     pub editing_mask: bool,
     pub clipped: bool,
     pub locked: bool,
-    pub linked: bool,
+    /// Which link group the layer is in, if any. The chain mark is drawn in
+    /// that group's colour, which is the whole of how a row says *which* set
+    /// of layers it travels with rather than only that it travels with some.
+    pub link: Option<u8>,
     /// What is actually on the layer, scaled to fill the chip — or `None`,
     /// which draws the checker alone and means "nothing to show". The two
     /// reasons for `None` are deliberately drawn the same: a layer that is
@@ -1870,10 +1873,17 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         .size()
         .x;
     marks_left -= blend_width;
-    for (on, icon) in [
-        (row.clipped, Icon::Clip),
-        (row.locked, Icon::Lock),
-        (row.linked, Icon::Chain),
+    for (on, icon, tint) in [
+        (row.clipped, Icon::Clip, p.text_dim),
+        (row.locked, Icon::Lock, p.text_dim),
+        // The one mark here drawn in anything but the dim text colour, because
+        // it is the one that has to be told apart from the identical mark on
+        // another row. Never hard-coded: `Palette::link_colour` is the table.
+        (
+            row.link.is_some(),
+            Icon::Chain,
+            row.link.map_or(p.text_dim, |g| p.link_colour(g)),
+        ),
     ] {
         if !on {
             continue;
@@ -1883,7 +1893,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             painter,
             Rect::from_min_size(pos2(marks_left, rect.center().y - 6.0), Vec2::splat(12.0)),
             icon,
-            p.text_dim,
+            tint,
         );
     }
 

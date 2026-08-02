@@ -933,6 +933,8 @@ const BLEND_WIDTH: f32 = 80.0;
 enum Bulk {
     Visible(bool),
     Lock(bool),
+    Link,
+    Unlink,
     Untick,
     Delete,
 }
@@ -1052,17 +1054,11 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             layer.locked = !is_locked;
             changed = true;
         }
-        if widgets::icon_toggle(
-            ui,
-            p,
-            Icon::Chain,
-            layer.linked,
-            true,
-            "Link the layer — linked layers move through the stack together",
-        ) {
-            layer.linked = !layer.linked;
-            changed = true;
-        }
+        // Linking is deliberately *not* here, where the other three flags are.
+        // It is the one thing on a layer that is a statement about several
+        // layers at once — a group of one says nothing — so it belongs to the
+        // ticked strip and there is exactly one of it. A chain on this row
+        // would have to mean "link this to what?".
 
         // Which of the layer's two surfaces a stroke lands in. Drawn only where
         // there is a mask to paint, because a switch with one position is a
@@ -1171,6 +1167,30 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 if icon_button(ui, p, Icon::Unlock, true, "Unlock the ticked layers") {
                     act = Some(Bulk::Lock(false));
                 }
+                // One chain, which links or unlinks depending on what the
+                // ticked layers already are. Two buttons would be two spellings
+                // of the same question, and the tooltip says which this is
+                // before it is pressed.
+                let already = ed.layers.shared_group(&ed.layers.targets());
+                let room = ed.layers.free_group().is_some();
+                if widgets::icon_toggle(
+                    ui,
+                    p,
+                    Icon::Chain,
+                    already.is_some(),
+                    already.is_some() || (picked > 1 && room),
+                    match (already.is_some(), picked > 1, room) {
+                        (true, _, _) => "Unlink them — they stop moving together",
+                        (_, false, _) => "Tick two or more layers to link them",
+                        (_, _, false) => "Every link group is in use — unlink one first",
+                        _ => "Link them — they move through the stack together",
+                    },
+                ) {
+                    act = Some(match already {
+                        Some(_) => Bulk::Unlink,
+                        None => Bulk::Link,
+                    });
+                }
                 if icon_button(ui, p, Icon::Lock, true, "Lock the ticked layers") {
                     act = Some(Bulk::Lock(true));
                 }
@@ -1212,6 +1232,14 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                         layer.locked = on;
                     }
                 }
+                changed = true;
+            }
+            Some(Bulk::Link) => {
+                ed.layers.link(&ed.layers.targets());
+                changed = true;
+            }
+            Some(Bulk::Unlink) => {
+                ed.layers.unlink(&ed.layers.targets());
                 changed = true;
             }
             Some(Bulk::Untick) => ed.layers.pick_all(false),
@@ -1289,7 +1317,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     editing_mask: index == active && editing_mask,
                     clipped: layer.clipped,
                     locked: layer.locked,
-                    linked: layer.linked,
+                    link: layer.link,
                     thumb: ed.thumbs.picture(layer.slot()),
                     picked: layer.picked,
                 },

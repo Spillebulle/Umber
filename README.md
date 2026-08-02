@@ -172,8 +172,12 @@ besides:
 - **A lock.** No strokes, no transforms, no clearing, and no canvas flip until
   it comes off. The controls that would do any of those are disabled rather than
   quietly ignored.
-- **A link.** Linked layers move through the stack together when any one of them
-  is dragged. They do **not** yet transform together — see below.
+- **A link group.** Tick two or more layers, press the chain, and they become a
+  set that moves through the stack together when any one of them is dragged.
+  Each set is drawn with a chain mark in its own colour, so a document can hold
+  several independent ones — up to six, which is how many colours there are to
+  tell them apart with. Pressing the chain on a set that is already linked
+  unlinks it. Linked layers do **not** yet transform together — see below.
 
 All four are written into the `.ora` and read back out of it.
 
@@ -433,10 +437,14 @@ platforms is on the roadmap.
 - **Structural undo.** Undo covers painting, transforms and canvas flips;
   adding, deleting or reordering a layer is not recorded, and deleting a layer —
   or taking a mask off one — clears the history.
-- **Transforming a linked set.** Linking moves layers together through the
-  stack, which is the only part of "as a unit" the transform machinery can carry
-  today: a floating transform holds one layer's pixels and one undo entry holds
-  one patch, so moving several at once is a larger change than the flag.
+- **Transforming a linked set.** A link group moves its layers together through
+  the stack, which is the only part of "as a unit" the transform machinery can
+  carry today: a floating transform holds one layer's pixels and one undo entry
+  holds one patch, so moving several at once on the *canvas* is a larger change
+  than the groups were.
+- **Layer folders.** The stack is flat. Ticking several layers and acting on all
+  of them covers most of what folders are reached for; nesting, and a folder's
+  own visibility and opacity applying to what is inside it, do not exist.
 - **Layer masks from other applications.** Umber reads and writes its own; a
   `.kra` or `.psd` mask is still reported as lost rather than converted.
 - **Pen pressure on macOS and Linux**, as above. Windows works.

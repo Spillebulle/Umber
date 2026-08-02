@@ -378,7 +378,7 @@ pub struct LayerMeta {
     pub mask: Option<u32>,
     pub clipped: bool,
     pub locked: bool,
-    pub linked: bool,
+    pub link: Option<u8>,
 }
 
 /// Everything about one document that its file will carry.
@@ -919,7 +919,7 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 mask: l.mask(),
                 clipped: l.clipped,
                 locked: l.locked,
-                linked: l.linked,
+                link: l.link,
             })
             .collect(),
     })
@@ -972,7 +972,7 @@ fn run_task(task: Task) -> Vec<Report> {
                 .map(Vec::as_slice),
             clipped: l.clipped,
             locked: l.locked,
-            linked: l.linked,
+            link: l.link,
             ..SaveLayer::new(&l.name, l.blend, px)
         })
         .collect();
@@ -1289,7 +1289,7 @@ mod tests {
                 mask: None,
                 clipped: false,
                 locked: false,
-                linked: false,
+                link: None,
             }],
         }
     }

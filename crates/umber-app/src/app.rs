@@ -1422,7 +1422,7 @@ impl UmberApp {
                     mask: mask.as_deref(),
                     clipped: layer.clipped,
                     locked: layer.locked,
-                    linked: layer.linked,
+                    link: layer.link,
                     ..SaveLayer::new(&layer.name, layer.blend, px)
                 })
                 .collect();

@@ -42,7 +42,7 @@ use super::{
 use crate::color::Color;
 use crate::docformat;
 use crate::document::Background;
-use crate::layer::BlendMode;
+use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
 
@@ -68,10 +68,14 @@ struct LayerSpec {
     /// `umber-mask`: the archive entry holding this layer's mask, outside the
     /// ORA layer stack. See [`docformat::MASK_ATTR`].
     mask_src: Option<String>,
-    /// `umber-clip`, `umber-lock`, `umber-link`.
+    /// `umber-clip`, `umber-lock`, and the link group.
     clipped: bool,
     locked: bool,
-    linked: bool,
+    /// `umber-link-group` where the file has it, and `umber-link` alone read as
+    /// group zero where it does not: a file written before groups existed said
+    /// "one set", and group zero is that set. See
+    /// [`docformat::LINK_GROUP_ATTR`].
+    link: Option<u8>,
 }
 
 pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
@@ -303,7 +307,13 @@ fn parse_stack(
                             mask_src: attrs.string(docformat::MASK_ATTR),
                             clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
                             locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
-                            linked: attrs.get(docformat::LINK_ATTR) == Some("true"),
+                            link: attrs
+                                .get(docformat::LINK_GROUP_ATTR)
+                                .and_then(|g| g.parse::<u8>().ok())
+                                .filter(|g| (*g as usize) < LayerStack::LINK_GROUPS)
+                                .or_else(|| {
+                                    (attrs.get(docformat::LINK_ATTR) == Some("true")).then_some(0)
+                                }),
                         });
                     }
                     _ => {}
@@ -373,7 +383,7 @@ fn load_layer(
     layer.opacity = spec.opacity;
     layer.clipped = spec.clipped;
     layer.locked = spec.locked;
-    layer.linked = spec.linked;
+    layer.link = spec.link;
     layer.mask = load_mask(zip, spec, canvas, warnings);
     Ok(layer)
 }

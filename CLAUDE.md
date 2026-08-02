@@ -303,7 +303,31 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   `EditBody::Pixels` holds one patch — so moving several at once needs N of each
   *and* an entry holding several patches, or an undo would step through a
   multi-layer move one layer at a time and leave the document in states it was
-  never in. The README says so rather than the flag half-working.
+  never in. The README says so rather than the flag half-working. **Groups did
+  not change this**: several sets that each travel through the stack is still
+  reordering, which is a `Vec` shuffle.
+- **A link is a *group*, and the group is bounded by the colours.** `Layer::link`
+  is `Option<u8>` and `LayerStack::LINK_GROUPS` is 6 because
+  `theme::Palette::link_colours` is 6 — a group is told from its neighbours by
+  the colour of the chain on its rows, so a seventh would be a mark that lies
+  about which layers travel together. Asking for one is refused with a tooltip
+  saying so. `free_group` hands back the **lowest** free number, so unlinking
+  returns a colour to the pool rather than walking off the end of it, and
+  `Palette::link_colour` takes the number modulo the table because the number
+  comes out of a *file* and the drawing path may not panic on one this build
+  cannot colour.
+- **The chain lives in the ticked strip and nowhere else.** Linking is the one
+  thing on a layer that is a statement about several layers at once — a group of
+  one says nothing, which is why `link` refuses fewer than two — so a chain in
+  the per-layer flags row would have to mean "link this to what?". One button,
+  which unlinks when `shared_group` says the targets already are one set and
+  links otherwise, because two buttons would be two spellings of one question.
+- **`umber-link-group` did not raise `umber-version`, and `umber-link` is still
+  written beside it.** A link changes no pixel — it decides what travels with
+  what when a layer is dragged — so a build that reads only the old flag shows
+  the same picture and merely has one set where this build has three, which is
+  exactly what that build did with the file it wrote. A file with the flag and
+  no group reads as group zero: the single set it was written as.
 - **Reordering does not clear the undo history; deleting does.** The difference
   is whether a slot changes hands — a `PixelPatch` names one, and only a delete
   frees one for the next layer to inherit. `LayerStack::reorder` is the whole of

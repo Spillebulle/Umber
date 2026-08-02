@@ -156,8 +156,9 @@ pub struct ImportedLayer {
     pub clipped: bool,
     /// Refuses edits until unlocked.
     pub locked: bool,
-    /// Moves with the other linked layers.
-    pub linked: bool,
+    /// Which link group this layer belongs to, if any. See
+    /// [`crate::docformat::LINK_GROUP_ATTR`].
+    pub link: Option<u8>,
 }
 
 impl ImportedLayer {
@@ -175,7 +176,7 @@ impl ImportedLayer {
             mask: None,
             clipped: false,
             locked: false,
-            linked: false,
+            link: None,
         }
     }
 }
@@ -192,7 +193,7 @@ impl fmt::Debug for ImportedLayer {
             .field("mask", &self.mask.is_some())
             .field("clipped", &self.clipped)
             .field("locked", &self.locked)
-            .field("linked", &self.linked)
+            .field("link", &self.link)
             .finish()
     }
 }
@@ -294,7 +295,7 @@ impl ImportedDocument {
                 dst.blend = layer.blend;
                 dst.clipped = layer.clipped;
                 dst.locked = layer.locked;
-                dst.linked = layer.linked;
+                dst.link = layer.link;
                 dst.slot()
             };
             uploads.push(LayerUpload {
