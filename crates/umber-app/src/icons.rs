@@ -25,6 +25,9 @@ pub enum Icon {
     /// A dashed box — the marquee, which is what a selection looks like on the
     /// canvas.
     Select,
+    /// A box with its corner handles — what a floating transform looks like on
+    /// the canvas, as `Select` is what a selection looks like.
+    Transform,
     Pan,
     Zoom,
     // Layers
@@ -115,6 +118,25 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 line(at(LO + from, HI), at(LO + to, HI));
                 line(at(LO, LO + from), at(LO, LO + to));
                 line(at(HI, LO + from), at(HI, LO + to));
+            }
+        }
+
+        Icon::Transform => {
+            // A solid box with its four corner handles, which is exactly what
+            // the tool draws on the canvas. Deliberately *not* dashed: the
+            // dashes belong to the selection, and a transform box is a
+            // different thing that happens to be the same shape.
+            const LO: f32 = 6.0;
+            const HI: f32 = 18.0;
+            path(vec![
+                at(LO, LO),
+                at(HI, LO),
+                at(HI, HI),
+                at(LO, HI),
+                at(LO, LO),
+            ]);
+            for (x, y) in [(LO, LO), (HI, LO), (HI, HI), (LO, HI)] {
+                painter.circle_filled(at(x, y), 2.4 * scale, colour);
             }
         }
 

@@ -1114,6 +1114,7 @@ fn edit_icon(kind: EditKind) -> Icon {
     match kind {
         EditKind::Paint => Icon::Brush,
         EditKind::Erase => Icon::Eraser,
+        EditKind::Transform => Icon::Transform,
     }
 }
 

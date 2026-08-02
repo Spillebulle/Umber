@@ -21,19 +21,30 @@ use crate::time::Timestamp;
 /// What one recorded edit was, so a list of them can be named.
 ///
 /// Deliberately closed and short. An entry exists only where a patch was
-/// captured, and today that is a stroke and nothing else: adding a layer,
-/// deleting one or reordering the stack are not undoable, and deleting one
-/// clears the history outright. A variant here would be a promise the engine
-/// cannot keep — a row naming an action that clicking it will not restore is
-/// worse than an action the list stays quiet about.
+/// captured: adding a layer, deleting one or reordering the stack are not
+/// undoable, and deleting one clears the history outright. A variant here would
+/// be a promise the engine cannot keep — a row naming an action that clicking
+/// it will not restore is worse than an action the list stays quiet about.
+///
+/// [`EditKind::Transform`] earns its place under that rule rather than being an
+/// exception to it. A transform captures one patch spanning the source *and*
+/// the destination — see `transform::Transform::damage` — so replaying it puts
+/// the pixels back where they came from and takes them out of where they went,
+/// in one write. A paste is the same shape with no source to restore, which is
+/// why it is not a variant of its own: what the engine holds is a rectangle of
+/// pixels either way, and two rows that undo identically should not have two
+/// names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
     Paint,
     Erase,
+    /// Pixels moved, scaled or turned — or pasted, which is the same patch with
+    /// nothing where they came from.
+    Transform,
 }
 
 impl EditKind {
-    pub const ALL: [EditKind; 2] = [Self::Paint, Self::Erase];
+    pub const ALL: [EditKind; 3] = [Self::Paint, Self::Erase, Self::Transform];
 
     /// Which kind a stroke in `mode` records.
     ///
@@ -50,6 +61,7 @@ impl EditKind {
         match self {
             Self::Paint => "Stroke",
             Self::Erase => "Erase",
+            Self::Transform => "Transform",
         }
     }
 }
