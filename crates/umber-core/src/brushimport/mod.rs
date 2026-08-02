@@ -283,15 +283,20 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
 
 /// Wrap a converted brush up as a preset.
 ///
-/// Filed by style, the same way the shipped library is, so a brush you import
-/// lands among its own kind instead of in a bin called "Imported" that grows
-/// without order.
+/// Filed by style, the same way the shipped library is, so the brush has a home
+/// among its own kind whatever else happens to it. That is its `category`, and
+/// it is deliberately not the whole answer: [`crate::preset::UserLibrary::
+/// import_file`] puts what it reads in a collection called "Imported" as well,
+/// because twenty brushes filed correctly across six collections are twenty
+/// brushes somebody has to go and find. The style is what they fall back to the
+/// moment they are moved out of there.
 fn preset_for(source: &str, name: String, brush: Brush) -> BrushPreset {
     let category = crate::style::classify(&name, &brush).to_string();
     BrushPreset {
         id: format!("{source}/{}", preset::slug(&name)),
         name,
         category,
+        collection: None,
         credit: None,
         brush,
         tip: None,

@@ -12,7 +12,15 @@
 //!   CC-BY material legal and CC0 material honest.
 //! - **Where does it belong in the picker?** — a free-form
 //!   [`BrushPreset::category`], because a flat list of two hundred brushes is
-//!   not usable.
+//!   not usable, and a [`BrushPreset::collection`] over the top of it for where
+//!   the *user* has since decided it belongs.
+//!
+//! That last one has a second half, and it is the awkward one:
+//! [`Library::collections`]. A user may file a **shipped** brush, and a shipped
+//! preset lives in [`builtin`] — `include_str!`'d into the binary and replaced
+//! wholesale by every update. So that choice cannot be written where the brush
+//! is; it is recorded against the brush's stable id in the user's own
+//! `brushes.ron`, which an update never touches.
 //!
 //! Everything here is plain data: no GPU types, no file dialogs, no UI.
 
@@ -68,6 +76,19 @@ pub struct BrushPreset {
     /// brings its own categories, and Umber has no business enumerating them.
     #[serde(default)]
     pub category: String,
+    /// The collection the *user* has put this brush in, which overrides
+    /// [`Self::category`] wherever the two disagree.
+    ///
+    /// Two fields rather than one because they answer different questions and
+    /// only one of them is the user's. `category` is what the brush arrived
+    /// with — the pack's own grouping, or [`crate::style::classify`]'s reading
+    /// of the name — and overwriting it would throw away the only thing that
+    /// can file the brush if the user later takes their own choice off again.
+    ///
+    /// `None` is the ordinary state and costs nothing in the file, which is why
+    /// adding it did not have to touch a line of the generated library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
     #[serde(default)]
     pub credit: Option<Credit>,
     #[serde(default)]
@@ -91,7 +112,26 @@ pub struct BrushPreset {
     pub tip: Option<String>,
 }
 
+/// Where a brush read out of somebody else's file lands.
+///
+/// A collection rather than the style the name suggests, because the question
+/// somebody has just after importing twenty brushes is "where did they go?",
+/// and [`crate::style::classify`] answers it by scattering them across six
+/// collections. The classifier's reading is not thrown away — it stays on
+/// [`BrushPreset::category`] and is what the brush falls back to the moment the
+/// user moves it out of here.
+pub const IMPORTED: &str = "Imported";
+
 impl BrushPreset {
+    /// Which collection this brush belongs in: the user's choice where they
+    /// have made one, and what the brush arrived with otherwise.
+    pub fn collection(&self) -> &str {
+        match self.collection.as_deref() {
+            Some(name) if !name.is_empty() => name,
+            _ => &self.category,
+        }
+    }
+
     /// A brush the user has just made in the brush editor and not yet saved.
     ///
     /// The id is left empty deliberately: [`UserLibrary::save`] allocates one
@@ -102,6 +142,7 @@ impl BrushPreset {
             id: String::new(),
             name: name.into(),
             category: "My brushes".to_string(),
+            collection: None,
             credit: None,
             brush,
             tip: None,
@@ -149,6 +190,7 @@ fn umber_defaults() -> Vec<BrushPreset> {
         id: format!("umber/{id}"),
         name: name.to_string(),
         category: crate::style::classify(name, &brush).to_string(),
+        collection: None,
         credit: Some(credit.clone()),
         brush,
         tip: None,
@@ -264,24 +306,80 @@ fn umber_defaults() -> Vec<BrushPreset> {
 struct LibraryFile {
     version: u32,
     presets: Vec<BrushPreset>,
+    /// Collections the user has put brushes this file does *not* hold into,
+    /// by [`BrushPreset::id`]. See [`Library::collections`].
+    ///
+    /// Skipped when empty, so a library nobody has re-grouped — and the whole
+    /// of the generated shipped one — is written exactly as it was before this
+    /// existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    collections: BTreeMap<String, String>,
 }
 
-/// Read a RON brush library.
-pub fn parse_library(text: &str) -> Result<Vec<BrushPreset>, PresetError> {
+/// Everything in a library file.
+///
+/// The presets, and one thing that is not a preset: where the user has filed
+/// brushes that are *not in this file*. See [`Library::collections`].
+#[derive(Clone, Debug, Default)]
+pub struct Library {
+    pub presets: Vec<BrushPreset>,
+    /// Preset id to collection name, for ids this library does not hold.
+    ///
+    /// This is where a user's re-grouping of a **shipped** brush lives, and it
+    /// has to be a table beside the presets rather than a field on one because
+    /// there is no shipped preset to write to: [`builtin`] is `include_str!`'d
+    /// into the binary and replaced wholesale by every update. A choice
+    /// recorded there would last until the next release and then vanish, which
+    /// is the worst way for a preference to be lost — silently, months later.
+    ///
+    /// Recorded here it survives an update twice over: the file is in the
+    /// user's own data directory, which an update never touches, and it names
+    /// the brush by its **stable id**, so a release that adds, removes or
+    /// reorders shipped brushes still resolves it to the same one.
+    ///
+    /// An entry whose id no longer names anything is kept rather than swept.
+    /// The shipped library is not this module's to enumerate — only the app
+    /// knows what is in it this release — and a brush that has gone might come
+    /// back.
+    pub collections: BTreeMap<String, String>,
+}
+
+/// Read a RON brush library, presets and all.
+pub fn parse(text: &str) -> Result<Library, PresetError> {
     let file: LibraryFile =
         ron::from_str(text).map_err(|e| PresetError::Malformed(None, e.to_string()))?;
     if file.version > FORMAT_VERSION {
         return Err(PresetError::UnsupportedVersion(None, file.version));
     }
-    Ok(file.presets)
+    Ok(Library {
+        presets: file.presets,
+        collections: file.collections,
+    })
+}
+
+/// Read a RON brush library.
+///
+/// The presets alone, for the two callers — the `.ron` importer and the library
+/// generator — that read somebody's file for the brushes in it and have no use
+/// for where its owner filed brushes of their own.
+pub fn parse_library(text: &str) -> Result<Vec<BrushPreset>, PresetError> {
+    Ok(parse(text)?.presets)
 }
 
 /// Serialise a brush library to RON, pretty-printed so that a generated library
 /// gives a readable diff when it is regenerated.
 pub fn to_ron(presets: &[BrushPreset]) -> Result<String, PresetError> {
+    to_ron_file(presets, &BTreeMap::new())
+}
+
+fn to_ron_file(
+    presets: &[BrushPreset],
+    collections: &BTreeMap<String, String>,
+) -> Result<String, PresetError> {
     let file = LibraryFile {
         version: FORMAT_VERSION,
         presets: presets.to_vec(),
+        collections: collections.clone(),
     };
     let config = ron::ser::PrettyConfig::new().struct_names(false);
     ron::ser::to_string_pretty(&file, config)
@@ -329,6 +427,10 @@ pub fn to_ron(presets: &[BrushPreset]) -> Result<String, PresetError> {
 pub struct UserLibrary {
     dir: PathBuf,
     presets: Vec<BrushPreset>,
+    /// Where the user has filed brushes this library does not hold — the
+    /// shipped ones. See [`Library::collections`], which is the argument for
+    /// why this cannot live on the preset.
+    collections: BTreeMap<String, String>,
     /// Every mask in `tips/`, by name.
     ///
     /// `Arc` because the same mask is handed to the editor, then to the GPU,
@@ -391,14 +493,15 @@ impl UserLibrary {
                 None => None,
             },
         };
-        let presets = match &text {
-            Some(text) => parse_library(text).map_err(|e| e.at(&file))?,
-            None => Vec::new(),
+        let contents = match &text {
+            Some(text) => parse(text).map_err(|e| e.at(&file))?,
+            None => Library::default(),
         };
 
         let mut library = Self {
             dir,
-            presets,
+            presets: contents.presets,
+            collections: contents.collections,
             tips: BTreeMap::new(),
             migrated,
             warnings: Vec::new(),
@@ -540,6 +643,66 @@ impl UserLibrary {
         Ok(true)
     }
 
+    /// Put a brush in a collection, or take the user's choice back off with
+    /// `None`.
+    ///
+    /// `id` may name a brush this library does not hold. That is not an error
+    /// and it is the whole reason the two halves below exist: the brush is a
+    /// shipped one, [`builtin`] is compiled into the binary and replaced
+    /// wholesale by every update, so there is nowhere on the preset to write
+    /// the choice down. It goes in a table beside the presets instead, against
+    /// the brush's stable id, in the user's own data directory — see
+    /// [`Library::collections`].
+    ///
+    /// A brush the library *does* hold carries its own collection on the preset
+    /// rather than in that table, so the choice travels with the brush into an
+    /// export and comes back with it on another machine.
+    pub fn assign(&mut self, id: &str, collection: Option<&str>) -> Result<(), PresetError> {
+        let collection = collection.map(str::trim).filter(|name| !name.is_empty());
+        match self.presets.iter_mut().find(|preset| preset.id == id) {
+            Some(preset) => {
+                preset.collection = collection.map(ToOwned::to_owned);
+                // Belt and braces: an id that was in the table before this
+                // library came to hold a preset of that name would otherwise
+                // outvote the field, and the two would disagree for ever.
+                self.collections.remove(id);
+            }
+            None => match collection {
+                Some(name) => {
+                    self.collections.insert(id.to_owned(), name.to_owned());
+                }
+                None => {
+                    self.collections.remove(id);
+                }
+            },
+        }
+        self.write()
+    }
+
+    /// Stamp the recorded collections onto presets from elsewhere.
+    ///
+    /// The caller passes the whole merged library — everything shipped, then
+    /// everything here — and gets back the shipped half filed where the user
+    /// put it. Nothing this library holds is touched by the table, so the two
+    /// cannot disagree.
+    ///
+    /// An empty table is the ordinary case and costs one branch.
+    pub fn apply_collections(&self, presets: &mut [BrushPreset]) {
+        if self.collections.is_empty() {
+            return;
+        }
+        for preset in presets {
+            if let Some(name) = self.collections.get(&preset.id) {
+                preset.collection = Some(name.clone());
+            }
+        }
+    }
+
+    /// Where the user has filed brushes this library does not hold.
+    pub fn collections(&self) -> &BTreeMap<String, String> {
+        &self.collections
+    }
+
     /// Change a brush's display name. The id deliberately does not follow, so
     /// anything holding a selection keeps it.
     pub fn rename(&mut self, id: &str, name: impl Into<String>) -> Result<bool, PresetError> {
@@ -574,6 +737,19 @@ impl UserLibrary {
             if preset.id.is_empty() || self.presets.iter().any(|p| p.id == preset.id) {
                 preset.id = self.allocate_id(&preset.name);
             }
+            // Everything read out of somebody else's file lands in one
+            // collection, so that "where did those twenty brushes go?" has an
+            // answer that is not "somewhere among two hundred and thirty-nine".
+            // The style each brush was classified as is still on `category`
+            // underneath, and is what it falls back to when it is moved out.
+            //
+            // `get_or_insert` rather than an assignment: a preset that already
+            // names a collection came out of an Umber `.ron`, which means it is
+            // the user's own export coming home, and their grouping is not this
+            // function's to overwrite.
+            preset
+                .collection
+                .get_or_insert_with(|| IMPORTED.to_string());
             match tip {
                 Some(mask) => preset.tip = Some(self.store_tip(&preset.id, mask)?),
                 // An Umber `.ron` names its tips, and the files are not in it —
@@ -645,7 +821,7 @@ impl UserLibrary {
 
     fn write(&mut self) -> Result<(), PresetError> {
         create_dir(&self.dir)?;
-        let text = to_ron(&self.presets)?;
+        let text = to_ron_file(&self.presets, &self.collections)?;
         let file = self.dir.join(Self::FILE_NAME);
 
         // Write beside the library and rename over it. A direct write that is
@@ -1047,6 +1223,181 @@ mod tests {
         // zero, which for the stroke ramp would be a division by nothing.
         assert_eq!(presets[0].brush.stroke_span, Brush::default().stroke_span);
         assert_eq!(presets[0].brush.speed_offset, 0.0);
+    }
+
+    /// The user's own grouping is theirs, so it has to reach the file and come
+    /// back. `category` underneath it is untouched — that is what the brush
+    /// falls back to if the choice is ever taken off again.
+    #[test]
+    fn a_collection_the_user_chose_survives_the_file() {
+        let scratch = Scratch::new("collection");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let id = library
+            .save(
+                BrushPreset {
+                    category: "Inks & pens".to_string(),
+                    collection: Some("Comics".to_string()),
+                    ..BrushPreset::unsaved("Nib", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
+
+        let text = std::fs::read_to_string(scratch.path().join("brushes.ron")).expect("read");
+        assert!(
+            text.contains("Comics"),
+            "the collection was not written: {text}"
+        );
+
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        let back = reloaded.get(&id).expect("saved brush is there");
+        assert_eq!(back.collection.as_deref(), Some("Comics"));
+        assert_eq!(back.collection(), "Comics");
+        assert_eq!(back.category, "Inks & pens");
+    }
+
+    /// A library written before collections existed names none of them, and has
+    /// to load as "no choice made" rather than failing or arriving blank.
+    #[test]
+    fn a_library_from_before_collections_still_loads() {
+        let old = r#"(
+            version: 1,
+            presets: [(
+                id: "user/old",
+                name: "Old",
+                category: "Inks & pens",
+                brush: (size: 12.0),
+            )],
+        )"#;
+        let presets = parse_library(old).expect("an older library still parses");
+        assert_eq!(presets[0].collection, None);
+        // And the brush still files where it always did.
+        assert_eq!(presets[0].collection(), "Inks & pens");
+    }
+
+    /// A brush with no choice made and nothing to fall back on has to answer
+    /// *something*, or the picker would have to guess.
+    #[test]
+    fn an_empty_collection_falls_through_to_the_category() {
+        let mut preset = BrushPreset::unsaved("X", Brush::default());
+        assert_eq!(preset.collection(), "My brushes");
+        preset.collection = Some(String::new());
+        assert_eq!(preset.collection(), "My brushes");
+        preset.collection = Some("Comics".to_string());
+        assert_eq!(preset.collection(), "Comics");
+    }
+
+    /// Twenty brushes filed correctly across six collections are twenty
+    /// brushes somebody has to go and find.
+    #[test]
+    fn an_import_lands_in_one_collection_without_losing_its_style() {
+        let scratch = Scratch::new("imported");
+        fs::create_dir_all(&scratch.0).expect("scratch");
+        let file = scratch.0.join("pack.ron");
+        fs::write(
+            &file,
+            r#"(version: 1, presets: [
+                (id: "pack/a", name: "A", category: "Charcoal, chalk & pastel", brush: ()),
+                (id: "pack/b", name: "B", category: "Markers", brush: (), collection: Some("Mine")),
+            ])"#,
+        )
+        .expect("write");
+
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let added = library.import_file(&file).expect("import");
+
+        assert_eq!(added[0].collection(), IMPORTED);
+        // The classifier's reading is still underneath, so moving the brush out
+        // of "Imported" puts it back among its own kind.
+        assert_eq!(added[0].category, "Charcoal, chalk & pastel");
+        // A preset that already names a collection is somebody's own export
+        // coming home, and their grouping is not the importer's to overwrite.
+        assert_eq!(added[1].collection(), "Mine");
+    }
+
+    /// The one that matters. A shipped preset lives in the binary and is
+    /// replaced wholesale by every update, so a user's re-grouping of one has
+    /// to be written somewhere else — and has to find the brush again by *id*,
+    /// because the release it lands in will have added, removed and reordered
+    /// brushes around it.
+    #[test]
+    fn a_shipped_brushs_collection_survives_the_shipped_library_being_replaced() {
+        let scratch = Scratch::new("assign-shipped");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        library.assign("umber/ink", Some("Comics")).expect("assign");
+        // Not by adding a copy of somebody else's brush to the user's own.
+        assert!(library.presets().is_empty());
+
+        let text = std::fs::read_to_string(scratch.path().join("brushes.ron")).expect("read");
+        assert!(text.contains("umber/ink"), "not written down: {text}");
+
+        // The next release: the shipped library rebuilt from scratch, with a
+        // brush inserted ahead of the filed one and another taken away, so
+        // anything that had remembered a *position* comes back with the wrong
+        // brush or none.
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        let mut shipped = builtin().to_vec();
+        shipped.insert(
+            0,
+            BrushPreset {
+                id: "umber/new-next-release".to_string(),
+                ..BrushPreset::unsaved("New", Brush::default())
+            },
+        );
+        shipped.retain(|preset| preset.id != "umber/marker");
+        reloaded.apply_collections(&mut shipped);
+
+        let ink = shipped
+            .iter()
+            .find(|preset| preset.id == "umber/ink")
+            .expect("still shipped");
+        assert_eq!(ink.collection(), "Comics");
+        // Exactly one brush moved, and it is that one.
+        assert_eq!(
+            shipped
+                .iter()
+                .filter(|preset| preset.collection() == "Comics")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn taking_a_shipped_brushs_collection_off_puts_it_back_among_its_own_kind() {
+        let scratch = Scratch::new("unassign-shipped");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        library.assign("umber/ink", Some("Comics")).expect("assign");
+        library.assign("umber/ink", None).expect("unassign");
+        assert!(library.collections().is_empty());
+
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        let mut shipped = builtin().to_vec();
+        reloaded.apply_collections(&mut shipped);
+        let ink = shipped.iter().find(|p| p.id == "umber/ink").expect("ink");
+        // Back to what `style::classify` made of it when the library was built.
+        assert_eq!(ink.collection(), "Inks & pens");
+    }
+
+    /// A brush the library holds keeps its collection on the preset, so the
+    /// choice travels with the brush into an export instead of being left
+    /// behind in a table that refers to it.
+    #[test]
+    fn a_brush_the_library_holds_carries_its_own_collection() {
+        let scratch = Scratch::new("assign-own");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let id = library
+            .save(BrushPreset::unsaved("Nib", Brush::default()), None)
+            .expect("save");
+        library.assign(&id, Some("Comics")).expect("assign");
+
+        assert!(
+            library.collections().is_empty(),
+            "a brush of its own does not belong in the table"
+        );
+        assert_eq!(library.get(&id).unwrap().collection(), "Comics");
+
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert_eq!(reloaded.get(&id).unwrap().collection(), "Comics");
     }
 
     #[test]
