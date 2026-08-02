@@ -155,6 +155,28 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
 - **The outline is a dashed line, not marching ants.** Animating it means
   requesting a frame for ever, which is the cost `render`'s `repaint_at` exists
   to avoid.
+- **A live selection carries three real buttons over the canvas** — Deselect,
+  Copy, Cut — so their rectangles go in `Editor::selection_buttons` and through
+  `canvas_overlay_owns_pointer`, exactly as the transform tool's flip pair and
+  `Editor::scroll_bars` do. Miss that and a press on one is also a press on the
+  canvas: a dab under the button that was clicked, inside the selection somebody
+  was about to copy. The rectangles are recorded on **every** frame the strip is
+  drawn, not only the frame it is clicked on, and cleared the moment it is not.
+  The pen reaches the same test through `pointer_over_canvas`, which is what
+  stops this being a control that works with a mouse and paints with a pen.
+- **The strip is gone whenever a float is up.** The transform tool's own buttons
+  occupy that place, and a Copy beside them would name a selection that is no
+  longer what an edit acts on.
+- **Where it goes is `overlay::place_strip`'s, in `umber-core`** — above the
+  marquee, below it where there is no room, over it where there is room on
+  neither side, and clamped into the view in every case. It is placed against
+  the *visible* part of the selection, so one three quarters off the left edge
+  gets its strip over the quarter that can be seen. Deliberately **not** the
+  flip buttons' rule, which declines to draw when the box has been dragged out
+  from under them: a floating transform can be moved back and a selection
+  cannot, so there the artist would have no way of reaching the controls at all.
+  Same division `ScrollSpan` and `Clip::place` keep — the rule is testable
+  without a window, and `ui.rs` only paints it.
 
 ### Transforms and the clipboard
 
@@ -248,6 +270,41 @@ put on and take off.
 - **The marquee travels with the picture**, at commit, by transforming the rings
   and rasterising again. Nothing in `selection.rs` was changed for it. Only for
   a lift: a paste did not come out of the selection.
+- **A cut is a copy and its exact complement, from one pass over one buffer.**
+  `Clip::cut_from_layer` returns both halves and `from_layer` is that same
+  function with the second not built, so the two cannot disagree about the edge
+  of a soft selection. The share that leaves is **subtracted** from the alpha
+  that was there rather than computed as `alpha × (1 − coverage)`: both sides
+  round to nearest, so an independent removal leaves a rim of the edge in the
+  copy *and* on the layer — the ghost outline a masked lift used to leave.
+  `taken + left == before` therefore holds byte for byte, and
+  `a_cut_takes_exactly_what_it_leaves_behind` drives every (alpha, coverage)
+  pair through it.
+- **One readback serves the clipboard, the write-back and the undo patch**,
+  because the bytes read *are* the pre-cut state of the rectangle. There is no
+  second blocking read, and no new pipeline: the removal is a `write_layer_rect`
+  of what `umber-core` worked out.
+- **A cut records `EditKind::Erase`, and that is not a placeholder.** It removes
+  coverage and undoes by putting a rectangle of pixels back, which is what an
+  eraser stroke is and undoes as — and two rows that undo identically must not
+  have two names, the same rule that keeps a paste filed under Transform. So no
+  new variant, no new `panels::edit_icon` arm and no `history::VERSION` bump.
+- **A copy, a cut and a paste all put a float down first**, which is one rule
+  rather than three and is the rule every path that leaves the document already
+  follows. Taking the float's own pixels without committing is *not available*:
+  the transformed copy exists only in the preview slice, which holds it
+  composited over the layer beneath, so a readback would take whatever was under
+  the picture too. Cancelling instead is worse — for a lifted float the layer
+  still holds the originals, so a "cut" that abandoned the move would clear a
+  region the artist had already dragged away from.
+- **`take_region` is the one place that decides what a copy or a cut reads.** A
+  lift carried the marquee with it at commit, so the selection is already over
+  the right pixels; a **paste** did not, deliberately, so its own destination
+  rectangle is the only thing naming where the picture went. Reading the stale
+  selection after a paste copies some other part of the canvas, which is what it
+  used to do.
+- **A cut is gated on the lock once**, in `cut_selection`, and says so; a copy
+  is not gated at all, because it writes nothing.
 
 ### Layers
 
@@ -965,7 +1022,9 @@ once per stroke but must never move into the drawing loop.
   deciding what it looks like — and an icon set richer than the enum would be a
   promise about what the engine records. **A paste is not a variant of its
   own**: it is a Transform patch with nothing where the pixels came from, and
-  two rows that undo identically should not have two names.
+  two rows that undo identically should not have two names. **A cut is not one
+  either**, for the same reason — it is an Erase; see "Transforms and the
+  clipboard".
 - **The time is wall-clock, and may be absent.** `Instant` means nothing outside
   the run that produced it and these go into a file, so `umber_core::time`
   carries a `Timestamp` in Unix milliseconds. `Edit::at` is an `Option`, and
