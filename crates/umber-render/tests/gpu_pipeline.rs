@@ -15,7 +15,7 @@ use umber_core::{
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource, Gpu,
-    LayerDraw, ProbeParams, StrokeStyle,
+    LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -59,7 +59,7 @@ impl Harness {
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         let gpu = shared_gpu()?;
-        let canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT);
+        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::new(DOC, DOC), TARGET_FORMAT);
 
         let mut enc = gpu
             .device
@@ -177,6 +177,26 @@ impl Harness {
 
     fn set_background(&mut self, background: Background) {
         self.canvas.set_background(background);
+    }
+
+    /// Read a layer thumbnail through the real two-pass, non-blocking path.
+    ///
+    /// The loop is what the frame loop does: record whatever pass is due,
+    /// submit, map, collect. Bounded because a job that never answers is a hang
+    /// rather than a failure, which is the worst way for CI to break.
+    fn thumbnail(&mut self, slot: u32) -> Thumbnail {
+        assert!(self.canvas.begin_thumb(slot), "a thumbnail was in flight");
+        for _ in 0..64 {
+            let mut enc = self.encoder();
+            self.canvas.drive_thumb(&self.gpu.device, &mut enc);
+            self.gpu.queue.submit(Some(enc.finish()));
+            self.canvas.submit_thumb();
+            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            if let Some(thumb) = self.canvas.take_thumb(&self.gpu.device) {
+                return thumb;
+            }
+        }
+        panic!("the thumbnail never came home");
     }
 
     /// Put an exact block of bytes into a layer.
@@ -2617,7 +2637,7 @@ fn record_probe(h: &mut Harness, stack: &[LayerDraw], enc: &mut wgpu::CommandEnc
 /// the stack already deep, which is close enough to this to be worth a guard.
 #[test]
 fn a_layer_copy_beyond_the_array_is_refused_rather_than_fatal() {
-    let h = harness_or_skip!();
+    let mut h = harness_or_skip!();
     let beyond = h.canvas.slot_capacity();
     let rect = PixelRect {
         x: 0,
@@ -3815,7 +3835,7 @@ fn a_dragged_float_leaves_no_trail_behind_it() {
 /// Random, because the point of every test below is that certain bytes come
 /// back *exactly*: a flat layer would pass them all while restoring nothing.
 fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
-    let canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
+    let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -4061,6 +4081,179 @@ fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
             );
         }
     }
+}
+
+// --- layer thumbnails -------------------------------------------------------
+
+/// The whole point of the two passes: a mark occupying an eighth of the canvas
+/// comes back **filling** the thumbnail rather than as a speck in the corner of
+/// a shrunken canvas.
+///
+/// Also pins the empty answer, which is a real answer and not a failure —
+/// without it the layer list would ask again on every frame for as long as a
+/// blank layer was in the stack.
+#[test]
+fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
+    let Some(mut h) = Harness::new() else { return };
+    let side = umber_core::thumbnail::SIZE as usize;
+    let alpha = |px: &[u8], x: usize, y: usize| px[(y * side + x) * 4 + 3];
+
+    // A canvas big enough that scaling the content up is the interesting case.
+    // On the harness's own 64² the "never magnify" cap binds for any mark, and
+    // this test would then be asserting that rule rather than this one — see
+    // `a_tiny_mark_is_never_magnified` in `umber_core::thumbnail`.
+    const SIDE: u32 = 512;
+    h.canvas.resize(
+        &h.gpu.device,
+        &h.gpu.queue,
+        UVec2::splat(SIDE),
+        Anchor::TopLeft,
+    );
+
+    assert!(
+        h.thumbnail(0).is_empty(),
+        "a layer nobody has painted on has nothing to show"
+    );
+
+    // An eighth of the canvas, hard against the top-left corner — the case a
+    // whole-canvas thumbnail renders as four grey pixels.
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: SIDE / 8,
+            height: SIDE / 8,
+        },
+        [255, 0, 0, 255],
+    );
+    let thumb = h.thumbnail(0);
+    assert!(!thumb.is_empty());
+    assert_eq!(thumb.slot, 0);
+
+    let px = &thumb.rgba;
+    assert_eq!(
+        alpha(px, side / 2, side / 2),
+        255,
+        "the mark should be in the middle of the frame"
+    );
+    // The mark is square and so is the frame, so it fills all but the padding:
+    // a few texels in from the edge is still ink.
+    let inset = (side as f32 * (umber_core::thumbnail::PADDING + 0.04)) as usize;
+    assert_eq!(
+        alpha(px, inset, inset),
+        255,
+        "the mark should fill the frame"
+    );
+    assert_eq!(alpha(px, 0, 0), 0, "and there should be a margin around it");
+    // Red went in, red comes out: the pass un-premultiplies and sRGB-encodes,
+    // which is the form `Color32::from_rgba_unmultiplied` is handed.
+    let mid = (side / 2 * side + side / 2) * 4;
+    assert_eq!(&px[mid..mid + 3], &[255, 0, 0]);
+}
+
+/// A layer written to **between** a thumbnail's two passes must not wedge the
+/// job.
+///
+/// This was a real bug. The bounds pass leaves the job waiting at the end of one
+/// frame and the picture pass is recorded on the next, so a stroke committing —
+/// which is to say every pointer-up — lands in that gap and disowns it. With the
+/// abandoned check folded into the mapped arm alone, the job could never be
+/// collected, never be re-driven and never be dropped: `thumb_in_flight` stayed
+/// true for the life of the renderer, so no layer thumbnail ever updated again
+/// *and* `app.rs` requested a redraw every frame for ever.
+#[test]
+fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
+    let Some(mut h) = Harness::new() else { return };
+    let block = PixelRect {
+        x: 4,
+        y: 4,
+        width: 8,
+        height: 8,
+    };
+    h.write_block(0, block, [255, 0, 0, 255]);
+
+    assert!(h.canvas.begin_thumb(0));
+    // Drive until the bounds pass has come home — the job is then waiting, with
+    // its region decided and its picture pass not yet recorded.
+    for _ in 0..8 {
+        let mut enc = h.encoder();
+        h.canvas.drive_thumb(&h.gpu.device, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.submit_thumb();
+        let _ = h.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(
+            h.canvas.take_thumb(&h.gpu.device).is_none(),
+            "the picture cannot have arrived before the second pass ran"
+        );
+        if h.canvas.thumb_phase_is_picture() {
+            break;
+        }
+    }
+    assert!(
+        h.canvas.thumb_phase_is_picture(),
+        "the bounds pass never came home"
+    );
+
+    // Paint on the layer, which is what disowns the job.
+    h.write_block(0, block, [0, 255, 0, 255]);
+
+    // One collection is all it should take to give the job back.
+    assert!(h.canvas.take_thumb(&h.gpu.device).is_none());
+    assert!(
+        !h.canvas.thumb_in_flight(),
+        "the disowned job was never dropped — the list is frozen and the loop \
+         will never sleep again"
+    );
+    assert!(h.canvas.begin_thumb(0), "and a fresh one can be asked for");
+}
+
+/// The invalidation rule, at the level that owns it. Every route that writes a
+/// slice moves that slice's counter and no other — which is what lets the layer
+/// list cache a picture and know exactly when it has stopped being true.
+#[test]
+fn writing_a_slice_moves_its_revision_and_leaves_the_others_alone() {
+    let Some(mut h) = Harness::new() else { return };
+    let before = [h.canvas.slot_revision(0), h.canvas.slot_revision(1)];
+
+    h.stamp(&[dab(32.0, 32.0, 8.0, 1.0)]);
+    assert_eq!(
+        [h.canvas.slot_revision(0), h.canvas.slot_revision(1)],
+        before,
+        "a stroke that has not been committed has changed no layer"
+    );
+
+    h.commit_to(0, Color::BLACK, 1.0, BrushMode::Paint);
+    assert!(h.canvas.slot_revision(0) > before[0], "the commit wrote it");
+    assert_eq!(
+        h.canvas.slot_revision(1),
+        before[1],
+        "and wrote nothing else"
+    );
+
+    // The other two routes into a layer's pixels, each of which the layer list
+    // depends on being counted.
+    let after_commit = h.canvas.slot_revision(0);
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+        [1, 2, 3, 4],
+    );
+    assert!(
+        h.canvas.slot_revision(0) > after_commit,
+        "an undo writes its patch back through `write_layer_rect`"
+    );
+
+    let after_write = h.canvas.slot_revision(0);
+    let mut enc = h.encoder();
+    h.canvas.clear_layer(&mut enc, 0);
+    h.gpu.queue.submit(Some(enc.finish()));
+    assert!(h.canvas.slot_revision(0) > after_write);
 }
 
 /// The mirror of a tightly packed square of RGBA8, done on the CPU.

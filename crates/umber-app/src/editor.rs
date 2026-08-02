@@ -250,6 +250,14 @@ pub struct Editor {
     /// keeps `presets` in step.
     pub tips: BTreeMap<String, Arc<TipMask>>,
     pub layers: LayerStack,
+    /// The layer list's thumbnails.
+    ///
+    /// Above the `--- documents ---` line because it names the document it
+    /// belongs to and empties itself when that changes — the same arrangement
+    /// the autosave's map of open documents keeps, and for the same reason: it
+    /// is a cache of GPU state rather than part of the document. See
+    /// [`crate::thumbs`].
+    pub thumbs: crate::thumbs::Thumbs,
     /// Where the live document lets an edit land, or `None` for all of it.
     ///
     /// An `Arc` because the renderer compares it by identity to decide whether
@@ -448,6 +456,7 @@ impl Default for Editor {
             tip_name: None,
             tips: BTreeMap::new(),
             layers: LayerStack::new(),
+            thumbs: crate::thumbs::Thumbs::default(),
             session: Session::default(),
             notice: None,
             ui: UiState::default(),

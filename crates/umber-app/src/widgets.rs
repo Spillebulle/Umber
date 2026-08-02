@@ -1746,6 +1746,10 @@ pub struct LayerRowResponse {
     /// The mask chip was clicked, which is how the edit target is switched from
     /// the list rather than from the toggle row.
     pub mask_clicked: bool,
+    /// The tick box was clicked. Its own target, like the eye's: ticking a row
+    /// for a bulk operation must not also select it, or every tick would move
+    /// the brush.
+    pub pick_clicked: bool,
 }
 
 /// What one row has to draw besides its name.
@@ -1772,7 +1776,21 @@ pub struct LayerRow<'a> {
     pub editing_mask: bool,
     pub clipped: bool,
     pub locked: bool,
-    pub linked: bool,
+    /// Which link group the layer is in, if any. The chain mark is drawn in
+    /// that group's colour, which is the whole of how a row says *which* set
+    /// of layers it travels with rather than only that it travels with some.
+    pub link: Option<u8>,
+    /// What is actually on the layer, scaled to fill the chip — or `None`,
+    /// which draws the checker alone and means "nothing to show". The two
+    /// reasons for `None` are deliberately drawn the same: a layer that is
+    /// genuinely empty, and one whose picture has not come back from the GPU
+    /// yet. Distinguishing them would mean a spinner on every row of a freshly
+    /// opened document for the two frames it takes.
+    pub thumb: Option<&'a egui::TextureHandle>,
+    /// Ticked for a bulk operation. Drawn on every row whether or not anything
+    /// is ticked: a box that only appeared once you had found the first one is
+    /// a feature nobody finds.
+    pub picked: bool,
 }
 
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
@@ -1806,9 +1824,32 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         painter.rect_filled(rect, metrics::RADIUS, p.control);
     }
 
-    // The eye is its own hit target inside the row, so toggling visibility
-    // does not also change the selection.
-    let eye = Rect::from_min_size(rect.left_top() + vec2(5.0, 6.0), vec2(18.0, 18.0));
+    // The tick box, and then the eye. Both are their own hit targets inside the
+    // row, so neither also changes the selection: ticking four rows to hide
+    // them would otherwise move the brush four times on the way.
+    let pick = Rect::from_min_size(rect.left_top() + vec2(4.0, 6.0), vec2(18.0, 18.0));
+    let pick_response = ui.interact(pick, ui.id().with(("pick", slot)), Sense::click());
+    let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(12.0));
+    if row.picked {
+        ui.painter().rect_filled(box_rect, 2.0, p.accent);
+        icons::draw(ui.painter(), box_rect.shrink(1.0), Icon::Check, p.window);
+    } else {
+        ui.painter().rect_stroke(
+            box_rect,
+            2.0,
+            Stroke::new(
+                1.0,
+                if pick_response.hovered() {
+                    p.text_dim
+                } else {
+                    p.border
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let eye = Rect::from_min_size(rect.left_top() + vec2(23.0, 6.0), vec2(18.0, 18.0));
     let eye_response = ui.interact(eye, ui.id().with(("eye", slot)), Sense::click());
 
     icons::draw(
@@ -1818,9 +1859,14 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         if visible { p.text } else { p.text_dim },
     );
 
-    // Thumbnail placeholder: a checker chip. Rendering real layer thumbnails
-    // needs a downscale pass that does not exist yet.
-    let thumb = Rect::from_min_size(rect.left_top() + vec2(27.0, 3.0), vec2(24.0, 24.0));
+    // The layer's own content, scaled to fill the chip, over a checker.
+    //
+    // The checker is drawn whether or not there is a picture, because the
+    // picture carries alpha and a thumbnail of a sketch is mostly transparent —
+    // laying it on a flat fill would say the layer was opaque. Where there is
+    // no picture at all the checker is the whole chip, and that is the stated
+    // "nothing on this layer" state; see [`LayerRow::thumb`].
+    let thumb = Rect::from_min_size(rect.left_top() + vec2(45.0, 3.0), vec2(24.0, 24.0));
     painter.rect_filled(thumb, 3.0, p.window);
     for i in 0..4 {
         for j in 0..4 {
@@ -1833,6 +1879,14 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             );
             painter.rect_filled(cell.intersect(thumb), 0.0, p.control_hover);
         }
+    }
+    if let Some(picture) = row.thumb {
+        painter.image(
+            picture.id(),
+            thumb,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
     }
 
     // The mask chip, beside the layer's own, and only where there is a mask.
@@ -1878,10 +1932,17 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         .size()
         .x;
     marks_left -= blend_width;
-    for (on, icon) in [
-        (row.clipped, Icon::Clip),
-        (row.locked, Icon::Lock),
-        (row.linked, Icon::Chain),
+    for (on, icon, tint) in [
+        (row.clipped, Icon::Clip, p.text_dim),
+        (row.locked, Icon::Lock, p.text_dim),
+        // The one mark here drawn in anything but the dim text colour, because
+        // it is the one that has to be told apart from the identical mark on
+        // another row. Never hard-coded: `Palette::link_colour` is the table.
+        (
+            row.link.is_some(),
+            Icon::Chain,
+            row.link.map_or(p.text_dim, |g| p.link_colour(g)),
+        ),
     ] {
         if !on {
             continue;
@@ -1891,7 +1952,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             painter,
             Rect::from_min_size(pos2(marks_left, rect.center().y - 6.0), Vec2::splat(12.0)),
             icon,
-            p.text_dim,
+            tint,
         );
     }
 
@@ -1925,6 +1986,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         clicked: response.clicked(),
         eye_clicked: eye_response.clicked(),
         mask_clicked,
+        pick_clicked: pick_response.clicked(),
     }
 }
 

@@ -108,8 +108,31 @@ pub struct Layer {
     /// Read through [`LayerStack::locked_at`] at the *one* gate each operation
     /// has, never at the call sites that reach it — see that method.
     pub locked: bool,
-    /// Travels with the other linked layers when any of them is moved.
-    pub linked: bool,
+    /// Which link group the layer belongs to, if any.
+    ///
+    /// A *group*, not a flag: several independent sets can exist at once, each
+    /// drawn in its own colour on the rows that belong to it, so "these three
+    /// move together" and "those two move together" are two different
+    /// statements rather than one set of five. Numbered rather than named
+    /// because the number is only ever a key — into
+    /// [`LayerStack::LINK_GROUPS`]'s worth of palette colours, and into the
+    /// file. Written through [`LayerStack::link`] and [`LayerStack::unlink`].
+    pub link: Option<u8>,
+    /// Ticked in the list, for an operation that is about to be done to
+    /// several layers at once.
+    ///
+    /// **Deliberately not written to the file.** Every other flag here is a
+    /// property of the picture; this one is a statement about what the painter
+    /// is *about to do*, and reopening a document to find four layers still
+    /// ticked from last week would be an instruction nobody gave. It is a field
+    /// rather than a set held beside the stack because a set would have to be
+    /// keyed by slot and then kept in step with reordering and deletion by
+    /// hand — as a field both come free, which is the same argument
+    /// [`Layer::link`] makes for itself.
+    ///
+    /// Read through [`LayerStack::targets`], never off the field: what a bulk
+    /// operation reaches is one rule and it has one place.
+    pub picked: bool,
     /// Texture-array slice holding this layer's pixels. Stable for the layer's
     /// lifetime.
     slot: u32,
@@ -146,7 +169,8 @@ impl Layer {
             blend: BlendMode::Normal,
             clipped: false,
             locked: false,
-            linked: false,
+            link: None,
+            picked: false,
             slot,
             mask: None,
         }
@@ -182,6 +206,16 @@ impl LayerStack {
     /// stack position, so the two numbers genuinely differ; conflating them
     /// would have capped a document at 32 masked layers.
     pub const MAX_SLOTS: u32 = Self::MAX as u32 * 2 + 1;
+
+    /// How many independent link groups a document may hold.
+    ///
+    /// Bounded by the *colours*, not by anything the model needs: a group is
+    /// told apart from its neighbours by the colour of the chain on its rows,
+    /// and two groups sharing a colour would be a mark that lies about which
+    /// layers travel together. `theme::Palette::link_colours` is this long, and
+    /// asking for a seventh group is refused with a tooltip saying so rather
+    /// than granted with a repeated colour.
+    pub const LINK_GROUPS: usize = 6;
 
     pub fn new() -> Self {
         Self {
@@ -333,6 +367,9 @@ impl LayerStack {
         if self.active >= self.layers.len() {
             self.active = self.layers.len() - 1;
         }
+        // Deleting one of a pair would otherwise leave the survivor in a group
+        // of one — see `dissolve_lone_groups`.
+        self.dissolve_lone_groups();
         Some(layer.slot)
     }
 
@@ -364,14 +401,163 @@ impl LayerStack {
         self.layers.iter().any(|l| l.locked)
     }
 
-    /// Stack positions of every linked layer, ascending.
-    pub fn linked_indices(&self) -> Vec<usize> {
+    // --- ticking several layers ---------------------------------------------
+
+    /// Stack positions of every ticked layer, ascending.
+    pub fn picked_indices(&self) -> Vec<usize> {
         self.layers
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.linked)
+            .filter(|(_, l)| l.picked)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// How many layers are ticked.
+    pub fn picked_count(&self) -> usize {
+        self.layers.iter().filter(|l| l.picked).count()
+    }
+
+    /// **What a bulk operation reaches**, and the one place that is decided:
+    /// every ticked layer, or the selected one alone when nothing is ticked.
+    ///
+    /// The fallback makes the rule total, so a caller never has to special-case
+    /// an empty tick list. It is not currently reached — the strip that holds
+    /// every caller is only drawn once something is ticked — and it is
+    /// deliberately not what the *single-layer* controls use: a row's own eye
+    /// writes `visible` directly, because that control means "this layer" and
+    /// routing it through here would let a tick on another row change what it
+    /// does.
+    ///
+    /// Ascending, so a caller deleting them can walk the list backwards and
+    /// have every index still be valid as it goes.
+    pub fn targets(&self) -> Vec<usize> {
+        let picked = self.picked_indices();
+        if picked.is_empty() {
+            vec![self.active]
+        } else {
+            picked
+        }
+    }
+
+    /// Tick or untick every layer at once.
+    pub fn pick_all(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            layer.picked = on;
+        }
+    }
+
+    // --- link groups --------------------------------------------------------
+
+    /// Stack positions of every layer in `group`, ascending.
+    pub fn group_indices(&self, group: u8) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.link == Some(group))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The group every one of `indices` is in, where they are all in the same
+    /// one — which is what makes the chain button mean "unlink" rather than
+    /// "link".
+    ///
+    /// `None` for an empty list, for a layer in no group, and for a set spread
+    /// over two groups. All three are "these are not currently one linked set",
+    /// which is the only question the caller asks.
+    pub fn shared_group(&self, indices: &[usize]) -> Option<u8> {
+        let first = self.layers.get(*indices.first()?)?.link?;
+        indices
+            .iter()
+            .all(|i| self.layers.get(*i).and_then(|l| l.link) == Some(first))
+            .then_some(first)
+    }
+
+    /// The lowest group number nothing is using, or `None` when all of them
+    /// are.
+    ///
+    /// Lowest rather than next: a group emptied by unlinking gives its number —
+    /// and therefore its colour — straight back, so a session of linking and
+    /// unlinking does not walk off the end of the palette while most of it
+    /// stands unused.
+    pub fn free_group(&self) -> Option<u8> {
+        (0..Self::LINK_GROUPS as u8).find(|g| self.group_indices(*g).is_empty())
+    }
+
+    /// Put `indices` into a link group of their own, returning its number.
+    ///
+    /// Refused — `None` — for fewer than two layers, because a group of one is
+    /// a statement about nothing, and when every group is in use. A layer
+    /// already in another group **leaves it**: belonging to two sets that move
+    /// independently is not a state the stack can be in.
+    pub fn link(&mut self, indices: &[usize]) -> Option<u8> {
+        // Counted rather than taken on trust. `link(&[0, 0])` and an index off
+        // the end both pass a bare length test and then make the group of one
+        // this refuses — and the refusal is the whole reason `unlink` and
+        // `remove` have to dissolve one afterwards.
+        let mut members: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|i| *i < self.layers.len())
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        let indices = &members[..];
+        if indices.len() < 2 {
+            return None;
+        }
+        // Before the writes, so a refusal changes nothing. The layers being
+        // linked may be the whole of an existing group, in which case that
+        // group is about to be freed and is the one that will be handed
+        // back — which is right, and is what makes re-linking the same set
+        // keep its colour.
+        let group = self
+            .shared_group(indices)
+            .or_else(|| self.free_group())
+            .or_else(|| {
+                // Every group is in use, but one of them may consist entirely
+                // of layers that are about to leave it.
+                (0..Self::LINK_GROUPS as u8)
+                    .find(|g| self.group_indices(*g).iter().all(|i| indices.contains(i)))
+            })?;
+        for index in indices {
+            if let Some(layer) = self.layers.get_mut(*index) {
+                layer.link = Some(group);
+            }
+        }
+        Some(group)
+    }
+
+    /// Take `indices` out of whatever group each is in.
+    pub fn unlink(&mut self, indices: &[usize]) {
+        for index in indices {
+            if let Some(layer) = self.layers.get_mut(*index) {
+                layer.link = None;
+            }
+        }
+        self.dissolve_lone_groups();
+    }
+
+    /// Take the last member of any group out of it.
+    ///
+    /// [`LayerStack::link`] refuses to *make* a group of one, so nothing may
+    /// leave one behind either — and two things can: unlinking one member of a
+    /// pair, and deleting one. A lone member would draw a coloured chain
+    /// meaning "moves together with nothing", which is a mark that lies, and it
+    /// would hold its number so [`LayerStack::free_group`] could not hand the
+    /// colour back — six such strays and the chain button reports every group
+    /// in use with no real group anywhere.
+    ///
+    /// Called from the two places that can shrink a group and from nowhere
+    /// else: nothing but a removal reduces one.
+    fn dissolve_lone_groups(&mut self) {
+        for group in 0..Self::LINK_GROUPS as u8 {
+            let members = self.group_indices(group);
+            if let [only] = members[..] {
+                self.layers[only].link = None;
+            }
+        }
     }
 
     /// Move the layer at `from` so that it sits at position `to`, shifting
@@ -388,11 +574,12 @@ impl LayerStack {
     /// Returns `false` where nothing moved: an index off the end, or a layer
     /// asked to move to where it already is. The caller wants to know, because
     /// a move that did nothing is not a document modification.
-    /// **Linked layers travel together.** Moving one that is linked carries
-    /// every other linked layer with it, and lands them contiguously at the
-    /// destination in the order they were already in. That is the one sense of
-    /// "move as a unit" this architecture can carry today — see the note on
-    /// [`Layer::linked`] and `Floating` in the app, which cannot.
+    /// **A link group travels together.** Moving a layer that belongs to one
+    /// carries every other layer of *that group* with it — not every linked
+    /// layer in the document — and lands them contiguously at the destination
+    /// in the order they were already in. That is the one sense of "move as a
+    /// unit" this architecture can carry today; see the note on [`Layer::link`]
+    /// and `Floating` in the app, which cannot.
     pub fn reorder(&mut self, from: usize, to: usize) -> bool {
         if from >= self.layers.len() || to >= self.layers.len() || from == to {
             return false;
@@ -404,10 +591,9 @@ impl LayerStack {
         // how they come to disagree.
         let selected = self.layers[self.active].slot;
 
-        let group: Vec<usize> = if self.layers[from].linked {
-            self.linked_indices()
-        } else {
-            vec![from]
+        let group: Vec<usize> = match self.layers[from].link {
+            Some(link) => self.group_indices(link),
+            None => vec![from],
         };
         if group.len() < 2 {
             let layer = self.layers.remove(from);
@@ -834,8 +1020,7 @@ mod tests {
         s.add();
         // Slots 0..3 at positions 0..3. Link the bottom and the top.
         let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
-        s.get_mut(0).unwrap().linked = true;
-        s.get_mut(3).unwrap().linked = true;
+        assert_eq!(s.link(&[0, 3]), Some(0));
 
         // Drag the bottom one to the top; its partner comes too, and the two
         // arrive side by side in the order they were already in.
@@ -854,13 +1039,39 @@ mod tests {
         s.add();
         s.add();
         let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
-        s.get_mut(0).unwrap().linked = true;
-        s.get_mut(1).unwrap().linked = true;
+        s.link(&[0, 1]);
 
         assert!(s.reorder(2, 0));
         assert_eq!(
             s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
             vec![slots[2], slots[0], slots[1]]
+        );
+    }
+
+    /// The whole point of groups: a layer carries *its own* set, not every
+    /// linked layer in the document. Before groups this test could not have
+    /// been written, because there was only one set.
+    #[test]
+    fn a_move_carries_the_layers_own_group_and_no_other() {
+        let mut s = LayerStack::new();
+        for _ in 0..5 {
+            s.add();
+        }
+        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        assert_eq!(s.link(&[3, 4]), Some(1), "a second, independent group");
+
+        // Drag the bottom of the first group to the top. Its partner comes;
+        // the other group stays exactly where it was.
+        assert!(s.reorder(0, 5));
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            vec![slots[2], slots[3], slots[4], slots[5], slots[0], slots[1]]
+        );
+        assert_eq!(
+            s.group_indices(1),
+            vec![1, 2],
+            "the other group did not move"
         );
     }
 
@@ -873,14 +1084,202 @@ mod tests {
         s.add();
         s.add();
         s.add();
-        s.get_mut(0).unwrap().linked = true;
-        s.get_mut(1).unwrap().linked = true;
+        s.link(&[0, 1]);
         s.set_active(2);
         let slot = s.active_slot();
 
         s.reorder(0, 3);
         assert_eq!(s.active_slot(), slot);
         assert_eq!(s.active_index(), 0, "two layers moved up past it");
+    }
+
+    /// What the chain button asks before it decides whether it links or
+    /// unlinks. All three "no" answers mean the same thing to the caller:
+    /// these are not currently one linked set.
+    #[test]
+    fn a_set_shares_a_group_only_when_every_one_of_them_is_in_it() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.add();
+        assert_eq!(s.shared_group(&[]), None, "nothing is not a set");
+        assert_eq!(s.shared_group(&[0, 1]), None, "unlinked layers");
+
+        s.link(&[0, 1]);
+        assert_eq!(s.shared_group(&[0, 1]), Some(0));
+        assert_eq!(
+            s.shared_group(&[0]),
+            Some(0),
+            "one layer of a group is in it"
+        );
+        assert_eq!(s.shared_group(&[0, 2]), None, "one of them is in no group");
+
+        s.link(&[2, 3]);
+        assert_eq!(s.shared_group(&[1, 2]), None, "two different groups");
+    }
+
+    /// A group of one says nothing, and a layer cannot be in two sets that
+    /// move independently.
+    #[test]
+    fn linking_needs_two_layers_and_takes_them_out_of_their_old_groups() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        assert_eq!(
+            s.link(&[1]),
+            None,
+            "a group of one is a statement about nothing"
+        );
+        assert_eq!(s.link(&[]), None);
+
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        assert_eq!(
+            s.link(&[1, 2]),
+            Some(1),
+            "a new group, and 1 leaves the old"
+        );
+        assert_eq!(s.group_indices(0), vec![0]);
+        assert_eq!(s.group_indices(1), vec![1, 2]);
+    }
+
+    /// Nothing may leave a group of one standing, because `link` refuses to
+    /// make one: a lone member draws a chain meaning "moves together with
+    /// nothing", and it holds a colour `free_group` can then never hand back.
+    /// Both routes that can shrink a group are covered.
+    #[test]
+    fn a_group_that_falls_to_one_member_dissolves() {
+        let mut s = LayerStack::new();
+        for _ in 0..3 {
+            s.add();
+        }
+        // Unticking down to one and pressing the chain: the strip's own path.
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        s.unlink(&[0]);
+        assert_eq!(s.get(1).unwrap().link, None, "the survivor is not a group");
+        assert_eq!(s.free_group(), Some(0), "and the colour came back");
+
+        // Deleting one of a pair.
+        assert_eq!(s.link(&[2, 3]), Some(0));
+        s.remove(3);
+        assert_eq!(s.get(2).unwrap().link, None);
+        assert_eq!(s.free_group(), Some(0));
+
+        // A group of three losing one is still a group.
+        let mut s = LayerStack::new();
+        for _ in 0..2 {
+            s.add();
+        }
+        assert_eq!(s.link(&[0, 1, 2]), Some(0));
+        s.unlink(&[0]);
+        assert_eq!(s.group_indices(0), vec![1, 2]);
+    }
+
+    /// A caller that hands the same layer twice, or one off the end, must not
+    /// get round the "two or more" rule by arithmetic.
+    #[test]
+    fn linking_counts_layers_rather_than_indices() {
+        let mut s = LayerStack::new();
+        s.add();
+        assert_eq!(s.link(&[0, 0]), None, "one layer named twice is one layer");
+        assert_eq!(
+            s.link(&[0, 99]),
+            None,
+            "an index off the end is not a layer"
+        );
+        assert_eq!(s.link(&[0, 1, 1]), Some(0));
+    }
+
+    /// Numbers — and therefore colours — come back when a group empties, so a
+    /// session of linking and unlinking does not walk off the end of the
+    /// palette while most of it stands unused.
+    #[test]
+    fn an_emptied_group_gives_its_colour_back() {
+        let mut s = LayerStack::new();
+        for _ in 0..3 {
+            s.add();
+        }
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        assert_eq!(s.link(&[2, 3]), Some(1));
+        s.unlink(&[0, 1]);
+        assert_eq!(s.free_group(), Some(0));
+        assert_eq!(
+            s.link(&[0, 3]),
+            Some(0),
+            "the lowest free number, not the next"
+        );
+    }
+
+    /// Every group in use is a refusal rather than a repeated colour, because
+    /// a chain mark that two independent sets share is a mark that lies. The
+    /// one exception is re-linking a set that already holds a whole group,
+    /// which frees that group in the same breath.
+    #[test]
+    fn a_seventh_group_is_refused_rather_than_given_a_used_colour() {
+        let mut s = LayerStack::new();
+        while s.len() < LayerStack::LINK_GROUPS * 2 + 2 {
+            s.add();
+        }
+        for g in 0..LayerStack::LINK_GROUPS {
+            assert_eq!(s.link(&[g * 2, g * 2 + 1]), Some(g as u8));
+        }
+        let spare = s.len() - 2;
+        assert_eq!(
+            s.link(&[spare, spare + 1]),
+            None,
+            "there is no colour left to tell a seventh group apart"
+        );
+        // Re-linking exactly one existing group keeps its own number.
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        // And a set that swallows a whole group whole takes that group's
+        // number, because it is emptied on the way.
+        assert_eq!(s.link(&[0, 1, spare]), Some(0));
+    }
+
+    // --- ticking -----------------------------------------------------------
+
+    /// The one rule for what a bulk operation reaches. The fallback is what
+    /// keeps a bulk operation and a single one from being two pieces of code.
+    #[test]
+    fn a_bulk_operation_reaches_the_ticked_layers_or_the_selected_one() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.set_active(1);
+        assert_eq!(s.targets(), vec![1], "nothing ticked is the selected layer");
+        assert_eq!(s.picked_count(), 0);
+
+        s.get_mut(0).unwrap().picked = true;
+        s.get_mut(2).unwrap().picked = true;
+        assert_eq!(s.targets(), vec![0, 2]);
+        assert_eq!(s.picked_count(), 2);
+        assert!(
+            !s.targets().contains(&1),
+            "the selected layer is not reached once something is ticked"
+        );
+
+        s.pick_all(false);
+        assert_eq!(s.targets(), vec![1]);
+        s.pick_all(true);
+        assert_eq!(s.targets(), vec![0, 1, 2]);
+    }
+
+    /// A tick belongs to the layer, not to a position — which is the whole
+    /// reason it is a field rather than a set of positions held beside the
+    /// stack. Both of these would have had to be maintained by hand.
+    #[test]
+    fn a_tick_follows_its_layer_and_goes_when_the_layer_does() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.get_mut(0).unwrap().picked = true;
+        let slot = s.get(0).unwrap().slot();
+
+        s.reorder(0, 2);
+        assert_eq!(s.picked_indices(), vec![2]);
+        assert_eq!(s.get(2).unwrap().slot(), slot);
+
+        s.remove(2);
+        assert_eq!(s.picked_indices(), Vec::<usize>::new());
     }
 
     #[test]

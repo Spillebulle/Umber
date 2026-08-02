@@ -329,7 +329,38 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   `EditBody::Pixels` holds one patch — so moving several at once needs N of each
   *and* an entry holding several patches, or an undo would step through a
   multi-layer move one layer at a time and leave the document in states it was
-  never in. The README says so rather than the flag half-working.
+  never in. The README says so rather than the flag half-working. **Groups did
+  not change this**: several sets that each travel through the stack is still
+  reordering, which is a `Vec` shuffle.
+- **A link is a *group*, and the group is bounded by the colours.** `Layer::link`
+  is `Option<u8>` and `LayerStack::LINK_GROUPS` is 6 because
+  `theme::Palette::link_colours` is 6 — a group is told from its neighbours by
+  the colour of the chain on its rows, so a seventh would be a mark that lies
+  about which layers travel together. Asking for one is refused with a tooltip
+  saying so. `free_group` hands back the **lowest** free number, so unlinking
+  returns a colour to the pool rather than walking off the end of it, and
+  **`unlink` and `remove` both dissolve a group that has fallen to one
+  member** — `link` refuses to make a group of one, so nothing may leave one
+  behind either, and a lone member would draw a chain meaning "moves together
+  with nothing" while holding a colour `free_group` could then never return.
+  `Palette::link_colour` takes the number modulo the table as a third line of
+  defence, after the model's refusal and the ORA reader's filter, because the
+  alternative failure is an index panic on the drawing path. The link colours
+  are checked for separation from **each other and from all four accents** in
+  both themes; checking only the authored accent is what shipped a green a hair
+  from `Accent::Sage`.
+- **The chain lives in the ticked strip and nowhere else.** Linking is the one
+  thing on a layer that is a statement about several layers at once — a group of
+  one says nothing, which is why `link` refuses fewer than two — so a chain in
+  the per-layer flags row would have to mean "link this to what?". One button,
+  which unlinks when `shared_group` says the targets already are one set and
+  links otherwise, because two buttons would be two spellings of one question.
+- **`umber-link-group` did not raise `umber-version`, and `umber-link` is still
+  written beside it.** A link changes no pixel — it decides what travels with
+  what when a layer is dragged — so a build that reads only the old flag shows
+  the same picture and merely has one set where this build has three, which is
+  exactly what that build did with the file it wrote. A file with the flag and
+  no group reads as group zero: the single set it was written as.
 - **Reordering does not clear the undo history; deleting does.** The difference
   is whether a slot changes hands — a `PixelPatch` names one, and only a delete
   frees one for the next layer to inherit. `LayerStack::reorder` is the whole of
@@ -346,6 +377,67 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+- **The stack is flat, and folders are designed but not built.**
+  `docs/layer-folders.md` is the design; the two things to know before starting
+  are that a *pass-through* folder needs no change to `composite.wgsl` and no
+  `umber-version` bump, and that a folder with its own opacity or blend mode
+  needs both — an accumulator stack in the composite loop, because a group at
+  50% over two overlapping children is not two children at 50%, and revision 3,
+  because an older build folding that opacity into each child opens the document
+  showing something else. Do not draw a folder's opacity control before the
+  second exists.
+- **A tick is a field on the layer and is never written to the file.** Every
+  other flag is a property of the picture; a tick says what the painter is
+  *about to do*, and reopening a document to find four layers still ticked is an
+  instruction nobody gave. A field rather than a set beside the stack, because a
+  set would be keyed by slot and would then have to be kept in step with
+  reordering and deletion by hand — as a field both come free, which is the
+  argument `linked` already makes for itself. It is also not a document
+  modification: a tick puts no dot on the tab.
+- **`LayerStack::targets` is the one rule for what a *bulk* operation reaches** —
+  every ticked layer, or the selected one alone when nothing is ticked. The
+  fallback makes the rule total, so no caller has to special-case an empty tick
+  list; note that no caller reaches it today, because the strip is only drawn
+  when something is ticked. It is deliberately **not** the rule for the
+  single-layer controls: the row's own eye and the flags row write their flag
+  directly, because those are the controls that mean "this layer" and routing
+  them through `targets` would make a tick somewhere else change what the eye
+  in front of you does. `App::delete_picked_layers` is written in terms of
+  `delete_layer` so the lock gate, the float being put down and the history
+  being cleared are each stated once.
+- **The ticked-layers strip is drawn only when something is ticked**, and the
+  tick box is drawn on every row whether or not anything is. A strip that was
+  always there costs the list a row of height on every three-layer document; a
+  box that appeared only after you had found the first one is a feature nobody
+  finds.
+- **A thumbnail is the layer's *content*, and it is two passes because the
+  bounding box of that content is on the GPU.** `thumbnail.wgsl` reduces a
+  rectangle of one slice to a 64-square: first the whole slice to the
+  **greatest** alpha per cell, which `umber_core::thumbnail::content_rect` turns
+  into a document rectangle and `framed` into the region to draw; then that
+  region to a **mean**, which is the picture. The first must be a maximum: a
+  one-pixel line averaged over a 32×32 cell is 1/1024, which is zero in eight
+  bits, so a mean reports every sketched layer as empty. `textureLoad`, not a
+  sampler — a bilinear tap at 30:1 is a point sample with extra steps, and the
+  region deliberately runs off the canvas where clamp-to-edge would smear the
+  edge row across the margin. The frame never magnifies past 1:1, so a single
+  dab reads as a single dab.
+- **The invalidation rule is `CanvasRenderer::slot_revision`, bumped inside
+  every method that writes a slice** — commit, float commit, `write_layer_rect`,
+  clear, mask fill, flip, resize. That is exhaustive by construction, because a
+  layer's pixels cannot change without going through one of them; a `touch` call
+  beside each of the eight call sites in `app.rs` is the "forgotten at the
+  sixth" failure written out in advance. `Thumbs::wanted` is the whole policy —
+  the active layer first, then stack order — and it is a model with no drawing
+  in it.
+- **"Nothing on this layer" is a cached answer, not a missing one**, or a blank
+  layer is re-read on every frame for as long as it is open. It draws the same
+  checker a picture that has not arrived yet does: distinguishing the two would
+  put a spinner on every row of a freshly opened document.
+- **The cache is keyed by document and empties itself when that changes**, which
+  is what lets it live *above* the `--- documents ---` line — a slot is a slice
+  of one document's array, so slot 3 is a different layer in every tab. And a
+  slot that leaves the stack loses its picture, because slots are recycled.
 
 ### Documents
 

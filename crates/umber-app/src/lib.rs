@@ -40,6 +40,7 @@ mod splash;
 mod tabs;
 mod taskbar;
 mod theme;
+mod thumbs;
 mod ui;
 mod update;
 mod updatedlg;

@@ -22,6 +22,6 @@ pub mod gpu;
 
 pub use canvas::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource,
-    LayerDraw, ProbeParams, StrokeStyle,
+    LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
 };
 pub use gpu::Gpu;
