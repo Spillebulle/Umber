@@ -490,6 +490,13 @@ pub struct BrushRow<'a> {
     /// row — rename and delete in the browser. Reserved always, so a name does
     /// not reflow the moment the pointer arrives.
     pub trailing: f32,
+    /// Whether this row can be picked up and carried to a collection.
+    ///
+    /// Only the browser's rows can: it is the one place the collections are on
+    /// screen to be dropped on. Asked for rather than assumed, because the
+    /// panel's rows are a shortlist with nowhere to drag to, and a row that
+    /// senses a drag it can do nothing with is a row that swallows one.
+    pub draggable: bool,
 }
 
 /// A brush preset: a stroke sample, then the name.
@@ -501,8 +508,14 @@ pub struct BrushRow<'a> {
 /// list this long is the difference between choosing a brush and scrolling past
 /// it.
 pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), row.height), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), row.height),
+        if row.draggable {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        },
+    );
 
     // The library is 239 presets deep and both lists are scrolled, so most
     // rows on most frames are off screen. Each sample is a few dozen stamps;

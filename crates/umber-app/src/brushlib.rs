@@ -27,6 +27,13 @@
 //!   then the eraser, on the way past. Nothing here has to do anything about
 //!   it: `ui::draw` suspends dispatch for whatever field holds the keyboard,
 //!   for the whole interface at once. See [`crate::shortcuts::set_typing`].
+//! - **The drag that moves a brush between collections is a model, in
+//!   [`crate::brushdrag`].** What a release would do is decided there and
+//!   nowhere else, so this file only supplies the pointer and the rectangles
+//!   the rail's rows landed in — the same division `dock.rs` keeps against
+//!   `panels.rs`. Where the resulting choice is *stored* is
+//!   `preset::Library::collections`'s to explain, and it is not obvious: a
+//!   shipped brush has no preset that survives an update to write it on.
 //! - **[`resync`] carries the bitmap tips across too.** `BrushPreset::tip` is
 //!   the *name* of a mask in the user's library, and the drawing path has no
 //!   business reaching into a library; `Editor::tips` is where
@@ -39,6 +46,7 @@
 //! because a column that works for five brushes does not work for 201 — see the
 //! README.
 
+use crate::brushdrag;
 use crate::controls;
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
@@ -149,6 +157,10 @@ struct State {
     /// The id of the user brush whose Delete has been pressed once. Deleting a
     /// brush cannot be undone — the history covers painting only — so it asks.
     confirming: Option<String>,
+    /// The brush being carried from one collection to another, if any.
+    /// [`crate::brushdrag`] decides what a release would do; this only holds
+    /// the answer between frames.
+    drag: Option<brushdrag::Drag>,
     notice: Option<Notice>,
 }
 
@@ -224,6 +236,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         saving: None,
         renaming: None,
         confirming: None,
+        drag: None,
         notice,
     }
 }
@@ -277,11 +290,7 @@ impl Index {
         // through paint to the things done to paint already down. A library you
         // cannot add to is a reference; the brushes you made are the ones you
         // are reaching for, so they stay at the top.
-        groups.sort_by(|a, b| {
-            rank(a, shipped)
-                .cmp(&rank(b, shipped))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        groups.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name)));
         Self {
             total: presets.len(),
             shipped,
@@ -304,13 +313,24 @@ fn collection_of(preset: &BrushPreset) -> &str {
     }
 }
 
-/// Sort key for a collection: yours first, then styles in their declared order,
-/// then anything an imported library brought its own name for.
-fn rank(group: &Group, shipped: usize) -> usize {
-    if group.members.iter().all(|i| *i >= shipped) {
-        return 0;
+/// Sort key for a collection: yours first, then the styles in their declared
+/// order.
+///
+/// "Yours" is decided by the *name*, not by who owns the brushes in it. A
+/// collection the classifier could never have produced — "My brushes",
+/// "Imported", a name somebody typed, a name an imported library brought — is
+/// one somebody chose, and those are the ones being reached for.
+///
+/// Reading it off the members instead ("every brush in here is the user's")
+/// looks equivalent and is not: dragging one shipped brush into "My brushes"
+/// would make the group no longer all yours, and send the collection you use
+/// most to the bottom of the rail.
+fn rank(group: &Group) -> usize {
+    match style::order_of(&group.name) {
+        // `order_of` answers with the length for a name it does not know.
+        unknown if unknown == style::Style::ALL.len() => 0,
+        order => 1 + order,
     }
-    1 + style::order_of(&group.name)
 }
 
 /// Walk the presets in `scope` that match `query`, in display order.
@@ -411,8 +431,18 @@ fn resync(ed: &mut Editor, library: &UserLibrary) {
         .active_preset
         .and_then(|i| ed.presets.get(i))
         .map(|preset| preset.id.clone());
-    ed.presets.truncate(preset::builtin().len());
+    // Rebuilt from the shipped library rather than truncated back to it: a
+    // shipped preset in hand carries whichever collection the user last put it
+    // in, and taking that choice off again has to take it off the copy here
+    // too. Two hundred and thirty-nine clones, when the library changes — which
+    // is a save, a delete, an import or a move, never a frame.
+    ed.presets.clear();
+    ed.presets.extend(preset::builtin().iter().cloned());
     ed.presets.extend(library.presets().iter().cloned());
+    // Where the user filed the *shipped* brushes. It cannot be on the presets
+    // themselves — see `preset::Library::collections` — so it is stamped on
+    // here, by id, every time the merged list is rebuilt.
+    library.apply_collections(&mut ed.presets);
     ed.active_preset = selected.and_then(|id| ed.presets.iter().position(|p| p.id == id));
     // The masks come across too, so the drawing path can resolve a preset's tip
     // without reaching into the library. Cloning the map is cloning a handful of
@@ -640,6 +670,10 @@ enum Request {
     /// Rename it to this.
     Commit(String, String),
     Delete(String),
+    /// Pick this brush up: its id, its name, and the collection it is in.
+    Grab(String, String, String),
+    /// Put down whatever is being carried, wherever the rail says it landed.
+    Drop,
 }
 
 #[derive(Default)]
@@ -698,6 +732,9 @@ fn list(
                 user,
                 height,
                 trailing: if detail { ROW_CONTROLS } else { 0.0 },
+                // Only in the browser, which is the one place the collections
+                // are on screen to be dropped on.
+                draggable: detail,
             },
         );
         if editing == Some(preset.id.as_str()) {
@@ -715,6 +752,23 @@ fn list(
         };
         if response.clicked() {
             out.picked = Some(i);
+        }
+        // Picking a brush up and putting it down. egui settles click against
+        // drag for us — a press that never moves far enough is a click — so a
+        // row that is dragged is never also selected.
+        //
+        // Both ends come from the row that was pressed, including the release,
+        // because egui keeps the drag with the widget it began on however far
+        // the pointer travels. That is what lets the rail be a drop target
+        // without the rail having to sense anything.
+        if response.drag_started() {
+            out.request = Some(Request::Grab(
+                preset.id.clone(),
+                preset.name.clone(),
+                collection_of(preset).to_owned(),
+            ));
+        } else if response.drag_stopped() {
+            out.request = Some(Request::Drop);
         }
         // Rows scrolled out of sight are not worth two hit tests each.
         if detail
@@ -1254,15 +1308,61 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
             });
         });
 
+    if let Some(drag) = &state.drag {
+        drag_ghost(root.ctx(), p, drag);
+    }
+
     if response.should_close() {
         close_browser(state);
     }
+}
+
+/// The label that follows the pointer while a brush is being carried.
+///
+/// On egui's tooltip layer, so it rides over the modal and over the rail
+/// instead of being clipped to the list it came out of. Painted rather than
+/// added as a widget: nothing about it is interactive, and a widget sitting
+/// under the pointer through a drag would take the hover the rail's rows need.
+///
+/// It names the destination as well as the brush, because "let go here" is the
+/// one thing a drag has to be able to answer before it is finished — and where
+/// it says nothing, letting go does nothing.
+fn drag_ghost(ctx: &egui::Context, p: &Palette, drag: &brushdrag::Drag) {
+    let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) else {
+        return;
+    };
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        Id::new("brush-library-drag"),
+    ));
+    // An em dash rather than an arrow. Archivo carries no arrow glyph and would
+    // draw a blank box; the dash is ordinary punctuation and is already how the
+    // attribution tooltip joins two things together.
+    let label = match drag.destination() {
+        Some(to) => format!("{} — {to}", drag.name),
+        None => drag.name.clone(),
+    };
+    let galley = painter.layout_no_wrap(label, FontId::proportional(text::TINY), p.text_strong);
+    let rect = Rect::from_min_size(pointer + vec2(14.0, 12.0), galley.size() + vec2(16.0, 9.0));
+    painter.rect_filled(rect, metrics::RADIUS, p.popover);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.popover_border),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + vec2(8.0, 4.5), galley, p.text_strong);
 }
 
 fn close_browser(state: &mut State) {
     state.browser_open = false;
     state.renaming = None;
     state.confirming = None;
+    // The rail goes with the browser, so a drag that outlived it would be a
+    // brush being carried towards targets that are no longer on screen.
+    state.drag = None;
 }
 
 fn browser_rail(ui: &mut Ui, p: &Palette, state: &mut State) {
@@ -1291,6 +1391,23 @@ fn browser_rail(ui: &mut Ui, p: &Palette, state: &mut State) {
             }
             ui.add_space(8.0);
 
+            // Where every collection row landed, so a brush dragged out of the
+            // list can be dropped on one. Collected only while something is
+            // actually being carried: the rail is redrawn every frame and this
+            // would otherwise be a `Vec` of fourteen names built sixty times a
+            // second to answer a question nobody is asking.
+            let dragging = state.drag.is_some();
+            let mut rows: Vec<brushdrag::Row> = Vec::new();
+
+            // The row a drop would land on, as [`brushdrag::Drag::aim`] left it
+            // at the end of the *last* frame. One frame behind the pointer,
+            // which nobody can see in a drag, and what it buys is that the mark
+            // can be painted as part of the row rather than over the top of it
+            // — `sidebar_tab` draws its own label, and a highlight laid on
+            // afterwards would cover the name of the collection it is pointing
+            // at.
+            let aimed = state.drag.as_ref().and_then(brushdrag::Drag::destination);
+
             egui::ScrollArea::vertical()
                 .id_salt("brush-library-collections")
                 .auto_shrink([false, false])
@@ -1299,13 +1416,45 @@ fn browser_rail(ui: &mut Ui, p: &Palette, state: &mut State) {
                     for group in &state.index.groups {
                         let scope = Scope::Category(group.name.clone());
                         let label = format!("{} ({})", group.name, group.members.len());
-                        if controls::sidebar_tab(ui, p, &label, state.scope == scope, true, "")
-                            .clicked()
-                        {
+                        let target = aimed == Some(group.name.as_str());
+                        let response = controls::sidebar_tab(
+                            ui,
+                            p,
+                            &label,
+                            state.scope == scope || target,
+                            true,
+                            "",
+                        );
+                        if target {
+                            // An outline as well as the fill, so "the brush
+                            // lands here" cannot be read as "this collection is
+                            // the one being shown".
+                            ui.painter().rect_stroke(
+                                response.rect,
+                                metrics::RADIUS,
+                                Stroke::new(1.0, p.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if dragging {
+                            rows.push(brushdrag::Row {
+                                name: group.name.clone(),
+                                rect: response.rect,
+                            });
+                        }
+                        // A release over the rail ends a drag; it is not also a
+                        // click on whichever collection it landed on.
+                        if response.clicked() && !dragging {
                             chosen = Some(scope);
                         }
                     }
                 });
+
+            // Take this frame's aim, for the drop and for the mark above.
+            if let Some(drag) = &mut state.drag {
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                drag.aim(&rows, pointer);
+            }
 
             if let Some(scope) = chosen {
                 state.scope = scope;
@@ -1458,10 +1607,53 @@ fn browser_list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, he
                 state.notice = Some(Notice::good(format!("Deleted \"{name}\".")));
             }
         }
+        Some(Request::Grab(id, name, from)) => {
+            // A drag is not an edit, so anything half-finished gets out of the
+            // way rather than being left open behind the moving row.
+            state.renaming = None;
+            state.confirming = None;
+            state.drag = Some(brushdrag::Drag::new(id, name, from));
+        }
+        Some(Request::Drop) => {
+            if let Some(drag) = state.drag.take() {
+                move_to_collection(state, ed, &drag);
+            }
+        }
         None => {
             if let Some(index) = out.picked {
                 ed.apply_preset(index);
             }
+        }
+    }
+}
+
+/// File a dragged brush wherever the rail says it landed.
+///
+/// A drop that lands on nothing — off the rail, or on the collection the brush
+/// is already in — is not a failure and says nothing: the user let go
+/// somewhere, and a line of explanation for a gesture they abandoned is noise.
+fn move_to_collection(state: &mut State, ed: &mut Editor, drag: &brushdrag::Drag) {
+    let Some(to) = drag.destination() else {
+        return;
+    };
+    let (id, to) = (drag.id.clone(), to.to_owned());
+    let label = drag.name.clone();
+    // `assign` takes the id rather than a position, and takes it for shipped
+    // brushes as well as the user's own — see `Library::collections` for where
+    // a shipped brush's collection has to live to survive an update.
+    if write(state, ed, |library| library.assign(&id, Some(&to))).is_some() {
+        state.notice = Some(Notice::good(format!("Moved \"{label}\" to {to}.")));
+        // The collection it came out of may have been the last brush in it, and
+        // an empty one is not in the rail at all. Showing it would be a list
+        // with nothing in it and no way to say why.
+        if let Scope::Category(showing) = &state.scope
+            && !state
+                .index
+                .groups
+                .iter()
+                .any(|group| group.name == *showing)
+        {
+            state.scope = Scope::All;
         }
     }
 }
@@ -1756,6 +1948,15 @@ mod tests {
 
         assert!(index.is_user(shipped));
         assert!(!index.is_user(shipped - 1));
+        // And a *shipped* brush dragged into your collection does not send that
+        // collection to the bottom of the rail. It is the name that makes a
+        // collection yours, not who happens to be in it.
+        let mut with_a_shipped_one = presets.clone();
+        with_a_shipped_one[0].collection = Some("My brushes".to_owned());
+        assert_eq!(
+            Index::build(&with_a_shipped_one).groups[0].name,
+            "My brushes"
+        );
         assert_eq!(index.total, presets.len());
         // Every preset lands in exactly one collection, or the picker would
         // quietly hide brushes.
