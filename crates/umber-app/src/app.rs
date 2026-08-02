@@ -2,6 +2,7 @@
 
 use crate::canvasdlg;
 use crate::editor::{Editor, Floating, Interaction, Tool};
+use crate::gesture;
 use crate::keylayout;
 use crate::logo;
 use crate::session::{DocId, DocumentState};
@@ -27,7 +28,7 @@ use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, FloatParams, FloatSource, Gpu, ProbeParams,
 };
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -2422,6 +2423,187 @@ impl UmberApp {
         self.request_redraw();
     }
 
+    // --- the pointer, whichever kind it is ---
+    //
+    // A mouse reaches winit as `CursorMoved` and `MouseInput`; a pen on Windows
+    // Ink reaches it as `WindowEvent::Touch` and produces neither. The three
+    // functions below are what both families call, so a gesture is decided in
+    // one place and a tablet cannot be left behind by a change made for a
+    // mouse. What each family still owns is only what it alone can know: which
+    // button, which contact id, and what the device reported for pressure.
+
+    /// A press landed on the canvas. Returns what it was taken to mean, which
+    /// is what the touch path uses to decide whether this contact owns the
+    /// gesture that follows.
+    ///
+    /// `reported` is the device's pressure where there is one — a mouse has
+    /// none and passes `None`.
+    fn pointer_pressed(
+        &mut self,
+        pos: Vec2,
+        reported: Option<f32>,
+        pointer: gesture::Pointer,
+    ) -> gesture::Press {
+        let decision = gesture::press(pointer);
+        // Every press ends the brush-size drag except the one that is carrying
+        // it on. A mouse press is never a contact, so `press` can never answer
+        // `ResizeBrush` for one and this stays exactly the rule it always was:
+        // Alt with a button is the eyedropper, Alt without one is the resize,
+        // and a press is what tells them apart.
+        if decision != gesture::Press::ResizeBrush {
+            self.set_brush_resize(false);
+        }
+        if decision == gesture::Press::Ignored {
+            return decision;
+        }
+        // A touch carries its own position and `Editor::cursor` does not follow
+        // it, so this is where a pen's press puts it. For a mouse it is what
+        // `CursorMoved` already left there.
+        self.editor.cursor = pos;
+        self.editor.last_cursor = pos;
+
+        match decision {
+            gesture::Press::Ignored | gesture::Press::ResizeBrush => {}
+            gesture::Press::Pan => self.editor.interaction = Interaction::Panning,
+            gesture::Press::Zoom => {
+                self.editor.zoom_anchor = pos;
+                self.editor.interaction = Interaction::Zooming;
+            }
+            gesture::Press::Paint => {
+                let point = self.editor.sample(pos, reported);
+                self.start_stroke(point);
+            }
+            gesture::Press::Select => {
+                let doc = self.editor.screen_to_doc(pos);
+                // The same op the mouse path takes. A pen user holding Shift
+                // means to add to the selection just as a mouse user does.
+                let op = self.selection_op();
+                self.editor.selection_press(doc, op);
+            }
+            gesture::Press::Transform => self.transform_press(pos),
+            gesture::Press::Eyedropper => self.pick_colour_at_cursor(),
+        }
+        decision
+    }
+
+    /// The pointer moved. Returns whether the frame is worth asking for.
+    fn pointer_moved(&mut self, pos: Vec2, reported: Option<f32>) -> bool {
+        self.editor.last_cursor = self.editor.cursor;
+        self.editor.cursor = pos;
+        let pivot = self.editor.canvas_pivot;
+        let mut dragging_float = false;
+
+        match self.editor.interaction {
+            Interaction::Drawing => {
+                let point = self.editor.sample(pos, reported);
+                self.editor.stroke.extend(point);
+            }
+            Interaction::Selecting => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.selection_moved(doc);
+            }
+            Interaction::Panning => {
+                let delta = pos - self.editor.last_cursor;
+                self.editor.camera.pan_by_screen(delta);
+            }
+            Interaction::Zooming => {
+                // Zooms about where the drag started, which is the convention
+                // every other paint app uses. Right and up zoom in; how the two
+                // axes combine into one factor is `Camera::zoom_drag_factor`'s,
+                // so it can be reasoned about and tested without a pointer.
+                let delta = pos - self.editor.last_cursor;
+                let factor = umber_core::Camera::zoom_drag_factor(delta);
+                let anchor = self.editor.zoom_anchor;
+                self.editor.camera.zoom_at(anchor, factor, pivot);
+            }
+            // Nothing is held, so two things live here, and they are mutually
+            // exclusive by construction: the Alt-held resize needs Alt down and
+            // no button, and a polygon draft only exists once a click has landed
+            // a vertex.
+            //
+            // The resize reads the pointer's travel from where Alt went down as
+            // the size, absolutely rather than stepped per event. Both axes,
+            // right and up bigger — the directions the zoom drag uses for
+            // "more", resolved onto one distance by the same
+            // `geom::drag_towards_more`.
+            //
+            // The draft case is a polygon whose gesture was interrupted, by a
+            // middle drag to pan say, which takes the interaction over without
+            // abandoning the outline. The rubber band still has to follow the
+            // pointer, or the tool looks dead until the next click lands a
+            // vertex somewhere unexpected.
+            Interaction::Idle => {
+                if let Some(resize) = self.editor.brush_resize {
+                    self.editor.brush.size =
+                        Brush::size_after_drag(resize.from, pos - resize.origin);
+                } else if self.editor.selection_draft.is_some() {
+                    let doc = self.editor.screen_to_doc(pos);
+                    self.editor.selection_moved(doc);
+                    self.editor.interaction = Interaction::Selecting;
+                } else {
+                    // A transform handle, which is a third thing that lives in
+                    // this arm — and is exclusive with the other two the same
+                    // way, since a float only exists with the transform tool in
+                    // hand and the resize needs Alt with nothing pressed. Shift
+                    // constrains a corner to one scale on both axes, as it does
+                    // everywhere else; a touch screen has no Shift to hold, so
+                    // reading it here rather than passing `false` on the touch
+                    // path costs a finger nothing and gives a pen with a
+                    // keyboard beside it the constraint a mouse has.
+                    dragging_float = self.transform_moved(pos, self.modifiers.shift_key());
+                }
+            }
+        }
+
+        self.editor.interaction != Interaction::Idle
+            || dragging_float
+            || self.editor.brush_resize.is_some()
+    }
+
+    /// The press was let go of. `contact` is whether it was a pen or a finger
+    /// leaving the glass rather than a button coming up.
+    fn pointer_released(&mut self, pos: Vec2, contact: bool) {
+        self.editor.cursor = pos;
+
+        // A contact that was carrying the brush-size drag is the one gesture a
+        // pen spells differently from a mouse, and this is where the difference
+        // is settled: it travelled, so it was the resize; it did not, so it was
+        // the tablet's Alt-click and therefore the eyedropper. See
+        // `gesture::press`.
+        if contact && let Some(resize) = self.editor.brush_resize {
+            if gesture::is_tap(resize.origin.distance(pos)) {
+                // Put back the wobble the tap made of the size before reading
+                // the colour: a click is not allowed to have resized anything.
+                self.editor.brush.size = resize.from;
+                self.pick_colour_at_cursor();
+            }
+            // Re-seat the drag where the nib left off. Alt is still held — the
+            // gesture is armed until `ModifiersChanged` says otherwise — and
+            // without this the next contact would measure from where Alt went
+            // down and jump the size back.
+            self.set_brush_resize(false);
+            self.set_brush_resize(true);
+            return;
+        }
+
+        // A handle let go of. This ends the drag and not the transform — unless
+        // it was a click outside the box, which `Self::transform_release` is
+        // what knows.
+        self.transform_release();
+        match self.editor.interaction {
+            Interaction::Drawing => self.finish_stroke(),
+            // The polygon is the one gesture a release does not end — it is a
+            // sequence of clicks, and stopping on the first button-up would make
+            // it a line every time. `selection_release` is what knows that, so
+            // the interaction is left alone here.
+            Interaction::Selecting => {
+                let doc = self.editor.screen_to_doc(pos);
+                self.editor.selection_release(doc);
+            }
+            _ => self.editor.interaction = Interaction::Idle,
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(gfx) = self.gfx.as_ref() {
             gfx.window.request_redraw();
@@ -2797,77 +2979,11 @@ impl ApplicationHandler<Wake> for UmberApp {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = Vec2::new(position.x as f32, position.y as f32);
-                self.editor.last_cursor = self.editor.cursor;
-                self.editor.cursor = pos;
                 // A mouse event, so a mouse is what is driving the pointer:
                 // the pen's dot gives way to the ordinary arrow. A pen sends
                 // none of these — see `Editor::pen_pointer`.
                 self.editor.pen_pointer = false;
-                let mut dragging_float = false;
-
-                match self.editor.interaction {
-                    Interaction::Drawing => {
-                        let point = self.editor.sample(pos, None);
-                        self.editor.stroke.extend(point);
-                    }
-                    Interaction::Selecting => {
-                        let doc = self.editor.screen_to_doc(pos);
-                        self.editor.selection_moved(doc);
-                    }
-                    Interaction::Panning => {
-                        let delta = pos - self.editor.last_cursor;
-                        self.editor.camera.pan_by_screen(delta);
-                    }
-                    Interaction::Zooming => {
-                        // Zooms about where the drag started, which is the
-                        // convention every other paint app uses. Right and up
-                        // zoom in; how the two axes combine into one factor is
-                        // `Camera::zoom_drag_factor`'s, so it can be reasoned
-                        // about and tested without a pointer.
-                        let delta = pos - self.editor.last_cursor;
-                        let factor = umber_core::Camera::zoom_drag_factor(delta);
-                        let anchor = self.editor.zoom_anchor;
-                        self.editor.camera.zoom_at(anchor, factor, pivot);
-                    }
-                    // Nothing is held, so two things live here, and they are
-                    // mutually exclusive by construction: the Alt-held resize
-                    // needs Alt down and no button, and a polygon draft only
-                    // exists once a click has landed a vertex.
-                    //
-                    // The resize reads the pointer's travel from where Alt went
-                    // down as the size, absolutely rather than stepped per
-                    // event. Both axes, right and up bigger — the directions the
-                    // zoom drag uses for "more", resolved onto one distance by
-                    // the same `geom::drag_towards_more`.
-                    //
-                    // The draft case is a polygon whose gesture was interrupted,
-                    // by a middle drag to pan say, which takes the interaction
-                    // over without abandoning the outline. The rubber band still
-                    // has to follow the pointer, or the tool looks dead until the
-                    // next click lands a vertex somewhere unexpected.
-                    Interaction::Idle => {
-                        if let Some(resize) = self.editor.brush_resize {
-                            self.editor.brush.size =
-                                Brush::size_after_drag(resize.from, pos - resize.origin);
-                        } else if self.editor.selection_draft.is_some() {
-                            let doc = self.editor.screen_to_doc(pos);
-                            self.editor.selection_moved(doc);
-                            self.editor.interaction = Interaction::Selecting;
-                        } else {
-                            // A transform handle, which is a third thing that
-                            // lives in this arm — and is exclusive with the
-                            // other two the same way, since a float only exists
-                            // with the transform tool in hand and the resize
-                            // needs Alt with nothing pressed. Shift constrains a
-                            // corner to one scale on both axes, as it does
-                            // everywhere else.
-                            dragging_float = self.transform_moved(pos, self.modifiers.shift_key());
-                        }
-                    }
-                }
-                if (self.editor.interaction != Interaction::Idle
-                    || dragging_float
-                    || self.editor.brush_resize.is_some())
+                if self.pointer_moved(pos, None)
                     && let Some(g) = self.gfx.as_ref()
                 {
                     g.window.request_redraw();
@@ -2878,71 +2994,45 @@ impl ApplicationHandler<Wake> for UmberApp {
                 let pressed = state == ElementState::Pressed;
                 // A button is a mouse's, whatever moved the pointer last.
                 self.editor.pen_pointer = false;
-                // The other half of how the resize and the eyedropper are told
-                // apart: the resize is Alt with *nothing* down, so a press ends
-                // it, and the press itself goes on to be handled as it always
-                // was. Without this an Alt-click would pick a colour with the
-                // resize still live, so the eyedropper would leave a circle on
-                // the canvas and the next flick of the wrist would silently
-                // rescale the brush.
-                if pressed {
-                    self.set_brush_resize(false);
-                }
                 // Middle-drag and space-drag always pan, whatever tool is
-                // selected — muscle memory should not depend on the rail.
-                let pan_override = button == MouseButton::Middle
-                    || (button == MouseButton::Left && self.editor.space_down);
+                // selected — muscle memory should not depend on the rail. Space
+                // is the *left* button's override; a middle press already pans.
+                let pan_button = button == MouseButton::Middle;
+                let pos = self.editor.cursor;
 
-                if pan_override {
-                    self.editor.interaction = if pressed {
-                        Interaction::Panning
-                    } else {
-                        Interaction::Idle
-                    };
-                } else if button == MouseButton::Left {
-                    if pressed && !ui_has_pointer && self.modifiers.alt_key() {
-                        // Alt is the eyedropper in every paint app; honouring it
-                        // whatever tool is selected is what people expect.
-                        self.pick_colour_at_cursor();
-                    } else if pressed && !ui_has_pointer {
-                        let pos = self.editor.cursor;
-                        self.editor.last_cursor = pos;
-                        match self.editor.ui.tool {
-                            Tool::Brush | Tool::Eraser => {
-                                let point = self.editor.sample(pos, None);
-                                self.start_stroke(point);
-                            }
-                            Tool::Select => {
-                                let doc = self.editor.screen_to_doc(pos);
-                                let op = self.selection_op();
-                                self.editor.selection_press(doc, op);
-                            }
-                            Tool::Transform => self.transform_press(pos),
-                            Tool::Pan => self.editor.interaction = Interaction::Panning,
-                            Tool::Zoom => {
-                                self.editor.zoom_anchor = pos;
-                                self.editor.interaction = Interaction::Zooming;
-                            }
-                        }
-                    } else if !pressed {
-                        // A handle let go of. This ends the drag and not the
-                        // transform — unless it was a click outside the box,
-                        // which `Self::transform_release` is what knows.
-                        self.transform_release();
-                        match self.editor.interaction {
-                            Interaction::Drawing => self.finish_stroke(),
-                            // The polygon is the one gesture a release does not
-                            // end — it is a sequence of clicks, and stopping on
-                            // the first button-up would make it a line every
-                            // time. `selection_release` is what knows that, so
-                            // the interaction is left alone here.
-                            Interaction::Selecting => {
-                                let doc = self.editor.screen_to_doc(self.editor.cursor);
-                                self.editor.selection_release(doc);
-                            }
-                            _ => self.editor.interaction = Interaction::Idle,
-                        }
+                match (pressed, button) {
+                    (true, MouseButton::Left | MouseButton::Middle) => {
+                        self.pointer_pressed(
+                            pos,
+                            // A mouse has no pressure sensor. `PressureModel`
+                            // is what turns that into a full-pressure stroke.
+                            None,
+                            gesture::Pointer {
+                                tool: self.editor.ui.tool,
+                                ui_owns: ui_has_pointer,
+                                alt: self.modifiers.alt_key(),
+                                space: self.editor.space_down && !pan_button,
+                                pan_button,
+                                // A button, not a contact — which is the whole
+                                // of how Alt keeps meaning the eyedropper here.
+                                contact: false,
+                                resizing: self.editor.brush_resize.is_some(),
+                            },
+                        );
                     }
+                    // Any other button still ends the brush-size drag: it is
+                    // Alt with *nothing* down. Without this an Alt-click would
+                    // pick a colour with the resize still live, so the
+                    // eyedropper would leave a circle on the canvas and the next
+                    // flick of the wrist would silently rescale the brush.
+                    (true, _) => self.set_brush_resize(false),
+                    // The middle button pans and nothing else, so its release
+                    // has nothing to finish.
+                    (false, MouseButton::Middle) => {
+                        self.editor.interaction = Interaction::Idle;
+                    }
+                    (false, MouseButton::Left) => self.pointer_released(pos, false),
+                    (false, _) => {}
                 }
                 if let Some(g) = self.gfx.as_ref() {
                     g.window.request_redraw();
@@ -3019,155 +3109,144 @@ impl ApplicationHandler<Wake> for UmberApp {
                 // draws its own cursor for.
                 self.editor.pen_pointer = true;
 
-                match touch.phase {
-                    TouchPhase::Started => {
+                // Which of the six things a touch event can be. In
+                // `gesture::contact` rather than in a chain of `if`s here,
+                // because the two rules it carries — a `Moved` for an unknown
+                // id is a hover, and a second contact is a pinch — were both
+                // bugs, and neither can be reproduced on a machine with no
+                // tablet. The counts are taken *before* the maps are touched,
+                // so `down` includes this contact for a `Started`.
+                let known = self.editor.touches.contains_key(&touch.id);
+                let down = self.editor.touches.len() + usize::from(!known);
+                let owner = self.editor.drawing_touch == Some(touch.id);
+
+                match gesture::contact(touch.phase, down, known, owner) {
+                    gesture::Contact::Press => {
                         self.editor.touches.insert(touch.id, pos);
-                        if self.editor.touches.len() > 1 {
-                            // A second finger means the gesture was a pinch,
-                            // not a stroke. Abandon whatever the first finger
-                            // was making — all three are gestures that must not
-                            // half-happen because a hand landed on the glass.
-                            // The transform's *float* survives it and only the
-                            // drag is dropped: the picture is still there to be
-                            // moved, and throwing it away because somebody
-                            // pinched to look closer at it would be the
-                            // opposite of what they asked for.
-                            self.cancel_stroke();
-                            self.editor.cancel_selection_draft();
-                            // `Editor::transform_release` rather than this
-                            // type's: a second finger landing must drop the
-                            // drag *and* the pending "put it down", not carry
-                            // it out. Nobody pinching to look closer meant to
-                            // commit.
-                            self.put_down_at = None;
-                            self.editor.transform_release();
-                            self.editor.drawing_touch = None;
-                            self.update_pinch();
-                        } else if !self
+                        // Against the touch's *own* position. It carries one and
+                        // `Editor::cursor` does not follow it, so the mouse's
+                        // answer would be about somewhere else entirely — see
+                        // `ui_owns_pointer`. No window means no canvas, so the
+                        // interface owns it by default.
+                        let ui_owns = self
                             .gfx
                             .as_ref()
-                            .is_none_or(|g| ui_owns_pointer(&self.editor, &g.egui_ctx, pos))
-                        {
-                            // Against the touch's *own* position. It carries
-                            // one and `Editor::cursor` does not follow it, so
-                            // the mouse's answer would be about somewhere else
-                            // entirely — see `ui_owns_pointer`.
-                            self.editor.cursor = pos;
-                            self.editor.last_cursor = pos;
+                            .is_none_or(|g| ui_owns_pointer(&self.editor, &g.egui_ctx, pos));
+                        // The same decision the mouse press makes, from the same
+                        // function. It used to be a second `match` on the tool
+                        // here, which is how the Pan tool, the Zoom tool, Alt for
+                        // the eyedropper and Alt for the brush-size drag all came
+                        // to be reachable only by mouse — a pen produces none of
+                        // the events the arm above handles.
+                        let decision = self.pointer_pressed(
+                            pos,
+                            reported,
+                            gesture::Pointer {
+                                tool: self.editor.ui.tool,
+                                ui_owns,
+                                // A keyboard modifier reaches a pen user exactly
+                                // as it reaches a mouse user, and this arm used
+                                // to consult neither.
+                                alt: self.modifiers.alt_key(),
+                                space: self.editor.space_down,
+                                // No buttons on the glass.
+                                pan_button: false,
+                                contact: true,
+                                resizing: self.editor.brush_resize.is_some(),
+                            },
+                        );
+                        // A press the interface took is not this contact's to
+                        // follow. Deliberately *not* treated as a pinch either:
+                        // one finger on a panel is not a gesture, and cancelling
+                        // the stroke there threw away a stroke the other hand
+                        // was in the middle of.
+                        if decision != gesture::Press::Ignored {
                             self.editor.drawing_touch = Some(touch.id);
-                            // Dispatched on the tool, exactly as a mouse press
-                            // is. Without this every tool painted under a pen:
-                            // a stroke was started whatever was in hand, so the
-                            // selection tool drew a line instead of an outline.
-                            match self.editor.ui.tool {
-                                Tool::Brush | Tool::Eraser => {
-                                    let point = self.editor.sample(pos, reported);
-                                    self.start_stroke(point);
-                                }
-                                Tool::Select => {
-                                    let doc = self.editor.screen_to_doc(pos);
-                                    // The same op the mouse path takes. A pen
-                                    // user holding Shift means to add to the
-                                    // selection just as a mouse user does, and
-                                    // reading the modifiers here rather than
-                                    // passing `Replace` is what stops the two
-                                    // paths meaning different things.
-                                    let op = self.selection_op();
-                                    self.editor.selection_press(doc, op);
-                                }
-                                Tool::Transform => self.transform_press(pos),
-                                // One finger navigates nothing: panning and
-                                // zooming by touch are the two-finger gesture
-                                // below, which is what a hand expects anyway.
-                                Tool::Pan | Tool::Zoom => {}
-                            }
                         }
-                        // Otherwise it landed on the interface, which egui has
-                        // already been handed. Deliberately *not* the pinch
-                        // branch: one finger on a panel is not a gesture, and
-                        // cancelling the stroke there threw away a stroke the
-                        // other hand was in the middle of.
                     }
-                    TouchPhase::Moved => {
-                        // An update for an id that never started is a **hover** —
-                        // a pen in range but off the glass, which Windows reports
-                        // as a pointer update with no down flag. Two things are
-                        // true of it and they must not be run together:
-                        //
-                        // It is not a contact and must not be recorded as one: a
-                        // pen that hovers and is then carried out of range leaves
-                        // no "up", so the entry would sit there for ever, and the
-                        // next real press — Windows gives each contact session a
-                        // fresh pointer id — would look like a second finger and
-                        // be taken for a pinch. A finger always starts before it
-                        // moves, so nothing is lost by requiring it.
-                        //
-                        // But *where the pen is* is worth having anyway, and used
-                        // to be thrown away with the rest of the event. It is
-                        // where the pen's own dot is drawn, and where Alt reads
-                        // the brush-resize gesture's anchor from — without it
-                        // both sat wherever the mouse was last left. So the
-                        // position is taken, and nothing else is.
-                        //
-                        // `last_cursor` is deliberately left alone. It is the
-                        // previous point of a *gesture* — what the pan and zoom
-                        // drags measure against, and what a stroke's speed and
-                        // therefore its simulated pressure come from — and a
-                        // pen waved about in mid-air is none of those.
-                        if !self.editor.touches.contains_key(&touch.id) {
-                            self.editor.cursor = pos;
-                            // A pen sends a few hundred of these a second, so
-                            // the frame is asked for only where the dot it
-                            // moves is actually drawn — over a panel or a menu
-                            // this would be repainting an identical picture.
-                            if self.editor.pointer_over_canvas(pos) {
-                                self.request_redraw();
-                            }
-                            return;
-                        }
+                    gesture::Contact::Pinch => {
                         self.editor.touches.insert(touch.id, pos);
-                        if self.editor.drawing_touch == Some(touch.id) {
-                            self.editor.last_cursor = self.editor.cursor;
-                            self.editor.cursor = pos;
-                            match self.editor.ui.tool {
-                                Tool::Brush | Tool::Eraser => {
-                                    let point = self.editor.sample(pos, reported);
-                                    self.editor.stroke.extend(point);
-                                }
-                                Tool::Select => {
-                                    let doc = self.editor.screen_to_doc(pos);
-                                    self.editor.selection_moved(doc);
-                                }
-                                Tool::Transform => {
-                                    // No Shift to hold on a touch screen, so a
-                                    // corner drag is always free there. The
-                                    // mouse keeps the constraint.
-                                    self.transform_moved(pos, false);
-                                }
-                                Tool::Pan | Tool::Zoom => {}
-                            }
-                        } else {
-                            self.update_pinch();
-                        }
+                        // A second finger means the gesture was a pinch, not a
+                        // stroke. Abandon whatever the first finger was making —
+                        // all of them are gestures that must not half-happen
+                        // because a hand landed on the glass. The transform's
+                        // *float* survives it and only the drag is dropped: the
+                        // picture is still there to be moved, and throwing it
+                        // away because somebody pinched to look closer at it
+                        // would be the opposite of what they asked for.
+                        self.cancel_stroke();
+                        self.editor.cancel_selection_draft();
+                        // `Editor::transform_release` rather than this type's: a
+                        // second finger landing must drop the drag *and* the
+                        // pending "put it down", not carry it out. Nobody
+                        // pinching to look closer meant to commit.
+                        self.put_down_at = None;
+                        self.editor.transform_release();
+                        self.editor.drawing_touch = None;
+                        // A pan or a zoom the first contact had begun goes with
+                        // the rest of it. `cancel_stroke` resets this only where
+                        // there was a stroke to cancel, and now that the Pan and
+                        // Zoom tools answer a single contact there is a live
+                        // `Interaction` here that no stroke ever produced — left
+                        // set, it would go on panning off the second finger's
+                        // every move.
+                        self.editor.interaction = Interaction::Idle;
+                        self.update_pinch();
                     }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.editor.touches.remove(&touch.id);
-                        if self.editor.drawing_touch == Some(touch.id) {
-                            match self.editor.ui.tool {
-                                Tool::Brush | Tool::Eraser => self.finish_stroke(),
-                                Tool::Select => {
-                                    let doc = self.editor.screen_to_doc(pos);
-                                    self.editor.selection_release(doc);
-                                }
-                                // The float stays up, exactly as it does when a
-                                // mouse button comes up: the box is still there
-                                // to be dragged again — unless the tap was a
-                                // click outside it, which puts it down.
-                                Tool::Transform => self.transform_release(),
-                                Tool::Pan | Tool::Zoom => {}
-                            }
-                            self.editor.drawing_touch = None;
+                    gesture::Contact::Hover => {
+                        // A pen in range and off the glass. It is not a contact
+                        // and is deliberately not recorded as one — see
+                        // `gesture::contact` — but *where the pen is* is worth
+                        // having, and it goes through the same body a mouse move
+                        // takes, because a hover is exactly a mouse move with
+                        // nothing held. The two things that live in that state —
+                        // the brush-size circle following the hand, and a
+                        // polygon's rubber band between clicks — used to stand
+                        // still under a pen because this branch recorded the
+                        // position and returned.
+                        let previous = self.editor.last_cursor;
+                        let wants_frame = self.pointer_moved(pos, None);
+                        // `last_cursor` is the previous point of a *gesture* —
+                        // what the pan and zoom drags measure against, and what a
+                        // stroke's speed and therefore its simulated pressure
+                        // come from — and a pen waved about in mid-air is none of
+                        // those. Put back rather than never written, so that one
+                        // body stays the only place a pointer move is
+                        // interpreted.
+                        self.editor.last_cursor = previous;
+                        // A pen sends a few hundred of these a second, so the
+                        // frame is asked for only where something that moved is
+                        // actually drawn — over a panel or a menu this would be
+                        // repainting an identical picture.
+                        if wants_frame || self.editor.pointer_over_canvas(pos) {
+                            self.request_redraw();
                         }
+                        return;
+                    }
+                    gesture::Contact::Drag => {
+                        self.editor.touches.insert(touch.id, pos);
+                        // Dispatched on the `Interaction` the press set, not on
+                        // the tool — which is what lets a contact drive the pan
+                        // and the zoom, and what stops this arm being a second
+                        // reading of what a drag means.
+                        self.pointer_moved(pos, reported);
+                    }
+                    gesture::Contact::Pinching => {
+                        self.editor.touches.insert(touch.id, pos);
+                        self.update_pinch();
+                    }
+                    gesture::Contact::Release => {
+                        self.editor.touches.remove(&touch.id);
+                        // The float stays up, exactly as it does when a mouse
+                        // button comes up: the box is still there to be dragged
+                        // again — unless the tap was a click outside it, which
+                        // puts it down.
+                        self.pointer_released(pos, true);
+                        self.editor.drawing_touch = None;
+                        self.editor.pinch = None;
+                    }
+                    gesture::Contact::Lift => {
+                        self.editor.touches.remove(&touch.id);
                         self.editor.pinch = None;
                     }
                 }

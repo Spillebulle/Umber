@@ -377,6 +377,7 @@ own: it carries between tabs but not yet to and from other applications.
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
 | `Alt` + move, nothing held | Resize the brush, against a circle drawn at the size — right and up bigger |
+| `Alt` + pen drag | The same resize. A pen has no button-less drag on the glass, so the nib down and moving is the resize and the nib down and still is the eyedropper |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
 | Wheel | Scroll the canvas up and down |
