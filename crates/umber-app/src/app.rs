@@ -19,6 +19,7 @@ use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::{
     Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
+    SelectionOp,
 };
 use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
 use winit::application::ApplicationHandler;
@@ -604,6 +605,39 @@ impl UmberApp {
         // The circle appearing and — more importantly — disappearing is a frame
         // nothing else would ask for.
         self.request_redraw();
+    }
+
+    /// What a press with the selection tool means: replace what is selected,
+    /// add to it, or take the new shape out of it.
+    ///
+    /// **Shift adds and Ctrl — Command on macOS — subtracts.** Shift-to-add is
+    /// universal and needs no defending. Subtract is the interesting half:
+    /// Photoshop's and Krita's spelling of it is Alt, and Alt is not available
+    /// here. It is already the eyedropper when a button goes down and the brush
+    /// resize when one does not (see `set_brush_resize`), and the eyedropper is
+    /// tested *before* the tool is consulted — so an Alt-drag with the selection
+    /// tool in hand picks a colour today, and making it subtract instead would
+    /// take a gesture away from every tool to give it to one. Ctrl is GIMP's
+    /// binding for the same operation, so this is a convention somebody already
+    /// has rather than one invented here, and Ctrl is otherwise unspoken for on
+    /// a canvas press — it is the wheel's zoom modifier and nothing else.
+    ///
+    /// Not in [`shortcuts`]'s rebindable table, deliberately: a held modifier
+    /// is part of a *gesture*, not a command that could be listed, enumerated
+    /// or fired from the keyboard. The tool options strip is where it is
+    /// written down instead.
+    ///
+    /// Command is accepted alongside Control for the same reason
+    /// `shortcuts::resolve` folds the two: winit reports it as Super, and a Mac
+    /// keyboard has no Ctrl a hand reaches for.
+    fn selection_op(&self) -> SelectionOp {
+        if self.modifiers.shift_key() {
+            SelectionOp::Add
+        } else if self.modifiers.control_key() || self.modifiers.super_key() {
+            SelectionOp::Subtract
+        } else {
+            SelectionOp::Replace
+        }
     }
 
     /// Take the colour under the cursor as the painting colour.
@@ -1966,7 +2000,8 @@ impl ApplicationHandler<Wake> for UmberApp {
                             }
                             Tool::Select => {
                                 let doc = self.editor.screen_to_doc(pos);
-                                self.editor.selection_press(doc);
+                                let op = self.selection_op();
+                                self.editor.selection_press(doc, op);
                             }
                             Tool::Pan => self.editor.interaction = Interaction::Panning,
                             Tool::Zoom => {

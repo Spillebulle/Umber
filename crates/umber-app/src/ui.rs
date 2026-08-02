@@ -673,6 +673,24 @@ mod strip_budget {
     /// Kept clear at the right for the link into the brush editor, which is the
     /// only way to reach half the brush's settings and so is never dropped.
     pub const EDIT_LINK: f32 = 92.0;
+    /// The line naming the modifiers that add to and subtract from a selection.
+    pub const COMBINE: f32 = 175.0;
+}
+
+/// How to add to and subtract from a selection, named for this platform.
+///
+/// A held modifier is part of a gesture rather than a command, so it is
+/// deliberately not in the rebindable table — which leaves the options strip as
+/// the only place the user can find out. `const` rather than `format!` with
+/// `shortcuts::primary_modifier_name`, because the strip is painted every frame
+/// and a string built per frame for a line that never changes is exactly what
+/// the rest of this interface avoids.
+const fn combine_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Hold Shift to add, Cmd to subtract."
+    } else {
+        "Hold Shift to add, Ctrl to subtract."
+    }
 }
 
 /// The horizontal strip of settings for the current tool.
@@ -747,6 +765,17 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     .size(text::SMALL)
                     .color(p.text_dim),
             );
+            // Dropped first when the window is narrow: the gesture the mode
+            // needs is the line somebody is stuck without, and this one is
+            // about a gesture they have not reached for yet.
+            if ui.available_width() >= strip_budget::COMBINE + strip_budget::EDIT_LINK {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(combine_hint())
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                );
+            }
             if ed.selection.is_some() {
                 divider(ui, p);
                 // Only offered where there is something to clear. A live

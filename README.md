@@ -279,6 +279,13 @@ the outline is antialiased, so a diagonal is a diagonal rather than a staircase.
 A click on the canvas with nothing enclosed clears the selection, as does
 `Ctrl` + `D`.
 
+Hold `Shift` while you draw and the new shape is **added** to what is already
+selected — two separate areas can both be live, and two that touch become one.
+Hold `Ctrl` (`Cmd` on a Mac) and it is **taken away** instead. `Alt` is not the
+subtract key here as it is in some applications, because on Umber's canvas it
+already picks up a colour and resizes the brush. The modifier is read when the
+gesture starts, so you can let go of it part way through a lasso.
+
 The outline stays drawn whatever tool you pick up, because it is how you know
 your painting is being held back. It is a plain dashed line rather than
 animated marching ants: animating it means asking for a new frame for ever, and
@@ -291,6 +298,7 @@ Umber sits still when you do.
 | Left drag | Use the selected tool |
 | `B` / `E` / `S` / `H` / `Z` | Brush / eraser / select / pan / zoom |
 | `Ctrl` + `D` | Deselect |
+| `Shift` / `Ctrl` + drag with Select | Add the new shape to the selection / take it away |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
@@ -322,9 +330,9 @@ platforms is on the roadmap.
 ## What is not there yet
 
 - **Text, shapes and transforms.** The tool rail has five tools. Selections
-  work — rectangle, freehand lasso and polygon, and painting is clipped to them
-  — but there is nothing yet to move, scale or rotate what one holds, no way to
-  add to or subtract from one, and no feather.
+  work — rectangle, freehand lasso and polygon, painting is clipped to them, and
+  they can be added to and subtracted from — but there is nothing yet to move,
+  scale or rotate what one holds, no intersect, and no feather.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
   been built or run. Do not believe anyone who says otherwise.
 - **Automatic crash recovery.** Autosave keeps copies and Settings will open the

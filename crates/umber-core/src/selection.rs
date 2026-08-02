@@ -27,6 +27,9 @@
 //! algorithm, approximate where the path is exact. And a mask is tied to one
 //! canvas size, where the rings are geometry and can be rasterised again.
 //!
+//! Combining two selections is the one thing that cannot hold to that, and
+//! "What a boolean costs the outline" below says exactly what it gives up.
+//!
 //! # Antialiasing and the fill rule
 //!
 //! [`rasterise`] runs [`SUB_SCANLINES`] sub-scanlines per pixel row and
@@ -43,17 +46,71 @@
 //! crosses itself is one region to the person who drew it; even-odd would
 //! punch a hole in the middle of their own loop.
 //!
+//! # Combining selections
+//!
+//! Holding a modifier while drawing adds the new shape to the selection or
+//! takes it away — [`SelectionOp`]. **The boolean happens on the coverage, not
+//! on the rings.** Coverage is a rectangle of bytes: union is `max`, difference
+//! is `min(a, 255 - b)`, both exact per pixel and both linear in the area
+//! touched. Polygon boolean geometry is the alternative and it is a large,
+//! bug-prone algorithm — self-intersection, coincident edges, degenerate
+//! vertices — for a result the mask already has exactly.
+//!
+//! `max`/`min(a, 255 - b)` rather than `a + b - ab` and its dual: they are
+//! idempotent, so adding a shape to itself is the identity where the
+//! probabilistic pair would fatten it a little every time; they are exact
+//! wherever either operand is fully in or fully out, which is every pixel
+//! except the one-wide antialiased band at an edge; and they never manufacture
+//! coverage the geometry does not have. What they cost is a seam: two shapes
+//! that meet along a shared edge each cover it about half, and `max` of two
+//! halves is a half rather than the whole the two together really do cover. It
+//! is one pixel wide, it is what Photoshop and GIMP do, and the alternative is
+//! to keep the geometry — which is the thing this avoids.
+//!
+//! # What a boolean costs the outline
+//!
+//! The rings cannot survive it. Concatenating two ring lists is a union only
+//! when the shapes are disjoint — where they overlap it draws a seam straight
+//! through the middle of the merged region — and reversing a ring is a
+//! difference only when it falls entirely inside. So after a boolean the rings
+//! are **traced back out of the mask**, by [`trace_rings`], and that is the
+//! second, approximate algorithm the section above says the rings exist to
+//! avoid. Being honest about what that loses:
+//!
+//! - **The outline becomes pixel-quantised.** A lasso's smooth diagonal is a
+//!   staircase once it has been added to something. Every application that
+//!   draws marching ants from a mask has this, and the alternative is exactly
+//!   the polygon boolean this design refused.
+//! - **The geometry stops being resolution-independent.** Rasterising traced
+//!   rings onto a different canvas reproduces the staircase rather than the
+//!   curve. Nothing does that today — `Editor::apply_canvas` drops the
+//!   selection outright on a resize, for the same reason it drops the history
+//!   — so this is a door closed, not a behaviour lost.
+//! - **The threshold is 50%.** [`Selection::contains`] answers off the traced
+//!   ring and [`Selection::coverage_at`] off the mask, so along an antialiased
+//!   edge the two can disagree by one pixel. They already could: `bounds` is
+//!   the outline's box rounded outwards.
+//!
+//! An unmodified gesture — much the commonest — keeps its exact rings. Tracing
+//! only ever runs where a boolean actually ran.
+//!
 //! # What is not here
 //!
-//! No boolean operations (add to / subtract from a selection), no feather, no
-//! "select by colour". Each is a real feature and none is drawn in the
-//! interface, which is the rule this file lives by as much as any other.
+//! No intersect, no feather, no "select by colour". Each is a real feature and
+//! none is drawn in the interface, which is the rule this file lives by as much
+//! as any other.
 
 use crate::geom::{PixelRect, Rect};
 use glam::{UVec2, Vec2};
 
 /// Sub-scanlines per pixel row. See the module docs.
 const SUB_SCANLINES: u32 = 4;
+
+/// Coverage at or above which a pixel counts as inside, for [`trace_rings`].
+///
+/// Half. A traced outline has to fall somewhere in the antialiased band and the
+/// middle of it is the only choice that treats the two sides alike.
+const INSIDE: u8 = 128;
 
 /// How a selection outline is drawn.
 ///
@@ -94,6 +151,23 @@ impl SelectionMode {
             }
         }
     }
+}
+
+/// What a new shape does to the selection already standing.
+///
+/// Which modifier means which is the interface's, not the engine's — see
+/// `app.rs` — because it has to be reconciled with what Alt already does on the
+/// canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SelectionOp {
+    /// The new shape *is* the selection. What an unmodified gesture does.
+    #[default]
+    Replace,
+    /// Union. Two disjoint areas can both be selected; two that touch become
+    /// one region with one outline.
+    Add,
+    /// Difference. The new shape is taken out of what was selected.
+    Subtract,
 }
 
 /// A region of the document, as an outline and a coverage mask over the
@@ -199,6 +273,158 @@ impl Selection {
     pub fn rings(&self) -> &[Vec<Vec2>] {
         &self.rings
     }
+
+    /// Build a selection from a coverage mask, trimming it to what is actually
+    /// covered and tracing its outline.
+    ///
+    /// The two booleans below both end here, which is what keeps the trim and
+    /// the trace in one place. Trimming is not tidiness: a difference leaves
+    /// empty rows and columns behind, and `bounds` is what sizes the texture
+    /// the dab pass samples, so an untrimmed mask would upload the hole it just
+    /// cut. It is also how "subtracted down to nothing" becomes `None`, which
+    /// is the same answer as no selection everywhere else in this file.
+    fn from_mask(bounds: PixelRect, coverage: Vec<u8>) -> Option<Self> {
+        let (bounds, coverage) = trim(bounds, coverage)?;
+        let rings = trace_rings(bounds, &coverage);
+        // A mask can be non-empty and still trace nothing: coverage below
+        // `INSIDE` everywhere is a selection so faint no outline can be drawn
+        // for it, and an outline nobody can see is a selection nobody can find.
+        if rings.is_empty() {
+            return None;
+        }
+        Some(Self {
+            rings,
+            bounds,
+            coverage,
+        })
+    }
+
+    /// This selection with `other` added to it.
+    ///
+    /// The bounding rectangle **grows**, so the mask is reallocated and
+    /// re-origined against the union of the two — which is the one place an
+    /// off-by-one here would put every selected pixel one across.
+    pub fn union(&self, other: &Self) -> Option<Self> {
+        let bounds = union_rects(self.bounds, other.bounds);
+        let mut coverage = vec![0u8; bounds.area() as usize];
+        // `max`, not a probabilistic add: see the module docs.
+        self.blit_into(&mut coverage, bounds, |dst, src| dst.max(src));
+        other.blit_into(&mut coverage, bounds, |dst, src| dst.max(src));
+        Self::from_mask(bounds, coverage)
+    }
+
+    /// This selection with `other` taken out of it.
+    ///
+    /// The bounds can only shrink, so the mask starts as this one's and
+    /// [`Selection::from_mask`] trims whatever the cut emptied.
+    pub fn difference(&self, other: &Self) -> Option<Self> {
+        let mut coverage = self.coverage.clone();
+        // `min(a, 255 - b)`, the dual of the `max` above: where `other` is
+        // fully in, nothing survives; where it is half in, at most half does.
+        other.blit_into(&mut coverage, self.bounds, |dst, src| dst.min(255 - src));
+        Self::from_mask(self.bounds, coverage)
+    }
+
+    /// Apply `op` to the selection standing, with the shape just drawn.
+    ///
+    /// Every empty case is decided here rather than at the call site, because
+    /// they do not all answer the same way. A `Replace` that encloses nothing
+    /// **deselects** — a bare click is how every paint application spells that.
+    /// An `Add` or a `Subtract` that encloses nothing leaves the selection
+    /// exactly as it was: a slip of the hand while holding a modifier is not a
+    /// request to throw the work away. And subtracting from nothing is nothing,
+    /// because "no selection" means the whole document and taking a shape out
+    /// of it would be a bigger claim than the gesture made.
+    ///
+    /// `shape` is taken by value so `Replace` — much the commonest — moves it
+    /// through untouched, with no copy of the mask and no outline traced.
+    pub fn combined(base: Option<&Self>, shape: Option<Self>, op: SelectionOp) -> Option<Self> {
+        match (op, base, shape) {
+            (SelectionOp::Replace, _, shape) => shape,
+            (SelectionOp::Subtract, None, _) => None,
+            (SelectionOp::Add, None, shape) => shape,
+            (_, Some(base), None) => Some(base.clone()),
+            (SelectionOp::Add, Some(base), Some(shape)) => base.union(&shape),
+            (SelectionOp::Subtract, Some(base), Some(shape)) => base.difference(&shape),
+        }
+    }
+
+    /// Combine this selection's coverage into `dst`, which spans `rect`.
+    ///
+    /// Row by row over the overlap only, so a small shape added to a large
+    /// selection costs the small shape rather than the large one.
+    fn blit_into(&self, dst: &mut [u8], rect: PixelRect, mut f: impl FnMut(u8, u8) -> u8) {
+        let x0 = self.bounds.x.max(rect.x);
+        let y0 = self.bounds.y.max(rect.y);
+        let x1 = (self.bounds.x + self.bounds.width).min(rect.x + rect.width);
+        let y1 = (self.bounds.y + self.bounds.height).min(rect.y + rect.height);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let span = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let d = (y - rect.y) as usize * rect.width as usize + (x0 - rect.x) as usize;
+            let s = (y - self.bounds.y) as usize * self.bounds.width as usize
+                + (x0 - self.bounds.x) as usize;
+            for i in 0..span {
+                dst[d + i] = f(dst[d + i], self.coverage[s + i]);
+            }
+        }
+    }
+}
+
+/// The smallest rectangle holding both.
+fn union_rects(a: PixelRect, b: PixelRect) -> PixelRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    PixelRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+/// Shrink `rect` to the rows and columns of `coverage` that hold anything, and
+/// re-origin the mask onto it. `None` when nothing is covered at all.
+fn trim(rect: PixelRect, coverage: Vec<u8>) -> Option<(PixelRect, Vec<u8>)> {
+    let w = rect.width as usize;
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = rect.height as usize;
+    let mut max_y = 0usize;
+    for (y, row) in coverage.chunks_exact(w).enumerate() {
+        let first = row.iter().position(|c| *c != 0);
+        let Some(first) = first else { continue };
+        // `rposition` from the end rather than a second scan of the whole row:
+        // an interior row of a large selection is covered edge to edge, and
+        // both ends are then found in one step each.
+        let last = row.iter().rposition(|c| *c != 0).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    let trimmed = PixelRect {
+        x: rect.x + min_x as u32,
+        y: rect.y + min_y as u32,
+        width: (max_x - min_x + 1) as u32,
+        height: (max_y - min_y + 1) as u32,
+    };
+    if trimmed == rect {
+        return Some((rect, coverage));
+    }
+    let tw = trimmed.width as usize;
+    let mut out = Vec::with_capacity(tw * trimmed.height as usize);
+    for y in min_y..=max_y {
+        out.extend_from_slice(&coverage[y * w + min_x..y * w + max_x + 1]);
+    }
+    Some((trimmed, out))
 }
 
 /// The winding number of `ring` about `point`, by the standard crossing count.
@@ -306,6 +532,202 @@ fn add_span(acc: &mut [f32], origin: f32, x0: f32, x1: f32, weight: f32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tracing an outline back out of a mask
+// ---------------------------------------------------------------------------
+
+/// A directed boundary edge, as stored in the two grids below.
+const FORWARD: u8 = 1;
+/// The same edge run the other way — see [`trace_rings`].
+const BACKWARD: u8 = 2;
+
+/// Trace the closed rings round the pixels of `coverage` that are at least
+/// [`INSIDE`], in document space.
+///
+/// Only ever called after a boolean, and the module docs say what that costs.
+/// It runs at pointer-up, once, and it is linear in the area — a full-canvas
+/// selection on a 2048² document builds about 16 MB of grids and gives them
+/// straight back, which is the same order as the rasterisation that produced
+/// the mask a moment earlier. Nothing on the drawing path may reach it.
+///
+/// The method is boundary-edge walking, not marching squares over a 2×2 window:
+/// it is the same information and it comes out already oriented. Every pixel
+/// that is inside contributes one **directed** edge for each neighbour that is
+/// outside, oriented so the inside is always on the *right* of the direction of
+/// travel. Outer rings then come out wound the way [`Selection::rectangle`]
+/// winds — the top edge running +x — and a ring round a hole comes out wound
+/// the other way, so nonzero winding empties the hole with no special case and
+/// [`Selection::contains`] keeps working on a traced outline.
+///
+/// Each vertex has at most two outgoing edges, and two only where two inside
+/// pixels meet corner to corner across two outside ones. There the walk turns
+/// as sharply as it can — the first candidate is a right turn — which keeps
+/// diagonally touching regions apart rather than pinching them into one ring.
+/// The choice is made against the *original* edges rather than the ones still
+/// unwalked, so it pairs each arrival with exactly one departure and the rings
+/// are the cycles of that pairing; a walk therefore ends by arriving back at
+/// the edge it started from and can never wander onto another ring.
+fn trace_rings(bounds: PixelRect, coverage: &[u8]) -> Vec<Vec<Vec2>> {
+    let w = bounds.width as usize;
+    let h = bounds.height as usize;
+    let inside = |x: isize, y: isize| {
+        x >= 0
+            && y >= 0
+            && (x as usize) < w
+            && (y as usize) < h
+            && coverage[y as usize * w + x as usize] >= INSIDE
+    };
+
+    // Horizontal edges live on the grid lines between pixel rows: `h + 1` rows
+    // of `w`. Vertical ones on the lines between columns: `h` rows of `w + 1`.
+    let mut hor = vec![0u8; (h + 1) * w];
+    let mut ver = vec![0u8; h * (w + 1)];
+    for gy in 0..=h {
+        for gx in 0..w {
+            hor[gy * w + gx] = match (
+                inside(gx as isize, gy as isize - 1),
+                inside(gx as isize, gy as isize),
+            ) {
+                // The top edge of an inside pixel, run +x: inside below, which
+                // is the right-hand side when facing +x with y pointing down.
+                (false, true) => FORWARD,
+                // Its bottom edge, run -x, for the same reason mirrored.
+                (true, false) => BACKWARD,
+                _ => 0,
+            };
+        }
+    }
+    for gy in 0..h {
+        for gx in 0..=w {
+            ver[gy * (w + 1) + gx] = match (
+                inside(gx as isize - 1, gy as isize),
+                inside(gx as isize, gy as isize),
+            ) {
+                // The right edge of an inside pixel, run +y.
+                (true, false) => FORWARD,
+                // Its left edge, run -y.
+                (false, true) => BACKWARD,
+                _ => 0,
+            };
+        }
+    }
+
+    // An edge is named by its index into one grid or the other. Horizontal
+    // indices come first so one number covers both.
+    let split = hor.len();
+    let dir_of = |e: usize| -> u8 {
+        if e < split {
+            // 0 is +x, 2 is -x.
+            if hor[e] == FORWARD { 0 } else { 2 }
+        } else if ver[e - split] == FORWARD {
+            // 1 is +y, 3 is -y.
+            1
+        } else {
+            3
+        }
+    };
+    let ends_of = |e: usize| -> ((usize, usize), (usize, usize)) {
+        if e < split {
+            let (gx, gy) = (e % w, e / w);
+            if hor[e] == FORWARD {
+                ((gx, gy), (gx + 1, gy))
+            } else {
+                ((gx + 1, gy), (gx, gy))
+            }
+        } else {
+            let i = e - split;
+            let (gx, gy) = (i % (w + 1), i / (w + 1));
+            if ver[i] == FORWARD {
+                ((gx, gy), (gx, gy + 1))
+            } else {
+                ((gx, gy + 1), (gx, gy))
+            }
+        }
+    };
+    // The edge leaving `(gx, gy)` in direction `d`, if there is one.
+    let leaving = |(gx, gy): (usize, usize), d: u8| -> Option<usize> {
+        match d {
+            0 if gx < w && hor[gy * w + gx] == FORWARD => Some(gy * w + gx),
+            2 if gx > 0 && hor[gy * w + gx - 1] == BACKWARD => Some(gy * w + gx - 1),
+            1 if gy < h && ver[gy * (w + 1) + gx] == FORWARD => Some(split + gy * (w + 1) + gx),
+            3 if gy > 0 && ver[(gy - 1) * (w + 1) + gx] == BACKWARD => {
+                Some(split + (gy - 1) * (w + 1) + gx)
+            }
+            _ => None,
+        }
+    };
+
+    let mut walked = vec![false; hor.len() + ver.len()];
+    let mut rings = Vec::new();
+    let mut ring: Vec<Vec2> = Vec::new();
+    for start in 0..walked.len() {
+        let present = if start < split {
+            hor[start] != 0
+        } else {
+            ver[start - split] != 0
+        };
+        if !present || walked[start] {
+            continue;
+        }
+        ring.clear();
+        let mut e = start;
+        loop {
+            walked[e] = true;
+            let (from, to) = ends_of(e);
+            ring.push(Vec2::new(
+                bounds.x as f32 + from.0 as f32,
+                bounds.y as f32 + from.1 as f32,
+            ));
+            let d = dir_of(e);
+            // Right, straight on, left, back the way we came.
+            let Some(next) = [1u8, 0, 3, 2]
+                .into_iter()
+                .find_map(|turn| leaving(to, (d + turn) % 4))
+            else {
+                break;
+            };
+            // Back at an edge already claimed — normally the one this ring
+            // began at. Anything else would mean the pairing above was not a
+            // pairing, and stopping is the safe reading either way.
+            if walked[next] {
+                break;
+            }
+            e = next;
+        }
+        // Only the corners are kept. A straight run along the edge of a large
+        // selection is one segment however many pixels long it is, which is
+        // what stops the outline being redrawn from thousands of points every
+        // frame for the rest of the session.
+        let corners = corners_only(&ring);
+        if corners.len() >= 3 {
+            rings.push(corners);
+        }
+    }
+    rings
+}
+
+/// Drop the points of a closed ring that lie in the middle of a straight run.
+fn corners_only(ring: &[Vec2]) -> Vec<Vec2> {
+    let n = ring.len();
+    if n < 3 {
+        return ring.to_vec();
+    }
+    let mut out = Vec::new();
+    for i in 0..n {
+        let prev = ring[(i + n - 1) % n];
+        let here = ring[i];
+        let next = ring[(i + 1) % n];
+        // Axis-aligned throughout, so "same direction" is a sign test and
+        // needs no tolerance.
+        let a = here - prev;
+        let b = next - here;
+        if a.x * b.y != a.y * b.x {
+            out.push(here);
+        }
+    }
+    out
+}
+
 /// A selection being drawn: the gesture, before it becomes a [`Selection`].
 ///
 /// Lives here rather than in the interface because what each mode does with a
@@ -314,6 +736,10 @@ fn add_span(acc: &mut [f32], origin: f32, x0: f32, x1: f32, weight: f32) {
 #[derive(Clone, Debug)]
 pub struct SelectionDraft {
     mode: SelectionMode,
+    /// What this gesture will do to the selection standing. Snapshotted when
+    /// the gesture *begins* and never read again — see
+    /// [`SelectionDraft::combining`].
+    op: SelectionOp,
     /// Rectangle: the corner the drag started at. Lasso: every sampled point.
     /// Polygon: every vertex clicked so far.
     points: Vec<Vec2>,
@@ -335,13 +761,36 @@ impl SelectionDraft {
     pub fn new(mode: SelectionMode, at: Vec2) -> Self {
         Self {
             mode,
+            op: SelectionOp::Replace,
             points: vec![at],
             cursor: at,
         }
     }
 
+    /// Make this gesture add to or subtract from the selection already there.
+    ///
+    /// A separate step rather than a fourth argument to [`SelectionDraft::new`]
+    /// because [`SelectionOp::Replace`] is what a gesture is unless something
+    /// says otherwise, and every existing caller means exactly that.
+    ///
+    /// **The modifier is read once, when the gesture begins.** A hand lets go
+    /// of Shift halfway through a lasso and a polygon spans several clicks;
+    /// reading it again at the end would let a key tapped mid-drag change what
+    /// a finished gesture turns out to have meant. Snapshotting is also what
+    /// every other paint application does, and it is the same rule
+    /// `Editor::start_stroke` follows for the stroke's style.
+    #[must_use]
+    pub fn combining(mut self, op: SelectionOp) -> Self {
+        self.op = op;
+        self
+    }
+
     pub fn mode(&self) -> SelectionMode {
         self.mode
+    }
+
+    pub fn op(&self) -> SelectionOp {
+        self.op
     }
 
     /// A press, after the first. Returns true when the shape is now closed and
@@ -622,6 +1071,208 @@ mod tests {
         draft.moved(vec2(40.0, 10.0));
         draft.moved(vec2(40.0, 40.0));
         assert_eq!(draft.finish(DOC).map(|s| s.bounds().width), Some(30));
+    }
+
+    // --- combining --------------------------------------------------------
+
+    /// How many pixels of `s` are at least half selected. The booleans are
+    /// about *area*, so the tests below count it rather than sampling.
+    fn covered(s: &Selection) -> usize {
+        s.coverage().iter().filter(|c| **c >= 128).count()
+    }
+
+    #[test]
+    fn adding_a_disjoint_shape_selects_both_and_grows_the_bounds() {
+        // The point of Add: two areas with nothing between them are one
+        // selection. The bounding rectangle has to grow to hold both, and the
+        // mask has to be re-origined onto it — an off-by-one there puts every
+        // selected pixel one across, on a mask that still looks plausible.
+        let a = rect(4.0, 4.0, 10.0, 10.0);
+        let b = rect(30.0, 40.0, 40.0, 50.0);
+        let both = a.union(&b).expect("two areas");
+
+        assert_eq!(
+            both.bounds(),
+            PixelRect {
+                x: 4,
+                y: 4,
+                width: 36,
+                height: 46
+            }
+        );
+        assert_eq!(both.coverage().len(), 36 * 46);
+        // Both shapes, in their own places, and nothing joining them.
+        assert_eq!(both.coverage_at(5, 5), 255);
+        assert_eq!(both.coverage_at(9, 9), 255);
+        assert_eq!(both.coverage_at(31, 41), 255);
+        assert_eq!(both.coverage_at(39, 49), 255);
+        assert_eq!(both.coverage_at(20, 20), 0, "the gap stays out");
+        assert_eq!(covered(&both), 36 + 100);
+        // Two regions, so two rings — not one ring round the pair.
+        assert_eq!(both.rings().len(), 2);
+        assert!(both.contains(vec2(6.0, 6.0)));
+        assert!(both.contains(vec2(35.0, 45.0)));
+        assert!(!both.contains(vec2(20.0, 20.0)));
+    }
+
+    #[test]
+    fn adding_a_touching_shape_merges_it_into_one_region() {
+        // Two rectangles sharing an edge. The area is the sum, and the outline
+        // is *one* ring: the seam between them is not a boundary of the union,
+        // so tracing must not leave it in.
+        let a = rect(10.0, 10.0, 20.0, 20.0);
+        let b = rect(20.0, 10.0, 30.0, 20.0);
+        let merged = a.union(&b).expect("one region");
+
+        assert_eq!(
+            merged.bounds(),
+            PixelRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 10
+            }
+        );
+        assert_eq!(covered(&merged), 200);
+        assert_eq!(merged.coverage_at(19, 15), 255);
+        assert_eq!(merged.coverage_at(20, 15), 255, "and across the join");
+        assert_eq!(merged.rings().len(), 1, "one region, one outline");
+        // A rectangle, so four corners once the straight runs are collapsed.
+        assert_eq!(merged.rings()[0].len(), 4);
+        assert!(merged.contains(vec2(25.0, 15.0)));
+    }
+
+    #[test]
+    fn adding_a_shape_that_overlaps_does_not_double_the_overlap() {
+        // `max`, not `a + b - ab`: adding a shape to itself is the identity.
+        let a = rect(10.0, 10.0, 20.0, 20.0);
+        let again = a.union(&a).expect("itself");
+        assert_eq!(again.bounds(), a.bounds());
+        assert_eq!(again.coverage(), a.coverage());
+    }
+
+    #[test]
+    fn subtracting_half_a_rectangle_leaves_exactly_the_other_half() {
+        // The plain statement of what Subtract is for. Half of a 20×20 box is
+        // taken away and the remaining area, the remaining outline and the
+        // trimmed bounds all have to agree that it went.
+        let whole = rect(10.0, 10.0, 30.0, 30.0);
+        let right_half = rect(20.0, 10.0, 30.0, 30.0);
+        let left = whole.difference(&right_half).expect("the left half");
+
+        assert_eq!(
+            left.bounds(),
+            PixelRect {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 20
+            },
+            "the bounds shrink onto what is left"
+        );
+        assert_eq!(left.coverage().len(), 200);
+        assert_eq!(covered(&left), 200);
+        assert_eq!(left.coverage_at(19, 20), 255);
+        assert_eq!(left.coverage_at(20, 20), 0);
+        assert!(left.contains(vec2(15.0, 20.0)));
+        assert!(!left.contains(vec2(25.0, 20.0)));
+    }
+
+    #[test]
+    fn subtracting_the_middle_leaves_a_hole_the_outline_knows_about() {
+        // A hole is the case the winding of a traced ring decides. The inner
+        // ring has to come out wound the opposite way to the outer one, or
+        // nonzero winding fills the hole straight back in and `contains`
+        // disagrees with the mask it was traced from.
+        let whole = rect(10.0, 10.0, 40.0, 40.0);
+        let middle = rect(20.0, 20.0, 30.0, 30.0);
+        let ring = whole.difference(&middle).expect("a frame");
+
+        assert_eq!(ring.bounds(), whole.bounds(), "the outside is unchanged");
+        assert_eq!(covered(&ring), 900 - 100);
+        assert_eq!(ring.coverage_at(25, 25), 0);
+        assert_eq!(ring.coverage_at(15, 25), 255);
+        assert_eq!(
+            ring.rings().len(),
+            2,
+            "an outer ring and one round the hole"
+        );
+        assert!(!ring.contains(vec2(25.0, 25.0)), "the hole is not selected");
+        assert!(ring.contains(vec2(15.0, 25.0)));
+    }
+
+    #[test]
+    fn subtracting_everything_selects_nothing() {
+        // Down to nothing is the same answer as never having had one, because
+        // every caller treats an empty selection and no selection alike — and
+        // a `Selection` with a zero-area mask would be a rectangle the renderer
+        // must not be handed.
+        let a = rect(10.0, 10.0, 20.0, 20.0);
+        assert!(a.difference(&a).is_none());
+        let over = rect(0.0, 0.0, 64.0, 64.0);
+        assert!(a.difference(&over).is_none());
+    }
+
+    #[test]
+    fn the_empty_cases_of_a_combination_each_answer_differently() {
+        let base = rect(10.0, 10.0, 20.0, 20.0);
+        let shape = rect(30.0, 30.0, 40.0, 40.0);
+
+        // A bare click deselects — but only without a modifier. A slip of the
+        // hand while adding or subtracting must leave the work alone.
+        assert!(Selection::combined(Some(&base), None, SelectionOp::Replace).is_none());
+        let kept = Selection::combined(Some(&base), None, SelectionOp::Add).expect("kept");
+        assert_eq!(kept.bounds(), base.bounds());
+        let kept = Selection::combined(Some(&base), None, SelectionOp::Subtract).expect("kept");
+        assert_eq!(kept.bounds(), base.bounds());
+
+        // Adding to nothing is the shape itself, and it comes through
+        // untouched — the same rings, not rings traced back out of a mask.
+        let fresh = Selection::combined(None, Some(shape.clone()), SelectionOp::Add).expect("new");
+        assert_eq!(fresh.rings(), shape.rings());
+
+        // Subtracting from nothing is nothing: no selection means the whole
+        // document, and taking a shape out of it would claim more than the
+        // gesture did.
+        assert!(Selection::combined(None, Some(shape.clone()), SelectionOp::Subtract).is_none());
+
+        // Replace never looks at the base, and never re-traces.
+        let replaced =
+            Selection::combined(Some(&base), Some(shape.clone()), SelectionOp::Replace).unwrap();
+        assert_eq!(replaced.rings(), shape.rings());
+    }
+
+    #[test]
+    fn a_gesture_carries_the_operation_it_began_with() {
+        // Snapshotted at the start: a modifier let go of halfway through a
+        // lasso, or tapped between two clicks of a polygon, must not change
+        // what the gesture turns out to have meant.
+        let draft = SelectionDraft::new(SelectionMode::Rectangle, vec2(10.0, 10.0))
+            .combining(SelectionOp::Subtract);
+        assert_eq!(draft.op(), SelectionOp::Subtract);
+        assert_eq!(
+            SelectionDraft::new(SelectionMode::Lasso, vec2(0.0, 0.0)).op(),
+            SelectionOp::Replace,
+            "an unmodified gesture replaces"
+        );
+    }
+
+    #[test]
+    fn two_areas_touching_only_at_a_corner_keep_their_own_outlines() {
+        // The one ambiguous case in the trace: two selected pixels meeting
+        // diagonally across two unselected ones. The walk turns as sharply as
+        // it can, so they stay two regions — pinching them into one ring would
+        // put an outline through pixels that are not selected.
+        let a = rect(10.0, 10.0, 20.0, 20.0);
+        let b = rect(20.0, 20.0, 30.0, 30.0);
+        let both = a.union(&b).expect("two squares corner to corner");
+        assert_eq!(covered(&both), 200);
+        assert_eq!(both.rings().len(), 2);
+        assert!(
+            !both.contains(vec2(25.0, 15.0)),
+            "the empty quarters stay out"
+        );
+        assert!(!both.contains(vec2(15.0, 25.0)));
     }
 
     #[test]
