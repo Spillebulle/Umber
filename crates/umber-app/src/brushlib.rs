@@ -54,12 +54,6 @@ use std::sync::Arc;
 use umber_core::preset::{self, BrushPreset, PresetError, UserLibrary};
 use umber_core::style;
 
-/// The design's settings dialog is 1000×640; the browser is smaller because it
-/// shows one list rather than six panes. Clamped to the window, because a modal
-/// wider than the screen has no way back out of its own corners.
-const BROWSER_WIDTH: f32 = 780.0;
-const BROWSER_HEIGHT: f32 = 540.0;
-const BROWSER_RAIL: f32 = 210.0;
 /// Width kept clear at the right of a browser row for its two controls.
 const ROW_CONTROLS: f32 = 46.0;
 
@@ -1219,9 +1213,12 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     if !state.browser_open {
         return;
     }
+    // Clamped to the window, because a modal wider than the screen has no way
+    // back out of its own corners.
     let available = root.ctx().content_rect().size();
-    let width = BROWSER_WIDTH.min(available.x - 48.0).max(460.0);
-    let height = BROWSER_HEIGHT.min(available.y - 48.0).max(300.0);
+    let [full_width, full_height] = metrics::BRUSH_LIBRARY;
+    let width = full_width.min(available.x - 48.0).max(460.0);
+    let height = full_height.min(available.y - 48.0).max(300.0);
 
     let response = egui::Modal::new(Id::new("brush-library-browser"))
         .frame(
@@ -1239,12 +1236,12 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 // it and the pane, as in the settings dialog.
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.allocate_ui_with_layout(
-                    vec2(BROWSER_RAIL, height),
+                    vec2(metrics::BRUSH_LIBRARY_RAIL, height),
                     Layout::top_down(Align::Min),
                     |ui| browser_rail(ui, p, state),
                 );
                 ui.allocate_ui_with_layout(
-                    vec2(width - BROWSER_RAIL, height),
+                    vec2(width - metrics::BRUSH_LIBRARY_RAIL, height),
                     Layout::top_down(Align::Min),
                     |ui| browser_pane(ui, p, ed, state),
                 );
@@ -1629,12 +1626,23 @@ fn notice_bar(ui: &mut Ui, p: &Palette, notice: &Notice, dismissable: bool) -> b
             ui.horizontal_top(|ui| {
                 ui.set_min_width(full);
                 ui.scope(|ui| {
+                    // The width the text has to live inside, stated rather than
+                    // discovered. A label in a horizontal layout defaults to
+                    // `TextWrapMode::Extend`, so this used to size the strip
+                    // instead of being sized by it — and an import that lost
+                    // eight features put the browser wider than the screen,
+                    // with its corners out of reach. `set_max_width` alone is
+                    // not enough: it bounds the ui, and an extending label
+                    // simply overruns it.
                     ui.set_max_width((full - 26.0).max(40.0));
-                    ui.label(
-                        RichText::new(&notice.text)
-                            .size(text::TINY)
-                            .color(if notice.bad { p.warning } else { p.text })
-                            .line_height(Some(14.0)),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&notice.text)
+                                .size(text::TINY)
+                                .color(if notice.bad { p.warning } else { p.text })
+                                .line_height(Some(14.0)),
+                        )
+                        .wrap(),
                     );
                 });
                 if dismissable {

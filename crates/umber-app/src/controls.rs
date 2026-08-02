@@ -698,7 +698,16 @@ pub fn banner<R>(ui: &mut Ui, p: &Palette, message: &str, buttons: impl FnOnce(&
                 let (mark, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
                 draw_glyph(ui.painter(), mark, Glyph::Warning, p.accent);
                 ui.add_space(2.0);
-                ui.label(egui::RichText::new(message).size(text::TINY).color(p.text));
+                // Wrapped explicitly. A label in a horizontal layout defaults to
+                // `TextWrapMode::Extend`, so a long message does not run onto a
+                // second line — it makes the strip wider, and with it whatever
+                // dialog the strip is in. A banner carries what went wrong, and
+                // what went wrong is exactly the text nobody sized the window
+                // for.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(message).size(text::TINY).color(p.text))
+                        .wrap(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
             });
         });

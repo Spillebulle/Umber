@@ -332,6 +332,18 @@ pub mod metrics {
     /// The schematic of a module on one of those cards, in the proportions of
     /// the dock itself so it reads as the thing it stands for.
     pub const MODULE_PREVIEW: [f32; 2] = [78.0, 58.0];
+    /// The brush library browser: a collection rail and a list of brushes.
+    /// Smaller than the settings dialog because it shows one list rather than
+    /// six panes.
+    ///
+    /// A *fixed* size, and that is the point of it being here rather than in
+    /// `brushlib.rs`: the browser carries notices — what an import dropped,
+    /// which is a sentence naming as many features as the file had — and a
+    /// modal that grows to fit its own error message ends up wider than the
+    /// screen with its corners out of reach.
+    pub const BRUSH_LIBRARY: [f32; 2] = [780.0, 540.0];
+    /// The collection rail down its left-hand side.
+    pub const BRUSH_LIBRARY_RAIL: f32 = 210.0;
     /// The brush editor dialog. Wider than the other modals because the design
     /// lays its Tip section out as two columns and its Dynamics section as a
     /// row of curve panels, and neither survives being narrowed.
