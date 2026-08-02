@@ -90,6 +90,12 @@ impl Legends {
     ///
     /// The reader is injected rather than called directly, which is what makes
     /// every layout testable off the platform that could answer for it.
+    ///
+    /// Which is also why it is dead code everywhere but Windows: only that
+    /// `platform` module has a reader to hand it, and everywhere else the sole
+    /// caller is the test module — the Norwegian and German layouts are tested
+    /// on machines that could never answer for them, and that is the point.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn read(ask: impl Fn(KeyCode) -> Option<char>) -> Legends {
         let positions = LETTERS
             .into_iter()

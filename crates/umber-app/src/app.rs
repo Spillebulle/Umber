@@ -2475,12 +2475,17 @@ impl ApplicationHandler<Wake> for UmberApp {
         // instead, and that file says `umber`, so the two platforms genuinely
         // want different strings here. `taskbar`'s tests pin both against the
         // packaging so a rename cannot quietly break either.
+        //
+        // Both traits spell it `with_name`, so both calls name their trait
+        // explicitly. Written as a chain, the second one is ambiguous and does
+        // not compile — and the tempting repair, dropping one `use`, would
+        // silently set the same platform's name twice.
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
         let attrs = {
             use winit::platform::wayland::WindowAttributesExtWayland;
             use winit::platform::x11::WindowAttributesExtX11;
-            WindowAttributesExtWayland::with_name(attrs, taskbar::APP_ID, "")
-                .with_name("umber", "umber")
+            let attrs = WindowAttributesExtWayland::with_name(attrs, taskbar::APP_ID, "");
+            WindowAttributesExtX11::with_name(attrs, "umber", "umber")
         };
         let window = Arc::new(
             event_loop

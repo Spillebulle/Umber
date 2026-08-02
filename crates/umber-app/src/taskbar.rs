@@ -35,6 +35,14 @@
 ///
 /// Microsoft asks for `Company.Product`, which this satisfies while also being
 /// the reverse-DNS form the freedesktop world wants.
+///
+/// macOS is the one platform that reads it from nowhere: an application there
+/// is identified by its bundle, so nothing in this build refers to the constant
+/// and CI's `-D warnings` calls it dead. It is still *the* name — the tests
+/// below pin it against the packaging on every platform — so the allowance is
+/// narrowed to macOS rather than the constant being moved behind a `cfg` that
+/// would make those tests platform-specific too.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub const APP_ID: &str = "io.github.spillebulle.umber";
 
 /// Tell Windows which application this process is, before any window exists.

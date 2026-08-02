@@ -66,6 +66,12 @@ const WINDOW_ICON: u32 = 64;
 /// there, and winit names 256 as a good ceiling for `ICON_BIG`. The mark is a
 /// rounded square whose only detail is the corner radius, so it survives the
 /// downscale without needing a set of hand-tuned sizes the way a glyph would.
+///
+/// Windows-only, like the function that reads it: it is `ICON_BIG`, which no
+/// other platform has. macOS takes its icon from the bundle and Linux from the
+/// installed desktop entry, so on both this would be a rasterisation nobody
+/// asks for — and under CI's `-D warnings`, a build failure.
+#[cfg(target_os = "windows")]
 const TASKBAR_ICON: u32 = 256;
 
 /// Draw the mark, filling `rect`.
@@ -153,6 +159,7 @@ pub fn window_icon() -> Option<winit::window::Icon> {
 /// taskbar. The executable's own icon resource does not rescue it — that one is
 /// for Explorer, the Start Menu shortcut and the moment before the process
 /// exists, not for a window that is already up.
+#[cfg(target_os = "windows")]
 pub fn taskbar_icon() -> Option<winit::window::Icon> {
     icon_at(TASKBAR_ICON)
 }
