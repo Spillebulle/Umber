@@ -10,7 +10,7 @@
 
 use crate::theme::Palette;
 use egui::{
-    Color32, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, epaint::Vertex, pos2, vec2,
+    Color32, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, epaint::Vertex, pos2, vec2,
 };
 use umber_core::Hsv;
 
@@ -42,6 +42,96 @@ pub enum WheelShape {
 
 impl WheelShape {
     pub const ALL: [WheelShape; 2] = [Self::Triangle, Self::Square];
+
+    /// Where the shape sits with the Angle control at zero, in degrees.
+    ///
+    /// The pose every build before the angle existed drew: the triangle's apex
+    /// straight up, the square's axes level. Screen y is down, so "up" is a
+    /// quarter turn back from egui's zero angle, which points right.
+    ///
+    /// Any orientation would do for the triangle — the barycentric maths reads
+    /// the three corners wherever they are — but a fixed triangle that points
+    /// sideways looks like one that failed to finish turning, which is why zero
+    /// is not the same number for both shapes and why the angle is stored per
+    /// shape rather than shared.
+    fn neutral(self) -> f32 {
+        match self {
+            Self::Triangle => -90.0,
+            Self::Square => 0.0,
+        }
+    }
+
+    /// Whether the hue is what turns this centre while "Rotate with hue" is on.
+    ///
+    /// The triangle alone, and it stays the triangle alone now that the square
+    /// can be turned as well: the triangle has a corner that *is* the hue, so
+    /// following the marker round the ring keeps the two beside each other. A
+    /// square has no such corner, and turning it with the hue would only swing
+    /// the saturation and value axes off the level for nothing.
+    fn follows_hue(self, rotate: bool) -> bool {
+        rotate && matches!(self, Self::Triangle)
+    }
+}
+
+/// The angle each wheel centre is held at, in degrees from its neutral pose.
+///
+/// One number per shape rather than one shared between them, for two reasons.
+/// The two do not have the same neutral — apex up against axes level — so a
+/// single value would stand for a different pose in each and switching shapes
+/// would turn whichever one was showing. And an angle is a choice *about* a
+/// shape: trying the other one and coming back should find the first where it
+/// was left, not where the second was.
+///
+/// Zero is the pose every build before this drew, which is also what a
+/// preferences file written before the setting existed supplies.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WheelAngles {
+    triangle: f32,
+    square: f32,
+}
+
+impl WheelAngles {
+    pub fn of(self, shape: WheelShape) -> f32 {
+        match shape {
+            WheelShape::Triangle => self.triangle,
+            WheelShape::Square => self.square,
+        }
+    }
+
+    /// Set one shape's angle, wrapped into a single turn.
+    ///
+    /// Normalising here rather than at the call sites is what lets a hand-edited
+    /// preferences file, a slider drag and a default all arrive by the same
+    /// door.
+    pub fn set(&mut self, shape: WheelShape, degrees: f32) {
+        let degrees = normalise_angle(degrees);
+        match shape {
+            WheelShape::Triangle => self.triangle = degrees,
+            WheelShape::Square => self.square = degrees,
+        }
+    }
+}
+
+/// An angle in degrees, brought into `0..360`.
+///
+/// A whole turn is the period for both shapes. Their *outlines* repeat sooner —
+/// three times round for the triangle, four for the square — but the triangle's
+/// corners are a hue, a white and a black, and the square's axes are a
+/// saturation and a value. A third of a turn therefore moves the colours even
+/// where it leaves the outline exactly where it was, so there is no shorter
+/// range to offer.
+///
+/// Anything not finite comes back as zero rather than being carried: this ends
+/// up in `sin_cos` and then in vertex positions, and one NaN there is a mesh
+/// egui discards — a picker that silently stops drawing.
+pub fn normalise_angle(degrees: f32) -> f32 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let wrapped = degrees.rem_euclid(360.0);
+    // `rem_euclid` of a tiny negative rounds up to exactly 360 in f32, which is
+    // the one value outside the range this promises.
+    if wrapped >= 360.0 { 0.0 } else { wrapped }
 }
 
 const RING_SEGMENTS: usize = 96;
@@ -90,22 +180,47 @@ fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-/// Where the triangle's hue corner sits when it is not following the hue.
-///
-/// Straight up. Screen y is down, so that is a quarter turn anticlockwise from
-/// egui's zero angle, which points right. Any orientation would do — the
-/// barycentric maths reads the three corners wherever they are — but a fixed
-/// triangle that points sideways looks like one that failed to finish turning.
-const STILL_APEX: f32 = -std::f32::consts::FRAC_PI_2;
-
 /// How far out a press has to be to belong to the hue ring rather than to the
 /// centre.
 ///
-/// The hub's outermost 8% steers hue too, so the ring's inner edge is forgiving
-/// to grab. Everything inside it — including the three wide gaps between an
-/// inscribed triangle and the ring — belongs to the saturation and value shape,
-/// which is where those presses have always gone.
+/// The hub's outermost 8% steers hue too, so the ring's inner edge is
+/// forgiving to grab. Everything inside it — including the three wide gaps
+/// between an inscribed triangle and the ring — belongs to the saturation and
+/// value shape, which is where those presses have always gone.
 const RING_GRIP: f32 = 0.92;
+
+/// Draw the picker. Returns true when the colour changed.
+pub fn show(
+    ui: &mut Ui,
+    p: &Palette,
+    mode: PickerMode,
+    shape: &mut WheelShape,
+    rotate: &mut bool,
+    angles: &mut WheelAngles,
+    hsv: &mut Hsv,
+) -> bool {
+    match mode {
+        PickerMode::Wheel => wheel(ui, p, shape, rotate, angles, hsv),
+        PickerMode::Square => square(ui, p, hsv),
+        PickerMode::Sliders => sliders(ui, p, hsv),
+    }
+}
+
+/// The angle the wheel's centre is drawn at, in degrees from its neutral pose —
+/// which is also exactly what the Angle control reads.
+///
+/// Following the hue *replaces* the stored angle rather than offsetting it: the
+/// shape's orientation is then a function of the hue, and there is nothing left
+/// for a second number to mean. That is the whole reason the Angle control is
+/// drawn dead rather than live while it is on. Returning the hue's own answer in
+/// the control's units is what lets the dead rail still say where the shape is.
+fn wheel_angle(shape: WheelShape, rotate: bool, angles: WheelAngles, hue: f32) -> f32 {
+    if shape.follows_hue(rotate) {
+        normalise_angle(hue - shape.neutral())
+    } else {
+        angles.of(shape)
+    }
+}
 
 /// Where the gesture this response is reporting began, or `None` if there is no
 /// gesture.
@@ -124,27 +239,12 @@ fn gesture_origin(ui: &Ui, response: &Response) -> Option<Pos2> {
         .or_else(|| response.interact_pointer_pos())
 }
 
-/// Draw the picker. Returns true when the colour changed.
-pub fn show(
-    ui: &mut Ui,
-    p: &Palette,
-    mode: PickerMode,
-    shape: &mut WheelShape,
-    rotate: &mut bool,
-    hsv: &mut Hsv,
-) -> bool {
-    match mode {
-        PickerMode::Wheel => wheel(ui, p, shape, rotate, hsv),
-        PickerMode::Square => square(ui, p, hsv),
-        PickerMode::Sliders => sliders(ui, p, hsv),
-    }
-}
-
 fn wheel(
     ui: &mut Ui,
     p: &Palette,
     shape: &mut WheelShape,
     rotate: &mut bool,
+    angles: &mut WheelAngles,
     hsv: &mut Hsv,
 ) -> bool {
     let mut changed = false;
@@ -166,7 +266,7 @@ fn wheel(
     // the topmost widget under it, and the centre's rect is the square around a
     // shape inscribed in the ring — so its corners cover the ring at the four
     // diagonals, and a hue drag begun there went to the saturation and value
-    // shape instead. Settling it at the press rather than per frame is also what
+    // field instead. Settling it at the press rather than per frame is also what
     // lets a drag begun on the ring carry on across the middle, which is how
     // both controls have always behaved once held.
     let response = ui.interact(area, ui.id().with("wheel"), Sense::click_and_drag());
@@ -232,15 +332,17 @@ fn wheel(
 
     // --- saturation / value shape ---
     let drag = if on_ring { None } else { at };
+    let base = (shape.neutral() + wheel_angle(*shape, *rotate, *angles, hsv.h)).to_radians();
     match shape {
         WheelShape::Square => {
-            // Largest square that fits inside the ring.
+            // Largest square that fits inside the ring. Inscribed in the circle,
+            // so turning it cannot take it outside — the size is the same
+            // whatever the angle.
             let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
-            let sv = Rect::from_center_size(centre, vec2(half * 2.0, half * 2.0));
-            changed |= sv_square(ui, sv, drag, hsv);
+            changed |= sv_field(ui, centre, Vec2::splat(half), base, drag, hsv);
         }
         WheelShape::Triangle => {
-            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), *rotate, drag, hsv);
+            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), base, drag, hsv);
         }
     }
 
@@ -260,23 +362,61 @@ fn wheel(
         *shape = picked;
     }
 
-    // Only the triangle turns, so the row is drawn only when it is showing —
-    // rather than drawn disabled — because the square centre has no orientation
-    // for the setting to be about. A dead control here would be asking the user
-    // to work out which of the two shapes it refers to.
+    // Only the triangle follows the hue — see `WheelShape::follows_hue` — so the
+    // row is drawn only when the triangle is showing, rather than drawn
+    // disabled: for the square the setting has no meaning at all, and a dead
+    // control here would be asking which of the two shapes it refers to.
     if *shape == WheelShape::Triangle {
         crate::widgets::toggle_row(ui, p, "Rotate with hue", rotate);
+    }
+
+    // The angle the shape is held at, when the hue is not deciding it.
+    //
+    // A slider rather than a drag on the shape itself. Both regions of the wheel
+    // are already spoken for: the ring steers hue, and the centre is the
+    // saturation and value field right out to the gaps between an inscribed
+    // shape and the ring, where `clamp_barycentric` deliberately slides along an
+    // edge rather than freezing. A rotate gesture could therefore only be a
+    // modifier or a third zone carved out of one of those, and neither is
+    // something anyone would find without being told.
+    //
+    // Drawn disabled rather than hidden while the hue *is* deciding it. The
+    // setting still holds a value and the shape still has an angle — it is only
+    // that something else is supplying it — so the rail goes on reading where
+    // the shape actually is, and the row does not appear and disappear as the
+    // toggle above it is flipped. Hiding is what that toggle does for the
+    // square, and the difference is that there the setting means nothing at all,
+    // where here it means something that is temporarily spoken for.
+    //
+    // Recomputed rather than reusing `base`: the switch above may have changed
+    // shape this very frame, and the angle belongs to the shape.
+    let following = shape.follows_hue(*rotate);
+    let mut degrees = wheel_angle(*shape, *rotate, *angles, hsv.h);
+    let row = ui.scope(|ui| {
+        if following {
+            ui.disable();
+        }
+        crate::widgets::slider_row(ui, p, "Angle", &mut degrees, 0.0..=359.0, false, |v| {
+            format!("{v:.0}°")
+        })
+    });
+    if row.inner {
+        angles.set(*shape, degrees);
+    }
+    if following {
+        row.response
+            .on_hover_text("The hue is setting the angle — turn Rotate with hue off to set it.");
     }
 
     changed
 }
 
-/// Saturation/value triangle inscribed in the ring.
+/// Saturation/value triangle inscribed in the ring, turned by `base` radians.
 ///
 /// The apex is the full hue, with white and black at the other two corners.
-/// When `rotate` is set the apex tracks the hue marker round the ring, which is
-/// what the design shows; otherwise it holds still at [`STILL_APEX`] and only
-/// its colour changes.
+/// `base` is where that apex points: the hue when the shape is following it,
+/// which is what the design shows, and otherwise the shape's neutral pose
+/// turned by the user's own angle.
 ///
 /// The choice is not cosmetic. Following the hue keeps the apex next to the
 /// marker that sets it, so the two controls read as one instrument — but it
@@ -287,18 +427,18 @@ fn wheel(
 /// several hues becomes a matter of returning to the same place.
 ///
 /// `drag` is where the pointer is, if this frame's gesture belongs to the
-/// centre. The wheel decides that — see the interaction comment there — so there
-/// is no `interact` of its own to overlap the ring's.
+/// centre. The wheel decides that — see the interaction comment there — so
+/// there is no `interact` of its own to overlap the ring's.
 fn sv_triangle(
     ui: &mut Ui,
     centre: Pos2,
     radius: f32,
-    rotate: bool,
+    base: f32,
     drag: Option<Pos2>,
     hsv: &mut Hsv,
 ) -> bool {
     let mut changed = false;
-    let (hue_pt, white_pt, black_pt) = triangle_corners(centre, radius, rotate, hsv.h);
+    let (hue_pt, white_pt, black_pt) = triangle_corners(centre, radius, base);
 
     if let Some(pos) = drag {
         // Barycentric coordinates give saturation and value directly.
@@ -382,12 +522,11 @@ fn sv_triangle(
 /// The triangle's three corners, in the order the rest of this file reads them:
 /// full hue, white, black.
 ///
-/// Split out from [`sv_triangle`] because it is the whole of what `rotate`
+/// Split out from [`sv_triangle`] because it is the whole of what the angle
 /// changes, and everything else about the triangle — the hit test, the mesh,
 /// the marker — is derived from these three points. Testing it without a `Ui`
 /// is therefore testing the feature.
-fn triangle_corners(centre: Pos2, radius: f32, rotate: bool, hue: f32) -> (Pos2, Pos2, Pos2) {
-    let base = if rotate { hue.to_radians() } else { STILL_APEX };
+fn triangle_corners(centre: Pos2, radius: f32, base: f32) -> (Pos2, Pos2, Pos2) {
     let corner = |k: f32| {
         let a = base + k * std::f32::consts::TAU / 3.0;
         centre + vec2(a.cos(), a.sin()) * radius
@@ -431,7 +570,9 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     let drag = (response.dragged() || response.clicked())
         .then(|| response.interact_pointer_pos())
         .flatten();
-    changed |= sv_square(ui, rect, drag, hsv);
+    // Square on the page and level: this mode has no ring to turn inside, so
+    // the angle a wheel centre carries is not a setting here.
+    changed |= sv_field(ui, rect.center(), rect.size() * 0.5, 0.0, drag, hsv);
 
     ui.add_space(9.0);
 
@@ -476,41 +617,105 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     changed
 }
 
-/// The saturation/value gradient: white→hue left to right, black bottom.
+/// The field's own axes: across, rising saturation, and down, falling value.
 ///
-/// `drag` is where the pointer is, if this frame's gesture belongs to the field
-/// — see [`sv_triangle`].
-fn sv_square(ui: &mut Ui, rect: Rect, drag: Option<Pos2>, hsv: &mut Hsv) -> bool {
+/// At an angle of zero these are exactly `(1, 0)` and `(0, 1)`, so a level field
+/// puts every vertex where the axis-aligned version put it. That exactness is
+/// what lets the plain square mode and the wheel's turnable centre be one
+/// implementation rather than two that have to agree.
+fn field_axes(angle: f32) -> (Vec2, Vec2) {
+    let (sin, cos) = angle.sin_cos();
+    (vec2(cos, sin), vec2(-sin, cos))
+}
+
+/// Where a saturation and value land in the field.
+fn field_point(centre: Pos2, half: Vec2, angle: f32, s: f32, v: f32) -> Pos2 {
+    let (across, down) = field_axes(angle);
+    centre + across * (half.x * (s * 2.0 - 1.0)) + down * (half.y * (1.0 - v * 2.0))
+}
+
+/// The reverse: what saturation and value a point stands for.
+///
+/// Clamped to the field rather than rejected, for the reason
+/// [`clamp_barycentric`] gives — dragging past an edge slides along it instead
+/// of freezing the picker. A field squashed to nothing would divide by zero, and
+/// one NaN reaching a vertex is a mesh egui discards.
+fn field_at(centre: Pos2, half: Vec2, angle: f32, pos: Pos2) -> (f32, f32) {
+    let (across, down) = field_axes(angle);
+    let d = pos - centre;
+    let u = (d.dot(across) / half.x.max(1e-3)).clamp(-1.0, 1.0);
+    let w = (d.dot(down) / half.y.max(1e-3)).clamp(-1.0, 1.0);
+    ((u + 1.0) * 0.5, (1.0 - w) * 0.5)
+}
+
+/// One axis of the field's mesh grid: the parameter in `-1..=1`, and how far out
+/// of the field this row or column sits. The first and last are the skirt.
+fn field_edge(i: usize, n: usize) -> (f32, f32) {
+    if i == 0 {
+        (-1.0, -1.0)
+    } else if i == n + 2 {
+        (1.0, 1.0)
+    } else {
+        ((i - 1) as f32 / n as f32 * 2.0 - 1.0, 0.0)
+    }
+}
+
+/// The saturation/value gradient: white→hue across, black down, turned by
+/// `angle` radians about `centre`.
+///
+/// `half` is the semi-axes before the turn, so the plain square mode passes a
+/// rectangle's and the wheel passes a square's. `drag` is where the pointer is,
+/// if this frame's gesture belongs to the field.
+fn sv_field(
+    ui: &mut Ui,
+    centre: Pos2,
+    half: Vec2,
+    angle: f32,
+    drag: Option<Pos2>,
+    hsv: &mut Hsv,
+) -> bool {
     let mut changed = false;
 
     if let Some(pos) = drag {
-        hsv.s = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-        hsv.v = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+        (hsv.s, hsv.v) = field_at(centre, half, angle, pos);
         changed = true;
     }
 
     // Four-corner interpolation is not enough — saturation and value do not
-    // multiply linearly — so the square is drawn as a small grid.
+    // multiply linearly — so the field is drawn as a small grid.
     const N: usize = 8;
+    // One ring of vertices outside it, pushed a feather out along the field's
+    // own axes and faded to nothing. A turned field has four diagonal edges, and
+    // a mesh handed to egui whole never goes through its tessellator's own
+    // antialiasing — see `feather`. Pushing along the axes rather than away from
+    // the centre makes the skirt exactly one feather wide the whole way round,
+    // corners included.
+    let f = feather(ui);
+    let (across, down) = field_axes(angle);
+    let steps = N + 2;
+
     let painter = ui.painter();
     let mut mesh = Mesh::default();
-    for iy in 0..=N {
-        for ix in 0..=N {
-            let s = ix as f32 / N as f32;
-            let v = 1.0 - iy as f32 / N as f32;
+    for iy in 0..=steps {
+        for ix in 0..=steps {
+            let (u, out_u) = field_edge(ix, N);
+            let (w, out_w) = field_edge(iy, N);
+            let (s, v) = ((u + 1.0) * 0.5, (1.0 - w) * 0.5);
+            let colour = hsv_colour(hsv.h, s, v);
             mesh.vertices.push(Vertex {
-                pos: pos2(
-                    rect.left() + rect.width() * s,
-                    rect.top() + rect.height() * (1.0 - v),
-                ),
+                pos: centre + across * (half.x * u + f * out_u) + down * (half.y * w + f * out_w),
                 uv: egui::epaint::WHITE_UV,
-                color: hsv_colour(hsv.h, s, v),
+                color: if out_u == 0.0 && out_w == 0.0 {
+                    colour
+                } else {
+                    faded(colour)
+                },
             });
         }
     }
-    let stride = (N + 1) as u32;
-    for iy in 0..N as u32 {
-        for ix in 0..N as u32 {
+    let stride = (steps + 1) as u32;
+    for iy in 0..steps as u32 {
+        for ix in 0..steps as u32 {
             let i = iy * stride + ix;
             mesh.indices.extend_from_slice(&[
                 i,
@@ -524,10 +729,7 @@ fn sv_square(ui: &mut Ui, rect: Rect, drag: Option<Pos2>, hsv: &mut Hsv) -> bool
     }
     painter.add(Shape::mesh(mesh));
 
-    let marker = pos2(
-        rect.left() + rect.width() * hsv.s,
-        rect.top() + rect.height() * (1.0 - hsv.v),
-    );
+    let marker = field_point(centre, half, angle, hsv.s, hsv.v);
     painter.circle_stroke(marker, 5.5, Stroke::new(2.0, Color32::WHITE));
 
     changed
@@ -609,8 +811,26 @@ mod tests {
     const CENTRE: Pos2 = pos2(100.0, 100.0);
     const RADIUS: f32 = 50.0;
 
+    /// The triangle as the wheel builds it: a shape, the rotate flag, the stored
+    /// angles and a hue, resolved through the one function that decides.
+    fn corners_at(
+        shape: WheelShape,
+        rotate: bool,
+        angles: WheelAngles,
+        hue: f32,
+    ) -> (Pos2, Pos2, Pos2) {
+        let base = (shape.neutral() + wheel_angle(shape, rotate, angles, hue)).to_radians();
+        triangle_corners(CENTRE, RADIUS, base)
+    }
+
     fn corners(rotate: bool, hue: f32) -> (Pos2, Pos2, Pos2) {
-        triangle_corners(CENTRE, RADIUS, rotate, hue)
+        corners_at(WheelShape::Triangle, rotate, WheelAngles::default(), hue)
+    }
+
+    fn turned(degrees: f32) -> (Pos2, Pos2, Pos2) {
+        let mut angles = WheelAngles::default();
+        angles.set(WheelShape::Triangle, degrees);
+        corners_at(WheelShape::Triangle, false, angles, 0.0)
     }
 
     fn apart(a: Pos2, b: Pos2) -> f32 {
@@ -648,19 +868,215 @@ mod tests {
         assert!(hue_pt.y < CENTRE.y, "{hue_pt:?}");
     }
 
+    /// The angle is measured from each shape's own neutral pose, so zero is
+    /// exactly what every build before it existed drew — and an older
+    /// preferences file, which supplies zero by saying nothing, changes nothing.
+    #[test]
+    fn an_angle_of_zero_is_the_pose_the_picker_has_always_had() {
+        assert_eq!(turned(0.0), corners(false, 0.0));
+        assert_eq!(WheelAngles::default().of(WheelShape::Triangle), 0.0);
+        assert_eq!(WheelAngles::default().of(WheelShape::Square), 0.0);
+        // The square's neutral is level, not apex-up: the two shapes do not
+        // share a zero, which is half of why they do not share an angle.
+        let (across, down) = field_axes(WheelShape::Square.neutral().to_radians());
+        assert_eq!(across, vec2(1.0, 0.0));
+        assert_eq!(down, vec2(0.0, 1.0));
+    }
+
+    /// A quarter turn puts the apex where egui's zero angle points — to the
+    /// right — because the neutral is a quarter turn back from it.
+    #[test]
+    fn the_angle_turns_the_triangle_by_exactly_that_much() {
+        let (hue_pt, ..) = turned(90.0);
+        assert!((hue_pt.x - (CENTRE.x + RADIUS)).abs() < 1e-3, "{hue_pt:?}");
+        assert!((hue_pt.y - CENTRE.y).abs() < 1e-3, "{hue_pt:?}");
+    }
+
+    /// Why the range is a whole turn and not a third of one. A third of a turn
+    /// maps the triangle's *outline* onto itself — but the corners are a hue, a
+    /// white and a black, so what it actually does is hand each corner the next
+    /// one's colour. The shape looks unmoved and the picker is completely
+    /// different, which is exactly the case a shortened range would hide.
+    #[test]
+    fn a_third_of_a_turn_moves_the_triangles_colours_and_not_its_outline() {
+        let (hue_pt, white_pt, black_pt) = turned(0.0);
+        let (hue_now, white_now, black_now) = turned(120.0);
+        // The outline is the same three points, in a different order.
+        assert!(apart(hue_now, white_pt) < 1e-3, "{hue_now:?}");
+        assert!(apart(white_now, black_pt) < 1e-3, "{white_now:?}");
+        assert!(apart(black_now, hue_pt) < 1e-3, "{black_now:?}");
+        // And the hue corner has genuinely moved, which is what the picker
+        // shows and the outline does not.
+        assert!(apart(hue_now, hue_pt) > RADIUS);
+    }
+
+    /// The angle is meaningless while the hue is supplying it, so the picker
+    /// must not quietly add the two together — that is what the Angle control
+    /// being drawn dead promises, and this is that promise in the model.
+    #[test]
+    fn a_triangle_following_the_hue_ignores_the_stored_angle() {
+        let mut angles = WheelAngles::default();
+        for degrees in [0.0, 17.0, 120.0, 359.0] {
+            angles.set(WheelShape::Triangle, degrees);
+            for hue in [0.0, 47.0, 210.0] {
+                assert_eq!(
+                    corners_at(WheelShape::Triangle, true, angles, hue),
+                    corners(true, hue),
+                    "angle {degrees} leaked in at hue {hue}"
+                );
+            }
+        }
+    }
+
+    /// "Rotate with hue" is the triangle's alone — a square has no corner that
+    /// is the hue — so a square is turned by its own angle whatever the flag
+    /// says.
+    #[test]
+    fn a_square_is_turned_only_by_its_own_angle() {
+        let mut angles = WheelAngles::default();
+        angles.set(WheelShape::Square, 30.0);
+        for rotate in [true, false] {
+            assert_eq!(wheel_angle(WheelShape::Square, rotate, angles, 200.0), 30.0);
+        }
+        assert!(!WheelShape::Square.follows_hue(true));
+        assert!(WheelShape::Triangle.follows_hue(true));
+    }
+
+    /// Each shape keeps its own number: trying the other one and coming back
+    /// finds the first where it was left.
+    #[test]
+    fn each_shape_remembers_its_own_angle() {
+        let mut angles = WheelAngles::default();
+        angles.set(WheelShape::Triangle, 45.0);
+        assert_eq!(
+            angles.of(WheelShape::Square),
+            0.0,
+            "the square did not move"
+        );
+        angles.set(WheelShape::Square, 200.0);
+        assert_eq!(
+            angles.of(WheelShape::Triangle),
+            45.0,
+            "nor the triangle back"
+        );
+    }
+
+    #[test]
+    fn an_angle_wraps_into_a_single_turn() {
+        assert_eq!(normalise_angle(0.0), 0.0);
+        assert_eq!(normalise_angle(359.0), 359.0);
+        assert_eq!(normalise_angle(360.0), 0.0);
+        assert_eq!(normalise_angle(370.0), 10.0);
+        assert_eq!(normalise_angle(-90.0), 270.0);
+        assert_eq!(normalise_angle(-720.0), 0.0);
+        // A tiny negative is where `rem_euclid` rounds up to exactly a turn,
+        // which is the one value outside the range it promises.
+        assert!(normalise_angle(-1e-7) < 360.0);
+        // Nothing non-finite may reach `sin_cos`: one NaN vertex is a mesh egui
+        // discards, which reads as a picker that has stopped drawing.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(normalise_angle(bad), 0.0);
+        }
+        let mut angles = WheelAngles::default();
+        angles.set(WheelShape::Triangle, f32::NAN);
+        assert_eq!(angles.of(WheelShape::Triangle), 0.0, "set normalises too");
+    }
+
+    /// Whatever the field is turned to, a point still stands for the same
+    /// saturation and value it did — the gradient turns with the field rather
+    /// than sliding under it.
+    #[test]
+    fn a_turned_field_reads_the_same_colour_at_the_same_place() {
+        let half = vec2(40.0, 40.0);
+        for angle in [0.0, 0.4, 1.0, -2.5, std::f32::consts::TAU] {
+            for (s, v) in [
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (0.0, 1.0),
+                (1.0, 1.0),
+                (0.5, 0.5),
+                (0.25, 0.8),
+            ] {
+                let at = field_point(CENTRE, half, angle, s, v);
+                let (back_s, back_v) = field_at(CENTRE, half, angle, at);
+                assert!((back_s - s).abs() < 1e-4, "{s} -> {back_s} at {angle}");
+                assert!((back_v - v).abs() < 1e-4, "{v} -> {back_v} at {angle}");
+            }
+        }
+    }
+
+    /// A level field has to land exactly where the axis-aligned version put it,
+    /// because the plain square mode and the wheel's turnable centre are now one
+    /// implementation. Anything less than exact would be a mode that shifted by
+    /// a fraction of a pixel for no reason.
+    #[test]
+    fn a_level_field_is_the_axis_aligned_one() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 130.0));
+        let (centre, half) = (rect.center(), rect.size() * 0.5);
+        // The corners exactly: those are the four the eye can check against the
+        // rect, and the arithmetic that reaches them is exact.
+        for (s, v) in [(0.0, 1.0), (1.0, 1.0), (0.0, 0.0), (1.0, 0.0)] {
+            let at = field_point(centre, half, 0.0, s, v);
+            assert_eq!(
+                at,
+                pos2(
+                    rect.left() + rect.width() * s,
+                    rect.top() + rect.height() * (1.0 - v)
+                )
+            );
+        }
+        // And the inside to within a rounding step, which is all a different
+        // order of the same multiplications can promise.
+        for (s, v) in [(0.37, 0.62), (0.5, 0.5), (0.9, 0.1)] {
+            let at = field_point(centre, half, 0.0, s, v);
+            assert!(
+                (at.x - (rect.left() + rect.width() * s)).abs() < 1e-3,
+                "{at:?}"
+            );
+            assert!(
+                (at.y - (rect.top() + rect.height() * (1.0 - v))).abs() < 1e-3,
+                "{at:?}"
+            );
+        }
+    }
+
+    /// The field's edges are drawn with a skirt, and the skirt has to be outside
+    /// it — a row folded back inside would paint a faded band across the
+    /// gradient.
+    #[test]
+    fn the_fields_skirt_lies_outside_it() {
+        const N: usize = 8;
+        assert_eq!(field_edge(0, N), (-1.0, -1.0));
+        assert_eq!(field_edge(N + 2, N), (1.0, 1.0));
+        assert_eq!(field_edge(1, N), (-1.0, 0.0));
+        assert_eq!(field_edge(N + 1, N), (1.0, 0.0));
+        // The interior is evenly spaced and covers the whole field.
+        for i in 1..=N + 1 {
+            let (u, out) = field_edge(i, N);
+            assert_eq!(out, 0.0);
+            assert!((-1.0..=1.0).contains(&u), "{u}");
+        }
+    }
+
     /// Whichever way it is turned, the three corners have to stay a triangle:
     /// the barycentric hit test divides by its area, and a degenerate one
     /// returns NaN and freezes the picker.
     #[test]
     fn the_corners_are_never_collinear() {
-        for rotate in [true, false] {
-            for hue in [0.0, 30.0, 90.0, 180.0, 275.0, 359.9] {
-                let (h, w, b) = corners(rotate, hue);
-                let (a, _, _) = barycentric(CENTRE, h, w, b);
-                assert!(a.is_finite(), "degenerate at rotate={rotate} hue={hue}");
-                // The centre is inside, so every weight is positive.
-                let (x, y, z) = barycentric(CENTRE, h, w, b);
-                assert!(x > 0.0 && y > 0.0 && z > 0.0, "{x} {y} {z}");
+        let mut angles = WheelAngles::default();
+        for degrees in [0.0, 1.0, 45.0, 120.0, 271.0, 359.0] {
+            angles.set(WheelShape::Triangle, degrees);
+            for rotate in [true, false] {
+                for hue in [0.0, 30.0, 90.0, 180.0, 275.0, 359.9] {
+                    let (h, w, b) = corners_at(WheelShape::Triangle, rotate, angles, hue);
+                    let (x, y, z) = barycentric(CENTRE, h, w, b);
+                    assert!(
+                        x.is_finite(),
+                        "degenerate at angle={degrees} rotate={rotate} hue={hue}"
+                    );
+                    // The centre is inside, so every weight is positive.
+                    assert!(x > 0.0 && y > 0.0 && z > 0.0, "{x} {y} {z}");
+                }
             }
         }
     }

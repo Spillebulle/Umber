@@ -187,8 +187,9 @@ rather than in adverbs.
 ## The workspace
 
 The Colour panel offers four ways to pick a colour. The wheel's triangle can
-follow the hue as you turn it or hold still, whichever you prefer, and Umber
-remembers which one you left it on.
+follow the hue as you turn it or hold still, whichever you prefer, and either
+centre can be set to whatever angle you like to work at. Umber remembers all
+of it, each shape's angle separately.
 
 | Wheel, triangle | Wheel, square | Saturation / value | Sliders |
 |---|---|---|---|
