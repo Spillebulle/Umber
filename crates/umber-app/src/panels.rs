@@ -873,6 +873,14 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
+/// The blend picker's width on the layer row it shares with the opacity slider.
+///
+/// Fixed, and this is one of the two places a dropdown's width is: the row has
+/// exactly one thing on it that wants the spare room and it is the rail, not the
+/// picker. Wide enough for "Multiply", the longest mode there is, and for the
+/// one after it should the stack ever gain another.
+const BLEND_WIDTH: f32 = 80.0;
+
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     let count = ed.layers.len();
     let active = ed.layers.active_index();
@@ -919,18 +927,19 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     ui.horizontal(|ui| {
         let layer = ed.layers.active_mut();
         let before = (layer.blend, layer.opacity);
-        egui::ComboBox::from_id_salt("layer-blend")
-            .selected_text(
-                egui::RichText::new(layer.blend.label())
-                    .size(text::TINY)
-                    .color(p.text),
-            )
-            .width(80.0)
-            .show_ui(ui, |ui| {
+        // A fixed width rather than the layout's: the slider beside it is the
+        // control that should take the room the row has spare.
+        let label = layer.blend.label();
+        widgets::dropdown(
+            ui,
+            p,
+            widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(BLEND_WIDTH)),
+            |ui| {
                 for mode in BlendMode::ALL {
                     ui.selectable_value(&mut layer.blend, mode, mode.label());
                 }
-            });
+            },
+        );
         let value = layer.opacity;
         widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
         changed = before != (layer.blend, layer.opacity);
@@ -1258,47 +1267,18 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
 
 /// The Colour panel's picker-type switch: a half-filled disc, the mode name,
 /// and a chevron.
+///
+/// The look every other dropdown in the interface now takes — see
+/// [`widgets::dropdown`] — and the one that keeps its leading mark, because a
+/// half-filled disc genuinely says "colour picker" where none of the others has
+/// a glyph to hand.
 fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.picker.label();
-    let font = FontId::proportional(9.5);
-    let text_w = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 26.0, 16.0), Sense::click());
-    let colour = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text_dim
-    };
-    let painter = ui.painter();
-    icons::draw(
-        painter,
-        Rect::from_min_size(rect.left_top(), vec2(12.0, 16.0)),
-        Icon::HalfCircle,
-        colour,
-    );
-    painter.text(
-        rect.left_center() + vec2(15.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        colour,
-    );
-    icons::draw(
-        painter,
-        Rect::from_min_size(rect.right_top() - vec2(11.0, 0.0), vec2(11.0, 16.0)),
-        Icon::ChevronDown,
-        colour,
-    );
-
-    if response.clicked() {
-        ed.ui.picker_menu_open = !ed.ui.picker_menu_open;
-    }
-    let popup = egui::Popup::from_response(&response)
-        .open(ed.ui.picker_menu_open)
-        .show(|ui| {
+    widgets::dropdown(
+        ui,
+        p,
+        widgets::Dropdown::new(label).icon(Icon::HalfCircle),
+        |ui| {
             for mode in PickerMode::ALL {
                 if ui
                     .selectable_label(ed.ui.picker == mode, mode.label())
@@ -1308,13 +1288,10 @@ fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                         crate::prefs::mark_dirty();
                     }
                     ed.ui.picker = mode;
-                    ed.ui.picker_menu_open = false;
                 }
             }
-        });
-    if popup.is_none() {
-        ed.ui.picker_menu_open = false;
-    }
+        },
+    );
 }
 
 // --- the module library ----------------------------------------------------

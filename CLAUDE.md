@@ -1025,10 +1025,21 @@ design shows a whole row of them.
   does, so a handle cannot be drawn where the pointer disagrees with it — which
   is the worst kind of control that lies. Solid line, not the selection's
   dashes: the two are often on screen together and mean different things.
-- **The selection tool's mode is a dropdown, and it is the Colour panel's
-  dropdown pattern.** A painted trigger and a popup of `selectable_label`s, the
-  same shape `picker_mode_switch` uses. One dropdown pattern in the interface
-  rather than two, and `widgets.rs` gains nothing a second caller would need.
+- **There is one dropdown, `widgets::dropdown`, and it is the Colour panel's
+  picker-mode look**: an optional leading mark, the label, an optional figure, a
+  chevron, no fill. There were four — that switch, a filled pill on the tool
+  options strip, a full-width row in the brush library and five stock
+  `egui::ComboBox`es — which made one gesture read as four controls. **The menu
+  is `egui::Popup::menu` at every call site**, not a flag on `Editor::ui`: egui
+  holds the open state against the trigger's own id, which is the scope the flag
+  was standing in for, and it gets click-toggle, click-outside and Escape
+  without any of that being written down. `DropdownWidth` is `Content`, `Fill`
+  or `Exact` and all three are used — a trigger in a row sizes to itself, one
+  alone on a line fills it, and the curve presets and the layer blend are sized
+  by the control beside them. **There is deliberately no filled variant**: the
+  strip already has a filled pill in `widgets::chip`, where the fill means *not
+  a control*, so a second one that opens would teach the opposite.
+  `metrics::DROPDOWN` is the height and `text::TINY` the font, everywhere.
 - **The canvas dialogs are one form and two call sites** (`canvasdlg.rs`). New
   document and Canvas settings ask the same four questions, so they share
   `CanvasForm` and one body; two dialogs drifting apart is how "New" ends up

@@ -113,8 +113,6 @@ pub struct UiState {
     /// Which outline the selection tool draws. One tool with a mode rather
     /// than three tools: see `umber_core::selection`.
     pub selection_mode: SelectionMode,
-    /// Open state of the mode dropdown in the tool options strip.
-    pub selection_menu_open: bool,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
     /// Whether the wheel's triangle turns to follow the hue. Meaningless for the
@@ -123,8 +121,6 @@ pub struct UiState {
     /// How far each wheel centre is turned from its neutral pose, when the hue
     /// is not deciding it. One angle per shape — see [`WheelAngles`].
     pub wheel_angles: WheelAngles,
-    /// Open state of the picker-mode dropdown in the Colour panel header.
-    pub picker_menu_open: bool,
     pub brush_editor_open: bool,
     pub brush_tab: BrushTab,
     pub settings_open: bool,
@@ -192,14 +188,12 @@ impl Default for UiState {
             pressure_open: true,
             tool: Tool::Brush,
             selection_mode: SelectionMode::Rectangle,
-            selection_menu_open: false,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
             wheel_rotates: true,
             // Zero is the pose every build before the angle existed drew.
             wheel_angles: WheelAngles::default(),
-            picker_menu_open: false,
             brush_editor_open: false,
             brush_tab: BrushTab::Tip,
             settings_open: false,

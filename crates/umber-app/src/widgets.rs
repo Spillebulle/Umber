@@ -187,6 +187,225 @@ pub fn segmented<T: PartialEq + Copy>(
     changed
 }
 
+/// The leading mark's box on a [`dropdown`] that has one.
+const DROPDOWN_ICON: f32 = 12.0;
+/// The chevron at a [`dropdown`]'s right-hand end.
+const DROPDOWN_CHEVRON: f32 = 11.0;
+/// Between any two of a [`dropdown`]'s parts.
+const DROPDOWN_GAP: f32 = 4.0;
+
+/// How wide a [`dropdown`] draws itself.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DropdownWidth {
+    /// Exactly what its own contents need. The trigger sits in a row of other
+    /// things — a panel header, the tool options strip — and a fixed width
+    /// there would leave a gap that means nothing.
+    Content,
+    /// The whole width the layout is offering. What a trigger on its own line
+    /// in a panel body or one of the brush editor's columns wants: it is the
+    /// only thing on that line, so anything narrower reads as a mistake.
+    Fill,
+    /// Exactly this. For the pickers whose width is decided by something beside
+    /// them rather than by the layout — the curve presets, as wide as the curve
+    /// panel they sit under, and the layer blend, which shares its row with the
+    /// opacity slider and must not take the room that wants.
+    Exact(f32),
+}
+
+/// A dropdown trigger: an optional mark, the current choice, an optional figure
+/// at the right, and a chevron.
+///
+/// A struct rather than five positional arguments, and built up rather than
+/// written out, because most call sites want only the label — see
+/// [`Dropdown::new`].
+pub struct Dropdown<'a> {
+    /// The choice currently in force. Elided if the width it is given cannot
+    /// hold it.
+    label: &'a str,
+    /// A mark for *what* is being chosen, drawn before the label.
+    ///
+    /// Optional because most of these have no natural one: "Drives", "Driven
+    /// by" and the curve presets name an abstraction, and a glyph invented to
+    /// fill the slot would be worse than the gap — it would have to be learnt,
+    /// and it would say something the interface does not mean.
+    icon: Option<Icon>,
+    /// A figure between the label and the chevron: the brush library's count of
+    /// what is in the collection. Monospace and dim, because it is a reading
+    /// rather than part of the choice.
+    trailing: Option<&'a str>,
+    width: DropdownWidth,
+}
+
+impl<'a> Dropdown<'a> {
+    /// A trigger showing `label`, sized to its own contents, with no mark and
+    /// no figure.
+    pub fn new(label: &'a str) -> Self {
+        Self {
+            label,
+            icon: None,
+            trailing: None,
+            width: DropdownWidth::Content,
+        }
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn trailing(mut self, trailing: &'a str) -> Self {
+        self.trailing = Some(trailing);
+        self
+    }
+
+    pub fn width(mut self, width: DropdownWidth) -> Self {
+        self.width = width;
+        self
+    }
+}
+
+/// Where a trigger's label starts, relative to its left edge.
+fn dropdown_lead(icon: bool) -> f32 {
+    if icon {
+        DROPDOWN_ICON + DROPDOWN_GAP
+    } else {
+        0.0
+    }
+}
+
+/// What a trigger's fixed parts take: the mark, the figure, the chevron and the
+/// gaps between them. Everything left over is the label's.
+///
+/// One function, used both to size a trigger to its content — furniture plus
+/// the measured label — and to decide how much of a trigger of a *given* width
+/// the label may have. Stating it twice is how a picker ends up a few pixels
+/// short of its own longest option, eliding a name that fits, which nobody sees
+/// until they pick that one option.
+fn dropdown_furniture(icon: bool, trailing: Option<f32>) -> f32 {
+    dropdown_lead(icon)
+        + trailing.map_or(0.0, |w| w + DROPDOWN_GAP)
+        + DROPDOWN_GAP
+        + DROPDOWN_CHEVRON
+}
+
+/// The dropdown. One trigger, one menu, everywhere in the interface.
+///
+/// The look is the Colour panel's picker-type switch: dim text that comes up to
+/// [`Palette::text_strong`] under the pointer, with a chevron after it and no
+/// fill at all. There used to be four looks for the one gesture — that switch,
+/// a filled pill on the tool options strip, a full-width row in the brush
+/// library, and five stock `egui::ComboBox`es — so the same act of choosing
+/// read as four different controls depending where you met it. A stock
+/// ComboBox is also the thing this module exists not to do: egui's own widgets
+/// have a look the design does not use, and restyling them fights the framework
+/// rather than settling it.
+///
+/// **The menu is `egui::Popup::menu`, and every caller opens it that way.** The
+/// alternative in use was a `bool` on `Editor::ui` toggled by the trigger and
+/// cleared when the popup came back `None`. It works, but it puts a field on the
+/// editor for every dropdown anybody adds — state that is not per-document,
+/// that nothing else reads, and that has to be cleared in two places or the menu
+/// reopens itself. `Popup::menu` keeps that in egui's memory against the
+/// trigger's own id, which is exactly the scope the flag was standing in for:
+/// the popup toggles on a click, closes on a click anywhere, and closes on
+/// Escape without anybody writing that down. A painted trigger is a plain
+/// `Response`, which is all `Popup::menu` ever wanted.
+///
+/// The body is laid out the way `ComboBox` lays its own out — justified, wrap
+/// off so a long entry widens the menu rather than folding, and inside a scroll
+/// area, because a menu taller than the window has entries that cannot be
+/// reached. Returns whatever the body returned, or `None` when the menu is shut.
+pub fn dropdown<R>(
+    ui: &mut Ui,
+    p: &Palette,
+    trigger: Dropdown<'_>,
+    menu: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let font = FontId::proportional(text::TINY);
+    let figure = FontId::monospace(text::TINY);
+    let measure = |s: &str, font: &FontId| {
+        ui.painter()
+            .layout_no_wrap(s.to_owned(), font.clone(), p.text)
+            .size()
+            .x
+    };
+    let label_w = measure(trigger.label, &font);
+    let trailing_w = trigger.trailing.map(|t| measure(t, &figure));
+
+    let furniture = dropdown_furniture(trigger.icon.is_some(), trailing_w);
+    let width = match trigger.width {
+        DropdownWidth::Content => furniture + label_w,
+        DropdownWidth::Fill => ui.available_width(),
+        DropdownWidth::Exact(w) => w,
+    };
+    // A panel dragged to its minimum can offer nothing at all, and a `Rect`
+    // built from a negative width has its max left of its min — which paints
+    // somewhere unrelated rather than panicking.
+    let width = width.max(MIN_TRACK);
+
+    let (rect, response) = ui.allocate_exact_size(vec2(width, metrics::DROPDOWN), Sense::click());
+    let ink = if response.hovered() {
+        p.text_strong
+    } else {
+        p.text_dim
+    };
+
+    let painter = ui.painter();
+    if let Some(icon) = trigger.icon {
+        icons::draw(
+            painter,
+            Rect::from_min_size(rect.left_top(), vec2(DROPDOWN_ICON, rect.height())),
+            icon,
+            ink,
+        );
+    }
+    // The chevron is last on every trigger, whatever else is on one: it is the
+    // mark that says this opens, so it has to be in the same place each time.
+    // The figure goes inside it rather than beyond it, which is the one thing
+    // the brush library's own switch used to do the other way round.
+    let chevron = Rect::from_min_size(
+        pos2(rect.right() - DROPDOWN_CHEVRON, rect.top()),
+        vec2(DROPDOWN_CHEVRON, rect.height()),
+    );
+    icons::draw(painter, chevron, Icon::ChevronDown, ink);
+    if let Some(text) = trigger.trailing {
+        painter.text(
+            pos2(chevron.left() - DROPDOWN_GAP, rect.center().y),
+            Align2::RIGHT_CENTER,
+            text,
+            figure,
+            p.text_dim,
+        );
+    }
+    painter.text(
+        pos2(
+            rect.left() + dropdown_lead(trigger.icon.is_some()),
+            rect.center().y,
+        ),
+        Align2::LEFT_CENTER,
+        elide(painter, trigger.label, text::TINY, width - furniture),
+        font,
+        ink,
+    );
+
+    egui::Popup::menu(&response)
+        .width(rect.width())
+        .show(|ui| {
+            ui.set_min_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(metrics::DROPDOWN_MENU)
+                .show(ui, |ui| {
+                    // A trigger is often narrower than its own longest entry,
+                    // and wrapping there folds every label in the list rather
+                    // than widening the menu once.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    menu(ui)
+                })
+                .inner
+        })
+        .map(|popup| popup.inner)
+}
+
 /// Map a value onto `0..=1` along a slider, linearly or logarithmically.
 ///
 /// A logarithmic map is what makes a 1–400 px brush size usable: half the
@@ -1651,6 +1870,111 @@ mod tests {
                 assert!(
                     width <= COLUMN + 0.5,
                     "the row claimed {width} px of a {COLUMN} px column"
+                );
+            });
+        }
+    }
+
+    /// A trigger that sized itself to its own label has room for that label.
+    ///
+    /// The two halves of the arithmetic are the same function, which is what
+    /// makes this hold rather than nearly hold; the test is what stops somebody
+    /// splitting them again. The failure it guards against is quiet: a picker a
+    /// few pixels short elides the one long option and reads as a name somebody
+    /// mistyped, and every other option looks fine.
+    #[test]
+    fn a_dropdown_sized_to_its_content_has_room_for_all_of_it() {
+        // Plausible measured widths: a name, and a two-figure member count.
+        for label in [8.0, 42.0, 137.5] {
+            for icon in [false, true] {
+                for trailing in [None, Some(13.0)] {
+                    let width = dropdown_furniture(icon, trailing) + label;
+                    let room = width - dropdown_furniture(icon, trailing);
+                    assert_eq!(room, label, "{label} px label, icon {icon}, {trailing:?}");
+                }
+            }
+        }
+    }
+
+    /// And every part of one is paid for exactly once.
+    ///
+    /// Written as differences rather than totals so it says what each part
+    /// costs instead of restating the sum the widget already computes — a test
+    /// that copies the formula passes whatever the formula becomes.
+    #[test]
+    fn each_part_of_a_dropdown_costs_itself_and_one_gap() {
+        let bare = dropdown_furniture(false, None);
+        // A bare trigger is its chevron and the gap before it, and nothing else:
+        // no fill, no padding, no leading inset.
+        assert_eq!(bare, DROPDOWN_GAP + DROPDOWN_CHEVRON);
+        assert_eq!(
+            dropdown_furniture(true, None) - bare,
+            DROPDOWN_ICON + DROPDOWN_GAP
+        );
+        assert_eq!(
+            dropdown_furniture(false, Some(13.0)) - bare,
+            13.0 + DROPDOWN_GAP
+        );
+        assert_eq!(
+            dropdown_furniture(true, Some(13.0)) - bare,
+            DROPDOWN_ICON + DROPDOWN_GAP + 13.0 + DROPDOWN_GAP
+        );
+    }
+
+    /// A trigger told to fill its column takes the column and no more.
+    ///
+    /// The same rule `a_number_row_is_no_wider_than_the_column_it_is_drawn_in`
+    /// exists for, and the reason [`DropdownWidth::Fill`] is a variant rather
+    /// than every call site passing `ui.available_width()`: two of these sit in
+    /// one of the brush editor's `ui.columns` pair, inside a modal of fixed
+    /// width, so a picker that reported itself wider than its column would put
+    /// the dialog wider than the screen.
+    #[test]
+    fn a_filled_dropdown_is_no_wider_than_the_column_it_is_drawn_in() {
+        // A brush editor column: half the dialog, less the gap between them.
+        const COLUMN: f32 = 270.0;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+
+        // Twice, for the reason the number row's test runs twice: the first
+        // pass builds the font atlas, and a control that only misbehaves once
+        // it has been laid out before would otherwise go unseen.
+        // A label far longer than the column. Both widths are measured, and the
+        // content-sized one is asserted *over* the column — otherwise a label
+        // that happened to fit would make this pass without testing anything.
+        const LABEL: &str = "The direction the stroke is travelling in, \
+                             in degrees measured from due east";
+
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                let p = Palette::of(crate::theme::ThemeKind::Graphite);
+                let sized = |ui: &mut Ui, width: DropdownWidth| {
+                    ui.scope(|ui| {
+                        ui.set_max_width(COLUMN);
+                        dropdown(
+                            ui,
+                            &p,
+                            Dropdown::new(LABEL).trailing("128").width(width),
+                            |_| {},
+                        );
+                    })
+                    .response
+                    .rect
+                    .width()
+                };
+                let content = sized(ui, DropdownWidth::Content);
+                assert!(
+                    content > COLUMN,
+                    "the label is too short for this to be a test: {content} px in a \
+                     {COLUMN} px column"
+                );
+                let filled = sized(ui, DropdownWidth::Fill);
+                assert!(
+                    filled <= COLUMN + 0.5,
+                    "the trigger claimed {filled} px of a {COLUMN} px column"
                 );
             });
         }

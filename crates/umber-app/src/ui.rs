@@ -1125,62 +1125,30 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// The selection tool's mode switch: the mode name and a chevron, opening a
 /// list of the three.
 ///
-/// The trigger is painted, like every other control the design specifies;
-/// the list itself is a popup of `selectable_label`s, exactly as the Colour
-/// panel's picker-mode switch is. One dropdown pattern rather than two.
+/// [`widgets::dropdown`], like every other dropdown in the interface. It used
+/// to paint a filled `p.control` pill behind itself so it would read as a
+/// control against the strip, and it no longer does — deliberately. The strip
+/// already has a filled pill on it, [`widgets::chip`], and there the fill means
+/// the opposite: a chip is a *reading*, deliberately not a control, and says so
+/// in its tooltip. Two pills side by side, one of which opens and one of which
+/// does not, teaches nothing. What says this opens is the chevron, which is
+/// what says it everywhere else too.
 fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.selection_mode.label();
-    let font = FontId::proportional(text::SMALL);
-    let text_w = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), p.text_dim)
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(vec2(text_w + 16.0, 18.0), Sense::click());
-    let colour = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, metrics::RADIUS, p.control);
-    painter.text(
-        rect.left_center() + vec2(6.0, 0.0),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        colour,
-    );
-    icons::draw(
-        painter,
-        Rect::from_min_size(rect.right_top() - vec2(12.0, 0.0), vec2(12.0, 18.0)),
-        Icon::ChevronDown,
-        colour,
-    );
-
-    if response.clicked() {
-        ed.ui.selection_menu_open = !ed.ui.selection_menu_open;
-    }
-    let popup = egui::Popup::from_response(&response)
-        .open(ed.ui.selection_menu_open)
-        .show(|ui| {
-            for mode in SelectionMode::ALL {
-                if ui
-                    .selectable_label(ed.ui.selection_mode == mode, mode.label())
-                    .clicked()
-                {
-                    ed.ui.selection_mode = mode;
-                    // A half-drawn outline belongs to the mode that was
-                    // drawing it, and a polygon left open under the lasso
-                    // would take its next click as a vertex.
-                    ed.cancel_selection_draft();
-                    ed.ui.selection_menu_open = false;
-                }
+    widgets::dropdown(ui, p, widgets::Dropdown::new(label), |ui| {
+        for mode in SelectionMode::ALL {
+            if ui
+                .selectable_label(ed.ui.selection_mode == mode, mode.label())
+                .clicked()
+            {
+                ed.ui.selection_mode = mode;
+                // A half-drawn outline belongs to the mode that was drawing it,
+                // and a polygon left open under the lasso would take its next
+                // click as a vertex.
+                ed.cancel_selection_draft();
             }
-        });
-    if popup.is_none() {
-        ed.ui.selection_menu_open = false;
-    }
+        }
+    });
 }
 
 fn divider(ui: &mut egui::Ui, p: &Palette) {
@@ -1739,7 +1707,6 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             &mut c[0],
             p,
             "Pressure → size",
-            "size",
             &mut ed.brush.pressure_size,
             &mut ed.brush.size_curve,
             Some(("Min size", &mut ed.brush.min_size_ratio)),
@@ -1748,7 +1715,6 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             &mut c[1],
             p,
             "Pressure → opacity",
-            "opacity",
             &mut ed.brush.pressure_opacity,
             &mut ed.brush.opacity_curve,
             None,
@@ -1757,7 +1723,6 @@ fn brush_editor_dynamics(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             &mut c[2],
             p,
             "Pressure → hardness",
-            "hardness",
             &mut ed.brush.pressure_hardness,
             &mut ed.brush.hardness_curve,
             Some(("Min hardness", &mut ed.brush.min_hardness_ratio)),
@@ -1886,14 +1851,15 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 .size(text::SMALL)
                 .color(p.text_dim),
         );
-        egui::ComboBox::from_id_salt("mod-target")
-            .selected_text(
-                egui::RichText::new(edited.target.label())
-                    .size(text::TINY)
-                    .color(p.text),
-            )
-            .width(c[0].available_width())
-            .show_ui(&mut c[0], |ui| {
+        // No leading mark on either of these two: "Drives" and "Driven by" name
+        // an abstraction, and a glyph invented for one would have to be learnt
+        // before it said anything.
+        let label = edited.target.label();
+        widgets::dropdown(
+            &mut c[0],
+            p,
+            widgets::Dropdown::new(label).width(widgets::DropdownWidth::Fill),
+            |ui| {
                 for target in DabTarget::ALL {
                     if ui
                         .selectable_label(target == edited.target, target.label())
@@ -1908,21 +1874,20 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                         edited.high = 0.0;
                     }
                 }
-            });
+            },
+        );
 
         c[1].label(
             egui::RichText::new("Driven by")
                 .size(text::SMALL)
                 .color(p.text_dim),
         );
-        egui::ComboBox::from_id_salt("mod-input")
-            .selected_text(
-                egui::RichText::new(edited.input.label())
-                    .size(text::TINY)
-                    .color(p.text),
-            )
-            .width(c[1].available_width())
-            .show_ui(&mut c[1], |ui| {
+        let label = edited.input.label();
+        widgets::dropdown(
+            &mut c[1],
+            p,
+            widgets::Dropdown::new(label).width(widgets::DropdownWidth::Fill),
+            |ui| {
                 for input in DabInput::ALL {
                     if ui
                         .selectable_label(input == edited.input, input.label())
@@ -1931,7 +1896,8 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                         edited.input = input;
                     }
                 }
-            });
+            },
+        );
     });
 
     ui.add_space(8.0);
@@ -1969,10 +1935,14 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         widgets::curve_editor(&mut c[0], p, &mut edited.curve, size);
         c[0].add_space(6.0);
         let current = edited.curve.preset_name().unwrap_or("Custom");
-        egui::ComboBox::from_id_salt("mod-curve")
-            .selected_text(egui::RichText::new(current).size(text::TINY).color(p.text))
-            .width(size)
-            .show_ui(&mut c[0], |ui| {
+        // As wide as the curve panel above it rather than as wide as the
+        // column: the two are one control read downwards, and a picker running
+        // past the square it belongs to would break that.
+        widgets::dropdown(
+            &mut c[0],
+            p,
+            widgets::Dropdown::new(current).width(widgets::DropdownWidth::Exact(size)),
+            |ui| {
                 for (name, preset) in ResponseCurve::PRESETS {
                     if ui
                         .selectable_label(edited.curve.preset_name() == Some(name), name)
@@ -1981,7 +1951,8 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                         edited.curve = preset;
                     }
                 }
-            });
+            },
+        );
 
         caption(&mut c[1], p, input_note(edited.input));
     });
@@ -2115,7 +2086,6 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             &mut c[1],
             p,
             "Pressure → scatter",
-            "scatter",
             &mut ed.brush.pressure_scatter,
             &mut ed.brush.scatter_curve,
             Some(("Min scatter", &mut ed.brush.min_scatter_ratio)),
@@ -2333,11 +2303,15 @@ fn brush_editor_blending(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 
 /// One dynamics column: an on/off toggle, the curve, its presets, and — where
 /// the parameter has a floor rather than falling to zero — that floor.
+///
+/// Took a `salt` for the preset picker's id while that was an `egui::ComboBox`,
+/// which needs one given to it. [`widgets::dropdown`] is allocated out of the
+/// `Ui` it is drawn in, so it takes its id from where it lands — and each of
+/// these columns is its own `Ui`.
 fn curve_column(
     ui: &mut egui::Ui,
     p: &Palette,
     label: &str,
-    salt: &str,
     enabled: &mut bool,
     curve: &mut ResponseCurve,
     min: Option<(&str, &mut f32)>,
@@ -2357,10 +2331,13 @@ fn curve_column(
 
         ui.add_space(6.0);
         let current = curve.preset_name().unwrap_or("Custom");
-        egui::ComboBox::from_id_salt(("curve-preset", salt))
-            .selected_text(egui::RichText::new(current).size(text::TINY).color(p.text))
-            .width(size)
-            .show_ui(ui, |ui| {
+        // As wide as the curve panel above it, for the reason the Inputs tab's
+        // copy of this gives.
+        widgets::dropdown(
+            ui,
+            p,
+            widgets::Dropdown::new(current).width(widgets::DropdownWidth::Exact(size)),
+            |ui| {
                 for (name, preset) in ResponseCurve::PRESETS {
                     if ui
                         .selectable_label(curve.preset_name() == Some(name), name)
@@ -2369,7 +2346,8 @@ fn curve_column(
                         *curve = preset;
                     }
                 }
-            });
+            },
+        );
 
         if let Some((label, value)) = min {
             ui.add_space(8.0);

@@ -350,6 +350,18 @@ pub mod metrics {
     pub const BRUSH_EDITOR_WIDTH: f32 = 560.0;
     /// One dynamics curve panel, square.
     pub const CURVE_PANEL: f32 = 150.0;
+    /// A dropdown trigger — [`crate::widgets::dropdown`], which is every
+    /// dropdown there is. One height wherever it is drawn: the Colour panel's
+    /// header, the tool options strip, a panel body and the brush editor's
+    /// two-column layout all put one somewhere, and four heights is how the
+    /// four separate triggers this replaced came to look like four controls.
+    pub const DROPDOWN: f32 = 18.0;
+    /// The tallest a dropdown's menu grows before it scrolls.
+    ///
+    /// Some of the lists are long — thirteen dab inputs, ten blend modes, a
+    /// user's collections — and a menu taller than the window has entries that
+    /// cannot be reached at all.
+    pub const DROPDOWN_MENU: f32 = 240.0;
 }
 
 /// Install Archivo, the typeface the design specifies.

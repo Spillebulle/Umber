@@ -657,56 +657,35 @@ fn collection_row(ui: &mut Ui, p: &Palette, ed: &Editor, state: &mut State) {
         Scope::Category(name) => name.as_str(),
     };
 
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
-    let ink = if response.hovered() {
-        p.text_strong
-    } else {
-        p.text_dim
-    };
-    let painter = ui.painter();
-    let font = FontId::proportional(text::TINY);
-    painter.text(
-        rect.left_center(),
-        Align2::LEFT_CENTER,
-        widgets::elide(painter, label, text::TINY, rect.width() - 52.0),
-        font,
-        ink,
-    );
-    painter.text(
-        rect.right_center(),
-        Align2::RIGHT_CENTER,
-        count.to_string(),
-        FontId::monospace(9.5),
-        p.text_dim,
-    );
-    icons::draw(
-        painter,
-        Rect::from_min_size(pos2(rect.right() - 36.0, rect.top()), vec2(12.0, 20.0)),
-        Icon::ChevronDown,
-        ink,
-    );
-
+    // The one trigger that carries a figure as well as a name. Full width,
+    // because it is the only thing on its line and a picker sized to
+    // "All collections" would jump about as the collection changed.
+    let members = count.to_string();
     let mut chosen = None;
-    egui::Popup::menu(&response).show(|ui| {
-        ui.set_min_width(190.0);
-        let all = format!("All collections ({})", state.index.total);
-        if ui
-            .selectable_label(state.scope == Scope::All, all)
-            .clicked()
-        {
-            chosen = Some(Scope::All);
-            ui.close();
-        }
-        ui.separator();
-        for group in &state.index.groups {
-            let scope = Scope::Category(group.name.clone());
-            let label = format!("{} ({})", group.name, group.members.len());
-            if ui.selectable_label(state.scope == scope, label).clicked() {
-                chosen = Some(scope);
-                ui.close();
+    widgets::dropdown(
+        ui,
+        p,
+        widgets::Dropdown::new(label)
+            .trailing(&members)
+            .width(widgets::DropdownWidth::Fill),
+        |ui| {
+            let all = format!("All collections ({})", state.index.total);
+            if ui
+                .selectable_label(state.scope == Scope::All, all)
+                .clicked()
+            {
+                chosen = Some(Scope::All);
             }
-        }
-    });
+            ui.separator();
+            for group in &state.index.groups {
+                let scope = Scope::Category(group.name.clone());
+                let label = format!("{} ({})", group.name, group.members.len());
+                if ui.selectable_label(state.scope == scope, label).clicked() {
+                    chosen = Some(scope);
+                }
+            }
+        },
+    );
     if let Some(scope) = chosen {
         state.scope = scope;
     }
