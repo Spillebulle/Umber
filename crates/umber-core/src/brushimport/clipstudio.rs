@@ -42,17 +42,15 @@
 //! Despite the names, nothing in there is a zip. `catalog.zip` and
 //! `material_0.layer` are Clip Studio's own container — magic
 //! `\x89C2F\r\n\x1a\n`, then chunks of `[u32 le size][4-byte tag][payload]
-//! [u32 checksum]` tagged `HEAD`, `dATA` and `TAIL` — and a `dATA` payload
-//! begins with a two-byte flag that is `1` when what follows is compressed by
-//! a codec that is Clip Studio's and is documented nowhere.
+//! [u32 checksum]` tagged `HEAD`, `dATA` and `TAIL`.
 //!
 //! **So the tip comes from `thumbnail.png`.** That is a real PNG of the real
 //! material and needs no guesswork, at the cost of a longest side of 300 —
 //! which is a limit only for a material that was bigger, and is well inside
-//! what [`TipMask`] stamps. Reversing the codec to gain resolution on a stamp
-//! that is then scaled to the dab anyway is not a trade worth the risk of
-//! getting somebody's brush subtly wrong, which is the thing `CLAUDE.md` says
-//! an import must never do. It is named as a loss all the same.
+//! what [`TipMask`] stamps. The full-resolution pixels *are* reachable and
+//! `docs/brushes.md` records exactly how; what stands between them and this
+//! reader is a second SQLite dialect and a zlib dependency, not a mystery.
+//! The lost resolution is named as a loss meanwhile.
 //!
 //! A material reference — `TextureImage`, `BrushPatternImageArray` — is a small
 //! blob whose first field is the `OriginalPath` of the row in `MaterialFile`
@@ -61,20 +59,29 @@
 //!
 //! # What is dropped
 //!
-//! The list is in [`Dropped`]. The ones worth stating here are the shape of the
+//! The list is in [`dropped`]. The ones worth stating here are the shape of the
 //! whole thing rather than a detail:
 //!
 //! - **Clip Studio's per-setting "effect sources" are a table Umber does not
 //!   have.** Every one of them carries a bitmask of which inputs drive it, a
-//!   minimum per input, and a response curve. Pen pressure and the per-dab
-//!   random draw are read; pen tilt, pen bearing and stroke speed are named and
-//!   dropped, because which bit is which cannot be told apart from the files to
-//!   hand and a modulation wired to the wrong input is worse than none.
+//!   floor per input, and a response curve. Pen pressure, stroke speed and the
+//!   per-dab random draw are read. **Pen tilt is named and dropped**, and that
+//!   is not because the bit cannot be identified — it can, see [`TILT`] — but
+//!   because no platform Umber runs on reports tilt at all, so the modulation
+//!   would sit at a value the pen never produces.
+//! - **The taper arrives at the start of a stroke and not at its end.** "In"
+//!   is a size ramp over the first stretch of the mark, which is precisely what
+//!   [`DabInput::Stroke`] is. "Out" is measured back from an end the engine
+//!   does not know until the stroke is over.
 //! - **The paper texture becomes one of Umber's three.** Umber's grain is a
-//!   closed set (see [`crate::GrainPattern`]), so the strength and the tile
-//!   size carry across and the picture does not.
-//! - **Dual brushes, watercolour edges, the taper, colour jitter and the vector
-//!   settings have no engine behind them at all** and are named.
+//!   closed set (see [`GrainPattern`]), so the strength and the tile size carry
+//!   across and the picture does not.
+//! - **Dual brushes, watercolour edges, colour jitter and the vector settings
+//!   have no engine behind them at all** and are named.
+//! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
+//!   a tool group and a group holding a fill or a selection tool is the
+//!   ordinary case; a note about it would appear on nearly every import ever
+//!   made and teach the reader to skip the list that carries the rest.
 //!
 //! Nothing here is refused for being approximate: this is a user's own import,
 //! which `CLAUDE.md` holds to a different standard than the shipped library —
@@ -82,6 +89,7 @@
 
 use crate::brush::{Brush, GrainPattern};
 use crate::curve::ResponseCurve;
+use crate::dynamics::{DabInput, DabTarget, Modulation};
 use crate::preset::PresetError;
 use crate::sqlite::{Database, Row, Table, Value};
 use crate::tip::{TipMask, stroke_coverage};
@@ -96,16 +104,26 @@ pub mod dropped {
     pub const THUMBNAIL_TIP: &str = "bitmap tips at their full resolution";
     pub const SEVERAL_TIPS: &str = "brushes that cycle through several tip images";
     pub const PAPER_TEXTURE: &str = "the paper texture's own picture";
-    pub const OTHER_INPUTS: &str = "settings driven by pen tilt, pen bearing or stroke speed";
+    /// Umber has no tilt input on any platform it runs on, so a tilt mapping
+    /// could only ever be evaluated at a value the pen never reports.
+    pub const TILT_INPUT: &str = "settings driven by pen tilt";
+    /// A fifth effect source that every setting declares support for and that
+    /// nothing in the sample files ever switches on. Named rather than guessed.
+    pub const UNKNOWN_INPUT: &str = "settings driven by an effect source this reader cannot name";
+    /// Stroke speed reaches size and per-dab opacity; on anything else there is
+    /// no Umber setting for it to drive.
+    pub const SPEED_ELSEWHERE: &str = "stroke speed driving a setting Umber has no equivalent for";
     pub const MIXING: &str = "the detail of Clip Studio's underlying-colour mixing";
     pub const DUAL_BRUSH: &str = "dual brushes";
     pub const WATER_EDGE: &str = "watercolour edges";
-    pub const TAPER: &str = "stroke taper (in and out)";
+    /// The taper *in* is imported as a stroke-position ramp. The taper out
+    /// cannot be: it is measured back from an end the engine does not know
+    /// until the stroke is over.
+    pub const TAPER_OUT: &str = "the stroke's taper at its end";
     pub const COLOUR_JITTER: &str = "per-dab hue, saturation and brightness shifts";
     pub const RIBBON: &str = "ribbon and continuous-image strokes";
     pub const BLEND_MODE: &str = "a blending mode set on the brush itself";
     pub const SPRAY_SHAPE: &str = "the spray's particle count and bias";
-    pub const NOT_A_BRUSH: &str = "sub-tools that are not brushes";
     pub const VECTOR: &str = "the vector-layer settings";
     /// The material was there and its thumbnail could not be turned into a
     /// mask — a picture with no dark pixels in it paints nothing.
@@ -164,8 +182,12 @@ pub fn from_sut(bytes: &[u8]) -> Result<SutFile, PresetError> {
         // shape tools share these tables and leave every brush column null.
         // Skipping them by the data rather than by a tool-type number means a
         // tool this build has never heard of is skipped for the right reason.
+        //
+        // Deliberately **not** reported. A `.sutg` is a whole tool group and
+        // legitimately holds fill and selection tools; saying so on every group
+        // ever imported is how a reader learns to skip the list that carries
+        // the losses that matter.
         if settings.real("BrushSize").is_none() {
-            push_once(&mut file.dropped, dropped::NOT_A_BRUSH);
             continue;
         }
 
@@ -364,45 +386,65 @@ impl Settings<'_> {
 
 /// Which input drives a setting, bit by bit.
 ///
-/// Only these two are acted on. **Bit 4 is pen pressure**: it is the bit set on
-/// the size effector of every pressure-sensitive brush in the sample files and
-/// on nothing else, which is as firm as this gets without Clip Studio's source.
-/// **Bit 7 is the per-dab random draw**: it is the only bit ever set on the hue,
-/// saturation and brightness effectors — which is what colour jitter is — and
-/// it is set exactly on the brushes whose rotation randomness is not left at its
-/// default.
+/// Clip Studio's Dynamics dialog lists its effect sources as **Pen pressure,
+/// Tilt, Velocity, Random**, and the bits are that list from bit 4 upwards.
+/// Three things agree on it:
 ///
-/// Bits 5, 6 and 8 are pen tilt, pen bearing and stroke speed in some order that
-/// the files to hand cannot settle. They are reported through
-/// [`dropped::OTHER_INPUTS`] rather than guessed at: Umber has an input for
-/// speed, and wiring tilt into it would make a brush behave wrongly in a way
-/// that looks deliberate.
+/// - Bit 4 is the only bit set on the size effector of every pressure-sensitive
+///   brush in the sample files, and bit 7 is the only bit ever set on the hue,
+///   saturation and brightness effectors — which is colour jitter, so random.
+///   The two ends of the list pin the order of the middle.
+/// - `usedFlag` in Ken Evans' `CSPBrushInfo`, an independent decoding of these
+///   same blobs, reads `0x10` pressure, `0x20` tilt, `0x40` velocity, `0x80`
+///   random.
+/// - The `sup` word says every setting supports exactly these four (`0xf0`),
+///   and brush size and its neighbours one more (`0x1f0`) that nothing in
+///   either sample file ever switches on. That fifth is [`UNKNOWN`].
+///
+/// Velocity is Umber's [`DabInput::Speed`]. Tilt is not anything: no platform
+/// Umber runs on reports it, so a tilt mapping would be a modulation that can
+/// never fire — see [`dropped::TILT_INPUT`].
 const PRESSURE: u32 = 1 << 4;
+const TILT: u32 = 1 << 5;
+const VELOCITY: u32 = 1 << 6;
 const RANDOM: u32 = 1 << 7;
-/// Everything else a setting can be driven by.
-const OTHER: u32 = (1 << 5) | (1 << 6) | (1 << 8);
+const UNKNOWN: u32 = 1 << 8;
 
 /// One `*Effector` blob.
 ///
 /// Big-endian throughout, unlike the container it sits in:
 ///
 /// ```text
-/// u32  44          length of this record
+/// u32  44           length of this record
 /// u32               which inputs this setting supports
 /// u32               which are switched on
-/// i32 x 8           the minimum, per input, as a percentage; [5..8] unread
-/// -- and, when the blob is longer than 44 bytes --
-/// u32  12          length of the curve header
+/// i32               the floor under pen pressure, as a percentage
+/// i32               the floor under tilt
+/// i32               the floor under velocity
+/// i32               the floor under the random draw
+/// i32               unread
+/// u32               bytes of the first curve record, or zero
+/// u32               bytes of the second curve record, or zero
+/// i32               tilt's ceiling, which is the one input that may exceed 100
+/// -- then each curve record that the two lengths above declare --
+/// u32  12           length of the curve header
 /// u32               how many control points
-/// u32  16          bytes per point
+/// u32  16           bytes per point
 /// (f64, f64) x n    the points, x then y, both 0..1
 /// ```
+///
+/// **There are only ever two curve records**: the first belongs to pen
+/// pressure and the second to whichever of tilt and velocity is switched on.
+/// A `.sut` written by a brush that has been edited keeps the second record
+/// after its source is switched off, so its presence proves nothing — which is
+/// why [`Effector::curve_for`] asks what is *enabled* before it reads one.
 #[derive(Clone, Debug)]
 struct Effector {
     enabled: u32,
-    /// Minimum for each of the five inputs, in the order of bits 4 to 8.
-    minimums: [i32; 5],
-    points: Vec<(f64, f64)>,
+    /// Floor for each of pressure, tilt, velocity and random, in that order.
+    minimums: [i32; 4],
+    /// The pressure curve, and the tilt-or-velocity curve.
+    curves: [Vec<(f64, f64)>; 2],
 }
 
 impl Effector {
@@ -414,23 +456,40 @@ impl Effector {
             u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
         };
         let enabled = word(8);
-        let mut minimums = [0i32; 5];
+        let mut minimums = [0i32; 4];
         for (i, slot) in minimums.iter_mut().enumerate() {
             *slot = word(12 + i * 4) as i32;
         }
 
-        let mut points = Vec::new();
-        if bytes.len() >= 56 {
-            let count = word(48) as usize;
+        // The two curve records sit end to end after the header, and either may
+        // be absent — which is what the declared lengths are for. Walking them
+        // rather than assuming the first record is at 44 is what tells the
+        // pressure curve apart from the one beside it.
+        let mut curves = [Vec::new(), Vec::new()];
+        let mut at = 44usize;
+        for (slot, length) in curves
+            .iter_mut()
+            .zip([word(32) as usize, word(36) as usize])
+        {
+            if length == 0 {
+                continue;
+            }
+            let Some(record) = bytes.get(at..at.saturating_add(length)) else {
+                break;
+            };
+            at += length;
+            if record.len() < 12 {
+                continue;
+            }
+            let count = u32::from_be_bytes(record[4..8].try_into().expect("four bytes")) as usize;
             for i in 0..count {
-                let at = 56 + i * 16;
-                let Some(pair) = bytes.get(at..at + 16) else {
+                let Some(pair) = record.get(12 + i * 16..12 + i * 16 + 16) else {
                     break;
                 };
                 let x = f64::from_be_bytes(pair[..8].try_into().expect("eight bytes"));
                 let y = f64::from_be_bytes(pair[8..].try_into().expect("eight bytes"));
                 if x.is_finite() && y.is_finite() {
-                    points.push((x, y));
+                    slot.push((x, y));
                 }
             }
         }
@@ -438,7 +497,7 @@ impl Effector {
         Some(Self {
             enabled,
             minimums,
-            points,
+            curves,
         })
     }
 
@@ -454,70 +513,97 @@ impl Effector {
         (raw as f32 / 100.0).clamp(0.0, 1.0)
     }
 
-    /// The control points as one of Umber's fixed-sample response curves.
+    /// The curve for one input, as one of Umber's fixed-sample response curves.
     ///
     /// Piecewise linear between the points and held flat outside them, which is
     /// what the curve editor draws. Clip Studio's own interpolation is smoother
     /// than that between widely spaced points; five evenly spaced samples is
     /// the resolution [`ResponseCurve`] has, so the difference is below what it
     /// could record anyway.
-    fn response(&self) -> ResponseCurve {
-        if self.points.len() < 2 {
+    ///
+    /// The second record is shared by tilt and velocity, so a brush driven by
+    /// **both** cannot say which of them the curve belongs to. That brush gets
+    /// a straight line rather than a curve that might be the other input's:
+    /// the range still carries how far the setting travels, which is the part
+    /// that shows.
+    fn curve_for(&self, input: u32) -> ResponseCurve {
+        let points = match input {
+            PRESSURE => &self.curves[0],
+            _ if self.drives(TILT) && self.drives(VELOCITY) => return ResponseCurve::LINEAR,
+            _ => &self.curves[1],
+        };
+        if points.len() < 2 {
             return ResponseCurve::LINEAR;
         }
         let mut curve = ResponseCurve::LINEAR;
         for i in 0..ResponseCurve::N {
             let x = f64::from(ResponseCurve::x_of(i));
-            curve.set(i, self.at(x) as f32);
+            curve.set(i, at(points, x) as f32);
         }
         curve
     }
-
-    fn at(&self, x: f64) -> f64 {
-        let first = self.points[0];
-        if x <= first.0 {
-            return first.1;
-        }
-        for pair in self.points.windows(2) {
-            let (ax, ay) = pair[0];
-            let (bx, by) = pair[1];
-            if x <= bx {
-                let span = bx - ax;
-                if span <= f64::EPSILON {
-                    return by;
-                }
-                return ay + (by - ay) * (x - ax) / span;
-            }
-        }
-        self.points.last().expect("at least two points").1
-    }
 }
 
-/// Whether any effect source on this brush is something Umber will not
-/// reproduce.
+fn at(points: &[(f64, f64)], x: f64) -> f64 {
+    let first = points[0];
+    if x <= first.0 {
+        return first.1;
+    }
+    for pair in points.windows(2) {
+        let (ax, ay) = pair[0];
+        let (bx, by) = pair[1];
+        if x <= bx {
+            let span = bx - ax;
+            if span <= f64::EPSILON {
+                return by;
+            }
+            return ay + (by - ay) * (x - ax) / span;
+        }
+    }
+    points.last().expect("at least two points").1
+}
+
+/// The effect sources on this brush that Umber will not reproduce.
 ///
 /// Every `*Effector` column is swept rather than the handful this importer
 /// reads, because the question is what the *brush* does and not what this
 /// function happens to look at — a setting Umber has no field for at all is
-/// still a setting whose behaviour will not arrive.
-fn reads_other_inputs(settings: &Settings) -> bool {
-    let effectors = settings
-        .table
-        .columns()
-        .iter()
-        .filter(|name| name.ends_with("Effector"))
+/// still a setting whose behaviour will not arrive. `driven` names the columns
+/// whose velocity mapping *was* imported, so speed is only reported where it
+/// really had nowhere to go.
+fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut note = |sources: u32, column: &str| {
+        if sources & TILT != 0 {
+            push_once(&mut out, dropped::TILT_INPUT);
+        }
+        if sources & UNKNOWN != 0 {
+            push_once(&mut out, dropped::UNKNOWN_INPUT);
+        }
+        if sources & VELOCITY != 0 && !driven.contains(&column) {
+            push_once(&mut out, dropped::SPEED_ELSEWHERE);
+        }
+    };
+
+    for name in settings.table.columns() {
         // The dual brush's own are not consulted: the whole dual brush is
         // dropped and already says so.
-        .filter(|name| !name.starts_with("Dual"))
-        .filter_map(|name| settings.effector(name))
-        .any(|effector| effector.enabled & OTHER != 0);
+        if !name.ends_with("Effector") || name.starts_with("Dual") {
+            continue;
+        }
+        if let Some(effector) = settings.effector(name) {
+            note(effector.enabled, name);
+        }
+    }
 
     // Rotation states its sources as a bare integer of the same bits rather
     // than as a record, so it is not in the sweep above and has to be asked
     // separately — which matters, because a chisel that turns with the stroke
-    // is exactly the brush this would otherwise stay quiet about.
+    // is exactly the brush this would otherwise stay quiet about. Its low bits
+    // are its own and are not effect sources, so only the input bits are read.
     let rotation = settings.int("BrushRotationEffector").unwrap_or(0) as u32;
-    effectors || rotation & OTHER != 0
+    note(rotation, "BrushRotationEffector");
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +801,36 @@ const GRAIN_TILE_AT_FULL_SCALE: f32 = 256.0;
 /// the moment the hand does, which is the one thing an airbrush must not do.
 const HELD_SPRAY_RATE: f32 = 30.0;
 
+/// The smallest size a modulation may state, as a log offset on the radius.
+///
+/// [`DabTarget::Size`]'s own editor range is ±2, and a taper or a velocity
+/// mapping that reaches zero cannot be written as a log at all. Clamping here
+/// rather than letting `ln(0)` through keeps the stored number one the brush
+/// editor can draw and drag, and `exp(-2)` is a dab an eighth of its width —
+/// a point as far as a stroke is concerned.
+const MIN_SIZE_LOG: f32 = -2.0;
+
+/// The settings whose velocity mapping has an Umber target, and which one.
+///
+/// One table rather than a branch per column, because
+/// [`unreachable_inputs`] has to name exactly the settings this does *not*
+/// cover — two lists would drift into a brush that both imports its speed
+/// mapping and apologises for it.
+///
+/// Clip Studio's Opacity is the whole stroke's and its Flow is one dab's, and
+/// they multiply; Umber reaches both through per-dab coverage, and the
+/// modulation table composes opacity by multiplication for the same reason.
+const SPEED_TARGETS: [(&str, DabTarget); 3] = [
+    ("BrushSizeEffector", DabTarget::Size),
+    ("BrushOpacityEffector", DabTarget::Opacity),
+    ("BrushFlowEffector", DabTarget::Opacity),
+];
+
+/// [`Brush::stroke_hold`] at MyPaint's own ceiling, which the stroke builder
+/// reads as "the input reaches 1 and stays there". A taper happens once at the
+/// start of a mark; a ramp that wrapped would be a row of tapers.
+const NEVER_WRAP: f32 = 10.0;
+
 fn convert(
     settings: &Settings,
     materials: &Materials,
@@ -788,7 +904,7 @@ fn convert(
     brush.pressure_size = size_effector.as_ref().is_some_and(|e| e.drives(PRESSURE));
     if let Some(effector) = size_effector.as_ref().filter(|e| e.drives(PRESSURE)) {
         brush.min_size_ratio = effector.minimum(PRESSURE);
-        brush.size_curve = effector.response();
+        brush.size_curve = effector.curve_for(PRESSURE);
     }
     // The same effector's random input is a per-dab size draw, which is
     // Umber's radius jitter. Stated as a floor rather than a spread, so a
@@ -802,8 +918,38 @@ fn convert(
     if let Some(effector) = settings.effector("BrushOpacityEffector") {
         brush.pressure_opacity = effector.drives(PRESSURE);
         if brush.pressure_opacity {
-            brush.opacity_curve = effector.response();
+            brush.opacity_curve = effector.curve_for(PRESSURE);
         }
+    }
+
+    // ---- stroke speed --------------------------------------------------
+    // Clip Studio's velocity input is Umber's `Speed`, and the shape is the
+    // same in both: the setting is full at a standstill and falls towards the
+    // input's floor as the pen moves — which is why `low` is the floor and
+    // `high` is the untouched value rather than the other way round.
+    //
+    // Only these three settings have somewhere to land. Velocity on anything
+    // else is named through `dropped::SPEED_ELSEWHERE`, and `SPEED_TARGETS`
+    // is what keeps the two halves from disagreeing.
+    for (column, target) in SPEED_TARGETS {
+        let Some(effector) = settings.effector(column).filter(|e| e.drives(VELOCITY)) else {
+            continue;
+        };
+        let floor = effector.minimum(VELOCITY);
+        let (low, high) = match target {
+            // Size is a log offset, so a factor composes by addition here and
+            // by multiplication in pixels.
+            DabTarget::Size => (floor.max(0.001).ln().max(MIN_SIZE_LOG), 0.0),
+            // Opacity is a factor, because that is how the table composes it.
+            _ => (floor, 1.0),
+        };
+        brush.modulations.push(Modulation {
+            target,
+            input: DabInput::Speed,
+            low,
+            high,
+            curve: effector.curve_for(VELOCITY),
+        });
     }
 
     // Rotation has its own encoding: a plain integer of the same bits rather
@@ -895,21 +1041,46 @@ fn convert(
         }
     }
 
+    // ---- the taper -----------------------------------------------------
+    // "In" is a size ramp over the first stretch of the mark, which is exactly
+    // what the `Stroke` input is: it counts travel from the start of the stroke
+    // and, held at its ceiling, never wraps. `BrushInLength` is in the same
+    // unit as the brush size and the ramp is measured in dab radii, so a brush
+    // scaled up tapers over a proportionally longer mark — which is what Clip
+    // Studio does too, since it scales the taper with the tool.
+    //
+    // "Out" cannot follow: it is measured back from an end the engine does not
+    // know until the stroke is over, and there is nothing to look ahead with.
+    if settings.flag("BrushUseIn")
+        && let Some(length) = settings.real("BrushInLength").filter(|v| *v > 0.0)
+    {
+        let radius = (brush.size * 0.5).max(0.5);
+        brush.stroke_span = (length as f32 / radius).clamp(0.1, 1000.0);
+        brush.stroke_hold = NEVER_WRAP;
+        brush.modulations.push(Modulation {
+            target: DabTarget::Size,
+            input: DabInput::Stroke,
+            low: MIN_SIZE_LOG,
+            high: 0.0,
+            curve: ResponseCurve::LINEAR,
+        });
+    }
+    if settings.flag("BrushUseOut") {
+        push_once(&mut dropped, dropped::TAPER_OUT);
+    }
+
     // ---- what is left over ---------------------------------------------
     if settings.flag("BrushContinuousPlot") {
         brush.dabs_per_second = HELD_SPRAY_RATE;
     }
-    if reads_other_inputs(settings) {
-        push_once(&mut dropped, dropped::OTHER_INPUTS);
+    for loss in unreachable_inputs(settings, &SPEED_TARGETS.map(|(column, _)| column)) {
+        push_once(&mut dropped, loss);
     }
     if settings.flag("UseDualBrush") {
         push_once(&mut dropped, dropped::DUAL_BRUSH);
     }
     if settings.flag("BrushUseWaterEdge") {
         push_once(&mut dropped, dropped::WATER_EDGE);
-    }
-    if settings.flag("BrushUseIn") || settings.flag("BrushUseOut") {
-        push_once(&mut dropped, dropped::TAPER);
     }
     if settings.flag("BrushRibbon") {
         push_once(&mut dropped, dropped::RIBBON);
@@ -964,7 +1135,8 @@ mod tests {
     /// The columns of `Variant` this importer actually reads, in an order that
     /// is deliberately *not* the order the code reads them in — the point of
     /// the schema being name-addressed is that neither one matters.
-    const VARIANT_COLUMNS: [&str; 36] = [
+    const VARIANT_COLUMNS: [&str; 40] = [
+        "TextureDensityEffector",
         "VariantID",
         "BrushRotation",
         "Opacity",
@@ -974,6 +1146,9 @@ mod tests {
         "BrushHardness",
         "BrushInterval",
         "BrushAutoIntervalType",
+        "BrushFlowEffector",
+        "BrushInLength",
+        "BrushOutLength",
         "BrushOpacityEffector",
         "BrushVerticalThicknes",
         "BrushRotationEffector",
@@ -1146,8 +1321,36 @@ mod tests {
         ])
     }
 
-    /// A `*Effector` blob: which inputs are on, their minimums, and a curve.
-    fn effector(enabled: u32, minimums: [i32; 5], curve: &[(f64, f64)]) -> Value {
+    /// A `*Effector` blob: which inputs are on, their floors, and up to two
+    /// curve records — the pressure one and the one tilt and velocity share.
+    ///
+    /// Either may be absent, and the header's two lengths are what says so.
+    /// A brush edited into using tilt and then out of it again leaves the
+    /// second record behind with nothing enabled, which the fixture can build
+    /// by passing a curve for an input that is off.
+    fn effector(
+        enabled: u32,
+        minimums: [i32; 4],
+        pressure_curve: &[(f64, f64)],
+        other_curve: &[(f64, f64)],
+    ) -> Value {
+        let record = |points: &[(f64, f64)]| -> Vec<u8> {
+            if points.is_empty() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&12u32.to_be_bytes());
+            out.extend_from_slice(&(points.len() as u32).to_be_bytes());
+            out.extend_from_slice(&16u32.to_be_bytes());
+            for (x, y) in points {
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+            }
+            out
+        };
+        let first = record(pressure_curve);
+        let second = record(other_curve);
+
         let mut out = Vec::new();
         out.extend_from_slice(&44u32.to_be_bytes());
         out.extend_from_slice(&0x1f0u32.to_be_bytes());
@@ -1156,17 +1359,12 @@ mod tests {
             out.extend_from_slice(&m.to_be_bytes());
         }
         out.extend_from_slice(&0i32.to_be_bytes());
-        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&(first.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(second.len() as u32).to_be_bytes());
+        // Tilt's ceiling, at the default that means "no gain".
         out.extend_from_slice(&100i32.to_be_bytes());
-        if !curve.is_empty() {
-            out.extend_from_slice(&12u32.to_be_bytes());
-            out.extend_from_slice(&(curve.len() as u32).to_be_bytes());
-            out.extend_from_slice(&16u32.to_be_bytes());
-            for (x, y) in curve {
-                out.extend_from_slice(&x.to_be_bytes());
-                out.extend_from_slice(&y.to_be_bytes());
-            }
-        }
+        out.extend_from_slice(&first);
+        out.extend_from_slice(&second);
         Value::Blob(out)
     }
 
@@ -1322,8 +1520,12 @@ mod tests {
     /// The fill, selection and shape tools share these tables and leave every
     /// brush column null. Importing one as a brush would produce a preset made
     /// entirely of defaults wearing somebody else's name.
+    ///
+    /// Skipping it is **not** reported: a `.sutg` is a tool group and a group
+    /// holding a fill tool is the ordinary case, so a note about it would
+    /// appear on nearly every import and teach the reader to skip the list.
     #[test]
-    fn a_sub_tool_that_is_not_a_brush_is_skipped_and_said_so() {
+    fn a_sub_tool_that_is_not_a_brush_is_skipped_quietly() {
         let bytes = sut(
             &[
                 ("Pencil", Variant::plain(1)),
@@ -1335,7 +1537,8 @@ mod tests {
         let file = from_sut(&bytes).expect("read");
         assert_eq!(file.tools.len(), 1);
         assert_eq!(file.tools[0].name, "Pencil");
-        assert_eq!(file.dropped, [dropped::NOT_A_BRUSH]);
+        assert!(file.dropped.is_empty(), "{:?}", file.dropped);
+        assert!(dropped_features(&bytes).is_empty());
     }
 
     #[test]
@@ -1419,8 +1622,9 @@ mod tests {
                     // flat for the first half of the range.
                     effector(
                         PRESSURE,
-                        [20, 0, 0, 0, 0],
+                        [20, 0, 0, 0],
                         &[(0.0, 0.0), (0.5, 0.0), (1.0, 1.0)],
+                        &[],
                     ),
                 ),
             )],
@@ -1448,7 +1652,7 @@ mod tests {
         let bytes = sut(
             &[(
                 "Marker",
-                Variant::plain(1).set("BrushSizeEffector", effector(0, [0; 5], &[])),
+                Variant::plain(1).set("BrushSizeEffector", effector(0, [0; 4], &[], &[])),
             )],
             &[],
         );
@@ -1457,22 +1661,200 @@ mod tests {
         assert_eq!(brush.radius_at(0.0), brush.radius_at(1.0));
     }
 
-    /// Everything but pressure and randomness is named rather than wired to
-    /// whichever of Umber's inputs looks closest.
+    /// Umber has no tilt input on any platform it runs on, so a tilt mapping
+    /// is named rather than wired to whichever of Umber's inputs looks closest.
+    /// Storing it against speed would be a brush that thins when you *move*
+    /// where the author meant it to thin when you *lift* — wrong in a way that
+    /// looks deliberate.
     #[test]
-    fn an_input_this_reader_cannot_identify_is_named_rather_than_guessed_at() {
+    fn a_tilt_mapping_is_named_rather_than_wired_to_speed() {
         let bytes = sut(
             &[(
                 "Tilt pen",
-                Variant::plain(1).set("BrushSizeEffector", effector(1 << 5, [0; 5], &[])),
+                Variant::plain(1).set("BrushSizeEffector", effector(TILT, [0, 40, 0, 0], &[], &[])),
             )],
             &[],
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
-        assert!(tool.dropped.contains(&dropped::OTHER_INPUTS));
-        // And it must not have quietly become pressure on the way past.
+        assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
+        // And it must not have quietly become pressure or speed on the way past.
         assert!(!tool.brush.pressure_size);
         assert!(tool.brush.modulations.is_empty());
+    }
+
+    /// The fifth effect source. Nothing in either sample file switches it on,
+    /// so it is named rather than guessed at — the same rule tilt is held to.
+    #[test]
+    fn an_effect_source_this_reader_cannot_name_says_so() {
+        let bytes = sut(
+            &[(
+                "Odd",
+                Variant::plain(1).set("BrushSizeEffector", effector(UNKNOWN, [0; 4], &[], &[])),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.dropped, [dropped::UNKNOWN_INPUT]);
+        assert!(tool.brush.modulations.is_empty());
+    }
+
+    /// Clip Studio's velocity input is Umber's speed, and the whole point is
+    /// that a brush set to thin as the hand moves arrives thinning as the hand
+    /// moves. The floor is the size at full speed and the curve is the shape
+    /// between; `Size` is a *log* offset, so a floor of 25% is `ln(0.25)`.
+    #[test]
+    fn stroke_speed_drives_size_through_its_floor_and_its_curve() {
+        let bytes = sut(
+            &[(
+                "Velocity pen",
+                Variant::plain(1).set(
+                    "BrushSizeEffector",
+                    effector(
+                        PRESSURE | VELOCITY,
+                        [10, 0, 25, 0],
+                        &[(0.0, 0.0), (1.0, 1.0)],
+                        // Full at a standstill, gone by two thirds of the way
+                        // up the range: Clip Studio's own default shape.
+                        &[(0.0, 1.0), (0.66, 0.0), (1.0, 0.0)],
+                    ),
+                ),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        // Speed is rendered, so there is nothing to apologise for.
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        let m = tool
+            .brush
+            .modulations
+            .as_slice()
+            .iter()
+            .find(|m| m.input == DabInput::Speed)
+            .expect("a speed modulation");
+        assert_eq!(m.target, DabTarget::Size);
+        assert!((m.high - 0.0).abs() < 1e-6, "{}", m.high);
+        assert!((m.low - 0.25f32.ln()).abs() < 1e-5, "{}", m.low);
+        // Standing still leaves the dab alone; moving fast shrinks it to the
+        // floor. `at` takes the input already normalised onto 0..1.
+        assert!((m.at(0.0).exp() - 1.0).abs() < 1e-5);
+        assert!((m.at(1.0).exp() - 0.25).abs() < 1e-4);
+        // Pressure is untouched by any of it, and reads its own curve.
+        assert!(tool.brush.pressure_size);
+        assert!((tool.brush.min_size_ratio - 0.1).abs() < 1e-6);
+        assert_eq!(tool.brush.size_curve, ResponseCurve::LINEAR);
+    }
+
+    /// The two curve records are the pressure one and the one tilt and velocity
+    /// share, in that order — and either may be missing. Reading the first
+    /// record whatever it is would give a velocity brush the pressure curve, or
+    /// a pressure brush somebody else's.
+    #[test]
+    fn the_second_curve_record_belongs_to_speed_and_the_first_to_pressure() {
+        let bytes = sut(
+            &[(
+                "Velocity only",
+                Variant::plain(1).set(
+                    "BrushSizeEffector",
+                    // No pressure record at all: the only curve in the blob is
+                    // the second one, and it is speed's.
+                    effector(
+                        VELOCITY,
+                        [0, 0, 0, 0],
+                        &[],
+                        &[(0.0, 1.0), (0.5, 1.0), (1.0, 0.0)],
+                    ),
+                ),
+            )],
+            &[],
+        );
+        let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+        let m = brush.modulations.as_slice()[0];
+        // Flat across the first half, then straight down.
+        assert!((m.curve.sample(0.0) - 1.0).abs() < 1e-5);
+        assert!((m.curve.sample(0.5) - 1.0).abs() < 1e-5);
+        assert!((m.curve.sample(1.0) - 0.0).abs() < 1e-5);
+        assert!(!brush.pressure_size);
+    }
+
+    /// One record cannot say whether it belongs to tilt or to velocity, so a
+    /// brush driven by both gets a straight line rather than a shape that might
+    /// be the other input's. The range still carries how far the size travels.
+    #[test]
+    fn a_setting_driven_by_both_tilt_and_speed_keeps_the_range_and_drops_the_shape() {
+        let bytes = sut(
+            &[(
+                "Both",
+                Variant::plain(1).set(
+                    "BrushSizeEffector",
+                    effector(
+                        TILT | VELOCITY,
+                        [0, 100, 30, 0],
+                        &[],
+                        &[(0.0, 1.0), (0.2, 0.0), (1.0, 0.0)],
+                    ),
+                ),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        let m = tool.brush.modulations.as_slice()[0];
+        assert_eq!(m.curve, ResponseCurve::LINEAR);
+        assert!((m.low - 0.3f32.ln()).abs() < 1e-5);
+        // The tilt half is still a loss and still says so.
+        assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
+    }
+
+    /// Speed on Clip Studio's per-dab density is Umber's per-dab opacity, and
+    /// opacity composes as a *factor* rather than as an offset — so the floor
+    /// is the factor at full speed and the untouched value is 1.
+    #[test]
+    fn stroke_speed_on_flow_becomes_a_per_dab_opacity_factor() {
+        let bytes = sut(
+            &[(
+                "Fading marker",
+                Variant::plain(1).set(
+                    "BrushFlowEffector",
+                    effector(VELOCITY, [0, 0, 40, 0], &[], &[(0.0, 1.0), (1.0, 0.0)]),
+                ),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+        let m = tool.brush.modulations.as_slice()[0];
+        assert_eq!((m.target, m.input), (DabTarget::Opacity, DabInput::Speed));
+        assert!((m.at(0.0) - 1.0).abs() < 1e-5);
+        assert!((m.at(1.0) - 0.4).abs() < 1e-5);
+    }
+
+    /// Speed reaches size and per-dab opacity and nothing else, so a brush
+    /// whose *texture density* follows velocity has to say the mapping did not
+    /// arrive — and a brush whose size does must not say it anyway.
+    #[test]
+    fn stroke_speed_with_nowhere_to_land_is_named() {
+        let bytes = sut(
+            &[
+                (
+                    "Textured",
+                    Variant::plain(1).set(
+                        "TextureDensityEffector",
+                        effector(VELOCITY, [0, 0, 50, 0], &[], &[]),
+                    ),
+                ),
+                (
+                    "Sized",
+                    Variant::plain(2).set(
+                        "BrushSizeEffector",
+                        effector(VELOCITY, [0, 0, 50, 0], &[], &[]),
+                    ),
+                ),
+            ],
+            &[],
+        );
+        let tools = from_sut(&bytes).expect("read").tools;
+        assert_eq!(tools[0].dropped, [dropped::SPEED_ELSEWHERE]);
+        assert!(tools[1].dropped.is_empty(), "{:?}", tools[1].dropped);
     }
 
     #[test]
@@ -1579,8 +1961,9 @@ mod tests {
 
     /// The dab angle names its sources as a bare integer rather than as the
     /// record every other setting uses, so it is easily missed by a sweep of
-    /// the effector columns — and a chisel that turns with the stroke is
-    /// exactly the brush that would then arrive silently wrong.
+    /// the effector columns — and a chisel that turns with the pen is exactly
+    /// the brush that would then arrive silently wrong. Its two low bits are
+    /// its own and must not be read as effect sources.
     #[test]
     fn an_input_driving_the_dab_angle_is_reported_too() {
         let bytes = sut(
@@ -1588,13 +1971,105 @@ mod tests {
                 "Rake",
                 Variant::plain(1)
                     .int("BrushThickness", 40)
-                    .int("BrushRotationEffector", ((1 << 6) | 3) as i64),
+                    .int("BrushRotationEffector", (TILT | 3) as i64),
             )],
             &[],
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
-        assert!(tool.dropped.contains(&dropped::OTHER_INPUTS));
+        assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
         assert_eq!(tool.brush.dab_angle_jitter, 0.0);
+
+        // An angle that turns with the pen's speed has no Umber field either,
+        // and there is no amount beside it to build a modulation out of.
+        let bytes = sut(
+            &[(
+                "Speed rake",
+                Variant::plain(1).int("BrushRotationEffector", (VELOCITY | 3) as i64),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.dropped, [dropped::SPEED_ELSEWHERE]);
+    }
+
+    /// Clip Studio's taper-in is a size ramp over the first stretch of the
+    /// mark, and Umber's stroke-position input is exactly that. The ramp is
+    /// measured in dab radii, so the same brush scaled up tapers over a
+    /// proportionally longer mark rather than finishing in the first inch.
+    #[test]
+    fn a_taper_in_becomes_a_size_ramp_along_the_stroke() {
+        let bytes = sut(
+            &[(
+                "Tapered",
+                Variant::plain(1)
+                    .real("BrushSize", 20.0)
+                    .int("BrushUseIn", 1)
+                    .real("BrushInLength", 40.0),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        // 40 px over a radius of 10 is four radii of travel.
+        assert!((tool.brush.stroke_span - 4.0).abs() < 1e-5);
+        // And it must not wrap: a taper happens once, at the start of a mark.
+        assert_eq!(tool.brush.stroke_hold, 10.0);
+        assert!(tool.brush.uses_stroke_position());
+
+        let m = tool
+            .brush
+            .modulations
+            .as_slice()
+            .iter()
+            .find(|m| m.input == DabInput::Stroke)
+            .expect("a stroke-position modulation");
+        assert_eq!(m.target, DabTarget::Size);
+        // Small at the start of the mark, its full size once the ramp is over.
+        assert!(m.at(0.0) < -1.9, "{}", m.at(0.0));
+        assert!((m.at(1.0) - 0.0).abs() < 1e-6);
+        // Nothing is claimed about the far end, which cannot be done at all.
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+    }
+
+    /// The taper *out* is measured back from an end the engine does not know
+    /// until the stroke is over, so it is named rather than approximated with
+    /// something that would fire in the wrong place.
+    #[test]
+    fn a_taper_out_is_named_and_the_stroke_ramp_is_left_alone() {
+        let bytes = sut(
+            &[(
+                "Only out",
+                Variant::plain(1)
+                    .int("BrushUseOut", 1)
+                    .real("BrushOutLength", 20.0),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.dropped, [dropped::TAPER_OUT]);
+        assert!(tool.brush.modulations.is_empty());
+        // The ramp is the fast path's business: a brush that reads no stroke
+        // position must not make the stroke builder start measuring one.
+        assert!(!tool.brush.uses_stroke_position());
+        assert_eq!(tool.brush.stroke_hold, Brush::default().stroke_hold);
+    }
+
+    /// Clip Studio leaves the taper's length in the file when the taper itself
+    /// is switched off, so reading the number alone would put a ramp on every
+    /// brush that had ever had one.
+    #[test]
+    fn a_taper_that_is_switched_off_leaves_no_ramp() {
+        let bytes = sut(
+            &[(
+                "Plain",
+                Variant::plain(1)
+                    .int("BrushUseIn", 0)
+                    .real("BrushInLength", 20.0),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.brush.modulations.is_empty());
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
     }
 
     /// The whole point of the exercise: a stamp brush has to arrive with the
