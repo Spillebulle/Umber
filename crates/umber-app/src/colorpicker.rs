@@ -158,6 +158,14 @@ const MIN_PICKER: f32 = 48.0;
 /// through that step. So the meshes here carry their own skirt. Without it the
 /// hue ring's two circular edges and the triangle's three diagonals come out as
 /// visible stair-steps.
+///
+/// This is the width of the *band*, not a distance to move a vertex by, and the
+/// three shapes reach it differently: the ring pushes its vertices `f` along
+/// the radius, because a circle's normal is its radius; the field pushes its
+/// outer ring `f` along the field's own axes, which is exact at the corners
+/// too; and the triangle needs [`SKIRT_MITRE`] times as much, for the reason
+/// stated there. Moving a vertex `f` and assuming the edge followed is what
+/// left the diagonals half-feathered.
 fn feather(ui: &Ui) -> f32 {
     1.0 / ui.ctx().pixels_per_point().max(0.5)
 }
@@ -372,6 +380,15 @@ fn wheel(
 
     // The angle the shape is held at, when the hue is not deciding it.
     //
+    // A rail with a typeable figure — [`crate::widgets::number_row`] — rather
+    // than a plain one. Two of the angles anybody actually wants here are
+    // exact: the neutral pose, and a quarter turn from it. Landing on either by
+    // dragging a rail 240 px wide across 360° is a matter of luck, so the rail
+    // snaps to each 45° and the figure beside it can be typed. Forty-five
+    // rather than ninety because a triangle's own symmetry is a third of a turn
+    // and a square's a quarter: 45° is the coarsest step that has every
+    // half-way pose of both shapes on it.
+    //
     // A slider rather than a drag on the shape itself. Both regions of the wheel
     // are already spoken for: the ring steers hue, and the centre is the
     // saturation and value field right out to the gaps between an inscribed
@@ -396,9 +413,7 @@ fn wheel(
         if following {
             ui.disable();
         }
-        crate::widgets::slider_row(ui, p, "Angle", &mut degrees, 0.0..=359.0, false, |v| {
-            format!("{v:.0}°")
-        })
+        crate::widgets::number_row(ui, p, &mut degrees, angle_row())
     });
     if row.inner {
         angles.set(*shape, degrees);
@@ -409,6 +424,26 @@ fn wheel(
     }
 
     changed
+}
+
+/// The Angle control's shape: a whole turn, a figure in degrees, landing on
+/// each 45°.
+///
+/// Split out so the tests drive the control the picker actually draws rather
+/// than a copy of its numbers — the same reason [`triangle_corners`] is its own
+/// function.
+fn angle_row() -> crate::widgets::NumberRow<'static> {
+    crate::widgets::NumberRow {
+        label: "Angle",
+        range: 0.0..=359.0,
+        snap: 45.0,
+        per_unit: 1.0,
+        suffix: "°",
+        decimals: 0,
+        // The wheel is not drawn inside the thing this turns, so there is
+        // nothing to run away from the pointer as it is dragged.
+        deferred: false,
+    }
 }
 
 /// Saturation/value triangle inscribed in the ring, turned by `base` radians.
@@ -463,10 +498,10 @@ fn sv_triangle(
         (white_pt, Color32::WHITE),
         (black_pt, Color32::BLACK),
     ];
-    // The centroid is the direction to push each corner out along for the
-    // skirt. Exact for the ring, which is radial; for a triangle it makes the
-    // skirt a fraction wider at the corners than along the edges, which at one
-    // pixel nobody can see.
+    // The centroid gives each corner its outward direction. For an equilateral
+    // triangle that direction is also the corner's bisector, which is what
+    // [`skirt_corner`] needs — and how far along it to go is the whole of why
+    // the diagonals used to stair-step while the ring did not.
     let centroid = pos2(
         corners.iter().map(|(pt, _)| pt.x).sum::<f32>() / 3.0,
         corners.iter().map(|(pt, _)| pt.y).sum::<f32>() / 3.0,
@@ -484,16 +519,8 @@ fn sv_triangle(
         });
     }
     for (pt, colour) in corners {
-        let away = pt - centroid;
-        // A triangle squashed to nothing has no outward direction, and
-        // normalising it would put NaN into the mesh.
-        let out = if away.length() > 1e-3 {
-            pt + away.normalized() * f
-        } else {
-            pt
-        };
         mesh.vertices.push(Vertex {
-            pos: out,
+            pos: skirt_corner(pt, centroid, f),
             uv: egui::epaint::WHITE_UV,
             color: faded(colour),
         });
@@ -532,6 +559,51 @@ fn triangle_corners(centre: Pos2, radius: f32, base: f32) -> (Pos2, Pos2, Pos2) 
         centre + vec2(a.cos(), a.sin()) * radius
     };
     (corner(0.0), corner(1.0), corner(2.0))
+}
+
+/// How much further out a corner of the triangle goes than its edges do.
+///
+/// The ring's skirt is easy, and that is exactly why the triangle's looked like
+/// it had one when it did not. A circle's outward *normal* is its radial
+/// direction, so a vertex pushed a feather out from the centre carries its edge
+/// a feather out with it and the faded band is one pixel wide the whole way
+/// round. A triangle's corners are not its edges. Pushing a corner out along
+/// the line from the centroid scales the whole shape about that point, and an
+/// equilateral triangle's inradius is *half* its circumradius — so a corner
+/// moved by `f` moves each of the three edges by only `f/2`. The diagonals were
+/// being feathered over half a pixel while the ring got a whole one, which is
+/// the whole of why they went on stair-stepping.
+///
+/// What an edge needs is to be offset `f` along its own normal, and the corner
+/// then goes where two such offset edges meet: `f / sin(θ/2)` along the
+/// bisector, for an interior angle θ. [`triangle_corners`] places its three
+/// points a third of a turn apart on a circle, so this triangle is *always*
+/// equilateral — θ is always 60°, `sin(30°)` is exactly a half, and the factor
+/// is exactly 2. Nothing here has to measure an angle, and there is no case
+/// where it is some other number.
+///
+/// Widening the skirt is also the only change worth making: turning the
+/// interior into more triangles would not help, because the aliasing is at the
+/// boundary and the gradient across the middle is already exact at three
+/// vertices.
+const SKIRT_MITRE: f32 = 2.0;
+
+/// One corner of the skirt: the triangle's corner pushed out along its bisector
+/// far enough that all three edges move out by exactly `f`.
+///
+/// For an equilateral triangle the direction from the centroid to a corner *is*
+/// that corner's bisector, so the centroid is all this needs to be told.
+///
+/// A triangle squashed to nothing has no outward direction, and normalising it
+/// would put NaN into the mesh — which egui discards whole, so the picker would
+/// simply stop drawing.
+fn skirt_corner(pt: Pos2, centroid: Pos2, f: f32) -> Pos2 {
+    let away = pt - centroid;
+    if away.length() > 1e-3 {
+        pt + away.normalized() * f * SKIRT_MITRE
+    } else {
+        pt
+    }
 }
 
 fn barycentric(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> (f32, f32, f32) {
@@ -1056,6 +1128,80 @@ mod tests {
             assert_eq!(out, 0.0);
             assert!((-1.0..=1.0).contains(&u), "{u}");
         }
+    }
+
+    /// The Angle control's figure has to survive being read and typed back:
+    /// somebody who wants exactly 90° types it, and what they get has to be
+    /// what the readout then says. `normalise_angle` is the door every angle
+    /// comes through, so the round trip is tested with it in place.
+    #[test]
+    fn a_typed_angle_comes_back_as_the_angle_it_reads() {
+        let row = angle_row();
+        for degrees in [0.0, 45.0, 90.0, 137.0, 315.0, 359.0] {
+            let typed = row
+                .parse(&row.format(degrees))
+                .expect("the readout is a figure the field accepts");
+            assert_eq!(normalise_angle(typed), degrees);
+            let mut angles = WheelAngles::default();
+            angles.set(WheelShape::Triangle, typed);
+            assert_eq!(angles.of(WheelShape::Triangle), degrees);
+        }
+    }
+
+    /// The angle typed straight into the picker's own geometry: 90° has to be
+    /// the exact quarter turn, not one rounded through a rail's pixel width.
+    #[test]
+    fn a_typed_quarter_turn_is_exactly_a_quarter_turn() {
+        let row = angle_row();
+        let typed = row.parse("90").expect("a bare figure is accepted");
+        assert_eq!(turned(typed), turned(90.0));
+    }
+
+    /// The skirt has to be one feather wide along the **edges**, which is where
+    /// the stair-steps are. Pushing a vertex out by a feather — what the ring
+    /// does, correctly, because its normal is radial — moves an equilateral
+    /// triangle's edges by only half of one, and half a pixel of fade is what
+    /// left the diagonals visibly stepped.
+    #[test]
+    fn the_triangles_skirt_is_one_feather_wide_along_every_edge() {
+        let f = 1.0;
+        for degrees in [0.0_f32, 17.0, 45.0, 120.0, 271.0, 359.0] {
+            let (a, b, c) = triangle_corners(CENTRE, RADIUS, degrees.to_radians());
+            let inner = [a, b, c];
+            let centroid = pos2(
+                inner.iter().map(|p| p.x).sum::<f32>() / 3.0,
+                inner.iter().map(|p| p.y).sum::<f32>() / 3.0,
+            );
+            let outer = inner.map(|pt| skirt_corner(pt, centroid, f));
+
+            for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+                let dir = inner[j] - inner[i];
+                // Perpendicular distance from each end of the outer edge to the
+                // line the inner edge lies on. Both, so the two are parallel as
+                // well as far enough apart — a skirt that fanned would be wide
+                // at one end of an edge and nothing at the other.
+                for end in [outer[i], outer[j]] {
+                    let d = end - inner[i];
+                    let across = (dir.x * d.y - dir.y * d.x).abs() / dir.length();
+                    assert!(
+                        (across - f).abs() < 1e-3,
+                        "edge {i}-{j} at {degrees}° is feathered over {across}, not {f}"
+                    );
+                }
+                // And outside, not folded back over the gradient.
+                let out = outer[i] - centroid;
+                let inn = inner[i] - centroid;
+                assert!(out.length() > inn.length(), "corner {i} folded inwards");
+            }
+        }
+    }
+
+    /// A triangle squashed to nothing has no outward direction, and one NaN
+    /// vertex is a mesh egui throws away — a picker that has stopped drawing.
+    #[test]
+    fn a_degenerate_triangle_gets_no_skirt_rather_than_a_nan() {
+        let pt = skirt_corner(CENTRE, CENTRE, 1.0);
+        assert_eq!(pt, CENTRE);
     }
 
     /// Whichever way it is turned, the three corners have to stay a triangle:

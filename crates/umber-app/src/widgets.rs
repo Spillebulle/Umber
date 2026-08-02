@@ -133,7 +133,7 @@ fn slider_body(
             ),
         );
 
-        changed = drag_track(&response, track, value, lo, hi, log);
+        changed = drag_track(&response, track, value, lo, hi, log, 0.0);
         paint_track(
             ui.painter(),
             p,
@@ -261,6 +261,11 @@ fn from_t(t: f32, lo: f32, hi: f32, log: bool) -> f32 {
 }
 
 /// Drag a track and report whether the value moved.
+///
+/// `snap` is the multiple a drag is pulled onto, in the value's own units, and
+/// zero — what every rail but [`number_row`]'s passes — is the exact identity:
+/// [`snapped`] returns its argument untouched, so nothing that did not ask for
+/// a snap pays a rounding step for one.
 fn drag_track(
     response: &Response,
     track: Rect,
@@ -268,6 +273,7 @@ fn drag_track(
     lo: f32,
     hi: f32,
     log: bool,
+    snap: f32,
 ) -> bool {
     if !(response.dragged() || response.clicked()) {
         return false;
@@ -276,7 +282,7 @@ fn drag_track(
         return false;
     };
     let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
-    let next = from_t(t, lo, hi, log);
+    let next = snapped(from_t(t, lo, hi, log), snap, lo, hi);
     if next == *value {
         return false;
     }
@@ -391,7 +397,7 @@ pub fn inline_slider(
 
     let (row, response) = ui.allocate_exact_size(vec2(90.0, 16.0), Sense::click_and_drag());
     let track = Rect::from_center_size(row.center(), vec2(row.width() - 10.0, 3.0));
-    let changed = drag_track(&response, track, value, lo, hi, log);
+    let changed = drag_track(&response, track, value, lo, hi, log, 0.0);
     paint_track(ui.painter(), p, track, to_t(*value, lo, hi, log), 10.0);
 
     ui.add_space(4.0);
@@ -411,9 +417,362 @@ pub fn bare_slider(ui: &mut Ui, p: &Palette, value: &mut f32, range: RangeInclus
     let width = (ui.available_width() - 30.0).max(MIN_TRACK * 3.0);
     let (row, response) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
     let track = Rect::from_center_size(row.center(), vec2(row.width(), 3.0));
-    let changed = drag_track(&response, track, value, lo, hi, false);
+    let changed = drag_track(&response, track, value, lo, hi, false, 0.0);
     paint_track(ui.painter(), p, track, to_t(*value, lo, hi, false), 0.0);
     changed
+}
+
+// ---------------------------------------------------------------------------
+// A figure you can drag onto, or type
+// ---------------------------------------------------------------------------
+
+/// Fraction of a snap step within which a drag is pulled onto it.
+///
+/// An eighth of the step either side, so a quarter of the rail's travel lands
+/// on a multiple and three quarters of it is free. A half would leave no free
+/// travel at all — every value on the rail would be a snapped one, and the
+/// control would read as a segmented picker wearing a slider's clothes. A
+/// twentieth is too small to land on with a hand on a trackpad, which is the
+/// case the snap exists for.
+const SNAP_PULL: f32 = 0.125;
+
+/// The nearest multiple of `step`, where the value came close enough to it.
+///
+/// A pure function of four numbers so the feel of the thing can be pinned
+/// without a window: how wide the pull is, and that a multiple outside the
+/// control's own range is not one to land on.
+///
+/// `step` of zero — every rail but [`number_row`]'s — returns the value bit for
+/// bit, so nothing that did not ask for a snap is rounded by one.
+fn snapped(value: f32, step: f32, lo: f32, hi: f32) -> f32 {
+    // Spelled out rather than as `!(step > 0.0)`: a NaN step has to fall out
+    // here too, and a negated comparison on a partially ordered type is the
+    // one place that is easy to write and hard to read.
+    if !step.is_finite() || step <= 0.0 || !value.is_finite() {
+        return value;
+    }
+    let nearest = (value / step).round() * step;
+    // A multiple past the end of the range is not somewhere the control can
+    // go, and clamping it back would put the value at the end rather than
+    // leaving the drag where the hand put it.
+    if (nearest - value).abs() <= step * SNAP_PULL && nearest >= lo && nearest <= hi {
+        nearest
+    } else {
+        value
+    }
+}
+
+/// How a [`number_row`] reads its figure, writes it back, and lands on a
+/// multiple.
+///
+/// A struct of plain fields rather than seven positional arguments or a
+/// builder, for the reason [`BrushRow`] is one — and for one more here: every
+/// field is read by `number_row` itself, so the shipped set cannot drift out of
+/// use as call sites come and go. A builder's unused method is dead code the
+/// day before the call site that wanted it lands.
+///
+/// Every number is in the **value's own units** and none of them is in the
+/// readout's: `snap: 45.0` for an angle in degrees, `snap: 0.25` for a scale
+/// shown as 25%. One set of units through the whole struct is what stops a call
+/// site being right about its range and wrong about its step.
+pub struct NumberRow<'a> {
+    pub label: &'a str,
+    pub range: RangeInclusive<f32>,
+    /// The multiple a drag lands on. Zero for a rail that snaps to nothing.
+    ///
+    /// A *typed* figure is never snapped — that is the whole reason the field
+    /// is there — and Alt held during a drag gives the free travel back.
+    pub snap: f32,
+    /// How many of the readout's units one of the value's is: 1.0 where the
+    /// readout is in the value's own units, 100.0 where a fraction around 1 is
+    /// shown and typed as a percentage.
+    pub per_unit: f32,
+    /// What follows the figure in the readout — and only there. A field being
+    /// typed into starts from the bare number; see [`NumberRow::bare`].
+    pub suffix: &'a str,
+    /// Places after the point, in the readout and in what a field starts from.
+    pub decimals: usize,
+    /// Hand the value back only when the drag ends, as
+    /// [`slider_row_deferred`] does and for the same one reason: a rail drawn
+    /// inside the thing it scales moves out from under the pointer if it is
+    /// applied per frame. A typed figure is applied at once either way — the
+    /// pointer is nowhere near the track, so there is nothing to run away from.
+    pub deferred: bool,
+}
+
+impl NumberRow<'_> {
+    /// The readout: the figure in the units it is shown in, and its suffix.
+    pub fn format(&self, value: f32) -> String {
+        format!("{}{}", self.bare(value), self.suffix)
+    }
+
+    /// The same figure with nothing after it.
+    ///
+    /// What a field starts from, so the suffix is never something to delete
+    /// before typing and never something to retype after.
+    pub fn bare(&self, value: f32) -> String {
+        let shown = value * self.per_unit;
+        let decimals = self.decimals;
+        format!("{shown:.decimals$}")
+    }
+
+    /// What a typed line means, or `None` where it means nothing — in which
+    /// case the value is left exactly as it was.
+    ///
+    /// The exact inverse of [`NumberRow::bare`] by construction rather than by
+    /// agreement: one scale and one suffix serve both directions, so a call
+    /// site cannot hand this a parser that disagrees with its own formatter.
+    /// That is the same argument `docimport::srgb`'s pair is held to, on a
+    /// much smaller thing.
+    ///
+    /// The suffix is accepted and not required. Somebody who selects the whole
+    /// field and types "90" means ninety degrees, and somebody who pastes
+    /// "90°" back in means the same.
+    pub fn parse(&self, text: &str) -> Option<f32> {
+        let text = text.trim();
+        let text = text.strip_suffix(self.suffix).unwrap_or(text).trim();
+        let typed: f32 = text.parse().ok()?;
+        if !typed.is_finite() {
+            return None;
+        }
+        Some(typed / self.per_unit)
+    }
+}
+
+/// [`slider_row`] with a figure that can be typed, and a rail that lands on
+/// multiples.
+///
+/// Returns true when the value changed. The rail is exactly the one every other
+/// row draws — same track, same knob, same drag — and the two things added sit
+/// either side of it:
+///
+/// - **The readout is a field.** Dragging a rail to exactly 90° is a matter of
+///   luck at any panel width; typing it is not. A typed figure is taken
+///   verbatim, clamped to the range and snapped to nothing.
+/// - **A drag lands on each multiple of [`NumberRow::snap`]**, within
+///   [`SNAP_PULL`] of one. Sweeping through still feels continuous because
+///   three quarters of the travel is free, and **Alt** held gives back the
+///   last quarter for the case where the exact figure wanted is 43°.
+///
+/// Called from the colour picker's wheel (an angle, 45° apart) and from
+/// Settings' Interface scale (a percentage, 25% apart, and
+/// [`NumberRow::deferred`] because that one is drawn inside the thing it
+/// scales). It is deliberately linear: a logarithmic rail with a snap would
+/// have a pull that changed width as it travelled, which is a control that
+/// feels broken rather than one that feels helpful.
+///
+/// **Key dispatch is suspended while the field has focus, and not from here.**
+/// `ui::draw` asks `Context::text_edit_focused` once for the whole interface
+/// and pulls `shortcuts::set_typing`, which is what stops the digits of a typed
+/// angle also selecting the brush and then the eraser. A widget reaching for
+/// that lever itself would be exactly the per-module version that rule exists
+/// to replace — and it must not reach for `shortcuts::set_capturing`, the other
+/// flag, which belongs to the shortcut recorder: a second writer would hand
+/// dispatch back to the canvas while a chord was still being listened for.
+pub fn number_row(ui: &mut Ui, p: &Palette, value: &mut f32, row: NumberRow<'_>) -> bool {
+    let id = ui.id().with(("number-row", row.label));
+    let held_id = id.with("held");
+    let (lo, hi) = (*row.range.start(), *row.range.end());
+
+    // What the rail is showing. That is the value itself, except part-way
+    // through a deferred drag, when it is the figure the pointer is over and
+    // the caller has not been told about yet.
+    let mut shown = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(held_id))
+        .filter(|_| row.deferred)
+        .unwrap_or(*value);
+
+    let mut typed = None;
+    let rail = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+
+        // A panel squeezed to its minimum can leave nothing here at all, and a
+        // negative width makes a `Rect` whose max is left of its min.
+        let width = ui.available_width().max(MIN_TRACK);
+
+        // The header is a rail's height rather than [`slider_row`]'s line of
+        // text: a caret needs somewhere to stand, and a field clipped to the
+        // cap height of its own glyphs looks like a mistake.
+        let (header, _) = ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::hover());
+        ui.painter().text(
+            header.left_center(),
+            Align2::LEFT_CENTER,
+            row.label,
+            FontId::proportional(text::SMALL),
+            p.text_dim,
+        );
+        typed = number_field(ui, p, header, id, shown, &row);
+
+        let (track_row, response) =
+            ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::click_and_drag());
+        let track = Rect::from_center_size(
+            track_row.center(),
+            vec2(
+                (track_row.width() - metrics::SLIDER_KNOB).max(MIN_TRACK),
+                metrics::SLIDER_RAIL,
+            ),
+        );
+
+        // Alt gives the snap back. The modifier is read here rather than off
+        // the drag's start because a hand that finds itself two degrees off can
+        // reach for it mid-sweep, which is when it is actually wanted.
+        let free = ui.input(|i| i.modifiers.alt);
+        drag_track(
+            &response,
+            track,
+            &mut shown,
+            lo,
+            hi,
+            false,
+            if free { 0.0 } else { row.snap },
+        );
+        paint_track(
+            ui.painter(),
+            p,
+            track,
+            to_t(shown, lo, hi, false),
+            metrics::SLIDER_KNOB,
+        );
+
+        // Built only while the pointer is actually over the rail: this is a
+        // panel body, drawn every frame, and a `format!` for a tooltip nobody
+        // is looking at is an allocation per frame for nothing.
+        if row.snap > 0.0 && response.hovered() {
+            return response.on_hover_text(format!(
+                "Lands on each {}. Hold Alt for anything in between, or type the figure above.",
+                row.format(row.snap)
+            ));
+        }
+        response
+    });
+
+    // A typed figure ends any deferral with it: whatever the rail was holding
+    // was abandoned the moment somebody said what they actually wanted.
+    if let Some(figure) = typed {
+        ui.ctx().data_mut(|d| d.remove::<f32>(held_id));
+        let figure = figure.clamp(lo, hi);
+        if figure != *value {
+            *value = figure;
+            return true;
+        }
+        return false;
+    }
+
+    // Still held, and the caller asked not to be told until it is let go.
+    if row.deferred && rail.inner.is_pointer_button_down_on() {
+        ui.ctx().data_mut(|d| d.insert_temp(held_id, shown));
+        return false;
+    }
+    ui.ctx().data_mut(|d| d.remove::<f32>(held_id));
+    if shown != *value {
+        *value = shown;
+        true
+    } else {
+        false
+    }
+}
+
+/// The figure at the right of a [`number_row`]'s header, as a field.
+///
+/// Returns what was typed, on the one frame it is committed — Enter, or the
+/// focus going elsewhere. Escape abandons it, which is what egui's own
+/// `DragValue` does and therefore what a keyboard already expects here.
+///
+/// The text entry itself is egui's, for the reason `controls::search_field`
+/// gives: caret, selection, IME and clipboard are not worth reimplementing to
+/// change a border. Only the frame is ours — none at all, the readout's
+/// monospace face and the palette's own ink — so a field nobody is typing in is
+/// indistinguishable from the readout [`slider_row`] paints.
+fn number_field(
+    ui: &mut Ui,
+    p: &Palette,
+    header: Rect,
+    id: egui::Id,
+    value: f32,
+    row: &NumberRow<'_>,
+) -> Option<f32> {
+    let edit_id = id.with("field");
+    let buffer_id = id.with("typed");
+    let font = FontId::monospace(text::TINY);
+
+    // Sized from the widest figure the range can produce, never from the one
+    // showing. A field that grew as a drag took the number from one digit to
+    // three would creep leftwards under the very pointer aiming at it.
+    let width = {
+        let painter = ui.painter();
+        let measure = |v: f32| {
+            painter
+                // A digit's worth of room past the readout, so a caret at the
+                // end of the text has somewhere to be.
+                .layout_no_wrap(format!("{}0", row.format(v)), font.clone(), p.text)
+                .size()
+                .x
+        };
+        measure(*row.range.start())
+            .max(measure(*row.range.end()))
+            .clamp(MIN_TRACK, header.width().max(MIN_TRACK))
+    };
+    let rect = Rect::from_min_max(pos2(header.right() - width, header.top()), header.max);
+
+    // A figure that can be typed into has to look like one. Painted before the
+    // field rather than from its response — a fill added afterwards would be
+    // over the glyphs — and from `contains_pointer`, which is geometry alone
+    // and cannot oscillate with what it reveals.
+    let focused = ui.memory(|m| m.has_focus(edit_id));
+    if focused || ui.rect_contains_pointer(rect) {
+        ui.painter()
+            .rect_filled(rect.expand2(vec2(4.0, 1.0)), metrics::RADIUS, p.control);
+    }
+
+    let held: Option<String> = ui.ctx().data(|d| d.get_temp(buffer_id));
+    let editing = held.is_some();
+    let mut text = held.unwrap_or_else(|| row.format(value));
+
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let edit = child.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(edit_id)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .desired_width(rect.width())
+            .horizontal_align(egui::Align::RIGHT)
+            .clip_text(true)
+            .font(font)
+            .text_color(p.text),
+    );
+
+    if edit.gained_focus() {
+        // Start from the bare figure, whole and selected: the first keystroke
+        // then replaces it, which is what somebody who clicked a number and
+        // typed "90" meant.
+        text = row.bare(value);
+        let mut state = egui::TextEdit::load_state(child.ctx(), edit_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::default(),
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+        state.store(child.ctx(), edit_id);
+    }
+
+    if edit.has_focus() {
+        child.ctx().data_mut(|d| d.insert_temp(buffer_id, text));
+        return None;
+    }
+    if !editing {
+        return None;
+    }
+    child.ctx().data_mut(|d| d.remove::<String>(buffer_id));
+    if child.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return None;
+    }
+    row.parse(&text)
 }
 
 /// A read-only bordered pill showing a name and its value.
@@ -1268,6 +1627,131 @@ pub fn pressure_graph(
                     painter.add(egui::Shape::line(run.clone(), stroke));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The colour wheel's Angle control, and Settings' Interface scale: the two
+    /// call sites, stated once so the tests drive what the interface draws
+    /// rather than a copy of it.
+    fn angle() -> NumberRow<'static> {
+        NumberRow {
+            label: "Angle",
+            range: 0.0..=359.0,
+            snap: 45.0,
+            per_unit: 1.0,
+            suffix: "°",
+            decimals: 0,
+            deferred: false,
+        }
+    }
+
+    fn scale() -> NumberRow<'static> {
+        NumberRow {
+            label: "Interface scale",
+            range: 0.5..=2.0,
+            snap: 0.25,
+            per_unit: 100.0,
+            suffix: "%",
+            decimals: 0,
+            deferred: true,
+        }
+    }
+
+    /// The point of the snap: a drag that lands near a multiple is taken to it,
+    /// so 90° is reachable with a hand rather than with luck.
+    #[test]
+    fn a_drag_that_lands_near_a_multiple_is_taken_to_it() {
+        // Within an eighth of 45° — 5.625° — either side.
+        for degrees in [45.0, 44.0, 46.0, 41.0, 49.0, 90.5, 314.0] {
+            let landed = snapped(degrees, 45.0, 0.0, 359.0);
+            assert_eq!(
+                landed % 45.0,
+                0.0,
+                "{degrees} should have been pulled onto a multiple, got {landed}"
+            );
+        }
+    }
+
+    /// And three quarters of the travel is free, or the rail would be a
+    /// segmented picker in a slider's clothes.
+    #[test]
+    fn a_drag_between_two_multiples_is_left_where_the_hand_put_it() {
+        // Each of these is more than 5.625° from every multiple of 45.
+        for degrees in [20.0, 22.5, 30.0, 60.0, 100.0, 200.5] {
+            assert_eq!(snapped(degrees, 45.0, 0.0, 359.0), degrees);
+        }
+    }
+
+    /// A multiple past the end of the range is not somewhere the control can
+    /// go. Clamping to it would put the value at the end of the rail rather
+    /// than leaving the drag alone, which is a knob that jumps at the extreme.
+    #[test]
+    fn a_snap_never_reaches_outside_the_range() {
+        // 360° is the nearest multiple to 359° and is not on this rail.
+        assert_eq!(snapped(359.0, 45.0, 0.0, 359.0), 359.0);
+        // Nor is 0.25 below a scale that starts at 0.5.
+        assert_eq!(snapped(0.51, 0.25, 0.5, 2.0), 0.5);
+        assert_eq!(snapped(0.5, 0.25, 0.5, 2.0), 0.5);
+    }
+
+    /// Every rail but this one passes no step, and must be untouched by the
+    /// arithmetic that exists for the one that does.
+    #[test]
+    fn no_snap_step_is_the_exact_identity() {
+        for value in [0.0, 1.0, 0.37, 44.999, -12.5, 1e6] {
+            assert_eq!(snapped(value, 0.0, -1e9, 1e9), value);
+        }
+        // Nothing non-finite is rounded into a number either: a NaN that came
+        // out of a drag has to stay a NaN and be dealt with where it was made.
+        assert!(snapped(f32::NAN, 45.0, 0.0, 359.0).is_nan());
+    }
+
+    /// The readout and the field are one scale and one suffix in two
+    /// directions, so a figure typed back exactly as it was shown is the figure
+    /// that was shown. This is what "type exactly 90°" rests on.
+    #[test]
+    fn a_typed_figure_is_the_readout_it_was_taken_from() {
+        for degrees in [0.0, 45.0, 90.0, 137.0, 359.0] {
+            let row = angle();
+            assert_eq!(row.parse(&row.format(degrees)), Some(degrees));
+            assert_eq!(row.parse(&row.bare(degrees)), Some(degrees));
+        }
+        for factor in [0.5, 1.0, 1.25, 1.75, 2.0] {
+            let row = scale();
+            assert_eq!(row.parse(&row.format(factor)), Some(factor));
+            assert_eq!(row.parse(&row.bare(factor)), Some(factor));
+        }
+    }
+
+    /// The suffix is the readout's and never the field's: "125" is what a scale
+    /// of 1.25 offers to be typed over, and it means 1.25 back.
+    #[test]
+    fn the_suffix_is_offered_and_not_demanded() {
+        let row = scale();
+        assert_eq!(row.format(1.25), "125%");
+        assert_eq!(row.bare(1.25), "125");
+        assert_eq!(row.parse("125"), Some(1.25));
+        assert_eq!(row.parse("125%"), Some(1.25));
+        assert_eq!(row.parse("  125 % "), Some(1.25));
+        let row = angle();
+        assert_eq!(row.format(90.0), "90°");
+        assert_eq!(row.parse("90"), Some(90.0));
+        assert_eq!(row.parse("90°"), Some(90.0));
+    }
+
+    /// A line that means nothing leaves the value exactly as it was, rather
+    /// than resolving to zero — which for an angle would be a shape that
+    /// silently snapped back to its neutral because somebody mistyped.
+    #[test]
+    fn a_line_that_means_nothing_is_refused() {
+        let row = angle();
+        for text in ["", " ", "°", "ninety", "9 0", "1/2", "--3", "nan", "inf"] {
+            assert_eq!(row.parse(text), None, "{text:?} parsed");
         }
     }
 }
