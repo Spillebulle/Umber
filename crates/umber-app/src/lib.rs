@@ -25,6 +25,7 @@ mod editor;
 mod icons;
 mod inputlog;
 mod keylayout;
+mod layerdrag;
 mod localtime;
 mod logo;
 mod panels;

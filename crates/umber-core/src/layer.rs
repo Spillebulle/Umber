@@ -203,18 +203,49 @@ impl LayerStack {
         Some(layer.slot)
     }
 
+    /// Move the layer at `from` so that it sits at position `to`, shifting
+    /// everything between them along by one.
+    ///
+    /// **This is a `Vec` shuffle and nothing else.** A layer's slot is fixed
+    /// for its lifetime, so no pixels move and no slot changes hands — which is
+    /// exactly why reordering, unlike *deleting*, does not have to clear the
+    /// undo history. A `PixelPatch` names a slot; deleting frees one for the
+    /// next layer to inherit, and an entry replayed after that would land in
+    /// the wrong layer. Nothing here frees or reassigns one, so every patch
+    /// still names the pixels it was captured from.
+    ///
+    /// Returns `false` where nothing moved: an index off the end, or a layer
+    /// asked to move to where it already is. The caller wants to know, because
+    /// a move that did nothing is not a document modification.
+    pub fn reorder(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.layers.len() || to >= self.layers.len() || from == to {
+            return false;
+        }
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        // The selection follows the *layer*, not the position it was at. Three
+        // cases: the moved layer itself, a layer the move stepped over — every
+        // one of those shifts by exactly one, in the opposite direction — and
+        // everything outside the span, which does not move at all.
+        if self.active == from {
+            self.active = to;
+        } else if from < to && self.active > from && self.active <= to {
+            self.active -= 1;
+        } else if to < from && self.active >= to && self.active < from {
+            self.active += 1;
+        }
+        true
+    }
+
     /// Move a layer one step towards the top. Returns its new index.
     pub fn move_up(&mut self, index: usize) -> Option<usize> {
         if index + 1 >= self.layers.len() {
             return None;
         }
-        self.layers.swap(index, index + 1);
-        if self.active == index {
-            self.active = index + 1;
-        } else if self.active == index + 1 {
-            self.active = index;
-        }
-        Some(index + 1)
+        // A step is a reorder over one place. Written in terms of it rather
+        // than as its own swap so there is one piece of code keeping the
+        // selection with its layer, instead of three that have to agree.
+        self.reorder(index, index + 1).then_some(index + 1)
     }
 
     /// Move a layer one step towards the bottom. Returns its new index.
@@ -222,13 +253,7 @@ impl LayerStack {
         if index == 0 || index >= self.layers.len() {
             return None;
         }
-        self.layers.swap(index, index - 1);
-        if self.active == index {
-            self.active = index - 1;
-        } else if self.active == index - 1 {
-            self.active = index;
-        }
-        Some(index - 1)
+        self.reorder(index, index - 1).then_some(index - 1)
     }
 
     /// True when at least one layer would contribute to the composite.
@@ -311,6 +336,132 @@ mod tests {
         assert!(s.move_up(1).is_none());
         assert!(s.move_down(0).is_none());
         assert_eq!(s.len(), 2);
+    }
+
+    /// Reordering must be a shuffle of the order and nothing else. If a slot
+    /// ever followed a position, deleting a layer would not be the only thing
+    /// that had to clear the undo history — a patch names a slot.
+    #[test]
+    fn reordering_preserves_every_layers_slot() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.add();
+        let mut slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        assert_eq!(slots.len(), 4);
+
+        // Bottom to top, which is the longest move there is.
+        s.reorder(0, 3);
+        let moved = slots.remove(0);
+        slots.push(moved);
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            slots
+        );
+
+        // And back down again, past two layers rather than to an end.
+        s.reorder(3, 1);
+        let moved = slots.remove(3);
+        slots.insert(1, moved);
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            slots
+        );
+        // Every slot still present exactly once: nothing was freed or reissued.
+        let unique: std::collections::HashSet<_> = slots.iter().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn reordering_a_layer_onto_its_own_position_is_a_no_op() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.set_active(1);
+        let before: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+
+        assert!(
+            !s.reorder(1, 1),
+            "a move to where it already is moved nothing"
+        );
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(s.active_index(), 1);
+    }
+
+    #[test]
+    fn reordering_off_the_end_moves_nothing() {
+        let mut s = LayerStack::new();
+        s.add();
+        let before: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        assert!(!s.reorder(0, 2));
+        assert!(!s.reorder(7, 0));
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    /// The selection is a layer, not a row number: whichever layer was being
+    /// painted on has to still be the one being painted on afterwards.
+    #[test]
+    fn the_active_layer_follows_the_layer_and_not_the_position() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.add();
+
+        // The moved layer itself.
+        s.set_active(0);
+        let slot = s.active_slot();
+        s.reorder(0, 2);
+        assert_eq!(s.active_index(), 2);
+        assert_eq!(s.active_slot(), slot);
+
+        // A layer the move steps over: it shifts by one, the other way.
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.add();
+        s.set_active(2);
+        let slot = s.active_slot();
+        s.reorder(0, 3);
+        assert_eq!(s.active_index(), 1, "stepped over, so down one");
+        assert_eq!(s.active_slot(), slot);
+
+        s.reorder(3, 0);
+        assert_eq!(s.active_index(), 2, "stepped over the other way, so up one");
+        assert_eq!(s.active_slot(), slot);
+
+        // And a layer outside the span the move covers does not move at all.
+        s.set_active(3);
+        let slot = s.active_slot();
+        s.reorder(0, 1);
+        assert_eq!(s.active_index(), 3);
+        assert_eq!(s.active_slot(), slot);
+    }
+
+    /// The buttons are `reorder` over one place, so they must still behave
+    /// exactly as they did when each did its own swap.
+    #[test]
+    fn a_step_is_a_reorder_over_one_place() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+
+        assert_eq!(s.move_up(0), Some(1));
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            vec![slots[1], slots[0], slots[2]]
+        );
+        assert_eq!(s.move_down(1), Some(0));
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            slots
+        );
     }
 
     #[test]

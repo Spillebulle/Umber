@@ -17,6 +17,7 @@ use crate::colorpicker::{self, PickerMode};
 use crate::dock::{ColumnGeometry, DropTarget, Floating, Geometry, PanelKind, Side, limits};
 use crate::editor::{Editor, Tool};
 use crate::icons::{self, Icon};
+use crate::layerdrag;
 use crate::shortcuts::{self, Action};
 use crate::theme::{Palette, metrics, text};
 use crate::ui::{UiActions, icon_button};
@@ -25,6 +26,7 @@ use egui::{
     Align, Align2, CursorIcon, FontId, Frame, Id, LayerId, Layout, Order, Pos2, Rect, Sense,
     Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
+use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
 use umber_core::{BlendMode, EditKind, LayerStack, Timestamp};
 
@@ -519,35 +521,76 @@ fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
         .clicked()
 }
 
+/// The dash pattern every dashed affordance here is drawn with. One pair, so
+/// the column outline and the dock indicator cannot drift apart.
+const DASH: f32 = 5.0;
+const GAP: f32 = 4.0;
+
 /// A dashed outline round a rounded rect.
 ///
 /// egui strokes rects solid; the design's dock affordances are dashed, and a
 /// dashed border is what distinguishes "this is where it will go" from a real
-/// piece of chrome. Corners are approximated by insetting the four runs, which
-/// at these radii is not visible.
+/// piece of chrome.
+///
+/// **One closed polyline, corners included.** Dashing the four straight edges
+/// separately — which is what this used to do — draws a rectangle with its
+/// corners missing, and it restarts the pattern four times so the dashes do not
+/// line up across a corner even when one is drawn. `dashes_from_line` carries
+/// its position along the whole path it is given, so handing it the corner arcs
+/// as part of that path is all it takes for the pattern to run continuously the
+/// whole way round.
 fn dashed_rect(painter: &egui::Painter, rect: Rect, radius: f32, stroke: Stroke) {
-    let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
-    let runs = [
-        [
-            pos2(rect.left() + r, rect.top()),
-            pos2(rect.right() - r, rect.top()),
-        ],
-        [
-            pos2(rect.right(), rect.top() + r),
-            pos2(rect.right(), rect.bottom() - r),
-        ],
-        [
-            pos2(rect.right() - r, rect.bottom()),
-            pos2(rect.left() + r, rect.bottom()),
-        ],
-        [
-            pos2(rect.left(), rect.bottom() - r),
-            pos2(rect.left(), rect.top() + r),
-        ],
-    ];
-    for run in runs {
-        painter.extend(egui::Shape::dashed_line(&run, stroke, 5.0, 4.0));
+    let points = rounded_outline(rect, radius);
+    painter.extend(egui::Shape::dashed_line(&points, stroke, DASH, GAP));
+}
+
+/// The rounded rectangle as a closed polyline, starting and ending at the
+/// middle of the top edge.
+///
+/// A closed dashed path has exactly one seam — the point where the last dash
+/// meets the first — because the perimeter is not a whole number of dash-plus-
+/// gap. Starting mid-edge puts it in the middle of the longest straight run
+/// rather than at a corner, which is where the eye is already looking for a
+/// join.
+fn rounded_outline(rect: Rect, radius: f32) -> Vec<Pos2> {
+    let r = radius
+        .min(rect.width() * 0.5)
+        .min(rect.height() * 0.5)
+        .max(0.0);
+    // A radius this small is a square corner: the arc would be a run of
+    // coincident points, and a zero-length segment is a dash with no direction.
+    if r < 0.5 {
+        return vec![
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+            rect.left_top(),
+        ];
     }
+
+    // Enough segments that the chord error is well under a pixel at the radii
+    // the design uses, and no more: this runs once per outline per frame.
+    let steps = ((r * 0.8).ceil() as usize).clamp(2, 12);
+    let start = pos2(rect.center().x, rect.top());
+    let mut points = Vec::with_capacity(4 * (steps + 1) + 2);
+    points.push(start);
+    // Clockwise on screen, y down: top-right, bottom-right, bottom-left,
+    // top-left. Each arc's first point is where the straight edge before it
+    // ended, so the edges fall out of the gaps between the arcs.
+    for (centre, from) in [
+        (pos2(rect.right() - r, rect.top() + r), -FRAC_PI_2),
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (pos2(rect.left() + r, rect.bottom() - r), FRAC_PI_2),
+        (pos2(rect.left() + r, rect.top() + r), PI),
+    ] {
+        for i in 0..=steps {
+            let angle = from + FRAC_PI_2 * (i as f32 / steps as f32);
+            points.push(centre + vec2(angle.cos(), angle.sin()) * r);
+        }
+    }
+    points.push(start);
+    points
 }
 
 /// The dashed outline the design puts round a docked column while the layout is
@@ -886,6 +929,21 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     let active = ed.layers.active_index();
 
     ui.horizontal(|ui| {
+        // Whose settings these are. The blend picker and the opacity slider
+        // below edit the *selected* layer — `Layer::blend` and `Layer::opacity`
+        // have always been per-layer — and with nothing saying so the pair read
+        // as a document-wide setting, which is the one thing they are not.
+        // Typography is `controls::section`'s, so the panel gains a heading and
+        // not a second heading style; it is inline rather than a call to it
+        // because that helper is a block with its own spacing and this shares
+        // the icon row.
+        ui.label(
+            egui::RichText::new("Layer settings")
+                .size(text::SMALL)
+                .color(p.text_dim)
+                .strong(),
+        )
+        .on_hover_text("Blend mode and opacity apply to the selected layer");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(
                 ui,
@@ -953,6 +1011,35 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
 
     ui.add_space(7.0);
 
+    // What is being carried, if anything. Kept in egui's temporary store rather
+    // than on `Editor`, which is where `history_body`'s scroll memo lives and
+    // for the same reason: this belongs to the list, not to the document, and a
+    // tab switch has nothing to say about it.
+    let mut drag: Option<layerdrag::Drag> = ui.ctx().data(|d| d.get_temp(layer_drag_id()));
+
+    // The row a drop would land on, as `Drag::aim` left it at the end of the
+    // *last* frame. One frame behind the pointer, which nobody can see in a
+    // drag, and what it buys is that the mark can be handed to the row as its
+    // own highlight rather than painted over the top of it — `layer_row` draws
+    // its own name and blend, and a fill laid on afterwards would cover both.
+    let aimed = drag.as_ref().and_then(layerdrag::Drag::destination);
+
+    // Where the rows land, for the drag model. Collected only while a button is
+    // down or something is already being carried: the list is redrawn every
+    // frame and this would otherwise be a `Vec` built sixty times a second to
+    // answer a question nobody is asking.
+    let (pointer, origin, down, released, deciding) = ui.input(|i| {
+        (
+            i.pointer.interact_pos(),
+            i.pointer.press_origin(),
+            i.pointer.primary_down(),
+            i.pointer.any_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+    let watching = drag.is_some() || down;
+    let mut rows: Vec<layerdrag::Row> = Vec::new();
+
     // Stored bottom-first; shown top-first, the way it is drawn.
     let mut select = None;
     let mut toggle = None;
@@ -960,21 +1047,94 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         let Some(layer) = ed.layers.get(index) else {
             continue;
         };
-        let row = widgets::layer_row(
-            ui,
-            p,
-            &layer.name,
-            layer.slot(),
-            layer.visible,
-            index == active,
-            layer.blend.label(),
-        );
+        let target = aimed == Some(index);
+        // Through a scope, purely to learn where the row landed: `layer_row`
+        // reports what was clicked and not what it occupied, and a rect guessed
+        // from the row height would be a second statement of a number
+        // `widgets.rs` already owns.
+        let placed = ui.scope(|ui| {
+            widgets::layer_row(
+                ui,
+                p,
+                &layer.name,
+                layer.slot(),
+                layer.visible,
+                // The drop target borrows the selected row's own fill, so the
+                // mark is part of the row. The outline below is what keeps
+                // "the layer lands here" from reading as "this row is
+                // selected".
+                index == active || target,
+                layer.blend.label(),
+            )
+        });
+        let (row, rect) = (placed.inner, placed.response.rect);
+        if target {
+            ui.painter().rect_stroke(
+                rect,
+                metrics::RADIUS,
+                Stroke::new(1.0, p.accent),
+                StrokeKind::Inside,
+            );
+        }
+        if watching {
+            rows.push(layerdrag::Row { index, rect });
+        }
+        // A release that ends a drag is not also a click on the row it landed
+        // on, nor on the eye it happened to pass over.
+        if drag.is_some() {
+            continue;
+        }
         if row.eye_clicked {
             toggle = Some(index);
         } else if row.clicked {
             select = Some(index);
         }
     }
+
+    // Picking a layer up, aiming it and putting it down. All of it off the
+    // pointer's own state rather than a `Response`, because the row belongs to
+    // `widgets::layer_row` and senses clicks only — and a second widget laid
+    // over the row to sense drags would be on top of the eye inside it, which
+    // would leave the visibility toggle dead. egui still settles click against
+    // drag: `is_decidedly_dragging` is exactly the condition under which it
+    // stops calling the press a click, so a press that becomes a drag never
+    // also selects and a click that never moves still does.
+    if drag.is_none()
+        && down
+        && deciding
+        && let Some(index) = origin.and_then(|at| layerdrag::row_pressed(&rows, at))
+        && let Some(layer) = ed.layers.get(index)
+    {
+        drag = Some(layerdrag::Drag::new(index, layer.name.clone()));
+    }
+    if let Some(carried) = &mut drag {
+        carried.aim(&rows, pointer);
+        drag_ghost(ui.ctx(), p, carried);
+    }
+    if !down && let Some(carried) = drag.take() {
+        // `released` distinguishes the frame the button came up on from a drag
+        // left in the store by a panel that stopped being drawn mid-gesture.
+        // Without it, reopening the module with the pointer over the list would
+        // resolve a drop nobody was making.
+        if released
+            && let Some(to) = carried.destination()
+            // Reordering does not clear the undo history, and deleting a layer
+            // does. The difference is `LayerStack::reorder`'s to state and it
+            // states it: a `PixelPatch` names a *slot*, deleting frees one for
+            // the next layer to inherit, and nothing here frees or reassigns
+            // one. Stack order is the `Vec` order, so this moved no pixels.
+            && ed.layers.reorder(carried.from, to)
+        {
+            changed = true;
+        }
+    }
+    ui.ctx().data_mut(|d| match drag {
+        Some(drag) => {
+            d.insert_temp(layer_drag_id(), drag);
+        }
+        None => d.remove::<layerdrag::Drag>(layer_drag_id()),
+    });
+
     if let Some(index) = toggle
         && let Some(layer) = ed.layers.get_mut(index)
     {
@@ -987,6 +1147,43 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     if changed {
         ed.mark_modified();
     }
+}
+
+/// Where the layer being dragged is kept between frames.
+fn layer_drag_id() -> Id {
+    Id::new("layer-drag")
+}
+
+/// The label that follows the pointer while a layer is being carried.
+///
+/// On egui's tooltip layer, so it rides over the list rather than being clipped
+/// to it, and painted rather than added as a widget: nothing about it is
+/// interactive, and a widget sitting under the pointer through a drag would
+/// take the hover the rows need. Same shape as the brush library's ghost, minus
+/// the destination — the list says where the layer lands by lighting the row up
+/// under the pointer, where the collection rail is a list of names the pointer
+/// may be nowhere near.
+fn drag_ghost(ctx: &egui::Context, p: &Palette, drag: &layerdrag::Drag) {
+    let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) else {
+        return;
+    };
+    ctx.set_cursor_icon(CursorIcon::Grabbing);
+
+    let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("layer-drag-ghost")));
+    let galley = painter.layout_no_wrap(
+        drag.name.clone(),
+        FontId::proportional(text::TINY),
+        p.text_strong,
+    );
+    let rect = Rect::from_min_size(pointer + vec2(14.0, 12.0), galley.size() + vec2(16.0, 9.0));
+    painter.rect_filled(rect, metrics::RADIUS, p.popover);
+    painter.rect_stroke(
+        rect,
+        metrics::RADIUS,
+        Stroke::new(1.0, p.popover_border),
+        StrokeKind::Inside,
+    );
+    painter.galley(rect.min + vec2(8.0, 4.5), galley, p.text_strong);
 }
 
 /// One row of the History list, as the list has worked it out.
