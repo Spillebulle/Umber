@@ -9,7 +9,9 @@
 //! black and the hue would snap back to red on the way out.
 
 use crate::theme::Palette;
-use egui::{Color32, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, epaint::Vertex, pos2, vec2};
+use egui::{
+    Color32, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, epaint::Vertex, pos2, vec2,
+};
 use umber_core::Hsv;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +98,32 @@ fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
 /// triangle that points sideways looks like one that failed to finish turning.
 const STILL_APEX: f32 = -std::f32::consts::FRAC_PI_2;
 
+/// How far out a press has to be to belong to the hue ring rather than to the
+/// centre.
+///
+/// The hub's outermost 8% steers hue too, so the ring's inner edge is forgiving
+/// to grab. Everything inside it — including the three wide gaps between an
+/// inscribed triangle and the ring — belongs to the saturation and value shape,
+/// which is where those presses have always gone.
+const RING_GRIP: f32 = 0.92;
+
+/// Where the gesture this response is reporting began, or `None` if there is no
+/// gesture.
+///
+/// A drag reports where the pointer is *now*, which by the end of one can be
+/// anywhere; which of the wheel's two controls it belongs to has to be settled
+/// from where it was pressed. egui clears the press origin on release and a
+/// click is reported on the release, so a click falls back to its own position —
+/// by definition it has not moved far enough for the two to differ.
+fn gesture_origin(ui: &Ui, response: &Response) -> Option<Pos2> {
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    ui.ctx()
+        .input(|i| i.pointer.press_origin())
+        .or_else(|| response.interact_pointer_pos())
+}
+
 /// Draw the picker. Returns true when the colour changed.
 pub fn show(
     ui: &mut Ui,
@@ -131,19 +159,26 @@ fn wheel(
     // inner edge outside its outer one. Keep a hub for the triangle instead.
     let inner = (outer - RING_THICKNESS).max(outer * 0.25);
 
+    // One interaction for the whole wheel, and where a gesture was *pressed*
+    // decides which of the two controls inside it the gesture belongs to.
+    //
+    // Two overlapping `ui.interact` rects cannot do it: egui hands a press to
+    // the topmost widget under it, and the centre's rect is the square around a
+    // shape inscribed in the ring — so its corners cover the ring at the four
+    // diagonals, and a hue drag begun there went to the saturation and value
+    // shape instead. Settling it at the press rather than per frame is also what
+    // lets a drag begun on the ring carry on across the middle, which is how
+    // both controls have always behaved once held.
+    let response = ui.interact(area, ui.id().with("wheel"), Sense::click_and_drag());
+    let at = response.interact_pointer_pos();
+    let on_ring = gesture_origin(ui, &response)
+        .is_some_and(|from| (from - centre).length() > inner * RING_GRIP);
+
     // --- hue ring ---
-    let ring_response = ui.interact(area, ui.id().with("hue-ring"), Sense::click_and_drag());
-    if (ring_response.dragged() || ring_response.clicked())
-        && let Some(pos) = ring_response.interact_pointer_pos()
-    {
+    if on_ring && let Some(pos) = at {
         let d = pos - centre;
-        let radius = d.length();
-        // Only the ring itself steers hue; the middle belongs to the
-        // saturation/value shape.
-        if radius > inner * 0.92 {
-            hsv.h = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
-            changed = true;
-        }
+        hsv.h = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
+        changed = true;
     }
 
     let f = feather(ui);
@@ -196,15 +231,16 @@ fn wheel(
     painter.circle_stroke(marker, 6.0, Stroke::new(2.0, Color32::WHITE));
 
     // --- saturation / value shape ---
+    let drag = if on_ring { None } else { at };
     match shape {
         WheelShape::Square => {
             // Largest square that fits inside the ring.
             let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
             let sv = Rect::from_center_size(centre, vec2(half * 2.0, half * 2.0));
-            changed |= sv_square(ui, sv, hsv, "wheel-sv");
+            changed |= sv_square(ui, sv, drag, hsv);
         }
         WheelShape::Triangle => {
-            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), *rotate, hsv);
+            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), *rotate, drag, hsv);
         }
     }
 
@@ -249,15 +285,22 @@ fn wheel(
 /// the next. Holding still gives up the first to get the second: the point you
 /// last picked stays where you left it, and picking the same tint across
 /// several hues becomes a matter of returning to the same place.
-fn sv_triangle(ui: &mut Ui, centre: Pos2, radius: f32, rotate: bool, hsv: &mut Hsv) -> bool {
+///
+/// `drag` is where the pointer is, if this frame's gesture belongs to the
+/// centre. The wheel decides that — see the interaction comment there — so there
+/// is no `interact` of its own to overlap the ring's.
+fn sv_triangle(
+    ui: &mut Ui,
+    centre: Pos2,
+    radius: f32,
+    rotate: bool,
+    drag: Option<Pos2>,
+    hsv: &mut Hsv,
+) -> bool {
     let mut changed = false;
     let (hue_pt, white_pt, black_pt) = triangle_corners(centre, radius, rotate, hsv.h);
 
-    let rect = Rect::from_center_size(centre, vec2(radius * 2.0, radius * 2.0));
-    let response = ui.interact(rect, ui.id().with("wheel-tri"), Sense::click_and_drag());
-    if (response.dragged() || response.clicked())
-        && let Some(pos) = response.interact_pointer_pos()
-    {
+    if let Some(pos) = drag {
         // Barycentric coordinates give saturation and value directly.
         let (a, b, c) = barycentric(pos, hue_pt, white_pt, black_pt);
         if a.is_finite() {
@@ -382,8 +425,13 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     let mut changed = false;
     let width = ui.available_width().max(MIN_PICKER);
 
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 130.0), Sense::hover());
-    changed |= sv_square(ui, rect, hsv, "square-sv");
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 130.0), Sense::click_and_drag());
+    // Nothing overlaps this one, so it does its own interacting — unlike the
+    // wheel's centre, which shares a hit area with the ring.
+    let drag = (response.dragged() || response.clicked())
+        .then(|| response.interact_pointer_pos())
+        .flatten();
+    changed |= sv_square(ui, rect, drag, hsv);
 
     ui.add_space(9.0);
 
@@ -429,13 +477,13 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
 }
 
 /// The saturation/value gradient: white→hue left to right, black bottom.
-fn sv_square(ui: &mut Ui, rect: Rect, hsv: &mut Hsv, salt: &str) -> bool {
+///
+/// `drag` is where the pointer is, if this frame's gesture belongs to the field
+/// — see [`sv_triangle`].
+fn sv_square(ui: &mut Ui, rect: Rect, drag: Option<Pos2>, hsv: &mut Hsv) -> bool {
     let mut changed = false;
 
-    let response = ui.interact(rect, ui.id().with(salt), Sense::click_and_drag());
-    if (response.dragged() || response.clicked())
-        && let Some(pos) = response.interact_pointer_pos()
-    {
+    if let Some(pos) = drag {
         hsv.s = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
         hsv.v = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
         changed = true;
