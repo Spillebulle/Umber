@@ -320,6 +320,34 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+- **A thumbnail is the layer's *content*, and it is two passes because the
+  bounding box of that content is on the GPU.** `thumbnail.wgsl` reduces a
+  rectangle of one slice to a 64-square: first the whole slice to the
+  **greatest** alpha per cell, which `umber_core::thumbnail::content_rect` turns
+  into a document rectangle and `framed` into the region to draw; then that
+  region to a **mean**, which is the picture. The first must be a maximum: a
+  one-pixel line averaged over a 32×32 cell is 1/1024, which is zero in eight
+  bits, so a mean reports every sketched layer as empty. `textureLoad`, not a
+  sampler — a bilinear tap at 30:1 is a point sample with extra steps, and the
+  region deliberately runs off the canvas where clamp-to-edge would smear the
+  edge row across the margin. The frame never magnifies past 1:1, so a single
+  dab reads as a single dab.
+- **The invalidation rule is `CanvasRenderer::slot_revision`, bumped inside
+  every method that writes a slice** — commit, float commit, `write_layer_rect`,
+  clear, mask fill, flip, resize. That is exhaustive by construction, because a
+  layer's pixels cannot change without going through one of them; a `touch` call
+  beside each of the eight call sites in `app.rs` is the "forgotten at the
+  sixth" failure written out in advance. `Thumbs::wanted` is the whole policy —
+  the active layer first, then stack order — and it is a model with no drawing
+  in it.
+- **"Nothing on this layer" is a cached answer, not a missing one**, or a blank
+  layer is re-read on every frame for as long as it is open. It draws the same
+  checker a picture that has not arrived yet does: distinguishing the two would
+  put a spinner on every row of a freshly opened document.
+- **The cache is keyed by document and empties itself when that changes**, which
+  is what lets it live *above* the `--- documents ---` line — a slot is a slice
+  of one document's array, so slot 3 is a different layer in every tab. And a
+  slot that leaves the stack loses its picture, because slots are recycled.
 
 ### Documents
 

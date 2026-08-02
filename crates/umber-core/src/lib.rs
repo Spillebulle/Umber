@@ -28,6 +28,7 @@ pub mod selection;
 mod sqlite;
 pub mod stroke;
 pub mod style;
+pub mod thumbnail;
 pub mod time;
 pub mod tip;
 mod tip_table;

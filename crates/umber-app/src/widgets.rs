@@ -1714,6 +1714,13 @@ pub struct LayerRow<'a> {
     pub clipped: bool,
     pub locked: bool,
     pub linked: bool,
+    /// What is actually on the layer, scaled to fill the chip — or `None`,
+    /// which draws the checker alone and means "nothing to show". The two
+    /// reasons for `None` are deliberately drawn the same: a layer that is
+    /// genuinely empty, and one whose picture has not come back from the GPU
+    /// yet. Distinguishing them would mean a spinner on every row of a freshly
+    /// opened document for the two frames it takes.
+    pub thumb: Option<&'a egui::TextureHandle>,
 }
 
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
@@ -1759,8 +1766,13 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         if visible { p.text } else { p.text_dim },
     );
 
-    // Thumbnail placeholder: a checker chip. Rendering real layer thumbnails
-    // needs a downscale pass that does not exist yet.
+    // The layer's own content, scaled to fill the chip, over a checker.
+    //
+    // The checker is drawn whether or not there is a picture, because the
+    // picture carries alpha and a thumbnail of a sketch is mostly transparent —
+    // laying it on a flat fill would say the layer was opaque. Where there is
+    // no picture at all the checker is the whole chip, and that is the stated
+    // "nothing on this layer" state; see [`LayerRow::thumb`].
     let thumb = Rect::from_min_size(rect.left_top() + vec2(27.0, 3.0), vec2(24.0, 24.0));
     painter.rect_filled(thumb, 3.0, p.window);
     for i in 0..4 {
@@ -1774,6 +1786,14 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
             );
             painter.rect_filled(cell.intersect(thumb), 0.0, p.control_hover);
         }
+    }
+    if let Some(picture) = row.thumb {
+        painter.image(
+            picture.id(),
+            thumb,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
     }
 
     // The mask chip, beside the layer's own, and only where there is a mask.

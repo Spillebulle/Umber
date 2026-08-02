@@ -1656,7 +1656,7 @@ mod tests {
         editor.session.mark_modified();
 
         let id = editor.session.active_id();
-        let canvas = CanvasRenderer::new(
+        let mut canvas = CanvasRenderer::new(
             &gpu.device,
             editor.doc.size,
             wgpu::TextureFormat::Rgba8Unorm,

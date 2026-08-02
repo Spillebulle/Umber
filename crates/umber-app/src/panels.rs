@@ -1188,6 +1188,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     clipped: layer.clipped,
                     locked: layer.locked,
                     linked: layer.linked,
+                    thumb: ed.thumbs.picture(layer.slot()),
                 },
             )
         });

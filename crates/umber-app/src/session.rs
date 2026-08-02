@@ -39,6 +39,17 @@ use umber_core::{Camera, Document, EditTarget, History, LayerStack, Selection};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocId(u64);
 
+impl DocId {
+    /// An identity for a test that needs two documents and no session to open
+    /// them in. Deliberately not a general constructor: outside a test the only
+    /// thing that may mint one is [`Session::open`], or two documents could
+    /// come to share a layer array.
+    #[cfg(test)]
+    pub fn for_test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 /// The engine state belonging to one document.
 ///
 /// Moving one of these in and out of the editor is what a tab switch is. Every

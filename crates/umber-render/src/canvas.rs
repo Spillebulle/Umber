@@ -237,6 +237,15 @@ const PROBE_SIZE: u32 = 8;
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 const PROBE_FORMAT: wgpu::TextureFormat = OFFSCREEN_FORMAT;
+
+/// Side of a layer thumbnail's target, in texels. See
+/// [`umber_core::thumbnail`], which owns the number and the reason for it.
+const THUMB_SIZE: u32 = umber_core::thumbnail::SIZE;
+/// Bytes per row of a thumbnail readback. `THUMB_SIZE` RGBA texels is exactly
+/// the 256-byte copy alignment, so there is no padding to stride over — which
+/// is one of the two reasons that size was chosen.
+const THUMB_ROW_BYTES: u32 = THUMB_SIZE * 4;
+const _: () = assert!(THUMB_ROW_BYTES.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
 /// Rows in a texture-to-buffer copy must be a multiple of 256 bytes, and eight
 /// RGBA pixels are 32 — so each row is padded and the reader strides over it.
 const PROBE_ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -510,6 +519,73 @@ pub struct DocumentCapture {
     /// One buffer per slot asked for, in that order.
     pub layers: Vec<Vec<u8>>,
     pub merged: Vec<u8>,
+}
+
+// --- layer thumbnails -------------------------------------------------------
+
+/// Which of a thumbnail's two passes is in flight.
+///
+/// They are the *same* pass with `reduce` flipped — see `thumbnail.wgsl`. The
+/// second cannot be recorded until the first has come home, because what it
+/// draws is decided by what the first found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ThumbPhase {
+    /// Reducing the whole slice to the greatest alpha per cell, to find where
+    /// the layer's content is.
+    Bounds,
+    /// Reducing that region to a mean, which is the picture.
+    Picture,
+}
+
+/// One layer thumbnail on its way to the CPU.
+///
+/// Built like the smudge probe rather than like the autosave's capture: two
+/// small copies, a `map_async` after the frame that recorded each, and a
+/// collection on some later frame by a poll that never waits. Nothing here may
+/// block, because the layer list is redrawn every frame and the blocking
+/// readbacks — `read_layer_rect` and `read_layer_pieces` — are explicitly
+/// reserved for a Save and for a pointer-up.
+///
+/// One at a time, for the reason [`Capture`] is one at a time: the cost is a
+/// couple of frames of latency on something nobody is waiting for, and the
+/// alternative is one staging buffer per layer.
+struct ThumbJob {
+    slot: u32,
+    /// [`CanvasRenderer::slot_revision`] when the job began. Handed back with
+    /// the picture so the caller can tell a thumbnail of the layer as it is now
+    /// from one of the layer as it was two strokes ago.
+    revision: u64,
+    phase: ThumbPhase,
+    /// The region the picture pass draws, from `umber_core::thumbnail::framed`.
+    /// `None` until the bounds pass has come home.
+    region: Option<umber_core::Rect>,
+    state: StepState,
+    /// One of the `PROBE_*` constants, for the reason [`Probe::outcome`] is.
+    outcome: Arc<AtomicU8>,
+    /// The layer was written to, or the document has gone, so whatever comes
+    /// home describes a picture that is no longer there. Marked rather than
+    /// dropped, exactly as a probe is — a buffer awaiting a map is still the
+    /// GPU's, and handing it back early is a validation error and therefore an
+    /// abort. See [`CanvasRenderer::reset_probes`].
+    abandoned: bool,
+}
+
+/// A layer thumbnail, as the interface wants it.
+pub struct Thumbnail {
+    pub slot: u32,
+    /// The revision the job began at. A caller holding a newer one knows to ask
+    /// again rather than to draw this.
+    pub revision: u64,
+    /// Straight-alpha sRGB, `SIZE` square — or empty where the layer holds
+    /// nothing at all, which is a state the list draws rather than a failure.
+    pub rgba: Vec<u8>,
+}
+
+impl Thumbnail {
+    /// True where the layer had no non-transparent pixel to show.
+    pub fn is_empty(&self) -> bool {
+        self.rgba.is_empty()
+    }
 }
 
 /// One layer's contribution to the composite, in stack order.
@@ -845,6 +921,24 @@ struct FlipUniforms {
     _pad: u32,
 }
 
+/// Mirrors `Thumb` in `thumbnail.wgsl`.
+///
+/// Every member is a `vec2` or a scalar, so both sides pack to 48 bytes with no
+/// alignment surprise. Scalar padding, not a `vec2`: see the uniform-layout note
+/// in CLAUDE.md.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ThumbUniforms {
+    src_min: [f32; 2],
+    src_size: [f32; 2],
+    dest: [u32; 2],
+    layer_size: [u32; 2],
+    slot: u32,
+    reduce: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 /// The layer texture array and the views onto it.
 struct LayerStore {
     texture: wgpu::Texture,
@@ -966,6 +1060,12 @@ struct Shared {
     flip_layout: wgpu::BindGroupLayout,
     flip_pipeline: wgpu::RenderPipeline,
 
+    /// Reduces a rectangle of one slice to a 64-square, for the layer list.
+    /// One pipeline for both of a thumbnail's passes — they differ by a uniform
+    /// and nothing else. See `thumbnail.wgsl`.
+    thumb_layout: wgpu::BindGroupLayout,
+    thumb_pipeline: wgpu::RenderPipeline,
+
     transform_layout: wgpu::BindGroupLayout,
     /// `dst * cov` — takes the selected pixels into the floating copy.
     transform_keep_pipeline: wgpu::RenderPipeline,
@@ -1057,6 +1157,30 @@ pub struct CanvasRenderer {
     /// two canvas-sized textures and a slice of the layer array is not
     /// something to hold for a session in case somebody presses T.
     float: Option<Float>,
+
+    /// How many times each slice's pixels have been written.
+    ///
+    /// **This is the layer list's invalidation rule, and it lives here because
+    /// here is the only place a layer's pixels can change.** Every route — a
+    /// stroke committing, a transform being put down, an undo writing a patch
+    /// back, a layer cleared, a mask filled, a canvas flipped or resized — ends
+    /// in one of this type's methods, so bumping a counter in each of them is
+    /// exhaustive by construction. The alternative was a `touch` call beside
+    /// every one of the eight call sites in `app.rs`, which is CLAUDE.md's
+    /// "an invariant enforced at five call sites is one that will be forgotten
+    /// at the sixth" written out in advance.
+    ///
+    /// Indexed by slot, and long enough for [`MAX_SLOTS`] from the start: it is
+    /// half a kilobyte, and growing it in step with the texture array would be
+    /// a second place for the capacity to be got wrong.
+    slot_revisions: Vec<u64>,
+    /// The thumbnail being read back, if any. See [`ThumbJob`].
+    thumb: Option<ThumbJob>,
+    /// The thumbnail pass's target and staging buffer, allocated on the first
+    /// request and reused for every one after it. Sixteen kilobytes each, so
+    /// holding them is cheaper than the allocation churn of a per-job pair.
+    thumb_target: Option<wgpu::Texture>,
+    thumb_buffer: Option<wgpu::Buffer>,
 }
 
 impl Shared {
@@ -1333,6 +1457,53 @@ impl Shared {
             cache: None,
         });
 
+        // ---- thumbnail pass -------------------------------------------------
+        //
+        // No sampler, for the reason the flip pass has none: `thumbnail.wgsl`
+        // reads with `textureLoad`, because a bilinear tap at a reduction of
+        // 30:1 drops nearly every texel it is meant to be summarising.
+        let thumb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("thumbnail"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/thumbnail.wgsl").into()),
+        });
+        let thumb_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("thumb-bgl"),
+            entries: &[uniform_entry(0), texture_array_entry(1)],
+        });
+        let thumb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("thumb-pl"),
+            bind_group_layouts: &[Some(&thumb_layout)],
+            immediate_size: 0,
+        });
+        let thumb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("thumbnail"),
+            layout: Some(&thumb_pl),
+            vertex: wgpu::VertexState {
+                module: &thumb_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &thumb_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    // Non-sRGB, matching every other offscreen target here: the
+                    // shader does its own encode and a typed target would do it
+                    // twice.
+                    format: OFFSCREEN_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // ---- transform pass -------------------------------------------------
         let transform_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("transform"),
@@ -1427,6 +1598,8 @@ impl Shared {
             flip_layout,
             flip_pipeline,
             transform_layout,
+            thumb_layout,
+            thumb_pipeline,
             transform_keep_pipeline,
             transform_take_pipeline,
             transform_draw_pipeline,
@@ -1589,6 +1762,10 @@ impl CanvasRenderer {
             commit_bind_group,
             commit_uniforms,
             float: None,
+            slot_revisions: vec![0; MAX_SLOTS],
+            thumb: None,
+            thumb_target: None,
+            thumb_buffer: None,
         }
     }
 
@@ -1712,6 +1889,10 @@ impl CanvasRenderer {
         if new_size == self.doc_size {
             return;
         }
+        // Every thumbnail is a picture of a canvas that is about to stop
+        // existing, and the one in flight would come home describing the old
+        // geometry through the new document's arithmetic.
+        self.touch_all_slots();
         let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
         log::info!(
             "resizing canvas {} x {} -> {} x {}, {anchor:?}",
@@ -2254,7 +2435,7 @@ impl CanvasRenderer {
     /// It is also less work. A thin diagonal across a large canvas commits a
     /// hundred and fifty narrow strips instead of the whole document.
     pub fn commit_stroke(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         slot: u32,
@@ -2316,6 +2497,7 @@ impl CanvasRenderer {
         }
 
         self.clear_stroke(encoder);
+        self.touch_slot(slot);
     }
 
     /// Wipe the scratch surface.
@@ -2331,10 +2513,11 @@ impl CanvasRenderer {
     }
 
     /// Wipe one layer.
-    pub fn clear_layer(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+    pub fn clear_layer(&mut self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
         if let Some(view) = self.layers.slot_views.get(slot as usize) {
             clear_view(encoder, view, "clear-layer");
         }
+        self.touch_slot(slot);
     }
 
     /// Fill one slice with opaque white — what a **new mask** starts as.
@@ -2348,7 +2531,8 @@ impl CanvasRenderer {
     /// come back as `0xff` in every channel — which matters, because the
     /// composite reads the red one and a mask that arrived at 0xfe would dim
     /// its layer by a level the painter never asked for.
-    pub fn fill_layer_white(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+    pub fn fill_layer_white(&mut self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+        self.touch_slot(slot);
         let Some(view) = self.layers.slot_views.get(slot as usize) else {
             return;
         };
@@ -2371,10 +2555,11 @@ impl CanvasRenderer {
     }
 
     /// Wipe every allocated slot. Used at startup.
-    pub fn clear_all_layers(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn clear_all_layers(&mut self, encoder: &mut wgpu::CommandEncoder) {
         for view in &self.layers.slot_views {
             clear_view(encoder, view, "clear-layer");
         }
+        self.touch_all_slots();
     }
 
     // --- flipping the canvas ------------------------------------------------
@@ -2420,6 +2605,9 @@ impl CanvasRenderer {
         // that were mirrored and layers that were not. The scheduler's half of
         // this is the caller's — see `app.rs`'s `stop_autosave_of`.
         self.cancel_capture();
+        for &slot in slots {
+            self.touch_slot(slot);
+        }
 
         let scratch = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("umber-flip"),
@@ -2863,16 +3051,17 @@ impl CanvasRenderer {
     /// target instead of the preview's, which is what makes the committed
     /// result the preview rather than a second rendering of it.
     pub fn commit_float(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         damage: PixelRect,
         params: &FloatParams,
     ) {
-        let Some(float) = self.float.as_ref() else {
+        let Some(slot) = self.float.as_ref().map(|f| f.layer_slot) else {
             return;
         };
-        self.render_float(queue, encoder, float.layer_slot, damage, params);
+        self.render_float(queue, encoder, slot, damage, params);
+        self.touch_slot(slot);
     }
 
     /// Give the floating transform's storage back. Nothing is written: the
@@ -3450,6 +3639,331 @@ impl CanvasRenderer {
             slot.outcome.store(PROBE_PENDING, Ordering::Release);
             slot.stale = false;
             slot.state = ProbeState::Idle;
+        }
+    }
+
+    // --- layer thumbnails ---------------------------------------------------
+
+    /// How many times slot `slot` has been written to.
+    ///
+    /// The layer list's whole invalidation rule: a thumbnail is stale exactly
+    /// when this has moved since it was taken. See
+    /// [`CanvasRenderer::slot_revisions`] for why the counter lives here.
+    pub fn slot_revision(&self, slot: u32) -> u64 {
+        self.slot_revisions.get(slot as usize).copied().unwrap_or(0)
+    }
+
+    /// Note that a slice's pixels have changed.
+    ///
+    /// Called by every method here that writes one, and by nothing outside this
+    /// type. A thumbnail of that slice in flight is disowned in the same
+    /// breath: it is a picture of the layer as it was a moment ago, and drawing
+    /// it would show the stroke that has just landed as missing.
+    fn touch_slot(&mut self, slot: u32) {
+        if let Some(rev) = self.slot_revisions.get_mut(slot as usize) {
+            *rev += 1;
+        }
+        if let Some(job) = self.thumb.as_mut()
+            && job.slot == slot
+        {
+            job.abandoned = true;
+        }
+    }
+
+    /// Note that every slice has changed — a flip, a resize, a fresh document.
+    fn touch_all_slots(&mut self) {
+        for rev in &mut self.slot_revisions {
+            *rev += 1;
+        }
+        self.cancel_thumb();
+    }
+
+    /// True while a thumbnail is in flight, abandoned or otherwise.
+    ///
+    /// Abandoned counts, for the reason [`Self::capture_in_flight`] says: the
+    /// staging buffer is the GPU's until its map settles.
+    pub fn thumb_in_flight(&self) -> bool {
+        self.thumb.is_some()
+    }
+
+    /// Start reading a thumbnail of `slot` back, without blocking.
+    ///
+    /// Returns false when one is already in flight — the caller's cue to ask
+    /// again next frame rather than to queue a second. Nothing is recorded
+    /// here: [`Self::drive_thumb`] records a pass, [`Self::submit_thumb`] maps
+    /// it, and [`Self::take_thumb`] collects it and lets the next pass go.
+    pub fn begin_thumb(&mut self, slot: u32) -> bool {
+        if self.thumb.is_some() || slot >= self.layers.capacity {
+            return false;
+        }
+        self.thumb = Some(ThumbJob {
+            slot,
+            revision: self.slot_revision(slot),
+            phase: ThumbPhase::Bounds,
+            region: None,
+            state: StepState::Waiting,
+            outcome: Arc::new(AtomicU8::new(PROBE_PENDING)),
+            abandoned: false,
+        });
+        true
+    }
+
+    /// Record the pass this thumbnail is waiting on, into the frame's encoder.
+    ///
+    /// Costs one draw over 64² fragments and one 16 KB copy. The draw reads
+    /// every texel of the region exactly once between them, which is the same
+    /// bandwidth the composite pass spends on that layer every frame anyway.
+    pub fn drive_thumb(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+        let Some(job) = self.thumb.as_ref() else {
+            return;
+        };
+        if job.state != StepState::Waiting || job.abandoned {
+            return;
+        }
+        let (slot, phase, region) = (job.slot, job.phase, job.region);
+        // The whole slice for the bounds pass; what that found for the picture.
+        let region = match (phase, region) {
+            (ThumbPhase::Bounds, _) => umber_core::Rect::new(
+                Vec2::ZERO,
+                Vec2::new(self.doc_size.x as f32, self.doc_size.y as f32),
+            ),
+            (ThumbPhase::Picture, Some(region)) => region,
+            // A picture phase with no region cannot arise — `take_thumb` sets
+            // one or finishes the job — but a silent wrong picture is worse
+            // than a dropped one.
+            (ThumbPhase::Picture, None) => return,
+        };
+
+        let target = self.thumb_target.get_or_insert_with(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("umber-thumbnail"),
+                size: wgpu::Extent3d {
+                    width: THUMB_SIZE,
+                    height: THUMB_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OFFSCREEN_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let buffer = self.thumb_buffer.get_or_insert_with(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("umber-thumbnail-readback"),
+                size: (THUMB_ROW_BYTES * THUMB_SIZE) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thumb-uniforms"),
+            contents: bytemuck::bytes_of(&ThumbUniforms {
+                src_min: [region.min.x, region.min.y],
+                src_size: [region.max.x - region.min.x, region.max.y - region.min.y],
+                dest: [THUMB_SIZE, THUMB_SIZE],
+                layer_size: [self.doc_size.x, self.doc_size.y],
+                slot,
+                reduce: u32::from(phase == ThumbPhase::Bounds),
+                _pad0: 0,
+                _pad1: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("thumb-bg"),
+            layout: &self.shared.thumb_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.layers.array_view),
+                },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("thumbnail-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        // Every texel is written by the draw, so loading the
+                        // last job's picture would only be a dependency the
+                        // driver has to honour.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.shared.thumb_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(THUMB_ROW_BYTES),
+                    rows_per_image: Some(THUMB_SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: THUMB_SIZE,
+                height: THUMB_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        if let Some(job) = self.thumb.as_mut() {
+            job.state = StepState::Rendering;
+        }
+    }
+
+    /// Start the map for a thumbnail pass whose copy has been submitted.
+    ///
+    /// Split from [`Self::drive_thumb`] for the reason [`Self::submit_probes`]
+    /// is split from `probe_canvas`: `map_async` may only be called on a buffer
+    /// whose writes are already submitted, and the encoder holding that copy is
+    /// still open when the pass is recorded.
+    pub fn submit_thumb(&mut self) {
+        let Some(job) = self.thumb.as_mut() else {
+            return;
+        };
+        if job.state != StepState::Rendering {
+            return;
+        }
+        let Some(buffer) = self.thumb_buffer.as_ref() else {
+            return;
+        };
+        job.state = StepState::Mapping;
+        job.outcome.store(PROBE_PENDING, Ordering::Release);
+        let outcome = job.outcome.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let code = if result.is_ok() {
+                    PROBE_MAPPED
+                } else {
+                    PROBE_FAILED
+                };
+                outcome.store(code, Ordering::Release);
+            });
+    }
+
+    /// Collect a thumbnail that has come home, if one has.
+    ///
+    /// Polls without blocking. A `Some` is the picture; the bounds pass in
+    /// between produces nothing and merely arms the second pass, so a caller
+    /// asks every frame and gets an answer every few.
+    pub fn take_thumb(&mut self, device: &wgpu::Device) -> Option<Thumbnail> {
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let job = self.thumb.as_mut()?;
+        if job.state != StepState::Mapping {
+            return None;
+        }
+        let buffer = self.thumb_buffer.as_ref()?;
+        let mut bytes = None;
+        match job.outcome.load(Ordering::Acquire) {
+            PROBE_MAPPED => {
+                // Read even when abandoned: the buffer still has to be unmapped
+                // before the next job can be given it, and reading is what
+                // makes the unmap legal to reason about.
+                if !job.abandoned {
+                    bytes = Some(buffer.slice(..).get_mapped_range().to_vec());
+                }
+                buffer.unmap();
+            }
+            PROBE_FAILED => {}
+            // Still in flight. Leaving it alone is the whole point.
+            _ => return None,
+        }
+        job.outcome.store(PROBE_PENDING, Ordering::Release);
+        job.state = StepState::Waiting;
+
+        let (slot, revision, phase, abandoned) = (job.slot, job.revision, job.phase, job.abandoned);
+        let Some(bytes) = bytes else {
+            // Abandoned or failed: the buffer is back, so the job goes.
+            self.thumb = None;
+            return None;
+        };
+        if abandoned {
+            self.thumb = None;
+            return None;
+        }
+
+        match phase {
+            ThumbPhase::Bounds => {
+                let content = umber_core::thumbnail::content_rect(
+                    &bytes,
+                    THUMB_ROW_BYTES as usize,
+                    UVec2::splat(THUMB_SIZE),
+                    self.doc_size,
+                );
+                match content {
+                    Some(content) => {
+                        let job = self.thumb.as_mut()?;
+                        job.region = Some(umber_core::thumbnail::framed(
+                            content,
+                            UVec2::splat(THUMB_SIZE),
+                        ));
+                        job.phase = ThumbPhase::Picture;
+                        None
+                    }
+                    // Nothing on the layer. Answered rather than left to time
+                    // out, so the list can draw its "empty" state and stop
+                    // asking: a job that produced no answer would be requested
+                    // again on the very next frame, for ever.
+                    None => {
+                        self.thumb = None;
+                        Some(Thumbnail {
+                            slot,
+                            revision,
+                            rgba: Vec::new(),
+                        })
+                    }
+                }
+            }
+            ThumbPhase::Picture => {
+                self.thumb = None;
+                Some(Thumbnail {
+                    slot,
+                    revision,
+                    rgba: bytes,
+                })
+            }
+        }
+    }
+
+    /// Disown the thumbnail in flight, if there is one.
+    ///
+    /// Marked rather than dropped, for the reason [`Self::reset_probes`] gives
+    /// at length: a buffer awaiting a map is still the GPU's, and recording a
+    /// copy into one is a validation error and therefore an abort.
+    pub fn cancel_thumb(&mut self) {
+        if let Some(job) = self.thumb.as_mut() {
+            job.abandoned = true;
         }
     }
 
@@ -4038,8 +4552,15 @@ impl CanvasRenderer {
     }
 
     /// Write a previously captured rectangle back into one layer.
-    pub fn write_layer_rect(&self, queue: &wgpu::Queue, slot: u32, rect: PixelRect, bytes: &[u8]) {
+    pub fn write_layer_rect(
+        &mut self,
+        queue: &wgpu::Queue,
+        slot: u32,
+        rect: PixelRect,
+        bytes: &[u8],
+    ) {
         debug_assert_eq!(bytes.len() as u64, rect.area() * 4);
+        self.touch_slot(slot);
         // As in `read_layer_rect`: refuse rather than abort. See there.
         if slot >= self.layers.capacity {
             log::error!(

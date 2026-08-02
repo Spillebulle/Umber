@@ -11,6 +11,7 @@ use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
 use crate::theme::{self, Accent, ThemeKind};
+use crate::thumbs;
 use crate::ui;
 use glam::{UVec2, Vec2};
 use std::collections::HashMap;
@@ -500,7 +501,7 @@ impl UmberApp {
                 let Some(gfx) = self.gfx.as_mut() else {
                     return EditBody::Pixels(patch);
                 };
-                let Some(canvas) = gfx.canvases.get(&id) else {
+                let Some(canvas) = gfx.canvases.get_mut(&id) else {
                     return EditBody::Pixels(patch);
                 };
                 // The pieces of the patch, not its bounding box: swapping them
@@ -970,7 +971,7 @@ impl UmberApp {
         let slot = self.editor.layers.active_slot();
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
             return;
         };
         let mut enc = gfx
@@ -1842,6 +1843,17 @@ impl UmberApp {
                 },
             );
         }
+        // One layer thumbnail's next pass, into the same encoder. Requested and
+        // driven here rather than from the panel because the panel has no
+        // encoder and no device; what the panel decides is only *which* slot,
+        // and that is `Thumbs::wanted`'s, in a model with no drawing in it.
+        //
+        // At most one job is in flight at a time, so a document with sixty
+        // layers fills its list over a couple of seconds rather than in one
+        // frame — which is the right trade for something nobody is waiting on.
+        thumbs::request(&mut self.editor, canvas);
+        canvas.drive_thumb(&gfx.gpu.device, &mut encoder);
+
         canvas.composite(
             &gfx.gpu.queue,
             &mut encoder,
@@ -1910,6 +1922,19 @@ impl UmberApp {
             }
         }
 
+        // The thumbnail's copy, mapped now that the frame holding it has been
+        // submitted, and collected by a poll that never waits — the smudge
+        // probe's arrangement exactly, and for the same reason.
+        if let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id()) {
+            canvas.submit_thumb();
+            if let Some(thumb) = canvas.take_thumb(&gfx.gpu.device) {
+                self.editor.thumbs.accept(&gfx.egui_ctx, thumb);
+                // The list is not otherwise redrawn until something happens,
+                // and a thumbnail arriving is something happening.
+                gfx.window.request_redraw();
+            }
+        }
+
         // The autosave's own readback, mapped now that the frame holding its
         // copy has been submitted, and collected by a poll that never waits.
         // Anything the writer thread has finished is applied here too.
@@ -1924,7 +1949,16 @@ impl UmberApp {
         // needs the same: under `ControlFlow::Wait` a document being read back
         // would otherwise stop dead the moment the painter took their hand off
         // the mouse, which is exactly when it started.
-        if self.editor.interaction == Interaction::Drawing || self.editor.autosave.capturing() {
+        // A thumbnail in flight needs the same: it takes several frames, and
+        // under `ControlFlow::Wait` a list left half filled in would stay that
+        // way until the user moved the mouse.
+        if self.editor.interaction == Interaction::Drawing
+            || self.editor.autosave.capturing()
+            || gfx
+                .canvases
+                .get(&self.editor.session.active_id())
+                .is_some_and(CanvasRenderer::thumb_in_flight)
+        {
             gfx.window.request_redraw();
         }
 
@@ -3224,7 +3258,7 @@ fn with_extension(path: PathBuf) -> PathBuf {
 /// The read blocks, once, for all the pieces together. Acceptable on an
 /// explicit undo and nowhere near the drawing loop — the same rule the capture
 /// at pointer-up lives by.
-fn swap_patch(canvas: &CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> PixelPatch {
+fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> PixelPatch {
     let rects: Vec<PixelRect> = patch.pieces().iter().map(|p| p.rect).collect();
     let current = canvas.read_layer_pieces(&gpu.device, &gpu.queue, patch.slot, &rects);
     for piece in patch.pieces() {

@@ -177,6 +177,14 @@ besides:
 
 All four are written into the `.ora` and read back out of it.
 
+Every row draws **what is actually on that layer**, not the whole canvas
+shrunk: the picture is the bounding box of whatever is not transparent, scaled
+to fill the chip with a little room to spare, so two layers holding the same
+mark in different corners look the same and a sketch on a large canvas is still
+legible. A layer with nothing on it draws the checker. The pictures are read off
+the GPU without ever stalling a frame, one layer at a time, so a stack fills in
+over a moment or two rather than all at once.
+
 **File → Flip canvas horizontally / vertically** mirrors every layer's pixels —
 the picture, not the view — at the size the canvas already is. Unlike a resize
 it keeps the undo history: a flip goes into the list as an entry of its own, and
