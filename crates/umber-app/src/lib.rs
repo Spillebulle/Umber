@@ -23,6 +23,7 @@ mod dock;
 pub mod docshot;
 mod editor;
 mod exportdlg;
+mod gesture;
 mod icons;
 mod inputlog;
 mod keylayout;

@@ -135,6 +135,18 @@ pub struct Sample {
     pub route: Route,
     pub motion: Motion,
     pub force_kind: ForceKind,
+    /// Which gesture the real [`gesture::press`] call resolved this press to,
+    /// and `None` for everything that is not a press.
+    ///
+    /// The reason this is worth a column: three gestures — the Alt-drag brush
+    /// resize, the Pan tool and the Zoom tool — were decided in the mouse arm of
+    /// `window_event` alone, so a pen fell through them and painted. "Which
+    /// gesture did that press become" is the one reading that would have shown
+    /// it, from inside the running application, on the machine that has the
+    /// tablet. Recorded rather than recomputed, like [`Sample::resolved`]:
+    /// `press` is pure, but a second call here would be a second opinion, and
+    /// the page has to show what actually ran.
+    pub gesture: Option<crate::gesture::Press>,
 }
 
 impl Sample {
@@ -147,6 +159,7 @@ impl Sample {
         route: Route::Mouse,
         motion: Motion::Moved,
         force_kind: ForceKind::Absent,
+        gesture: None,
     };
 }
 
@@ -369,6 +382,31 @@ impl InputLog {
         }
     }
 
+    /// Record which gesture the one real `gesture::press` call resolved a press
+    /// to.
+    ///
+    /// **Only ever lands on a sample that is itself a press.** `note` records
+    /// the left button and touches and skips everything else, so a middle-click
+    /// — which resolves to a pan and is a press the page never saw — would
+    /// otherwise back-fill its answer onto whatever motion happened to be
+    /// newest. Same shape as [`Self::note_resolved`], and the same reason it is
+    /// called immediately after the real decision rather than deciding again.
+    pub fn note_gesture(&mut self, gesture: crate::gesture::Press) {
+        if let Some(newest) = self.ring.newest_mut()
+            && newest.motion == Motion::Down
+        {
+            newest.gesture = Some(gesture);
+        }
+    }
+
+    /// The most recent press that resolved to a gesture, for the pane's readout.
+    ///
+    /// Walks the ring backwards, which is fine: only the Input & pen page calls
+    /// it, once per frame it is open, and never while painting.
+    pub fn last_gesture(&self) -> Option<crate::gesture::Press> {
+        self.ring.iter().filter_map(|s| s.gesture).last()
+    }
+
     /// Start the test strip's own resolution, from a copy of the live model.
     pub fn begin_probe(&mut self, model: PressureModel, now: f64) {
         self.probe = model;
@@ -570,6 +608,45 @@ mod tests {
             newest.reported, None,
             "mouse events have no pressure field at all"
         );
+    }
+
+    #[test]
+    fn a_press_records_the_gesture_it_was_resolved_to() {
+        // The reading this column exists for: a pen press that became a stroke
+        // when the user meant to resize the brush is invisible in "route" and
+        // "motion", and obvious here.
+        let mut log = InputLog::default();
+        log.note(&pen(TouchPhase::Started, 10.0, Some(0.4)), 0.0);
+        log.note_gesture(crate::gesture::Press::ResizeBrush);
+        assert_eq!(
+            log.ring.newest().unwrap().gesture,
+            Some(crate::gesture::Press::ResizeBrush)
+        );
+        assert_eq!(log.last_gesture(), Some(crate::gesture::Press::ResizeBrush));
+
+        // A move is not a press and must not be given one. `note` skips the
+        // middle button entirely, so without this guard a middle-click's pan
+        // would be back-filled onto whatever motion happened to be newest.
+        log.note(&pen(TouchPhase::Moved, 20.0, Some(0.6)), 0.1);
+        log.note_gesture(crate::gesture::Press::Pan);
+        assert_eq!(
+            log.ring.newest().unwrap().gesture,
+            None,
+            "only a press carries a gesture"
+        );
+        assert_eq!(
+            log.last_gesture(),
+            Some(crate::gesture::Press::ResizeBrush),
+            "and the readout still names the last real press"
+        );
+    }
+
+    #[test]
+    fn a_gesture_with_nothing_to_hang_it_on_is_harmless() {
+        let mut log = InputLog::default();
+        log.note_gesture(crate::gesture::Press::Paint);
+        assert!(log.ring.is_empty());
+        assert_eq!(log.last_gesture(), None);
     }
 
     #[test]

@@ -1362,7 +1362,7 @@ pressure over as `Force`. **A pen therefore arrives as `WindowEvent::Touch`, not
 as mouse events**, and produces no `CursorMoved` at all, because winit consumes
 the pointer messages and Windows never promotes them to legacy mouse ones.
 
-Two things follow, and both were bugs:
+Three things follow, and all three were bugs:
 
 - **Anything deciding whether a press belongs to the document must take the
   position from the event**, not from `Editor::cursor`. `cursor` is written by
@@ -1374,6 +1374,45 @@ Two things follow, and both were bugs:
   range sends no "up", so the entry would never be removed, and the next press
   — Windows issues a fresh pointer id per contact session — would count as a
   second finger and be read as a pinch.
+- **No gesture may be decided inside a mouse event arm.** This is the general
+  form of the other two, and it shipped three gestures a tablet could not reach:
+  the Alt-drag brush resize, the Pan tool and the Zoom tool all worked under a
+  mouse and did nothing under a pen — the resize worse than nothing, since the
+  press fell through to painting. `gesture.rs` is the fix and it is a *model*
+  with no winit in it, the same division `dock.rs` and `layerdrag.rs` keep:
+  `gesture::press` says what a press means and `gesture::contact` says which
+  touch events are presses at all, so `window_event`'s two families both supply
+  observations and neither interprets them. A gesture added there reaches both
+  pointers or neither. **Do not add a `match` on `Tool` to either arm.**
+  - **The touch arm must consult the keyboard.** Alt, Shift and Space arrive
+    normally under a pen — `ModifiersChanged` is not a mouse event — and the
+    touch arm simply never read them, so Alt painted and Space did nothing.
+  - **A contact is not a button, and the brush resize is the one place that
+    matters.** The mouse's rule is "Alt with a button is the eyedropper, Alt
+    without one is the resize"; a pen has no button-less drag *on the glass* to
+    spell the second with. So a contact **continues** the resize where a button
+    ends it — which is how Krita and Photoshop spell it on a tablet — and the
+    eyedropper is Alt with the nib down and still, settled at the release by
+    `gesture::is_tap`. `a_pen_press_resolves_to_what_a_mouse_press_would` pins
+    every other cell of the matrix, and `alt_with_a_contact_carries_the_brush_
+    resize_on` pins that this asymmetry does not leak back onto the mouse.
+  - **One contact drives the Pan and Zoom tools; two fingers are still a
+    pinch.** "One finger navigates nothing" is right for a hand that has landed
+    on the glass with a brush in hand and wrong for somebody who went to the
+    rail and *chose* the tool. The pinch keeps precedence because a second
+    contact is tested first — and it now has to reset `Interaction` as well as
+    the stroke, because there is a live pan a `cancel_stroke` would not clear.
+  - **A hover goes through the same body a mouse move does**, because a hover
+    *is* a mouse move with nothing held. `last_cursor` is saved and put back
+    across it: it is the previous point of a *gesture*, and a pen waved about in
+    mid-air is not one.
+- **Settings → Input & pen records which gesture a press resolved to**, beside
+  the route and the motion, because "the pen arrived and became the wrong
+  gesture" is invisible in the other two columns — which is exactly why the
+  three above shipped. `InputLog::note_gesture` takes the answer the one real
+  `gesture::press` call gave and lands it only on a sample that is itself a
+  press, since `note` records the left button and touches and nothing else.
+  Same rule as `note_resolved`, and observation only.
 
 The pressure resolution is 1024 levels, which is what the `WM_POINTER` API
 carries however many the tablet itself distinguishes. `PressureSource::Device`
