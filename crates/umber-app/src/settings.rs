@@ -26,6 +26,15 @@
 //! on Umber has a pen, so the two pen fixes it exists to verify shipped
 //! unproven. See [`crate::inputlog`].
 //!
+//! **The dialog is one size on every pane.** [`WIDTH`] by [`HEIGHT`], clamped
+//! only to the window, with one vertical scroll area between the pane's header
+//! and its footer and never a horizontal one. It used to be sized by whichever
+//! page was showing — two panes scrolled and two did not — so moving from
+//! Themes to Shortcuts resized the modal and slid the rail out from under the
+//! pointer that had just clicked it. Anything added here belongs *inside* that
+//! scroll area, and nothing in it may report itself wider than the pane; see
+//! the note on [`TextWrapMode`](egui::TextWrapMode) in [`pane`].
+//!
 //! The page also owns the preferences file. [`show`] runs every frame whether
 //! the dialog is open or not, so its first call is where stored settings are
 //! read, and the frame after a change is where they are written.
@@ -76,8 +85,21 @@ impl SettingsTab {
     ];
 }
 
-/// The design's dialog is 1000×640. It is clamped to the window, because a
-/// modal wider than the screen has no way back out of its own corners.
+/// The design's dialog is 1000×640, and it is that size on every pane.
+///
+/// One size always, not a size per page. A modal that grew when you moved from
+/// Themes to Shortcuts moved the rail out from under the pointer, so the tab
+/// you had just clicked was no longer where you clicked it — and the pane that
+/// happened to be longest silently decided how big the dialog was. What varies
+/// is the *content*, and a page longer than the frame scrolls inside it.
+///
+/// Clamped to the window, because a modal wider than the screen has no way back
+/// out of its own corners. That clamp reads the window and never the page, so
+/// it cannot reintroduce the thing above.
+///
+/// These belong in `theme::metrics` with the design's other fixed sizes, beside
+/// the brush browser's, which is there for exactly this reason. They are here
+/// because this change does not own that file.
 const WIDTH: f32 = 1000.0;
 const HEIGHT: f32 = 640.0;
 /// The design's left rail.
@@ -236,70 +258,130 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
             ui.set_min_height(ui.available_height());
             ui.spacing_mut().item_spacing.y = 8.0;
 
-            ui.horizontal(|ui| {
-                let (title, blurb) = match ed.ui.settings_tab {
-                    SettingsTab::General => (
-                        "General",
-                        "How the workspace itself behaves, before any document is open.",
-                    ),
-                    SettingsTab::InputAndPen => (
-                        "Input & pen",
-                        "Where a stroke's pressure comes from, and a live reading of what \
-                         the window system is sending to judge it by.",
-                    ),
-                    SettingsTab::Themes => (
-                        "Themes",
-                        "The interface should disappear behind your work. Pick a theme.",
-                    ),
-                    SettingsTab::Shortcuts => (
-                        "Shortcuts",
-                        "Click any binding to rebind it. Conflicts are flagged, never \
-                         silently dropped.",
-                    ),
-                    SettingsTab::Performance => ("", ""),
-                };
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(15.0)
-                            .color(p.text_strong)
-                            .strong(),
-                    );
-                    controls::note(ui, p, blurb);
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    let (rect, close) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
-                    icons::draw(
-                        ui.painter(),
-                        rect,
-                        Icon::Close,
-                        if close.hovered() {
-                            p.text_strong
-                        } else {
-                            p.text_dim
-                        },
-                    );
-                    if close.clicked() {
-                        ed.ui.settings_open = false;
-                    }
-                });
-            });
+            pane_header(ui, p, ed);
             ui.add_space(10.0);
 
-            match ed.ui.settings_tab {
-                SettingsTab::General => general_pane(ui, p, ed, actions),
-                SettingsTab::InputAndPen => input_pane(ui, p, ed),
-                SettingsTab::Themes => themes_pane(ui, p, ed),
-                SettingsTab::Shortcuts => shortcuts_pane(ui, p),
-                // The rail cannot select this; a preferences file naming it
-                // could, so it lands somewhere rather than on a blank pane.
-                SettingsTab::Performance => ed.ui.settings_tab = SettingsTab::General,
-            }
+            // The one scroll area in the dialog, and the whole of how the frame
+            // stays one size. `auto_shrink([false, false])` makes it claim the
+            // space it was given whatever is in it, so a short pane does not
+            // shrink the dialog and a long one does not stretch it; and because
+            // it is `vertical`, content wider than the viewport is clipped
+            // rather than growing a horizontal bar. Every pane used to decide
+            // its own answer to this — two of them scrolled and two did not,
+            // which is exactly why the dialog changed size as you moved between
+            // them.
+            let body = (ui.available_height() - FOOTER_RESERVE - LIST_GAP).max(0.0);
+            egui::ScrollArea::vertical()
+                // A scroll position per pane. One shared position would carry
+                // the Shortcuts list's offset onto General, which is short
+                // enough to be left showing nothing.
+                .id_salt(("settings-pane", pane_id(ed.ui.settings_tab)))
+                .max_height(body)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // The trap this dialog kept falling into: an egui label in a
+                    // *horizontal* layout defaults to `TextWrapMode::Extend`, so
+                    // a long one does not run onto a second line — it makes its
+                    // row wider, and with it the pane, and with it the window.
+                    // `set_max_width` does not help, because an extending label
+                    // overruns the ui it is in. Wrapping is the fix at the
+                    // source; the clip above is what makes a page that still
+                    // overruns cost a truncated word rather than the dialog's
+                    // size.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    match ed.ui.settings_tab {
+                        SettingsTab::General => general_pane(ui, p, ed, actions),
+                        SettingsTab::InputAndPen => input_pane(ui, p, ed),
+                        SettingsTab::Themes => themes_pane(ui, p, ed),
+                        SettingsTab::Shortcuts => shortcuts_pane(ui, p),
+                        // The rail cannot select this; a preferences file naming
+                        // it could, so it lands somewhere rather than on a blank
+                        // pane.
+                        SettingsTab::Performance => ed.ui.settings_tab = SettingsTab::General,
+                    }
+                });
 
             let left = (ui.available_height() - FOOTER_RESERVE).max(0.0);
             ui.allocate_space(vec2(0.0, left));
             storage_footer(ui, p, ed);
         });
+}
+
+/// A stable name for a pane, so its scroll position is its own.
+fn pane_id(tab: SettingsTab) -> &'static str {
+    match tab {
+        SettingsTab::General => "general",
+        SettingsTab::InputAndPen => "input",
+        SettingsTab::Themes => "themes",
+        SettingsTab::Shortcuts => "shortcuts",
+        SettingsTab::Performance => "performance",
+    }
+}
+
+/// The pane's title, what it is for, and the way out.
+///
+/// Above the scroll area rather than inside it: the close mark is the only one
+/// on the dialog and must not be scrollable away.
+fn pane_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    ui.horizontal(|ui| {
+        let (title, blurb) = match ed.ui.settings_tab {
+            SettingsTab::General => (
+                "General",
+                "How the workspace itself behaves, before any document is open.",
+            ),
+            SettingsTab::InputAndPen => (
+                "Input & pen",
+                "Where a stroke's pressure comes from, and a live reading of what \
+                 the window system is sending to judge it by.",
+            ),
+            SettingsTab::Themes => (
+                "Themes",
+                "The interface should disappear behind your work. Pick a theme.",
+            ),
+            SettingsTab::Shortcuts => (
+                "Shortcuts",
+                "Click any binding to rebind it. Conflicts are flagged, never \
+                 silently dropped.",
+            ),
+            SettingsTab::Performance => ("", ""),
+        };
+        // Bounded, and told to wrap. A blurb is the longest run of text above
+        // the fold, and a label in this horizontal layout would otherwise
+        // extend — pushing the close mark off the edge on a narrow window and
+        // widening the dialog on any other. `CLOSE_RESERVE` is what the mark
+        // and its gap take.
+        const CLOSE_RESERVE: f32 = 30.0;
+        let text_width = (ui.available_width() - CLOSE_RESERVE).max(80.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(text_width);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(
+                egui::RichText::new(title)
+                    .size(15.0)
+                    .color(p.text_strong)
+                    .strong(),
+            );
+            controls::note(ui, p, blurb);
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            let (rect, close) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+            icons::draw(
+                ui.painter(),
+                rect,
+                Icon::Close,
+                if close.hovered() {
+                    p.text_strong
+                } else {
+                    p.text_dim
+                },
+            );
+            if close.clicked() {
+                ed.ui.settings_open = false;
+            }
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -644,25 +726,18 @@ const NIB_MAX: f32 = 9.0;
 /// is what lets the instruments sit on screen together, and what falls below
 /// the fold is then the part it does no harm to scroll to.
 fn input_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    // The pane is taller than the dialog on a small window, and the strip at
-    // the foot is the part somebody has come here to use — so it scrolls rather
-    // than being cut off.
-    let height = (ui.available_height() - FOOTER_RESERVE - LIST_GAP).max(200.0);
-    egui::ScrollArea::vertical()
-        .max_height(height)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            route_section(ui, p, ed);
-            ui.add_space(12.0);
-            source_section(ui, p, ed);
-            ui.add_space(12.0);
-            pressure_section(ui, p, ed);
-            ui.add_space(12.0);
-            strip_section(ui, p, ed);
-            ui.add_space(16.0);
-            guide_section(ui, p, ed);
-        });
+    // No scroll area of its own any more. This pane is taller than the dialog
+    // and used to carry one, which is half of why the dialog changed size
+    // between panes; `pane` now scrolls every page the same way.
+    route_section(ui, p, ed);
+    ui.add_space(12.0);
+    source_section(ui, p, ed);
+    ui.add_space(12.0);
+    pressure_section(ui, p, ed);
+    ui.add_space(12.0);
+    strip_section(ui, p, ed);
+    ui.add_space(16.0);
+    guide_section(ui, p, ed);
 }
 
 /// The three names a pressure source goes by, in one place.
@@ -1558,49 +1633,44 @@ fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette) {
     // 3. The list.
     let query = editing.query.trim().to_lowercase();
     let mut request: Option<(Action, RowRequest)> = None;
-    // Fill the pane down to the footer rather than stopping at a fixed height.
-    // This is the longest list in the dialog and the only one worth scrolling,
-    // so a third of the pane sitting empty below it was wasted on the one tab
-    // that could use it. The frame's own 1 px border is inside this, hence the
-    // two; `LIST_GAP` is the breathing space above the footer's hairline.
+    // The list is drawn whole, inside the pane's own scroll area, rather than
+    // scrolling within itself. This is the longest content in the dialog and it
+    // used to carry a nested scroll area sized from the space left over — which
+    // is a second thing deciding how tall the dialog is, and a wheel that means
+    // two different things depending on which pixel it is over. One scroll area
+    // per dialog; the frame here is a border round the rows and nothing more.
     Frame::NONE
         .fill(p.window)
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(metrics::RADIUS_LARGE)
         .show(ui, |ui| {
-            let height = (ui.available_height() - FOOTER_RESERVE - LIST_GAP - 2.0).max(140.0);
-            egui::ScrollArea::vertical()
-                .max_height(height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let mut current = "";
-                    let mut any = false;
-                    for action in Action::ALL {
-                        if !query.is_empty()
-                            && !action.label().to_lowercase().contains(&query)
-                            && !action.category().to_lowercase().contains(&query)
-                        {
-                            continue;
-                        }
-                        any = true;
-                        let category = action.category();
-                        if category != current {
-                            current = category;
-                            category_heading(ui, p, category);
-                        }
-                        if let Some(row) = shortcut_row(ui, p, &bindings, action, &editing) {
-                            request = Some((action, row));
-                        }
-                    }
-                    if !any {
-                        Frame::NONE
-                            .inner_margin(Margin::symmetric(14, 12))
-                            .show(ui, |ui| {
-                                controls::note(ui, p, "No command matches that.");
-                            });
-                    }
-                });
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let mut current = "";
+            let mut any = false;
+            for action in Action::ALL {
+                if !query.is_empty()
+                    && !action.label().to_lowercase().contains(&query)
+                    && !action.category().to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                any = true;
+                let category = action.category();
+                if category != current {
+                    current = category;
+                    category_heading(ui, p, category);
+                }
+                if let Some(row) = shortcut_row(ui, p, &bindings, action, &editing) {
+                    request = Some((action, row));
+                }
+            }
+            if !any {
+                Frame::NONE
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        controls::note(ui, p, "No command matches that.");
+                    });
+            }
         });
 
     // 4. Whatever the list asked for.
