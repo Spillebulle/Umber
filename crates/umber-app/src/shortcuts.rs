@@ -21,6 +21,7 @@ pub enum Action {
     Redo,
     Deselect,
     Copy,
+    Cut,
     Paste,
     FlipCanvasHorizontal,
     FlipCanvasVertical,
@@ -45,7 +46,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 24] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -53,6 +54,7 @@ impl Action {
         Action::Redo,
         Action::Deselect,
         Action::Copy,
+        Action::Cut,
         Action::Paste,
         Action::FlipCanvasHorizontal,
         Action::FlipCanvasVertical,
@@ -81,6 +83,7 @@ impl Action {
             Action::Redo => "Redo",
             Action::Deselect => "Deselect",
             Action::Copy => "Copy",
+            Action::Cut => "Cut",
             Action::Paste => "Paste",
             Action::FlipCanvasHorizontal => "Flip canvas horizontally",
             Action::FlipCanvasVertical => "Flip canvas vertically",
@@ -104,7 +107,12 @@ impl Action {
     pub fn category(self) -> &'static str {
         match self {
             Action::Save | Action::SaveAs | Action::Export => "File",
-            Action::Undo | Action::Redo | Action::Deselect | Action::Copy | Action::Paste => "Edit",
+            Action::Undo
+            | Action::Redo
+            | Action::Deselect
+            | Action::Copy
+            | Action::Cut
+            | Action::Paste => "Edit",
             // Its own group rather than "Edit": these change the document
             // itself rather than the last thing done to it, and they are the
             // pair every other application files under Image.
@@ -269,6 +277,10 @@ pub fn defaults() -> Vec<Binding> {
         binding(Action::Redo, KeyCode::KeyY, true, false, false),
         binding(Action::Deselect, KeyCode::KeyD, true, false, false),
         binding(Action::Copy, KeyCode::KeyC, true, false, false),
+        // Ctrl+X, and it does not collide with Swap colours on plain X:
+        // `resolve` compares every modifier exactly, which is the same reason
+        // Ctrl+Shift+V cannot fire on Paste.
+        binding(Action::Cut, KeyCode::KeyX, true, false, false),
         binding(Action::Paste, KeyCode::KeyV, true, false, false),
         // Image
         //

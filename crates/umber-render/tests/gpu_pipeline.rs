@@ -1650,6 +1650,74 @@ fn layer_readback_and_writeback_round_trip() {
     assert_eq!(h.pixel(32, 32)[3], 255, "undo restore lost the pixels");
 }
 
+/// A cut is a read, a `Clip::cut_from_layer` and a write, and this is the whole
+/// of it end to end: what stays on the layer has to be exactly what did not go
+/// on the clipboard.
+///
+/// The complement itself is arithmetic and is pinned without a device in
+/// `umber_core::clipboard`. What only this can show is that the arithmetic
+/// survives the round trip through the texture — the layer is `Rgba8UnormSrgb`
+/// and the remainder is written as raw bytes, so a conversion creeping into
+/// either direction would put a rim of coverage back on a canvas the artist cut
+/// clean. That rim is the exact ghost outline a masked lift used to leave.
+#[test]
+fn a_cut_leaves_the_layer_holding_exactly_what_it_did_not_take() {
+    let mut h = harness_or_skip!();
+
+    let rect = PixelRect {
+        x: 8,
+        y: 8,
+        width: 40,
+        height: 40,
+    };
+    // A flat block, so every pixel starts at a known alpha and the only thing
+    // that can vary across the rectangle is the selection's own coverage.
+    h.write_block(0, rect, [200, 90, 30, 255]);
+
+    // A triangle, so its edge cuts the pixel grid diagonally and the rectangle
+    // holds fully covered, partly covered and untouched pixels at once.
+    let selection = Selection::from_rings(
+        vec![vec![
+            Vec2::new(12.0, 12.0),
+            Vec2::new(44.0, 20.0),
+            Vec2::new(20.0, 44.0),
+        ]],
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+
+    let before = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
+    let cut = umber_core::Clip::cut_from_layer(rect, &before, Some(&selection)).expect("a cut");
+    h.canvas
+        .write_layer_rect(&h.gpu.queue, 0, rect, &cut.remainder);
+
+    let after = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, rect);
+    let mut cleared = 0;
+    let mut partial = 0;
+    for i in (0..before.len()).step_by(4) {
+        assert_eq!(
+            cut.clip.pixels()[i + 3] as u32 + after[i + 3] as u32,
+            before[i + 3] as u32,
+            "pixel {} does not add back up to what was there",
+            i / 4
+        );
+        match after[i + 3] {
+            0 => cleared += 1,
+            a if a < before[i + 3] => partial += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        cleared > 0 && partial > 0,
+        "the fixture found {cleared} cleared and {partial} partly cut pixels, \
+         so it is not testing the edge"
+    );
+}
+
 #[test]
 fn readback_handles_row_padding() {
     // A 3px-wide rect is 12 bytes per row, far under the 256-byte copy

@@ -330,6 +330,16 @@ pub struct Editor {
     /// means putting the picture down, immediately, before the flip could take
     /// effect.
     pub transform_buttons: [Option<egui::Rect>; 2],
+    /// The live selection's three buttons — Deselect, Copy, Cut — as they were
+    /// last drawn, in points, and `None` where the strip is not offered.
+    ///
+    /// Recorded for exactly the reason [`Editor::transform_buttons`] is, and it
+    /// is the same problem with a worse failure: these sit *inside* the canvas
+    /// region in egui's background layer, so without this a press on one would
+    /// also be a press on the canvas — which with a brush in hand means a dab
+    /// painted under the button that was clicked, inside the very selection the
+    /// artist was about to copy.
+    pub selection_buttons: [Option<egui::Rect>; 3],
     /// egui points per physical pixel, from the last frame. Window events
     /// arrive in physical pixels and the layout works in points, so hit-testing
     /// a cursor position against a floating panel needs the conversion.
@@ -463,6 +473,7 @@ impl Default for Editor {
             canvas_size: Vec2::ONE,
             scroll_bars: [None, None],
             transform_buttons: [None, None],
+            selection_buttons: [None, None, None],
             pixels_per_point: 1.0,
             selection: None,
             edit_target: EditTarget::Layer,
@@ -550,14 +561,21 @@ impl Editor {
     }
 
     /// True when `screen` (physical pixels) is over one of the controls that
-    /// sit *inside* the canvas region — the scrollbars and the floating
-    /// transform's flip buttons — and are therefore not covered by
-    /// [`Editor::layout_owns_pointer`].
+    /// sit *inside* the canvas region — the scrollbars, the floating
+    /// transform's flip buttons and the selection's own strip — and are
+    /// therefore not covered by [`Editor::layout_owns_pointer`].
+    ///
+    /// Every canvas overlay has to be listed here, and this is the *only* place
+    /// they are: both the mouse's press path and the pen's reach it through
+    /// [`Editor::pointer_over_canvas`], so a control added to one and not the
+    /// other is the bug where a button works with a mouse and paints under a
+    /// pen.
     pub fn canvas_overlay_owns_pointer(&self, screen: Vec2) -> bool {
         let at = self.to_points(screen);
         self.scroll_bars
             .iter()
             .chain(self.transform_buttons.iter())
+            .chain(self.selection_buttons.iter())
             .flatten()
             .any(|bar| bar.contains(at))
     }
