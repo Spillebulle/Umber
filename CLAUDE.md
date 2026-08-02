@@ -167,16 +167,21 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
 - **The strip is gone whenever a float is up.** The transform tool's own buttons
   occupy that place, and a Copy beside them would name a selection that is no
   longer what an edit acts on.
-- **Where it goes is `overlay::place_strip`'s, in `umber-core`** — above the
-  marquee, below it where there is no room, over it where there is room on
-  neither side, and clamped into the view in every case. It is placed against
-  the *visible* part of the selection, so one three quarters off the left edge
-  gets its strip over the quarter that can be seen. Deliberately **not** the
-  flip buttons' rule, which declines to draw when the box has been dragged out
-  from under them: a floating transform can be moved back and a selection
-  cannot, so there the artist would have no way of reaching the controls at all.
-  Same division `ScrollSpan` and `Clip::place` keep — the rule is testable
-  without a window, and `ui.rs` only paints it.
+- **Where it goes is `overlay::place_strip`'s, in `umber-core`**, and that
+  module is the *selection strip's* rule rather than a general placer — the
+  flip pair keeps its own, in `ui.rs` where it is drawn, and the module docs say
+  so rather than claiming both. Above the marquee, below it where there is no
+  room, over it where there is room on neither side, and clamped into the view
+  in every case — measured against the **visible** part of the selection, so one
+  three quarters off the left edge gets its strip over the quarter that can be
+  seen. Why it clamps where the flip pair declines to draw: a floating transform
+  can be dragged back into reach and a selection cannot, so declining would
+  leave its commands with no control at all. A view too small to hold the whole
+  strip is the one case it *does* refuse, because the caller clips its painting
+  to that view and anything hanging off would be an invisible live target —
+  which is the thing the whole module exists to prevent. Same division
+  `ScrollSpan` and `Clip::place` keep: the rule is testable without a window,
+  and `ui.rs` only paints it.
 
 ### Transforms and the clipboard
 
@@ -291,20 +296,28 @@ put on and take off.
   new variant, no new `panels::edit_icon` arm and no `history::VERSION` bump.
 - **A copy, a cut and a paste all put a float down first**, which is one rule
   rather than three and is the rule every path that leaves the document already
-  follows. Taking the float's own pixels without committing is *not available*:
-  the transformed copy exists only in the preview slice, which holds it
-  composited over the layer beneath, so a readback would take whatever was under
-  the picture too. Cancelling instead is worse — for a lifted float the layer
-  still holds the originals, so a "cut" that abandoned the move would clear a
-  region the artist had already dragged away from.
-- **`take_region` is the one place that decides what a copy or a cut reads.** A
-  lift carried the marquee with it at commit, so the selection is already over
-  the right pixels; a **paste** did not, deliberately, so its own destination
-  rectangle is the only thing naming where the picture went. Reading the stale
-  selection after a paste copies some other part of the canvas, which is what it
-  used to do.
-- **A cut is gated on the lock once**, in `cut_selection`, and says so; a copy
-  is not gated at all, because it writes nothing.
+  follows. Once committed those pixels *are* the document, so `take_region` —
+  the one place either command decides what it reads — needs no special case
+  after it, and deliberately has none. A lift carried the marquee with it at
+  commit, so the selection is already over the right pixels.
+- **A float that arrived by *paste* is the case to leave alone.** It did not
+  come out of the selection, so afterwards the marquee names somewhere else and
+  a copy answers "nothing to copy". Reading `Transform::dest_rect` instead is
+  the obvious repair and is **wrong**, in a way that only shows up on the cut:
+  that is the bounding box of the *quad* plus a skirt, and a rectangle is not
+  the shape of the picture — cutting it with no mask clears the corners a
+  rotation left over, whatever showed through the clip's own transparency, and
+  the skirt. Silent damage to the layer, in one entry, and worse than a Ctrl+C
+  that does nothing; the clipboard already holds what was pasted. Putting the
+  case back needs the clip's **alpha** as a mask, not its bounding box.
+- **A cut is gated on the lock once**, in `cut_selection`, and the button is
+  *disabled* to match — the rule "Clear layer" already follows, so the gate
+  catches a keystroke rather than being the only thing between a live control
+  and a dialog. A copy is not gated at all, because it writes nothing.
+- **The cut's patch is the rectangle, not cells.** There is no `TileMask` to
+  have accumulated one from, so with nothing selected a bare Ctrl+X on a 10000²
+  canvas is 400 MB and the budget holds exactly one. Same rule as a stroke
+  across such a canvas, and said out loud for the reason the Undo section gives.
 
 ### Layers
 

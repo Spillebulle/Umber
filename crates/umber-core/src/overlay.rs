@@ -1,11 +1,17 @@
 //! Where a strip of controls drawn *over* the canvas goes.
 //!
-//! Two things in Umber sit on the canvas rather than beside it: the floating
-//! transform's flip buttons, and the row of Deselect / Copy / Cut that appears
-//! beside a selection. Neither is part of a panel, so neither is placed by the
-//! layout — each has to be put somewhere relative to the thing it acts on, and
-//! that is a **rule**, testable without a window, in the same division
-//! `Clip::place`, `CanvasCopy::plan` and `ScrollSpan` keep.
+//! This is the **selection's** strip — Deselect, Copy, Cut — and deliberately
+//! not a general placer for everything Umber draws over the canvas. The
+//! floating transform's flip pair is the other such control and keeps a rule of
+//! its own, in `ui.rs` where it is drawn: it sits above the box and is simply
+//! *not offered* when the box has been dragged out from under it. That is right
+//! there and wrong here, and the difference is the whole reason this module
+//! exists rather than one shared function with a flag: a transform can be
+//! dragged back into reach and a selection cannot, so a strip that declined to
+//! appear would leave its commands with no control at all.
+//!
+//! What it is placing is a **rule**, testable without a window, in the same
+//! division `Clip::place`, `CanvasCopy::plan` and `ScrollSpan` keep.
 //!
 //! The rule it exists to hold is one sentence: **a button drawn where it cannot
 //! be clicked is worse than no button.** A selection can be scrolled half off
@@ -38,9 +44,10 @@ use glam::Vec2;
 
 /// Which side of the thing it acts on a strip ended up on.
 ///
-/// Returned rather than inferred from the coordinates so the tests can say
-/// which rule fired, and so a caller that wants to point an arrow at the anchor
-/// does not have to work it out again.
+/// Reported rather than left to be inferred from the coordinates, so a test can
+/// say *which of the three rules fired* instead of asserting a number that two
+/// different rules could both have produced. No caller reads it today; the
+/// tests are the reason it is here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Above,
@@ -65,6 +72,16 @@ pub struct Strip {
 /// nothing, so the caller draws none.
 pub fn place_strip(anchor: Rect, view: Rect, size: Vec2, gap: f32) -> Option<Strip> {
     if view.is_empty() || size.x <= 0.0 || size.y <= 0.0 {
+        return None;
+    }
+    // A view too small to hold the strip has nowhere to put it. Pinning it to
+    // the near edge and letting the rest hang off looks like the more helpful
+    // answer and is not: the caller clips its painting to the view, so the
+    // buttons that hang off are *invisible* and still live — which is the exact
+    // shape of "a control drawn where it cannot be clicked" this module exists
+    // to refuse. Nothing is lost by declining, since every command a strip
+    // carries is also a keystroke.
+    if size.x > view.size().x || size.y > view.size().y {
         return None;
     }
     let visible = anchor.intersection(&view)?;
@@ -101,10 +118,9 @@ pub fn place_strip(anchor: Rect, view: Rect, size: Vec2, gap: f32) -> Option<Str
 
 /// Put a span of `len` starting at `start` inside `lo ..= hi`.
 ///
-/// A span too long to fit is pinned to `lo` rather than centred: the controls
-/// are laid out left to right, so the near edge is the one worth keeping — half
-/// a strip with its first button reachable beats half a strip cut off at both
-/// ends.
+/// `place_strip` has already refused anything longer than the span, so the
+/// guard covers only the exact fit — where `clamp`'s range would be empty and
+/// it would panic on `lo > hi` rather than answer the one position available.
 fn fit(start: f32, len: f32, lo: f32, hi: f32) -> f32 {
     if len >= hi - lo {
         return lo;
@@ -198,15 +214,22 @@ mod tests {
         assert!(place_strip(below, view(), strip(), 12.0).is_none());
     }
 
-    /// A view narrower than the strip cannot hold it, and pinning it to the
-    /// near edge keeps the first control reachable. Centring it would push both
-    /// ends off.
+    /// A view too narrow to hold the strip is offered none. Pinning it to the
+    /// near edge looks kinder and is not: the caller clips its painting to the
+    /// view, so whatever hangs off is an invisible live target — the one thing
+    /// this module exists to refuse.
     #[test]
-    fn a_strip_wider_than_the_view_starts_at_its_near_edge() {
-        let narrow = Rect::new(vec2(30.0, 0.0), vec2(70.0, 100.0));
+    fn a_view_too_small_to_hold_the_strip_is_offered_none() {
         let anchor = Rect::new(vec2(40.0, 50.0), vec2(60.0, 90.0));
-        let placed = place_strip(anchor, narrow, strip(), 12.0).expect("somewhere to go");
-        assert_eq!(placed.rect.min.x, 30.0);
+        let narrow = Rect::new(vec2(30.0, 0.0), vec2(70.0, 100.0));
+        assert!(place_strip(anchor, narrow, strip(), 12.0).is_none());
+        let short = Rect::new(vec2(0.0, 40.0), vec2(200.0, 55.0));
+        assert!(place_strip(anchor, short, strip(), 12.0).is_none());
+        // And one exactly big enough still is: the refusal is a bound, not a
+        // margin somebody has to guess at.
+        let exact = Rect::new(vec2(0.0, 0.0), vec2(74.0, 22.0));
+        let snug = Rect::new(vec2(40.0, 10.0), vec2(60.0, 20.0));
+        assert!(place_strip(snug, exact, strip(), 12.0).is_some());
     }
 
     /// Degenerate inputs answer nothing rather than a rectangle at a NaN.

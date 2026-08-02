@@ -1316,6 +1316,63 @@ impl Editor {
 mod tests {
     use super::*;
 
+    /// **Every canvas overlay has to be in `canvas_overlay_owns_pointer`**, and
+    /// until this there was nothing that would notice one falling out of the
+    /// chain. All three kinds are checked together — the scrollbars, the
+    /// transform's flip pair and the selection's strip — because the failure is
+    /// always the same and always silent: the control still draws, still hovers
+    /// and still clicks, and the press *also* reaches the canvas underneath it.
+    /// With a brush in hand that is a dab under the button that was pressed.
+    ///
+    /// This is the whole of what both press paths consult — the mouse's through
+    /// `ui_owns_pointer` and the pen's through the same call in the `Touch`
+    /// branch — so a hole here is a hole in both.
+    #[test]
+    fn every_canvas_overlay_takes_the_pointer_off_the_canvas() {
+        // A canvas region filling a 1000 x 800 window, points and pixels alike.
+        let region = |ed: &mut Editor| {
+            ed.pixels_per_point = 1.0;
+            ed.canvas_pivot = Vec2::new(500.0, 400.0);
+            ed.canvas_size = Vec2::new(1000.0, 800.0);
+        };
+        let middle = Vec2::new(500.0, 400.0);
+        let mut bare = Editor::default();
+        region(&mut bare);
+        assert!(
+            bare.pointer_over_canvas(middle),
+            "open canvas has to belong to the document"
+        );
+
+        let at = egui::Rect::from_min_size(egui::pos2(480.0, 380.0), egui::vec2(40.0, 40.0));
+        for (name, place) in [
+            ("a scrollbar", 0usize),
+            ("a transform flip button", 1),
+            ("a selection button", 2),
+        ] {
+            let mut ed = Editor::default();
+            region(&mut ed);
+            match place {
+                0 => ed.scroll_bars[0] = Some(at),
+                1 => ed.transform_buttons[1] = Some(at),
+                _ => ed.selection_buttons[2] = Some(at),
+            }
+            assert!(
+                ed.canvas_overlay_owns_pointer(middle),
+                "{name} did not claim the pointer"
+            );
+            assert!(
+                !ed.pointer_over_canvas(middle),
+                "a press on {name} would also reach the canvas"
+            );
+            // And only where it actually is: an overlay must not take the whole
+            // canvas with it.
+            assert!(
+                ed.pointer_over_canvas(Vec2::new(100.0, 100.0)),
+                "{name} claimed canvas it does not cover"
+            );
+        }
+    }
+
     fn point() -> InputPoint {
         InputPoint::new(Vec2::splat(10.0), 1.0, 0.0)
     }

@@ -36,8 +36,9 @@ pub struct UiActions {
     pub clear: bool,
     /// Take the selection onto Umber's clipboard, and — for a cut — off the
     /// layer. The caller's, because both block on a readback and a cut records
-    /// an undo entry. Raised by the selection's overlay strip and by the Edit
-    /// menu; the keyboard reaches the same two methods directly.
+    /// an undo entry. Raised by the selection's overlay strip, which is the only
+    /// control for either; the keyboard reaches the same two methods directly
+    /// rather than through here.
     pub copy_selection: bool,
     pub cut_selection: bool,
     /// Put the Export dialog up. Nothing is written by this: it only asks the
@@ -279,9 +280,11 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .show(root, |ui| {
             let rect = ui.max_rect();
             selection_outline(ui, &p, ed, rect);
-            // Before the transform box, so that on the one frame a float is
-            // being picked up the strip has already taken itself off rather
-            // than sitting under the box's own buttons.
+            // Beside the outline it belongs to rather than beside the
+            // transform box, which is the other thing drawn here and is what
+            // takes its place: `selection_buttons` returns early while a float
+            // is up, so the two can never both be on screen and the order of
+            // these two calls does not matter.
             selection_buttons(ui, &p, ed, rect, &mut actions);
             transform_box(ui, &p, ed, rect);
             canvas_scrollbars(ui, &p, ed, rect);
@@ -643,7 +646,14 @@ fn flip_buttons(
             egui::Vec2::splat(CANVAS_BUTTON),
         );
         ed.transform_buttons[i] = Some(at);
-        if canvas_button(ui, p, rect, at, ("float-flip", i), icon, tip)
+        let button = CanvasButton {
+            at,
+            clip: rect,
+            id: ("float-flip", i),
+            icon,
+            enabled: true,
+        };
+        if canvas_button(ui, p, button, || tip.to_string())
             && let Some(float) = ed.float.as_mut()
         {
             if flip {
@@ -719,20 +729,16 @@ fn selection_buttons(
         return;
     };
 
+    // Cut writes to the layer, so a locked one refuses it — and the control
+    // says so before the click rather than answering with a dialog, which is
+    // the rule "Clear layer" already follows against its own menu item. Copy
+    // and Deselect write nothing and are never refused.
+    let locked = ed.layers.active_is_locked();
     let mut deselect = false;
-    for (i, (icon, tip)) in [
-        (
-            Icon::Deselect,
-            shortcuts::labelled("Deselect", Action::Deselect),
-        ),
-        (
-            Icon::Copy,
-            shortcuts::labelled("Copy the selection", Action::Copy),
-        ),
-        (
-            Icon::Cut,
-            shortcuts::labelled("Cut the selection", Action::Cut),
-        ),
+    for (i, (icon, enabled)) in [
+        (Icon::Deselect, true),
+        (Icon::Copy, true),
+        (Icon::Cut, !locked),
     ]
     .into_iter()
     .enumerate()
@@ -744,8 +750,30 @@ fn selection_buttons(
             ),
             egui::Vec2::splat(CANVAS_BUTTON),
         );
+        // Recorded whatever happens next — including for a *disabled* button,
+        // which still must not let a press through to the canvas underneath it.
         ed.selection_buttons[i] = Some(at);
-        if canvas_button(ui, p, rect, at, ("selection-strip", i), icon, &tip) {
+        // The tooltip is built inside the closure, which egui calls only while
+        // the pointer is actually on the button. `shortcuts::labelled` formats
+        // a string and reads the binding table behind a lock, and this runs
+        // several times a second for as long as a selection is open — the same
+        // reason `Editor::selection_screen` exists.
+        let button = CanvasButton {
+            at,
+            clip: rect,
+            id: ("selection-strip", i),
+            icon,
+            enabled,
+        };
+        let clicked = canvas_button(ui, p, button, || match i {
+            0 => shortcuts::labelled("Deselect", Action::Deselect),
+            1 => shortcuts::labelled("Copy the selection", Action::Copy),
+            _ if locked => "The layer is locked, so nothing can be cut out of it. \
+                            Unlock it in the Layers panel."
+                .to_string(),
+            _ => shortcuts::labelled("Cut the selection", Action::Cut),
+        });
+        if clicked {
             match i {
                 0 => deselect = true,
                 1 => actions.copy_selection = true,
@@ -753,12 +781,19 @@ fn selection_buttons(
             }
         }
     }
-    // After the loop, because `deselect` takes the selection this frame's
-    // rectangles were computed from — and a strip recorded for a selection that
-    // has gone is a live target over open canvas until the next frame.
+    // After the loop, because it takes the selection this frame's rectangles
+    // were computed from.
+    //
+    // The rectangles are deliberately **left standing** for the rest of this
+    // frame. The buttons have already been painted into it, so clearing them
+    // would leave three marks on screen that the canvas owns — and a press
+    // there would paint a dab under a button the artist can still see. The
+    // opposite window costs a swallowed press over open canvas and no pixels,
+    // which is the cheaper of the two; the repaint below closes it next frame
+    // rather than waiting for egui to volunteer one.
     if deselect {
         ed.deselect();
-        ed.selection_buttons = [None, None, None];
+        ui.ctx().request_repaint();
     }
 }
 
@@ -769,25 +804,56 @@ fn selection_buttons(
 /// caller's, but whether a *press* there belongs to the canvas is not, and a
 /// button whose rectangle was only recorded on the frame it happened to be
 /// clicked would paint underneath itself on every other one.
+///
+/// A disabled one still hovers and still shows its tooltip, matching
+/// [`icon_button`] and for the same reason: the tooltip is usually the
+/// *explanation*, and skipping the hover along with the click leaves a dead
+/// mark with nothing to say for itself.
+///
+/// `tip` is a closure because egui calls it only while the pointer is on the
+/// button. Building the text unconditionally would allocate on the drawing
+/// path, and a canvas overlay is drawn for as long as the thing it belongs to
+/// is on screen.
+struct CanvasButton {
+    /// Where it goes, in points.
+    at: Rect,
+    /// The canvas region. Painting is clipped to it, so a strip that reaches
+    /// the edge does not draw over a panel.
+    clip: Rect,
+    /// Unique within the frame; the strip and the index within it.
+    id: (&'static str, usize),
+    icon: Icon,
+    enabled: bool,
+}
+
 fn canvas_button(
     ui: &mut egui::Ui,
     p: &Palette,
-    clip: Rect,
-    at: Rect,
-    id: (&'static str, usize),
-    icon: Icon,
-    tip: &str,
+    button: CanvasButton,
+    tip: impl FnOnce() -> String,
 ) -> bool {
-    let response = ui.interact(at, ui.id().with(id), Sense::click());
+    let CanvasButton {
+        at,
+        clip,
+        id,
+        icon,
+        enabled,
+    } = button;
+    let response = ui.interact(
+        at,
+        ui.id().with(id),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let lit = enabled && response.hovered();
     let painter = ui.painter().with_clip_rect(clip);
     painter.rect_filled(
         at,
         metrics::RADIUS,
-        if response.hovered() {
-            p.control_hover
-        } else {
-            p.control
-        },
+        if lit { p.control_hover } else { p.control },
     );
     painter.rect_stroke(
         at,
@@ -795,17 +861,17 @@ fn canvas_button(
         Stroke::new(1.0, p.border),
         egui::StrokeKind::Inside,
     );
-    icons::draw(
-        &painter,
-        at.shrink(3.0),
-        icon,
-        if response.hovered() {
-            p.text_strong
-        } else {
-            p.text
-        },
-    );
-    response.on_hover_text(tip).clicked()
+    let ink = match (enabled, lit) {
+        (false, _) => p.text_dim,
+        (_, true) => p.text_strong,
+        _ => p.text,
+    };
+    icons::draw(&painter, at.shrink(3.0), icon, ink);
+    response
+        .on_hover_ui(|ui| {
+            ui.label(tip());
+        })
+        .clicked()
 }
 
 /// The canvas scrollbars, along the bottom and the right of the document

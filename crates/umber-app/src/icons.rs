@@ -492,8 +492,8 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
 
         Icon::Deselect => {
             // `Select`'s box, drawn a size smaller to leave room for the
-            // stroke, and with the same dash spans so the two read as the same
-            // object with something done to it.
+            // stroke, with its dash spans scaled to match so the two read as
+            // the same object with something done to it.
             const LO: f32 = 6.0;
             const HI: f32 = 18.0;
             for (from, to) in [(0.0, 3.5), (5.0, 7.0), (8.5, 12.0)] {

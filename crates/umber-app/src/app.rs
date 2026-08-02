@@ -841,45 +841,34 @@ impl UmberApp {
     /// rectangle to read, and the mask that clips it.
     ///
     /// **A float in hand is put down first, and that is one rule for all three
-    /// of copy, cut and paste.** The clipboard is a picture of the document,
-    /// and while pixels are in the air the document has no definite state to
-    /// take a picture of — the same reason every path that leaves it (a tab
-    /// switch, a save, an export, a resize, a close) commits first. The
-    /// alternative, taking the float's own pixels without committing, is not
-    /// available for a reason worth writing down: the transformed copy exists
-    /// only in the preview slice, which holds the float composited *over the
-    /// layer beneath it*, so reading it back would take whatever was under the
-    /// picture along with it. Cancelling instead is worse still — for a lifted
-    /// float the layer still holds the originals, so a "cut" that abandoned the
-    /// move would clear a region the artist has already dragged away from.
+    /// of copy, cut and paste.** The clipboard is a picture of the document, and
+    /// while pixels are in the air the document has no definite state to take a
+    /// picture of — the same reason every path that leaves it (a tab switch, a
+    /// save, an export, a resize, a close) commits first. Once committed those
+    /// pixels *are* the document, so what follows needs no special case.
     ///
-    /// What it reads afterwards differs by how the float arrived. A **lift**
-    /// carried the marquee with it at commit, so the selection is already over
-    /// the pixels that were being held. A **paste** did not — deliberately; it
-    /// did not come out of the selection — so its own destination rectangle is
-    /// the only thing that names where the picture went, and taking the stale
-    /// selection instead would copy some other part of the canvas.
+    /// **And it deliberately gets none.** A float that arrived by *paste* did
+    /// not come out of the selection, so after the commit the marquee names
+    /// somewhere else and a copy answers "nothing to copy". Reading the float's
+    /// destination rectangle instead is the obvious repair and is wrong, in a
+    /// way that only shows up on the cut: `Transform::dest_rect` is the bounding
+    /// box of the **quad**, plus a skirt, and a rectangle is not the shape of
+    /// the picture. Cutting it with no mask clears every pixel in that box — the
+    /// four corners left over by a rotation, whatever showed through the clip's
+    /// own transparency, and the skirt — none of which the paste ever covered.
+    /// That is silent damage to the layer, recorded as one entry, and worse than
+    /// a Ctrl+C that does nothing. The clipboard already holds what was pasted,
+    /// which is what makes the missing case cheap; putting it back needs the
+    /// clip's own alpha as a mask, not its bounding box.
     fn take_region(&mut self) -> (PixelRect, Option<Arc<umber_core::Selection>>) {
-        let doc = self.editor.doc.size;
-        let pasted = self
-            .editor
-            .float
-            .as_ref()
-            .filter(|float| !float.lifted)
-            // `None` where the paste has been dragged or scaled entirely off
-            // the canvas, which is also the case where committing it writes
-            // nothing. The ordinary rule then applies and copies whatever the
-            // selection covers, which is the only answer left.
-            .and_then(|float| float.xf.dest_rect(doc));
         self.finish_transform();
         self.finish_stroke();
-        match pasted {
-            Some(rect) => (rect, None),
-            None => (
-                self.editor.transform_region(),
-                self.editor.selection.clone(),
-            ),
-        }
+        // A *lift* carried the marquee with it at commit, so after that the
+        // selection is already over the pixels that were being held.
+        (
+            self.editor.transform_region(),
+            self.editor.selection.clone(),
+        )
     }
 
     /// Take the selection — or the whole layer where there is none — onto
@@ -924,6 +913,14 @@ impl UmberApp {
     /// only where the engine can restore something, and two rows that undo
     /// identically must not have two names — the same rule that keeps a paste
     /// filed under Transform.
+    ///
+    /// **The patch is the rectangle, not the cells a mark reached**, because a
+    /// cut has no `TileMask` to have accumulated one from. With nothing selected
+    /// that rectangle is the whole canvas, so on the 10000² document the Undo
+    /// section uses as its bound a bare Ctrl+X costs 400 MB and the 512 MB
+    /// budget holds exactly one — the history before it ages out. That follows
+    /// from the same rule a stroke across such a canvas follows and is said here
+    /// rather than left to look like a fault.
     fn cut_selection(&mut self) {
         // **The one gate a lock has on cutting.** An explicit command with one
         // obvious outcome, so it says so, exactly as a paste onto a locked

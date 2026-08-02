@@ -368,7 +368,9 @@ step — and `Ctrl` + `V` pastes it back as a floating region the transform tool
 is already holding. What a cut removes is exactly what it took, edge included,
 so a soft or diagonal selection leaves no ghost of itself behind. All three put
 a floating picture down first, because the clipboard holds a picture of the
-document and there is no such thing while pixels are still in the air. A paste lands in the middle of the selection if there is one and
+document and there is no such thing while pixels are still in the air.
+
+A paste lands in the middle of the selection if there is one and
 otherwise in the middle of what you are looking at, nudged back on to the canvas
 if it would hang off. Something copied from a larger canvas is cropped to what
 fits, and Umber says so rather than doing it quietly. The clipboard is Umber's
