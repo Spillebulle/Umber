@@ -46,7 +46,11 @@ pub enum Phase {
     /// The user has asked to stop and the worker has not answered yet. Its
     /// answer is what decides between [`Phase::Stopped`] and the update having
     /// landed anyway — see the module comment.
-    Stopping,
+    ///
+    /// It carries the stage it was stopped from, so the bar holds the reading
+    /// it had. Emptying it would read as a reset, and the download is still
+    /// running until the worker says otherwise.
+    Stopping(Stage),
     /// Stopped before anything was written.
     Stopped,
     /// The new build is in place, or an installer is running. The countdown is
@@ -320,10 +324,13 @@ impl Flow {
 
     /// The user has asked to stop. The worker answers.
     pub fn request_stop(&mut self) -> bool {
-        if !self.can_stop() {
+        let Phase::Working(stage) = &self.phase else {
+            return false;
+        };
+        if !stage.can_stop() {
             return false;
         }
-        self.phase = Phase::Stopping;
+        self.phase = Phase::Stopping(*stage);
         true
     }
 
@@ -370,7 +377,7 @@ impl Flow {
 
     /// Whether a worker's answer is still expected.
     fn running(&self) -> bool {
-        matches!(self.phase, Phase::Working(_) | Phase::Stopping)
+        matches!(self.phase, Phase::Working(_) | Phase::Stopping(_))
     }
 
     /// Stop the countdown, leaving Umber running. Returns false where there is
@@ -545,7 +552,14 @@ mod tests {
         });
         assert!(flow.can_stop());
         assert!(flow.request_stop());
-        assert_eq!(*flow.phase(), Phase::Stopping);
+        assert_eq!(
+            *flow.phase(),
+            Phase::Stopping(Stage::Downloading {
+                received: 10,
+                total: 40,
+            }),
+            "the bar keeps the reading it had while the worker answers",
+        );
         assert!(!flow.can_stop(), "there is nothing left to ask twice");
 
         // A progress message already in the channel when the stop was clicked.
@@ -553,10 +567,9 @@ mod tests {
             received: 12,
             total: 40,
         });
-        assert_eq!(
-            *flow.phase(),
-            Phase::Stopping,
-            "a late report changes nothing"
+        assert!(
+            matches!(flow.phase(), Phase::Stopping(_)),
+            "a late report changes nothing",
         );
 
         flow.stopped();

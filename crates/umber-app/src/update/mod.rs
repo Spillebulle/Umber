@@ -773,17 +773,48 @@ pub fn open_in_browser(url: &str) {
 pub fn demo_release() -> Release {
     let mut version = Version::current();
     version.patch += 1;
+    // Every asset the release workflow publishes for a machine Umber can update
+    // itself, so the rehearsal shows the *primary* path — "Update now" — on
+    // whichever machine it is run from. A release with no assets would only ever
+    // rehearse the "no build for this machine" wording, which is the one screen
+    // that needs looking at least.
+    //
+    // The addresses are on `.invalid`, which is reserved and resolves nowhere:
+    // clicking "Update now" in the rehearsal runs the *real* worker as far as
+    // the connection and then lands on the failure screen, which is a rehearsal
+    // of that path rather than a download of anything.
+    let asset = |name: &str| Asset {
+        name: format!("umber-{version}{name}"),
+        size: 31 * 1024 * 1024,
+        browser_download_url: format!("https://example.invalid/umber-{version}{name}"),
+    };
     Release {
         version,
         tag: format!("v{version}"),
         page: RELEASES_PAGE.to_string(),
-        notes: "### Added\n- A rehearsal release. This one does not exist, and \
+        notes: "Added\n- A rehearsal release. This one does not exist, and \
                 nothing here will be downloaded.\n- A second line, so the notes \
-                box has something to scroll.\n\n### Fixed\n- A very long line, to \
+                box has something to scroll.\n\nFixed\n- A very long line, to \
                 prove that a release note cannot push this dialog wider than the \
                 screen the way the brush importer's notices once did.\n"
             .to_string(),
-        assets: Vec::new(),
+        assets: vec![
+            asset("-x64.msi"),
+            asset("-arm64.msi"),
+            asset("-x86_64-pc-windows-msvc.zip"),
+            asset("-aarch64-pc-windows-msvc.zip"),
+            asset("-universal-apple-darwin.tar.gz"),
+            asset("-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("-aarch64-unknown-linux-gnu.tar.gz"),
+            // The AppImage is the one whose name the workflow capitalises.
+            Asset {
+                name: format!("Umber-{version}-x86_64.AppImage"),
+                size: 31 * 1024 * 1024,
+                browser_download_url: format!(
+                    "https://example.invalid/Umber-{version}-x86_64.AppImage"
+                ),
+            },
+        ],
     }
 }
 
@@ -798,8 +829,9 @@ impl Updates {
                 flow.begin();
                 flow.stage(stage);
             }
-            Phase::Stopping => {
+            Phase::Stopping(stage) => {
                 flow.begin();
+                flow.stage(stage);
                 flow.request_stop();
             }
             Phase::Stopped => {
@@ -1001,7 +1033,10 @@ mod tests {
             cancel.load(Ordering::Relaxed),
             "the worker has to be told, or the download runs to the end",
         );
-        assert_eq!(updates.flow().map(Flow::phase), Some(&Phase::Stopping));
+        assert_eq!(
+            updates.flow().map(Flow::phase),
+            Some(&Phase::Stopping(Stage::Contacting)),
+        );
     }
 
     #[test]

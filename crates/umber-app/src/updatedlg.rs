@@ -80,13 +80,28 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.set_width(metrics::UPDATE_DIALOG_WIDTH);
             match flow.phase() {
                 Phase::Offer => offer(ui, p, &flow, &actions, &mut act),
-                Phase::Working(stage) => {
-                    working(ui, p, &flow, Some(*stage), flow.can_stop(), &mut act);
-                }
+                Phase::Working(stage) => working(
+                    ui,
+                    p,
+                    &flow,
+                    stage.progress(),
+                    stage.label(),
+                    flow.can_stop(),
+                    &mut act,
+                ),
                 // The stop has been asked for and the worker has not answered.
-                // The bar keeps the reading it had rather than emptying: the
-                // download is still running until it says otherwise.
-                Phase::Stopping => working(ui, p, &flow, None, false, &mut act),
+                // The bar keeps the reading it had rather than emptying — the
+                // download is still running until it says otherwise — and the
+                // line says what is being waited for.
+                Phase::Stopping(stage) => working(
+                    ui,
+                    p,
+                    &flow,
+                    stage.progress(),
+                    "stopping…".to_string(),
+                    false,
+                    &mut act,
+                ),
                 Phase::Stopped => stopped(ui, p, &mut act),
                 Phase::Done { outcome, countdown } => {
                     done(ui, p, &flow, *outcome, *countdown, now, &mut act);
@@ -193,7 +208,7 @@ fn offer(
     ui.add_space(14.0);
     unsigned_footnote(ui, p);
     ui.add_space(12.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    actions_row(ui, |ui| {
         // Right to left, so the action that carries the dialog is drawn first
         // and lands rightmost.
         if actions.update_now {
@@ -241,37 +256,48 @@ fn notes_box(ui: &mut egui::Ui, p: &Palette, notes: &str) {
         .show(ui, |ui| {
             ui.set_width(metrics::UPDATE_NOTES[0]);
             ui.set_height(metrics::UPDATE_NOTES[1]);
-            ui.label(
-                egui::RichText::new("Release notes")
-                    .size(text::TINY)
-                    .color(p.text_dim)
-                    .strong(),
+            // Explicitly vertical. A `Frame` takes the layout of the `Ui` it is
+            // shown in, and this one is shown inside the offer's two-column
+            // `horizontal_top` — so without this the heading and the notes sit
+            // side by side rather than one above the other.
+            ui.vertical(|ui| {
+                notes_body(ui, p, notes);
+            });
+        });
+}
+
+/// The box's contents: a heading and the notes under it.
+fn notes_body(ui: &mut egui::Ui, p: &Palette, notes: &str) {
+    ui.label(
+        egui::RichText::new("Release notes")
+            .size(text::TINY)
+            .color(p.text_dim)
+            .strong(),
+    );
+    ui.add_space(6.0);
+    // One vertical scroll area, claiming its space whatever is in it. Sized by
+    // the box rather than sizing it: notes are text nobody here wrote, and a
+    // box that grew to fit them would take the modal and then the window with
+    // it.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .id_salt("update-notes")
+        .show(ui, |ui| {
+            let text = if notes.is_empty() {
+                "This release was published without notes. The releases page has \
+                 what there is."
+            } else {
+                notes
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(text::SMALL)
+                        .color(p.text)
+                        .line_height(Some(15.5)),
+                )
+                .wrap(),
             );
-            ui.add_space(6.0);
-            // One vertical scroll area, claiming its space whatever is in it.
-            // Sized by the box rather than sizing it: notes are text nobody
-            // here wrote, and a box that grew to fit them would take the modal
-            // and then the window with it.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .id_salt("update-notes")
-                .show(ui, |ui| {
-                    let text = if notes.is_empty() {
-                        "This release was published without notes. The releases \
-                         page has what there is."
-                    } else {
-                        notes
-                    };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(text)
-                                .size(text::SMALL)
-                                .color(p.text)
-                                .line_height(Some(15.5)),
-                        )
-                        .wrap(),
-                    );
-                });
         });
 }
 
@@ -279,27 +305,24 @@ fn notes_box(ui: &mut egui::Ui, p: &Palette, notes: &str) {
 // Screen two: the work
 // ---------------------------------------------------------------------------
 
-/// The bar, the stage it names, and a cancel while one costs nothing.
+/// The bar, the line under it, and a cancel while stopping costs nothing.
 ///
-/// `stage` is `None` while a stop is waiting on the worker: the bar keeps its
-/// track and the line says what is happening, rather than the reading jumping
-/// backwards for the half second it takes to answer.
+/// Handed a fraction and a line rather than a [`update::Stage`], because the
+/// two do not always come from the same place: a stop waiting on the worker
+/// keeps the *stage's* reading on the bar while the line says "stopping…".
 fn working(
     ui: &mut egui::Ui,
     p: &Palette,
     flow: &Flow,
-    stage: Option<update::Stage>,
+    progress: Option<f32>,
+    line: String,
     can_stop: bool,
     act: &mut Option<Act>,
 ) {
     title(ui, p, &format!("Installing Umber {}", flow.release.version));
     ui.add_space(16.0);
-    widgets::progress_bar(ui, p, stage.and_then(update::Stage::progress));
+    widgets::progress_bar(ui, p, progress);
     ui.add_space(10.0);
-    let line = match stage {
-        Some(stage) => stage.label(),
-        None => "stopping…".to_string(),
-    };
     ui.add(
         egui::Label::new(
             egui::RichText::new(line)
@@ -310,7 +333,7 @@ fn working(
     );
 
     ui.add_space(16.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    actions_row(ui, |ui| {
         // Only while stopping is free. From the unpack onwards a stop could
         // land mid-swap, and a half-replaced binary is the one outcome that
         // costs somebody their installation — so the control comes off the
@@ -388,7 +411,7 @@ fn done(
     }
 
     ui.add_space(16.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    actions_row(ui, |ui| {
         if countdown.running() {
             if tabs::button(ui, p, button, true) {
                 *act = Some(Act::Finish);
@@ -430,7 +453,7 @@ fn stopped(ui: &mut egui::Ui, p: &Palette, act: &mut Option<Act>) {
          Umber is exactly as it was.",
     );
     ui.add_space(16.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    actions_row(ui, |ui| {
         if tabs::button(ui, p, "Close", true) {
             *act = Some(Act::NotNow);
         }
@@ -457,7 +480,7 @@ fn failed(ui: &mut egui::Ui, p: &Palette, message: &str, act: &mut Option<Act>) 
         .wrap(),
     );
     ui.add_space(16.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    actions_row(ui, |ui| {
         if tabs::button(ui, p, "Close", true) {
             *act = Some(Act::NotNow);
         }
@@ -473,6 +496,20 @@ fn failed(ui: &mut egui::Ui, p: &Palette, message: &str, act: &mut Option<Act>) 
 // ---------------------------------------------------------------------------
 // Small pieces
 // ---------------------------------------------------------------------------
+
+/// The strip of buttons at the foot of a screen, laid out right to left so the
+/// action that carries the dialog lands rightmost.
+///
+/// Wrapped in a `horizontal`, which is the idiom `canvasdlg.rs` uses and is not
+/// decoration: a bare `right_to_left` layout with a centred cross axis takes the
+/// *whole* of the modal's remaining height, which on the short screens here
+/// stretched the dialog to the height of the window and left the buttons
+/// floating in the middle of it.
+fn actions_row(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), body);
+    });
+}
 
 /// The dialog's heading, with the mark every update screen carries.
 fn title(ui: &mut egui::Ui, p: &Palette, line: &str) {
@@ -522,6 +559,96 @@ mod tests {
             notes: String::new(),
             assets: Vec::new(),
         }
+    }
+
+    /// Write every screen of this dialog out as a PNG so it can be looked at.
+    ///
+    /// Ignored, and run by hand — the same arrangement `splash`'s
+    /// `splash_preview` uses, and here it is the *only* way any of this is ever
+    /// seen: a real update needs a release that is newer than this build, which
+    /// means cutting one. It draws through `updatedlg::show` itself, offscreen,
+    /// so what lands in the file is the interface rather than a picture of it.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app update_dialog_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn update_dialog_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::Palette;
+        use crate::update::{Applied, Phase, flow::Countdown};
+        use egui::vec2;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/update-dlg");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+        let now = Instant::now();
+
+        let screens: [(&str, Phase); 8] = [
+            ("1-offer", Phase::Offer),
+            (
+                "2-downloading",
+                Phase::Working(Stage::Downloading {
+                    received: 12 * 1024 * 1024,
+                    total: 31 * 1024 * 1024,
+                }),
+            ),
+            ("3-unpacking", Phase::Working(Stage::Unpacking)),
+            ("4-handing-over", Phase::Working(Stage::HandingOver)),
+            (
+                "5-stopping",
+                Phase::Stopping(Stage::Downloading {
+                    received: 24 * 1024 * 1024,
+                    total: 31 * 1024 * 1024,
+                }),
+            ),
+            (
+                "6-done-restart",
+                Phase::Done {
+                    outcome: Applied::Restart,
+                    countdown: Countdown::stopped(),
+                },
+            ),
+            (
+                "7-done-installer",
+                Phase::Done {
+                    outcome: Applied::Installer,
+                    countdown: Countdown::stopped(),
+                },
+            ),
+            (
+                "8-failed",
+                Phase::Failed(
+                    "Umber could not download umber-0.0.5-x64.msi: connection reset by \
+                     peer.\n\nNothing was changed."
+                        .to_string(),
+                ),
+            ),
+        ];
+
+        let count = screens.len();
+        for (name, phase) in screens {
+            let mut ed = Editor::default();
+            ed.updates.demo(phase, now);
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let image = stage.shoot(
+                // Wide enough that the modal sits in a margin of dimmed
+                // backdrop rather than against the edge of the picture.
+                vec2(metrics::UPDATE_DIALOG_WIDTH + 120.0, 460.0),
+                1.5,
+                &palette,
+                palette.backdrop,
+                |ui| super::show(ui, &palette, &mut ed),
+            );
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote {count} screens to {}", dir.display());
     }
 
     #[test]

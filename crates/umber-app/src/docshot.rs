@@ -124,7 +124,7 @@ const TRIM_MARGIN: f32 = theme::metrics::PANEL_PAD as f32;
 const GENERIC_CONFIG_PATH: &str = r"%APPDATA%\Umber\config\preferences.conf";
 
 /// One finished picture, in the order a PNG wants its bytes.
-struct Image {
+pub(crate) struct Image {
     width: u32,
     height: u32,
     /// Three bytes per pixel. The alpha is dropped on readback: every one of
@@ -374,7 +374,17 @@ fn palette_colour(c: Color32) -> Color {
 /// One of each for the whole run, for the reason `gpu_pipeline.rs` shares its:
 /// device creation is by far the slowest thing here, and a context per picture
 /// would rebuild the Archivo atlas each time.
-struct Stage {
+/// A GPU, an egui context and a renderer, drawing into a texture.
+///
+/// `pub(crate)` rather than private because it is the only way anything in this
+/// crate can *look at* a piece of interface: it draws through `ui`'s own
+/// functions into an offscreen target, which is what a screen-by-screen preview
+/// needs and what no `cargo test` assertion can stand in for. See
+/// `updatedlg`'s ignored `update_dialog_preview`, which is the same idiom
+/// `splash`'s `splash_preview` already uses on the CPU. Nothing outside the
+/// crate sees it — `generate` is still the whole of this module's public
+/// surface.
+pub(crate) struct Stage {
     gpu: Gpu,
     ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
@@ -383,7 +393,7 @@ struct Stage {
 impl Stage {
     /// `None` when there is no adapter — a headless runner, a machine with no
     /// working driver. The caller skips rather than writing a broken file.
-    fn new() -> Option<Self> {
+    pub(crate) fn new() -> Option<Self> {
         let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))
             .inspect_err(|e| eprintln!("{e}"))
             .ok()?;
@@ -425,7 +435,7 @@ impl Stage {
     /// Run `body` until the interface stops animating, then read the frame back.
     ///
     /// `size` is in egui points; the image comes out `scale` times that.
-    fn shoot(
+    pub(crate) fn shoot(
         &mut self,
         size: Vec2,
         scale: f32,
@@ -628,7 +638,7 @@ impl Stage {
 // Writing
 // ---------------------------------------------------------------------------
 
-fn write_png(path: &Path, image: &Image) -> Result<(PathBuf, u64, u32, u32), String> {
+pub(crate) fn write_png(path: &Path, image: &Image) -> Result<(PathBuf, u64, u32, u32), String> {
     let file =
         std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width, image.height);

@@ -1075,6 +1075,13 @@ design shows a whole row of them.
   `keylayout::name_for` is a pure function of an injected reading, which is the
   only way the Norwegian and German answers are tested at all, and the reading is
   cached — the platform is asked from the *input* path, never while painting.
+- **A dialog's button strip goes inside a `horizontal`.** A bare
+  `Layout::right_to_left(Align::Center)` takes the *whole* of the remaining
+  height of the `Ui` it is in, because the align is the cross axis — so on a
+  short modal it stretches the dialog to the height of the window and leaves the
+  buttons floating in the middle of it. `canvasdlg.rs` already wraps its footer
+  for this reason and `updatedlg::actions_row` is the same wrap named; it is
+  invisible on a dialog whose content is tall, which is why it went unnoticed.
 - **A widget revealed on hover must not be what decides the hover.** egui stops
   its hover search at the topmost *interactive* widget, so a `Sense::hover()`
   row reads as not-hovered the moment the pointer is over a button inside it —
@@ -1717,6 +1724,11 @@ window nor a socket.
 - **The dialog cannot be dismissed while work is in flight.** Escape and the
   click outside are refused by `Flow::holds_work`; a modal that vanished
   mid-download would leave a thread running with nothing on screen to stop it.
+- **`Phase::Stopping` carries the stage it was stopped from**, so the bar holds
+  the reading it had while the worker answers. Emptying it reads as a reset, and
+  the download is still running until the worker says otherwise. That is also
+  why `working` takes a fraction and a line rather than a `Stage`: on that one
+  screen the two come from different places.
 - **The notes are the release's own**, out of the API reply — which is
   `CHANGELOG.md`'s section, published verbatim by the workflow. The changelog
   compiled into the binary describes the build already *running* and is exactly
