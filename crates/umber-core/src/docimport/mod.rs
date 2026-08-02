@@ -21,9 +21,11 @@
 //! afternoon before they notice the colours moved.
 //!
 //! The same rule shapes what happens *inside* a supported format. Umber has no
-//! layer groups, no masks, no clipping and five blend modes, so a real
-//! Photoshop file cannot arrive intact. Every such loss appends an
-//! [`ImportWarning`], and the UI is expected to show them.
+//! layer groups and five blend modes, and reads a mask out of its own files
+//! only, so a real Photoshop file cannot arrive intact. Every such loss appends
+//! an [`ImportWarning`], and the UI is expected to show them. Clipping is no
+//! longer among the losses — Umber's own flag means what Photoshop's does, so a
+//! clipped PSD layer arrives clipped.
 //!
 //! # Pixel convention
 //!
@@ -34,7 +36,9 @@
 
 mod blend;
 mod container;
-mod flat;
+// Visible inside the crate so `tip::TipMask::from_picture` can read a PNG
+// through the decoder that already exists rather than growing a second one.
+pub(crate) mod flat;
 mod history;
 mod krita;
 mod lzf;
@@ -141,6 +145,39 @@ pub struct ImportedLayer {
     /// `width * height * 4` bytes, sRGB-encoded with premultiplied alpha —
     /// see the module docs.
     pub pixels: Vec<u8>,
+    /// The layer's mask, canvas-sized and in the same form as `pixels` — so it
+    /// goes straight to `write_texture` like everything else here.
+    ///
+    /// `None` for every format but Umber's own so far. A `.kra` and a `.psd`
+    /// both carry masks and both still report them as lost; reading them is a
+    /// second decoder each and is not what this change is.
+    pub mask: Option<Vec<u8>>,
+    /// Bounded by the alpha of the nearest unclipped layer below.
+    pub clipped: bool,
+    /// Refuses edits until unlocked.
+    pub locked: bool,
+    /// Moves with the other linked layers.
+    pub linked: bool,
+}
+
+impl ImportedLayer {
+    /// A visible, fully opaque layer with none of the flags set.
+    ///
+    /// Every reader builds its layers through this, so a field added above does
+    /// not mean touching four readers and their fixtures.
+    pub fn new(name: impl Into<String>, blend: BlendMode, pixels: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            visible: true,
+            opacity: 1.0,
+            blend,
+            pixels,
+            mask: None,
+            clipped: false,
+            locked: false,
+            linked: false,
+        }
+    }
 }
 
 impl fmt::Debug for ImportedLayer {
@@ -152,6 +189,10 @@ impl fmt::Debug for ImportedLayer {
             .field("opacity", &self.opacity)
             .field("blend", &self.blend.label())
             .field("pixels", &format_args!("{} bytes", self.pixels.len()))
+            .field("mask", &self.mask.is_some())
+            .field("clipped", &self.clipped)
+            .field("locked", &self.locked)
+            .field("linked", &self.linked)
             .finish()
     }
 }
@@ -251,12 +292,28 @@ impl ImportedDocument {
                 dst.visible = layer.visible;
                 dst.opacity = layer.opacity;
                 dst.blend = layer.blend;
+                dst.clipped = layer.clipped;
+                dst.locked = layer.locked;
+                dst.linked = layer.linked;
                 dst.slot()
             };
             uploads.push(LayerUpload {
                 slot,
                 pixels: layer.pixels,
             });
+            // A mask is another slice of the same array, so it is another
+            // upload and nothing here has to know it is a mask. `add_mask`
+            // cannot fail on a layer that has just been built, and the caller
+            // fills the slice from this upload rather than with the opaque
+            // white a *new* mask starts as.
+            if let Some(mask) = layer.mask
+                && let Some(mask_slot) = stack.add_mask(i)
+            {
+                uploads.push(LayerUpload {
+                    slot: mask_slot,
+                    pixels: mask,
+                });
+            }
         }
 
         // Umber's own documents remember which layer was selected; for
@@ -285,10 +342,18 @@ impl ImportedDocument {
                     let body = match edit.body {
                         ImportedBody::Pixels {
                             layer,
+                            mask,
                             rect,
                             pieces,
                         } => {
-                            let slot = stack.get(layer)?.slot();
+                            // The layer's own slice, or its mask's. A mask
+                            // entry naming a layer that came back without one
+                            // drops the whole history rather than being
+                            // replayed into the pixels, which is what the `?`
+                            // does — the same rule the positions themselves
+                            // answer to.
+                            let dst = stack.get(layer)?;
+                            let slot = if mask { dst.mask()? } else { dst.slot() };
                             let pieces = pieces
                                 .into_iter()
                                 .map(|p| PatchPiece::new(p.rect, p.bytes))
@@ -351,6 +416,10 @@ impl ImportedDocument {
                 expected,
                 "reader produced a layer that is not canvas-sized"
             );
+            debug_assert!(
+                layer.mask.as_ref().is_none_or(|m| m.len() == expected),
+                "reader produced a mask that is not canvas-sized"
+            );
         }
         Ok(())
     }
@@ -378,8 +447,6 @@ pub enum ImportWarning {
     GroupOpacityFolded { group: String },
     /// A layer mask was ignored, so the layer covers more than it should.
     MaskIgnored { layer: String },
-    /// A clipping layer now paints outside the layer it was clipped to.
-    ClippingIgnored { layer: String },
     /// A layer could not be brought across at all.
     LayerSkipped { layer: String, reason: String },
     /// Layer structure was lost and the flattened image was used instead.
@@ -425,10 +492,6 @@ impl fmt::Display for ImportWarning {
             Self::MaskIgnored { layer } => write!(
                 f,
                 "Layer “{layer}” has a mask, which was ignored — the layer covers more than it did."
-            ),
-            Self::ClippingIgnored { layer } => write!(
-                f,
-                "Layer “{layer}” was clipped to the layer below it; Umber has no clipping, so it now paints everywhere."
             ),
             Self::LayerSkipped { layer, reason } => {
                 write!(f, "Layer “{layer}” could not be imported: {reason}.")
@@ -592,13 +655,11 @@ mod tests {
     use super::*;
 
     fn layer(name: &str, size: UVec2) -> ImportedLayer {
-        ImportedLayer {
-            name: name.to_string(),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels: vec![0; size.x as usize * size.y as usize * 4],
-        }
+        ImportedLayer::new(
+            name,
+            BlendMode::Normal,
+            vec![0; size.x as usize * size.y as usize * 4],
+        )
     }
 
     #[test]

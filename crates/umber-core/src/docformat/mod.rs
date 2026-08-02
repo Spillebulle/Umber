@@ -38,7 +38,7 @@
 //!
 //! # What Umber adds, and how it stays an ORA
 //!
-//! Five things Umber knows have nowhere to go in baseline ORA, so they are
+//! Several things Umber knows have nowhere to go in baseline ORA, so they are
 //! written as extra attributes. XML readers ignore attributes they do not
 //! recognise, so a file carrying them is still an ordinary `.ora` everywhere
 //! else; the `umber-` prefix keeps them out of the way of anything the
@@ -47,7 +47,13 @@
 //! * **[`VERSION_ATTR`]** on `<image>` — the revision of *these extensions*,
 //!   not of ORA. A file whose number is higher than [`VERSION`] is refused on
 //!   the way in, because a later revision exists precisely to store something
-//!   this build would drop without knowing it had.
+//!   this build would drop without knowing it had. What is written is the
+//!   *lowest* revision that describes the file — see [`required_version`] —
+//!   so a document using nothing new still opens in an older build.
+//! * **[`MASK_ATTR`]** on a masked `<layer>`, naming an entry under `umber/`.
+//!   The mask is deliberately not a layer of the ORA stack; see that constant.
+//! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
+//!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
 //! * **[`BLEND_ATTR`]** on a layer whose Umber mode has no exact SVG name.
 //!   Only [`BlendMode::Add`] needs it: `svg:plus` is Porter-Duff addition on
@@ -168,10 +174,70 @@ pub const EXTENSION: &str = "ora";
 /// painting because it carries a history they do not need would be a plainly
 /// worse trade. [`history::VERSION`] governs that layout instead, and an
 /// unreadable one is discarded rather than refused.
-pub const VERSION: u32 = 1;
+///
+/// **2 is the first revision that earned it**, and it earned it for layer masks
+/// and clipping. Both change what the picture *looks like* in a build that
+/// ignores them, and change it silently: a masked layer would come back
+/// covering everything the mask hid, and a clipped layer would come back
+/// painting outside the layer it was bound to. Neither is a dramatic failure —
+/// the file opens, every pixel is there — which is exactly what makes it the
+/// case this attribute exists for. An older build now refuses the document
+/// instead, and says which version it would need.
+///
+/// A lock and a link did **not** earn it and ride along on the same revision.
+/// An older build that drops them shows the identical picture; what it loses is
+/// a promise about what the artist can do to it next, which is recoverable by
+/// setting the flag again and is not worth refusing somebody's painting over.
+/// They are only ever written on a file that carries something else, or on one
+/// declaring revision 1 — see [`required_version`].
+pub const VERSION: u32 = 2;
 
-/// `<image>` attribute naming [`VERSION`].
+/// The lowest revision that describes `layers`.
+///
+/// The point is that a document with no masks and no clipping still declares
+/// **1** and therefore still opens in every Umber that came before. Writing
+/// [`VERSION`] unconditionally would lock every file this build touches away
+/// from older ones in exchange for nothing: a revision number is a statement
+/// about what a file *contains*, not about what wrote it.
+fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
+    if layers.iter().any(|l| l.mask.is_some() || l.clipped) {
+        2
+    } else {
+        1
+    }
+}
+
+/// `<image>` attribute naming the revision the file needs — see
+/// [`required_version`], which is not always [`VERSION`].
 pub const VERSION_ATTR: &str = "umber-version";
+
+/// `<layer>` attribute naming the archive entry holding the layer's mask.
+///
+/// The mask lives **outside** the ORA layer stack, under `umber/`, and that is
+/// the whole of how a masked document stays a plain `.ora`. The alternatives
+/// were both worse: a mask written as another `<layer>` would appear in every
+/// other application's layers panel as a grey rectangle nobody made, and
+/// Krita's convention — a nested `<stack>` whose second entry composites
+/// `svg:dst-in` — is not baseline ORA and would be read by GIMP and MyPaint as
+/// a layer that erases the one below it. An entry nobody else looks for is read
+/// by nobody else, so what other applications see is the layer unmasked, which
+/// is why this is one of the two things [`VERSION`] was raised for.
+pub const MASK_ATTR: &str = "umber-mask";
+
+/// `<layer>` attribute marking a layer clipped to the one below, spelled
+/// `"true"`.
+pub const CLIP_ATTR: &str = "umber-clip";
+
+/// `<layer>` attribute marking a locked layer, spelled `"true"`.
+pub const LOCK_ATTR: &str = "umber-lock";
+
+/// `<layer>` attribute marking a linked layer, spelled `"true"`.
+pub const LINK_ATTR: &str = "umber-link";
+
+/// Where a layer's mask goes inside the archive.
+pub fn mask_src(index: usize) -> String {
+    format!("umber/masks/{index:03}.png")
+}
 
 /// `<layer>` attribute marking the selected layer, spelled `"true"`.
 pub const SELECTED_ATTR: &str = "umber-selected";
@@ -211,6 +277,40 @@ pub struct SaveLayer<'a> {
     /// `width * height * 4` bytes in layer-texture form — sRGB-encoded with
     /// alpha premultiplied in linear space. See the module docs.
     pub pixels: &'a [u8],
+    /// The layer's mask slice, canvas-sized and in the same form as `pixels`.
+    ///
+    /// Only the **red** channel is written — a mask is coverage, and the slice
+    /// carries the same value in all three colour channels. See
+    /// [`MASK_ATTR`].
+    pub mask: Option<&'a [u8]>,
+    /// Bounded by the alpha of the nearest unclipped layer below.
+    pub clipped: bool,
+    /// Refuses edits until unlocked.
+    pub locked: bool,
+    /// Moves with the other linked layers.
+    pub linked: bool,
+}
+
+impl<'a> SaveLayer<'a> {
+    /// A layer with none of the flags set and no mask.
+    ///
+    /// A constructor rather than `Default`, because the three fields it does
+    /// take have no sensible default and a half-built layer is not a thing to
+    /// hand round. Its purpose is that adding a flag here does not mean
+    /// touching every test that builds one.
+    pub fn new(name: &'a str, blend: BlendMode, pixels: &'a [u8]) -> Self {
+        Self {
+            name,
+            visible: true,
+            opacity: 1.0,
+            blend,
+            pixels,
+            mask: None,
+            clipped: false,
+            locked: false,
+            linked: false,
+        }
+    }
 }
 
 /// A document on its way to disk.
@@ -414,6 +514,15 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                 expected,
             });
         }
+        if let Some(mask) = layer.mask
+            && mask.len() != expected
+        {
+            return Err(SaveError::WrongSize {
+                what: format!("mask of layer “{}”", layer.name),
+                found: mask.len(),
+                expected,
+            });
+        }
     }
     if doc.merged.len() != expected {
         return Err(SaveError::WrongSize {
@@ -443,6 +552,27 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         zip.start_file(&src, stored())?;
         zip.write_all(&png)?;
 
+        // The mask, as a greyscale PNG of the slice's red channel, under
+        // `umber/` where no other reader will look. Never trimmed: a mask is
+        // canvas-sized by definition and its *transparent* region is a region
+        // that hides, so a bounding box of the non-zero pixels would come back
+        // as a mask that revealed everything outside it.
+        //
+        // The bytes go in raw, exactly as the history's patches do: they are
+        // coverage, not colour, and the straight-alpha conversion the layer
+        // images get exists so other applications can read them. Nothing else
+        // reads these.
+        let mask_src = match layer.mask {
+            Some(mask) => {
+                let src = mask_src(i);
+                let grey: Vec<u8> = mask.chunks_exact(4).map(|px| px[0]).collect();
+                zip.start_file(&src, stored())?;
+                zip.write_all(&encode_png_grey(doc.size, &grey)?)?;
+                Some(src)
+            }
+            None => None,
+        };
+
         let (op, exact) = composite_op(layer.blend);
         if !exact {
             warnings.push(SaveWarning::BlendApproximated {
@@ -453,7 +583,15 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
         }
         // `doc.active` indexes the bottom-first stack; this loop runs top first.
         let selected = doc.layers.len() - 1 - i == doc.active;
-        entries.push(layer_xml(layer, &src, placed.at, op, exact, selected));
+        entries.push(layer_xml(
+            layer,
+            &src,
+            placed.at,
+            op,
+            exact,
+            selected,
+            mask_src.as_deref(),
+        ));
     }
 
     // The background goes in last, so it is the bottom of the stack — and it is
@@ -478,7 +616,16 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     };
 
     zip.start_file("stack.xml", deflated())?;
-    zip.write_all(stack_xml(doc.size, doc.dpi, saved_history, &entries).as_bytes())?;
+    zip.write_all(
+        stack_xml(
+            doc.size,
+            doc.dpi,
+            required_version(doc.layers),
+            saved_history,
+            &entries,
+        )
+        .as_bytes(),
+    )?;
 
     // Both are required of a conforming writer, and both are what gives a file
     // manager something to show.
@@ -544,7 +691,13 @@ pub fn background_from_id(id: &str) -> Option<Color> {
 
 // --- the XML ---------------------------------------------------------------
 
-fn stack_xml(size: UVec2, dpi: f32, saved_history: bool, layers: &[String]) -> String {
+fn stack_xml(
+    size: UVec2,
+    dpi: f32,
+    version: u32,
+    saved_history: bool,
+    layers: &[String],
+) -> String {
     // `xres`/`yres` are OpenRaster's own, in whole pixels per inch, and every
     // reader that cares about print already looks for them — which is exactly
     // why there is no `umber-dpi` beside them. Umber has one resolution rather
@@ -560,7 +713,7 @@ fn stack_xml(size: UVec2, dpi: f32, saved_history: bool, layers: &[String]) -> S
     let mut out = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
     out.push_str(&format!(
         "<image w=\"{}\" h=\"{}\" xres=\"{res}\" yres=\"{res}\" \
-         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{VERSION}\"{history}>\n \
+         version=\"{ORA_VERSION}\" {VERSION_ATTR}=\"{version}\"{history}>\n \
          <stack>\n",
         size.x, size.y
     ));
@@ -573,6 +726,7 @@ fn stack_xml(size: UVec2, dpi: f32, saved_history: bool, layers: &[String]) -> S
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layer_xml(
     layer: &SaveLayer<'_>,
     src: &str,
@@ -580,6 +734,7 @@ fn layer_xml(
     op: &str,
     exact: bool,
     selected: bool,
+    mask: Option<&str>,
 ) -> String {
     let mut out = format!(
         "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" \
@@ -595,6 +750,20 @@ fn layer_xml(
     }
     if selected {
         out.push_str(&format!(" {SELECTED_ATTR}=\"true\""));
+    }
+    if let Some(mask) = mask {
+        out.push_str(&format!(" {MASK_ATTR}=\"{mask}\""));
+    }
+    // Written only when set, so a file from a document nobody has flagged
+    // anything on is byte for byte the file this module always wrote.
+    for (attr, on) in [
+        (CLIP_ATTR, layer.clipped),
+        (LOCK_ATTR, layer.locked),
+        (LINK_ATTR, layer.linked),
+    ] {
+        if on {
+            out.push_str(&format!(" {attr}=\"true\""));
+        }
     }
     out.push_str("/>");
     out
@@ -755,6 +924,26 @@ fn thumbnail(merged: &[u8], canvas: UVec2) -> (UVec2, Vec<u8>) {
     (UVec2::new(tw, th), out)
 }
 
+/// One byte per pixel, for a layer mask.
+///
+/// Greyscale rather than RGBA because a mask is one channel and writing four
+/// would quadruple the entry for three copies of the same byte. `decode_png`
+/// widens it back to `(g, g, g, 255)` on the way in, which is exactly the form
+/// a mask slice holds — so the round trip is byte for byte and needs no
+/// conversion at either end.
+fn encode_png_grey(size: UVec2, grey: &[u8]) -> Result<Vec<u8>, SaveError> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, size.x, size.y);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(grey))
+        .map_err(|e| SaveError::Io(std::io::Error::other(e)))?;
+    Ok(out)
+}
+
 fn encode_png(size: UVec2, rgba: &[u8]) -> Result<Vec<u8>, SaveError> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, size.x, size.y);
@@ -809,13 +998,7 @@ mod tests {
     }
 
     fn layer<'a>(name: &'a str, pixels: &'a [u8]) -> SaveLayer<'a> {
-        SaveLayer {
-            name,
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels,
-        }
+        SaveLayer::new(name, BlendMode::Normal, pixels)
     }
 
     /// Write a document and read it straight back through the importer, which
@@ -835,18 +1018,14 @@ mod tests {
 
         let layers = vec![
             SaveLayer {
-                name: "Paper",
                 visible: true,
                 opacity: 0.5,
-                blend: BlendMode::Multiply,
-                pixels: &bottom,
+                ..SaveLayer::new("Paper", BlendMode::Multiply, &bottom)
             },
             SaveLayer {
-                name: "Ink",
                 visible: false,
                 opacity: 1.0,
-                blend: BlendMode::Screen,
-                pixels: &top,
+                ..SaveLayer::new("Ink", BlendMode::Screen, &top)
             },
         ];
         let doc = round_trip(&SaveDocument {
@@ -875,6 +1054,100 @@ mod tests {
         assert_eq!(doc.active, Some(0), "the selected layer was lost");
         assert_eq!(doc.layers[0].pixels, bottom);
         assert_eq!(doc.layers[1].pixels, top);
+    }
+
+    /// A mask, a clip, a lock and a link all the way out and back.
+    ///
+    /// The mask is the one with pixels in it, so it is checked byte for byte:
+    /// it goes into the archive as the red channel of a slice and has to come
+    /// back as a slice whose red channel is those bytes again. Anything lossy
+    /// in that path would show up as a mask that drifted a level every time the
+    /// document was saved — the same failure
+    /// `saving_and_reopening_does_not_move_a_pixel` guards for the picture.
+    #[test]
+    fn masks_and_the_layer_flags_survive_a_round_trip() {
+        let size = UVec2::new(4, 4);
+        let pixels = solid(size, [10, 20, 30, 255]);
+        // A gradient rather than a flat fill, so a mask written back
+        // transposed, trimmed or half-decoded could not pass.
+        let mask: Vec<u8> = (0..16u8)
+            .flat_map(|i| {
+                let v = i * 17;
+                [v, v, v, 255]
+            })
+            .collect();
+
+        let layers = vec![
+            SaveLayer {
+                locked: true,
+                ..SaveLayer::new("Paper", BlendMode::Normal, &pixels)
+            },
+            SaveLayer {
+                mask: Some(&mask),
+                clipped: true,
+                linked: true,
+                ..SaveLayer::new("Ink", BlendMode::Normal, &pixels)
+            },
+        ];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A document that carries a mask needs the revision that was raised
+        // for one, so an older build refuses it rather than opening a picture
+        // with the mask silently gone.
+        assert!(
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"{VERSION}\"")),
+            "a masked document must declare the revision it needs"
+        );
+        // And the mask lives outside the ORA stack, so no other reader shows it
+        // as a layer nobody made.
+        let names: Vec<String> = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+            .unwrap()
+            .file_names()
+            .map(str::to_string)
+            .collect();
+        assert!(names.iter().any(|n| n == &mask_src(0)), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("data/")).count(),
+            2,
+            "the mask must not be one of the layers"
+        );
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.layers[0].locked, "the lock was lost");
+        assert!(!doc.layers[0].clipped);
+        assert_eq!(doc.layers[0].mask, None);
+        assert!(doc.layers[1].clipped, "the clip was lost");
+        assert!(doc.layers[1].linked, "the link was lost");
+        assert_eq!(
+            doc.layers[1].mask.as_deref(),
+            Some(&mask[..]),
+            "the mask did not come back byte for byte"
+        );
+
+        // And the mask reaches the stack as a slice of its own, ready to be
+        // uploaded like any other.
+        let opened = doc.open();
+        let mask_slot = opened.stack.mask_at(1).expect("the layer kept its mask");
+        assert!(opened.stack.mask_at(0).is_none());
+        assert!(
+            opened
+                .uploads
+                .iter()
+                .any(|u| u.slot == mask_slot && u.pixels == mask),
+            "the mask's pixels were not handed over for upload"
+        );
     }
 
     #[test]
@@ -1131,11 +1404,9 @@ mod tests {
         let size = UVec2::new(2, 2);
         let pixels = solid(size, [90, 90, 90, 255]);
         let layers = vec![SaveLayer {
-            name: "Glow",
             visible: true,
             opacity: 1.0,
-            blend: BlendMode::Add,
-            pixels: &pixels,
+            ..SaveLayer::new("Glow", BlendMode::Add, &pixels)
         }];
         let doc = SaveDocument {
             size,
@@ -1199,10 +1470,17 @@ mod tests {
         })
         .unwrap();
 
+        // A document with no mask and no clipping declares revision 1, so it
+        // still opens in every build that came before — see `required_version`.
+        assert!(
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"1\"")),
+            "a plain document must not claim a revision it does not use"
+        );
+
         // Rewrite the archive with the version bumped past this build's.
         let doctored = with_stack_xml(&bytes, |xml| {
             xml.replace(
-                &format!("{VERSION_ATTR}=\"{VERSION}\""),
+                &format!("{VERSION_ATTR}=\"1\""),
                 &format!("{VERSION_ATTR}=\"{}\"", VERSION + 1),
             )
         });

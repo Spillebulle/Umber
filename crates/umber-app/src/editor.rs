@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, Handle, History, Hsv, InputPoint,
-    LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp, StrokeBuilder, TipMask,
-    Transform,
+    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, EditTarget, Handle, History, Hsv,
+    InputPoint, LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp, StrokeBuilder,
+    TipMask, Transform,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -231,6 +231,20 @@ pub struct Editor {
     /// is what `CanvasRenderer::set_tip` compares to decide whether the tip
     /// already on the GPU is the one wanted.
     pub tip: Option<Arc<TipMask>>,
+    /// The *name* [`Editor::tip`] was resolved from, which is what a save
+    /// writes back onto `BrushPreset::tip`.
+    ///
+    /// Kept beside the mask rather than derived from it, because the two can
+    /// legitimately disagree in both directions and each is a real state:
+    ///
+    /// - a **name with no mask** is a library copied without its `tips/`
+    ///   directory. The brush paints round, as `BrushPreset::tip` promises, and
+    ///   the reference has to survive an Update rather than being thrown away
+    ///   on the machine that happens to be missing the picture.
+    /// - a **mask with no name** is one just imported or drawn, which has not
+    ///   been written into the library yet. Saving is what stores it and gives
+    ///   it a name, through `UserLibrary::save`'s own `tips/` path.
+    pub tip_name: Option<String>,
     /// Every mask the user's library holds, by name — what [`Editor::tip`] is
     /// resolved against. Filled in by `brushlib::resync`, which is also what
     /// keeps `presets` in step.
@@ -246,6 +260,13 @@ pub struct Editor {
     ///
     /// Per-document, so it lives in [`DocumentState`] as well as here.
     pub selection: Option<Arc<Selection>>,
+    /// Whether a stroke lands in the active layer or in its mask.
+    ///
+    /// Per-document, so it lives in [`DocumentState`] as well as here. Read
+    /// through [`Editor::stroke_target`], never off the field: a target of
+    /// `Mask` on a layer that has none is not a state anything downstream
+    /// should have to consider.
+    pub edit_target: EditTarget,
     /// Every open document, and which of them the fields above belong to.
     pub session: Session,
     /// A message that has to reach the user rather than the log — an import
@@ -424,6 +445,7 @@ impl Default for Editor {
             presets: umber_core::preset::builtin().to_vec(),
             active_preset: None,
             tip: None,
+            tip_name: None,
             tips: BTreeMap::new(),
             layers: LayerStack::new(),
             session: Session::default(),
@@ -443,6 +465,7 @@ impl Default for Editor {
             transform_buttons: [None, None],
             pixels_per_point: 1.0,
             selection: None,
+            edit_target: EditTarget::Layer,
             stroke: StrokeBuilder::new(),
             float: None,
             clipboard: None,
@@ -632,13 +655,30 @@ impl Editor {
                 .cloned()
                 .or_else(|| umber_core::tip::builtin(name).cloned())
         });
+        // The name is kept whether or not it resolved — see `Editor::tip_name`.
+        // Dropping it here would mean that opening a brush on a machine without
+        // its `tips/` directory and pressing Update took the reference off the
+        // brush for every machine.
+        self.tip_name = preset.tip.clone();
         self.active_preset = Some(index);
+    }
+
+    /// Put a bitmap tip in the brush's hand, by name where it has one.
+    ///
+    /// `name` is `None` for a mask that is not in the library yet — one just
+    /// imported or drawn — which `UserLibrary::save` stores and names when the
+    /// brush is saved.
+    pub fn set_tip(&mut self, mask: Arc<TipMask>, name: Option<String>) {
+        self.tip = Some(mask);
+        self.tip_name = name;
     }
 
     /// Take the bitmap tip off the brush in hand, without touching the preset
     /// it came from. Saving is what makes that stick.
     pub fn clear_tip(&mut self) {
         self.tip = None;
+        // Both halves, or an Update would put the reference straight back.
+        self.tip_name = None;
     }
 
     pub fn fit_view(&mut self) {
@@ -676,6 +716,7 @@ impl Editor {
             history: std::mem::take(&mut self.history),
             camera: self.camera,
             selection: self.selection.take(),
+            edit_target: std::mem::take(&mut self.edit_target),
         }
     }
 
@@ -685,6 +726,7 @@ impl Editor {
         self.history = state.history;
         self.camera = state.camera;
         self.selection = state.selection;
+        self.edit_target = state.edit_target;
         // The gesture, unlike the selection, does not travel: it belonged to
         // the pointer, and the pointer is now over a different document.
         self.selection_draft = None;
@@ -897,13 +939,75 @@ impl Editor {
             .collect()
     }
 
-    pub fn begin_stroke(&mut self, point: InputPoint) {
+    // --- what a stroke lands in ---------------------------------------------
+
+    /// Where a stroke would go: the slice, and whether it is a mask.
+    ///
+    /// The **one** place [`Editor::edit_target`] is turned into something the
+    /// engine acts on. Asking for the mask of a layer that has none is not an
+    /// error and not a refusal — it paints the layer, because the alternative
+    /// is a brush that silently does nothing and a switch that has to be kept
+    /// in step with which layer is selected.
+    pub fn stroke_target(&self) -> (u32, bool) {
+        match (self.edit_target, self.layers.active_mask()) {
+            (EditTarget::Mask, Some(slot)) => (slot, true),
+            _ => (self.layers.active_slot(), false),
+        }
+    }
+
+    /// True when the interface should show the mask as the thing being painted.
+    pub fn editing_mask(&self) -> bool {
+        self.stroke_target().1
+    }
+
+    /// What a stroke on a mask puts down.
+    ///
+    /// A mask holds coverage, not colour, so the palette is read as a **grey**:
+    /// black hides, white reveals, and everything between is a partial. The
+    /// eraser reveals — it paints white — rather than scaling the slice's alpha
+    /// down, because the composite reads the red channel and an eraser that
+    /// moved only the alpha would appear to do nothing at all. Forcing the mode
+    /// here, once, is what keeps that out of the shader: `commit.wgsl` and
+    /// `composite.wgsl` both see an ordinary paint stroke in a grey.
+    fn mask_paint(&self) -> (Color, BrushMode) {
+        let level = match self.brush.mode {
+            BrushMode::Erase => 1.0,
+            BrushMode::Paint => self.color.luminance(),
+        };
+        (
+            Color {
+                r: level,
+                g: level,
+                b: level,
+                a: 1.0,
+            },
+            BrushMode::Paint,
+        )
+    }
+
+    /// Begin a stroke, unless the layer it would land on is locked.
+    ///
+    /// **The lock is refused here and nowhere else on the painting path.** Every
+    /// route to a stroke — mouse, pen, touch, a shortcut that starts one —
+    /// arrives at this function, so a check spread over those call sites is one
+    /// that a later route would miss. Returns whether the stroke started, which
+    /// is what tells the caller not to put the interaction into `Drawing`.
+    pub fn begin_stroke(&mut self, point: InputPoint) -> bool {
+        if self.layers.active_is_locked() {
+            return false;
+        }
+        let (slot, on_mask) = self.stroke_target();
+        let (color, mode) = if on_mask {
+            self.mask_paint()
+        } else {
+            (self.color, self.brush.mode)
+        };
         // Snapshot the brush: the user can change colour, opacity or layer via
         // the panel mid-stroke, but the stroke must finish as it started.
         self.stroke_style = StrokeStyle {
-            color: self.color,
+            color,
             opacity: self.brush.opacity,
-            mode: self.brush.mode,
+            mode,
             // Decided once, here, from the brush this stroke started with. It
             // must not change mid-stroke: dabs already stamped without a colour
             // recorded would commit as the flat palette colour while the rest
@@ -914,14 +1018,27 @@ impl Editor {
             // agree with `StrokeBuilder::is_coloured`, which is what decides
             // which dab pipeline the frame uses.
             per_dab_color: self.brush.colours_dabs(),
+            // Snapshotted with everything else, for the same reason: switching
+            // the edit target mid-stroke must not send the second half of a
+            // mark somewhere the first half did not go.
+            on_mask,
         };
-        self.stroke_slot = self.layers.active_slot();
+        // The mask's slice, when that is what is being painted. Captured here
+        // exactly as the layer's was, so selecting another layer — or turning
+        // the mask switch — mid-stroke cannot land the commit elsewhere.
+        self.stroke_slot = slot;
         self.pressure.reset();
         // `Color` is already linear — the engine works in linear throughout —
-        // so this is the same value the composite would have used.
-        let paint = [self.color.r, self.color.g, self.color.b];
-        self.stroke.begin(self.brush, paint, point);
+        // so this is the same value the composite would have used. The
+        // snapshotted colour rather than the palette, so a mask stroke's grey
+        // is what the dabs carry too.
+        let color = self.stroke_style.color;
+        let paint = [color.r, color.g, color.b];
+        let mut brush = self.brush;
+        brush.mode = self.stroke_style.mode;
+        self.stroke.begin(brush, paint, point);
         self.interaction = Interaction::Drawing;
+        true
     }
 
     // --- selections -------------------------------------------------------
@@ -1145,6 +1262,12 @@ impl Editor {
                 opacity: l.opacity,
                 blend: l.blend.index(),
                 visible: l.visible,
+                // The mask is *not* swapped for the preview slice: a floating
+                // transform moves the layer's pixels, not what hides them, and
+                // the preview has to be masked exactly as the committed result
+                // will be.
+                mask: l.mask(),
+                clipped: l.clipped,
             })
             .collect()
     }
@@ -1168,5 +1291,93 @@ impl Editor {
     /// about rather than leaving them wondering why the pen feels dead.
     pub fn pressure_is_flat(&self) -> bool {
         matches!(self.pressure.source, PressureSource::Constant)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point() -> InputPoint {
+        InputPoint::new(Vec2::splat(10.0), 1.0, 0.0)
+    }
+
+    /// The gate every route to a stroke passes through. Checked here rather
+    /// than at the four call sites in `app.rs` that reach it, which is the
+    /// whole of how a lock cannot be forgotten by a fifth.
+    #[test]
+    fn a_locked_layer_refuses_a_stroke() {
+        let mut ed = Editor::default();
+        assert!(ed.begin_stroke(point()), "an unlocked layer paints");
+        assert_eq!(ed.interaction, Interaction::Drawing);
+
+        ed.stroke.end();
+        ed.interaction = Interaction::Idle;
+        ed.layers.active_mut().locked = true;
+        assert!(!ed.begin_stroke(point()), "a locked layer must refuse");
+        assert_eq!(
+            ed.interaction,
+            Interaction::Idle,
+            "a refused stroke must not leave the pointer drawing"
+        );
+        assert!(!ed.stroke.is_active());
+    }
+
+    /// The edit target only means anything on a layer that has a mask, and
+    /// [`Editor::stroke_target`] is the one place that decides it — so nothing
+    /// downstream ever sees "paint the mask" on a layer with none.
+    #[test]
+    fn the_edit_target_falls_back_to_the_layer_without_a_mask() {
+        let mut ed = Editor {
+            edit_target: EditTarget::Mask,
+            ..Default::default()
+        };
+        assert_eq!(ed.stroke_target(), (ed.layers.active_slot(), false));
+        assert!(!ed.editing_mask());
+
+        let mask = ed.layers.add_mask(0).unwrap();
+        assert_eq!(ed.stroke_target(), (mask, true));
+        assert!(ed.editing_mask());
+    }
+
+    /// A mask holds coverage, so a stroke on one is a grey — and the eraser
+    /// reveals rather than scaling the slice's alpha down, which the composite
+    /// would not see at all. Both are decided once, in `begin_stroke`, and
+    /// travel to the preview and the commit as one snapshotted `StrokeStyle`.
+    #[test]
+    fn a_stroke_on_a_mask_is_a_grey_and_the_eraser_reveals() {
+        let mut ed = Editor::default();
+        let mask = ed.layers.add_mask(0).unwrap();
+        ed.edit_target = EditTarget::Mask;
+        ed.set_color(Color::new(0.0, 1.0, 0.0, 1.0));
+
+        assert!(ed.begin_stroke(point()));
+        assert!(ed.stroke_style.on_mask);
+        assert_eq!(ed.stroke_slot, mask, "the commit must land in the mask");
+        let c = ed.stroke_style.color;
+        assert_eq!((c.r, c.g, c.b), (c.r, c.r, c.r), "a mask stroke is a grey");
+        assert!(c.r > 0.0 && c.r < 1.0, "green is a mid grey, not black");
+
+        ed.interaction = Interaction::Idle;
+        ed.brush.mode = BrushMode::Erase;
+        assert!(ed.begin_stroke(point()));
+        assert_eq!(ed.stroke_style.mode, BrushMode::Paint);
+        assert_eq!(ed.stroke_style.color.r, 1.0, "the eraser reveals");
+    }
+
+    /// Painting the layer is untouched by any of the above: the same slot, the
+    /// palette colour, and the mode the tool is in.
+    #[test]
+    fn painting_the_layer_is_exactly_what_it_was() {
+        let mut ed = Editor::default();
+        ed.layers.add_mask(0);
+        ed.set_color(Color::new(0.25, 0.5, 0.75, 1.0));
+        ed.brush.mode = BrushMode::Erase;
+
+        assert!(ed.begin_stroke(point()));
+        assert!(!ed.stroke_style.on_mask);
+        assert_eq!(ed.stroke_slot, ed.layers.active_slot());
+        assert_eq!(ed.stroke_style.color, ed.color);
+        assert_eq!(ed.stroke_style.mode, BrushMode::Erase);
     }
 }

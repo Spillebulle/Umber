@@ -98,6 +98,63 @@ pub fn slider_row(
     changed
 }
 
+/// A square icon that is either on or off, and can be unavailable.
+///
+/// The Layers panel's flags — clip, lock, link — are all of this shape:
+/// something the selected layer either is or is not, small enough to sit four
+/// across in a docked panel. It is not [`toggle`], which is a 28-px pill and
+/// belongs on a labelled row; and it is not [`crate::ui::icon_button`], which
+/// has no on state at all, so a lock drawn with it would look identical whether
+/// the layer was locked or not.
+///
+/// **Off is not dim.** Dim means "unavailable" everywhere in this interface, so
+/// an off toggle keeps the ordinary text colour and it is the *chip* behind it
+/// that appears when it is on. A disabled one is dim and does not respond,
+/// which is the state the tooltip has to explain.
+pub fn icon_toggle(
+    ui: &mut Ui,
+    p: &Palette,
+    icon: Icon,
+    on: bool,
+    enabled: bool,
+    tip: &str,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::splat(20.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hovered = enabled && response.hovered();
+    if on {
+        ui.painter()
+            .rect_filled(rect, metrics::RADIUS, p.control_active);
+        ui.painter().rect_stroke(
+            rect,
+            metrics::RADIUS,
+            Stroke::new(1.0, p.accent_dim),
+            egui::StrokeKind::Inside,
+        );
+    } else if hovered {
+        ui.painter().rect_filled(rect, metrics::RADIUS, p.control);
+    }
+    icons::draw(
+        ui.painter(),
+        rect.shrink(2.0),
+        icon,
+        if !enabled {
+            p.text_dim.gamma_multiply(0.4)
+        } else if on || hovered {
+            p.text_strong
+        } else {
+            p.text
+        },
+    );
+    response.on_hover_text(tip).clicked()
+}
+
 /// Pill toggle, 28×16 with a sliding knob.
 pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(vec2(28.0, 16.0), Sense::click());
@@ -1627,25 +1684,54 @@ pub fn elide(painter: &egui::Painter, s: &str, size: f32, width: f32) -> String 
 pub struct LayerRowResponse {
     pub clicked: bool,
     pub eye_clicked: bool,
+    /// The mask chip was clicked, which is how the edit target is switched from
+    /// the list rather than from the toggle row.
+    pub mask_clicked: bool,
+}
+
+/// What one row has to draw besides its name.
+///
+/// A struct rather than seven positional arguments, because a row of `bool`s at
+/// a call site is exactly where "visible" and "locked" get transposed and
+/// nothing complains.
+#[derive(Clone, Copy)]
+pub struct LayerRow<'a> {
+    pub name: &'a str,
+    /// Identifies the layer for the row's inner hit targets. The layer's
+    /// *name* looks like the obvious key and is not one: names Umber generates
+    /// are unique, but an imported ORA or PSD routinely carries two layers
+    /// called the same thing, and two widgets sharing an id is an egui id clash
+    /// — one of the two eyes then stops answering. A slot is unique by
+    /// construction and never changes hands while a layer exists.
+    pub slot: u32,
+    pub visible: bool,
+    pub active: bool,
+    pub blend: &'a str,
+    pub has_mask: bool,
+    /// The mask, rather than the layer, is what a stroke would land in. Only
+    /// ever true on the selected row — the edit target is per document.
+    pub editing_mask: bool,
+    pub clipped: bool,
+    pub locked: bool,
+    pub linked: bool,
 }
 
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
 ///
-/// `slot` identifies the layer for the eye's own hit target. The layer's *name*
-/// looks like the obvious key and is not one: names Umber generates are unique,
-/// but an imported ORA or PSD routinely carries two layers called the same
-/// thing, and two widgets sharing an id is an egui id clash — one of the two
-/// eyes then stops answering. A slot is unique by construction and never
-/// changes hands while a layer exists.
-pub fn layer_row(
-    ui: &mut Ui,
-    p: &Palette,
-    name: &str,
-    slot: u32,
-    visible: bool,
-    active: bool,
-    blend: &str,
-) -> LayerRowResponse {
+/// The flags are **shown** here and changed from the panel's toggle row. Four
+/// more hit targets per row would either grow the row — the list has to hold
+/// eight layers on screen — or leave the name nothing to be drawn in. The one
+/// exception is the mask chip, which is a target because clicking the thing you
+/// want to paint is the whole gesture and there is nowhere else it could go.
+pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowResponse {
+    let LayerRow {
+        name,
+        slot,
+        visible,
+        active,
+        blend,
+        ..
+    } = row;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
 
     let painter = ui.painter();
@@ -1690,10 +1776,77 @@ pub fn layer_row(
         }
     }
 
+    // The mask chip, beside the layer's own, and only where there is a mask.
+    // It is the switch as well as the indicator: clicking the thing you mean to
+    // paint is the gesture every application uses for this, and the ring is
+    // what says which of the two the brush is currently pointed at.
+    let mut mask_clicked = false;
+    let mut text_left = thumb.right() + 8.0;
+    if row.has_mask {
+        let chip = Rect::from_min_size(thumb.right_top() + vec2(4.0, 3.0), vec2(18.0, 18.0));
+        let hit = ui.interact(chip, ui.id().with(("mask", slot)), Sense::click());
+        mask_clicked = hit.clicked();
+        ui.painter().rect_filled(chip, 3.0, p.window);
+        icons::draw(
+            ui.painter(),
+            chip.shrink(2.0),
+            Icon::Mask,
+            if row.editing_mask {
+                p.text_strong
+            } else {
+                p.text_dim
+            },
+        );
+        // Drawn on whichever of the two the strokes are going into, so the pair
+        // always says which is which rather than only saying "there is a mask".
+        let aimed = if row.editing_mask { chip } else { thumb };
+        ui.painter().rect_stroke(
+            aimed.expand(1.0),
+            3.0,
+            Stroke::new(1.0, if active { p.accent } else { p.border }),
+            egui::StrokeKind::Outside,
+        );
+        text_left = chip.right() + 6.0;
+    }
+
+    // The flags, as small marks between the name and the blend label. Painted
+    // only when set: a row of four grey icons on every layer is noise, and the
+    // list's job is to let a stack be read at a glance.
+    let painter = ui.painter();
+    let mut marks_left = rect.right() - 7.0;
+    let blend_width = painter
+        .layout_no_wrap(blend.to_owned(), FontId::proportional(9.0), p.text_dim)
+        .size()
+        .x;
+    marks_left -= blend_width;
+    for (on, icon) in [
+        (row.clipped, Icon::Clip),
+        (row.locked, Icon::Lock),
+        (row.linked, Icon::Chain),
+    ] {
+        if !on {
+            continue;
+        }
+        marks_left -= 14.0;
+        icons::draw(
+            painter,
+            Rect::from_min_size(pos2(marks_left, rect.center().y - 6.0), Vec2::splat(12.0)),
+            icon,
+            p.text_dim,
+        );
+    }
+
     painter.text(
-        pos2(thumb.right() + 8.0, rect.center().y),
+        pos2(text_left, rect.center().y),
         Align2::LEFT_CENTER,
-        name,
+        // Cut to what is left after the marks and the blend label, so a long
+        // name cannot run underneath either of them.
+        elide(
+            painter,
+            name,
+            text::SMALL,
+            (marks_left - text_left - 6.0).max(0.0),
+        ),
         FontId::proportional(text::SMALL),
         match (active, visible) {
             (true, _) => p.text_strong,
@@ -1712,6 +1865,7 @@ pub fn layer_row(
     LayerRowResponse {
         clicked: response.clicked(),
         eye_clicked: eye_response.clicked(),
+        mask_clicked,
     }
 }
 

@@ -254,13 +254,11 @@ fn main() {
     let mut stack = LayerStack::new();
     stack.get_mut(0).unwrap().name = "Paint".into();
     let size = UVec2::new(W as u32, H as u32);
-    let layers = [SaveLayer {
-        name: "Paint",
-        visible: true,
-        opacity: 1.0,
-        blend: umber_core::layer::BlendMode::Normal,
-        pixels: &layer,
-    }];
+    let layers = [SaveLayer::new(
+        "Paint",
+        umber_core::layer::BlendMode::Normal,
+        &layer,
+    )];
     let mut document = SaveDocument {
         size,
         layers: &layers,

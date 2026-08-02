@@ -125,11 +125,10 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
             parent = group.parent_id();
         }
 
-        if is_clipped(layer.is_clipping_mask()) {
-            warnings.push(ImportWarning::ClippingIgnored {
-                layer: name.clone(),
-            });
-        }
+        // Carried across rather than reported lost: Umber's own clipping means
+        // the same thing — bounded by the nearest unclipped layer below — so
+        // there is nothing to warn about any more.
+        let clipped = is_clipped(layer.is_clipping_mask());
         if has_mask(layer) {
             warnings.push(ImportWarning::MaskIgnored {
                 layer: name.clone(),
@@ -169,13 +168,11 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         }
         srgb::encode_buffer(&mut pixels);
 
-        layers.push(ImportedLayer {
-            name,
-            visible,
-            opacity,
-            blend: mode,
-            pixels,
-        });
+        let mut imported = ImportedLayer::new(name, mode, pixels);
+        imported.visible = visible;
+        imported.opacity = opacity;
+        imported.clipped = clipped;
+        layers.push(imported);
     }
 
     if layers.is_empty() {
@@ -203,13 +200,7 @@ fn finish_flat(size: UVec2, mut pixels: Vec<u8>, warnings: Vec<ImportWarning>) -
     ImportedDocument {
         format: FORMAT,
         size,
-        layers: vec![ImportedLayer {
-            name: "Background".to_string(),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels,
-        }],
+        layers: vec![ImportedLayer::new("Background", BlendMode::Normal, pixels)],
         active: None,
         background: Background::Transparent,
         dpi: None,
@@ -401,8 +392,11 @@ mod tests {
         );
     }
 
+    /// Clipping used to be a reported loss and is now carried across, because
+    /// Umber's own flag means the same thing. A warning here would be an
+    /// import claiming to have dropped something it kept.
     #[test]
-    fn a_clipped_layer_is_reported() {
+    fn a_clipped_layer_arrives_clipped() {
         let psd = fixtures::psd(
             1,
             1,
@@ -412,12 +406,10 @@ mod tests {
             ],
         );
         let doc = read(&psd).unwrap();
-        assert_eq!(
-            doc.warnings,
-            vec![ImportWarning::ClippingIgnored {
-                layer: "Clipped".into()
-            }]
-        );
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        // Bottom first, so the clipped one is on top.
+        assert!(!doc.layers[0].clipped, "the base is not clipped");
+        assert!(doc.layers[1].clipped);
     }
 
     #[test]

@@ -65,6 +65,13 @@ struct LayerSpec {
     /// `umber-background`: this "layer" is really the document background, and
     /// this is its colour. The PNG beside it is for other applications.
     background: Option<Color>,
+    /// `umber-mask`: the archive entry holding this layer's mask, outside the
+    /// ORA layer stack. See [`docformat::MASK_ATTR`].
+    mask_src: Option<String>,
+    /// `umber-clip`, `umber-lock`, `umber-link`.
+    clipped: bool,
+    locked: bool,
+    linked: bool,
 }
 
 pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
@@ -293,6 +300,10 @@ fn parse_stack(
                             background: attrs
                                 .get(docformat::BACKGROUND_ATTR)
                                 .and_then(docformat::background_from_id),
+                            mask_src: attrs.string(docformat::MASK_ATTR),
+                            clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
+                            locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
+                            linked: attrs.get(docformat::LINK_ATTR) == Some("true"),
                         });
                     }
                     _ => {}
@@ -357,13 +368,49 @@ fn load_layer(
     );
     srgb::encode_buffer(&mut pixels);
 
-    Ok(ImportedLayer {
-        name: spec.name.clone(),
-        visible: spec.visible,
-        opacity: spec.opacity,
-        blend: mode,
-        pixels,
-    })
+    let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
+    layer.visible = spec.visible;
+    layer.opacity = spec.opacity;
+    layer.clipped = spec.clipped;
+    layer.locked = spec.locked;
+    layer.linked = spec.linked;
+    layer.mask = load_mask(zip, spec, canvas, warnings);
+    Ok(layer)
+}
+
+/// A layer's mask, when the file names one.
+///
+/// Canvas-sized and **not** put through `srgb`: the bytes went in raw, because
+/// a mask is coverage rather than colour and nothing but Umber reads them.
+/// `decode_png` widens the greyscale entry back to `(g, g, g, 255)`, which is
+/// exactly what a mask slice holds.
+///
+/// A mask that is named and then cannot be read is a *warning*, not a skipped
+/// layer: the pixels are all there, and a layer that comes back showing more
+/// than it should is a far smaller loss than one that does not come back at
+/// all. Saying so is the point — subtly wrong pixels are what the rule about
+/// silent losses exists for.
+fn load_mask(
+    zip: &mut Zip<'_>,
+    spec: &LayerSpec,
+    canvas: UVec2,
+    warnings: &mut Vec<ImportWarning>,
+) -> Option<Vec<u8>> {
+    let src = spec.mask_src.as_ref()?;
+    let decoded = container::read_optional_entry(zip, src, FORMAT)
+        .ok()
+        .flatten()
+        .and_then(|png| flat::decode_png(&png, FORMAT).ok())
+        .filter(|image| image.size == canvas);
+    match decoded {
+        Some(image) => Some(image.rgba),
+        None => {
+            warnings.push(ImportWarning::MaskIgnored {
+                layer: spec.name.clone(),
+            });
+            None
+        }
+    }
 }
 
 /// Last resort: the composite every ORA is required to carry.
@@ -387,13 +434,11 @@ fn flattened_fallback(
     Ok(ImportedDocument {
         format: FORMAT,
         size: canvas,
-        layers: vec![ImportedLayer {
-            name: "Merged image".to_string(),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
+        layers: vec![ImportedLayer::new(
+            "Merged image",
+            BlendMode::Normal,
             pixels,
-        }],
+        )],
         active: None,
         // `mergedimage.png` already has the background composited into it, so
         // carrying the property across as well would paint it a second time.

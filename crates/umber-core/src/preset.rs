@@ -149,12 +149,85 @@ impl BrushPreset {
         Self {
             id: String::new(),
             name: name.into(),
-            category: "My brushes".to_string(),
+            category: MINE.to_string(),
             collection: None,
             credit: None,
             brush,
             tip: None,
         }
+    }
+
+    /// A brand-new brush, made from nothing rather than saved out of one that
+    /// was already in hand.
+    ///
+    /// The settings are [`Brush::default`]'s, and that is the decision rather
+    /// than an omission. A new brush has to be one somebody can immediately
+    /// paint a recognisable line with and then change one thing about, so every
+    /// value here is the middle of its own range: a 24-pixel round dab at
+    /// half-hardness, full opacity, spacing a tenth of the diameter, pressure
+    /// driving size and nothing else, no scatter, no grain, no smudge and an
+    /// empty modulation table. Anything more opinionated — a soft airbrush, a
+    /// hard liner — is a brush that already exists in the shipped library and
+    /// can be reached with "Save as new…" instead.
+    ///
+    /// Deliberately **no tip**: a stamp is the one thing a new brush cannot be
+    /// given without asking where the picture comes from, which is what the
+    /// Tip section's picker and "Draw a tip…" are for.
+    ///
+    /// The collection is left to [`Self::unsaved`]'s [`MINE`], through
+    /// `category` rather than `collection`, so that filing the brush somewhere
+    /// else and then taking that choice off again puts it back where it
+    /// started rather than nowhere.
+    pub fn fresh(name: impl Into<String>) -> Self {
+        Self::unsaved(name, Brush::default())
+    }
+}
+
+/// Where a brush the user made lands, and the default [`BrushPreset::category`]
+/// of anything saved out of the brush editor.
+///
+/// Named rather than typed at each call site because the browser's rail sorts
+/// on it — a name [`crate::style::classify`] could never produce is one
+/// somebody chose, and so goes to the top — and a second spelling of it would
+/// be a second collection with half the user's brushes in it.
+pub const MINE: &str = "My brushes";
+
+/// A name for something new that nothing else is already called: `desired`
+/// where it is free, then `desired 2`, `desired 3`, and so on.
+///
+/// One function for brushes and for tips, because two that disagreed would be
+/// two naming schemes — and the failure of the second one is a library with
+/// "My brush" in it twice, which is a list nobody can read.
+///
+/// Compared with [`same_collection`]'s rule, trimmed and case-folded: "My
+/// brush" and "my brush" are two rows somebody would have to tell apart by
+/// squinting.
+///
+/// An empty or blank `desired` falls back to `fallback`, so a caller that hands
+/// this whatever was in a text field cannot produce a nameless brush.
+pub fn unique_name<'a>(
+    desired: &str,
+    fallback: &str,
+    taken: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let desired = match desired.trim() {
+        "" => fallback.trim(),
+        name => name,
+    };
+    let taken: Vec<&str> = taken.into_iter().collect();
+    let free = |candidate: &str| !taken.iter().any(|other| same_collection(other, candidate));
+    if free(desired) {
+        return desired.to_owned();
+    }
+    // From 2, because the first one has no number: "My brush" and then "My
+    // brush 2" is how everything else in the interface counts.
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{desired} {n}");
+        if free(&candidate) {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -930,6 +1003,13 @@ impl UserLibrary {
     /// A file name for a tip. Ids carry a `/`, which a file name cannot, so
     /// they go through [`slug`] — and two ids can slug to the same thing, so
     /// the result still has to be made unique.
+    ///
+    /// Hyphenated rather than [`unique_name`]'s ` 2`, and deliberately: this is
+    /// a **file stem**, not something anybody reads, and the directory is meant
+    /// to be openable with whatever opens pictures. Replacing the same brush's
+    /// tip twice therefore gives `user-nib`, `user-nib-2`, `user-nib-3` —
+    /// distinct files, so the mask a preset still names can never be written
+    /// over by a mask for a different one.
     fn allocate_tip_name(&self, preset_id: &str) -> String {
         let stem = slug(preset_id);
         let stem = if stem.is_empty() { "tip" } else { &stem };
@@ -1911,5 +1991,82 @@ mod tests {
         assert_eq!(slug("  spaced  out  "), "spaced-out");
         assert_eq!(slug("Ærø 12"), "r-12");
         assert_eq!(slug("!!!"), "");
+    }
+
+    /// A brand-new brush has to be one somebody can immediately paint a line
+    /// with, or "New brush" hands them a dead tool and a shrug.
+    #[test]
+    fn a_new_brush_is_paintable_and_files_under_the_users_own_collection() {
+        let preset = BrushPreset::fresh("My brush");
+        let b = &preset.brush;
+        assert!((Brush::MIN_SIZE..=Brush::MAX_SIZE).contains(&b.size));
+        assert!(b.step_at(0.0) > 0.0, "the dab loop would spin");
+        assert!(b.opacity > 0.0, "a new brush that paints nothing");
+        assert!(b.stabilization < 1.0, "it would never reach the pointer");
+        // No stamp: a tip is the one thing that cannot be defaulted, because it
+        // is a picture and nobody has said where it comes from yet.
+        assert!(preset.tip.is_none());
+        // Filed through `category`, so moving it out of a collection and back
+        // puts it here rather than nowhere.
+        assert_eq!(preset.category, MINE);
+        assert_eq!(preset.collection, None);
+        assert_eq!(preset.collection(), MINE);
+        // And no id: `UserLibrary::save` allocates one that cannot collide.
+        assert!(preset.id.is_empty());
+    }
+
+    /// Two brushes called "My brush" is a list nobody can read, and the second
+    /// one is what pressing New brush twice produces.
+    #[test]
+    fn a_new_name_steps_round_the_names_already_in_use() {
+        assert_eq!(unique_name("My brush", "Brush", []), "My brush");
+        assert_eq!(unique_name("My brush", "Brush", ["My brush"]), "My brush 2");
+        assert_eq!(
+            unique_name("My brush", "Brush", ["My brush", "My brush 2"]),
+            "My brush 3"
+        );
+        // Case and surrounding space do not make a second one, exactly as they
+        // do not make a second collection.
+        assert_eq!(
+            unique_name("  my brush ", "Brush", ["My brush"]),
+            "my brush 2"
+        );
+        // A gap in the middle is filled rather than stepped past: the number is
+        // "the first one free", not "how many there have ever been".
+        assert_eq!(
+            unique_name("My brush", "Brush", ["My brush", "My brush 3"]),
+            "My brush 2"
+        );
+        // Whatever a text field holds, the result is a name.
+        assert_eq!(unique_name("   ", "Brush", []), "Brush");
+        assert_eq!(unique_name("", "Brush", ["Brush"]), "Brush 2");
+    }
+
+    /// Replacing a brush's tip must not write over the file the *old* mask is
+    /// still in, because a preset somewhere else may still name it.
+    #[test]
+    fn a_second_tip_for_one_brush_gets_a_file_of_its_own() {
+        let scratch = Scratch::new("tip-names");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let id = library
+            .save(
+                BrushPreset::unsaved("Nib", Brush::default()),
+                Some(TipMask::new(2, 2, vec![255; 4]).expect("mask")),
+            )
+            .expect("save");
+        let first = library.get(&id).unwrap().tip.clone().expect("named");
+        assert_eq!(first, "user-nib");
+
+        // A second brush cut from a different stamp, then the first re-stamped.
+        let other = library
+            .save(
+                BrushPreset::unsaved("Nib", Brush::default()),
+                Some(TipMask::new(2, 2, vec![128; 4]).expect("mask")),
+            )
+            .expect("save");
+        let second = library.get(&other).unwrap().tip.clone().expect("named");
+        assert_ne!(first, second, "one file would hold two different masks");
+        assert!(scratch.tip_file(&first).exists());
+        assert!(scratch.tip_file(&second).exists());
     }
 }

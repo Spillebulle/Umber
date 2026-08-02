@@ -203,6 +203,13 @@ enum SaveBody<'a> {
         /// Index into [`super::SaveDocument::layers`], bottom first. **Never a
         /// texture slot** — see the module docs.
         layer: usize,
+        /// The patch belongs to that layer's **mask**, not to its pixels.
+        ///
+        /// A mask is another slice of the same texture array, so a patch on one
+        /// is an ordinary patch naming an ordinary slot; what a file cannot
+        /// hold is the slot, and "layer 3" alone does not say which of that
+        /// layer's two slices was painted.
+        mask: bool,
         /// The whole region the stroke damaged. The pieces are inside it and
         /// generally do not fill it — see [`crate::damage`].
         rect: PixelRect,
@@ -249,14 +256,28 @@ impl<'a> SaveHistory<'a> {
             // resolve and nothing that could fail to. A flip belongs to the
             // document rather than to one slice of it.
             let body = match edit.patch() {
-                Some(patch) => SaveBody::Pixels {
-                    layer: layers
-                        .layers()
-                        .iter()
-                        .position(|l| l.slot() == patch.slot)?,
-                    rect: patch.rect,
-                    pieces: patch.pieces(),
-                },
+                Some(patch) => {
+                    // Either of the layer's two slices. A patch that matches
+                    // neither is one whose slot has been freed — a deleted
+                    // layer or a removed mask — and both of those clear the
+                    // history, so reaching here at all means something went
+                    // wrong and the whole history is refused.
+                    let (layer, mask) = layers.layers().iter().enumerate().find_map(|(i, l)| {
+                        if l.slot() == patch.slot {
+                            Some((i, false))
+                        } else if l.mask() == Some(patch.slot) {
+                            Some((i, true))
+                        } else {
+                            None
+                        }
+                    })?;
+                    SaveBody::Pixels {
+                        layer,
+                        mask,
+                        rect: patch.rect,
+                        pieces: patch.pieces(),
+                    }
+                }
                 None => SaveBody::Flip,
             };
             entries.push(SaveEdit {
@@ -311,6 +332,18 @@ pub(crate) struct Manifest {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ManifestEdit {
     pub layer: usize,
+    /// The entry belongs to `layer`'s mask rather than to its pixels.
+    ///
+    /// `default` and skipped when false, so a manifest from a document with no
+    /// mask patches is byte for byte what this module wrote before masks
+    /// existed. This did **not** bump [`VERSION`], and the argument is short:
+    /// a mask patch can only be written where a layer actually has a mask —
+    /// `SaveHistory::new` refuses the whole history otherwise — and a document
+    /// with a mask declares `umber-version` 2, which every build that predates
+    /// this refuses before it reaches the manifest at all. A build that could
+    /// misread this field cannot open the file that carries it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mask: bool,
     /// [`EditKind`] by name — see [`kind_id`].
     pub kind: String,
     pub x: u32,
@@ -346,6 +379,11 @@ pub(crate) struct ManifestEdit {
     /// and every consumer of this field wants the integer anyway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<i64>,
+}
+
+/// `skip_serializing_if` wants a predicate over a reference.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One piece of an edit: where it goes, and what holds its pixels.
@@ -439,13 +477,15 @@ pub(crate) fn write(
             .enumerate()
             .map(|(n, (i, _))| {
                 let edit = &history.entries[*i];
-                let (layer, rect, pieces) = match &edit.body {
+                let (layer, mask, rect, pieces) = match &edit.body {
                     SaveBody::Pixels {
                         layer,
+                        mask,
                         rect,
                         pieces,
                     } => (
                         *layer,
+                        *mask,
                         *rect,
                         pieces
                             .iter()
@@ -463,6 +503,7 @@ pub(crate) fn write(
                     // has no rectangle. See [`ManifestEdit`].
                     SaveBody::Flip => (
                         0,
+                        false,
                         PixelRect {
                             x: 0,
                             y: 0,
@@ -474,6 +515,7 @@ pub(crate) fn write(
                 };
                 ManifestEdit {
                     layer,
+                    mask,
                     kind: kind_id(edit.kind),
                     x: rect.x,
                     y: rect.y,
@@ -557,11 +599,13 @@ mod tests {
             .layers()
             .iter()
             .map(|l| SaveLayer {
-                name: &l.name,
                 visible: true,
                 opacity: 1.0,
-                blend: BlendMode::Normal,
-                pixels: &pixels,
+                // A mask goes into the file wherever the stack has one, so a
+                // patch recorded against a mask has something to be placed
+                // against when the document comes back.
+                mask: l.mask().map(|_| &pixels[..]),
+                ..SaveLayer::new(&l.name, BlendMode::Normal, &pixels)
             })
             .collect();
         let (bytes, _) = encode(&SaveDocument {
@@ -712,11 +756,9 @@ mod tests {
     fn a_document_with_no_history_opens_with_an_empty_one() {
         let pixels = blank();
         let layers = vec![SaveLayer {
-            name: "Ink",
             visible: true,
             opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels: &pixels,
+            ..SaveLayer::new("Ink", BlendMode::Normal, &pixels)
         }];
         let (bytes, _) = encode(&SaveDocument {
             size: CANVAS,
@@ -843,11 +885,9 @@ mod tests {
 
         let pixels = vec![0u8; (side * side * 4) as usize];
         let layers = vec![SaveLayer {
-            name: "Ink",
             visible: true,
             opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels: &pixels,
+            ..SaveLayer::new("Ink", BlendMode::Normal, &pixels)
         }];
         let (bytes, _) = encode(&SaveDocument {
             size: UVec2::new(side, side),
@@ -980,6 +1020,40 @@ mod tests {
             manifest.version > 2,
             "a manifest carrying a flip must not claim a revision an older \
              build would open and then replay older patches mirrored"
+        );
+    }
+
+    /// A stroke on a mask has to come back as a stroke on that mask.
+    ///
+    /// This is the sharp case for "a slot is never written down": a masked
+    /// layer holds *two* slices, so a stack position alone does not say which
+    /// of them an entry was recorded against. Reading the mask entry back onto
+    /// the layer's pixels would write coverage over somebody's painting, and it
+    /// would happen on an undo, which is the one action that is supposed to be
+    /// safe.
+    #[test]
+    fn a_patch_on_a_mask_comes_back_on_that_mask() {
+        let mut stack = stack(&["Paper", "Ink"]);
+        let mask = stack.add_mask(1).expect("the layer can take a mask");
+        let pixels = stack.get(1).unwrap().slot();
+        assert_ne!(mask, pixels, "the fixture is not testing anything");
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(pixels, 4, 4, 11)));
+        history.record(Edit::new(EditKind::Paint, patch(mask, 4, 4, 22)));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let opened = doc.open();
+        assert_eq!(opened.history.len(), 2);
+
+        let slot_of = |i: usize| opened.history.entry_at(i).unwrap().patch().unwrap().slot;
+        let layer = opened.stack.get(1).unwrap();
+        assert_eq!(slot_of(0), layer.slot(), "the layer entry moved");
+        assert_eq!(
+            slot_of(1),
+            layer.mask().expect("the mask came back"),
+            "a mask entry would have been replayed into the layer's pixels"
         );
     }
 

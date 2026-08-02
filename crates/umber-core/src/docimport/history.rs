@@ -45,6 +45,10 @@ pub enum ImportedBody {
         /// A **stack position**, bottom first — never a texture slot. See
         /// [`crate::docformat::history`] for why the two must not be confused.
         layer: usize,
+        /// The patch belongs to that layer's **mask** rather than to its
+        /// pixels. False for every entry of a document written before masks
+        /// existed, which is what those entries meant.
+        mask: bool,
         /// The whole region the stroke damaged.
         rect: PixelRect,
         /// The parts of it the stroke actually touched. One covering the whole
@@ -239,6 +243,7 @@ fn load(
             at: entry.at.map(Timestamp::from_unix_millis),
             body: ImportedBody::Pixels {
                 layer: entry.layer,
+                mask: entry.mask,
                 rect: PixelRect {
                     x: entry.x,
                     y: entry.y,

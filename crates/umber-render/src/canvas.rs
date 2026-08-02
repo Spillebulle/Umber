@@ -57,6 +57,19 @@ const MAX_DABS_PER_FRAME: usize = 65_536;
 /// umber-core. All three must agree.
 const MAX_LAYERS: usize = 64;
 
+/// How deep the layer texture array may grow.
+///
+/// **Not** [`MAX_LAYERS`], and the difference is the point: that one bounds
+/// *stack positions*, because it sizes a uniform array in `composite.wgsl`,
+/// while this one bounds *slices*, and a slice is a layer, a layer's mask, or
+/// the spare a floating transform previews into. Mirrored by
+/// `LayerStack::MAX_SLOTS`.
+///
+/// Nothing is allocated up front by raising it — [`INITIAL_SLOTS`] is still
+/// four and growth still doubles — so a document with no masks pays nothing for
+/// the headroom.
+const MAX_SLOTS: usize = MAX_LAYERS * 2 + 1;
+
 /// Texture-array slices allocated up front. Growth doubles this, so a typical
 /// document never pays for a copy.
 const INITIAL_SLOTS: u32 = 4;
@@ -500,7 +513,7 @@ pub struct DocumentCapture {
 }
 
 /// One layer's contribution to the composite, in stack order.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LayerDraw {
     /// Texture-array slice holding the pixels.
     pub slot: u32,
@@ -508,6 +521,14 @@ pub struct LayerDraw {
     /// Matches `umber_core::BlendMode::index`.
     pub blend: u32,
     pub visible: bool,
+    /// Slice holding this layer's mask, when it has one. Another slice of the
+    /// same array — see `umber_core::layer`'s module docs for why.
+    ///
+    /// `None` is the exact identity in the shader: the mask factor is 1.0 and
+    /// nothing is sampled that matters.
+    pub mask: Option<u32>,
+    /// Bounded by the alpha of the nearest unclipped layer below.
+    pub clipped: bool,
 }
 
 /// How the stroke in the scratch surface should look.
@@ -528,6 +549,17 @@ pub struct StrokeStyle {
     /// stroke. Preview and commit both read it, which is what keeps them from
     /// disagreeing about where the colour came from.
     pub per_dab_color: bool,
+    /// The stroke is landing in the active layer's **mask** rather than in its
+    /// pixels.
+    ///
+    /// The switch lives here, and only here, for the reason everything else in
+    /// this struct does: preview and commit are handed the same `StrokeStyle`,
+    /// so they cannot disagree about which of the two a stroke is going into.
+    /// The slice it commits to is the one passed to
+    /// [`CanvasRenderer::commit_stroke`] — a mask is an ordinary slice, so the
+    /// commit pass needs no variant of its own; what this flag decides is where
+    /// `composite.wgsl` blends the *preview*.
+    pub on_mask: bool,
 }
 
 impl Default for StrokeStyle {
@@ -537,6 +569,7 @@ impl Default for StrokeStyle {
             opacity: 1.0,
             mode: BrushMode::Paint,
             per_dab_color: false,
+            on_mask: false,
         }
     }
 }
@@ -755,9 +788,14 @@ struct ViewUniforms {
     checker: f32,
     is_export: u32,
     per_dab_color: u32,
-    _pad: [u32; 2],
+    /// The stroke in flight is going into the active layer's mask.
+    stroke_on_mask: u32,
+    _pad: u32,
     /// (opacity, blend, slot, visible) per stack position.
     layers: [[f32; 4]; MAX_LAYERS],
+    /// (mask slot, has mask, clipped, unused) per stack position. See the WGSL
+    /// struct for why this is a second array rather than bits in the first.
+    extra: [[f32; 4]; MAX_LAYERS],
 }
 
 /// Mirrors `Xf` in `transform.wgsl`. Every member is a `vec2<f32>`, which is
@@ -1584,7 +1622,7 @@ impl CanvasRenderer {
         while capacity < needed {
             capacity *= 2;
         }
-        let capacity = capacity.min(MAX_LAYERS as u32);
+        let capacity = capacity.min(MAX_SLOTS as u32);
         log::info!(
             "growing layer storage {} -> {} slots",
             self.layers.capacity,
@@ -2113,13 +2151,27 @@ impl CanvasRenderer {
         let offset = params.camera.center - params.pivot * scale;
 
         let mut packed = [[0.0f32; 4]; MAX_LAYERS];
+        let mut extra = [[0.0f32; 4]; MAX_LAYERS];
         let count = params.layers.len().min(MAX_LAYERS);
-        for (dst, src) in packed.iter_mut().zip(&params.layers[..count]) {
+        for ((dst, ext), src) in packed
+            .iter_mut()
+            .zip(extra.iter_mut())
+            .zip(&params.layers[..count])
+        {
             *dst = [
                 src.opacity.clamp(0.0, 1.0),
                 src.blend as f32,
                 src.slot as f32,
                 if src.visible { 1.0 } else { 0.0 },
+            ];
+            *ext = [
+                // The layer's own slice where there is no mask, so the array
+                // index the shader samples is always in range and the result
+                // is discarded by the flag beside it rather than by a branch.
+                src.mask.unwrap_or(src.slot) as f32,
+                if src.mask.is_some() { 1.0 } else { 0.0 },
+                if src.clipped { 1.0 } else { 0.0 },
+                0.0,
             ];
         }
 
@@ -2151,8 +2203,10 @@ impl CanvasRenderer {
                 checker: 8.0,
                 is_export: if params.export { 1 } else { 0 },
                 per_dab_color: u32::from(params.stroke.per_dab_color),
-                _pad: [0; 2],
+                stroke_on_mask: u32::from(params.stroke.on_mask),
+                _pad: 0,
                 layers: packed,
+                extra,
             }),
         );
 
@@ -2281,6 +2335,39 @@ impl CanvasRenderer {
         if let Some(view) = self.layers.slot_views.get(slot as usize) {
             clear_view(encoder, view, "clear-layer");
         }
+    }
+
+    /// Fill one slice with opaque white — what a **new mask** starts as.
+    ///
+    /// White is "reveal everything", so a layer that has just gained a mask
+    /// looks exactly as it did a moment before; that is what makes adding one
+    /// something a painter can try rather than commit to.
+    ///
+    /// A clear rather than a draw. The clear value is linear and the target is
+    /// sRGB-typed, but 1.0 encodes to 255 either way, so the slice really does
+    /// come back as `0xff` in every channel — which matters, because the
+    /// composite reads the red one and a mask that arrived at 0xfe would dim
+    /// its layer by a level the painter never asked for.
+    pub fn fill_layer_white(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+        let Some(view) = self.layers.slot_views.get(slot as usize) else {
+            return;
+        };
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("fill-mask-white"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
     }
 
     /// Wipe every allocated slot. Used at startup.

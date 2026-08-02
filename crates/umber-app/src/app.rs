@@ -380,7 +380,13 @@ impl UmberApp {
     /// changing it mid-stroke would restamp what is already in the scratch under
     /// a new shape. Between strokes is the only safe moment, and this is it.
     fn start_stroke(&mut self, point: InputPoint) {
-        self.editor.begin_stroke(point);
+        // A locked layer refuses here, once, inside `begin_stroke` — every
+        // route to a stroke passes through it. Nothing below runs, so the
+        // pointer goes on producing move events that reach a stroke builder
+        // that was never begun and does nothing with them.
+        if !self.editor.begin_stroke(point) {
+            return;
+        }
 
         let id = self.editor.session.active_id();
         let tip = self.editor.tip.clone();
@@ -521,12 +527,25 @@ impl UmberApp {
     /// nothing at all was mirrored and the caller must not record an entry
     /// saying otherwise.
     fn mirror_document(&mut self, axis: umber_core::FlipAxis) -> bool {
+        // **The one gate a lock has on the flip**, on the way out as well as on
+        // the way back, since undoing a flip comes through here too. Refused
+        // *whole* rather than applied to the unlocked layers: a picture with
+        // some layers mirrored and some not is one that was never on screen,
+        // and a flip that half happened cannot be undone by flipping again,
+        // which is the entire reason it stores no pixels. The menu item is
+        // disabled to match — see `ui::draw`.
+        if self.editor.layers.any_locked() {
+            return false;
+        }
+        // Masks are slices too, and a mask that stayed put while its layer
+        // mirrored would hide the wrong half of it.
         let slots: Vec<u32> = self
             .editor
             .layers
             .layers()
             .iter()
-            .map(|l| l.slot())
+            .flat_map(|l| [Some(l.slot()), l.mask()])
+            .flatten()
             .collect();
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else {
@@ -594,6 +613,30 @@ impl UmberApp {
     /// Returns false when there was no room, which is when the layer stack is
     /// already using every slice the composite shader's array has.
     fn begin_float(&mut self, rect: PixelRect, pixels: Option<&[u8]>) -> bool {
+        // **The one gate a lock has on the transform tool.** A lift and a paste
+        // both come through here, so neither needs a check of its own — and
+        // neither does the drag, the commit or the flip buttons, because
+        // without a float there is nothing for any of them to act on.
+        //
+        // A *paste* says so and a lift does not, which is not an inconsistency:
+        // a paste is an explicit command with one obvious outcome, where a
+        // press on the canvas with the transform tool in hand happens every
+        // time somebody puts the pen down. A notice raised by that would be a
+        // dialog appearing over the canvas repeatedly, which is the failure the
+        // autosave's "say it once" rule is about.
+        if self.editor.layers.active_is_locked() {
+            if pixels.is_some() {
+                self.editor.notice = Some(Notice {
+                    title: "The layer is locked".to_string(),
+                    lines: vec![
+                        "Nothing was pasted. Unlock the layer in the Layers panel, or \
+                         select another one, and paste again."
+                            .to_string(),
+                    ],
+                });
+            }
+            return false;
+        }
         let slot = self.editor.layers.active_slot();
         let reserved = self.editor.layers.slot_capacity_needed();
         // A lift is clipped by the selection; a paste puts down exactly what it
@@ -915,6 +958,11 @@ impl UmberApp {
 
     /// Erase the active layer, leaving the rest of the stack alone.
     fn clear_active_layer(&mut self) {
+        // **The one gate a lock has on clearing.** The menu item is disabled to
+        // match, so this only catches a shortcut.
+        if self.editor.layers.active_is_locked() {
+            return;
+        }
         // Abandoned rather than committed: clearing the layer is the artist
         // saying they want none of it, and putting the floating pixels down
         // first only to wipe them would be theatre.
@@ -970,13 +1018,78 @@ impl UmberApp {
     }
 
     fn delete_layer(&mut self, index: usize) {
+        // **The one gate a lock has on deletion.** A lock that stopped strokes
+        // and let the layer be thrown away would protect nothing worth
+        // protecting.
+        if self.editor.layers.locked_at(index) {
+            return;
+        }
         self.finish_transform();
         if self.editor.layers.remove(index).is_none() {
             return;
         }
-        // Slots are recycled, so an undo entry recorded against the freed slot
-        // would later be replayed into whichever layer inherits it. Dropping
-        // history is the blunt but safe fix; structural undo is the real one.
+        // Slots are recycled — both of them, where the layer had a mask — so an
+        // undo entry recorded against a freed slot would later be replayed into
+        // whichever layer or mask inherits it. Dropping history is the blunt but
+        // safe fix; structural undo is the real one.
+        self.editor.history.clear();
+        self.editor.mark_modified();
+    }
+
+    /// Give the selected layer a mask, filled opaque white so nothing about the
+    /// picture changes until something is painted into it.
+    fn add_mask(&mut self) {
+        // The float's preview slice is taken from the same pool, so a mask
+        // allocated under one would collide with it — exactly the reason
+        // `add_layer` puts the picture down first.
+        self.finish_transform();
+        let index = self.editor.layers.active_index();
+        if self.editor.layers.locked_at(index) {
+            return;
+        }
+        let Some(slot) = self.editor.layers.add_mask(index) else {
+            return;
+        };
+        let needed = self.editor.layers.slot_capacity_needed();
+        self.editor.mark_modified();
+        // Painting the mask is what the painter almost certainly wants next,
+        // and the switch is one click away either way.
+        self.editor.edit_target = umber_core::EditTarget::Mask;
+
+        let id = self.editor.session.active_id();
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
+        canvas.ensure_slots(&gfx.gpu.device, &gfx.gpu.queue, needed);
+        let mut enc = gfx
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("init-mask"),
+            });
+        // White, not cleared: a recycled slice holds the last layer's pixels,
+        // and an empty mask would hide the layer outright.
+        canvas.fill_layer_white(&mut enc, slot);
+        gfx.gpu.queue.submit(Some(enc.finish()));
+    }
+
+    /// Take the selected layer's mask off.
+    ///
+    /// The mask's slice goes back on the free list, so this **clears the undo
+    /// history** for exactly the reason deleting a layer does: a patch recorded
+    /// against that slice would be replayed into whatever inherits it.
+    fn remove_mask(&mut self) {
+        self.finish_transform();
+        self.finish_stroke();
+        let index = self.editor.layers.active_index();
+        if self.editor.layers.locked_at(index) {
+            return;
+        }
+        if self.editor.layers.remove_mask(index).is_none() {
+            return;
+        }
+        self.editor.edit_target = umber_core::EditTarget::Layer;
         self.editor.history.clear();
         self.editor.mark_modified();
     }
@@ -1263,6 +1376,16 @@ impl UmberApp {
                     canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, layer.slot(), rect)
                 })
                 .collect();
+            // The masks, read the same way and only where there is one. A
+            // document with no masks pays for nothing here.
+            let masks: Vec<Option<Vec<u8>>> = stack
+                .iter()
+                .map(|layer| {
+                    layer.mask().map(|slot| {
+                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
+                    })
+                })
+                .collect();
             // The flattened preview the format requires comes from the same
             // composite pass the screen uses, so it cannot disagree with it.
             let merged = canvas.export_rgba(
@@ -1274,12 +1397,15 @@ impl UmberApp {
             let layers: Vec<SaveLayer<'_>> = stack
                 .iter()
                 .zip(&pixels)
-                .map(|(layer, px)| SaveLayer {
-                    name: &layer.name,
+                .zip(&masks)
+                .map(|((layer, px), mask)| SaveLayer {
                     visible: layer.visible,
                     opacity: layer.opacity,
-                    blend: layer.blend,
-                    pixels: px,
+                    mask: mask.as_deref(),
+                    clipped: layer.clipped,
+                    locked: layer.locked,
+                    linked: layer.linked,
+                    ..SaveLayer::new(&layer.name, layer.blend, px)
                 })
                 .collect();
 
@@ -1858,8 +1984,26 @@ impl UmberApp {
                 self.close_document(index);
             }
         }
+        if let Some(index) = actions.use_tip_and_close {
+            // Paired for the reason `save_and_close` is: the prompt can be
+            // raised on a tab that is not in front, and taking one canvas as a
+            // stamp while closing another would lose the work in the most
+            // confusing way available.
+            self.switch_document(index);
+            // Closed only if the stamp was actually taken. A canvas nobody has
+            // painted on is refused, and the tab stays open holding it.
+            if self.commit_tip() {
+                self.close_document(index);
+            }
+        }
         if actions.add_layer {
             self.add_layer();
+        }
+        if actions.add_mask {
+            self.add_mask();
+        }
+        if actions.remove_mask {
+            self.remove_mask();
         }
         if let Some(index) = actions.delete_layer {
             self.delete_layer(index);
@@ -1886,6 +2030,12 @@ impl UmberApp {
         }
         if let Some(doc) = actions.create_document {
             self.create_document(doc);
+        }
+        if actions.new_tip {
+            self.new_tip_document();
+        }
+        if actions.commit_tip {
+            self.commit_tip();
         }
         if let Some(change) = actions.canvas_change {
             self.apply_canvas(change);
@@ -1960,6 +2110,129 @@ impl UmberApp {
             gfx.add_canvas(id, &doc, slots);
         }
         self.request_redraw();
+    }
+
+    /// Open a canvas to draw the brush in hand's bitmap tip on.
+    ///
+    /// What the canvas *is* — square, 256 pixels, transparent — is
+    /// `umber_core::tip::authoring_document`'s, with the argument for each half
+    /// beside it. Nothing about the shape of it is decided here.
+    ///
+    /// An ordinary document in every other respect: it has an undo history, it
+    /// can be saved as a picture, and closing it unsaved asks the same question
+    /// every other tab asks. Only the tab's [`Tab::tip_for`] says otherwise,
+    /// which is what the strip along the top and "Use as tip" read.
+    ///
+    /// [`Tab::tip_for`]: crate::session::Tab::tip_for
+    fn new_tip_document(&mut self) {
+        let Some(preset) = self
+            .editor
+            .active_preset
+            .and_then(|i| self.editor.presets.get(i))
+        else {
+            return;
+        };
+        let target = umber_core::TipTarget::new(&preset.id, &preset.name);
+        let doc = umber_core::tip::authoring_document();
+
+        self.finish_transform();
+        self.finish_stroke();
+        let id =
+            self.editor
+                .open_document(DocumentState::blank(doc), target.title(), None, Vec::new());
+        let tab = self.editor.session.active_tab_mut();
+        tab.tip_for = Some(target);
+        let slots = self.editor.layers.slot_capacity_needed();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.add_canvas(id, &doc, slots);
+        }
+        // The brush editor is a modal over the canvas the artist has just been
+        // sent to; leaving it up would hide the thing they are meant to paint.
+        self.editor.ui.brush_editor_open = false;
+        self.request_redraw();
+    }
+
+    /// Turn the tip canvas in front into the stamp it was opened for.
+    ///
+    /// The pixels come off `export_rgba` — the *screen* composite pass with an
+    /// export flag, which is the same one the PNG export, the eyedropper and
+    /// the autosave use, so what is stamped is byte for byte what the artist
+    /// was looking at. There is deliberately no second flattener here.
+    ///
+    /// It answers with straight-alpha sRGB, and the alpha is the whole of what
+    /// is taken: `TipMask::from_alpha` has the argument, and the short version
+    /// is that a tip document starts transparent, so its alpha *is* the paint
+    /// laid on it. Colour is discarded because a tip has none — the palette
+    /// decides that at painting time.
+    ///
+    /// Where the mask *goes* is `brushlib::commit_tip`'s, including both ways
+    /// it can fail to reach the brush it was drawn for.
+    /// Answers whether the canvas was taken. `false` means the stamp is still
+    /// only on the canvas — nothing was painted, the mask was refused, or the
+    /// document has no renderer — which is what stops the close prompt closing
+    /// a tab that still holds the only copy of the work.
+    fn commit_tip(&mut self) -> bool {
+        self.finish_transform();
+        self.finish_stroke();
+        let Some(target) = self.editor.session.active_tab().tip_for.clone() else {
+            return false;
+        };
+        let id = self.editor.session.active_id();
+        // Scoped so the borrow of `self.gfx` ends before the editor is taken
+        // mutably below. The context is an `Arc` inside, so cloning it is a
+        // refcount rather than a copy of egui's state.
+        let Some((ctx, pixels)) = ({
+            let gfx = self.gfx.as_ref();
+            gfx.and_then(|gfx| gfx.canvases.get(&id).map(|canvas| (gfx, canvas)))
+                .map(|(gfx, canvas)| {
+                    let layers = self.editor.layer_draws(None);
+                    (
+                        gfx.egui_ctx.clone(),
+                        canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers),
+                    )
+                })
+        }) else {
+            return false;
+        };
+
+        let size = self.editor.doc.size;
+        let mask = match umber_core::TipMask::from_alpha(size.x, size.y, &pixels) {
+            Ok(mask) => mask,
+            Err(error) => {
+                self.editor.notice = Some(Notice {
+                    title: "That canvas cannot be a brush tip".to_string(),
+                    lines: vec![error.to_string()],
+                });
+                return false;
+            }
+        };
+        // A canvas nobody has painted on is not a brush. Caught here rather
+        // than at the library, because the honest answer is "there is nothing
+        // on it yet" rather than a file error — and because a mask of all
+        // zeroes would be a brush that silently paints nothing.
+        if mask.coverage().iter().all(|&coverage| coverage == 0) {
+            self.editor.notice = Some(Notice {
+                title: "There is nothing on this canvas yet".to_string(),
+                lines: vec![
+                    "Paint the stamp first. What you paint becomes coverage: colour is \
+                     ignored and opacity is the strength."
+                        .to_string(),
+                ],
+            });
+            return false;
+        }
+
+        let outcome = crate::brushlib::commit_tip(&ctx, &mut self.editor, &target, mask);
+        // Raised as a dialog rather than left in the brush library's own notice
+        // strip, because the Brushes panel can be closed — and this one writes
+        // to the user's library, so it has to be seen whatever the layout is
+        // doing. It is one dialog per deliberate press, not a recurring one.
+        self.editor.notice = Some(Notice {
+            title: outcome.title,
+            lines: vec![outcome.detail],
+        });
+        self.request_redraw();
+        true
     }
 
     /// Apply the Canvas settings dialog's answer to the document in front.
@@ -2102,6 +2375,9 @@ impl UmberApp {
                 // selection invented at import would be a claim about the
                 // artist's intent that the file did not make.
                 selection: None,
+                // A document just opened is a document being looked at, not one
+                // whose masks are being edited — whatever the last document was.
+                edit_target: umber_core::EditTarget::Layer,
             },
             name.clone(),
             Some(path.to_path_buf()),

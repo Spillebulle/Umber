@@ -20,8 +20,12 @@ almost right until they are compared side by side.
 
 Everything below follows from that. Where a format could be read only by
 guessing, it is not read. Where a document can be read but not represented —
-groups, masks, blend modes Umber lacks — it is imported and the loss is
-reported in `ImportedDocument::warnings`, which the UI shows.
+groups, another application's masks, blend modes Umber lacks — it is imported
+and the loss is reported in `ImportedDocument::warnings`, which the UI shows.
+Clipping is no longer in that list: Umber's own flag means what Photoshop's
+does, so a clipped `.psd` layer arrives clipped. Umber's own masks arrive too,
+out of its own `.ora`; a `.kra` or `.psd` mask is still reported as lost,
+because reading one is a second decoder in each of those formats.
 
 ## Verdicts
 

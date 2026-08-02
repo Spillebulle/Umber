@@ -117,6 +117,15 @@ which an update replaces wholesale. The presets are a text file; the stamps sit
 beside them in `tips/` as ordinary greyscale PNGs you can open, replace or copy
 between machines.
 
+### Making one
+
+**New brush** starts from scratch, and any brush can be given a bitmap stamp —
+one already in your library, or a picture you import. You can also **draw the
+stamp yourself**: Umber opens a canvas set up for it, says at the top which
+brush it is for, and puts what you painted on that brush when you are done.
+What you paint is the coverage — colour is ignored, opacity is the strength,
+and the eraser takes coverage back off.
+
 ### Editing one
 
 The brush editor reaches **every** field a brush has, across six sections: Tip,
@@ -145,6 +154,28 @@ The background is transparent, white, black or a colour of your choosing, and
 it is a property of the document rather than a filled bottom layer — so you can
 change it afterwards, erasing cannot punch a hole through it, and "transparent"
 stays expressible.
+
+### Layers
+
+Each layer has a blend mode, an opacity and a visibility, and four things
+besides:
+
+- **A mask.** Greyscale coverage that hides and reveals the layer without
+  touching a pixel of it — black hides, white reveals, grey is a partial. The
+  Layers panel's mask button adds one, and the chip beside the layer's own
+  thumbnail is what switches the brush between painting the layer and painting
+  its mask. The eraser reveals; undo covers a stroke on a mask exactly as it
+  covers one on a layer.
+- **Clipping.** A clipped layer only shows where the nearest unclipped layer
+  below it does. A run of them all answer to that one layer, which is what every
+  other application means by the word.
+- **A lock.** No strokes, no transforms, no clearing, and no canvas flip until
+  it comes off. The controls that would do any of those are disabled rather than
+  quietly ignored.
+- **A link.** Linked layers move through the stack together when any one of them
+  is dragged. They do **not** yet transform together — see below.
+
+All four are written into the `.ora` and read back out of it.
 
 **File → Flip canvas horizontally / vertically** mirrors every layer's pixels —
 the picture, not the view — at the size the canvas already is. Unlike a resize
@@ -384,8 +415,14 @@ platforms is on the roadmap.
 - **Automatic crash recovery.** Autosave keeps copies and Settings will open the
   folder, but nothing offers one back to you the next time Umber starts.
 - **Structural undo.** Undo covers painting, transforms and canvas flips;
-  adding, deleting or reordering a layer is not recorded, and deleting a layer
-  clears the history.
+  adding, deleting or reordering a layer is not recorded, and deleting a layer —
+  or taking a mask off one — clears the history.
+- **Transforming a linked set.** Linking moves layers together through the
+  stack, which is the only part of "as a unit" the transform machinery can carry
+  today: a floating transform holds one layer's pixels and one undo entry holds
+  one patch, so moving several at once is a larger change than the flag.
+- **Layer masks from other applications.** Umber reads and writes its own; a
+  `.kra` or `.psd` mask is still reported as lost rather than converted.
 - **Pen pressure on macOS and Linux**, as above. Windows works.
 - Navigator, palette and harmony colour modes, per-brush blend modes, and
   stylus tilt.

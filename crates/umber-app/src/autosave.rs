@@ -373,6 +373,12 @@ pub struct LayerMeta {
     /// The texture-array slice holding the pixels, which is what the capture
     /// reads.
     pub slot: u32,
+    /// The slice holding the layer's mask, when it has one — another slice of
+    /// the same array, so it is read by exactly the same capture.
+    pub mask: Option<u32>,
+    pub clipped: bool,
+    pub locked: bool,
+    pub linked: bool,
 }
 
 /// Everything about one document that its file will carry.
@@ -414,13 +420,31 @@ impl Candidate {
                 opacity: l.opacity,
                 blend: l.blend.index(),
                 visible: l.visible,
+                mask: l.mask,
+                clipped: l.clipped,
             })
             .collect()
     }
 
-    /// The slices the capture should read, in stack order.
+    /// The slices the capture should read: every layer in stack order, then
+    /// every mask in the same order.
+    ///
+    /// Masks last rather than interleaved so that a document with none reads
+    /// exactly the list it always did, and so [`Candidate::mask_index`] is
+    /// arithmetic rather than a second table.
     pub fn slots(&self) -> Vec<u32> {
-        self.layers.iter().map(|l| l.slot).collect()
+        let masks = self.layers.iter().filter_map(|l| l.mask);
+        self.layers.iter().map(|l| l.slot).chain(masks).collect()
+    }
+
+    /// Where layer `index`'s mask landed in [`Candidate::slots`], if it has one.
+    pub fn mask_index(&self, index: usize) -> Option<usize> {
+        self.layers.get(index)?.mask?;
+        let before = self.layers[..index]
+            .iter()
+            .filter(|l| l.mask.is_some())
+            .count();
+        Some(self.layers.len() + before)
     }
 }
 
@@ -892,6 +916,10 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 opacity: l.opacity,
                 blend: l.blend,
                 slot: l.slot(),
+                mask: l.mask(),
+                clipped: l.clipped,
+                locked: l.locked,
+                linked: l.linked,
             })
             .collect(),
     })
@@ -929,13 +957,23 @@ fn run_task(task: Task) -> Vec<Report> {
     let layers: Vec<SaveLayer<'_>> = doc
         .layers
         .iter()
+        .enumerate()
         .zip(&pixels.layers)
-        .map(|(l, px)| SaveLayer {
-            name: &l.name,
+        .map(|((i, l), px)| SaveLayer {
             visible: l.visible,
             opacity: l.opacity,
-            blend: l.blend,
-            pixels: px,
+            // The masks are the tail of the same capture — see
+            // `Candidate::slots`. A mask the capture did not bring back is
+            // written as no mask at all rather than as a blank one: an autosave
+            // that invented an empty mask would hide the layer it belonged to.
+            mask: doc
+                .mask_index(i)
+                .and_then(|k| pixels.layers.get(k))
+                .map(Vec::as_slice),
+            clipped: l.clipped,
+            locked: l.locked,
+            linked: l.linked,
+            ..SaveLayer::new(&l.name, l.blend, px)
         })
         .collect();
 
@@ -1248,6 +1286,10 @@ mod tests {
                 opacity: 1.0,
                 blend: BlendMode::Normal,
                 slot: 0,
+                mask: None,
+                clipped: false,
+                locked: false,
+                linked: false,
             }],
         }
     }

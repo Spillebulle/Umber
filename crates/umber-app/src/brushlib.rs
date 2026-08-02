@@ -54,7 +54,7 @@
 
 use crate::brushdrag;
 use crate::controls;
-use crate::editor::Editor;
+use crate::editor::{BrushTab, Editor};
 use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 use crate::ui::icon_button;
@@ -65,6 +65,7 @@ use egui::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use umber_core::TipMask;
 use umber_core::preset::{self, BrushPreset, NewCollection, PresetError, UserLibrary};
 use umber_core::style;
 
@@ -624,14 +625,29 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     store(ui.ctx(), state);
 }
 
-/// The way into an import.
+/// The two ways to add to the library: make one, or read somebody else's.
 ///
 /// The design's `✎ Edit "<name>"…` link was here too, and is now a pencil in
-/// the panel header — see [`header_controls`]. This one stays a link because
-/// it opens a file dialog rather than switching a view, and because a mark
-/// alone could not carry which four applications' brushes Umber will read.
+/// the panel header — see [`header_controls`]. These two stay links because
+/// each opens something rather than switching a view, and because a mark alone
+/// could not carry which four applications' brushes Umber will read.
+///
+/// New brush sits above Import and beside it deliberately: they are the same
+/// question — "where does a brush I do not have yet come from?" — and the
+/// header's `＋`, which looks like it should be the answer, is not: that one
+/// saves the brush already in your hand.
 fn panel_links(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let writable = state.writable();
+    if link(ui, p, Icon::BrushNew, "New brush…", writable)
+        .on_hover_text(if writable {
+            "Make a brush from Umber's defaults and open it in the brush editor"
+        } else {
+            state.why_not()
+        })
+        .clicked()
+    {
+        new_brush(state, ed);
+    }
     if link(ui, p, Icon::Import, "Import brushes…", writable)
         .on_hover_text(if writable {
             "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
@@ -1098,15 +1114,59 @@ fn active_name(ed: &Editor) -> String {
         .map_or_else(|| "Brush".to_owned(), |preset| preset.name.clone())
 }
 
+/// What a save should do about the tip in the brush's hand.
+///
+/// Two answers, because `BrushPreset::tip` is a **name** and the mask may or
+/// may not already be under one:
+///
+/// - a mask the editor holds a *name* for is already in the library's `tips/`
+///   directory (or in the shipped table), so only the name travels — which is
+///   the whole reason the field is a name: two brushes cut from one stamp share
+///   one file and one GPU upload.
+/// - a mask with **no** name has just been imported or drawn and is nowhere on
+///   disk yet, so the picture itself has to travel and `UserLibrary::save`
+///   writes it out. That is the one path that stores a tip, and there is
+///   deliberately no second one.
+///
+/// A name whose mask this machine does not have still travels as a name. The
+/// brush paints round here — `BrushPreset::tip` says so — but taking the
+/// reference off would break the brush everywhere else, which is a far worse
+/// answer to a missing file.
+fn tip_for_save(ed: &Editor) -> (Option<String>, Option<TipMask>) {
+    match (&ed.tip, &ed.tip_name) {
+        (Some(mask), None) => (None, Some(mask.as_ref().clone())),
+        (_, name) => (name.clone(), None),
+    }
+}
+
+/// Learn the name `UserLibrary::save` gave a mask it has just stored.
+///
+/// Without this the editor would still be holding a nameless mask, and the next
+/// Update would write a second copy of the same picture into `tips/` — every
+/// time, for as long as the brush editor stayed open.
+fn adopt_saved_tip(ed: &mut Editor, id: &str) -> Option<String> {
+    let saved = ed
+        .presets
+        .iter()
+        .find(|preset| preset.id == id)?
+        .tip
+        .clone();
+    ed.tip_name = saved.clone();
+    saved
+}
+
 fn save_new(state: &mut State, ed: &mut Editor, name: String) {
     let brush = ed.brush;
-    // A brand-new preset names no tip, so the mask has to travel with it or a
-    // stamp brush would be saved as a round one. Cloned out of the `Arc`: the
-    // library stores a copy of its own and hands out a fresh handle.
-    let tip = ed.tip.as_deref().cloned();
+    let (named, tip) = tip_for_save(ed);
     let label = name.clone();
     let saved = write(state, ed, move |library| {
-        library.save(BrushPreset::unsaved(name, brush), tip)
+        library.save(
+            BrushPreset {
+                tip: named,
+                ..BrushPreset::unsaved(name, brush)
+            },
+            tip,
+        )
     });
     if let Some(id) = saved {
         // Select what was just saved. The user has named this brush; leaving
@@ -1129,22 +1189,83 @@ fn update(state: &mut State, ed: &mut Editor, id: String) {
         return;
     };
     preset.brush = ed.brush;
-    // The tip is part of what "these settings" means. Taking one off is
-    // clearing the reference; putting a different one on is an import, which
-    // arrives as its own brush. Neither goes through here, so the mask itself
-    // never has to be rewritten.
-    let tip_removed = ed.tip.is_none() && preset.tip.is_some();
-    if tip_removed {
-        preset.tip = None;
-    }
+    // The tip is part of what "these settings" means, and all three cases go
+    // through here now: taking one off, putting a different one from the
+    // library on, and storing one that was imported or drawn since the last
+    // save. See [`tip_for_save`].
+    let before = preset.tip.clone();
+    let (named, mask) = tip_for_save(ed);
+    preset.tip = named;
     let label = preset.name.clone();
-    if write(state, ed, move |library| library.save(preset, None)).is_some() {
-        state.notice = Some(Notice::good(if tip_removed {
-            format!("Updated \"{label}\", and took its bitmap tip off.")
-        } else {
-            format!("Updated \"{label}\".")
+    if write(state, ed, move |library| library.save(preset, mask)).is_some() {
+        let after = adopt_saved_tip(ed, &id);
+        state.notice = Some(Notice::good(match (before.as_deref(), after.as_deref()) {
+            (Some(_), None) => format!("Updated \"{label}\", and took its bitmap tip off."),
+            (None, Some(_)) => format!("Updated \"{label}\", and gave it its bitmap tip."),
+            (a, b) if a != b => format!("Updated \"{label}\", and changed its bitmap tip."),
+            _ => format!("Updated \"{label}\"."),
         }));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Making a brush from nothing
+// ---------------------------------------------------------------------------
+
+/// What a brush made from nothing is called before anybody renames it.
+const NEW_BRUSH: &str = "My brush";
+
+/// Make a brush, put it in the user's hand, and open the editor on it.
+///
+/// The distinction against the `＋` in the Brushes header is worth stating,
+/// because they look alike and are not: `＋` **saves what you are holding**, so
+/// it starts from whichever preset was selected and asks for a name. This one
+/// starts from [`BrushPreset::fresh`] — the middle of every range, no stamp —
+/// which is what somebody who wants to *build* a brush rather than vary one is
+/// asking for, and it needs no name field because it can always pick a free
+/// one itself.
+///
+/// Three things here are the ones to be careful of, and all three are
+/// `Editor::presets`' doing:
+///
+/// - The name is uniqued against the **merged** list, not against the user's
+///   library, so a new brush is never a second row called what a shipped one is
+///   called. `preset::unique_name` is where the rule lives.
+/// - The brush is written *before* it is selected, because `write` rebuilds the
+///   merged list and every index into it — `Editor::apply_preset` takes an
+///   index, so selecting first would select whatever ended up in that slot.
+/// - The selection is therefore re-found **by id**, which is the same reason
+///   [`resync`] re-finds it that way.
+fn new_brush(state: &mut State, ed: &mut Editor) {
+    let taken: Vec<String> = ed.presets.iter().map(|p| p.name.clone()).collect();
+    let name = preset::unique_name(NEW_BRUSH, NEW_BRUSH, taken.iter().map(String::as_str));
+    let label = name.clone();
+    let Some(id) = write(state, ed, move |library| {
+        library.save(BrushPreset::fresh(name), None)
+    }) else {
+        return;
+    };
+
+    if let Some(index) = ed.presets.iter().position(|preset| preset.id == id) {
+        ed.apply_preset(index);
+    }
+    // Straight into the editor, on the section that decides what the brush *is*
+    // — a new brush is an invitation to change something, and landing on
+    // whichever tab was last open would hide the answer to "what did that do?".
+    ed.ui.brush_editor_open = true;
+    ed.ui.brush_tab = BrushTab::Tip;
+    // Anything half-armed belongs to the brush that was in hand a moment ago.
+    state.saving = None;
+    state.renaming = None;
+    state.confirming = None;
+    // And show it: a new row inside whichever collection happened to be
+    // filtered would be a brush somebody has to go and find.
+    state.scope = Scope::All;
+    state.query.clear();
+    state.notice = Some(Notice::good(format!(
+        "Made \"{label}\" and put it in your hand. It is saved in your library — \
+         change it here, then press Update."
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1425,498 @@ fn file_label(path: &Path) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// The tip
+// ---------------------------------------------------------------------------
+
+/// The brush editor's Tip section, top row: which stamp this brush uses, and
+/// the three ways to change it. Returns whether the brush is stamped, which is
+/// what tells the section's Hardness slider it has nothing left to shape.
+///
+/// Drawn here rather than in `ui.rs` for [`save_row`]'s reason: everything it
+/// offers is a reach into the user's library, and the library is this module's.
+/// `ui.rs` paints the sliders.
+///
+/// **`BrushPreset::tip` is a name and this control chooses names.** Picking one
+/// out of the list sets `Editor::tip_name` as well as `Editor::tip`, so the
+/// mask stays shared with whatever else names it rather than being copied into
+/// a second file the moment somebody presses Update — see [`tip_for_save`]. The
+/// one entry that is not a name is a picture just imported, which has no name
+/// until it is saved.
+///
+/// Nothing here writes to the library. Every other control in the editor edits
+/// the brush in hand and waits for Update, and a tip that persisted on the spot
+/// would be the one setting that behaved differently — worse, it would be the
+/// one that could not be undone by walking away.
+pub fn tip_row(ui: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
+    let mut state = load(ui.ctx(), ed);
+    let mut action = None;
+
+    Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(metrics::RADIUS)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                tip_preview(ui, p, ed.tip.as_ref());
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let (title, detail) = tip_labels(ed);
+                    ui.label(RichText::new(title).size(text::SMALL).color(p.text_strong));
+                    ui.label(RichText::new(detail).size(text::TINY).color(p.text_dim));
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if link_wide(ui, p, Icon::Import, "Import a picture…", 118.0)
+                            .on_hover_text(
+                                "Read a PNG, JPEG, TIFF, GIF or BMP as this brush's stamp",
+                            )
+                            .clicked()
+                        {
+                            action = Some(TipAction::Import);
+                        }
+                        if link_wide(ui, p, Icon::Pencil, "Draw a tip…", 96.0)
+                            .on_hover_text(
+                                "Open a small transparent canvas and paint the stamp yourself",
+                            )
+                            .clicked()
+                        {
+                            action = Some(TipAction::Draw);
+                        }
+                    });
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(chosen) = tip_picker(ui, p, ed) {
+                        action = Some(TipAction::Choose(chosen));
+                    }
+                });
+            });
+        });
+
+    match action {
+        Some(TipAction::Choose(None)) => ed.clear_tip(),
+        Some(TipAction::Choose(Some(name))) => choose_tip(&mut state, ed, &name),
+        Some(TipAction::Import) => import_tip(&mut state, ed),
+        // Handed back to whoever is drawing the editor: opening a document is
+        // `app.rs`'s, because it needs GPU storage for the new canvas.
+        Some(TipAction::Draw) => ask_for_tip_canvas(ui.ctx()),
+        None => {}
+    }
+
+    let stamped = ed.tip.is_some();
+    store(ui.ctx(), state);
+    stamped
+}
+
+/// What [`tip_row`] was asked to do. One per frame: each of them rewrites the
+/// state the row was drawn from.
+enum TipAction {
+    /// A name out of the list, or `None` for the procedural round dab.
+    Choose(Option<String>),
+    Import,
+    Draw,
+}
+
+/// Where the Tip section's request for a canvas is left between being made and
+/// being carried out.
+///
+/// A slot of its own rather than a field on [`State`], and that is a cost
+/// decision: [`take_draw_request`] is read on **every** frame by `ui::draw`,
+/// and `State` is loaded and stored by cloning — a whole `Arc<UserLibrary>`,
+/// the index and half a dozen `String`s — which is a price worth paying to draw
+/// a list and not worth paying to find out that nobody pressed anything. This
+/// is one `bool`.
+fn draw_request_id() -> Id {
+    Id::new("brush-tip-draw-request")
+}
+
+fn ask_for_tip_canvas(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(draw_request_id(), true));
+}
+
+/// Whether the Tip section asked for a tip document, taken so it is asked for
+/// once.
+///
+/// A flag left in egui's store rather than a return value, because the row is
+/// drawn deep inside the brush editor's modal and the caller that can act on it
+/// — `ui::draw`, on its way to `UiActions` — is several layers of layout above.
+pub fn take_draw_request(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(draw_request_id()).unwrap_or(false))
+}
+
+/// The heading and the line under it: what this brush stamps.
+fn tip_labels(ed: &Editor) -> (&'static str, String) {
+    match (&ed.tip, &ed.tip_name) {
+        (Some(mask), _) => (
+            "Bitmap tip",
+            format!("{} × {} px", mask.width(), mask.height()),
+        ),
+        // A name with no mask. Said out loud rather than drawn as a round
+        // brush, because the brush *is* painting round and the reason is worth
+        // more than the symptom: the library was copied without its pictures.
+        (None, Some(name)) => (
+            "Bitmap tip missing",
+            format!("\"{name}\" is not in your library — painting round"),
+        ),
+        (None, None) => (
+            "Round tip",
+            "The procedural dab, shaped by Hardness".to_owned(),
+        ),
+    }
+}
+
+/// The list of stamps: none, then every mask in the user's library, then
+/// whatever this brush names if that is somewhere else.
+///
+/// Returns the choice, with `None` inside the `Some` meaning "no stamp".
+///
+/// Deliberately **not** a list of the shipped masks. There are twenty of them,
+/// they belong to the brushes they were drawn for, and a picker of twenty
+/// names nobody chose would bury the two or three the user made. A shipped one
+/// still appears while it is the brush's own tip, so switching away from it and
+/// back is possible without losing it.
+fn tip_picker(ui: &mut Ui, p: &Palette, ed: &Editor) -> Option<Option<String>> {
+    let current = ed.tip_name.as_deref();
+    let label = current.unwrap_or("Round");
+    let mut chosen = None;
+    widgets::dropdown(
+        ui,
+        p,
+        widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(132.0)),
+        |ui| {
+            if ui
+                .selectable_label(current.is_none(), "Round — no stamp")
+                .clicked()
+            {
+                chosen = Some(None);
+            }
+            // A mask in hand that is not in the library yet: imported or drawn,
+            // and not stored until the brush is saved. Named as what it is
+            // rather than left out, or the picker would show "Round" for a
+            // brush that is visibly stamping.
+            if current.is_none() && ed.tip.is_some() {
+                ui.separator();
+                let _ = ui.selectable_label(true, "Not saved yet");
+            }
+            if !ed.tips.is_empty() {
+                ui.separator();
+            }
+            for name in ed.tips.keys() {
+                if ui
+                    .selectable_label(current == Some(name.as_str()), name)
+                    .clicked()
+                {
+                    chosen = Some(Some(name.clone()));
+                }
+            }
+            // The brush's own tip, when it came from the shipped table or from
+            // a library this machine does not have.
+            if let Some(name) = current.filter(|name| !ed.tips.contains_key(*name)) {
+                ui.separator();
+                let _ = ui.selectable_label(true, name);
+            }
+        },
+    );
+    chosen
+}
+
+/// Put the named mask in the brush's hand.
+///
+/// The two-step is `Editor::apply_preset`'s: the user's library first, then the
+/// masks Umber ships. A name that resolves to neither still goes on the brush —
+/// see `Editor::tip_name` — and the brush paints round until the picture turns
+/// up, which is exactly what `BrushPreset::tip` promises.
+fn choose_tip(state: &mut State, ed: &mut Editor, name: &str) {
+    match ed
+        .tips
+        .get(name)
+        .cloned()
+        .or_else(|| umber_core::tip::builtin(name).cloned())
+    {
+        Some(mask) => {
+            ed.set_tip(mask, Some(name.to_owned()));
+            state.notice = None;
+        }
+        None => {
+            state.notice = Some(Notice::bad(format!(
+                "\"{name}\" is not in your brush library, so this brush paints round."
+            )));
+        }
+    }
+}
+
+/// Read a picture off disk as this brush's stamp.
+///
+/// The mask goes into the brush's hand and **not** into the library: nothing is
+/// written until the brush is saved, and `UserLibrary::save` is what stores it
+/// in `tips/`. Writing it here would mean a picture in the directory that no
+/// preset names, which the library's own `prune_tips` would delete on the next
+/// write — so the file would appear and vanish depending on what the user did
+/// next.
+///
+/// Blocking, like every other file dialog in this module.
+fn import_tip(state: &mut State, ed: &mut Editor) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Choose a picture for the brush tip")
+        .add_filter(
+            "Pictures",
+            &["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp"],
+        )
+        .add_filter("All files", &["*"])
+        .pick_file()
+    else {
+        return;
+    };
+
+    let read = std::fs::read(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|bytes| TipMask::from_picture(&bytes).map_err(|e| e.to_string()));
+    match read {
+        Ok((mask, reading)) => {
+            let (w, h) = (mask.width(), mask.height());
+            // No name: it is nowhere on disk yet. See `tip_for_save`.
+            ed.set_tip(Arc::new(mask), None);
+            // Which reading was taken is said every time, because it is a guess
+            // — the only one in the tip path — and a stamp that came out
+            // inverted is otherwise a mystery. See `umber_core::TipReading`.
+            state.notice = Some(Notice::good(format!(
+                "Took the tip from {} ({w} × {h}) by reading {}. \
+                 Save the brush to keep it.",
+                file_label(&path),
+                reading.describe(),
+            )));
+        }
+        Err(why) => state.notice = Some(Notice::bad(why)),
+    }
+}
+
+/// Widest a mask is downsampled to for the editor's 48-point thumbnail.
+///
+/// A stamp can be 2048 texels across, so it is box-averaged down first —
+/// nearest sampling would show a sparse spatter tip as an empty square about
+/// half the time.
+const TIP_PREVIEW_TEXELS: u32 = 96;
+
+/// The 48-point square at the left of [`tip_row`]: the mask, or a round dab
+/// where there is none.
+fn tip_preview(ui: &mut Ui, p: &Palette, mask: Option<&Arc<TipMask>>) {
+    let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+    ui.painter().rect_filled(rect, metrics::RADIUS, p.chrome);
+
+    let Some(mask) = mask else {
+        // A soft disc: the procedural dab, which is what "no stamp" paints.
+        // Drawn rather than left blank, because an empty square reads as a
+        // thumbnail that failed to load.
+        ui.painter()
+            .circle_filled(rect.center(), 15.0, p.text_dim.gamma_multiply(0.5));
+        ui.painter().circle_filled(rect.center(), 9.0, p.text_dim);
+        return;
+    };
+
+    // Kept in egui's temporary store and compared by `Arc` identity, so
+    // switching brush rebuilds it and holding the editor open does not. The
+    // naive version uploads a texture on every one of the modal's frames.
+    let id = Id::new("brush-tip-preview");
+    let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
+    let texture = match cached {
+        Some((held, texture)) if Arc::ptr_eq(&held, mask) => texture,
+        _ => {
+            let texture = ui.ctx().load_texture(
+                "brush-tip",
+                widgets::tip_image(mask, p.text_strong, TIP_PREVIEW_TEXELS),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(id, (Arc::clone(mask), texture.clone())));
+            texture
+        }
+    };
+    ui.painter().image(
+        texture.id(),
+        rect.shrink(2.0),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Drawing a tip on the canvas
+// ---------------------------------------------------------------------------
+
+/// The strip along the top of a document that is a brush stamp rather than a
+/// picture. Returns whether "Use as tip" was pressed.
+///
+/// The same shape as the layout-edit bar and for the same reason: a mode you
+/// are in has to say so, because everything else about the window looks
+/// exactly as it did. Here it matters more than there — the canvas is 256
+/// pixels of nothing, and without the strip the only clue is the tab's name.
+///
+/// Nothing is drawn on an ordinary document, which is every document but this
+/// one.
+pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
+    let Some(target) = ed.session.active_tab().tip_for.clone() else {
+        return false;
+    };
+    // Whether the brush it names is still there. A brush deleted while its tip
+    // canvas was open is a real state and must not be a surprise at the end —
+    // it is said here, before the work is done, and "Use as tip" still works:
+    // the stamp goes into the brush in hand instead. See `app`'s `commit_tip`.
+    let gone = !ed.presets.iter().any(|preset| preset.id == target.brush);
+
+    let mut commit = false;
+    let frame = Frame {
+        fill: p.control_active,
+        stroke: Stroke::new(1.0, p.accent_dim),
+        inner_margin: Margin::symmetric(12, 0),
+        ..Default::default()
+    };
+    egui::Panel::top("tip-document-bar")
+        .exact_size(metrics::EDIT_BAR)
+        .frame(frame)
+        .show(root, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.label(
+                    RichText::new("BRUSH TIP")
+                        .size(text::TINY)
+                        .color(p.accent)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if gone {
+                        format!(
+                            "for \"{}\", which is no longer in your library · \
+                             what you paint becomes coverage — colour is ignored, \
+                             opacity is the strength",
+                            target.name
+                        )
+                    } else {
+                        format!(
+                            "for \"{}\" · what you paint becomes coverage — colour is \
+                             ignored, opacity is the strength, and the eraser takes it \
+                             back off",
+                            target.name
+                        )
+                    })
+                    .size(text::TINY)
+                    .color(p.text_dim),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if controls::text_button(ui, p, "Use as tip", true, true)
+                        .on_hover_text(if gone {
+                            "Put the stamp in the brush you are holding — the brush this \
+                             canvas was for has gone"
+                        } else {
+                            "Write this canvas into your brush library as that brush's stamp"
+                        })
+                        .clicked()
+                    {
+                        commit = true;
+                    }
+                });
+            });
+        });
+    commit
+}
+
+/// What became of turning a tip canvas into a stamp, phrased for the user.
+///
+/// Sentences rather than an enum the caller has to word, because two of the
+/// three are not failures and not successes either — the interesting one is
+/// "the brush has gone, so the stamp is in your hand", which has to say both
+/// halves or it reads as a loss.
+pub struct TipCommit {
+    pub title: String,
+    pub detail: String,
+}
+
+/// Put a finished tip canvas onto the brush it was drawn for.
+///
+/// The caller supplies the mask, because reading the canvas back is the GPU's;
+/// what is decided here is where it goes, and there are only two answers:
+///
+/// - the brush is in the **user's** library, so the stamp is written onto it
+///   through `UserLibrary::save` — the one path that stores a tip, the same one
+///   an import and a Save use.
+/// - it is not, because it has been deleted since the canvas was opened or
+///   because it is a shipped brush that cannot be written to. Then the stamp
+///   goes into the brush in hand, unnamed, and "Save as new…" is what keeps it.
+///   Nothing is lost either way, and neither answer can panic: the id is looked
+///   up, never indexed.
+///
+/// The mask is put in the editor's hand in **both** cases, so that the very
+/// next stroke uses it. That is also what makes the write visible: a tip you
+/// have just drawn and cannot see the effect of reads as nothing having
+/// happened.
+pub fn commit_tip(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    target: &umber_core::TipTarget,
+    mask: TipMask,
+) -> TipCommit {
+    let mut state = load(ctx, ed);
+    let owned =
+        matches!(&state.store, Store::Ready(library) if library.get(&target.brush).is_some());
+
+    let outcome = if owned {
+        let id = target.brush.clone();
+        let stored = mask.clone();
+        let saved = write(&mut state, ed, move |library| {
+            let mut preset = library.get(&id).cloned().ok_or_else(|| {
+                PresetError::Malformed(None, "that brush is no longer in your library".to_owned())
+            })?;
+            // `None` for the name and the mask alongside is what stores it:
+            // `UserLibrary::save` writes the picture into `tips/` and puts the
+            // name it chose on the preset.
+            preset.tip = None;
+            library.save(preset, Some(stored))
+        });
+        match saved {
+            Some(id) => {
+                // Selected rather than merely written, so the brush in hand is
+                // the one that now has the stamp — and `apply_preset` is what
+                // resolves the name the library just allocated.
+                if let Some(index) = ed.presets.iter().position(|preset| preset.id == id) {
+                    ed.apply_preset(index);
+                }
+                TipCommit {
+                    title: format!("\"{}\" now stamps what you drew", target.name),
+                    detail: "The picture is in your brush library's tips folder, and the \
+                             brush is in your hand. This canvas is still open — paint on \
+                             it again and press Use as tip to replace the stamp."
+                        .to_owned(),
+                }
+            }
+            // `write` has already put the reason in the library's own notice;
+            // it is lifted out here so the modal can carry the same sentence
+            // rather than a second, vaguer one.
+            None => TipCommit {
+                title: "The tip could not be saved".to_owned(),
+                detail: state
+                    .notice
+                    .as_ref()
+                    .map_or_else(String::new, |notice| notice.text.clone()),
+            },
+        }
+    } else {
+        ed.set_tip(Arc::new(mask), None);
+        TipCommit {
+            title: format!("The stamp is in your hand, not on \"{}\"", target.name),
+            detail: format!(
+                "\"{}\" is not a brush Umber can write to — it has been deleted, or it is \
+                 one Umber ships and those are read-only. Nothing is lost: you are \
+                 painting with the stamp now, and \"Save as new…\" in the brush editor \
+                 keeps it.",
+                target.name
+            ),
+        }
+    };
+
+    store(ctx, state);
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +2345,8 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                     controls::search_field(ui, p, &mut state.query, "Search brushes");
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Right-to-left, so New brush lands left of Import — the
+                    // same pairing and the same order the panel's links keep.
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
                             "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
@@ -1741,6 +2356,19 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                         .clicked()
                     {
                         import(state, ed);
+                    }
+                    if controls::text_button(ui, p, "New brush", false, writable)
+                        .on_hover_text(if writable {
+                            "Make a brush from Umber's defaults and open it in the brush editor"
+                        } else {
+                            why_not.as_str()
+                        })
+                        .clicked()
+                    {
+                        new_brush(state, ed);
+                        // The editor it opens is a modal, and two modals over
+                        // each other leaves neither reachable.
+                        close_browser(state);
                     }
                 });
             });
@@ -2094,8 +2722,26 @@ fn notice_bar(ui: &mut Ui, p: &Palette, notice: &Notice, dismissable: bool) -> b
 /// elides a label that does not fit, and draws a disabled state — which the
 /// library needs, because a broken library still has to explain itself.
 fn link(ui: &mut Ui, p: &Palette, icon: Icon, label: &str, enabled: bool) -> Response {
+    sized_link(ui, p, icon, label, enabled, ui.available_width())
+}
+
+/// The same, at a stated width, for the two that share a row rather than
+/// having one to themselves. An `available_width` there is the whole rest of
+/// the row, so the first one drawn would swallow the second.
+fn link_wide(ui: &mut Ui, p: &Palette, icon: Icon, label: &str, width: f32) -> Response {
+    sized_link(ui, p, icon, label, true, width)
+}
+
+fn sized_link(
+    ui: &mut Ui,
+    p: &Palette,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+    width: f32,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(
-        vec2(ui.available_width(), 18.0),
+        vec2(width, 18.0),
         if enabled {
             Sense::click()
         } else {
@@ -2413,6 +3059,47 @@ mod tests {
         );
         assert!(both.text.contains("smudge"), "{}", both.text);
         assert!(both.text.contains("nope.kpp"), "{}", both.text);
+    }
+
+    /// `BrushPreset::tip` is a **name**, so a save has to know when it is
+    /// writing one down and when it is storing a picture. Getting this the
+    /// wrong way round is expensive in both directions: a name sent as a mask
+    /// puts a second copy of the same picture in `tips/` on every Update, and a
+    /// mask sent as a name is a stamp brush saved as a round one.
+    #[test]
+    fn a_named_tip_travels_as_a_name_and_a_fresh_one_as_the_picture() {
+        let mut ed = Editor::default();
+        let mask = Arc::new(TipMask::new(2, 2, vec![255; 4]).expect("mask"));
+
+        // Nothing in hand: nothing to say.
+        assert_eq!(tip_for_save(&ed), (None, None));
+
+        // Just imported or drawn — nowhere on disk, so the picture travels.
+        ed.set_tip(Arc::clone(&mask), None);
+        let (named, picture) = tip_for_save(&ed);
+        assert_eq!(named, None);
+        assert_eq!(picture.as_ref(), Some(mask.as_ref()));
+
+        // Already in the library: the name travels and the file is shared.
+        ed.set_tip(Arc::clone(&mask), Some("user-nib".to_owned()));
+        assert_eq!(
+            tip_for_save(&ed),
+            (Some("user-nib".to_owned()), None),
+            "a stored mask must not be written a second time"
+        );
+
+        // A name whose picture this machine does not have. The brush paints
+        // round here, but taking the reference off would break it everywhere
+        // else — see `Editor::tip_name`.
+        ed.clear_tip();
+        ed.tip_name = Some("gone".to_owned());
+        assert_eq!(tip_for_save(&ed), (Some("gone".to_owned()), None));
+
+        // And taking the tip off clears both halves, or an Update would put the
+        // reference straight back on.
+        ed.set_tip(mask, Some("user-nib".to_owned()));
+        ed.clear_tip();
+        assert_eq!(tip_for_save(&ed), (None, None));
     }
 
     #[test]

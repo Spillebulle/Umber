@@ -95,13 +95,7 @@ pub fn read_png(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     Ok(ImportedDocument {
         format,
         size: image.size,
-        layers: vec![ImportedLayer {
-            name: "Image".to_string(),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
-            pixels,
-        }],
+        layers: vec![ImportedLayer::new("Image", BlendMode::Normal, pixels)],
         active: None,
         background: Background::Transparent,
         dpi: None,

@@ -44,6 +44,21 @@ pub enum Icon {
     ChevronDown,
     Eye,
     EyeOff,
+    /// A frame with a disc in it: the layer, and the coverage that hides part
+    /// of it. Drawn as an outline plus a solid shape rather than as two
+    /// outlines, because at 16 px two nested rings read as a target.
+    Mask,
+    /// An arrow turning down and to the left, over a rule — the mark every
+    /// application uses for "bounded by the layer below".
+    Clip,
+    /// A closed padlock.
+    Lock,
+    /// The same padlock with its shackle open. A second icon rather than the
+    /// first drawn dim: dim means "unavailable" everywhere else in the
+    /// interface, and a lock that is merely *off* is very much available.
+    Unlock,
+    /// Two chain links: these layers move together.
+    Chain,
     // Chrome
     Close,
     Pencil,
@@ -66,6 +81,11 @@ pub enum Icon {
     /// A sheet with its corner turned down: the document itself, as opposed to
     /// something done to it.
     Document,
+    // Making a brush. Added at the end deliberately — this enum is shared, and
+    // renumbering it would be a merge that compiles and draws the wrong marks.
+    /// A brush with a plus beside it: make a brush from nothing, as against
+    /// `Plus` alone, which everywhere else means "save what is in your hand".
+    BrushNew,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -246,6 +266,69 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(at(5.0, 19.0), at(19.0, 5.0));
         }
 
+        Icon::Mask => {
+            path(vec![
+                at(4.0, 5.0),
+                at(20.0, 5.0),
+                at(20.0, 19.0),
+                at(4.0, 19.0),
+                at(4.0, 5.0),
+            ]);
+            painter.circle_filled(at(12.0, 12.0), 4.2 * scale, colour);
+        }
+
+        Icon::Clip => {
+            // The rule is the layer being clipped *to*; the arrow turns down
+            // onto it. Without the rule the mark is just a return arrow.
+            line(at(5.0, 19.0), at(19.0, 19.0));
+            path(vec![at(16.0, 5.0), at(16.0, 14.5), at(8.0, 14.5)]);
+            path(vec![at(11.5, 11.0), at(8.0, 14.5), at(11.5, 18.0)]);
+        }
+
+        Icon::Lock | Icon::Unlock => {
+            // Body first, so the shackle sits on top of it at any size.
+            path(vec![
+                at(6.0, 11.0),
+                at(18.0, 11.0),
+                at(18.0, 20.0),
+                at(6.0, 20.0),
+                at(6.0, 11.0),
+            ]);
+            // Half a ring, and where its ends land is the whole difference: a
+            // closed lock drops both legs onto the body, an open one lifts the
+            // right-hand leg clear and shifts the arch across.
+            const STEPS: usize = 12;
+            let closed = icon == Icon::Lock;
+            let cx = if closed { 12.0 } else { 15.0 };
+            let mut pts = Vec::with_capacity(STEPS + 2);
+            pts.push(at(cx - 3.6, 11.0));
+            for k in 0..=STEPS {
+                let a = std::f32::consts::PI + k as f32 * std::f32::consts::PI / STEPS as f32;
+                let (s, c) = a.sin_cos();
+                pts.push(at(cx + c * 3.6, 7.4 + s * 3.6));
+            }
+            if closed {
+                pts.push(at(cx + 3.6, 11.0));
+            }
+            path(pts);
+        }
+
+        Icon::Chain => {
+            // Two rounded links overlapping on the diagonal, plus the bar that
+            // joins them — the bar is what stops this reading as two capsules.
+            for side in [-1.0_f32, 1.0] {
+                path(rotated_rect(
+                    &at,
+                    12.0 + side * 3.6,
+                    12.0 - side * 3.6,
+                    3.2,
+                    5.0,
+                    45.0,
+                ));
+            }
+            line(at(9.5, 14.5), at(14.5, 9.5));
+        }
+
         Icon::Close => {
             line(at(6.5, 6.5), at(17.5, 17.5));
             line(at(17.5, 6.5), at(6.5, 17.5));
@@ -359,6 +442,17 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 at(6.0, 3.5),
             ]);
             path(vec![at(14.0, 3.5), at(14.0, 8.0), at(18.5, 8.0)]);
+        }
+
+        Icon::BrushNew => {
+            // `Brush`'s stroke, shortened and moved down-left to leave the
+            // top-right corner for the plus. Drawn from the same two primitives
+            // so the pair read as one family at 14 px, where a second brush
+            // shape would just look like a wobble.
+            line(at(5.0, 19.0), at(13.0, 11.0));
+            painter.circle_filled(at(5.0, 19.0), 2.6 * scale, colour);
+            line(at(17.5, 3.5), at(17.5, 11.5));
+            line(at(13.5, 7.5), at(21.5, 7.5));
         }
 
         Icon::HalfCircle => {

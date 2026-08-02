@@ -52,6 +52,17 @@ impl Color {
     pub fn with_alpha(self, a: f32) -> Self {
         Self { a, ..self }
     }
+
+    /// Relative luminance, in the linear space the components are already in.
+    ///
+    /// Rec. 709's weights, which is what "the grey this colour is" means for
+    /// linear light. Read by the one caller that needs a colour as a single
+    /// number — a stroke on a layer mask, which holds coverage rather than
+    /// colour. Not `(r + g + b) / 3`: a saturated blue and a saturated yellow
+    /// would then hide the same amount, which is not what either looks like.
+    pub fn luminance(self) -> f32 {
+        (0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b).clamp(0.0, 1.0)
+    }
 }
 
 /// Hue/saturation/value, the space colour pickers are built on.

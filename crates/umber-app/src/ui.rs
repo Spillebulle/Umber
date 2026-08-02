@@ -25,10 +25,9 @@ use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
-use std::sync::Arc;
 use umber_core::{
     Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, SelectionMode,
-    TipMask, input::PressureSource,
+    input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -67,6 +66,11 @@ pub struct UiActions {
     pub delete_layer: Option<usize>,
     pub move_layer_up: Option<usize>,
     pub move_layer_down: Option<usize>,
+    /// Give the selected layer a mask, or take its mask off. The caller's,
+    /// because a new mask has to be filled white on the GPU and a removed one
+    /// clears the undo history.
+    pub add_mask: bool,
+    pub remove_mask: bool,
     /// Make this document active. Every document has GPU storage of its own,
     /// so the switch is the caller's to carry out.
     pub pick_tab: Option<usize>,
@@ -89,6 +93,25 @@ pub struct UiActions {
     pub save_all_and_quit: bool,
     /// Open the internal autosave location in the system file manager.
     pub reveal_autosaves: bool,
+    /// Open a canvas to draw a bitmap tip for the brush currently in hand.
+    ///
+    /// A `bool` rather than the brush it is for, because `UiActions` is `Copy`
+    /// and a preset id is a `String`. The caller reads the brush off the editor
+    /// in the same frame the flag was set, which is the frame the request was
+    /// made in — see [`crate::brushlib::take_draw_request`].
+    pub new_tip: bool,
+    /// Turn the tip document in front into the stamp it was opened for. The
+    /// caller's, because the pixels come off the GPU.
+    pub commit_tip: bool,
+    /// Put this tab's canvas on the brush it was drawn for and then close it.
+    ///
+    /// The tab index rather than a `bool`, for the reason
+    /// [`UiActions::save_and_close`] carries one: the prompt can be raised on a
+    /// tab that is not in front, and committing one tab's canvas while closing
+    /// another would lose the work in the most confusing way available. Closed
+    /// only if the stamp reached a brush — a mask that was refused leaves the
+    /// tab open, still holding what it was about to lose.
+    pub use_tip_and_close: Option<usize>,
 }
 
 pub struct UiOutput {
@@ -153,6 +176,12 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // measured so the sidebars sit under it rather than behind it.
     panels::edit_bar(root, &p, ed);
 
+    // The same shape, for a document that is a brush stamp rather than a
+    // picture. Both are claimed before the workspace is measured, so the canvas
+    // shrinks under them rather than being covered — which is what keeps the
+    // camera pivot honest.
+    actions.commit_tip = crate::brushlib::tip_bar(root, &p, ed);
+
     // Everything below the strips and above the status bar is the layout's to
     // divide up. Measuring it here, before any of it is claimed, is what lets
     // the dock model compute every rect up front — so the drop indicator and
@@ -179,6 +208,10 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     }
 
     brush_editor(root, &p, ed);
+    // The Tip section's "Draw a tip…", answered here because opening a document
+    // needs GPU storage — the same division every other entry in `UiActions`
+    // keeps.
+    actions.new_tip = crate::brushlib::take_draw_request(root.ctx());
     crate::settings::show(root, &p, ed, &mut actions);
     // About, the first-run notice about the update check, and the prompt the
     // check raises. Drawn from here rather than from the Help menu, for the
@@ -219,6 +252,9 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         // Export keeps a copy of the picture but is not an answer to "close
         // this?", so the prompt stays open behind it.
         Some(tabs::CloseChoice::Export) => actions.open_export = true,
+        // Same rule as Save: the tab closes only if the stamp actually reached
+        // a brush. See `UiActions::use_tip_and_close`.
+        Some(tabs::CloseChoice::UseAsTip) => actions.use_tip_and_close = ed.ui.close_prompt.take(),
         Some(tabs::CloseChoice::Cancel) | None => {}
     }
     tabs::notice(root, &p, ed);
@@ -777,23 +813,41 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                 // Unlike a resize, a flip keeps the undo history: the canvas
                 // size does not change and the flip is its own inverse, so it
                 // goes in the history as an entry that stores no pixels.
-                if menu_item(ui, "Flip canvas horizontally", Action::FlipCanvasHorizontal)
-                    .on_hover_text(
+                // A locked layer refuses the flip *whole* — a picture with some
+                // layers mirrored and some not was never on screen, and a flip
+                // that half happened cannot be undone by flipping again. Said
+                // here rather than only refused in `mirror_document`, so the
+                // menu does not offer what it will not do.
+                let flip_locked = ed.layers.any_locked();
+                for (label, axis, hint) in [
+                    (
+                        "Flip canvas horizontally",
+                        umber_core::FlipAxis::Horizontal,
                         "Mirror every layer left to right. The canvas size is unchanged.",
-                    )
-                    .clicked()
-                {
-                    actions.flip_canvas = Some(umber_core::FlipAxis::Horizontal);
-                    ui.close();
-                }
-                if menu_item(ui, "Flip canvas vertically", Action::FlipCanvasVertical)
-                    .on_hover_text(
+                    ),
+                    (
+                        "Flip canvas vertically",
+                        umber_core::FlipAxis::Vertical,
                         "Mirror every layer top to bottom. The canvas size is unchanged.",
-                    )
-                    .clicked()
-                {
-                    actions.flip_canvas = Some(umber_core::FlipAxis::Vertical);
-                    ui.close();
+                    ),
+                ] {
+                    let action = match axis {
+                        umber_core::FlipAxis::Horizontal => Action::FlipCanvasHorizontal,
+                        umber_core::FlipAxis::Vertical => Action::FlipCanvasVertical,
+                    };
+                    let item = ui.add_enabled_ui(!flip_locked, |ui| menu_item(ui, label, action));
+                    if item
+                        .inner
+                        .on_hover_text(hint)
+                        .on_disabled_hover_text(
+                            "A layer is locked. A flip mirrors every layer at once, so it \
+                             cannot skip one — unlock it first.",
+                        )
+                        .clicked()
+                    {
+                        actions.flip_canvas = Some(axis);
+                        ui.close();
+                    }
                 }
                 ui.separator();
                 if menu_item(ui, "Save", Action::Save).clicked() {
@@ -824,7 +878,14 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Clear layer").clicked() {
+                if ui
+                    .add_enabled(
+                        !ed.layers.active_is_locked(),
+                        egui::Button::new("Clear layer"),
+                    )
+                    .on_disabled_hover_text("The layer is locked — unlock it to clear it.")
+                    .clicked()
+                {
                     actions.clear = true;
                     ui.close();
                 }
@@ -1442,7 +1503,10 @@ fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
 /// The design's Tip section: a two-column grid of the dab's own properties.
 fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
-    let stamped = bitmap_tip_row(ui, p, ed);
+    // The stamp itself is `brushlib`'s: every way of changing it — the list of
+    // masks, the file dialog, the canvas to draw one on — is a reach into the
+    // user's library, and this file paints the sliders.
+    let stamped = crate::brushlib::tip_row(ui, p, ed);
     ui.columns(2, |c| {
         widgets::slider_row(
             &mut c[0],
@@ -1589,96 +1653,6 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         p,
         "Airbrush rate keeps depositing paint while the pen is held still. \
          Spacing alone stops when you do.",
-    );
-}
-
-/// The bitmap tip, when the brush has one. Returns whether it does.
-///
-/// Only drawn for a stamp brush. Almost every brush is round, and a permanent
-/// row saying so would be a control that never does anything — the way in is
-/// **Import brushes…** in the Brushes panel, which reads `.gbr`.
-fn bitmap_tip_row(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> bool {
-    let Some(mask) = ed.tip.clone() else {
-        return false;
-    };
-
-    let mut cleared = false;
-    Frame::NONE
-        .fill(p.window)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(metrics::RADIUS)
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                tip_preview(ui, p, &mask);
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Bitmap tip")
-                            .size(text::SMALL)
-                            .color(p.text_strong),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("{} × {} px", mask.width(), mask.height()))
-                            .size(text::TINY)
-                            .color(p.text_dim),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::controls::text_button(ui, p, "Use a round tip", false, true)
-                        .on_hover_text(
-                            "Paint with the procedural round dab instead. \
-                             Save the brush to keep the change.",
-                        )
-                        .clicked()
-                    {
-                        cleared = true;
-                    }
-                });
-            });
-        });
-
-    if cleared {
-        ed.clear_tip();
-    }
-    !cleared
-}
-
-/// Widest a mask is downsampled to for the editor's 48-point thumbnail.
-///
-/// A stamp can be 2048 texels across, so it is box-averaged down first —
-/// nearest sampling would show a sparse spatter tip as an empty square about
-/// half the time.
-const TIP_PREVIEW_TEXELS: u32 = 96;
-
-fn tip_preview(ui: &mut egui::Ui, p: &Palette, mask: &Arc<TipMask>) {
-    // Kept in egui's temporary store and compared by `Arc` identity, so
-    // switching brush rebuilds it and holding the editor open does not. The
-    // naive version uploads a texture on every one of the modal's frames.
-    let id = egui::Id::new("brush-tip-preview");
-    let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
-    let texture = match cached {
-        Some((held, texture)) if Arc::ptr_eq(&held, mask) => texture,
-        _ => {
-            let texture = ui.ctx().load_texture(
-                "brush-tip",
-                widgets::tip_image(mask, p.text_strong, TIP_PREVIEW_TEXELS),
-                egui::TextureOptions::LINEAR,
-            );
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(id, (Arc::clone(mask), texture.clone())));
-            texture
-        }
-    };
-
-    let (rect, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, metrics::RADIUS, p.chrome);
-    painter.image(
-        texture.id(),
-        rect.shrink(2.0),
-        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
     );
 }
 
@@ -2217,11 +2191,15 @@ fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     );
 }
 
+/// Widest a tile is downsampled to for the 56-point thumbnail. A paper is at
+/// most a few hundred texels and this is more than the square can show.
+const PAPER_PREVIEW_TEXELS: u32 = 96;
+
 /// A thumbnail of one paper tile.
 ///
 /// Cached in egui's temporary store and keyed by the pattern, exactly as
-/// [`tip_preview`] is: the modal redraws every frame and this would otherwise
-/// upload a texture on each of them.
+/// `brushlib`'s tip preview is: the modal redraws every frame and this would
+/// otherwise upload a texture on each of them.
 fn paper_preview(ui: &mut egui::Ui, p: &Palette, pattern: GrainPattern) {
     let Some(tile) = umber_core::tip::pattern(pattern.key()) else {
         return;
@@ -2233,7 +2211,7 @@ fn paper_preview(ui: &mut egui::Ui, p: &Palette, pattern: GrainPattern) {
         _ => {
             let texture = ui.ctx().load_texture(
                 "brush-paper",
-                widgets::tip_image(tile, p.text_strong, TIP_PREVIEW_TEXELS),
+                widgets::tip_image(tile, p.text_strong, PAPER_PREVIEW_TEXELS),
                 egui::TextureOptions::LINEAR,
             );
             ui.ctx()

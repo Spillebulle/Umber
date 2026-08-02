@@ -50,16 +50,29 @@ struct View {
     // Non-zero when the stroke carries a colour per dab — a smudging brush —
     // and `stroke_color.rgb` is therefore not the whole story.
     per_dab_color: u32,
-    // Two scalars, not a vec2/vec3<u32>: a vec3 carries 16-byte alignment,
-    // which would push it to the next 16-byte boundary and leave the struct 16
-    // bytes longer than the Rust side. Scalars are 4-aligned and pack as
-    // intended.
-    _pad1: u32,
+    // Non-zero when the stroke in flight is being painted into the active
+    // layer's *mask* rather than into its pixels. See `fs` for the one place
+    // that reads it, and for why the maths there has to match `commit.wgsl`.
+    stroke_on_mask: u32,
+    // A scalar, not a vec2/vec3<u32>: a vec3 carries 16-byte alignment, which
+    // would push it to the next 16-byte boundary and leave the struct 16 bytes
+    // longer than the Rust side. Scalars are 4-aligned and pack as intended.
     _pad2: u32,
     // Per stack position, bottom first: (opacity, blend mode, slot, visible).
     // Packed as floats to dodge std140's array-stride rules; every value is a
     // small integer or a 0..1 float, so the round trip is exact.
     layers: array<vec4<f32>, MAX_LAYERS>,
+    // The rest of each stack position: (mask slot, has mask, clipped, unused).
+    //
+    // A second array rather than four more bits packed into `layers[i].w`. The
+    // mask *slot* does not fit in a flag, and a bit field would have to be
+    // unpacked identically here and in Rust — one more pair of statements that
+    // can drift, for a kilobyte of a uniform buffer whose guaranteed minimum
+    // size is sixty-four.
+    //
+    // `mask slot` is the layer's own slot where there is no mask, so the index
+    // is always inside the array whether or not the sample is taken.
+    extra: array<vec4<f32>, MAX_LAYERS>,
 };
 
 @group(0) @binding(0) var<uniform> v: View;
@@ -170,6 +183,15 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let coverage = textureSampleLevel(stroke_tex, samp, uv, 0.0).r;
 
     var acc = vec4<f32>(0.0);
+    // What a clipped layer is bounded by: the alpha of the nearest *unclipped*
+    // layer below it, after that layer's own mask and its own wet stroke. One
+    // running value is the whole of how a run of clipped layers all answer to
+    // the same base, which is what every other application means by the word.
+    //
+    // Zero to begin with, so a clipped layer with nothing unclipped beneath it
+    // shows nothing. Inventing a 1.0 there would make the flag mean something
+    // different at the bottom of the stack than it means anywhere else.
+    var clip_alpha = 0.0;
     for (var i = 0u; i < v.layer_count; i = i + 1u) {
         let params = v.layers[i];
         let opacity = params.x;
@@ -177,23 +199,69 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let slot = i32(params.z);
         let visible = params.w > 0.5;
 
-        if (!visible || opacity <= 0.0) {
-            continue;
-        }
+        let extra = v.extra[i];
+        let mask_slot = i32(extra.x);
+        let has_mask = extra.y > 0.5;
+        let clipped = extra.z > 0.5;
 
+        // Sampled before the visibility test now, because a hidden layer still
+        // has to bound whatever is clipped to it — to nothing. Two fetches for
+        // a layer that contributes no pixels is the price of that being one
+        // rule rather than two.
         var lay = textureSampleLevel(layer_tex, samp, uv, slot, 0.0);
+        let stroke_here = i == v.active_index;
+        let cov = coverage * v.stroke_color.a;
+
+        // The mask hides and reveals by multiplying the layer's premultiplied
+        // colour, which is exactly "it multiplies the alpha" written for both
+        // halves at once. A layer without one multiplies by an exact 1.0 —
+        // `no_mask_is_the_exact_identity` pins that.
+        //
+        // A branch, deliberately, where the tip and the paper use a `select`.
+        // Those two fold into a multiply by one and cost a fetch that was
+        // happening anyway; this one is a whole extra sample of a
+        // canvas-sized array, on the pass that runs every frame for every
+        // layer. `has_mask` comes out of a uniform, so the branch is uniform
+        // across the draw and an unmasked document really does pay nothing.
+        // `textureSampleLevel` is what makes it legal at all — an explicit LOD
+        // has no derivatives to require uniform control flow, which is the same
+        // reason the loop can sample in the first place.
+        var m = 1.0;
+        if (has_mask) {
+            m = textureSampleLevel(layer_tex, samp, uv, mask_slot, 0.0).r;
+        }
+        // A stroke on the mask previews by blending into `m` here. THIS MUST
+        // STAY IDENTICAL to what `commit.wgsl` writes into the mask slice —
+        // which is the ordinary paint blend, `src + dst * (1 - src.a)`, read
+        // on one channel because a mask slice is written with the greyscale
+        // the editor forces on a mask stroke. Any difference between the two
+        // shows up as the mask jumping at pointer-up.
+        if (stroke_here && v.stroke_on_mask != 0u && has_mask) {
+            m = v.stroke_color.r * cov + m * (1.0 - cov);
+        }
 
         // The in-progress stroke belongs to one layer, and must be blended
         // inside the stack rather than on top of the finished composite —
         // otherwise painting under a Multiply layer would preview wrongly.
-        if (i == v.active_index) {
-            let cov = coverage * v.stroke_color.a;
+        if (stroke_here && v.stroke_on_mask == 0u) {
             if (v.stroke_mode == 0u) {
                 let s = vec4<f32>(stroke_rgb(uv) * cov, cov);
                 lay = s + lay * (1.0 - s.a);
             } else {
                 lay = lay * (1.0 - cov);
             }
+        }
+
+        lay = lay * m;
+
+        if (clipped) {
+            lay = lay * clip_alpha;
+        } else {
+            clip_alpha = select(0.0, lay.a, visible && opacity > 0.0);
+        }
+
+        if (!visible || opacity <= 0.0) {
+            continue;
         }
 
         // Scaling a premultiplied colour by opacity is correct as-is.

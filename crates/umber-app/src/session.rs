@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::UVec2;
-use umber_core::{Camera, Document, History, LayerStack, Selection};
+use umber_core::{Camera, Document, EditTarget, History, LayerStack, Selection};
 
 /// Identity of an open document, stable for as long as it stays open.
 ///
@@ -56,6 +56,13 @@ pub struct DocumentState {
     /// one document's selection onto another's canvas, where its bounds might
     /// not even fit.
     pub selection: Option<Arc<Selection>>,
+    /// Whether a stroke on this document lands in the active layer or in its
+    /// mask.
+    ///
+    /// Per-document because a painter working on a mask in one tab has not
+    /// asked to be working on a mask in another — and because the layer that
+    /// *has* the mask is this document's.
+    pub edit_target: EditTarget,
 }
 
 impl DocumentState {
@@ -73,6 +80,7 @@ impl DocumentState {
             layers: LayerStack::new(),
             history: History::default(),
             selection: None,
+            edit_target: EditTarget::Layer,
         }
     }
 }
@@ -107,6 +115,16 @@ pub struct Tab {
     /// `umber_core::docimport`. Kept on the tab so the notice can be reopened
     /// after it has been dismissed.
     pub notes: Vec<String>,
+    /// The brush this document is a stamp for, when it is not a painting.
+    ///
+    /// `None` for every ordinary document, which is nearly all of them. It is
+    /// on the *tab* rather than on the editor because it belongs to one
+    /// document and several are open at once: opening a tip canvas, going back
+    /// to the picture and coming back must find the canvas still knowing what
+    /// it is for. Otherwise a tip document is an ordinary document — it has a
+    /// history, it can be saved, and closing it unsaved asks the same question
+    /// every other tab asks.
+    pub tip_for: Option<umber_core::TipTarget>,
     /// This document's state while another document is being edited. `None` for
     /// the active tab, whose state is live in the editor — see the module docs.
     parked: Option<DocumentState>,
@@ -156,6 +174,7 @@ impl Default for Session {
             modified: false,
             revision: 0,
             notes: Vec::new(),
+            tip_for: None,
             parked: None,
         });
         session
@@ -275,6 +294,7 @@ impl Session {
             modified: false,
             revision: 0,
             notes: Vec::new(),
+            tip_for: None,
             parked: None,
         });
         self.active = self.tabs.len() - 1;

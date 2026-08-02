@@ -329,13 +329,10 @@ fn load_layer(
         }),
     }
 
-    Ok(ImportedLayer {
-        name: spec.name.clone(),
-        visible: spec.visible,
-        opacity: spec.opacity,
-        blend: mode,
-        pixels,
-    })
+    let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
+    layer.visible = spec.visible;
+    layer.opacity = spec.opacity;
+    Ok(layer)
 }
 
 /// Read a layer's tile file and paint it onto a canvas-sized buffer.
@@ -454,13 +451,11 @@ fn flattened_fallback(
     Ok(ImportedDocument {
         format: FORMAT,
         size: canvas,
-        layers: vec![ImportedLayer {
-            name: "Merged image".to_string(),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
+        layers: vec![ImportedLayer::new(
+            "Merged image",
+            BlendMode::Normal,
             pixels,
-        }],
+        )],
         active: None,
         background: Background::Transparent,
         dpi: None,

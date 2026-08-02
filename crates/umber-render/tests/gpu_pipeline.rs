@@ -139,6 +139,7 @@ impl Harness {
                 opacity,
                 mode,
                 per_dab_color: self.per_dab_color,
+                on_mask: false,
             },
         );
         self.gpu.queue.submit(Some(enc.finish()));
@@ -226,6 +227,28 @@ impl Harness {
     /// This is what the user actually sees, so it is the only way to test
     /// per-layer opacity and blend modes.
     fn composite_pixel(&self, layers: &[LayerDraw], x: u32, y: u32) -> [u8; 4] {
+        // No stroke in flight for most of these tests; zero opacity keeps the
+        // scratch surface out of the result whatever it contains.
+        self.composite_pixel_with(
+            layers,
+            StrokeStyle {
+                opacity: 0.0,
+                ..Default::default()
+            },
+            x,
+            y,
+        )
+    }
+
+    /// The same pass with a stroke in flight, which is how the *preview* half
+    /// of anything the commit also does gets read.
+    fn composite_pixel_with(
+        &self,
+        layers: &[LayerDraw],
+        stroke: StrokeStyle,
+        x: u32,
+        y: u32,
+    ) -> [u8; 4] {
         let target = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test-target"),
             size: wgpu::Extent3d {
@@ -260,13 +283,8 @@ impl Harness {
                 layers,
                 backdrop: [0.0, 0.0, 0.0],
                 export: false,
-                // No stroke in flight for these tests; zero opacity keeps the
-                // scratch surface out of the result whatever it contains.
                 active_index: 0,
-                stroke: StrokeStyle {
-                    opacity: 0.0,
-                    ..Default::default()
-                },
+                stroke,
             },
         );
 
@@ -339,6 +357,8 @@ fn layer(slot: u32, opacity: f32, blend: BlendMode) -> LayerDraw {
         opacity,
         blend: blend.index(),
         visible: true,
+        mask: None,
+        clipped: false,
     }
 }
 
@@ -1877,6 +1897,343 @@ fn export_leaves_unpainted_pixels_transparent() {
 }
 
 // ---------------------------------------------------------------------------
+// Layer masks and clipping
+// ---------------------------------------------------------------------------
+
+/// Fill a slice with one exact colour, byte for byte.
+///
+/// Not `Harness::fill`, which stamps a dab and therefore has an antialiased
+/// edge: a mask is read a channel at a time and a test of it wants to know
+/// exactly what that channel holds.
+fn fill_slot(h: &mut Harness, slot: u32, rgba: [u8; 4]) {
+    let size = h.canvas.doc_size();
+    h.write_block(
+        slot,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: size.x,
+            height: size.y,
+        },
+        rgba,
+    );
+}
+
+#[test]
+fn a_mask_hides_what_it_covers() {
+    // The whole feature in one assertion: white reveals, black hides, and mid
+    // grey is a partial. Split down the canvas so all three are read out of one
+    // composite, which is also what proves the mask is sampled per fragment
+    // rather than folded into the layer.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    fill_slot(&mut h, 0, [255, 255, 255, 255]);
+    // The mask: opaque, and grey where the layer should be dimmed. The
+    // composite reads the red channel, and the slice is sRGB-typed, so
+    // sRGB 188 is linear ~0.5.
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.write_layer_rect(
+        &h.gpu.queue,
+        1,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: DOC,
+        },
+        &[0u8, 0, 0, 255].repeat((20 * DOC) as usize),
+    );
+    h.canvas.write_layer_rect(
+        &h.gpu.queue,
+        1,
+        PixelRect {
+            x: 20,
+            y: 0,
+            width: 20,
+            height: DOC,
+        },
+        &[188u8, 188, 188, 255].repeat((20 * DOC) as usize),
+    );
+
+    let mut masked = layer(0, 1.0, BlendMode::Normal);
+    masked.mask = Some(1);
+
+    // Hidden: the checkerboard, exactly as `a_hidden_layer_contributes_nothing`
+    // reads it.
+    let px = h.composite_pixel(&[masked], 10, 32);
+    assert!(
+        px[0] > 190 && px[0] < 235,
+        "a black mask must hide the layer, got {px:?}"
+    );
+    // Revealed: white, untouched.
+    assert_near(
+        h.composite_pixel(&[masked], 55, 32),
+        [255, 255, 255],
+        2,
+        "a white mask must be the identity",
+    );
+    // Half: white at half alpha over the checkerboard, so between the two.
+    let half = h.composite_pixel(&[masked], 30, 32);
+    assert!(
+        half[0] > 220 && half[0] < 252,
+        "a grey mask must be a partial, got {half:?}"
+    );
+}
+
+#[test]
+fn no_mask_is_the_exact_identity() {
+    // The rule every optional factor in this engine holds to, and the reason a
+    // mask is an `Option<u32>` rather than a slice reserved per layer: a
+    // document that has never used one must composite to the same bytes it did
+    // before masks existed.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+    fill_slot(&mut h, 0, [90, 140, 210, 255]);
+    // A slice that would hide everything if it were ever read.
+    fill_slot(&mut h, 1, [0, 0, 0, 255]);
+
+    let plain = layer(0, 1.0, BlendMode::Normal);
+    assert!(plain.mask.is_none(), "the fixture is not testing anything");
+    assert_eq!(
+        h.composite_pixel(&[plain], 32, 32),
+        h.composite_pixel(&[plain], 32, 32),
+    );
+    assert_near(
+        h.composite_pixel(&[plain], 32, 32),
+        [90, 140, 210],
+        2,
+        "an unmasked layer must composite untouched",
+    );
+}
+
+#[test]
+fn a_clipped_layer_is_bounded_by_the_one_below() {
+    // Clipping is the layer below's *alpha* and nothing else. The base covers
+    // the left half only, so the clipped layer must vanish on the right — and
+    // must be untouched on the left, because the base is opaque there.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    // Base: opaque red on the left half, nothing on the right.
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: DOC / 2,
+            height: DOC,
+        },
+        [200, 40, 40, 255],
+    );
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+
+    let base = layer(0, 1.0, BlendMode::Normal);
+    let mut clipped = layer(1, 1.0, BlendMode::Normal);
+    clipped.clipped = true;
+
+    assert_near(
+        h.composite_pixel(&[base, clipped], 10, 32),
+        [255, 255, 255],
+        2,
+        "where the base is opaque the clipped layer is untouched",
+    );
+    let outside = h.composite_pixel(&[base, clipped], 54, 32);
+    assert!(
+        outside[0] > 190 && outside[0] < 235,
+        "the clipped layer painted outside its base: {outside:?}"
+    );
+
+    // And unclipped it covers everything, which is what says the test above
+    // measured the flag rather than the fixture.
+    let free = layer(1, 1.0, BlendMode::Normal);
+    assert_near(
+        h.composite_pixel(&[base, free], 54, 32),
+        [255, 255, 255],
+        2,
+        "without the flag the layer covers the canvas",
+    );
+}
+
+#[test]
+fn a_run_of_clipped_layers_answers_to_the_nearest_unclipped_one() {
+    // Two clipped layers in a row are both bound by the base *below the run*,
+    // not each by the one immediately beneath. Reading it the other way would
+    // make the second follow the first, which is what a naive "previous
+    // layer's alpha" would do and is not what any application means.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 3);
+
+    // Base opaque on the left quarter only.
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: DOC / 4,
+            height: DOC,
+        },
+        [200, 40, 40, 255],
+    );
+    // The first clipped layer covers only the left *half*, so if the second
+    // followed it rather than the base, the second would show between the
+    // quarter and the half.
+    h.write_block(
+        1,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: DOC / 2,
+            height: DOC,
+        },
+        [40, 200, 40, 255],
+    );
+    fill_slot(&mut h, 2, [40, 40, 220, 255]);
+
+    let base = layer(0, 1.0, BlendMode::Normal);
+    let mut first = layer(1, 1.0, BlendMode::Normal);
+    first.clipped = true;
+    let mut second = layer(2, 1.0, BlendMode::Normal);
+    second.clipped = true;
+
+    let stack = [base, first, second];
+    // Inside the base: the topmost clipped layer wins.
+    assert_near(
+        h.composite_pixel(&stack, 5, 32),
+        [40, 40, 220],
+        3,
+        "inside the base",
+    );
+    // Beyond the base but inside the first clipped layer's own pixels: nothing,
+    // because both are bound by the base.
+    let beyond = h.composite_pixel(&stack, 24, 32);
+    assert!(
+        beyond[0] > 190 && beyond[0] < 235,
+        "a clipped layer followed the clipped layer below it: {beyond:?}"
+    );
+}
+
+#[test]
+fn a_clipped_layer_at_the_bottom_of_the_stack_shows_nothing() {
+    // There is no unclipped layer beneath it to be bounded by, so it is bounded
+    // by nothing. The alternative — treating "no base" as fully opaque — would
+    // make the flag mean something different at the bottom of the stack than it
+    // means anywhere else.
+    let mut h = harness_or_skip!();
+    fill_slot(&mut h, 0, [255, 255, 255, 255]);
+    let mut clipped = layer(0, 1.0, BlendMode::Normal);
+    clipped.clipped = true;
+
+    let px = h.composite_pixel(&[clipped], 32, 32);
+    assert!(
+        px[0] > 190 && px[0] < 235,
+        "expected the checkerboard, got {px:?}"
+    );
+}
+
+#[test]
+fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
+    // The invariant the whole edit-target design exists to hold. The preview
+    // blends the scratch into the mask inside `composite.wgsl`; the commit
+    // bakes the same scratch into the mask *slice* through `commit.wgsl`. Two
+    // implementations of one blend, exactly as the stroke path already has —
+    // and the failure, if they part company, is the mask jumping at pointer-up.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 2);
+
+    fill_slot(&mut h, 0, [255, 255, 255, 255]);
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+
+    let mut masked = layer(0, 1.0, BlendMode::Normal);
+    masked.mask = Some(1);
+
+    // Black paint on the mask hides. A partial coverage rather than a solid
+    // one, so both the blend and the opacity are actually exercised.
+    let style = StrokeStyle {
+        color: Color::BLACK,
+        opacity: 0.75,
+        mode: BrushMode::Paint,
+        per_dab_color: false,
+        on_mask: true,
+    };
+    // Before anything is painted, so the assertion below is about the stroke
+    // rather than about a comparison two identities would also satisfy.
+    let untouched = h.composite_pixel(&[masked], 32, 32);
+
+    h.stamp(&[dab(32.0, 32.0, 14.0, 1.0)]);
+    let previewed = h.composite_pixel_with(&[masked], style, 32, 32);
+    assert!(
+        untouched[0].abs_diff(previewed[0]) > 8,
+        "the preview did not hide anything: {untouched:?} then {previewed:?}"
+    );
+
+    let size = h.canvas.doc_size();
+    let rect = PixelRect {
+        x: 0,
+        y: 0,
+        width: size.x,
+        height: size.y,
+    };
+    let mut enc = h.encoder();
+    // Into the mask's slice, which is the whole of what "painting the mask"
+    // means to the renderer — `commit_stroke` has no variant for it.
+    h.canvas
+        .commit_stroke(&h.gpu.queue, &mut enc, 1, rect, &[rect], style);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let committed = h.composite_pixel(&[masked], 32, 32);
+    for c in 0..3 {
+        assert!(
+            previewed[c].abs_diff(committed[c]) <= 2,
+            "the mask jumped at pointer-up: previewed {previewed:?}, committed {committed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_masked_layer_clips_what_is_clipped_to_it() {
+    // How the two features compose, which is the question a stack of both
+    // raises: the base's alpha is what it is *after* its own mask, so hiding
+    // part of a base hides what is clipped to it. Anything else would let a
+    // clipped layer paint through a hole its base does not fill.
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 3);
+
+    fill_slot(&mut h, 0, [200, 40, 40, 255]);
+    // The base's mask: white on the left, black on the right.
+    fill_slot(&mut h, 1, [255, 255, 255, 255]);
+    h.canvas.write_layer_rect(
+        &h.gpu.queue,
+        1,
+        PixelRect {
+            x: DOC / 2,
+            y: 0,
+            width: DOC / 2,
+            height: DOC,
+        },
+        &[0u8, 0, 0, 255].repeat(((DOC / 2) * DOC) as usize),
+    );
+    fill_slot(&mut h, 2, [40, 40, 220, 255]);
+
+    let mut base = layer(0, 1.0, BlendMode::Normal);
+    base.mask = Some(1);
+    let mut clipped = layer(2, 1.0, BlendMode::Normal);
+    clipped.clipped = true;
+
+    assert_near(
+        h.composite_pixel(&[base, clipped], 10, 32),
+        [40, 40, 220],
+        3,
+        "where the base's mask reveals it",
+    );
+    let hidden = h.composite_pixel(&[base, clipped], 54, 32);
+    assert!(
+        hidden[0] > 190 && hidden[0] < 235,
+        "the clipped layer showed where its base was masked away: {hidden:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Document background
 // ---------------------------------------------------------------------------
 
@@ -2347,6 +2704,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
             opacity: 1.0,
             mode: BrushMode::Paint,
             per_dab_color: false,
+            on_mask: false,
         },
     );
     gpu.queue.submit(Some(enc.finish()));
@@ -2625,12 +2983,16 @@ fn a_capture_reads_back_exactly_what_the_blocking_path_does() {
             opacity: 1.0,
             blend: 0,
             visible: true,
+            mask: None,
+            clipped: false,
         },
         LayerDraw {
             slot: 1,
             opacity: 1.0,
             blend: 0,
             visible: true,
+            mask: None,
+            clipped: false,
         },
     ];
     let full = PixelRect {
@@ -2689,12 +3051,16 @@ fn a_document_too_large_for_one_staging_buffer_is_read_back_in_bands() {
             opacity: 1.0,
             blend: 0,
             visible: true,
+            mask: None,
+            clipped: false,
         },
         LayerDraw {
             slot: 1,
             opacity: 1.0,
             blend: 0,
             visible: true,
+            mask: None,
+            clipped: false,
         },
     ];
     let full = PixelRect {
@@ -2782,6 +3148,8 @@ fn a_capture_of_a_large_document_never_costs_a_frame() {
             opacity: 1.0,
             blend: 0,
             visible: true,
+            mask: None,
+            clipped: false,
         })
         .collect();
 
@@ -2860,6 +3228,8 @@ fn a_second_capture_is_refused_while_one_is_in_flight() {
         opacity: 1.0,
         blend: 0,
         visible: true,
+        mask: None,
+        clipped: false,
     }];
     assert!(h.canvas.begin_capture(&[0], &draws));
     assert!(
@@ -2890,6 +3260,8 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
         opacity: 1.0,
         blend: 0,
         visible: true,
+        mask: None,
+        clipped: false,
     }];
     assert!(h.canvas.begin_capture(&[0], &draws));
 
@@ -3303,6 +3675,7 @@ fn an_undo_restores_every_pixel_a_tiled_stroke_changed() {
             opacity: 1.0,
             mode: BrushMode::Paint,
             per_dab_color: false,
+            on_mask: false,
         },
     );
     gpu.queue.submit(Some(enc.finish()));

@@ -185,6 +185,225 @@ impl TipMask {
         };
         Self::new(info.width, info.height, coverage)
     }
+
+    /// Coverage from the **alpha** of straight-alpha, sRGB RGBA8 pixels, with
+    /// no reading to decide.
+    ///
+    /// This is the door a tip drawn inside Umber comes through — see
+    /// [`authoring_document`] — and it is separate from [`from_picture`]
+    /// precisely because there is nothing here to guess. The canvas starts
+    /// transparent, so its alpha *is* the paint that was laid on it: a stroke
+    /// at half opacity is coverage of a half, the eraser takes coverage back
+    /// off, and covering the whole canvas gives a solid stamp rather than
+    /// flipping a rule under the artist.
+    ///
+    /// Colour is discarded, and that is the whole shape of the feature rather
+    /// than a shortcut: a tip modulates coverage and the colour comes from the
+    /// palette at painting time, so a mark drawn in red and a mark drawn in
+    /// black are the same stamp. What varies coverage is opacity, not grey.
+    pub fn from_alpha(width: u32, height: u32, rgba: &[u8]) -> Result<Self, PresetError> {
+        let texels = width as usize * height as usize;
+        if rgba.len() < texels * 4 {
+            return Err(malformed(format!(
+                "a {width}x{height} tip needs {} bytes and got {}",
+                texels * 4,
+                rgba.len()
+            )));
+        }
+        let coverage = rgba[..texels * 4].chunks_exact(4).map(|px| px[3]).collect();
+        Self::new(width, height, coverage)
+    }
+
+    /// Read any picture Umber can decode as a tip, and say which reading was
+    /// taken.
+    ///
+    /// PNG goes through the document importer's decoder rather than a second
+    /// one of this module's — [`from_png`](Self::from_png) is strict on purpose
+    /// and reads only what Umber itself wrote into `tips/`. Everything else
+    /// goes through the `image` crate, which is already carried for the flat
+    /// export and covers JPEG, TIFF, GIF and BMP.
+    ///
+    /// A picture larger than [`TipMask::MAX_SIZE`] is **refused** rather than
+    /// resampled. Downscaling would be a second resampler nothing else calls,
+    /// and — worse — it would change the mask silently, so a spatter stamp
+    /// would come back softer than the one on disk with nothing saying why.
+    pub fn from_picture(bytes: &[u8]) -> Result<(Self, TipReading), PresetError> {
+        /// The eight bytes every PNG starts with.
+        const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+        let (width, height, rgba) = if bytes.starts_with(&PNG_MAGIC) {
+            let image =
+                crate::docimport::flat::decode_png(bytes, crate::docimport::SourceFormat::Png)
+                    .map_err(|e| malformed(e.to_string()))?;
+            (image.size.x, image.size.y, image.rgba)
+        } else {
+            let decoded = image::load_from_memory(bytes)
+                .map_err(|e| malformed(format!("the picture could not be read ({e})")))?
+                .to_rgba8();
+            (decoded.width(), decoded.height(), decoded.into_raw())
+        };
+
+        let (coverage, reading) = coverage_of(&rgba);
+        Ok((Self::new(width, height, coverage)?, reading))
+    }
+}
+
+/// The side of the canvas a tip is drawn on inside Umber.
+///
+/// 256 pixels, and the number is a compromise with a reason on each side.
+/// Below about 128 a stamp cannot hold detail a large brush will show, because
+/// [`crate::Brush::size`] stretches the mask over the dab and a 64-texel tip
+/// painted at 400 px is eight-fold magnification of its own antialiasing.
+/// Above about 512 the canvas is bigger than any mark anybody draws a stamp
+/// *as*, and the mask is stored and uploaded at whatever size it was drawn —
+/// a 2048² tip is four megabytes of coverage per brush and the ceiling
+/// [`TipMask::MAX_SIZE`] refuses anyway. 256 is also what the shipped stamps
+/// and every CC0 pack Umber vendors sit at or below.
+pub const AUTHORING_SIZE: u32 = 256;
+
+/// The document a tip is drawn on.
+///
+/// **Square, [`AUTHORING_SIZE`] on a side, and transparent.**
+///
+/// Square because a stamp is stretched over the dab's bounding square and
+/// [`TipMask::aspect`] narrows it back down from its own proportions — so a
+/// square canvas is the one shape that says nothing the artist did not mean.
+/// Somebody who wants a chisel draws a chisel across it and the empty margin
+/// costs coverage of zero, which is the exact identity.
+///
+/// Transparent because that is what makes the conversion unambiguous. The
+/// coverage is the alpha ([`TipMask::from_alpha`]), so what is painted is what
+/// stamps: ink becomes coverage, the eraser takes coverage away, opacity is the
+/// dial that makes a stamp fainter, and colour is discarded because a tip does
+/// not carry one. A white-backed document reading darkness was the alternative
+/// — it is how Photoshop defines a brush — and it is worse here twice over: a
+/// stroke of white would mean "erase" while Umber has an eraser that means
+/// something else, and a stamp that genuinely covers the whole canvas is
+/// indistinguishable from a blank white page.
+///
+/// The resolution is left at the document default. Nothing downstream reads it
+/// — a mask is texels, and [`crate::Brush::size`] is what decides how large the
+/// mark is in document pixels.
+pub fn authoring_document() -> crate::Document {
+    crate::Document::new(AUTHORING_SIZE, AUTHORING_SIZE)
+        .with_background(crate::Background::Transparent)
+}
+
+/// What a tip document is being drawn for.
+///
+/// Carried by the tab rather than by the editor, because it belongs to *that
+/// document* and several documents are open at once — a painter who opens a
+/// tip canvas, goes back to their picture and comes back must find the canvas
+/// still knowing what it is for.
+///
+/// The brush is named **by id**, for [`crate::BrushPreset::id`]'s own reason: a
+/// rename must not orphan it, and a position into the merged preset list means
+/// nothing after a save, a delete or an import. The display name is carried
+/// beside it only so the banner has something to say — it is what the brush was
+/// called when the canvas was opened, and it is deliberately not re-derived,
+/// because an id that no longer resolves has no name at all and the banner
+/// still has to be able to name what the user is drawing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TipTarget {
+    /// [`crate::BrushPreset::id`] of the brush this stamp is for.
+    pub brush: String,
+    /// What that brush was called when the canvas was opened.
+    pub name: String,
+}
+
+impl TipTarget {
+    pub fn new(brush: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            brush: brush.into(),
+            name: name.into(),
+        }
+    }
+
+    /// What the tab is called. Distinct from an "Untitled n" so the strip says
+    /// what the document is without anybody having to click it.
+    pub fn title(&self) -> String {
+        format!("Tip for {}", self.name)
+    }
+}
+
+/// Which reading of a picture was taken as coverage.
+///
+/// A tip *is* coverage, and a picture is four channels, so something has to
+/// decide. There is no single answer that is right for every file — which is
+/// exactly why [`TipMask::from_png`] refuses a colour PNG outright — so the
+/// rule is stated, applied to the whole image at once, and then **said out
+/// loud** by whoever imported it. A tip that is quietly the wrong shape is the
+/// failure this exists to avoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipReading {
+    /// The alpha channel. The picture has transparency in it, so it was drawn
+    /// on nothing and what was painted is what stamps. Colour is discarded.
+    ///
+    /// This is also what a `.gbr` colour stamp gives up, and what
+    /// [`TipMask::from_alpha`] takes unconditionally.
+    Alpha,
+    /// Darkness, `1 - luminance`. The picture is opaque in every pixel, so its
+    /// transparency says nothing at all about what was drawn, and ink on paper
+    /// is the only other thing a stamp can mean — a scan, a photograph of a
+    /// mark, a JPEG. Black stamps at full coverage and white stamps at none.
+    Ink,
+}
+
+impl TipReading {
+    /// One clause naming what was taken, for the sentence an import shows.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Alpha => "its transparency",
+            Self::Ink => "how dark it is",
+        }
+    }
+}
+
+/// Rec. 709 luminance over **sRGB** components, as a fraction.
+///
+/// Deliberately not linearised first, for [`crate::Color::to_hsv`]'s reason:
+/// "how dark does this look" is a perceptual question, and a luminance computed
+/// over linear values buries everything but the highlights, so a pencil drawing
+/// would import as a nearly blank stamp.
+fn luminance(r: u8, g: u8, b: u8) -> f32 {
+    (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
+}
+
+/// The mask a picture makes, and which reading produced it.
+///
+/// `rgba` is straight-alpha, sRGB-encoded RGBA8 — what
+/// `docimport::flat::decode_png` and `image`'s `to_rgba8` both hand back, and
+/// what `CanvasRenderer::export_rgba` returns.
+///
+/// The rule, decided **once for the whole picture** rather than per pixel: if
+/// any pixel is less than fully opaque the alpha is the coverage; otherwise the
+/// darkness is. Per-pixel would produce a mask with two different meanings
+/// inside it — the transparent margin of a stamp reading as alpha and its solid
+/// black centre reading as ink, which is the same number twice by luck and a
+/// different one everywhere else.
+///
+/// Note that the scan is what makes this decidable at all, and it is why a tip
+/// *drawn in Umber* does not come through here: a tip document is transparent
+/// to begin with, so an artist who covers the whole canvas would flip the rule
+/// under themselves and get their stamp inverted. That path takes
+/// [`TipMask::from_alpha`], which has nothing to decide.
+pub fn coverage_of(rgba: &[u8]) -> (Vec<u8>, TipReading) {
+    let opaque = rgba.chunks_exact(4).all(|px| px[3] == 255);
+    let coverage = if opaque {
+        rgba.chunks_exact(4)
+            .map(|px| (((1.0 - luminance(px[0], px[1], px[2])) * 255.0) + 0.5) as u8)
+            .collect()
+    } else {
+        rgba.chunks_exact(4).map(|px| px[3]).collect()
+    };
+    (
+        coverage,
+        if opaque {
+            TipReading::Ink
+        } else {
+            TipReading::Alpha
+        },
+    )
 }
 
 /// Every mask Umber ships, by name, decoded once.
@@ -370,6 +589,20 @@ fn malformed(message: String) -> PresetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG of the given colour type, for the import tests. The document
+    /// importer has fixtures of its own and they are private to it; one
+    /// four-line encoder here is cheaper than widening that module.
+    fn encode(width: u32, height: u32, colour: png::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(colour);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("header");
+        writer.write_image_data(data).expect("data");
+        drop(writer);
+        out
+    }
 
     #[test]
     fn a_mask_reads_back_row_major() {
@@ -571,5 +804,100 @@ mod tests {
         // brush at all.
         let ghost = TipMask::new(8, 8, vec![0; 64]).expect("build");
         assert!(!stroke_coverage(&ghost, 0.1).is_usable());
+    }
+
+    /// The whole of what a tip drawn in Umber is: the alpha, and nothing else.
+    /// Colour must not reach the mask, or a stamp would change shape depending
+    /// on what colour happened to be in the palette when it was drawn.
+    #[test]
+    fn a_drawn_tip_takes_its_coverage_from_the_alpha_and_ignores_the_colour() {
+        // Black, white and red, all at half alpha; then nothing at all.
+        let rgba = [
+            0, 0, 0, 128, // black
+            255, 255, 255, 128, // white
+            255, 0, 0, 128, // red
+            0, 0, 0, 0, // untouched canvas
+        ];
+        let mask = TipMask::from_alpha(4, 1, &rgba).expect("build");
+        assert_eq!(mask.coverage(), [128, 128, 128, 0]);
+
+        // A tip that covers the whole canvas is solid, not inverted. This is
+        // the case that rules out reading darkness here: every pixel is opaque,
+        // so the guessing rule would flip and hand back the negative.
+        let solid = TipMask::from_alpha(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255]).expect("build");
+        assert_eq!(solid.coverage(), [255, 255]);
+
+        // Short buffers are refused rather than read past the end.
+        assert!(TipMask::from_alpha(4, 1, &[0; 8]).is_err());
+    }
+
+    /// The one guess in the module, and the reason it is stated rather than
+    /// per pixel: a picture means one thing all over.
+    #[test]
+    fn a_picture_with_transparency_reads_as_alpha_and_an_opaque_one_as_ink() {
+        // A stamp drawn on nothing: black ink at the left, clear at the right.
+        let drawn = [0, 0, 0, 255, 0, 0, 0, 0];
+        let (coverage, reading) = coverage_of(&drawn);
+        assert_eq!(reading, TipReading::Alpha);
+        assert_eq!(coverage, [255, 0]);
+
+        // A scan: black on white, opaque throughout. Alpha says nothing, so the
+        // ink is the mark.
+        let scanned = [0, 0, 0, 255, 255, 255, 255, 255];
+        let (coverage, reading) = coverage_of(&scanned);
+        assert_eq!(reading, TipReading::Ink);
+        assert_eq!(coverage, [255, 0]);
+
+        // Mid-grey is about half coverage — checked loosely, because the
+        // luminance weights are perceptual rather than a third each.
+        let (coverage, _) = coverage_of(&[128, 128, 128, 255]);
+        assert!(
+            (coverage[0] as i32 - 127).abs() <= 2,
+            "got {coverage:?} for mid-grey"
+        );
+
+        // One transparent pixel is enough to settle the whole picture, which is
+        // what stops a stamp's solid centre and its clear margin being read two
+        // different ways.
+        let mostly_opaque = [0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0];
+        assert_eq!(coverage_of(&mostly_opaque).1, TipReading::Alpha);
+        assert_eq!(coverage_of(&mostly_opaque).0, [255, 255, 0]);
+    }
+
+    /// A tip imported off disk has to come back as the picture that went in,
+    /// through the decoder the document importer already has rather than a
+    /// second one.
+    #[test]
+    fn a_picture_file_imports_as_a_tip() {
+        let png = encode(2, 1, png::ColorType::Rgba, &[0, 0, 0, 255, 0, 0, 0, 0]);
+        let (mask, reading) = TipMask::from_picture(&png).expect("import");
+        assert_eq!((mask.width(), mask.height()), (2, 1));
+        assert_eq!(mask.coverage(), [255, 0]);
+        assert_eq!(reading, TipReading::Alpha);
+        assert!(reading.describe().contains("transparency"));
+
+        // A greyscale PNG has no alpha channel at all, so it is a scan.
+        let grey = encode(2, 1, png::ColorType::Grayscale, &[0, 255]);
+        let (mask, reading) = TipMask::from_picture(&grey).expect("import");
+        assert_eq!(mask.coverage(), [255, 0]);
+        assert_eq!(reading, TipReading::Ink);
+
+        assert!(TipMask::from_picture(b"not a picture").is_err());
+    }
+
+    /// The canvas a tip is drawn on. Both halves are load-bearing and both are
+    /// easy to change without noticing: a background that was not transparent
+    /// would make `from_alpha` read the paper as paint, and a non-square canvas
+    /// would put proportions into every stamp somebody drew.
+    #[test]
+    fn the_tip_document_is_a_square_transparent_canvas() {
+        let doc = authoring_document();
+        assert_eq!(doc.size.x, doc.size.y);
+        assert_eq!(doc.size.x, AUTHORING_SIZE);
+        // A canvas Umber offers and then refuses to read back would be a
+        // feature that fails at the last step. Checked at compile time, since
+        // both sides are constants.
+        const { assert!(AUTHORING_SIZE <= TipMask::MAX_SIZE) };
+        assert_eq!(doc.background, crate::Background::Transparent);
     }
 }

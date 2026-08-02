@@ -388,8 +388,13 @@ Written, read back, and asserted on in `docformat`'s tests:
 ## What is not saved
 
 - **The camera.** A reopened document is framed to fit, like any other.
-- **Layer groups, masks, adjustment layers, per-layer blend options.** Umber has
-  none of these yet. When it grows them, `umber-version` is the mechanism.
+- **Layer groups, adjustment layers, per-layer blend options.** Umber has none
+  of these yet. When it grows them, `umber-version` is the mechanism — which is
+  exactly what layer masks and clipping used it for: both are saved, both change
+  the picture in a build that ignores them, so a document carrying either
+  declares revision 2 and an older Umber refuses it rather than opening it with
+  the masks quietly gone. A document with neither still declares revision 1 and
+  still opens anywhere.
 - **Anything about the application** — tool, brush, palette. Those are
   preferences and live in the config directory.
 

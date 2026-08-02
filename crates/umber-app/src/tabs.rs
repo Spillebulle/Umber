@@ -359,7 +359,82 @@ pub enum CloseChoice {
     /// Open the export dialog — everything visible, but as one image, in
     /// whichever format it settles on.
     Export,
+    /// Put this canvas on the brush it was drawn for, and then close it.
+    ///
+    /// Only ever offered for a tip document. Writing one out as an `.ora`
+    /// keeps the pixels and loses the point of the tab, so the affirmative
+    /// answer there has to be the one the tab exists for.
+    UseAsTip,
     Close,
+}
+
+/// Ask before closing a canvas that was opened to draw a brush tip.
+///
+/// The same shape as [`close_prompt`] and the same emphasis on the answer that
+/// keeps the work — but the answer that keeps it is putting the stamp on the
+/// brush, not writing a document. There is no Export either: exporting a
+/// coverage mask as a picture is a thing somebody may want one day and is not
+/// what this dialog is for.
+fn tip_close_prompt(
+    root: &mut egui::Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    title: &str,
+    brush: &str,
+) -> Option<CloseChoice> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("close-tip"))
+        .frame(dialog_frame(p))
+        .show(root.ctx(), |ui| {
+            ui.set_width(420.0);
+            ui.label(
+                egui::RichText::new(format!("Use “{title}” as the tip before closing?"))
+                    .size(text::CONTROL)
+                    .color(p.text_strong)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "This canvas was opened to draw a stamp for “{brush}”. Closing \
+                     it without using it discards the stamp for good."
+                ))
+                .size(text::SMALL)
+                .color(p.text),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "What you painted becomes coverage: colour is ignored and opacity \
+                     is the strength.",
+                )
+                .size(text::SMALL)
+                .color(p.text_dim),
+            );
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if button(ui, p, "Cancel", false) {
+                    choice = Some(CloseChoice::Cancel);
+                }
+                if button(ui, p, "Discard and close", false) {
+                    choice = Some(CloseChoice::Close);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, p, "Use as tip", true) {
+                        choice = Some(CloseChoice::UseAsTip);
+                    }
+                });
+            });
+        });
+
+    if modal.should_close() {
+        choice = Some(CloseChoice::Cancel);
+    }
+    if matches!(choice, Some(CloseChoice::Cancel)) {
+        ed.ui.close_prompt = None;
+    }
+    choice
 }
 
 /// Ask before closing a document that holds work.
@@ -378,7 +453,15 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
     // Whether Save will need to ask for a file, which is worth saying before
     // the click rather than surprising the user with a dialog.
     let has_file = tab.path.is_some();
+    // A tip canvas is not a picture somebody is keeping, and the ordinary
+    // prompt offered to write it out as a document — which keeps the pixels and
+    // throws away the only thing the tab was for. It gets its own question.
+    let tip_for = tab.tip_for.as_ref().map(|target| target.name.clone());
     let mut choice = None;
+
+    if let Some(brush) = tip_for {
+        return tip_close_prompt(root, p, ed, &title, &brush);
+    }
 
     let modal = egui::Modal::new(egui::Id::new("close-document"))
         .frame(dialog_frame(p))

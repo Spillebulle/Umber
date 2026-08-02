@@ -28,7 +28,7 @@ use egui::{
 };
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
-use umber_core::{BlendMode, EditKind, LayerStack, Timestamp};
+use umber_core::{BlendMode, EditKind, EditTarget, LayerStack, Timestamp};
 
 /// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
 /// target is not something anyone can hit.
@@ -927,6 +927,9 @@ const BLEND_WIDTH: f32 = 80.0;
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     let count = ed.layers.len();
     let active = ed.layers.active_index();
+    // Read once: half a dozen controls below answer to it, and a lock read
+    // twice is a lock that can be read differently twice.
+    let locked = ed.layers.active_is_locked();
 
     ui.horizontal(|ui| {
         // Whose settings these are. The blend picker and the opacity slider
@@ -949,8 +952,12 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 ui,
                 p,
                 Icon::Trash,
-                count > 1,
-                "Delete layer — clears undo history",
+                count > 1 && !locked,
+                if locked {
+                    "The layer is locked — unlock it to delete it"
+                } else {
+                    "Delete layer — clears undo history"
+                },
             ) {
                 actions.delete_layer = Some(active);
             }
@@ -974,6 +981,113 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
 
     ui.add_space(4.0);
 
+    // The selected layer's flags, on one compact row of their own.
+    //
+    // A row of the *list* would have been the other place for them, and it is
+    // the wrong one: the list is what has to stay short enough to show a stack
+    // at a glance, and four more targets per row would either grow the row or
+    // shrink the name to nothing. The list *shows* the flags — see
+    // `widgets::layer_row` — and this is where they are changed, which is the
+    // same division the blend picker and the blend label already keep.
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let has_mask = ed.layers.active_mask().is_some();
+        if widgets::icon_toggle(
+            ui,
+            p,
+            Icon::Mask,
+            has_mask,
+            !locked,
+            match (has_mask, locked) {
+                (_, true) => "The layer is locked — unlock it to change its mask",
+                (true, _) => "Remove the layer mask — clears undo history",
+                (false, _) => "Add a layer mask, revealing everything",
+            },
+        ) {
+            if has_mask {
+                actions.remove_mask = true;
+            } else {
+                actions.add_mask = true;
+            }
+        }
+
+        let layer = ed.layers.active_mut();
+        if widgets::icon_toggle(
+            ui,
+            p,
+            Icon::Clip,
+            layer.clipped,
+            true,
+            "Clip to the layer below — the layer only shows where that one does",
+        ) {
+            layer.clipped = !layer.clipped;
+            changed = true;
+        }
+        let is_locked = layer.locked;
+        if widgets::icon_toggle(
+            ui,
+            p,
+            if is_locked { Icon::Lock } else { Icon::Unlock },
+            is_locked,
+            true,
+            if is_locked {
+                "Unlock the layer"
+            } else {
+                "Lock the layer — no strokes, transforms, clearing or flipping"
+            },
+        ) {
+            layer.locked = !is_locked;
+            changed = true;
+        }
+        if widgets::icon_toggle(
+            ui,
+            p,
+            Icon::Chain,
+            layer.linked,
+            true,
+            "Link the layer — linked layers move through the stack together",
+        ) {
+            layer.linked = !layer.linked;
+            changed = true;
+        }
+
+        // Which of the layer's two surfaces a stroke lands in. Drawn only where
+        // there is a mask to paint, because a switch with one position is a
+        // control that lies about there being a choice.
+        if ed.layers.active_mask().is_some() {
+            ui.add_space(4.0);
+            let on_mask = ed.editing_mask();
+            for (label, target, tip) in [
+                (
+                    "Layer",
+                    EditTarget::Layer,
+                    "Strokes land in the layer's pixels",
+                ),
+                (
+                    "Mask",
+                    EditTarget::Mask,
+                    "Strokes land in the mask: black hides, white reveals",
+                ),
+            ] {
+                let selected = (target == EditTarget::Mask) == on_mask;
+                if ui
+                    .selectable_label(
+                        selected,
+                        egui::RichText::new(label)
+                            .size(text::SMALL)
+                            .color(if selected { p.text_strong } else { p.text_dim }),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    ed.edit_target = target;
+                }
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+
     // Blend and opacity for the selected layer, on one row.
     //
     // Both change the picture, so both have to mark the document modified —
@@ -981,7 +1095,6 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // would let a tab holding a carefully set stack of opacities close without
     // a word. Collected and applied below the borrow rather than inside it,
     // since `mark_modified` also wants `ed`.
-    let mut changed = false;
     ui.horizontal(|ui| {
         let layer = ed.layers.active_mut();
         let before = (layer.blend, layer.opacity);
@@ -1000,7 +1113,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         );
         let value = layer.opacity;
         widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
-        changed = before != (layer.blend, layer.opacity);
+        changed |= before != (layer.blend, layer.opacity);
         ui.label(
             egui::RichText::new(format!("{:.0}", value * 100.0))
                 .monospace()
@@ -1043,6 +1156,8 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // Stored bottom-first; shown top-first, the way it is drawn.
     let mut select = None;
     let mut toggle = None;
+    let mut aim_at_mask = None;
+    let editing_mask = ed.editing_mask();
     for index in (0..count).rev() {
         let Some(layer) = ed.layers.get(index) else {
             continue;
@@ -1056,15 +1171,24 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             widgets::layer_row(
                 ui,
                 p,
-                &layer.name,
-                layer.slot(),
-                layer.visible,
-                // The drop target borrows the selected row's own fill, so the
-                // mark is part of the row. The outline below is what keeps
-                // "the layer lands here" from reading as "this row is
-                // selected".
-                index == active || target,
-                layer.blend.label(),
+                widgets::LayerRow {
+                    name: &layer.name,
+                    slot: layer.slot(),
+                    visible: layer.visible,
+                    // The drop target borrows the selected row's own fill, so
+                    // the mark is part of the row. The outline below is what
+                    // keeps "the layer lands here" from reading as "this row is
+                    // selected".
+                    active: index == active || target,
+                    blend: layer.blend.label(),
+                    has_mask: layer.has_mask(),
+                    // The edit target is per document, so only the selected row
+                    // can be the one being painted into.
+                    editing_mask: index == active && editing_mask,
+                    clipped: layer.clipped,
+                    locked: layer.locked,
+                    linked: layer.linked,
+                },
             )
         });
         let (row, rect) = (placed.inner, placed.response.rect);
@@ -1086,8 +1210,17 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         }
         if row.eye_clicked {
             toggle = Some(index);
+        } else if row.mask_clicked {
+            // Selecting the layer as well as its mask: painting a mask on a
+            // layer that is not the one being painted is not a state the
+            // engine has, and clicking the chip plainly means both.
+            select = Some(index);
+            aim_at_mask = Some(true);
         } else if row.clicked {
             select = Some(index);
+            // A click on the row proper — including its own thumbnail — is the
+            // way back off the mask.
+            aim_at_mask = Some(false);
         }
     }
 
@@ -1143,6 +1276,13 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     }
     if let Some(index) = select {
         ed.layers.set_active(index);
+    }
+    if let Some(mask) = aim_at_mask {
+        ed.edit_target = if mask {
+            EditTarget::Mask
+        } else {
+            EditTarget::Layer
+        };
     }
     if changed {
         ed.mark_modified();
