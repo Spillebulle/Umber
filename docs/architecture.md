@@ -118,8 +118,15 @@ layer would otherwise preview wrongly and then jump on release.
   The canvas shader does the encode explicitly instead.
 - **Brush sizes are in document pixels**, so painting at 12% zoom lays down
   exactly the pixels you would get at 100%.
-- **Undo stores damaged rectangles, not whole layers.** A full snapshot per
-  stroke would be 16 MB at 2048², exhausting a gigabyte in about sixty strokes.
+- **Undo stores the cells a stroke touched, not whole layers and not the box
+  it spans.** A full snapshot per stroke would be 16 MB at 2048², exhausting a
+  gigabyte in about sixty strokes; a bounding rectangle is barely better on a
+  large canvas, where a thin diagonal across a 10000² document reserved 381 MB
+  to record a few million pixels. Damage is accumulated on a 64-pixel grid and
+  a patch holds only the cells the dabs reached, clipped to the box so a small
+  mark can never cost more than it used to — 6.8 MB for that diagonal, and a
+  depth of 75 strokes rather than one. It is not unlimited: a wash that really
+  does cover a 10000² canvas is 381 MB of pixels however it is described.
   Undo covers painting only — adding, deleting or reordering a layer is *not*
   undoable yet, and deleting one clears the history, because slots are recycled
   and a stale entry would otherwise be replayed into the wrong layer. Resizing

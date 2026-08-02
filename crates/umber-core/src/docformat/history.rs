@@ -43,19 +43,26 @@
 //! and level the layer images use. `examples/measure-history.rs` is where these
 //! numbers come from and is checked in so they can be re-measured; it paints
 //! synthetic sessions on a 2048² canvas and captures exactly what `History`
-//! would hold.
+//! would hold — through the same [`TileMask`](crate::damage::TileMask) a real
+//! stroke does, so the raw column is the pieces and not the boxes round them.
 //!
-//! | session | raw patches | Deflate | PNG (fast) |
+//! | session (arguments) | raw patches | Deflate | PNG (fast) |
 //! |---|---|---|---|
-//! | 120 full-canvas strokes | 221 MB | 68 MB (3.3×), 4.2 s | 42 MB (5.2×), 0.35 s |
-//! | the same, heavily grained | 237 MB | 108 MB (2.2×), 5.6 s | 93 MB (2.6×), 0.41 s |
-//! | 300 small sketching strokes | 7.5 MB | 0.33 MB (23×), 0.02 s | 0.38 MB (20×), 0.00 s |
+//! | 120 full-canvas strokes (`120 0 1.0`) | 54.8 MB | 18.3 MB (3.0×), 0.85 s | 12.3 MB (4.5×), 0.12 s |
+//! | the same, heavily grained (`120 1.0 1.0`) | 61.2 MB | 30.9 MB (2.0×), 1.44 s | 30.6 MB (2.0×), 0.19 s |
+//! | 300 small sketching strokes (`300 0 0.25`) | 2.6 MB | 0.34 MB (7.7×), 0.10 s | 0.38 MB (6.8×), 0.01 s |
 //!
-//! PNG wins on size everywhere but the sketch — where the difference is 50 kB —
+//! PNG wins on size everywhere but the sketch — where the difference is 40 kB —
 //! and wins on *time* by an order of magnitude everywhere, because it filters
 //! each row against the one above before it deflates and then has far less left
 //! to compress. Deflate is what the ZIP would have done for free, so it is the
 //! alternative worth measuring, and it loses.
+//!
+//! The ratios are lower than they were before patches were cut to the cells a
+//! stroke reached, and that is the tiling working rather than the compressor
+//! failing: what a patch used to hold and PNG used to squeeze out for nothing
+//! was mostly canvas the stroke never went near. The bytes on disk are
+//! unchanged or better; it is the raw column that fell.
 //!
 //! Encoding runs **newest first** and stops at the budget, so a session far
 //! over it pays neither the time nor the space for the entries it will not
@@ -63,19 +70,19 @@
 //!
 //! | session | file | save | open |
 //! |---|---|---|---|
-//! | 300 small strokes | 2.67 → 3.09 MB | 0.09 → 0.08 s | 0.03 → 0.04 s |
-//! | 40 full-canvas strokes | 5.28 → 10.68 MB | 0.10 → 0.15 s | 0.04 → 0.10 s |
-//! | 120 full-canvas strokes | 9.68 → 41.53 MB | 0.12 → 0.39 s | 0.04 → 0.28 s |
+//! | 300 small strokes | 2.67 → 3.15 MB | 0.07 → 0.09 s | 0.03 → 0.04 s |
+//! | 40 full-canvas strokes | 5.28 → 6.97 MB | 0.12 → 0.14 s | 0.05 → 0.07 s |
+//! | 120 full-canvas strokes | 9.68 → 22.13 MB | 0.13 → 0.25 s | 0.05 → 0.18 s |
 //!
 //! Opening is in there because the patches have to be decoded before the
 //! document appears, and that is time the artist spends waiting.
 //!
-//! The last row is the budget saturating, and it is why saving the history is a
-//! **preference** rather than a policy: an afternoon of full-canvas painting
-//! makes the document four times the size, and somebody synchronising their
-//! work to a network drive is entitled to say no. It is on by default because
-//! the common case is the first row — sixteen per cent, and free — and because
-//! a feature nobody knows to switch on is one nobody gets.
+//! Saving the history is still a **preference** rather than a policy, and the
+//! last row is still why: an afternoon of full-canvas painting more than
+//! doubles the document, and somebody synchronising their work to a network
+//! drive is entitled to say no. It is on by default because the common case is
+//! the first row — eighteen per cent, and free — and because a feature nobody
+//! knows to switch on is one nobody gets.
 //!
 //! # Pixels
 //!
@@ -95,7 +102,7 @@ use zip::ZipWriter;
 
 use super::{SaveError, deflated, encode_png, stored};
 use crate::geom::PixelRect;
-use crate::history::{EditKind, History};
+use crate::history::{EditKind, History, PatchPiece};
 use crate::layer::LayerStack;
 use crate::time::Timestamp;
 
@@ -129,17 +136,34 @@ pub const MANIFEST: &str = "umber/history/index.json";
 /// have made that build throw the whole history away — all the pixels, to
 /// avoid losing the clock — which is a plainly worse trade. The test
 /// `a_manifest_from_a_newer_revision_is_discarded_and_not_refused` pins the
-/// behaviour a bump would rely on, for whenever one is genuinely earned.
-pub const VERSION: u32 = 1;
+/// behaviour a bump would rely on.
+///
+/// **2 is the first revision that earned it.** A patch became a set of pieces
+/// rather than one rectangle ([`crate::damage`]), and a build that reads only
+/// revision 1 would ignore `ManifestEdit::pieces`, take the entry's first PNG
+/// for the whole rectangle, and write it back over pixels that were never part
+/// of the edit — pixels it would then have no way to restore. That is a
+/// document quietly damaged by an undo, which is the one outcome worth losing
+/// a history over. Such a build now discards the history and opens the picture
+/// whole, exactly as it does for a document that has none.
+///
+/// This build still reads revision 1: an entry with no `pieces` is one piece
+/// covering the whole rectangle, which is precisely what revision 1 meant.
+pub const VERSION: u32 = 2;
 
 /// How much encoded patch data a document will carry.
 ///
-/// 32 MB, against 512 MB in memory. At the 2.6–5× that painted patches compress
-/// by, that is 80–170 MB of raw history — measured, the newest 62 of 120
-/// full-canvas strokes, 26 of 120 heavily grained ones, and all 300 of a
-/// sketching session with room to spare. It bounds the extra size of the file,
-/// the extra time a save takes and the extra time an *open* takes; the module
-/// docs have what those measure at.
+/// 32 MB, against 512 MB in memory. At the 2–7× that painted patches compress
+/// by, that is 64–220 MB of raw history — measured, **all** of 120 full-canvas
+/// strokes (12.3 MB encoded), all of 120 heavily grained ones (30.6 MB, only
+/// just), and all 300 of a sketching session with room to spare. It bounds the
+/// extra size of the file, the extra time a save takes and the extra time an
+/// *open* takes; the module docs have what those measure at.
+///
+/// It used to bind at 62 of those 120 strokes. Cutting patches to the cells a
+/// stroke reached is what moved it, and the number was left where it is: what
+/// a file will carry is a judgement about documents on somebody's disk, not a
+/// consequence of how well this release happens to pack them.
 ///
 /// One number rather than a fraction of the document, because a rule nobody can
 /// predict is worse than a limit everybody can. A larger one would not help the
@@ -156,9 +180,11 @@ pub struct SaveEdit<'a> {
     /// When it was painted. `None` for an entry that came out of a document
     /// written before this was recorded and is on its way back into one.
     at: Option<Timestamp>,
+    /// The whole region the stroke damaged. The pieces are inside it and
+    /// generally do not fill it — see [`crate::damage`].
     rect: PixelRect,
-    /// Layer-texture bytes, `rect.area() * 4` of them.
-    bytes: &'a [u8],
+    /// The parts of it the stroke actually touched, each with its own pixels.
+    pieces: &'a [PatchPiece],
 }
 
 /// An undo history resolved against the stack it belongs to.
@@ -199,7 +225,7 @@ impl<'a> SaveHistory<'a> {
                 kind: edit.kind,
                 at: edit.at,
                 rect: edit.patch.rect,
-                bytes: &edit.patch.bytes,
+                pieces: edit.patch.pieces(),
             });
         }
         Some(Self {
@@ -245,8 +271,22 @@ pub(crate) struct ManifestEdit {
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// Archive entry holding the patch.
+    /// Archive entry holding the whole rectangle, in a revision-1 manifest.
+    ///
+    /// Nothing writes it any more; it is read so that a document saved before
+    /// patches were made of pieces still opens with its history. An entry with
+    /// no `pieces` is exactly that entry: one piece, covering `x, y, w, h`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub src: String,
+    /// The parts of the rectangle the stroke actually touched, in the order
+    /// they were recorded.
+    ///
+    /// Empty in a revision-1 manifest, which is what [`VERSION`] was raised
+    /// for: a build that reads only revision 1 would ignore this field, decode
+    /// the first piece as though it were the whole rectangle, and write it back
+    /// over pixels that were never part of the edit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<ManifestPiece>,
     /// When the edit was made, in milliseconds since the Unix epoch, UTC.
     ///
     /// Optional in both directions, and that is the whole compatibility story
@@ -260,6 +300,17 @@ pub(crate) struct ManifestEdit {
     /// and every consumer of this field wants the integer anyway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<i64>,
+}
+
+/// One piece of an edit: where it goes, and what holds its pixels.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ManifestPiece {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    /// Archive entry holding this piece's PNG.
+    pub src: String,
 }
 
 /// Stable name for an [`EditKind`]. The debug spelling, like
@@ -289,15 +340,28 @@ pub(crate) fn write(
     // Newest first, stopping at the budget: the oldest entries are the ones to
     // lose, and encoding them only to throw them away would be the bulk of the
     // cost of a session that is far over.
+    //
+    // An entry goes in whole or not at all. Its pieces are the parts of one
+    // stroke's damage; half of them would restore half a stroke, which is not a
+    // state the canvas was ever in.
     let mut used = 0usize;
-    let mut kept: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut kept: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, edit) in history.entries.iter().enumerate().rev() {
-        let png = encode_png(UVec2::new(edit.rect.width, edit.rect.height), edit.bytes)?;
-        if used + png.len() > BUDGET_BYTES {
+        let mut pngs = Vec::with_capacity(edit.pieces.len());
+        let mut entry_bytes = 0usize;
+        for piece in edit.pieces {
+            let png = encode_png(
+                UVec2::new(piece.rect.width, piece.rect.height),
+                &piece.bytes(),
+            )?;
+            entry_bytes += png.len();
+            pngs.push(png);
+        }
+        if used + entry_bytes > BUDGET_BYTES {
             break;
         }
-        used += png.len();
-        kept.push((i, png));
+        used += entry_bytes;
+        kept.push((i, pngs));
     }
     if kept.is_empty() {
         return Ok(false);
@@ -328,18 +392,32 @@ pub(crate) fn write(
                     y: edit.rect.y,
                     w: edit.rect.width,
                     h: edit.rect.height,
-                    src: patch_src(n),
+                    src: String::new(),
+                    pieces: edit
+                        .pieces
+                        .iter()
+                        .enumerate()
+                        .map(|(p, piece)| ManifestPiece {
+                            x: piece.rect.x,
+                            y: piece.rect.y,
+                            w: piece.rect.width,
+                            h: piece.rect.height,
+                            src: patch_src(n, p),
+                        })
+                        .collect(),
                     at: edit.at.map(Timestamp::unix_millis),
                 }
             })
             .collect(),
     };
 
-    for (n, (_, png)) in kept.iter().enumerate() {
-        // Stored: a PNG is deflated already, so deflating it again in the ZIP
-        // costs time and gains nothing.
-        zip.start_file(patch_src(n), stored())?;
-        zip.write_all(png)?;
+    for (n, (_, pngs)) in kept.iter().enumerate() {
+        for (p, png) in pngs.iter().enumerate() {
+            // Stored: a PNG is deflated already, so deflating it again in the
+            // ZIP costs time and gains nothing.
+            zip.start_file(patch_src(n, p), stored())?;
+            zip.write_all(png)?;
+        }
     }
 
     let json =
@@ -349,8 +427,8 @@ pub(crate) fn write(
     Ok(true)
 }
 
-pub(crate) fn patch_src(index: usize) -> String {
-    format!("umber/history/{index:04}.png")
+pub(crate) fn patch_src(index: usize, piece: usize) -> String {
+    format!("umber/history/{index:04}-{piece:03}.png")
 }
 
 #[cfg(test)]
@@ -478,12 +556,11 @@ mod tests {
         // Millisecond resolution really made it into the file, rather than
         // being rounded away by a seconds-wide field.
         assert_eq!(back.time_at(0).unwrap().unix_millis() % 1000, 250);
-        // And the manifest is still revision 1: adding an optional field is
-        // something an older build ignores, so bumping would only have made it
-        // throw away pixels it can read perfectly well. See `VERSION`.
+        // And the manifest is revision 2, which a patch made of pieces earned
+        // and the per-entry timestamp deliberately did not. See `VERSION`.
         assert!(
-            manifest_of(&bytes).contains("\"version\":1"),
-            "the manifest revision moved without a reason"
+            manifest_of(&bytes).contains("\"version\":2"),
+            "the manifest revision is not the one this build writes"
         );
 
         for i in 0..history.len() {
@@ -491,7 +568,11 @@ mod tests {
             assert_eq!(after.kind, before.kind, "entry {i}");
             assert_eq!(after.at, before.at, "entry {i} lost the moment it was made");
             assert_eq!(after.patch.rect, before.patch.rect, "entry {i}");
-            assert_eq!(after.patch.bytes, before.patch.bytes, "entry {i}");
+            assert_eq!(
+                patch_pixels(&after.patch),
+                patch_pixels(&before.patch),
+                "entry {i}"
+            );
             // The same *layer*, which is what the slot has to mean again.
             let slot = opened
                 .stack
@@ -596,9 +677,9 @@ mod tests {
             json.replace("\"canvas\":[64,64]", "\"canvas\":[65,64]")
         });
         let newer = with_entry(&bytes, MANIFEST, |json| {
-            json.replace("\"version\":1", "\"version\":99")
+            json.replace("\"version\":2", "\"version\":99")
         });
-        let truncated = without_entry(&bytes, &patch_src(0));
+        let truncated = without_entry(&bytes, &patch_src(0, 0));
 
         for (what, doctored) in [
             ("renamed", renamed),
@@ -677,7 +758,7 @@ mod tests {
         }
         // Well past the file's budget, and comfortably inside memory's.
         assert!(history.used_bytes() > BUDGET_BYTES * 2);
-        let last = history.entry_at(count - 1).unwrap().patch.bytes.clone();
+        let last = patch_pixels(&history.entry_at(count - 1).unwrap().patch);
 
         let pixels = vec![0u8; (side * side * 4) as usize];
         let layers = vec![SaveLayer {
@@ -716,7 +797,7 @@ mod tests {
             "an eviction that is not counted is one the list cannot admit to"
         );
         assert_eq!(
-            back.entry_at(back.len() - 1).unwrap().patch.bytes,
+            patch_pixels(&back.entry_at(back.len() - 1).unwrap().patch),
             last,
             "the newest entry is the one that must survive"
         );
@@ -788,7 +869,7 @@ mod tests {
         let (bytes, _) = round_trip(&stack, &history);
 
         let newer = with_entry(&bytes, MANIFEST, |json| {
-            json.replace("\"version\":1", "\"version\":99")
+            json.replace("\"version\":2", "\"version\":99")
         });
         let doc = docimport::read_openraster(&newer).expect("the document must still open");
         assert!(doc.history.is_none(), "a newer manifest was trusted");
@@ -800,6 +881,16 @@ mod tests {
         );
         assert_eq!(doc.layers.len(), 2, "the picture was refused with it");
         assert!(doc.open().history.is_empty());
+    }
+
+    /// Every piece of a patch, as `(rect, pixels)` — what two patches have to
+    /// agree on to be the same patch.
+    fn patch_pixels(patch: &PixelPatch) -> Vec<(PixelRect, Vec<u8>)> {
+        patch
+            .pieces()
+            .iter()
+            .map(|p| (p.rect, p.bytes().into_owned()))
+            .collect()
     }
 
     /// The manifest JSON out of a built archive, as text.

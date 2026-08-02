@@ -23,10 +23,11 @@ use std::io::Write as _;
 use std::time::Instant;
 
 use glam::UVec2;
+use umber_core::damage::TileMask;
 use umber_core::docformat::{self, SaveDocument, SaveHistory, SaveLayer};
 use umber_core::document::Background;
 use umber_core::geom::PixelRect;
-use umber_core::history::{Edit, EditKind, History, PixelPatch};
+use umber_core::history::{Edit, EditKind, History, PatchPiece, PixelPatch};
 use umber_core::layer::LayerStack;
 
 const W: usize = 2048;
@@ -87,14 +88,25 @@ fn stamp(layer: &mut [u8], d: &Dab, rng: &mut Rng) {
 }
 
 /// Exactly what `finish_stroke` records: the layer as it was before the stroke,
-/// over the rectangle the stroke damaged.
-fn capture(layer: &[u8], slot: u32, rect: PixelRect) -> PixelPatch {
-    let mut bytes = Vec::with_capacity(rect.area() as usize * 4);
-    for y in rect.y..rect.y + rect.height {
-        let start = (y as usize * W + rect.x as usize) * 4;
-        bytes.extend_from_slice(&layer[start..start + rect.width as usize * 4]);
-    }
-    PixelPatch::new(rect, slot, bytes)
+/// over the pieces of the damaged rectangle the dabs actually reached.
+///
+/// Through the real [`TileMask`], not a rectangle, because the file is written
+/// out of whatever `History` holds — measuring the dense boxes patches used to
+/// be would report a document four times the size of the one Umber writes.
+fn capture(layer: &[u8], slot: u32, rect: PixelRect, mask: &TileMask) -> PixelPatch {
+    let pieces = mask
+        .pieces(rect)
+        .into_iter()
+        .map(|piece| {
+            let mut bytes = Vec::with_capacity(piece.area() as usize * 4);
+            for y in piece.y..piece.y + piece.height {
+                let start = (y as usize * W + piece.x as usize) * 4;
+                bytes.extend_from_slice(&layer[start..start + piece.width as usize * 4]);
+            }
+            PatchPiece::new(piece, bytes)
+        })
+        .collect();
+    PixelPatch::from_pieces(rect, slot, pieces)
 }
 
 /// What the ZIP's own compressor would make of a patch — the alternative to
@@ -148,8 +160,9 @@ fn main() {
         let steps = ((60.0 + rng.f() * 400.0) * scale) as usize;
         let (mut dx, mut dy) = (rng.f() * 2.0 - 1.0, rng.f() * 2.0 - 1.0);
 
-        // A wandering path, and the box it damages.
+        // A wandering path, the box it damages and the cells it reaches.
         let (mut lo, mut hi) = ((W as f32, H as f32), (0.0f32, 0.0f32));
+        let mut mask = TileMask::default();
         let mut path = Vec::with_capacity(steps);
         for _ in 0..steps {
             dx += rng.f() * 0.4 - 0.2;
@@ -159,6 +172,7 @@ fn main() {
             y = (y + dy / len * (r * 0.25).max(1.0)).clamp(0.0, H as f32 - 1.0);
             lo = (lo.0.min(x - r), lo.1.min(y - r));
             hi = (hi.0.max(x + r), hi.1.max(y + r));
+            mask.mark(glam::Vec2::new(x, y), glam::Vec2::splat(r));
             path.push((x, y));
         }
 
@@ -168,7 +182,7 @@ fn main() {
             width: (hi.0.ceil() as usize).min(W) as u32 - lo.0.max(0.0) as u32,
             height: (hi.1.ceil() as usize).min(H) as u32 - lo.1.max(0.0) as u32,
         };
-        history.record(Edit::new(EditKind::Paint, capture(&layer, 0, rect)));
+        history.record(Edit::new(EditKind::Paint, capture(&layer, 0, rect, &mask)));
 
         for at in path {
             stamp(
@@ -196,15 +210,21 @@ fn main() {
         let patch = &history.entry_at(i).unwrap().patch;
         raw += patch.byte_len();
 
-        let t = Instant::now();
-        deflate += deflated_len(&patch.bytes);
-        t_deflate += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        fast += png_len(patch.rect, &patch.bytes, png::Compression::Fast);
-        t_fast += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        balanced += png_len(patch.rect, &patch.bytes, png::Compression::Balanced);
-        t_balanced += t.elapsed().as_secs_f64();
+        // One dense piece each: `capture` above is the pre-tiles shape of a
+        // patch, which is what this example is measuring the *file* cost of.
+        // `measure-undo.rs` is the one that measures the pieces.
+        for piece in patch.pieces() {
+            let bytes = piece.bytes();
+            let t = Instant::now();
+            deflate += deflated_len(&bytes);
+            t_deflate += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            fast += png_len(piece.rect, &bytes, png::Compression::Fast);
+            t_fast += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            balanced += png_len(piece.rect, &bytes, png::Compression::Balanced);
+            t_balanced += t.elapsed().as_secs_f64();
+        }
     }
 
     println!("{strokes} strokes, grain {grain}, scale {scale}");

@@ -2084,12 +2084,27 @@ impl CanvasRenderer {
     }
 
     /// Bake the scratch stroke into `slot` over `rect`, then clear the scratch.
+    /// Bake the finished stroke into the layer.
+    ///
+    /// `pieces` are the parts of `rect` the stroke actually reached, and the
+    /// pass is scissored to them: **exactly the pixels the undo patch was
+    /// captured from, and no others.** That equality is the whole of why a
+    /// patch may be smaller than the stroke's bounding box. Committing the
+    /// whole box instead would run every pixel of it through the blend — an
+    /// identity where coverage is zero, but an identity computed in floating
+    /// point and written back through an sRGB encode, which is a guarantee
+    /// about rounding rather than a guarantee about pixels. Scissoring makes it
+    /// a guarantee about pixels: an untouched cell is never written at all.
+    ///
+    /// It is also less work. A thin diagonal across a large canvas commits a
+    /// hundred and fifty narrow strips instead of the whole document.
     pub fn commit_stroke(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         slot: u32,
         rect: PixelRect,
+        pieces: &[PixelRect],
         style: StrokeStyle,
     ) {
         let Some(view) = self.layers.slot_views.get(slot as usize) else {
@@ -2135,7 +2150,14 @@ impl CanvasRenderer {
                 BrushMode::Erase => &self.shared.commit_erase_pipeline,
             });
             pass.set_bind_group(0, &self.commit_bind_group, &[]);
-            pass.draw(0..4, 0..1);
+            // One quad, drawn once per piece under a different scissor. The
+            // vertex shader spans `rect` every time — the scissor is what
+            // decides which of it survives — so nothing per piece has to reach
+            // the uniform buffer.
+            for piece in pieces {
+                pass.set_scissor_rect(piece.x, piece.y, piece.width, piece.height);
+                pass.draw(0..4, 0..1);
+            }
         }
 
         self.clear_stroke(encoder);
@@ -3444,6 +3466,154 @@ impl CanvasRenderer {
             },
             (rect.width, rect.height),
         )
+    }
+
+    /// Read several rectangles of one layer back to the CPU, for the undo
+    /// stack, in **one** submission and one wait.
+    ///
+    /// This is what a stroke's patch is captured with. The pieces are the cells
+    /// of the canvas the stroke actually reached
+    /// ([`umber_core::damage::TileMask`]), which for a diagonal across a large
+    /// document is a hundred and fifty separate rectangles — and a hundred and
+    /// fifty calls to [`Self::read_layer_rect`] would be a hundred and fifty
+    /// submissions each blocking on its own fence, at pointer-up, in front of
+    /// the artist. Recorded together they cost one.
+    ///
+    /// Blocking, like [`Self::read_layer_rect`] and for the same reason: once
+    /// per stroke is acceptable, the drawing loop is not.
+    pub fn read_layer_pieces(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u32,
+        pieces: &[PixelRect],
+    ) -> Vec<Vec<u8>> {
+        // As in `read_layer_rect`: refuse rather than abort. See there.
+        if slot >= self.layers.capacity {
+            log::error!(
+                "read from slot {slot} beyond capacity {}",
+                self.layers.capacity
+            );
+            return pieces
+                .iter()
+                .map(|r| vec![0; (r.area() * 4) as usize])
+                .collect();
+        }
+
+        let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        // Every block is a whole number of padded rows, so laying them end to
+        // end keeps each one's offset aligned without any arithmetic of its
+        // own.
+        let block =
+            |r: &PixelRect| (u64::from(r.width) * 4).div_ceil(align) * align * u64::from(r.height);
+
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(pieces.len());
+        let mut batch: Vec<&PixelRect> = Vec::new();
+        let mut used = 0u64;
+        let flush = |batch: &mut Vec<&PixelRect>, out: &mut Vec<Vec<u8>>| {
+            if !batch.is_empty() {
+                self.read_batch(device, queue, slot, batch, out);
+                batch.clear();
+            }
+        };
+
+        for piece in pieces {
+            let size = block(piece);
+            // One piece larger than the whole limit cannot be batched at all.
+            // Cell runs are at most one cell tall, so this needs a patch that
+            // did not come from a damage mask — but the banded path exists and
+            // costs nothing to fall back to.
+            if size > self.readback_limit {
+                flush(&mut batch, &mut out);
+                out.push(self.read_layer_rect(device, queue, slot, *piece));
+                continue;
+            }
+            if used + size > self.readback_limit {
+                flush(&mut batch, &mut out);
+                used = 0;
+            }
+            used += size;
+            batch.push(piece);
+        }
+        flush(&mut batch, &mut out);
+        out
+    }
+
+    /// One submission's worth of [`Self::read_layer_pieces`]: every piece
+    /// copied into one staging buffer, then mapped once.
+    fn read_batch(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u32,
+        pieces: &[&PixelRect],
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded = |r: &PixelRect| (u64::from(r.width) * 4).div_ceil(align) * align;
+
+        let mut offsets = Vec::with_capacity(pieces.len());
+        let mut size = 0u64;
+        for piece in pieces {
+            offsets.push(size);
+            size += padded(piece) * u64::from(piece.height);
+        }
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("undo-pieces-readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("undo-pieces"),
+        });
+        for (piece, offset) in pieces.iter().zip(&offsets) {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: piece.x,
+                        y: piece.y,
+                        z: slot,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: *offset,
+                        bytes_per_row: Some(padded(piece) as u32),
+                        rows_per_image: Some(piece.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: piece.width,
+                    height: piece.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped = slice.get_mapped_range();
+        for (piece, offset) in pieces.iter().zip(&offsets) {
+            let unpadded = (piece.width * 4) as usize;
+            let padded = padded(piece) as usize;
+            let mut bytes = Vec::with_capacity(unpadded * piece.height as usize);
+            for row in 0..piece.height as usize {
+                let start = *offset as usize + row * padded;
+                bytes.extend_from_slice(&mapped[start..start + unpadded]);
+            }
+            out.push(bytes);
+        }
+        drop(mapped);
+        staging.unmap();
     }
 
     /// Copy a rectangle of a texture back to the CPU, blocking, and return it

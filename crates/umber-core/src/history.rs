@@ -1,9 +1,18 @@
 //! Undo/redo.
 //!
 //! Rather than snapshotting the whole layer per stroke (16 MB at 2048², which
-//! would blow past a gigabyte in ~60 strokes), we store only the rectangle a
-//! stroke actually touched. A typical stroke damages a small fraction of the
-//! canvas, so this keeps a deep history in a modest budget.
+//! would blow past a gigabyte in ~60 strokes), we store only the pixels a
+//! stroke actually replaced.
+//!
+//! "Actually replaced" used to mean the stroke's bounding rectangle, and a
+//! rectangle describes a diagonal terribly: a thin line corner to corner of a
+//! 10000² canvas reserved 381 MB to record a few million pixels, which is a
+//! history one step deep. A patch is therefore a set of [`PatchPiece`]s — the
+//! cells of a [`crate::damage::TileMask`] the dabs reached, merged into runs
+//! and clipped to the bounding box, so the pixels kept are always a subset of
+//! what the box held. Measured, that same diagonal costs 6.8 MB, and a piece
+//! whose pixels are all identical — blank canvas, a flat fill — costs four
+//! bytes. `examples/measure-undo.rs` is where the numbers come from.
 //!
 //! Every entry also carries an [`EditKind`] and the moment it was made, which
 //! is what lets the history be *listed* rather than only stepped through. The
@@ -12,6 +21,7 @@
 //! the number of single steps needed to reach it, so a click on a row costs the
 //! caller the same work as that many presses of undo and no new pixel path.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::brush::BrushMode;
@@ -120,29 +130,125 @@ pub enum Jump {
     Redo(usize),
 }
 
-/// The RGBA8 contents of a rectangle, tightly packed at `width * 4` per row.
+/// The RGBA8 contents of one rectangle of a patch, tightly packed at
+/// `width * 4` per row.
+///
+/// A patch is made of these rather than of one rectangle because a stroke's
+/// bounding box is a very poor description of a stroke — see
+/// [`crate::damage`], which is where the rectangles come from.
+#[derive(Clone, Debug)]
+pub struct PatchPiece {
+    pub rect: PixelRect,
+    bytes: PieceBytes,
+}
+
+/// How one piece's pixels are held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PieceBytes {
+    /// Every pixel the same one — blank canvas, or a flat fill.
+    ///
+    /// Most of a layer is usually untouched, and a stroke laid on an empty one
+    /// captures nothing but zeroes; storing four bytes for it is what makes an
+    /// early session's history effectively free. The scan that finds this stops
+    /// at the first pixel that differs, so a piece of busy painting pays four
+    /// comparisons to be told it is not flat.
+    Flat([u8; 4]),
+    Raw(Vec<u8>),
+}
+
+impl PatchPiece {
+    /// A piece of `rect`, from tightly packed RGBA8.
+    pub fn new(rect: PixelRect, bytes: Vec<u8>) -> Self {
+        debug_assert_eq!(
+            bytes.len() as u64,
+            rect.area() * 4,
+            "piece byte count must match rect area"
+        );
+        let bytes = match flat_pixel(&bytes) {
+            Some(pixel) => PieceBytes::Flat(pixel),
+            None => PieceBytes::Raw(bytes),
+        };
+        Self { rect, bytes }
+    }
+
+    /// The pixels, tightly packed — expanded on the spot where the piece is a
+    /// flat one.
+    ///
+    /// Borrowed in the ordinary case, so the write back to the GPU an undo
+    /// performs copies nothing it does not have to.
+    pub fn bytes(&self) -> Cow<'_, [u8]> {
+        match &self.bytes {
+            PieceBytes::Raw(bytes) => Cow::Borrowed(bytes),
+            PieceBytes::Flat(pixel) => Cow::Owned(pixel.repeat(self.rect.area() as usize)),
+        }
+    }
+
+    /// What this piece costs in memory, which is what the budget counts.
+    pub fn byte_len(&self) -> usize {
+        match &self.bytes {
+            PieceBytes::Raw(bytes) => bytes.len(),
+            PieceBytes::Flat(_) => 4,
+        }
+    }
+}
+
+/// The single pixel a tightly packed RGBA8 buffer is made of, if it is.
+fn flat_pixel(bytes: &[u8]) -> Option<[u8; 4]> {
+    let head: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    bytes.chunks_exact(4).all(|p| p == head).then_some(head)
+}
+
+/// The pixels a stroke replaced, as the rectangles it actually touched.
 #[derive(Clone, Debug)]
 pub struct PixelPatch {
+    /// The whole region the stroke damaged — what the commit pass spans and
+    /// what a list of the history would call the edit's extent. The pieces are
+    /// inside it and generally do not fill it.
     pub rect: PixelRect,
     /// Texture-array slot this patch belongs to. Slots are recycled on layer
     /// deletion, which is why [`History::clear`] must be called then — replaying
     /// this patch into a layer that merely inherited the slot would corrupt it.
     pub slot: u32,
-    pub bytes: Vec<u8>,
+    pieces: Vec<PatchPiece>,
 }
 
 impl PixelPatch {
+    /// A patch covering the whole of `rect` in one piece.
+    ///
+    /// What a caller with no damage information has: a test, and a history read
+    /// out of a document written before patches were made of pieces.
     pub fn new(rect: PixelRect, slot: u32, bytes: Vec<u8>) -> Self {
-        debug_assert_eq!(
-            bytes.len() as u64,
-            rect.area() * 4,
-            "patch byte count must match rect area"
-        );
-        Self { rect, slot, bytes }
+        Self {
+            rect,
+            slot,
+            pieces: vec![PatchPiece::new(rect, bytes)],
+        }
     }
 
+    /// A patch of the pieces a stroke's damage mask named.
+    ///
+    /// `rect` is the stroke's whole damaged region; the pieces are the parts of
+    /// it the dabs reached. Nothing checks that they are inside it — the same
+    /// list goes to the commit pass, so if they were not, the pixels that were
+    /// committed and the pixels that were recorded would be the same wrong set.
+    pub fn from_pieces(rect: PixelRect, slot: u32, pieces: Vec<PatchPiece>) -> Self {
+        Self { rect, slot, pieces }
+    }
+
+    pub fn pieces(&self) -> &[PatchPiece] {
+        &self.pieces
+    }
+
+    /// What the patch costs in memory.
+    ///
+    /// The per-piece bookkeeping is counted too. A patch is normally a handful
+    /// of megabytes and this is a few hundred bytes of it, but a session of
+    /// thousands of tiny strokes is the case where the pixels stop being the
+    /// bulk of what is held, and a budget that could not see that would be
+    /// counting the wrong thing.
     pub fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.pieces.iter().map(PatchPiece::byte_len).sum::<usize>()
+            + self.pieces.len() * std::mem::size_of::<PatchPiece>()
     }
 }
 
@@ -380,7 +486,15 @@ mod tests {
             width: w,
             height: h,
         };
-        PixelPatch::new(rect, 0, vec![fill; (w * h * 4) as usize])
+        let mut bytes = vec![fill; (w * h * 4) as usize];
+        // Not *every* byte the same. A patch whose pixels are all identical is
+        // held as one pixel — see `PieceBytes::Flat` — so a budget test built
+        // out of those would be measuring fifty bytes an entry and would pass
+        // whatever the budget did.
+        if let Some(last) = bytes.last_mut() {
+            *last = fill.wrapping_add(1);
+        }
+        PixelPatch::new(rect, 0, bytes)
     }
 
     fn edit(w: u32, h: u32, fill: u8) -> Edit {
@@ -395,11 +509,11 @@ mod tests {
 
         let undone = h.take_undo().unwrap();
         h.push_redo(edit(4, 4, 2));
-        assert_eq!(undone.patch.bytes[0], 1);
+        assert_eq!(undone.patch.pieces()[0].bytes()[0], 1);
         assert!(h.can_redo());
 
         let redone = h.take_redo().unwrap();
-        assert_eq!(redone.patch.bytes[0], 2);
+        assert_eq!(redone.patch.pieces()[0].bytes()[0], 2);
     }
 
     #[test]
@@ -423,7 +537,7 @@ mod tests {
         }
         assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
         // The newest entry must survive eviction.
-        assert_eq!(h.take_undo().unwrap().patch.bytes[0], 7);
+        assert_eq!(h.take_undo().unwrap().patch.pieces()[0].bytes()[0], 7);
     }
 
     #[test]
@@ -531,12 +645,22 @@ mod tests {
             assert_eq!(a.at, b.at, "entry {i}");
             assert_eq!(a.patch.rect, b.patch.rect, "entry {i}");
             assert_eq!(a.patch.slot, b.patch.slot, "entry {i}");
-            assert_eq!(a.patch.bytes, b.patch.bytes, "entry {i}");
+            assert_eq!(
+                a.patch.pieces()[0].bytes(),
+                b.patch.pieces()[0].bytes(),
+                "entry {i}"
+            );
         }
 
         // And the cursor is where it was: one redo available, two undos.
-        assert_eq!(restored.take_redo().unwrap().patch.bytes[0], 9);
-        assert_eq!(restored.take_undo().unwrap().patch.bytes[0], 2);
+        assert_eq!(
+            restored.take_redo().unwrap().patch.pieces()[0].bytes()[0],
+            9
+        );
+        assert_eq!(
+            restored.take_undo().unwrap().patch.pieces()[0].bytes()[0],
+            2
+        );
     }
 
     /// A file written by a build with a larger budget must not be able to hand
