@@ -371,14 +371,18 @@ pub struct LayerMeta {
     pub opacity: f32,
     pub blend: BlendMode,
     /// The texture-array slice holding the pixels, which is what the capture
-    /// reads.
-    pub slot: u32,
+    /// reads. `None` for a folder, which holds none.
+    pub slot: Option<u32>,
     /// The slice holding the layer's mask, when it has one — another slice of
     /// the same array, so it is read by exactly the same capture.
     pub mask: Option<u32>,
     pub clipped: bool,
     pub locked: bool,
     pub link: Option<u8>,
+    /// How deeply nested, 0 at the top level.
+    pub depth: u8,
+    /// This entry is a folder: no slot, no pixels, nothing to read back.
+    pub folder: bool,
 }
 
 /// Everything about one document that its file will carry.
@@ -415,15 +419,45 @@ impl Candidate {
     pub fn draws(&self) -> Vec<umber_render::LayerDraw> {
         self.layers
             .iter()
-            .map(|l| umber_render::LayerDraw {
-                slot: l.slot,
-                opacity: l.opacity,
-                blend: l.blend.index(),
-                visible: l.visible,
-                mask: l.mask,
-                clipped: l.clipped,
+            .enumerate()
+            // Exactly what `Editor::layer_draws` does, and for the same reason:
+            // a pass-through folder is its contents composited in place, so it
+            // contributes nothing but its eye. The flattened preview this
+            // builds has to match the screen, so the two rules have to be the
+            // same rule.
+            .filter_map(|(i, l)| {
+                Some(umber_render::LayerDraw {
+                    slot: l.slot?,
+                    opacity: l.opacity,
+                    blend: l.blend.index(),
+                    visible: self.effective_visible(i),
+                    mask: l.mask,
+                    clipped: l.clipped,
+                })
             })
             .collect()
+    }
+
+    /// Is this entry drawn, once every folder it is inside has had its say?
+    ///
+    /// A second reading of `LayerStack::effective_visible`, over the snapshot
+    /// rather than over the live stack — which is the point of the snapshot:
+    /// the stack may have been renamed, reordered or re-nested since the
+    /// capture began, and the file has to describe the instant the pixels came
+    /// from. The rule itself is one line and the ancestor walk is the same walk.
+    fn effective_visible(&self, index: usize) -> bool {
+        let Some(entry) = self.layers.get(index) else {
+            return false;
+        };
+        let mut want = entry.depth;
+        entry.visible
+            && self.layers[index + 1..].iter().all(|above| {
+                if want == 0 || above.depth >= want {
+                    return true;
+                }
+                want = above.depth;
+                above.visible
+            })
     }
 
     /// The slices the capture should read: every layer in stack order, then
@@ -434,7 +468,29 @@ impl Candidate {
     /// arithmetic rather than a second table.
     pub fn slots(&self) -> Vec<u32> {
         let masks = self.layers.iter().filter_map(|l| l.mask);
-        self.layers.iter().map(|l| l.slot).chain(masks).collect()
+        self.layers
+            .iter()
+            .filter_map(|l| l.slot)
+            .chain(masks)
+            .collect()
+    }
+
+    /// Where entry `index`'s pixels landed in [`Candidate::slots`].
+    ///
+    /// **Not `index` itself once a document has folders in it.** A folder holds
+    /// no slice, so it is not read back and not in the list — and an entry
+    /// looked up by its stack position would then be handed the pixels of a
+    /// layer below it. That is the autosave's version of the mistake the undo
+    /// history's slot-to-position mapping exists to prevent, and it would write
+    /// somebody's file with the layers shifted.
+    pub fn pixel_index(&self, index: usize) -> Option<usize> {
+        self.layers.get(index)?.slot?;
+        Some(
+            self.layers[..index]
+                .iter()
+                .filter(|l| l.slot.is_some())
+                .count(),
+        )
     }
 
     /// Where layer `index`'s mask landed in [`Candidate::slots`], if it has one.
@@ -444,7 +500,10 @@ impl Candidate {
             .iter()
             .filter(|l| l.mask.is_some())
             .count();
-        Some(self.layers.len() + before)
+        // Past every layer slice, which is the count of entries that *have*
+        // one — not the entry count, which folders inflate.
+        let pixels = self.layers.iter().filter(|l| l.slot.is_some()).count();
+        Some(pixels + before)
     }
 }
 
@@ -946,6 +1005,8 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
+                depth: l.depth,
+                folder: l.is_folder(),
             })
             .collect(),
     })
@@ -980,26 +1041,38 @@ fn run_task(task: Task) -> Vec<Report> {
         }];
     }
 
+    // Zipped by `pixel_index` rather than positionally: a folder is an entry
+    // with no slice, so the capture is shorter than the stack and a positional
+    // zip would pair every layer above a folder with the pixels of the one
+    // below it — and then truncate the top of the stack away entirely.
+    let empty: Vec<u8> = Vec::new();
     let layers: Vec<SaveLayer<'_>> = doc
         .layers
         .iter()
         .enumerate()
-        .zip(&pixels.layers)
-        .map(|((i, l), px)| SaveLayer {
-            visible: l.visible,
-            opacity: l.opacity,
-            // The masks are the tail of the same capture — see
-            // `Candidate::slots`. A mask the capture did not bring back is
-            // written as no mask at all rather than as a blank one: an autosave
-            // that invented an empty mask would hide the layer it belonged to.
-            mask: doc
-                .mask_index(i)
+        .map(|(i, l)| {
+            let px = doc
+                .pixel_index(i)
                 .and_then(|k| pixels.layers.get(k))
-                .map(Vec::as_slice),
-            clipped: l.clipped,
-            locked: l.locked,
-            link: l.link,
-            ..SaveLayer::new(&l.name, l.blend, px)
+                .map_or(&empty[..], Vec::as_slice);
+            SaveLayer {
+                visible: l.visible,
+                opacity: l.opacity,
+                // The masks are the tail of the same capture — see
+                // `Candidate::slots`. A mask the capture did not bring back is
+                // written as no mask at all rather than as a blank one: an autosave
+                // that invented an empty mask would hide the layer it belonged to.
+                mask: doc
+                    .mask_index(i)
+                    .and_then(|k| pixels.layers.get(k))
+                    .map(Vec::as_slice),
+                clipped: l.clipped,
+                locked: l.locked,
+                link: l.link,
+                depth: l.depth,
+                folder: l.folder,
+                ..SaveLayer::new(&l.name, l.blend, px)
+            }
         })
         .collect();
 
@@ -1311,7 +1384,9 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 blend: BlendMode::Normal,
-                slot: 0,
+                slot: Some(0),
+                depth: 0,
+                folder: false,
                 mask: None,
                 clipped: false,
                 locked: false,

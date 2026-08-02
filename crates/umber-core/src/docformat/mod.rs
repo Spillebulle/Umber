@@ -312,6 +312,14 @@ pub struct SaveLayer<'a> {
     pub locked: bool,
     /// Which link group this layer belongs to, if any. See [`LINK_GROUP_ATTR`].
     pub link: Option<u8>,
+    /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
+    pub depth: u8,
+    /// This entry is a folder: it becomes a nested `<stack>` and has no `src`,
+    /// no PNG and no pixels.
+    ///
+    /// `pixels` is empty for one, and the canvas-size check every layer is held
+    /// to is skipped — a folder has nothing to be the wrong size.
+    pub folder: bool,
 }
 
 impl<'a> SaveLayer<'a> {
@@ -332,6 +340,24 @@ impl<'a> SaveLayer<'a> {
             clipped: false,
             locked: false,
             link: None,
+            depth: 0,
+            folder: false,
+        }
+    }
+
+    /// A folder: a nested `<stack>` with a name, an eye and nothing else.
+    ///
+    /// No opacity and no blend mode, because a *pass-through* folder has
+    /// neither — see [`crate::layer`]'s docs. Writing an opacity here would be
+    /// the one thing that made this file open showing a different picture in an
+    /// older Umber, which is what [`required_version`] would then have to
+    /// answer for.
+    pub fn folder(name: &'a str, depth: u8, visible: bool) -> Self {
+        Self {
+            visible,
+            depth,
+            folder: true,
+            ..Self::new(name, BlendMode::Normal, &[])
         }
     }
 }
@@ -528,8 +554,11 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             max: LayerStack::MAX,
         });
     }
+    if doc.layers.iter().all(|l| l.folder) {
+        return Err(SaveError::Empty);
+    }
     let expected = doc.size.x as usize * doc.size.y as usize * 4;
-    for layer in doc.layers {
+    for layer in doc.layers.iter().filter(|l| !l.folder) {
         if layer.pixels.len() != expected {
             return Err(SaveError::WrongSize {
                 what: format!("pixels of layer “{}”", layer.name),
@@ -568,7 +597,22 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     // Top first, which is the order `stack.xml` wants. The `src` numbering
     // follows the same order so a file listing reads the way the layers panel
     // does.
+    //
+    // A folder writes no PNG at all, so the numbering has gaps where one sits.
+    // That is deliberate: `src` is a name, and numbering the *layers*
+    // consecutively instead would make the number stop matching the entry it
+    // belongs to, which is the one thing the numbering is for.
     for (i, layer) in doc.layers.iter().rev().enumerate() {
+        // `doc.active` indexes the bottom-first stack; this loop runs top first.
+        let selected = doc.layers.len() - 1 - i == doc.active;
+        if layer.folder {
+            entries.push(Entry {
+                depth: layer.depth,
+                folder: true,
+                xml: folder_xml(layer, selected),
+            });
+            continue;
+        }
         let src = format!("data/layer{i:03}.png");
         let placed = trim(layer.pixels, doc.size);
         let png = encode_png(placed.size, &placed.pixels)?;
@@ -604,17 +648,19 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                 used: op,
             });
         }
-        // `doc.active` indexes the bottom-first stack; this loop runs top first.
-        let selected = doc.layers.len() - 1 - i == doc.active;
-        entries.push(layer_xml(
-            layer,
-            &src,
-            placed.at,
-            op,
-            exact,
-            selected,
-            mask_src.as_deref(),
-        ));
+        entries.push(Entry {
+            depth: layer.depth,
+            folder: false,
+            xml: layer_xml(
+                layer,
+                &src,
+                placed.at,
+                op,
+                exact,
+                selected,
+                mask_src.as_deref(),
+            ),
+        });
     }
 
     // The background goes in last, so it is the bottom of the stack — and it is
@@ -623,7 +669,13 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
     if let Some(colour) = doc.background.colour() {
         zip.start_file(BACKGROUND_SRC, stored())?;
         zip.write_all(&encode_png(doc.size, &solid(doc.size, colour))?)?;
-        entries.push(background_xml(colour));
+        entries.push(Entry {
+            // At the top level whatever the stack above it does: the background
+            // is under everything, so it can be inside nothing.
+            depth: 0,
+            folder: false,
+            xml: background_xml(colour),
+        });
     }
 
     // The undo history, if the caller kept one. Under `umber/`, which every
@@ -714,13 +766,19 @@ pub fn background_from_id(id: &str) -> Option<Color> {
 
 // --- the XML ---------------------------------------------------------------
 
-fn stack_xml(
-    size: UVec2,
-    dpi: f32,
-    version: u32,
-    saved_history: bool,
-    layers: &[String],
-) -> String {
+/// One line of `stack.xml` on its way out, with what it takes to nest it.
+///
+/// The depth travels beside the text rather than being read back out of it,
+/// because closing a `<stack>` is a decision about the *next* entry and a
+/// string has nowhere to put that.
+struct Entry {
+    depth: u8,
+    /// This entry opens a `<stack>` that later entries go inside.
+    folder: bool,
+    xml: String,
+}
+
+fn stack_xml(size: UVec2, dpi: f32, version: u32, saved_history: bool, layers: &[Entry]) -> String {
     // `xres`/`yres` are OpenRaster's own, in whole pixels per inch, and every
     // reader that cares about print already looks for them — which is exactly
     // why there is no `umber-dpi` beside them. Umber has one resolution rather
@@ -740,13 +798,46 @@ fn stack_xml(
          <stack>\n",
         size.x, size.y
     ));
-    for layer in layers {
-        out.push_str("  ");
-        out.push_str(layer);
+    // A folder is a nested `<stack>`, which is the only thing in this file that
+    // is not one self-closing line. The entries arrive top first with a depth
+    // each, and a folder's contents are exactly the entries after it that are
+    // deeper — so the close tags are emitted whenever the depth comes back
+    // down, and whatever is still open is closed at the end.
+    //
+    // This is baseline OpenRaster, not an `umber-` extension: it is the nesting
+    // GIMP, Krita and MyPaint all write, and the reason folders did **not**
+    // move `VERSION_ATTR`. A reader that does not keep the nesting — an older
+    // Umber, or another application — folds the group's visibility into the
+    // layers inside it and draws the identical picture, because a pass-through
+    // folder *is* its contents composited in place.
+    let mut open: Vec<u8> = Vec::new();
+    for entry in layers {
+        while open.last().is_some_and(|d| *d >= entry.depth) {
+            open.pop();
+            // At the indent the opening tag was written at, which is one level
+            // in from however many folders remain open around it.
+            out.push_str(&indent(open.len() + 1));
+            out.push_str("</stack>\n");
+        }
+        out.push_str(&indent(open.len() + 1));
+        out.push_str(&entry.xml);
         out.push('\n');
+        if entry.folder {
+            open.push(entry.depth);
+        }
+    }
+    while open.pop().is_some() {
+        out.push_str(&indent(open.len() + 1));
+        out.push_str("</stack>\n");
     }
     out.push_str(" </stack>\n</image>\n");
     out
+}
+
+/// Indentation for a `stack.xml` line, so a nested file is readable in an
+/// editor — which is half of why the format was chosen.
+fn indent(levels: usize) -> String {
+    " ".repeat(levels + 1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -793,6 +884,39 @@ fn layer_xml(
         out.push_str(&format!(" {LINK_GROUP_ATTR}=\"{group}\""));
     }
     out.push_str("/>");
+    out
+}
+
+/// The opening tag of the nested `<stack>` a folder becomes.
+///
+/// **No `opacity` and no `composite-op`.** Both are legal on an ORA `<stack>`
+/// and both are deliberately absent, because a folder in this build is
+/// pass-through: it has no opacity of its own to write. Writing `opacity="1"`
+/// would be harmless and writing anything else would not — a group opacity is
+/// the one thing a reader that flattens the nesting away *cannot* reproduce,
+/// since a folder at 50% over two overlapping children is not the same picture
+/// as two children at 50% each. That is the whole reason folders did not move
+/// [`VERSION`], and it is why [`required_version`] has nothing to say about
+/// them.
+///
+/// `umber-selected` can land here: a folder is selectable, and a document
+/// saved with one in hand must reopen with it in hand.
+fn folder_xml(layer: &SaveLayer<'_>, selected: bool) -> String {
+    let mut out = format!(
+        "<stack name=\"{}\" visibility=\"{}\"",
+        attribute(layer.name),
+        if layer.visible { "visible" } else { "hidden" },
+    );
+    if selected {
+        out.push_str(&format!(" {SELECTED_ATTR}=\"true\""));
+    }
+    // A lock reaches what is inside the folder, so it is worth keeping; it
+    // changes no pixel, which is why — like a layer's — it did not move
+    // `VERSION` either.
+    if layer.locked {
+        out.push_str(&format!(" {LOCK_ATTR}=\"true\""));
+    }
+    out.push('>');
     out
 }
 
@@ -1026,6 +1150,183 @@ mod tests {
 
     fn layer<'a>(name: &'a str, pixels: &'a [u8]) -> SaveLayer<'a> {
         SaveLayer::new(name, BlendMode::Normal, pixels)
+    }
+
+    // --- folders ------------------------------------------------------------
+
+    /// A document with a folder in it, written and read straight back.
+    ///
+    /// The order is the thing to watch: `SaveDocument::layers` is bottom first,
+    /// so the folder is the entry **above** its contents, and `stack.xml` is
+    /// top first, so the `<stack>` element comes out before the layers inside
+    /// it. Get that backwards and the group swallows the wrong layers.
+    #[test]
+    fn a_folder_survives_a_round_trip() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [200, 30, 30, 255]);
+        // Bottom first, and the two above "Paper" are inside the folder.
+        let layers = vec![
+            layer("Paper", &px),
+            SaveLayer {
+                depth: 1,
+                ..layer("Sketch", &px)
+            },
+            SaveLayer {
+                depth: 1,
+                ..layer("Ink", &px)
+            },
+            SaveLayer::folder("Line art", 0, true),
+        ];
+
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 1,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &px,
+            history: None,
+        });
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        let shape: Vec<(&str, u8, bool)> = doc
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.depth, l.folder))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Paper", 0, false),
+                ("Sketch", 1, false),
+                ("Ink", 1, false),
+                ("Line art", 0, true),
+            ]
+        );
+        assert_eq!(doc.active, Some(1), "the selected layer came back");
+
+        // And the stack the document opens as agrees.
+        let opened = doc.open();
+        assert_eq!(opened.stack.subtree(3), 1..4);
+        assert_eq!(opened.uploads.len(), 3, "a folder has no pixels to upload");
+    }
+
+    /// **Folders do not raise `umber-version`**, and this is the test that has
+    /// to hold for that claim to be worth anything.
+    ///
+    /// A *pass-through* folder is exactly its contents composited in place, so
+    /// an older Umber — or GIMP, or MyPaint — that flattens the nesting away
+    /// shows the identical picture and loses only the grouping. That is
+    /// "plainer", not "wrong", which is the line `VERSION` is drawn on. A
+    /// folder with an opacity of its own would be the other case, and is
+    /// exactly why there is nowhere to put one.
+    #[test]
+    fn a_document_of_folders_still_declares_the_revision_it_needs() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [1, 2, 3, 255]);
+        let layers = vec![
+            SaveLayer {
+                depth: 1,
+                ..layer("Inside", &px)
+            },
+            SaveLayer::folder("Group", 0, false),
+        ];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &px,
+            history: None,
+        })
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains(&format!("{VERSION_ATTR}=\"1\"")),
+            "a folder is not a reason to shut older builds out:\n{xml}"
+        );
+        // Baseline OpenRaster nesting, not an `umber-` attribute of our own.
+        assert!(xml.contains("<stack name=\"Group\""), "{xml}");
+        assert!(xml.contains("</stack>"), "{xml}");
+        // And emphatically no group opacity or blend mode, because there is no
+        // such thing here and a reader that honoured one would draw a different
+        // picture from the one Umber showed.
+        let folder_line = xml
+            .lines()
+            .find(|l| l.contains("<stack name=\"Group\""))
+            .unwrap();
+        assert!(!folder_line.contains("opacity="), "{folder_line}");
+        assert!(!folder_line.contains("composite-op="), "{folder_line}");
+        assert!(
+            folder_line.contains("visibility=\"hidden\""),
+            "{folder_line}"
+        );
+    }
+
+    /// A saved undo history resolves against **stack positions that count
+    /// folders**, because that is what `SaveHistory::new` maps a slot to and
+    /// what the manifest's name fingerprint is built from. If the two ever
+    /// disagreed about what "layer 2" means, an undo would be replayed into the
+    /// wrong layer — the worst failure in that module.
+    #[test]
+    fn a_history_survives_a_document_that_has_folders_in_it() {
+        use crate::history::{Edit, EditBody, EditKind, History, PixelPatch};
+
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [9, 9, 9, 255]);
+
+        // A stack whose folder sits *below* the layer the patch belongs to, so
+        // a mapping that ignored folders would be off by one.
+        let mut stack = LayerStack::empty();
+        stack.push_imported(false, 1, "Inside".into());
+        stack.push_imported(true, 0, "Group".into());
+        stack.push_imported(false, 0, "Above".into());
+        let target = stack.get(2).unwrap().slot().unwrap();
+
+        let rect = crate::geom::PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::Paint,
+            EditBody::Pixels(PixelPatch::new(rect, target, vec![7; 2 * 2 * 4])),
+        ));
+        let saved = super::history::SaveHistory::new(&history, &stack)
+            .expect("every patch names a live slice");
+
+        let layers = vec![
+            SaveLayer {
+                depth: 1,
+                ..layer("Inside", &px)
+            },
+            SaveLayer::folder("Group", 0, true),
+            layer("Above", &px),
+        ];
+        let doc = round_trip(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 2,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &px,
+            history: Some(saved),
+        });
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        let opened = doc.open();
+        assert_eq!(opened.history.len(), 1, "the history came back");
+        let slot = opened.history.entry_at(0).unwrap().patch().unwrap().slot;
+        assert_eq!(
+            Some(slot),
+            opened.stack.get(2).unwrap().slot(),
+            "the patch came back on “Above”, not on the layer inside the group"
+        );
     }
 
     /// Write a document and read it straight back through the importer, which

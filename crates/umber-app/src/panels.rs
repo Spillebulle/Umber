@@ -977,10 +977,33 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             ) {
                 actions.delete_layer = Some(active);
             }
-            if icon_button(ui, p, Icon::ChevronDown, active > 0, "Move layer down") {
+            // Enabled by what the move would actually do, not by the index:
+            // a folder steps over its whole subtree, and one at the top of a
+            // group has nowhere to go without changing its nesting, which is
+            // something dragging says and a chevron cannot.
+            let span = ed.layers.subtree(active);
+            if icon_button(
+                ui,
+                p,
+                Icon::ChevronDown,
+                span.start > 0
+                    && ed
+                        .layers
+                        .can_reorder(active, span.start - 1, depth_of(ed, active)),
+                "Move layer down",
+            ) {
                 actions.move_layer_down = Some(active);
             }
-            if icon_button(ui, p, Icon::ChevronUp, active + 1 < count, "Move layer up") {
+            if icon_button(
+                ui,
+                p,
+                Icon::ChevronUp,
+                span.end < count
+                    && ed
+                        .layers
+                        .can_reorder(active, span.end, depth_of(ed, active)),
+                "Move layer up",
+            ) {
                 actions.move_layer_up = Some(active);
             }
             if icon_button(
@@ -988,9 +1011,28 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 p,
                 Icon::Plus,
                 count < LayerStack::MAX,
-                "Add a layer above the current one",
+                if ed.layers.active_is_folder() {
+                    "Add a layer inside the selected group"
+                } else {
+                    "Add a layer above the current one"
+                },
             ) {
                 actions.add_layer = true;
+            }
+            // Grouping reaches the same set every other bulk control does —
+            // `LayerStack::targets`, so the ticked layers or the selected one.
+            // Nothing about a folder is drawn beyond its name and its eye: a
+            // pass-through folder has no opacity and no blend mode, and a slider
+            // that did nothing would be exactly the control that lies. See
+            // `docs/layer-folders.md`.
+            if icon_button(
+                ui,
+                p,
+                Icon::Folder,
+                count < LayerStack::MAX,
+                "Put the ticked layers — or the selected one — in a group",
+            ) {
+                actions.group_layers = true;
             }
         });
     });
@@ -1005,96 +1047,131 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // shrink the name to nothing. The list *shows* the flags — see
     // `widgets::layer_row` — and this is where they are changed, which is the
     // same division the blend picker and the blend label already keep.
+    // **A folder has none of this.** No mask, no clipping, no blend mode and no
+    // opacity of its own — a pass-through folder is its contents composited in
+    // place. The controls are not drawn rather than drawn disabled: the design
+    // rule allows a disabled control with an explanation where there is one
+    // thing missing, and this is a whole block of them that will never apply to
+    // the selected entry. Its lock *is* drawn, because a lock on a folder means
+    // something and reaches everything inside it.
     let mut changed = false;
-    ui.horizontal(|ui| {
-        let has_mask = ed.layers.active_mask().is_some();
-        if widgets::icon_toggle(
-            ui,
-            p,
-            Icon::Mask,
-            has_mask,
-            !locked,
-            match (has_mask, locked) {
-                (_, true) => "The layer is locked — unlock it to change its mask",
-                (true, _) => "Remove the layer mask — clears undo history",
-                (false, _) => "Add a layer mask, revealing everything",
-            },
-        ) {
-            if has_mask {
-                actions.remove_mask = true;
-            } else {
-                actions.add_mask = true;
-            }
-        }
-
-        let layer = ed.layers.active_mut();
-        if widgets::icon_toggle(
-            ui,
-            p,
-            Icon::Clip,
-            layer.clipped,
-            true,
-            "Clip to the layer below — the layer only shows where that one does",
-        ) {
-            layer.clipped = !layer.clipped;
-            changed = true;
-        }
-        let is_locked = layer.locked;
-        if widgets::icon_toggle(
-            ui,
-            p,
-            if is_locked { Icon::Lock } else { Icon::Unlock },
-            is_locked,
-            true,
-            if is_locked {
-                "Unlock the layer"
-            } else {
-                "Lock the layer — no strokes, transforms, clearing or flipping"
-            },
-        ) {
-            layer.locked = !is_locked;
-            changed = true;
-        }
-        // Linking is deliberately *not* here, where the other three flags are.
-        // It is the one thing on a layer that is a statement about several
-        // layers at once — a group of one says nothing — so it belongs to the
-        // ticked strip and there is exactly one of it. A chain on this row
-        // would have to mean "link this to what?".
-
-        // Which of the layer's two surfaces a stroke lands in. Drawn only where
-        // there is a mask to paint, because a switch with one position is a
-        // control that lies about there being a choice.
-        if ed.layers.active_mask().is_some() {
-            ui.add_space(4.0);
-            let on_mask = ed.editing_mask();
-            for (label, target, tip) in [
-                (
-                    "Layer",
-                    EditTarget::Layer,
-                    "Strokes land in the layer's pixels",
-                ),
-                (
-                    "Mask",
-                    EditTarget::Mask,
-                    "Strokes land in the mask: black hides, white reveals",
-                ),
-            ] {
-                let selected = (target == EditTarget::Mask) == on_mask;
-                if ui
-                    .selectable_label(
-                        selected,
-                        egui::RichText::new(label)
-                            .size(text::SMALL)
-                            .color(if selected { p.text_strong } else { p.text_dim }),
-                    )
-                    .on_hover_text(tip)
-                    .clicked()
-                {
-                    ed.edit_target = target;
+    let is_folder = ed.layers.active_is_folder();
+    if !is_folder {
+        ui.horizontal(|ui| {
+            let has_mask = ed.layers.active_mask().is_some();
+            if widgets::icon_toggle(
+                ui,
+                p,
+                Icon::Mask,
+                has_mask,
+                !locked,
+                match (has_mask, locked) {
+                    (_, true) => "The layer is locked — unlock it to change its mask",
+                    (true, _) => "Remove the layer mask — clears undo history",
+                    (false, _) => "Add a layer mask, revealing everything",
+                },
+            ) {
+                if has_mask {
+                    actions.remove_mask = true;
+                } else {
+                    actions.add_mask = true;
                 }
             }
-        }
-    });
+
+            let layer = ed.layers.active_mut();
+            if widgets::icon_toggle(
+                ui,
+                p,
+                Icon::Clip,
+                layer.clipped,
+                true,
+                "Clip to the layer below — the layer only shows where that one does",
+            ) {
+                layer.clipped = !layer.clipped;
+                changed = true;
+            }
+            let is_locked = layer.locked;
+            if widgets::icon_toggle(
+                ui,
+                p,
+                if is_locked { Icon::Lock } else { Icon::Unlock },
+                is_locked,
+                true,
+                if is_locked {
+                    "Unlock the layer"
+                } else {
+                    "Lock the layer — no strokes, transforms, clearing or flipping"
+                },
+            ) {
+                layer.locked = !is_locked;
+                changed = true;
+            }
+            // Linking is deliberately *not* here, where the other three flags are.
+            // It is the one thing on a layer that is a statement about several
+            // layers at once — a group of one says nothing — so it belongs to the
+            // ticked strip and there is exactly one of it. A chain on this row
+            // would have to mean "link this to what?".
+
+            // Which of the layer's two surfaces a stroke lands in. Drawn only where
+            // there is a mask to paint, because a switch with one position is a
+            // control that lies about there being a choice.
+            if ed.layers.active_mask().is_some() {
+                ui.add_space(4.0);
+                let on_mask = ed.editing_mask();
+                for (label, target, tip) in [
+                    (
+                        "Layer",
+                        EditTarget::Layer,
+                        "Strokes land in the layer's pixels",
+                    ),
+                    (
+                        "Mask",
+                        EditTarget::Mask,
+                        "Strokes land in the mask: black hides, white reveals",
+                    ),
+                ] {
+                    let selected = (target == EditTarget::Mask) == on_mask;
+                    if ui
+                        .selectable_label(
+                            selected,
+                            egui::RichText::new(label)
+                                .size(text::SMALL)
+                                .color(if selected { p.text_strong } else { p.text_dim }),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        ed.edit_target = target;
+                    }
+                }
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            let layer = ed.layers.active_mut();
+            let is_locked = layer.locked;
+            if widgets::icon_toggle(
+                ui,
+                p,
+                if is_locked { Icon::Lock } else { Icon::Unlock },
+                is_locked,
+                true,
+                if is_locked {
+                    "Unlock the group"
+                } else {
+                    "Lock the group — nothing in it can be painted on or cleared"
+                },
+            ) {
+                layer.locked = !is_locked;
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new("A group carries its layers. It has no blend mode.")
+                    .size(text::TINY)
+                    .color(p.text_muted),
+            );
+        });
+    }
 
     ui.add_space(4.0);
 
@@ -1105,32 +1182,34 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // would let a tab holding a carefully set stack of opacities close without
     // a word. Collected and applied below the borrow rather than inside it,
     // since `mark_modified` also wants `ed`.
-    ui.horizontal(|ui| {
-        let layer = ed.layers.active_mut();
-        let before = (layer.blend, layer.opacity);
-        // A fixed width rather than the layout's: the slider beside it is the
-        // control that should take the room the row has spare.
-        let label = layer.blend.label();
-        widgets::dropdown(
-            ui,
-            p,
-            widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(BLEND_WIDTH)),
-            |ui| {
-                for mode in BlendMode::ALL {
-                    ui.selectable_value(&mut layer.blend, mode, mode.label());
-                }
-            },
-        );
-        let value = layer.opacity;
-        widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
-        changed |= before != (layer.blend, layer.opacity);
-        ui.label(
-            egui::RichText::new(format!("{:.0}", value * 100.0))
-                .monospace()
-                .size(10.0)
-                .color(p.text),
-        );
-    });
+    if !is_folder {
+        ui.horizontal(|ui| {
+            let layer = ed.layers.active_mut();
+            let before = (layer.blend, layer.opacity);
+            // A fixed width rather than the layout's: the slider beside it is the
+            // control that should take the room the row has spare.
+            let label = layer.blend.label();
+            widgets::dropdown(
+                ui,
+                p,
+                widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(BLEND_WIDTH)),
+                |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut layer.blend, mode, mode.label());
+                    }
+                },
+            );
+            let value = layer.opacity;
+            widgets::bare_slider(ui, p, &mut layer.opacity, 0.0..=1.0);
+            changed |= before != (layer.blend, layer.opacity);
+            ui.label(
+                egui::RichText::new(format!("{:.0}", value * 100.0))
+                    .monospace()
+                    .size(10.0)
+                    .color(p.text),
+            );
+        });
+    }
 
     ui.add_space(7.0);
 
@@ -1296,12 +1375,26 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     let mut toggle = None;
     let mut tick = None;
     let mut aim_at_mask = None;
+    let mut fold = None;
     let editing_mask = ed.editing_mask();
     for index in (0..count).rev() {
         let Some(layer) = ed.layers.get(index) else {
             continue;
         };
-        let target = aimed == Some(index);
+        // A folded folder hides its contents. Purely a filter on what is drawn:
+        // the model is untouched, so a collapsed group composites exactly as an
+        // open one does and a fold can never change the picture. Rows carry
+        // their stack index, which is what lets the list skip rows at all —
+        // nothing downstream reads a row's place in the slice.
+        if ed
+            .layers
+            .ancestors_of(index)
+            .iter()
+            .any(|a| ed.layers.get(*a).is_some_and(|f| f.collapsed))
+        {
+            continue;
+        }
+        let target = aimed.map(|a| a.index) == Some(index);
         // Through a scope, purely to learn where the row landed: `layer_row`
         // reports what was clicked and not what it occupied, and a rect guessed
         // from the row height would be a second statement of a number
@@ -1312,8 +1405,14 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 p,
                 widgets::LayerRow {
                     name: &layer.name,
-                    slot: layer.slot(),
+                    // A slot where there is one, and something no slot can be
+                    // where there is not — see `LayerRow::key`.
+                    key: layer.slot().map_or(u64::MAX - index as u64, u64::from),
                     visible: layer.visible,
+                    depth: layer.depth,
+                    folder: layer.is_folder(),
+                    collapsed: layer.collapsed,
+                    hidden_by_folder: layer.visible && !ed.layers.effective_visible(index),
                     // The drop target borrows the selected row's own fill, so
                     // the mark is part of the row. The outline below is what
                     // keeps "the layer lands here" from reading as "this row is
@@ -1327,7 +1426,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     clipped: layer.clipped,
                     locked: layer.locked,
                     link: layer.link,
-                    thumb: ed.thumbs.picture(layer.slot()),
+                    thumb: layer.slot().and_then(|s| ed.thumbs.picture(s)),
                     picked: layer.picked,
                 },
             )
@@ -1342,14 +1441,21 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             );
         }
         if watching {
-            rows.push(layerdrag::Row { index, rect });
+            rows.push(layerdrag::Row {
+                index,
+                rect,
+                depth: layer.depth,
+                folder: layer.is_folder(),
+            });
         }
         // A release that ends a drag is not also a click on the row it landed
         // on, nor on the eye it happened to pass over.
         if drag.is_some() {
             continue;
         }
-        if row.pick_clicked {
+        if row.fold_clicked {
+            fold = Some(index);
+        } else if row.pick_clicked {
             tick = Some(index);
         } else if row.eye_clicked {
             toggle = Some(index);
@@ -1384,7 +1490,13 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         drag = Some(layerdrag::Drag::new(index, layer.name.clone()));
     }
     if let Some(carried) = &mut drag {
-        carried.aim(&rows, pointer);
+        let from = carried.from;
+        // The legality of a drop is `LayerStack`'s, asked rather than restated:
+        // see `layerdrag`'s module docs. This is also what refuses a drop that
+        // would move nothing, which used to be a comparison against `from` here.
+        carried.aim(&rows, pointer, metrics::LAYER_INDENT, |to, depth| {
+            ed.layers.can_reorder(from, to, depth)
+        });
         drag_ghost(ui.ctx(), p, carried);
     }
     if !down && let Some(carried) = drag.take() {
@@ -1398,8 +1510,10 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             // does. The difference is `LayerStack::reorder`'s to state and it
             // states it: a `PixelPatch` names a *slot*, deleting frees one for
             // the next layer to inherit, and nothing here frees or reassigns
-            // one. Stack order is the `Vec` order, so this moved no pixels.
-            && ed.layers.reorder(carried.from, to)
+            // one. Stack order is the `Vec` order, so this moved no pixels —
+            // and a folder holds no slot at all, so re-nesting frees none
+            // either.
+            && ed.layers.reorder_to(carried.from, to.index, to.depth)
         {
             changed = true;
         }
@@ -1422,9 +1536,19 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // file. Marking the tab modified for one would put a dot on it for a
     // gesture that changed no pixel.
     if let Some(index) = tick
+        && let Some(on) = ed.layers.get(index).map(|l| !l.picked)
+    {
+        // Through `pick`, which cascades into a folder's contents — the half of
+        // "tick a group to act on everything in it" that the model owns. The
+        // other half is that `targets` was not changed at all.
+        ed.layers.pick(index, on);
+    }
+    // Folding is not a change to the document: it says what the list shows, not
+    // what the picture holds, which is also why it is never written to the file.
+    if let Some(index) = fold
         && let Some(layer) = ed.layers.get_mut(index)
     {
-        layer.picked = !layer.picked;
+        layer.collapsed = !layer.collapsed;
     }
     if let Some(index) = select {
         ed.layers.set_active(index);
@@ -1439,6 +1563,11 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     if changed {
         ed.mark_modified();
     }
+}
+
+/// The nesting of one entry, for the move buttons' enablement.
+fn depth_of(ed: &Editor, index: usize) -> u8 {
+    ed.layers.get(index).map_or(0, |l| l.depth)
 }
 
 /// Where the layer being dragged is kept between frames.

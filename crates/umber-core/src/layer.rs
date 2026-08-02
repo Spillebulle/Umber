@@ -33,6 +33,48 @@
 //! inherit, so it **clears the undo history** for precisely the reason deleting
 //! a layer does; and a mask slice is ordinary RGBA, of which the composite
 //! reads one channel.
+//!
+//! # Folders
+//!
+//! The stack is still one `Vec` and every existing caller still indexes it by
+//! position. A folder is an *entry* in that `Vec` carrying no slot, and its
+//! contents are the contiguous run of entries **immediately below it** whose
+//! [`Layer::depth`] is greater than its own. Two shapes were considered and a
+//! real tree (`enum Node { Layer(..), Folder(.., Vec<Node>) }`) reads better and
+//! breaks everything: `get`, `active_index`, `reorder`, `remove`, the app's
+//! `layer_draws`, the autosave's snapshot, `SaveHistory`'s position mapping and
+//! `layerdrag`'s rows all take a flat index today. A depth on a flat list keeps
+//! every one of them.
+//!
+//! **A folder sits above its own contents, not below them**, which is the one
+//! thing here that is easy to get backwards. It is what a layers panel draws —
+//! the group's row is above the layers in it — it is the order ORA's nested
+//! `<stack>` writes, since the first element of a stack is the uppermost; and it
+//! makes the folder entry the natural *end* of its own group as the composite
+//! walks bottom to top. So a folder's subtree ends at the folder and begins at
+//! the lowest entry of the run beneath it, and
+//! [`LayerStack::subtree`] is the one place that is computed.
+//!
+//! Every folder in this build is **pass-through**: a container, whose visibility
+//! and lock reach its contents and whose opacity and blend mode do not exist.
+//! That is not a simplification of the feature so much as the whole of the
+//! cheap half of it — a pass-through folder is *exactly* its contents
+//! composited in place, which is why `composite.wgsl` was not touched, why
+//! `umber-version` did not move, and why an older Umber (or GIMP, or MyPaint)
+//! flattening the nesting away shows the identical picture. See
+//! `docs/layer-folders.md`. A folder with an opacity of its own is group
+//! compositing and needs all three of those; the controls for it are
+//! deliberately not drawn until it does.
+//!
+//! ## Well-formedness
+//!
+//! Not every sequence of depths describes a tree, and the one that does not is
+//! a layer nested inside no folder. Rather than reason about each mutation
+//! separately, every structural change builds the depth sequence it would
+//! produce and runs [`well_formed`] over it before committing — the stack is at
+//! most [`LayerStack::MAX`] entries, so that costs nothing, and it means
+//! `reorder` cannot be made to invent a state the drawing code has no way to
+//! draw.
 
 use crate::color::Color;
 
@@ -133,17 +175,48 @@ pub struct Layer {
     /// Read through [`LayerStack::targets`], never off the field: what a bulk
     /// operation reaches is one rule and it has one place.
     pub picked: bool,
+    /// How deeply this entry is nested. 0 is the top level.
+    ///
+    /// Public to read and write freely only because every *structural* change
+    /// goes through [`LayerStack`], which validates the whole sequence: see the
+    /// module docs. Nothing outside this module should assign it.
+    pub depth: u8,
+    /// A folder folded shut, so the list draws its row and not its contents.
+    ///
+    /// Purely a property of the list, and deliberately so: a collapsed folder
+    /// composites exactly as an open one does, which is what stops a fold being
+    /// something that can change the picture. It is *not* written to the file
+    /// for the reason [`Layer::picked`] is not — reopening a document to find
+    /// somebody's folders shut the way they left them last week is a state
+    /// nobody asked for, and unlike a tick it is one they would have to undo
+    /// before they could see their own painting.
+    pub collapsed: bool,
+    /// This entry is a folder: it holds no pixels, and owns the run of entries
+    /// immediately below it whose [`Layer::depth`] is greater than its own.
+    folder: bool,
     /// Texture-array slice holding this layer's pixels. Stable for the layer's
-    /// lifetime.
-    slot: u32,
+    /// lifetime, and `None` for a folder.
+    ///
+    /// An `Option` rather than a slice a folder holds and nothing writes to,
+    /// because the second is a lie that the autosave would find: it reads every
+    /// slot back, so a folder holding one would be written to the file as a
+    /// blank layer nobody made — and on a large canvas it would cost 400 MB of
+    /// texture per folder for the privilege.
+    slot: Option<u32>,
     /// Slice holding this layer's mask, when it has one. Another slot of the
     /// same array — see the module docs.
     mask: Option<u32>,
 }
 
 impl Layer {
-    pub fn slot(&self) -> u32 {
+    /// The slice holding this layer's pixels, or `None` for a folder.
+    pub fn slot(&self) -> Option<u32> {
         self.slot
+    }
+
+    /// This entry is a folder and holds no pixels.
+    pub fn is_folder(&self) -> bool {
+        self.folder
     }
 
     /// The slice holding this layer's mask, if it has one.
@@ -171,10 +244,54 @@ impl Layer {
             locked: false,
             link: None,
             picked: false,
-            slot,
+            depth: 0,
+            collapsed: false,
+            folder: false,
+            slot: Some(slot),
             mask: None,
         }
     }
+
+    /// A fresh empty folder.
+    ///
+    /// Built through [`Layer::named`] so that a field added to a layer cannot
+    /// be given one default here and another there — the same argument
+    /// `named` itself makes. What a folder then overrides is exactly the two
+    /// things that make it one, and `opacity` and `blend` are left at the
+    /// values a pass-through folder means: no fade and no mode. They are not
+    /// drawn, and until group compositing exists nothing reads them.
+    fn folder_named(name: &str) -> Self {
+        Self {
+            folder: true,
+            slot: None,
+            ..Self::named(name, 0)
+        }
+    }
+}
+
+/// Does this sequence of `(depth, is folder)`, bottom first, describe a tree?
+///
+/// The rule read from the **top** down, which is the direction nesting is
+/// declared in: an entry may be one level deeper than the last thing that could
+/// enclose it, and only a folder can enclose anything. So a folder at depth `d`
+/// permits what follows it to reach `d + 1`, and an ordinary layer at depth `d`
+/// permits only `d` — which is precisely "a layer nested inside nothing is not a
+/// state", the one malformed shape a `Vec` of depths can otherwise hold.
+///
+/// Depth is bounded too. [`LayerStack::MAX_DEPTH`] is not a limit the model
+/// needs — it is what a bounded group stack in a fragment shader will need when
+/// folders gain an opacity of their own, and a document nested deeper than that
+/// has to be refused where somebody can be told, not in a shader with nowhere to
+/// report it.
+pub fn well_formed(entries: &[(u8, bool)]) -> bool {
+    let mut allowed = 0u8;
+    for (depth, folder) in entries.iter().rev() {
+        if *depth > allowed || *depth > LayerStack::MAX_DEPTH {
+            return false;
+        }
+        allowed = if *folder { *depth + 1 } else { *depth };
+    }
+    true
 }
 
 /// Bottom-to-top stack of layers. Index 0 is the bottom.
@@ -196,7 +313,23 @@ impl Default for LayerStack {
 impl LayerStack {
     /// Mirrored by `MAX_LAYERS` in `composite.wgsl`, which sizes a uniform
     /// array. Raising it means raising both.
+    ///
+    /// It bounds **stack entries**, folders included, not the layers that hold
+    /// pixels. A pass-through folder reaches the shader as nothing at all — it
+    /// is flattened away in the app's `layer_draws` — so counting it here is
+    /// stricter than the array needs today. It is counted anyway, because a
+    /// folder that composites its contents as a group *will* occupy an entry in
+    /// that array, and a cap that had to be tightened later would shut documents
+    /// this build had already written.
     pub const MAX: usize = 64;
+
+    /// The deepest a folder may be nested: eight levels, 0 through 7.
+    ///
+    /// Enforced here rather than left to the interface for the reason
+    /// [`well_formed`] gives — the eventual group stack in the fragment shader
+    /// is a fixed-size array, and a document too deep for it has to be refused
+    /// where the refusal can be seen.
+    pub const MAX_DEPTH: u8 = 7;
 
     /// Slices the renderer may have to allocate: one per layer, one per mask,
     /// and one spare for a floating transform's preview.
@@ -224,6 +357,65 @@ impl LayerStack {
             free_slots: Vec::new(),
             next_slot: 1,
         }
+    }
+
+    /// An empty stack, for [`LayerStack::push_imported`] to fill.
+    ///
+    /// Only ever a half-built thing, which is why it is not public: a document
+    /// with no layer has nowhere to paint, and every other constructor here
+    /// guarantees one. `docimport` fills it entry by entry because an import
+    /// has folders in it, and a folder is not something [`LayerStack::add`] can
+    /// be asked for — it takes no slot, and `add`'s whole contract is to hand
+    /// one back.
+    pub(crate) fn empty() -> Self {
+        Self {
+            layers: Vec::new(),
+            active: 0,
+            free_slots: Vec::new(),
+            next_slot: 0,
+        }
+    }
+
+    /// Append an entry at the top, for an import.
+    ///
+    /// Returns the slot a layer took, or `None` for a folder — which is the
+    /// same shape [`Layer::slot`] has and for the same reason, so a caller
+    /// cannot forget that a folder has no pixels to upload into.
+    pub(crate) fn push_imported(&mut self, folder: bool, depth: u8, name: String) -> Option<u32> {
+        let depth = depth.min(Self::MAX_DEPTH);
+        let mut entry = if folder {
+            Layer::folder_named(&name)
+        } else {
+            let slot = self.take_slot();
+            Layer::named(&name, slot)
+        };
+        entry.name = name;
+        entry.depth = depth;
+        let slot = entry.slot;
+        self.layers.push(entry);
+        slot
+    }
+
+    /// Make the stack describe a tree, whatever the file said.
+    ///
+    /// An import can name depths that do not nest — a `<stack>` Umber declined
+    /// to load a layer out of, a file some other application wrote, or one
+    /// simply damaged — and the reader has no business trusting them. Rather
+    /// than refuse a picture over its indentation, every depth that cannot be
+    /// enclosed is pulled outwards until it can. The pixels are all there
+    /// either way; what changes is only how the list groups them.
+    pub(crate) fn flatten_ill_formed(&mut self) {
+        let mut allowed = 0u8;
+        for i in (0..self.layers.len()).rev() {
+            let entry = &mut self.layers[i];
+            entry.depth = entry.depth.min(allowed).min(Self::MAX_DEPTH);
+            allowed = if entry.folder {
+                entry.depth + 1
+            } else {
+                entry.depth
+            };
+        }
+        debug_assert!(well_formed(&self.shape()));
     }
 
     pub fn len(&self) -> usize {
@@ -258,9 +450,215 @@ impl LayerStack {
         &mut self.layers[self.active]
     }
 
-    /// Slot that strokes should be committed into.
-    pub fn active_slot(&self) -> u32 {
+    /// Slot that strokes should be committed into, or `None` when a folder is
+    /// selected.
+    ///
+    /// A folder is selectable — it has to be, or it could not be renamed,
+    /// hidden, dragged or deleted — so "there is nowhere to paint" is a state
+    /// the caller genuinely has to handle rather than a case that cannot
+    /// arise. `Editor::begin_stroke` refuses on it at the same gate a lock is
+    /// refused at.
+    pub fn active_slot(&self) -> Option<u32> {
         self.layers[self.active].slot
+    }
+
+    /// Is the selected entry a folder, and therefore not somewhere to paint?
+    pub fn active_is_folder(&self) -> bool {
+        self.layers[self.active].folder
+    }
+
+    // --- the tree -----------------------------------------------------------
+
+    /// The entries `index` owns, itself included.
+    ///
+    /// For an ordinary layer that is just `index..index + 1`. For a folder it
+    /// runs back down over the contiguous block beneath it whose depth is
+    /// greater — see the module docs for why a folder is *above* its contents
+    /// and not below them.
+    ///
+    /// This is the one place the containment rule is written down. Everything
+    /// that has to move, delete, hide, lock, tick or draw a folder's contents
+    /// asks here.
+    pub fn subtree(&self, index: usize) -> std::ops::Range<usize> {
+        let Some(entry) = self.layers.get(index) else {
+            return index..index;
+        };
+        if !entry.folder {
+            return index..index + 1;
+        }
+        let mut start = index;
+        while start > 0 && self.layers[start - 1].depth > entry.depth {
+            start -= 1;
+        }
+        start..index + 1
+    }
+
+    /// The folders enclosing `index`, innermost first.
+    ///
+    /// Walking *up* the list: the enclosing folder of an entry at depth `d` is
+    /// the first entry above it at depth `d - 1`, which well-formedness
+    /// guarantees is a folder.
+    pub fn ancestors_of(&self, index: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let Some(entry) = self.layers.get(index) else {
+            return out;
+        };
+        let mut want = entry.depth;
+        for (i, above) in self.layers.iter().enumerate().skip(index + 1) {
+            if want == 0 {
+                break;
+            }
+            if above.depth < want {
+                out.push(i);
+                want = above.depth;
+            }
+        }
+        out
+    }
+
+    /// Does this entry actually contribute to the picture?
+    ///
+    /// Its own eye and every enclosing folder's. Visibility is the one member
+    /// of a folder's state that a *pass-through* folder can carry, and it is
+    /// free precisely because it is a boolean: `hidden ∧ anything = hidden`, so
+    /// folding it into the children is the same picture rather than an
+    /// approximation of one. An opacity is not — a folder at 50% over two
+    /// overlapping children is not two children at 50% each — which is why
+    /// there is no `effective_opacity` beside this and no control to feed one.
+    pub fn effective_visible(&self, index: usize) -> bool {
+        self.layers.get(index).is_some_and(|l| l.visible)
+            && self
+                .ancestors_of(index)
+                .iter()
+                .all(|i| self.layers[*i].visible)
+    }
+
+    /// Is this entry locked, by its own flag or by a folder it is in?
+    ///
+    /// A lock on a folder reaches its contents for the reason its visibility
+    /// does, and it is read at the same one gate per operation everything else
+    /// about a lock is read at — see [`LayerStack::locked_at`].
+    pub fn effective_locked(&self, index: usize) -> bool {
+        self.layers.get(index).is_some_and(|l| l.locked)
+            || self
+                .ancestors_of(index)
+                .iter()
+                .any(|i| self.layers[*i].locked)
+    }
+
+    /// The depth sequence this stack would have with `change` applied, for
+    /// [`well_formed`] to judge before anything is written.
+    fn shape(&self) -> Vec<(u8, bool)> {
+        self.layers.iter().map(|l| (l.depth, l.folder)).collect()
+    }
+
+    /// How many entries hold pixels. A document needs at least one.
+    pub fn pixel_count(&self) -> usize {
+        self.layers.iter().filter(|l| !l.folder).count()
+    }
+
+    /// Put the entries of `indices` — each expanded to its whole subtree — into
+    /// a new folder, and select it.
+    ///
+    /// Returns the folder's position. `None` where it would not fit, where the
+    /// contents would end up deeper than [`LayerStack::MAX_DEPTH`], or where
+    /// nothing was named.
+    ///
+    /// The group lands where its **topmost** member was, and the members arrive
+    /// in the order they were already in. Gathering entries that were not
+    /// adjacent does move them past each other and therefore does change the
+    /// picture — that is what grouping is in every application that has it, and
+    /// the alternative (refusing a non-contiguous selection) would make the
+    /// gesture fail for the commonest reason anybody reaches for it.
+    ///
+    /// **Frees no slot and reassigns none**, so it does not clear the undo
+    /// history. It is a `Vec` shuffle plus one entry that holds no pixels,
+    /// which is exactly [`LayerStack::reorder`]'s argument for itself.
+    pub fn group(&mut self, indices: &[usize]) -> Option<usize> {
+        if self.layers.len() >= Self::MAX {
+            return None;
+        }
+        // Whole subtrees, deduplicated: naming a folder and one of its children
+        // must not take that child twice, and must not leave it behind either.
+        let mut members: Vec<usize> = indices
+            .iter()
+            .filter(|i| **i < self.layers.len())
+            .flat_map(|i| self.subtree(*i))
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        if members.is_empty() {
+            return None;
+        }
+        // The shallowest member is the level the new folder takes; everything
+        // moving goes one deeper *than its own root*, not one deeper flat. A
+        // member two levels down inside another folder that is also moving has
+        // to keep that relationship, or the block arrives describing a layer
+        // nested inside nothing.
+        let base = members.iter().map(|i| self.layers[*i].depth).min()?;
+        let depths: Vec<u8> = members
+            .iter()
+            .map(|i| {
+                // The outermost enclosing folder that is *itself* moving is the
+                // root this entry hangs off; failing that it is its own root.
+                let root = self
+                    .ancestors_of(*i)
+                    .into_iter()
+                    .rfind(|a| members.contains(a))
+                    .unwrap_or(*i);
+                self.layers[*i].depth + base + 1 - self.layers[root].depth
+            })
+            .collect();
+        if depths.iter().any(|d| *d > Self::MAX_DEPTH) {
+            return None;
+        }
+
+        // **Before the members are lifted out.** A folder being grouped is one
+        // of them, so asking afterwards would not see it and would hand the new
+        // folder the same name — `grouping_keeps_the_nesting_the_entries_
+        // already_had` caught exactly that, twice-named "Group 1".
+        let name = format!("Group {}", self.next_group_number());
+
+        let mut taken: Vec<Layer> = Vec::with_capacity(members.len());
+        for (n, i) in members.iter().enumerate().rev() {
+            let mut layer = self.layers.remove(*i);
+            layer.depth = depths[n];
+            taken.push(layer);
+        }
+        taken.reverse();
+
+        // Where the block lands: the number of surviving entries below the
+        // topmost member, so the folder sits exactly where that member did.
+        let top = *members.last()?;
+        let at = (0..top).filter(|i| !members.contains(i)).count();
+        let mut folder = Layer::folder_named(&name);
+        folder.depth = base;
+        let n = taken.len();
+        for (k, layer) in taken.into_iter().enumerate() {
+            self.layers.insert(at + k, layer);
+        }
+        self.layers.insert(at + n, folder);
+
+        debug_assert!(well_formed(&self.shape()), "group left a malformed stack");
+        // The new folder is selected, which is what makes it renameable the
+        // moment it exists. Nothing was removed, so no slot changed hands and
+        // the layer that *was* selected is still in the stack — inside the
+        // folder, which is where the painter just put it.
+        self.active = at + n;
+        Some(at + n)
+    }
+
+    /// A name for a new folder that does not collide with an existing one, on
+    /// the same argument [`LayerStack::next_name_number`] makes for layers.
+    fn next_group_number(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| l.folder)
+            .filter_map(|l| l.name.strip_prefix("Group "))
+            .filter_map(|n| n.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     pub fn set_active(&mut self, index: usize) {
@@ -281,14 +679,32 @@ impl LayerStack {
     ///
     /// Returns the new layer's slot, which the caller must clear on the GPU —
     /// a recycled slot still holds the deleted layer's pixels.
+    /// **Into the selected folder** when one is selected, and beside the
+    /// selected layer otherwise.
+    ///
+    /// A folder's row sits above its contents, so "just below the folder" is
+    /// its topmost child — which is where every application puts a new layer
+    /// made while a group is in hand, and it is also the only reading that lets
+    /// somebody fill a folder they have just made without dragging.
     pub fn add(&mut self) -> Option<u32> {
         if self.layers.len() >= Self::MAX {
             return None;
         }
+        let selected = &self.layers[self.active];
+        let (at, depth) = if selected.folder {
+            if selected.depth + 1 > Self::MAX_DEPTH {
+                return None;
+            }
+            (self.active, selected.depth + 1)
+        } else {
+            (self.active + 1, selected.depth)
+        };
         let slot = self.take_slot();
         let name = format!("Layer {}", self.next_name_number());
-        let at = self.active + 1;
-        self.layers.insert(at, Layer::named(&name, slot));
+        let mut layer = Layer::named(&name, slot);
+        layer.depth = depth;
+        self.layers.insert(at, layer);
+        debug_assert!(well_formed(&self.shape()), "add left a malformed stack");
         self.active = at;
         Some(slot)
     }
@@ -355,22 +771,52 @@ impl LayerStack {
     ///
     /// Refuses to remove the last layer — a document with no layers has nowhere
     /// to paint.
-    pub fn remove(&mut self, index: usize) -> Option<u32> {
-        if self.layers.len() <= 1 || index >= self.layers.len() {
+    /// **A folder takes its contents with it.** Deleting a group and leaving
+    /// the layers in it behind would need every one of them re-parented, and
+    /// the entry the painter pressed delete on is the one they meant; every
+    /// application that has folders does the same. Every slice inside goes on
+    /// the free list, which is why the caller's duty to clear the undo history
+    /// is now larger rather than different.
+    ///
+    /// Returns the slots freed, ascending — the caller has to clear them on the
+    /// GPU before they are handed out again. Refuses to leave the document with
+    /// no layer holding pixels: a folder is not somewhere to paint.
+    pub fn remove(&mut self, index: usize) -> Option<Vec<u32>> {
+        if index >= self.layers.len() {
             return None;
         }
-        let layer = self.layers.remove(index);
-        self.free_slots.push(layer.slot);
-        if let Some(mask) = layer.mask {
-            self.free_slots.push(mask);
+        let span = self.subtree(index);
+        let going = self.layers[span.clone()]
+            .iter()
+            .filter(|l| !l.folder)
+            .count();
+        if self.pixel_count() - going == 0 {
+            return None;
         }
-        if self.active >= self.layers.len() {
-            self.active = self.layers.len() - 1;
+        let mut freed = Vec::new();
+        for layer in self.layers.drain(span.clone()) {
+            freed.extend(layer.slot);
+            freed.extend(layer.mask);
         }
+        freed.sort_unstable();
+        self.free_slots.extend(freed.iter().copied());
+        // The selection follows the stack rather than the number: a layer below
+        // the block that went shifts down by its length, one inside it is gone
+        // and the clamp catches it. Written out rather than left to the clamp
+        // alone because a folder deep in a tall stack moves every index above it
+        // and "it happens to still be in range" is not the same as "it is still
+        // the same layer".
+        self.active = if self.active >= span.end {
+            self.active - span.len()
+        } else {
+            self.active.min(span.start)
+        }
+        .min(self.layers.len() - 1);
+        debug_assert!(well_formed(&self.shape()), "remove left a malformed stack");
         // Deleting one of a pair would otherwise leave the survivor in a group
         // of one — see `dissolve_lone_groups`.
         self.dissolve_lone_groups();
-        Some(layer.slot)
+        Some(freed)
     }
 
     // --- locking ------------------------------------------------------------
@@ -387,8 +833,18 @@ impl LayerStack {
     }
 
     /// Is the layer a stroke or a transform would land on locked?
+    ///
+    /// **Through [`LayerStack::effective_locked`]**, so a lock on a folder
+    /// reaches every layer inside it. This is the question the one gate per
+    /// operation asks — `begin_stroke`, `begin_float`, `clear_active_layer` —
+    /// so putting the ancestor walk here is what makes a folder's lock mean
+    /// anything at all, without any of those three learning that folders exist.
+    ///
+    /// [`LayerStack::locked_at`] deliberately stays the layer's *own* flag: it
+    /// is what a row's padlock draws and toggles, and a row that showed itself
+    /// locked because of a folder would offer an unlock that did nothing.
     pub fn active_is_locked(&self) -> bool {
-        self.layers[self.active].locked
+        self.effective_locked(self.active)
     }
 
     /// Is any layer locked?
@@ -444,6 +900,27 @@ impl LayerStack {
     pub fn pick_all(&mut self, on: bool) {
         for layer in &mut self.layers {
             layer.picked = on;
+        }
+    }
+
+    /// Tick or untick one entry, **and everything inside it**.
+    ///
+    /// Ticking a folder means ticking what is in it — which is the half of
+    /// "mark a folder visible to make all its layers visible" that a folder has
+    /// to supply, since the other half is [`LayerStack::effective_visible`].
+    ///
+    /// It is **written into the ticks** rather than derived when they are read,
+    /// and the difference matters: a painter who ticks a folder and then unticks
+    /// one layer in it means what they did, where a rule that re-derived the set
+    /// at read time would put that layer straight back. It also makes "a folder
+    /// ticked whose contents are not" impossible to reach by this route, so
+    /// there is no third checkbox state for the list to have to draw.
+    ///
+    /// [`LayerStack::targets`] is untouched by any of this, which is the point:
+    /// what a bulk operation reaches is still one rule in one place.
+    pub fn pick(&mut self, index: usize, on: bool) {
+        for i in self.subtree(index) {
+            self.layers[i].picked = on;
         }
     }
 
@@ -560,8 +1037,56 @@ impl LayerStack {
         }
     }
 
-    /// Move the layer at `from` so that it sits at position `to`, shifting
-    /// everything between them along by one.
+    /// What a move of the entry at `from` actually carries, ascending.
+    ///
+    /// **Two ways of saying "these travel together", and one answer.** A link
+    /// group carries every other layer of *that group* — not every linked layer
+    /// in the document — and a folder carries what is inside it. They compose:
+    /// each member is expanded to its whole subtree, so dragging one layer of a
+    /// linked pair where the other is a folder brings that folder's contents
+    /// too. Written once here rather than as two branches in the move, because
+    /// two rules for "what is moving" is how the two come to disagree about a
+    /// set that is both.
+    fn moving_with(&self, from: usize) -> Vec<usize> {
+        let seeds: Vec<usize> = match self.layers.get(from).and_then(|l| l.link) {
+            Some(link) => self.group_indices(link),
+            None => vec![from],
+        };
+        let mut members: Vec<usize> = seeds.iter().flat_map(|i| self.subtree(*i)).collect();
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    /// The depth each of `members` would take if the block landed with its
+    /// roots at `depth`.
+    ///
+    /// A *root* is a member no other member encloses. Everything hanging off
+    /// one shifts by the same amount as that root, which is what keeps a
+    /// folder's shape through a move: its contents stay one level inside it
+    /// however far in or out the folder itself travels.
+    fn depths_at(&self, members: &[usize], depth: u8) -> Option<Vec<u8>> {
+        members
+            .iter()
+            .map(|i| {
+                let root = self
+                    .ancestors_of(*i)
+                    .into_iter()
+                    .rfind(|a| members.contains(a))
+                    .unwrap_or(*i);
+                let root_depth = self.layers[root].depth;
+                // Signed, because a folder dragged out to the top level takes
+                // its contents *up* by the same delta and `u8` would wrap.
+                let shifted = self.layers[*i].depth as i16 + depth as i16 - root_depth as i16;
+                (0..=Self::MAX_DEPTH as i16)
+                    .contains(&shifted)
+                    .then_some(shifted as u8)
+            })
+            .collect()
+    }
+
+    /// Move the entry at `from` so that it sits at position `to`, nested
+    /// `depth` levels deep, shifting everything between them along.
     ///
     /// **This is a `Vec` shuffle and nothing else.** A layer's slot is fixed
     /// for its lifetime, so no pixels move and no slot changes hands — which is
@@ -569,84 +1094,164 @@ impl LayerStack {
     /// undo history. A `PixelPatch` names a slot; deleting frees one for the
     /// next layer to inherit, and an entry replayed after that would land in
     /// the wrong layer. Nothing here frees or reassigns one, so every patch
-    /// still names the pixels it was captured from.
+    /// still names the pixels it was captured from. **A folder is the same
+    /// statement**: it holds no slot at all, so a document gaining, losing or
+    /// rearranging folders never invalidates a patch either.
     ///
-    /// Returns `false` where nothing moved: an index off the end, or a layer
-    /// asked to move to where it already is. The caller wants to know, because
-    /// a move that did nothing is not a document modification.
-    /// **A link group travels together.** Moving a layer that belongs to one
-    /// carries every other layer of *that group* with it — not every linked
-    /// layer in the document — and lands them contiguously at the destination
-    /// in the order they were already in. That is the one sense of "move as a
-    /// unit" this architecture can carry today; see the note on [`Layer::link`]
-    /// and `Floating` in the app, which cannot.
-    pub fn reorder(&mut self, from: usize, to: usize) -> bool {
-        if from >= self.layers.len() || to >= self.layers.len() || from == to {
+    /// `depth` is what the moved entry's own nesting becomes — it is how a drag
+    /// says "into that folder" rather than "beside it" — and what is inside it
+    /// follows. Refused where the result would not describe a tree, where it
+    /// would nest past [`LayerStack::MAX_DEPTH`], and where a folder would end
+    /// up inside itself; the last needs no test of its own, because a folder's
+    /// own subtree is not among the positions left once it has been lifted out.
+    ///
+    /// Returns `false` where nothing moved — an index off the end, or a drop
+    /// that leaves every entry at the position and depth it already had. The
+    /// caller wants to know, because a move that did nothing is not a document
+    /// modification.
+    pub fn reorder_to(&mut self, from: usize, to: usize, depth: u8) -> bool {
+        let Some(after) = self.plan_reorder(from, to, depth) else {
             return false;
-        }
-        // The selection follows the *layer*, not the position it was at, so it
-        // is remembered by slot and found again afterwards. Written this way
-        // rather than as index arithmetic because the group case has no
-        // arithmetic that is obviously right, and two rules for one question is
-        // how they come to disagree.
-        let selected = self.layers[self.active].slot;
-
-        let group: Vec<usize> = match self.layers[from].link {
-            Some(link) => self.group_indices(link),
-            None => vec![from],
         };
-        if group.len() < 2 {
-            let layer = self.layers.remove(from);
-            self.layers.insert(to, layer);
-        } else {
-            // Where the group lands, counted among the layers that are *not*
-            // moving: after everything at or before `to` when it is travelling
-            // up, before whatever is at `to` when it is travelling down.
-            let moving_up = to > from;
-            let insert_at = (0..self.layers.len())
-                .filter(|i| !group.contains(i))
-                .filter(|i| if moving_up { *i <= to } else { *i < to })
-                .count();
-            let mut taken = Vec::with_capacity(group.len());
-            for i in group.iter().rev() {
-                taken.push(self.layers.remove(*i));
-            }
-            taken.reverse();
-            for (n, layer) in taken.into_iter().enumerate() {
-                self.layers.insert(insert_at + n, layer);
-            }
-        }
-
-        self.active = self
-            .layers
+        // The selection follows the *entry*, not the position it was at. A
+        // layer is found again by its slot, which is what it always was; a
+        // folder has none, so it is followed by where the rearrangement put it —
+        // and `after` names every entry by the index it came from, so one
+        // lookup answers for both.
+        let was = self.active;
+        let mut taken: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
+        self.layers = after
             .iter()
-            .position(|l| l.slot == selected)
-            .unwrap_or(self.active.min(self.layers.len() - 1));
+            .map(|(i, d)| {
+                let mut layer = taken[*i].take().expect("each entry is placed once");
+                layer.depth = *d;
+                layer
+            })
+            .collect();
+        debug_assert!(well_formed(&self.shape()), "reorder left a malformed stack");
+        self.active = after
+            .iter()
+            .position(|(i, _)| *i == was)
+            .unwrap_or_else(|| self.active.min(self.layers.len() - 1));
         true
     }
 
-    /// Move a layer one step towards the top. Returns its new index.
+    /// Would [`LayerStack::reorder_to`] do anything?
+    ///
+    /// What the drag asks before it lights a row up. It is the same decision by
+    /// the same code — a mark promising a move the model would then refuse is
+    /// the lying control the drop rules exist to prevent — so this is the plan
+    /// without the writes, not a second opinion about it.
+    pub fn can_reorder(&self, from: usize, to: usize, depth: u8) -> bool {
+        self.plan_reorder(from, to, depth).is_some()
+    }
+
+    /// What the stack would look like: `(the index each entry came from, the
+    /// depth it would take)`, or `None` where the move is refused.
+    fn plan_reorder(&self, from: usize, to: usize, depth: u8) -> Option<Vec<(usize, u8)>> {
+        if from >= self.layers.len() || to >= self.layers.len() {
+            return None;
+        }
+        let members = self.moving_with(from);
+        // A folder cannot be dropped inside itself: the position names one of
+        // its own contents, which is about to travel with it.
+        //
+        // Deliberately the *subtree* and not the whole moving set. A link group
+        // carries members that are not inside one another, and dropping one on
+        // another of them is an ordinary move to that end of the stack — the
+        // insert position is counted among the entries that are staying, so it
+        // resolves perfectly well. Testing the whole set here broke exactly
+        // that, and `moving_a_linked_layer_carries_the_whole_set` is what said
+        // so.
+        let span = self.subtree(from);
+        if span.contains(&to) && to != from {
+            return None;
+        }
+        let depths = self.depths_at(&members, depth)?;
+
+        // Where the block lands, counted among the entries that are *not*
+        // moving: after everything at or before `to` when it is travelling up,
+        // before whatever is at `to` when it is travelling down. For a single
+        // entry this is exactly `remove(from); insert(to)`.
+        let moving_up = to > from;
+        let at = (0..self.layers.len())
+            .filter(|i| !members.contains(i))
+            .filter(|i| if moving_up { *i <= to } else { *i < to })
+            .count();
+
+        // The whole result, as (which entry, what depth), judged before a byte
+        // is written so that a refusal changes nothing — see the module docs on
+        // well-formedness. It is also what answers "did anything move": a drop
+        // that reproduces the order and the depths the stack already has is not
+        // an edit, however it was expressed.
+        let mut after: Vec<(usize, u8)> = (0..self.layers.len())
+            .filter(|i| !members.contains(i))
+            .map(|i| (i, self.layers[i].depth))
+            .collect();
+        after.splice(at..at, members.iter().copied().zip(depths.iter().copied()));
+        let now: Vec<(usize, u8)> = (0..self.layers.len())
+            .map(|i| (i, self.layers[i].depth))
+            .collect();
+        if after == now {
+            return None;
+        }
+        let shape: Vec<(u8, bool)> = after
+            .iter()
+            .map(|(i, d)| (*d, self.layers[*i].folder))
+            .collect();
+        well_formed(&shape).then_some(after)
+    }
+
+    /// Move an entry to `to`, keeping the nesting it already has.
+    ///
+    /// The two-argument form every caller written before folders speaks, and
+    /// the one [`LayerStack::move_up`] and [`LayerStack::move_down`] are
+    /// written in terms of.
+    pub fn reorder(&mut self, from: usize, to: usize) -> bool {
+        let Some(depth) = self.layers.get(from).map(|l| l.depth) else {
+            return false;
+        };
+        self.reorder_to(from, to, depth)
+    }
+
+    /// Move an entry one step towards the top. Returns its new index.
+    ///
+    /// A step is over the *neighbour*, and a folder's contents are not a
+    /// neighbour — so the step is expressed against the subtree's own bounds
+    /// rather than against `index ± 1`, which for a folder would name one of
+    /// its own children. `None` where there is nowhere to go, which now
+    /// includes the top of a folder: leaving one is a change of nesting, and
+    /// this button does not carry a depth. Dragging says it instead.
     pub fn move_up(&mut self, index: usize) -> Option<usize> {
-        if index + 1 >= self.layers.len() {
+        let span = self.subtree(index);
+        if span.end >= self.layers.len() {
             return None;
         }
         // A step is a reorder over one place. Written in terms of it rather
         // than as its own swap so there is one piece of code keeping the
         // selection with its layer, instead of three that have to agree.
-        self.reorder(index, index + 1).then_some(index + 1)
+        self.reorder(index, span.end).then_some(index + 1)
     }
 
-    /// Move a layer one step towards the bottom. Returns its new index.
+    /// Move an entry one step towards the bottom. Returns its new index.
     pub fn move_down(&mut self, index: usize) -> Option<usize> {
-        if index == 0 || index >= self.layers.len() {
+        let span = self.subtree(index);
+        if span.start == 0 || index >= self.layers.len() {
             return None;
         }
-        self.reorder(index, index - 1).then_some(index - 1)
+        self.reorder(index, span.start - 1).then_some(index - 1)
     }
 
     /// True when at least one layer would contribute to the composite.
+    ///
+    /// Through [`LayerStack::effective_visible`], so a stack whose every layer
+    /// is inside a hidden folder correctly reports that nothing shows. Folders
+    /// themselves are not counted: one holds no pixels, so a document of
+    /// nothing but folders shows nothing however many eyes are open.
     pub fn any_visible(&self) -> bool {
-        self.layers.iter().any(|l| l.visible && l.opacity > 0.0)
+        (0..self.layers.len())
+            .filter(|i| !self.layers[*i].folder)
+            .any(|i| self.effective_visible(i) && self.layers[i].opacity > 0.0)
     }
 
     fn next_name_number(&self) -> usize {
@@ -671,12 +1276,29 @@ pub const DEFAULT_BACKGROUND: Color = Color::TRANSPARENT;
 mod tests {
     use super::*;
 
+    /// A layer's slice, for the tests that compare stacks by slot.
+    ///
+    /// `Layer::slot` is an `Option` because a folder holds none; these tests
+    /// are all about layers, and unwrapping at the edge keeps them readable
+    /// rather than turning every comparison into one over `Option`s.
+    fn slot_of(layer: &Layer) -> u32 {
+        layer
+            .slot()
+            .expect("a layer has a slice; a folder is not a layer")
+    }
+
+    /// Every slice a removal gave back, which for a layer is one — or two,
+    /// where it had a mask.
+    fn removed(stack: &mut LayerStack, index: usize) -> Option<u32> {
+        stack.remove(index).and_then(|freed| freed.first().copied())
+    }
+
     #[test]
     fn a_new_stack_has_one_active_layer() {
         let s = LayerStack::new();
         assert_eq!(s.len(), 1);
         assert_eq!(s.active_index(), 0);
-        assert_eq!(s.active_slot(), 0);
+        assert_eq!(s.active_slot(), Some(0));
     }
 
     #[test]
@@ -693,13 +1315,13 @@ mod tests {
         // The whole point of slots: moving a layer must not move its pixels.
         let mut s = LayerStack::new();
         s.add();
-        let bottom_slot = s.get(0).unwrap().slot();
-        let top_slot = s.get(1).unwrap().slot();
+        let bottom_slot = slot_of(s.get(0).unwrap());
+        let top_slot = slot_of(s.get(1).unwrap());
 
         s.move_down(1);
 
-        assert_eq!(s.get(0).unwrap().slot(), top_slot);
-        assert_eq!(s.get(1).unwrap().slot(), bottom_slot);
+        assert_eq!(slot_of(s.get(0).unwrap()), top_slot);
+        assert_eq!(slot_of(s.get(1).unwrap()), bottom_slot);
     }
 
     #[test]
@@ -735,26 +1357,20 @@ mod tests {
         s.add();
         s.add();
         s.add();
-        let mut slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let mut slots: Vec<u32> = s.layers().iter().map(slot_of).collect();
         assert_eq!(slots.len(), 4);
 
         // Bottom to top, which is the longest move there is.
         s.reorder(0, 3);
         let moved = slots.remove(0);
         slots.push(moved);
-        assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
-            slots
-        );
+        assert_eq!(s.layers().iter().map(slot_of).collect::<Vec<_>>(), slots);
 
         // And back down again, past two layers rather than to an end.
         s.reorder(3, 1);
         let moved = slots.remove(3);
         slots.insert(1, moved);
-        assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
-            slots
-        );
+        assert_eq!(s.layers().iter().map(slot_of).collect::<Vec<_>>(), slots);
         // Every slot still present exactly once: nothing was freed or reissued.
         let unique: std::collections::HashSet<_> = slots.iter().collect();
         assert_eq!(unique.len(), 4);
@@ -766,16 +1382,13 @@ mod tests {
         s.add();
         s.add();
         s.set_active(1);
-        let before: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let before: Vec<u32> = s.layers().iter().map(slot_of).collect();
 
         assert!(
             !s.reorder(1, 1),
             "a move to where it already is moved nothing"
         );
-        assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
-            before
-        );
+        assert_eq!(s.layers().iter().map(slot_of).collect::<Vec<_>>(), before);
         assert_eq!(s.active_index(), 1);
     }
 
@@ -783,13 +1396,10 @@ mod tests {
     fn reordering_off_the_end_moves_nothing() {
         let mut s = LayerStack::new();
         s.add();
-        let before: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let before: Vec<u32> = s.layers().iter().map(slot_of).collect();
         assert!(!s.reorder(0, 2));
         assert!(!s.reorder(7, 0));
-        assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
-            before
-        );
+        assert_eq!(s.layers().iter().map(slot_of).collect::<Vec<_>>(), before);
     }
 
     /// The selection is a layer, not a row number: whichever layer was being
@@ -838,18 +1448,15 @@ mod tests {
         let mut s = LayerStack::new();
         s.add();
         s.add();
-        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let slots: Vec<u32> = s.layers().iter().map(slot_of).collect();
 
         assert_eq!(s.move_up(0), Some(1));
         assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            s.layers().iter().map(slot_of).collect::<Vec<_>>(),
             vec![slots[1], slots[0], slots[2]]
         );
         assert_eq!(s.move_down(1), Some(0));
-        assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
-            slots
-        );
+        assert_eq!(s.layers().iter().map(slot_of).collect::<Vec<_>>(), slots);
     }
 
     #[test]
@@ -863,7 +1470,7 @@ mod tests {
     fn removing_recycles_the_slot() {
         let mut s = LayerStack::new();
         let added = s.add().unwrap();
-        let freed = s.remove(1).unwrap();
+        let freed = removed(&mut s, 1).unwrap();
         assert_eq!(freed, added);
 
         let reused = s.add().unwrap();
@@ -958,8 +1565,8 @@ mod tests {
         let mut s = LayerStack::new();
         s.add();
         let mask = s.add_mask(1).unwrap();
-        let slot = s.get(1).unwrap().slot();
-        assert_eq!(s.remove(1), Some(slot));
+        let slot = slot_of(s.get(1).unwrap());
+        assert_eq!(removed(&mut s, 1), Some(slot));
 
         // Both come back, in some order, before the array grows.
         let capacity = s.slot_capacity_needed();
@@ -1019,14 +1626,14 @@ mod tests {
         s.add();
         s.add();
         // Slots 0..3 at positions 0..3. Link the bottom and the top.
-        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let slots: Vec<u32> = s.layers().iter().map(slot_of).collect();
         assert_eq!(s.link(&[0, 3]), Some(0));
 
         // Drag the bottom one to the top; its partner comes too, and the two
         // arrive side by side in the order they were already in.
         assert!(s.reorder(0, 3));
         assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            s.layers().iter().map(slot_of).collect::<Vec<_>>(),
             vec![slots[1], slots[2], slots[0], slots[3]]
         );
     }
@@ -1038,12 +1645,12 @@ mod tests {
         let mut s = LayerStack::new();
         s.add();
         s.add();
-        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let slots: Vec<u32> = s.layers().iter().map(slot_of).collect();
         s.link(&[0, 1]);
 
         assert!(s.reorder(2, 0));
         assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            s.layers().iter().map(slot_of).collect::<Vec<_>>(),
             vec![slots[2], slots[0], slots[1]]
         );
     }
@@ -1057,7 +1664,7 @@ mod tests {
         for _ in 0..5 {
             s.add();
         }
-        let slots: Vec<u32> = s.layers().iter().map(Layer::slot).collect();
+        let slots: Vec<u32> = s.layers().iter().map(slot_of).collect();
         assert_eq!(s.link(&[0, 1]), Some(0));
         assert_eq!(s.link(&[3, 4]), Some(1), "a second, independent group");
 
@@ -1065,7 +1672,7 @@ mod tests {
         // the other group stays exactly where it was.
         assert!(s.reorder(0, 5));
         assert_eq!(
-            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            s.layers().iter().map(slot_of).collect::<Vec<_>>(),
             vec![slots[2], slots[3], slots[4], slots[5], slots[0], slots[1]]
         );
         assert_eq!(
@@ -1272,11 +1879,11 @@ mod tests {
         s.add();
         s.add();
         s.get_mut(0).unwrap().picked = true;
-        let slot = s.get(0).unwrap().slot();
+        let slot = slot_of(s.get(0).unwrap());
 
         s.reorder(0, 2);
         assert_eq!(s.picked_indices(), vec![2]);
-        assert_eq!(s.get(2).unwrap().slot(), slot);
+        assert_eq!(slot_of(s.get(2).unwrap()), slot);
 
         s.remove(2);
         assert_eq!(s.picked_indices(), Vec::<usize>::new());
@@ -1289,5 +1896,471 @@ mod tests {
             assert!(s.add().is_some());
         }
         assert!(s.add().is_none(), "must not exceed the shader's array size");
+    }
+
+    // --- folders -----------------------------------------------------------
+
+    /// The stack as `(name, depth, is folder)`, bottom first — what nearly
+    /// every test below asserts against, because a folder is a shape and a
+    /// shape is easier to read than four separate assertions about it.
+    fn shape_of(s: &LayerStack) -> Vec<(String, u8, bool)> {
+        s.layers()
+            .iter()
+            .map(|l| (l.name.clone(), l.depth, l.is_folder()))
+            .collect()
+    }
+
+    /// Four layers, the top two put in a group:
+    ///
+    /// ```text
+    ///   3  Group 1    depth 0   folder
+    ///   2    Layer 4  depth 1
+    ///   1    Layer 3  depth 1
+    ///   0  Layer 1    depth 0
+    /// ```
+    ///
+    /// Note where the folder sits: **above** its contents, which is what a
+    /// layers panel draws, what ORA's nested `<stack>` writes, and what makes
+    /// the folder the end of its own group as the composite walks bottom to
+    /// top.
+    fn grouped() -> LayerStack {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        assert_eq!(s.group(&[1, 2]), Some(3));
+        s
+    }
+
+    #[test]
+    fn a_folder_owns_the_run_of_entries_beneath_it() {
+        let s = grouped();
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.subtree(3), 1..4, "the folder and both its layers");
+        assert_eq!(s.subtree(1), 1..2, "a layer owns only itself");
+        assert_eq!(s.subtree(0), 0..1);
+        assert_eq!(s.ancestors_of(1), vec![3]);
+        assert_eq!(s.ancestors_of(0), Vec::<usize>::new());
+        assert_eq!(s.pixel_count(), 3, "a folder holds no pixels");
+        assert_eq!(s.len(), 4, "three layers and one folder");
+    }
+
+    /// A folder holds **no slot**, which is the whole reason folders cost the
+    /// undo history nothing: a `PixelPatch` names a slice, and one that is
+    /// never handed out can never be inherited by anything.
+    #[test]
+    fn a_folder_takes_no_slice_and_grouping_frees_none() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        let before: Vec<Option<u32>> = s.layers().iter().map(Layer::slot).collect();
+        let capacity = s.slot_capacity_needed();
+
+        assert_eq!(s.group(&[0, 1, 2]), Some(3));
+        assert_eq!(s.get(3).unwrap().slot(), None, "a folder holds no slice");
+        assert_eq!(
+            s.slot_capacity_needed(),
+            capacity,
+            "grouping must not allocate a slice"
+        );
+        let after: Vec<Option<u32>> = s
+            .layers()
+            .iter()
+            .filter(|l| !l.is_folder())
+            .map(Layer::slot)
+            .collect();
+        assert_eq!(
+            after, before,
+            "every layer kept the slice it already had, so every patch still \
+             names its own pixels"
+        );
+    }
+
+    /// **Ticking a folder ticks what is in it**, which is the half of "mark a
+    /// group visible to show every layer in it" that the model owes. Written
+    /// into the ticks rather than derived when they are read: unticking one
+    /// layer afterwards has to stay unticked.
+    #[test]
+    fn ticking_a_folder_ticks_everything_in_it() {
+        let mut s = grouped();
+        s.pick(3, true);
+        assert_eq!(s.picked_indices(), vec![1, 2, 3]);
+        assert_eq!(s.targets(), vec![1, 2, 3]);
+
+        // And a layer unticked afterwards stays unticked — a rule that
+        // re-derived the set from the folder would put it straight back.
+        s.pick(1, false);
+        assert_eq!(s.picked_indices(), vec![2, 3]);
+
+        s.pick(3, false);
+        assert_eq!(s.picked_indices(), Vec::<usize>::new());
+    }
+
+    /// A folder's eye reaches its contents, and its lock does too. Both are
+    /// booleans, which is exactly why a *pass-through* folder can carry them
+    /// and cannot carry an opacity: `hidden ∧ anything = hidden`, where a
+    /// group at 50% over two overlapping children is not two children at 50%.
+    #[test]
+    fn a_folders_eye_and_lock_reach_what_is_inside_it() {
+        let mut s = grouped();
+        assert!(s.effective_visible(1));
+        assert!(!s.effective_locked(1));
+
+        s.get_mut(3).unwrap().visible = false;
+        assert!(!s.effective_visible(1), "hidden by the folder");
+        assert!(!s.effective_visible(2));
+        assert!(s.effective_visible(0), "outside the folder, still showing");
+        assert!(
+            s.get(1).unwrap().visible,
+            "the layer's own eye is untouched, so opening the folder reveals it"
+        );
+
+        s.get_mut(3).unwrap().visible = true;
+        s.get_mut(3).unwrap().locked = true;
+        assert!(s.effective_locked(1));
+        assert!(!s.effective_locked(0));
+        s.set_active(1);
+        assert!(
+            s.active_is_locked(),
+            "the one gate every operation asks has to see a folder's lock"
+        );
+    }
+
+    /// A stack whose every layer is inside a hidden folder shows nothing —
+    /// and a document of nothing but folders shows nothing either, however
+    /// many eyes are open, because a folder holds no pixels.
+    #[test]
+    fn a_hidden_folder_makes_the_document_show_nothing() {
+        let mut s = grouped();
+        s.get_mut(0).unwrap().visible = false;
+        assert!(s.any_visible(), "the group's two layers still show");
+        s.get_mut(3).unwrap().visible = false;
+        assert!(!s.any_visible());
+    }
+
+    /// A folder moves as a unit, and its contents keep their nesting.
+    #[test]
+    fn a_folder_travels_with_its_contents() {
+        let mut s = grouped();
+        assert!(s.reorder(3, 0), "the group to the bottom");
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+                ("Layer 1".into(), 0, false),
+            ]
+        );
+        assert_eq!(s.subtree(2), 0..3, "still one group");
+    }
+
+    /// Dragging into a folder and out again — the whole of what a drop's depth
+    /// is for.
+    #[test]
+    fn a_layer_can_be_dragged_into_a_folder_and_out_again() {
+        let mut s = grouped();
+        // "Layer 1", at the bottom, dropped onto the group's lower row at the
+        // group's own depth: it lands inside.
+        assert!(s.reorder_to(0, 1, 1));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 2".into(), 1, false),
+                ("Layer 1".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.subtree(3), 0..4, "all three are inside now");
+
+        // And back out: the same position at depth 0.
+        assert!(s.reorder_to(1, 0, 0));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+    }
+
+    /// The refusals. Each of these is a stack that would not describe a tree,
+    /// and each is judged *before* anything is written — a refused move leaves
+    /// the stack byte for byte as it was.
+    #[test]
+    fn a_move_that_would_not_describe_a_tree_is_refused() {
+        let mut s = grouped();
+        let before = shape_of(&s);
+
+        assert!(
+            !s.reorder_to(3, 1, 0),
+            "a folder cannot be dropped inside itself"
+        );
+        assert!(!s.reorder_to(3, 2, 0), "nor onto its other content");
+        assert!(
+            !s.reorder_to(0, 1, 2),
+            "nor two levels inside a folder that is one level deep"
+        );
+        assert!(!s.reorder_to(9, 0, 0), "an index off the end");
+        assert!(
+            !s.reorder_to(0, 0, 0),
+            "a drop where it already is, at the depth it already has"
+        );
+        assert_eq!(shape_of(&s), before, "a refusal changed something");
+
+        // And `can_reorder` is the same decision, which is what lets the drag
+        // light a row up only where the drop will really happen.
+        assert!(!s.can_reorder(3, 1, 0));
+        assert!(s.can_reorder(0, 1, 1));
+        assert_eq!(shape_of(&s), before, "asking must not change anything");
+    }
+
+    /// Nesting is capped in the model, not hoped for in the interface: the
+    /// eventual group stack in the fragment shader is a fixed-size array, and
+    /// a document too deep for it has to be refused where somebody can be told.
+    #[test]
+    fn nesting_stops_at_the_depth_the_shader_could_hold() {
+        let mut s = LayerStack::new();
+        // One layer, wrapped in folder after folder.
+        for _ in 0..=LayerStack::MAX_DEPTH {
+            if s.group(&[s.active_index()]).is_none() {
+                break;
+            }
+        }
+        let deepest = s.layers().iter().map(|l| l.depth).max().unwrap();
+        assert_eq!(deepest, LayerStack::MAX_DEPTH);
+        assert!(well_formed(
+            &s.layers()
+                .iter()
+                .map(|l| (l.depth, l.is_folder()))
+                .collect::<Vec<_>>()
+        ));
+        // The layer at the bottom of it all is as deep as anything gets.
+        assert_eq!(s.ancestors_of(0).len(), LayerStack::MAX_DEPTH as usize);
+    }
+
+    /// Deleting a folder takes its contents, frees every slice inside it, and
+    /// therefore **clears the undo history** for exactly the reason deleting
+    /// one layer does — which is the caller's duty, and is now a larger one.
+    #[test]
+    fn deleting_a_folder_takes_its_contents_and_frees_every_slice() {
+        let mut s = grouped();
+        let inside: Vec<u32> = s.layers()[1..3].iter().filter_map(Layer::slot).collect();
+        assert_eq!(inside.len(), 2);
+
+        let freed = s.remove(3).expect("the group can go");
+        assert_eq!(freed, inside, "both slices came back");
+        assert_eq!(shape_of(&s), vec![("Layer 1".into(), 0, false)]);
+
+        // And they are reused before the texture array grows, exactly as a
+        // deleted layer's is.
+        let capacity = s.slot_capacity_needed();
+        s.add();
+        s.add();
+        assert_eq!(s.slot_capacity_needed(), capacity);
+    }
+
+    /// A document needs somewhere to paint, and a folder is not somewhere. So
+    /// the folder holding the last layer cannot be deleted either — the
+    /// refusal counts *pixel layers*, not entries.
+    #[test]
+    fn the_folder_holding_the_last_layer_cannot_be_deleted() {
+        let mut s = LayerStack::new();
+        assert_eq!(s.group(&[0]), Some(1));
+        assert_eq!(s.len(), 2, "one layer inside one folder");
+        assert!(
+            s.remove(1).is_none(),
+            "deleting the group would leave nowhere to paint"
+        );
+        assert!(s.remove(0).is_none(), "and so would deleting the layer");
+        assert_eq!(s.len(), 2);
+    }
+
+    /// A new layer made with a folder selected goes **inside** it, which is
+    /// what every application does and the only way to fill a group without
+    /// dragging.
+    #[test]
+    fn a_new_layer_goes_inside_the_selected_folder() {
+        let mut s = grouped();
+        s.set_active(3);
+        assert!(s.add().is_some());
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Layer 4".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.active_index(), 3, "and it is selected");
+        assert_eq!(s.subtree(4), 1..5);
+    }
+
+    /// Grouping entries that are already nested keeps them nested relative to
+    /// each other. Flattening them to one level instead would silently
+    /// rearrange somebody's stack.
+    #[test]
+    fn grouping_keeps_the_nesting_the_entries_already_had() {
+        let mut s = grouped();
+        // Group the folder together with the loose layer below it.
+        assert_eq!(s.group(&[0, 3]), Some(4));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 1, false),
+                ("Layer 2".into(), 2, false),
+                ("Layer 3".into(), 2, false),
+                ("Group 1".into(), 1, true),
+                ("Group 2".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.subtree(4), 0..5, "the outer group holds everything");
+        assert_eq!(s.subtree(3), 1..4, "the inner one still holds its two");
+    }
+
+    /// A folder has no slot to find the selection by, so it is followed by
+    /// where the move put it — and a *layer* is still found by its slice,
+    /// which is what it always was.
+    #[test]
+    fn the_selection_follows_a_folder_through_a_move() {
+        let mut s = grouped();
+        s.set_active(3);
+        assert!(s.reorder(3, 0));
+        assert_eq!(s.active_index(), 2, "the folder, now above its contents");
+        assert!(s.active_is_folder());
+        assert_eq!(s.active_slot(), None, "and there is nowhere to paint");
+
+        s.set_active(3);
+        let slot = s.active_slot();
+        assert!(s.reorder(3, 0));
+        assert_eq!(s.active_slot(), slot, "a layer is still found by its slice");
+    }
+
+    /// The one shape a `Vec` of depths can hold that is not a tree: something
+    /// nested inside a thing that cannot hold it.
+    #[test]
+    fn only_a_folder_can_enclose_anything() {
+        // Bottom first, so the folder comes last.
+        assert!(well_formed(&[(1, false), (0, true)]), "a layer in a folder");
+        assert!(well_formed(&[(0, false), (0, false)]), "two loose layers");
+        assert!(well_formed(&[]), "nothing at all");
+        assert!(
+            well_formed(&[(2, false), (1, true), (0, true)]),
+            "a folder in a folder"
+        );
+        assert!(
+            !well_formed(&[(1, false), (0, false)]),
+            "a layer cannot hold a layer"
+        );
+        assert!(
+            !well_formed(&[(1, false)]),
+            "and nothing at all cannot hold one"
+        );
+        assert!(
+            !well_formed(&[(2, false), (0, true)]),
+            "a folder holds one level, not two"
+        );
+        assert!(
+            !well_formed(&[(LayerStack::MAX_DEPTH + 1, false)]),
+            "deeper than the shader could ever hold"
+        );
+    }
+
+    /// An import can name depths that do not nest — a file capped at
+    /// `MAX_DEPTH` on the way in, or one another application wrote. The
+    /// picture is refused over none of it; only the grouping changes.
+    #[test]
+    fn an_ill_formed_import_is_straightened_rather_than_refused() {
+        let mut s = LayerStack::empty();
+        s.push_imported(false, 3, "far too deep".into());
+        s.push_imported(true, 0, "Group".into());
+        s.push_imported(false, 7, "deeper than its folder".into());
+        s.flatten_ill_formed();
+        assert!(well_formed(
+            &s.layers()
+                .iter()
+                .map(|l| (l.depth, l.is_folder()))
+                .collect::<Vec<_>>()
+        ));
+        assert_eq!(
+            s.layers().iter().map(|l| l.depth).collect::<Vec<_>>(),
+            // Bottom first: the layer under the folder keeps one level, the
+            // folder is at the top level, and the one above it — enclosed by
+            // nothing at all — is pulled out to the top level too.
+            vec![1, 0, 0],
+            "each pulled out to the deepest level something could hold it at"
+        );
+    }
+
+    /// A linked layer inside a folder brings its group with it, and the folder
+    /// brings its contents — the two ways of saying "these travel together"
+    /// compose rather than fighting.
+    #[test]
+    fn a_link_group_and_a_folder_travel_together() {
+        let mut s = LayerStack::new();
+        for _ in 0..3 {
+            s.add();
+        }
+        // The bottom two in a group, leaving two loose layers above it.
+        assert_eq!(s.group(&[0, 1]), Some(2));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 1, false),
+                ("Layer 2".into(), 1, false),
+                ("Group 1".into(), 0, true),
+                ("Layer 3".into(), 0, false),
+                ("Layer 4".into(), 0, false),
+            ]
+        );
+
+        // Link the group's own row to the topmost loose layer, then drag that
+        // layer to the bottom. It brings the folder, and the folder brings the
+        // two layers inside it — the two ways of saying "these travel
+        // together", composing rather than fighting.
+        assert_eq!(s.link(&[2, 4]), Some(0));
+        assert!(s.reorder(4, 0));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 1, false),
+                ("Layer 2".into(), 1, false),
+                ("Group 1".into(), 0, true),
+                ("Layer 4".into(), 0, false),
+                ("Layer 3".into(), 0, false),
+            ]
+        );
+    }
+
+    /// A drop at the bottom of a folder's contents is a drop *into* it — the
+    /// position is the one the bottom layer already has, and the depth is what
+    /// says which side of the boundary it lands on. Without that, the bottom of
+    /// a group would be the one place in the stack a drag could not reach.
+    #[test]
+    fn the_bottom_of_a_folder_is_reachable_by_depth_alone() {
+        let mut s = grouped();
+        assert!(s.reorder_to(0, 0, 1), "same place, one level in");
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 1, false),
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.subtree(3), 0..4, "all three are inside now");
     }
 }

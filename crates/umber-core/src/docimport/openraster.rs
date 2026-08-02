@@ -76,6 +76,11 @@ struct LayerSpec {
     /// "one set", and group zero is that set. See
     /// [`docformat::LINK_GROUP_ATTR`].
     link: Option<u8>,
+    /// How deeply nested inside `<stack>` elements, 0 at the top level.
+    depth: u8,
+    /// This spec is a nested `<stack>`, and becomes a folder rather than a
+    /// layer. It names no `src` and decodes no PNG.
+    folder: bool,
 }
 
 pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
@@ -120,10 +125,14 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         }
     }
 
-    if layers.is_empty() {
+    if !layers.iter().any(|l| !l.folder) {
         // A file whose layer PNGs are unreadable can still be opened through
         // the composite the spec requires every writer to include. Losing the
         // layer structure is a real loss, but less of one than refusing.
+        //
+        // Folders do not count towards "there is something here": one holds no
+        // pixels, so a document of nothing but empty groups has nothing to show
+        // and nowhere to paint.
         return flattened_fallback(&mut zip, size, dpi, warnings);
     }
 
@@ -171,12 +180,16 @@ fn parse_stack(
         detail,
     };
 
-    // One frame per open `<stack>`: a group's opacity and visibility apply to
-    // everything inside it.
+    // One frame per open `<stack>`.
+    //
+    // Only the opacity is carried now: a group *is* a folder here, so its
+    // visibility and its name stay on the folder where they belong, and only
+    // the one thing a pass-through folder cannot hold still gets folded into
+    // the layers inside — with a warning, since folding a group's opacity into
+    // its children is not the same picture wherever those children overlap.
     #[derive(Clone)]
     struct Group {
         opacity: f32,
-        visible: bool,
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut size: Option<UVec2> = None;
@@ -236,9 +249,16 @@ fn parse_stack(
                             let visible = visible(&attrs);
                             let op = composite_op(&attrs);
 
-                            warnings.push(ImportWarning::GroupFlattened {
-                                group: name.clone(),
-                            });
+                            // **The group itself is kept**, as a folder, which
+                            // is why there is no `GroupFlattened` here any
+                            // more. What is still folded away is a group's
+                            // *opacity* and *blend mode*: a folder in this
+                            // build is pass-through, so it can carry the name
+                            // and the eye and nothing else, and the two that do
+                            // not survive are reported exactly as they were
+                            // before. See `docs/layer-folders.md` — the
+                            // difference is group compositing, and it is not
+                            // built.
                             if opacity < 1.0 {
                                 warnings.push(ImportWarning::GroupOpacityFolded {
                                     group: name.clone(),
@@ -246,18 +266,53 @@ fn parse_stack(
                             }
                             if blend::nearest(&op).1 != Fidelity::Exact {
                                 warnings.push(ImportWarning::BlendDropped {
-                                    layer: name,
+                                    layer: name.clone(),
                                     source: op,
                                 });
                             }
+                            // Nested deeper than Umber can hold. The depths are
+                            // capped below, which merges this group into the one
+                            // outside it; said out loud, because the grouping is
+                            // the only thing a folder *is* and losing it
+                            // silently is exactly the quiet loss this module
+                            // exists to refuse.
+                            if depth - 2 > LayerStack::MAX_DEPTH as usize {
+                                warnings.push(ImportWarning::GroupFlattened {
+                                    group: name.clone(),
+                                });
+                            }
 
-                            let inherited = groups.last().cloned().unwrap_or(Group {
-                                opacity: 1.0,
-                                visible: true,
-                            });
+                            let inherited =
+                                groups.last().cloned().unwrap_or(Group { opacity: 1.0 });
+                            // Visibility is deliberately *not* inherited here.
+                            // It lives on the folder now, and folding an outer
+                            // group's eye into an inner one as well would hide
+                            // the same layers twice — a painter who opened the
+                            // outer folder again would find the inner one still
+                            // shut for a reason nothing in the file said.
+                            // `LayerStack::effective_visible` walks the
+                            // ancestors instead, which is one rule rather than a
+                            // second copy baked into the import.
                             groups.push(Group {
                                 opacity: inherited.opacity * opacity,
-                                visible: inherited.visible && visible,
+                            });
+                            specs.push(LayerSpec {
+                                name,
+                                src: String::new(),
+                                x: 0,
+                                y: 0,
+                                opacity: 1.0,
+                                visible,
+                                composite_op: "src-over".into(),
+                                umber_blend: None,
+                                selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
+                                background: None,
+                                mask_src: None,
+                                clipped: false,
+                                locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
+                                link: None,
+                                depth: depth.saturating_sub(2).min(u8::MAX as usize) as u8,
+                                folder: true,
                             });
                         }
                         // `<stack/>` — an empty group — never gets an End.
@@ -278,17 +333,14 @@ fn parse_stack(
                             });
                             continue;
                         };
-                        let group = groups.last().cloned().unwrap_or(Group {
-                            opacity: 1.0,
-                            visible: true,
-                        });
+                        let group = groups.last().cloned().unwrap_or(Group { opacity: 1.0 });
                         specs.push(LayerSpec {
                             name: attrs.string("name").unwrap_or_else(|| name_from_src(&src)),
                             src,
                             x: attrs.parse("x").unwrap_or(0),
                             y: attrs.parse("y").unwrap_or(0),
                             opacity: opacity(&attrs) * group.opacity,
-                            visible: visible(&attrs) && group.visible,
+                            visible: visible(&attrs),
                             composite_op: composite_op(&attrs),
                             umber_blend: attrs
                                 .get(docformat::BLEND_ATTR)
@@ -314,6 +366,10 @@ fn parse_stack(
                                 .or_else(|| {
                                     (attrs.get(docformat::LINK_ATTR) == Some("true")).then_some(0)
                                 }),
+                            // One less than the XML nesting: the root `<stack>`
+                            // is the document, not a group.
+                            depth: depth.saturating_sub(1).min(u8::MAX as usize) as u8,
+                            folder: false,
                         });
                     }
                     _ => {}
@@ -342,6 +398,15 @@ fn load_layer(
     canvas: UVec2,
     warnings: &mut Vec<ImportWarning>,
 ) -> Result<ImportedLayer, String> {
+    // A folder has no `src` and nothing to decode. It still becomes an entry,
+    // because the *nesting* is what a folder is, and a group whose contents
+    // loaded but whose own row did not would leave every layer in it at a depth
+    // enclosed by nothing.
+    if spec.folder {
+        let mut folder = ImportedLayer::folder(spec.name.clone(), spec.depth, spec.visible);
+        folder.locked = spec.locked;
+        return Ok(folder);
+    }
     let png = container::read_optional_entry(zip, &spec.src, FORMAT)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("`{}` is not in the file", spec.src))?;
@@ -379,6 +444,9 @@ fn load_layer(
     srgb::encode_buffer(&mut pixels);
 
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
+    // How many `<stack>` elements this layer was inside. Carried even though
+    // the layer itself is not a folder: it is what puts the layer *in* one.
+    layer.depth = spec.depth;
     layer.visible = spec.visible;
     layer.opacity = spec.opacity;
     layer.clipped = spec.clipped;
@@ -574,25 +642,80 @@ mod tests {
         );
     }
 
+    /// A nested `<stack>` comes back as a **folder**, with its two layers
+    /// inside it — not flattened away, which is what this reader did before
+    /// folders existed.
+    ///
+    /// The folder is *above* its contents in the stack, which is the invariant
+    /// the whole tree rests on and the one thing here that is easy to get
+    /// backwards: the first element of an ORA stack is the uppermost, and
+    /// `LayerStack` is bottom first, so the group's own entry ends up last.
     #[test]
-    fn a_group_is_flattened_and_its_state_folded_into_its_layers() {
+    fn a_group_comes_back_as_a_folder_holding_its_layers() {
         let doc = read(&fixtures::ora_with_group()).unwrap();
-        // Two layers inside a hidden, half-opaque group.
-        assert_eq!(doc.layers.len(), 2);
-        assert!(
-            doc.layers.iter().all(|l| !l.visible),
-            "a hidden group must hide what is inside it"
+        // Two layers inside a hidden, half-opaque group, plus the group itself.
+        assert_eq!(doc.layers.len(), 3);
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["B", "A", "Ink"]);
+        assert_eq!(
+            doc.layers.iter().map(|l| l.depth).collect::<Vec<_>>(),
+            vec![1, 1, 0]
         );
-        assert_eq!(doc.layers[0].opacity, 0.5);
+        assert!(doc.layers[2].folder, "the group is the entry above its own");
+        assert!(!doc.layers[0].folder && !doc.layers[1].folder);
+    }
+
+    /// The group's **eye stays on the folder** and is not folded into the
+    /// layers inside it.
+    ///
+    /// Folding it in as well would hide them twice: a painter who opened the
+    /// folder again would find every layer in it still individually shut, for a
+    /// reason nothing in the file said. What hides them is
+    /// `LayerStack::effective_visible`, which walks the ancestors — one rule
+    /// rather than a second copy baked into the import.
+    #[test]
+    fn a_hidden_group_keeps_its_eye_rather_than_shutting_its_layers() {
+        let doc = read(&fixtures::ora_with_group()).unwrap();
         assert!(
-            doc.warnings
-                .iter()
-                .any(|w| matches!(w, ImportWarning::GroupFlattened { .. }))
+            !doc.layers[2].visible,
+            "the folder carries the hidden group"
+        );
+        assert!(
+            doc.layers[..2].iter().all(|l| l.visible),
+            "the layers inside were not hidden individually"
+        );
+
+        // And the stack agrees once it is built: nothing in the group shows.
+        let opened = doc.open();
+        assert!(!opened.stack.any_visible());
+        assert!(!opened.stack.effective_visible(0));
+    }
+
+    /// A group's **opacity** is the one thing a pass-through folder cannot
+    /// hold, so it is still folded into the layers inside and still reported.
+    /// That fold is only exact where the children do not overlap, which is why
+    /// it is a warning rather than a silent conversion — and why a folder with
+    /// an opacity of its own is group compositing and is not built. See
+    /// `docs/layer-folders.md`.
+    #[test]
+    fn a_groups_opacity_is_still_folded_in_and_still_reported() {
+        let doc = read(&fixtures::ora_with_group()).unwrap();
+        assert_eq!(doc.layers[0].opacity, 0.5);
+        assert_eq!(doc.layers[1].opacity, 0.5);
+        assert_eq!(
+            doc.layers[2].opacity, 1.0,
+            "the folder itself has no opacity to carry"
         );
         assert!(
             doc.warnings
                 .iter()
                 .any(|w| matches!(w, ImportWarning::GroupOpacityFolded { .. }))
+        );
+        assert!(
+            !doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::GroupFlattened { .. })),
+            "the group was kept, so nothing was flattened"
         );
     }
 

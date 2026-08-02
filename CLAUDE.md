@@ -285,7 +285,11 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   reordering is a pointer shuffle, not a texture copy. Anything indexing layers
   by position must not assume position equals slot.
 - **`LayerStack::MAX`, `MAX_LAYERS` in `canvas.rs`, and `MAX_LAYERS` in
-  `composite.wgsl` must agree.** The last one sizes a uniform array.
+  `composite.wgsl` must agree.** The last one sizes a uniform array. It bounds
+  stack **entries**, folders included — stricter than the array needs while
+  folders are flattened away, and deliberately so, because a folder that
+  composites as a group *will* occupy a slot in that array and a cap tightened
+  later would shut documents this build had already written.
 - **Deleting a layer clears undo history.** Slots are recycled, so a patch
   recorded against a freed slot would be replayed into whichever layer inherits
   it. Structural undo is the real fix and is not built yet.
@@ -377,6 +381,82 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+
+#### Folders
+
+A folder is an **entry in the same `Vec`** carrying no slot, and its contents
+are the contiguous run immediately below it whose `depth` is greater.
+`docs/layer-folders.md` has the whole argument; these are the rules.
+
+- **A folder sits *above* its own contents**, and this is the one thing here
+  that is easy to get backwards. It is what a layers panel draws, it is the
+  order ORA's nested `<stack>` writes — the first element of a stack is the
+  uppermost — and it makes the folder the natural *end* of its group as the
+  composite walks bottom to top, which is where a "close the group" marker will
+  have to go. `LayerStack::subtree` is the one place containment is computed;
+  everything that moves, deletes, hides, locks, ticks or draws a folder's
+  contents asks it.
+- **Every folder is pass-through, and that is the whole of why nothing else
+  changed.** A pass-through folder is exactly its contents composited in place,
+  so `composite.wgsl` was not touched, the four things that reuse that pass
+  needed nothing, and `umber-version` did not move — an older Umber, or GIMP,
+  flattens the nesting and shows the identical picture. Only visibility and
+  locking fold in, because both are booleans and `hidden ∧ anything = hidden`.
+  **An opacity does not fold**: a folder at 50% over two overlapping children is
+  not two children at 50% each. So a folder has no opacity and no blend mode,
+  and their controls are *not drawn* — not drawn disabled.
+- **`Editor::layer_draws` is where folders are flattened away**, and therefore
+  **a draw's position is not a stack position**. Anything handing the composite
+  a stack index must map it through `Editor::active_draw_index`, which answers
+  `u32::MAX` for a selected folder — deliberately not "the layer below it",
+  which is a real draw and would preview the stroke on a layer nobody chose.
+- **`Layer::slot` is an `Option` because a folder holds none.** A slot a folder
+  held and nothing wrote to is a lie the autosave would find — it reads every
+  slot back, so the file would gain a blank layer nobody made — and it would
+  cost 400 MB of texture per folder on a large canvas.
+- **Folders cost the undo history nothing**, and the rule is the one reordering
+  answers to: no slot changes hands. Grouping, re-nesting and folding free none
+  and reassign none, so every recorded patch still names its own pixels.
+  *Deleting* a folder deletes its contents, which frees their slices, so it
+  clears the history for exactly the reason deleting one layer does — and the
+  lock gate is over the whole subtree, because half a deletion is not a state
+  to leave a stack in.
+- **The history's stack positions count folders**, and the manifest's name
+  fingerprint is built the same way, so the two cannot disagree about what
+  "layer 3" means. A folder holds no slot so it can never be what a patch
+  resolves to; what it does is occupy a position, which is exactly why it has to
+  be counted. A position that names a folder drops the whole history.
+- **Every structural change is judged before it is written.** `well_formed` is
+  run over the depth sequence a move *would* produce, so `reorder_to` cannot
+  invent a layer nested inside nothing, and a refusal changes nothing.
+  `can_reorder` is that same plan without the writes — the drag asks it rather
+  than restating the rule, so a row cannot light up promising a move the model
+  will refuse.
+- **`MAX_DEPTH` is enforced in `umber-core`**, not hoped for: the eventual group
+  stack in the fragment shader is a fixed-size array and a document too deep for
+  it has to be refused where somebody can be told. An import too deep is
+  *straightened* rather than refused — `flatten_ill_formed`, once, in
+  `ImportedDocument::open` — because the pixels are all there either way and
+  only the grouping changes.
+- **Ticking a folder is written into the ticks, not derived at read time.**
+  `LayerStack::pick` cascades down the subtree; `targets` is untouched. A
+  painter who ticks a folder and unticks one layer means it, where a re-derived
+  set would put that layer straight back — and it makes "a folder ticked whose
+  contents are not" unreachable, so there is no third checkbox state to draw.
+- **Collapsing is a filter on what the list draws and nothing else.** It is not
+  in the file, for the reason a tick is not, plus one of its own: a fold that
+  survived a save would be a state somebody had to undo before they could see
+  their own painting. A collapsed folder composites exactly as an open one does.
+- **`layerdrag` decides the depth and `LayerStack` decides the legality.** The
+  pointer's horizontal position picks the nesting, one level per
+  `metrics::LAYER_INDENT`, capped by what the target row can hold. A refused
+  drop lights nothing up rather than falling back to a depth nobody asked for.
+- **A folder's row draws a folder mark, not a thumbnail.** The honest thumbnail
+  is the composite of its contents and is a third mode for `thumbnail.wgsl`; one
+  arbitrary child would be a picture that lies about what the group holds.
+- **The autosave snapshot has its own `pixel_index`.** A folder is read back as
+  nothing, so the capture is shorter than the stack and a positional zip would
+  pair every layer above a folder with the pixels of the one below it.
 - **The stack is flat, and folders are designed but not built.**
   `docs/layer-folders.md` is the design; the two things to know before starting
   are that a *pass-through* folder needs no change to `composite.wgsl` and no
@@ -539,6 +619,16 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   clipping: a build ignoring either shows a picture that is *wrong* — what the
   mask hid comes back, and the clipped layer paints everywhere. Locks and links
   ride along, because ignoring them changes no pixel.
+- **Folders did not move it either, and are baseline ORA rather than an
+  extension.** A folder is a nested `<stack>` — the nesting GIMP, Krita and
+  MyPaint all write and the one `docimport::openraster` already parsed. A reader
+  that flattens it away shows the identical picture and loses only the grouping,
+  because a pass-through folder *is* its contents composited in place: plainer,
+  not wrong, which is the line the version is drawn on. The folder's tag
+  therefore carries a name, a visibility and a lock, and deliberately **no
+  `opacity` and no `composite-op`** — a group opacity is the one thing a
+  flattening reader cannot reproduce, and writing one is what would earn the
+  bump. `a_document_of_folders_still_declares_the_revision_it_needs` guards it.
 - **The writer emits the lowest revision the file actually needs**
   (`required_version`), so a document with no mask and no clipping still
   declares 1 and still opens in every older Umber. A version number is a

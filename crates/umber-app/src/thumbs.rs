@@ -59,9 +59,20 @@ pub fn request(editor: &mut Editor, canvas: &mut CanvasRenderer) {
     let mut slots = [(0u32, 0u64); LayerStack::MAX];
     let mut live = [0u32; LayerStack::MAX];
     let mut count = 0;
-    for layer in editor.layers.layers().iter().take(LayerStack::MAX) {
-        slots[count] = (layer.slot(), canvas.slot_revision(layer.slot()));
-        live[count] = layer.slot();
+    // A folder has no slice to draw a picture of. The list shows it a folder
+    // mark instead — the honest answer, where a thumbnail of one arbitrary
+    // child would be a picture that lies about what the group holds. Compositing
+    // the contents is the right answer and is a third mode for `thumbnail.wgsl`;
+    // see `docs/layer-folders.md`.
+    for slot in editor
+        .layers
+        .layers()
+        .iter()
+        .filter_map(|l| l.slot())
+        .take(LayerStack::MAX)
+    {
+        slots[count] = (slot, canvas.slot_revision(slot));
+        live[count] = slot;
         count += 1;
     }
     let (slots, live) = (&slots[..count], &live[..count]);
@@ -70,7 +81,9 @@ pub fn request(editor: &mut Editor, canvas: &mut CanvasRenderer) {
     if canvas.thumb_in_flight() {
         return;
     }
-    let active = editor.layers.active_slot();
+    // `u32::MAX` where a folder is selected: no slot is preferred, so the
+    // queue simply takes them in order.
+    let active = editor.layers.active_slot().unwrap_or(u32::MAX);
     if let Some(slot) = editor.thumbs.wanted(slots, active) {
         canvas.begin_thumb(slot);
     }
@@ -291,7 +304,10 @@ mod tests {
         gpu.queue.submit(Some(enc.finish()));
 
         let ctx = Context::default();
-        let slot = editor.layers.active_slot();
+        let slot = editor
+            .layers
+            .active_slot()
+            .expect("the default stack is one layer");
         // Generous: a thumbnail is two passes and each takes a frame or two,
         // and the point of the bound is that a job which never answers fails
         // rather than hangs.

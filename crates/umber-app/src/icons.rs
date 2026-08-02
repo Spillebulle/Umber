@@ -92,6 +92,17 @@ pub enum Icon {
     /// circled `!` is a warning somebody can carry on past, and this is
     /// neither.
     Alert,
+    // Layer folders. At the end for the reason the brush marks above are: this
+    // enum is shared, and renumbering it would be a merge that compiles and
+    // draws the wrong marks.
+    /// A folder with a tab, as a layer group's row mark. Drawn where a layer's
+    /// row draws its thumbnail — a folder has no picture of its own, and one of
+    /// an arbitrary child would be a picture that lies about what is inside.
+    Folder,
+    /// A chevron pointing right: this folder is shut. Its pair is
+    /// [`Icon::ChevronDown`], which already exists and already points the way a
+    /// disclosure open should.
+    ChevronRight,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -261,6 +272,26 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
 
         Icon::ChevronUp => path(vec![at(6.0, 15.0), at(12.0, 9.0), at(18.0, 15.0)]),
         Icon::ChevronDown => path(vec![at(6.0, 9.0), at(12.0, 15.0), at(18.0, 9.0)]),
+
+        Icon::ChevronRight => path(vec![at(9.0, 6.0), at(15.0, 12.0), at(9.0, 18.0)]),
+
+        Icon::Folder => {
+            // The tab first, so the body's top edge draws over its base and the
+            // two read as one shape rather than as a box with a bump.
+            path(vec![
+                at(3.0, 8.0),
+                at(3.0, 5.5),
+                at(9.5, 5.5),
+                at(11.5, 8.0),
+            ]);
+            path(vec![
+                at(3.0, 8.0),
+                at(21.0, 8.0),
+                at(21.0, 18.5),
+                at(3.0, 18.5),
+                at(3.0, 8.0),
+            ]);
+        }
 
         Icon::Eye => {
             path(eye_outline(&at));
