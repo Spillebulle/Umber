@@ -35,7 +35,7 @@ use crate::editor::Editor;
 use crate::session::DocId;
 use egui::{Context, TextureHandle};
 use std::collections::HashMap;
-use umber_core::thumbnail;
+use umber_core::{LayerStack, thumbnail};
 use umber_render::{CanvasRenderer, Thumbnail};
 
 /// Ask the renderer for the next thumbnail the list is missing.
@@ -45,28 +45,33 @@ use umber_render::{CanvasRenderer, Thumbnail};
 /// picture is stale when the slice's revision has moved" — are stated once,
 /// together, against the same list of slots.
 ///
-/// Called every frame. It allocates one short `Vec` of at most
-/// `LayerStack::MAX` pairs, which is the drawing path's rule stretched as far
-/// as it goes: this is not on the drawing path, it is beside it, and the
-/// alternative is a second copy of the stack held on `Editor` to be kept in
-/// step.
+/// Called every frame, and therefore **allocates nothing**: the two lists are
+/// fixed arrays bounded by `LayerStack::MAX`, about a kilobyte of stack. A
+/// `Vec` a frame here would be the one place on this path that took the heap,
+/// and the rule that nothing on it allocates is only worth anything if it is
+/// kept where it is inconvenient.
 pub fn request(editor: &mut Editor, canvas: &mut CanvasRenderer) {
+    // Also called from the top of `app.rs`'s `render`, which is the call that
+    // matters — see `Thumbs::follow`. Repeated here so this function is correct
+    // on its own; it is idempotent, and one rule stated twice is not two rules.
     editor.thumbs.follow(editor.session.active_id());
 
-    let slots: Vec<(u32, u64)> = editor
-        .layers
-        .layers()
-        .iter()
-        .map(|layer| (layer.slot(), canvas.slot_revision(layer.slot())))
-        .collect();
-    let live: Vec<u32> = slots.iter().map(|(slot, _)| *slot).collect();
-    editor.thumbs.retain(&live);
+    let mut slots = [(0u32, 0u64); LayerStack::MAX];
+    let mut live = [0u32; LayerStack::MAX];
+    let mut count = 0;
+    for layer in editor.layers.layers().iter().take(LayerStack::MAX) {
+        slots[count] = (layer.slot(), canvas.slot_revision(layer.slot()));
+        live[count] = layer.slot();
+        count += 1;
+    }
+    let (slots, live) = (&slots[..count], &live[..count]);
+    editor.thumbs.retain(live);
 
     if canvas.thumb_in_flight() {
         return;
     }
     let active = editor.layers.active_slot();
-    if let Some(slot) = editor.thumbs.wanted(&slots, active) {
+    if let Some(slot) = editor.thumbs.wanted(slots, active) {
         canvas.begin_thumb(slot);
     }
 }
@@ -93,6 +98,13 @@ impl Thumbs {
     /// Called every frame rather than from the tab switch: a switch is four
     /// moves in `Editor` and a fifth that had to be remembered here is the one
     /// that would be forgotten by the path that closes a tab.
+    ///
+    /// **From the top of `app.rs`'s `render`, before the interface is built.**
+    /// `request` below runs after it — it needs the frame's encoder — and a
+    /// cache still naming the previous document while the list is drawn hands
+    /// the new document's rows the old one's pictures for the same slots. One
+    /// frame of the wrong picture, and precisely the confusion this cache being
+    /// keyed by document exists to prevent.
     pub fn follow(&mut self, doc: DocId) {
         if self.doc != Some(doc) {
             self.doc = Some(doc);

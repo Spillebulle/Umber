@@ -313,9 +313,16 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   about which layers travel together. Asking for one is refused with a tooltip
   saying so. `free_group` hands back the **lowest** free number, so unlinking
   returns a colour to the pool rather than walking off the end of it, and
-  `Palette::link_colour` takes the number modulo the table because the number
-  comes out of a *file* and the drawing path may not panic on one this build
-  cannot colour.
+  **`unlink` and `remove` both dissolve a group that has fallen to one
+  member** — `link` refuses to make a group of one, so nothing may leave one
+  behind either, and a lone member would draw a chain meaning "moves together
+  with nothing" while holding a colour `free_group` could then never return.
+  `Palette::link_colour` takes the number modulo the table as a third line of
+  defence, after the model's refusal and the ORA reader's filter, because the
+  alternative failure is an index panic on the drawing path. The link colours
+  are checked for separation from **each other and from all four accents** in
+  both themes; checking only the authored accent is what shipped a green a hair
+  from `Accent::Sage`.
 - **The chain lives in the ticked strip and nowhere else.** Linking is the one
   thing on a layer that is a statement about several layers at once — a group of
   one says nothing, which is why `link` refuses fewer than two — so a chain in
@@ -361,13 +368,17 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   reordering and deletion by hand — as a field both come free, which is the
   argument `linked` already makes for itself. It is also not a document
   modification: a tick puts no dot on the tab.
-- **`LayerStack::targets` is the one rule for what a bulk operation reaches** —
+- **`LayerStack::targets` is the one rule for what a *bulk* operation reaches** —
   every ticked layer, or the selected one alone when nothing is ticked. The
-  fallback is what stops there being a second, single-layer spelling of "hide
-  this" to drift from this one, and it is why the strip's buttons are never
-  dead. `App::delete_picked_layers` is written in terms of `delete_layer` for
-  the same reason: the lock gate, the float being put down and the history being
-  cleared are each stated once.
+  fallback makes the rule total, so no caller has to special-case an empty tick
+  list; note that no caller reaches it today, because the strip is only drawn
+  when something is ticked. It is deliberately **not** the rule for the
+  single-layer controls: the row's own eye and the flags row write their flag
+  directly, because those are the controls that mean "this layer" and routing
+  them through `targets` would make a tick somewhere else change what the eye
+  in front of you does. `App::delete_picked_layers` is written in terms of
+  `delete_layer` so the lock gate, the float being put down and the history
+  being cleared are each stated once.
 - **The ticked-layers strip is drawn only when something is ticked**, and the
   tick box is drawn on every row whether or not anything is. A strip that was
   always there costs the list a row of height on every three-layer document; a

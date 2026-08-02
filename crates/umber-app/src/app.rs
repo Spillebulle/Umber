@@ -1044,10 +1044,13 @@ impl UmberApp {
     /// each stated once — a second delete that forgot one of the three is
     /// exactly the bug the "one gate per operation" rule exists to prevent.
     ///
-    /// **Top-down**, because removing a layer shifts every index above it. And
-    /// `delete_layer` refuses to empty the stack all by itself, so the last
-    /// survivor stays whether or not it was ticked; it is left ticked, which is
-    /// what says the request was not carried out in full.
+    /// **Top-down**, because removing a layer shifts every index above it.
+    ///
+    /// A request that would empty the stack cannot arrive — the strip disables
+    /// the button when every layer is ticked — and `delete_layer` refuses the
+    /// last one anyway, which is the backstop rather than the visible
+    /// behaviour. Keeping both is the point: this function must stay callable
+    /// from somewhere that has not made that check.
     fn delete_picked_layers(&mut self) {
         for index in self.editor.layers.targets().into_iter().rev() {
             self.delete_layer(index);
@@ -1634,6 +1637,14 @@ impl UmberApp {
         // loop was asleep is on screen in the frame the wake-up produced rather
         // than in the one after it.
         self.editor.updates.poll();
+
+        // Also before the interface is built, and that is the whole point: a
+        // slot is a slice of *one* document's texture array, so the frame after
+        // a tab switch would otherwise draw the new document's rows wearing the
+        // old one's pictures for the same slot numbers. `thumbs::request` runs
+        // after the UI — it needs the frame's encoder — which is too late to be
+        // the only place this is asked.
+        self.editor.thumbs.follow(self.editor.session.active_id());
 
         let Some(gfx) = self.gfx.as_mut() else { return };
 
