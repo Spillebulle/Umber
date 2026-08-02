@@ -49,7 +49,9 @@ data/background.png         the document background, when it has one — see bel
 mergedimage.png             the flattened composite, required by the spec
 Thumbnails/thumbnail.png    at most 256 px on its long edge, also required
 umber/history/index.json    the saved undo history, when there is one — see below
-umber/history/0000.png      …and one PNG per recorded edit
+umber/history/0000-000.png  …and one PNG per piece of each recorded edit
+                            (an entry that stores no pixels — a canvas flip —
+                            writes none)
 ```
 
 `stack.xml` for a two-layer document:
@@ -274,6 +276,20 @@ history over. It discards the history and opens the picture whole instead.
 This build still reads revision 1, where an entry with no pieces is one piece
 covering its rectangle.
 
+Revision **3** is the second, and it is the sharper case. An entry can now be a
+**canvas flip**, which carries no pixels at all: a flip preserves the canvas
+size, so nothing already recorded stops being valid, and it is its own inverse,
+so undoing one is flipping again. That works because the timeline is stepped
+rather than seeked — by the time an older patch is reached the flip above it has
+already been undone, and the patch applies verbatim at the rectangle it names.
+A build that reads only revision 2 does not know the kind, and what it would do
+is not "one entry short": every entry older than the flip was recorded in the
+opposite orientation, so dropping the flip would write each of those patches
+back mirrored. It discards the whole history and opens the picture whole.
+`umber-version` is **not** bumped for this, for the reason above — an older
+build opening with an empty history is exactly what every build before histories
+did.
+
 ## The background, and why it is a real layer in the file
 
 A document's background — transparent, white, black or a colour — is a
@@ -366,7 +382,8 @@ Written, read back, and asserted on in `docformat`'s tests:
 - The undo history: both stacks, the position within the timeline, how many
   older entries the budget had already dropped, when each edit was made, and
   every patch byte for byte — on the layer it was recorded against, whatever
-  slot that layer ends up with.
+  slot that layer ends up with. A canvas flip too, which carries no pixels and
+  comes back as the entry that mirrors the picture again.
 
 ## What is not saved
 

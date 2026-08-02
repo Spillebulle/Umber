@@ -47,6 +47,10 @@ pub struct UiActions {
     pub save_and_close: Option<usize>,
     pub undo: bool,
     pub redo: bool,
+    /// Mirror the whole document about this axis. The pixels are the
+    /// renderer's, so like every other entry here it is the caller's to carry
+    /// out.
+    pub flip_canvas: Option<umber_core::FlipAxis>,
     /// Move the document to this position in the history — a click on a row of
     /// the History module. Carried out by the caller as that many undo or redo
     /// steps, since each one reads and writes a rect on the GPU.
@@ -750,6 +754,32 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                 {
                     let doc = ed.doc;
                     ed.canvas_form.open(crate::canvasdlg::Dialog::Settings, doc);
+                    ui.close();
+                }
+                // Beside Canvas settings rather than under a new Image menu:
+                // these are the same kind of thing — a change to the document
+                // rather than to the artwork on it — and the menu bar is the
+                // design's, not something to add a heading to for two rows.
+                //
+                // Unlike a resize, a flip keeps the undo history: the canvas
+                // size does not change and the flip is its own inverse, so it
+                // goes in the history as an entry that stores no pixels.
+                if menu_item(ui, "Flip canvas horizontally", Action::FlipCanvasHorizontal)
+                    .on_hover_text(
+                        "Mirror every layer left to right. The canvas size is unchanged.",
+                    )
+                    .clicked()
+                {
+                    actions.flip_canvas = Some(umber_core::FlipAxis::Horizontal);
+                    ui.close();
+                }
+                if menu_item(ui, "Flip canvas vertically", Action::FlipCanvasVertical)
+                    .on_hover_text(
+                        "Mirror every layer top to bottom. The canvas size is unchanged.",
+                    )
+                    .clicked()
+                {
+                    actions.flip_canvas = Some(umber_core::FlipAxis::Vertical);
                     ui.close();
                 }
                 ui.separator();

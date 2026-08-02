@@ -146,6 +146,11 @@ it is a property of the document rather than a filled bottom layer — so you ca
 change it afterwards, erasing cannot punch a hole through it, and "transparent"
 stays expressible.
 
+**File → Flip canvas horizontally / vertically** mirrors every layer's pixels —
+the picture, not the view — at the size the canvas already is. Unlike a resize
+it keeps the undo history: a flip goes into the list as an entry of its own, and
+stepping back over it puts the picture the way round it was.
+
 ### Saving, and opening other people's work
 
 **Umber saves to OpenRaster** (`.ora`) — the same format it reads. A `.ora` is a
@@ -208,7 +213,7 @@ module back.
 **Window → Modules** is every module there is, with a picture of each and a
 sentence saying what it is for. Adding one hands it to the pointer and you click
 where you want it. Among them is **History**: a viewable list of everything
-painted on the document, with a marker showing where you stand — click any entry
+done to the document, with a marker showing where you stand — click any entry
 to go there. Each row carries the mark of the tool that made it and how long
 after the previous one it happened, so the pauses in a session are visible at a
 glance; hover a time for the full date. Times are UTC, and an entry from a
@@ -344,6 +349,7 @@ own: it carries between tabs but not yet to and from other applications.
 | `Ctrl` + `+` / `-` | Zoom in / out |
 | `Ctrl` + `0` / `1` | Fit to window / 100% |
 | `Ctrl` + `Z`, `Ctrl` + `Shift` + `Z` | Undo / redo |
+| `Ctrl` + `Shift` + `H` / `V` | Flip the canvas left-to-right / top-to-bottom |
 | `Ctrl` + `S`, `Ctrl` + `Shift` + `S` | Save / save as… |
 | Two-finger drag (touch) | Pan and pinch-zoom |
 | Drag a panel header (layout edit mode) | Move that module |
@@ -372,8 +378,9 @@ platforms is on the roadmap.
   been built or run. Do not believe anyone who says otherwise.
 - **Automatic crash recovery.** Autosave keeps copies and Settings will open the
   folder, but nothing offers one back to you the next time Umber starts.
-- **Structural undo.** Undo covers painting; adding, deleting or reordering a
-  layer is not recorded, and deleting a layer clears the history.
+- **Structural undo.** Undo covers painting, transforms and canvas flips;
+  adding, deleting or reordering a layer is not recorded, and deleting a layer
+  clears the history.
 - **Pen pressure on macOS and Linux**, as above. Windows works.
 - Navigator, palette and harmony colour modes, per-brush blend modes, and
   stylus tilt.

@@ -1007,13 +1007,14 @@ struct HistoryRow {
 /// click to go back to any point in it.
 ///
 /// What it deliberately does *not* show is anything it cannot restore. Umber's
-/// history covers painting only — adding, deleting or reordering a layer is not
-/// recorded, and deleting one clears the list outright — so a row appears only
-/// where a patch was captured, and the note at the foot says so rather than
-/// leaving the gap to be discovered. A list that named a structural action it
-/// could not undo would be worse than one that admits its own edges. That is
-/// also why there are exactly two edit icons: an icon set richer than
-/// `EditKind` would be a promise about what the engine records.
+/// history covers painting, transforms and canvas flips — adding, deleting or
+/// reordering a layer is not recorded, and deleting one clears the list
+/// outright — so a row appears only where the engine can actually step back
+/// over the edit, and the note at the foot says so rather than leaving the gap
+/// to be discovered. A list that named a structural action it could not undo
+/// would be worse than one that admits its own edges. That is also why there is
+/// exactly one edit icon per `EditKind` and no more: an icon set richer than
+/// the enum would be a promise about what the engine records.
 fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let position = ed.history.position();
     let count = ed.history.len();
@@ -1084,11 +1085,12 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(if count == 0 {
-            "Nothing painted on this document yet. Strokes are recorded here; \
-             layers are not."
+            "Nothing done to this document yet. Strokes, transforms and canvas \
+             flips are recorded here; layers are not."
         } else {
-            "Strokes only. Adding, deleting or reordering a layer is not \
-             recorded, and deleting one clears this list."
+            "Strokes, transforms and canvas flips. Adding, deleting or \
+             reordering a layer is not recorded, and deleting one clears this \
+             list."
         })
         .size(9.5)
         .color(p.text_dim)
@@ -1131,6 +1133,10 @@ fn edit_icon(kind: EditKind) -> Icon {
         EditKind::Paint => Icon::Brush,
         EditKind::Erase => Icon::Eraser,
         EditKind::Transform => Icon::Transform,
+        // The same two marks the floating transform's own flip buttons carry,
+        // so a row and the control that could have produced it agree.
+        EditKind::FlipHorizontal => Icon::FlipHorizontal,
+        EditKind::FlipVertical => Icon::FlipVertical,
     }
 }
 

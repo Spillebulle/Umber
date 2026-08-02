@@ -24,12 +24,8 @@ use crate::history::EditKind;
 use crate::time::Timestamp;
 
 /// One recorded edit as it came out of a file.
-///
-/// `layer` is a **stack position**, bottom first — never a texture slot. See
-/// [`crate::docformat::history`] for why the two must not be confused.
 #[derive(Clone, Debug)]
 pub struct ImportedEdit {
-    pub layer: usize,
     pub kind: EditKind,
     /// When the edit was made, where the file says.
     ///
@@ -39,12 +35,26 @@ pub struct ImportedEdit {
     /// date, say — would be indistinguishable from a recorded one and would
     /// make the list assert something nobody measured.
     pub at: Option<Timestamp>,
-    /// The whole region the stroke damaged.
-    pub rect: PixelRect,
-    /// The parts of it the stroke actually touched. One covering the whole of
-    /// `rect` for an entry out of a revision-1 manifest, which is what that
-    /// revision could say.
-    pub pieces: Vec<ImportedPiece>,
+    pub body: ImportedBody,
+}
+
+/// What one entry carries, mirroring [`crate::history::EditBody`].
+#[derive(Clone, Debug)]
+pub enum ImportedBody {
+    Pixels {
+        /// A **stack position**, bottom first — never a texture slot. See
+        /// [`crate::docformat::history`] for why the two must not be confused.
+        layer: usize,
+        /// The whole region the stroke damaged.
+        rect: PixelRect,
+        /// The parts of it the stroke actually touched. One covering the whole
+        /// of `rect` for an entry out of a revision-1 manifest, which is what
+        /// that revision could say.
+        pieces: Vec<ImportedPiece>,
+    },
+    /// A canvas flip: no layer, no rectangle and no pixels. Undoing it is
+    /// flipping again.
+    Flip,
 }
 
 /// One piece of a recorded edit.
@@ -130,11 +140,26 @@ fn load(
 
     let mut entries = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
+        let kind = fmt::kind_from_id(&entry.kind)
+            .ok_or("one of its entries records something this build cannot undo")?;
+        // The kind decides the shape of the entry, so it is read before any of
+        // the fields that only a pixel entry has. A flip names no layer and no
+        // rectangle — the zeroes the writer put there are not a rectangle of
+        // the canvas and must not be checked as one.
+        if kind.flip_axis().is_some() {
+            if !entry.pieces.is_empty() || !entry.src.is_empty() {
+                return Err("one of its entries carries pixels it should not have".into());
+            }
+            entries.push(ImportedEdit {
+                kind,
+                at: entry.at.map(Timestamp::from_unix_millis),
+                body: ImportedBody::Flip,
+            });
+            continue;
+        }
         if entry.layer >= layer_names.len() {
             return Err("one of its entries names a layer this document does not have".into());
         }
-        let kind = fmt::kind_from_id(&entry.kind)
-            .ok_or("one of its entries records something this build cannot undo")?;
         // Bounds first: a rectangle running off the canvas would be written
         // back into whatever the arithmetic landed on.
         if entry.w == 0
@@ -205,7 +230,6 @@ fn load(
         }
 
         entries.push(ImportedEdit {
-            layer: entry.layer,
             kind,
             // Not validated beyond being a number. There is no range a
             // timestamp can be *wrong* in — a clock really can be set to 1904
@@ -213,13 +237,16 @@ fn load(
             // gap come out negative, which `Timestamp::since` already answers
             // by declining to report one.
             at: entry.at.map(Timestamp::from_unix_millis),
-            rect: PixelRect {
-                x: entry.x,
-                y: entry.y,
-                width: entry.w,
-                height: entry.h,
+            body: ImportedBody::Pixels {
+                layer: entry.layer,
+                rect: PixelRect {
+                    x: entry.x,
+                    y: entry.y,
+                    width: entry.w,
+                    height: entry.h,
+                },
+                pieces,
             },
-            pieces,
         });
     }
 

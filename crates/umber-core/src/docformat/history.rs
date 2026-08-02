@@ -149,7 +149,23 @@ pub const MANIFEST: &str = "umber/history/index.json";
 ///
 /// This build still reads revision 1: an entry with no `pieces` is one piece
 /// covering the whole rectangle, which is precisely what revision 1 meant.
-pub const VERSION: u32 = 2;
+///
+/// **3 is the second, and it is the sharper case of the two.** An entry can now
+/// be a canvas flip, which carries no pixels at all and is undone by flipping
+/// again ([`crate::history::EditBody::Flip`]). A build that reads only revision
+/// 2 does not know the kind, and what it would do with it is not "one entry
+/// short": every entry *older* than the flip was recorded in the opposite
+/// orientation, and reaching them means undoing the flip on the way past. Drop
+/// the flip and each of those patches is written back mirrored — the right
+/// bytes into the wrong pixels, over work that was never part of the edit.
+/// `kind_from_id` already answers `None` for a name it does not know and the
+/// reader already drops the whole history on that, so an older build was
+/// safe by construction; the bump is what makes it stop at the manifest
+/// instead, before it has decoded a single PNG, and what makes the reason it
+/// reports the true one.
+///
+/// This build still reads revisions 1 and 2. Nothing about them changed.
+pub const VERSION: u32 = 3;
 
 /// How much encoded patch data a document will carry.
 ///
@@ -173,18 +189,31 @@ pub const BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// One recorded edit on its way to disk.
 pub struct SaveEdit<'a> {
-    /// Index into [`super::SaveDocument::layers`], bottom first. **Never a
-    /// texture slot** — see the module docs.
-    layer: usize,
     kind: EditKind,
     /// When it was painted. `None` for an entry that came out of a document
     /// written before this was recorded and is on its way back into one.
     at: Option<Timestamp>,
-    /// The whole region the stroke damaged. The pieces are inside it and
-    /// generally do not fill it — see [`crate::damage`].
-    rect: PixelRect,
-    /// The parts of it the stroke actually touched, each with its own pixels.
-    pieces: &'a [PatchPiece],
+    body: SaveBody<'a>,
+}
+
+/// What an entry has to carry into the file, which mirrors
+/// [`crate::history::EditBody`]: pixels, or nothing at all.
+enum SaveBody<'a> {
+    Pixels {
+        /// Index into [`super::SaveDocument::layers`], bottom first. **Never a
+        /// texture slot** — see the module docs.
+        layer: usize,
+        /// The whole region the stroke damaged. The pieces are inside it and
+        /// generally do not fill it — see [`crate::damage`].
+        rect: PixelRect,
+        /// The parts of it the stroke actually touched, each with its own
+        /// pixels.
+        pieces: &'a [PatchPiece],
+    },
+    /// A canvas flip. It names no layer and no rectangle because it belongs to
+    /// the whole document, and it stores no pixels because doing it again is
+    /// what undoes it — the manifest entry is its kind and its time.
+    Flip,
 }
 
 /// An undo history resolved against the stack it belongs to.
@@ -216,16 +245,24 @@ impl<'a> SaveHistory<'a> {
         let mut entries = Vec::with_capacity(history.len());
         for i in 0..history.len() {
             let edit = history.entry_at(i)?;
-            let layer = layers
-                .layers()
-                .iter()
-                .position(|l| l.slot() == edit.patch.slot)?;
+            // An entry with no patch names no layer, so there is nothing to
+            // resolve and nothing that could fail to. A flip belongs to the
+            // document rather than to one slice of it.
+            let body = match edit.patch() {
+                Some(patch) => SaveBody::Pixels {
+                    layer: layers
+                        .layers()
+                        .iter()
+                        .position(|l| l.slot() == patch.slot)?,
+                    rect: patch.rect,
+                    pieces: patch.pieces(),
+                },
+                None => SaveBody::Flip,
+            };
             entries.push(SaveEdit {
-                layer,
                 kind: edit.kind,
                 at: edit.at,
-                rect: edit.patch.rect,
-                pieces: edit.patch.pieces(),
+                body,
             });
         }
         Some(Self {
@@ -262,6 +299,15 @@ pub(crate) struct Manifest {
     pub entries: Vec<ManifestEdit>,
 }
 
+/// One entry of the manifest.
+///
+/// Every field but `kind` and `at` describes an entry that holds *pixels*. An
+/// entry that does not — a canvas flip — writes them as zeroes and is read
+/// without looking at them, because the kind is what says which shape the entry
+/// has. The alternative was to make five fields optional, which would change
+/// the bytes written for every ordinary entry in order to describe one that is
+/// four fields long; the zeroes cost nothing in a deflated JSON and leave the
+/// common case byte for byte as it was.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ManifestEdit {
     pub layer: usize,
@@ -347,9 +393,17 @@ pub(crate) fn write(
     let mut used = 0usize;
     let mut kept: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, edit) in history.entries.iter().enumerate().rev() {
-        let mut pngs = Vec::with_capacity(edit.pieces.len());
+        // An entry with no pixels encodes nothing and costs nothing, so it can
+        // never be the one that reaches the budget. That is the right answer
+        // rather than a special case: what the budget bounds is the pixel data
+        // in the file, and a flip adds none.
+        let pieces: &[PatchPiece] = match &edit.body {
+            SaveBody::Pixels { pieces, .. } => pieces,
+            SaveBody::Flip => &[],
+        };
+        let mut pngs = Vec::with_capacity(pieces.len());
         let mut entry_bytes = 0usize;
-        for piece in edit.pieces {
+        for piece in pieces {
             let png = encode_png(
                 UVec2::new(piece.rect.width, piece.rect.height),
                 &piece.bytes(),
@@ -385,26 +439,48 @@ pub(crate) fn write(
             .enumerate()
             .map(|(n, (i, _))| {
                 let edit = &history.entries[*i];
+                let (layer, rect, pieces) = match &edit.body {
+                    SaveBody::Pixels {
+                        layer,
+                        rect,
+                        pieces,
+                    } => (
+                        *layer,
+                        *rect,
+                        pieces
+                            .iter()
+                            .enumerate()
+                            .map(|(p, piece)| ManifestPiece {
+                                x: piece.rect.x,
+                                y: piece.rect.y,
+                                w: piece.rect.width,
+                                h: piece.rect.height,
+                                src: patch_src(n, p),
+                            })
+                            .collect(),
+                    ),
+                    // Zeroes, read by nothing: the kind is what says this entry
+                    // has no rectangle. See [`ManifestEdit`].
+                    SaveBody::Flip => (
+                        0,
+                        PixelRect {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        },
+                        Vec::new(),
+                    ),
+                };
                 ManifestEdit {
-                    layer: edit.layer,
+                    layer,
                     kind: kind_id(edit.kind),
-                    x: edit.rect.x,
-                    y: edit.rect.y,
-                    w: edit.rect.width,
-                    h: edit.rect.height,
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
                     src: String::new(),
-                    pieces: edit
-                        .pieces
-                        .iter()
-                        .enumerate()
-                        .map(|(p, piece)| ManifestPiece {
-                            x: piece.rect.x,
-                            y: piece.rect.y,
-                            w: piece.rect.width,
-                            h: piece.rect.height,
-                            src: patch_src(n, p),
-                        })
-                        .collect(),
+                    pieces,
                     at: edit.at.map(Timestamp::unix_millis),
                 }
             })
@@ -438,7 +514,7 @@ mod tests {
     use crate::docimport::{self, ImportWarning};
     use crate::document::{Background, Document};
     use crate::geom::PixelRect;
-    use crate::history::{Edit, PixelPatch};
+    use crate::history::{Edit, EditBody, PixelPatch};
     use crate::layer::BlendMode;
 
     const CANVAS: UVec2 = UVec2::new(64, 64);
@@ -556,10 +632,11 @@ mod tests {
         // Millisecond resolution really made it into the file, rather than
         // being rounded away by a seconds-wide field.
         assert_eq!(back.time_at(0).unwrap().unix_millis() % 1000, 250);
-        // And the manifest is revision 2, which a patch made of pieces earned
-        // and the per-entry timestamp deliberately did not. See `VERSION`.
+        // And the manifest is the revision this build writes. See `VERSION`
+        // for what each of the two bumps was for, and for what deliberately did
+        // not earn one.
         assert!(
-            manifest_of(&bytes).contains("\"version\":2"),
+            manifest_of(&bytes).contains("\"version\":3"),
             "the manifest revision is not the one this build writes"
         );
 
@@ -567,10 +644,14 @@ mod tests {
             let (before, after) = (history.entry_at(i).unwrap(), back.entry_at(i).unwrap());
             assert_eq!(after.kind, before.kind, "entry {i}");
             assert_eq!(after.at, before.at, "entry {i} lost the moment it was made");
-            assert_eq!(after.patch.rect, before.patch.rect, "entry {i}");
             assert_eq!(
-                patch_pixels(&after.patch),
-                patch_pixels(&before.patch),
+                after.patch().unwrap().rect,
+                before.patch().unwrap().rect,
+                "entry {i}"
+            );
+            assert_eq!(
+                patch_pixels(after.patch().unwrap()),
+                patch_pixels(before.patch().unwrap()),
                 "entry {i}"
             );
             // The same *layer*, which is what the slot has to mean again.
@@ -578,11 +659,11 @@ mod tests {
                 .stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == after.patch.slot);
+                .position(|l| l.slot() == after.patch().unwrap().slot);
             let was = stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == before.patch.slot);
+                .position(|l| l.slot() == before.patch().unwrap().slot);
             assert_eq!(slot, was, "entry {i} came back on a different layer");
         }
         assert!(back.can_undo() && back.can_redo());
@@ -609,7 +690,7 @@ mod tests {
         let opened = doc.open();
         assert_eq!(opened.history.len(), 1);
 
-        let slot = opened.history.entry_at(0).unwrap().patch.slot;
+        let slot = opened.history.entry_at(0).unwrap().patch().unwrap().slot;
         let landed = opened
             .stack
             .layers()
@@ -677,7 +758,7 @@ mod tests {
             json.replace("\"canvas\":[64,64]", "\"canvas\":[65,64]")
         });
         let newer = with_entry(&bytes, MANIFEST, |json| {
-            json.replace("\"version\":2", "\"version\":99")
+            json.replace("\"version\":3", "\"version\":99")
         });
         let truncated = without_entry(&bytes, &patch_src(0, 0));
 
@@ -758,7 +839,7 @@ mod tests {
         }
         // Well past the file's budget, and comfortably inside memory's.
         assert!(history.used_bytes() > BUDGET_BYTES * 2);
-        let last = patch_pixels(&history.entry_at(count - 1).unwrap().patch);
+        let last = patch_pixels(history.entry_at(count - 1).unwrap().patch().unwrap());
 
         let pixels = vec![0u8; (side * side * 4) as usize];
         let layers = vec![SaveLayer {
@@ -797,7 +878,7 @@ mod tests {
             "an eviction that is not counted is one the list cannot admit to"
         );
         assert_eq!(
-            patch_pixels(&back.entry_at(back.len() - 1).unwrap().patch),
+            patch_pixels(back.entry_at(back.len() - 1).unwrap().patch().unwrap()),
             last,
             "the newest entry is the one that must survive"
         );
@@ -818,6 +899,88 @@ mod tests {
         assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
         assert_eq!(doc.layers[0].name, "Ink");
         assert_eq!(doc.open().history.len(), 1);
+    }
+
+    /// A flip travels into the file and back as what it is: an entry with a
+    /// kind, a time, and no pixels anywhere.
+    ///
+    /// The three things that matter are all here. It writes **no PNG** — an
+    /// entry that stored one would be a rectangle nobody can place, since a
+    /// flip names no layer. It comes back in the right place in the timeline,
+    /// because the entries either side of it are what a stepped undo depends
+    /// on. And the manifest declares the revision the flip earned, which is
+    /// what makes a build that reads only revision 2 discard the whole history
+    /// rather than skip an entry it does not know and then replay every older
+    /// patch mirrored.
+    #[test]
+    fn a_flip_survives_a_round_trip_and_carries_no_pixels() {
+        let stack = stack(&["Paper", "Ink"]);
+        let slot = stack.get(1).unwrap().slot();
+        let at = |secs: i64| Some(Timestamp::from_unix_millis(secs * 1000));
+
+        let mut history = History::default();
+        history.record(Edit::made_at(
+            EditKind::Paint,
+            at(1_785_542_400),
+            patch(slot, 5, 3, 11),
+        ));
+        history.record(Edit::made_at(
+            EditKind::FlipHorizontal,
+            at(1_785_542_410),
+            EditBody::Flip,
+        ));
+        history.record(Edit::made_at(
+            EditKind::FlipVertical,
+            at(1_785_542_420),
+            EditBody::Flip,
+        ));
+        history.record(Edit::made_at(
+            EditKind::Erase,
+            at(1_785_542_430),
+            patch(slot, 4, 4, 22),
+        ));
+
+        let (bytes, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(back.len(), 4);
+        assert_eq!(back.position(), 4);
+        let kinds: Vec<_> = (0..back.len()).map(|i| back.kind_at(i)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(EditKind::Paint),
+                Some(EditKind::FlipHorizontal),
+                Some(EditKind::FlipVertical),
+                Some(EditKind::Erase),
+            ],
+            "the timeline came back in a different order"
+        );
+        assert!(
+            back.entry_at(1).unwrap().patch().is_none(),
+            "a flip came back holding pixels"
+        );
+        assert_eq!(back.time_at(2), at(1_785_542_420));
+        assert_eq!(back.gap_at(2), Some(std::time::Duration::from_secs(10)));
+
+        // Two entries, two PNGs — the flips wrote nothing at all.
+        let zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let pngs = zip
+            .file_names()
+            .filter(|n| n.starts_with("umber/history/") && n.ends_with(".png"))
+            .count();
+        assert_eq!(pngs, 2, "a flip wrote a patch image");
+
+        // And the manifest says the revision that a flip earned, which is what
+        // a build reading only revision 2 stops at. See `VERSION`.
+        let manifest: Manifest = serde_json::from_str(&manifest_of(&bytes)).unwrap();
+        assert_eq!(manifest.version, VERSION);
+        assert!(
+            manifest.version > 2,
+            "a manifest carrying a flip must not claim a revision an older \
+             build would open and then replay older patches mirrored"
+        );
     }
 
     #[test]
@@ -869,7 +1032,7 @@ mod tests {
         let (bytes, _) = round_trip(&stack, &history);
 
         let newer = with_entry(&bytes, MANIFEST, |json| {
-            json.replace("\"version\":2", "\"version\":99")
+            json.replace("\"version\":3", "\"version\":99")
         });
         let doc = docimport::read_openraster(&newer).expect("the document must still open");
         assert!(doc.history.is_none(), "a newer manifest was trusted");

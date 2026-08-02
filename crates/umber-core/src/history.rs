@@ -20,13 +20,20 @@
 //! undone — and [`History::steps_to`] turns a position in that timeline into
 //! the number of single steps needed to reach it, so a click on a row costs the
 //! caller the same work as that many presses of undo and no new pixel path.
+//!
+//! Not every entry holds pixels. A canvas flip is **its own inverse** and
+//! preserves the canvas size, so it is recorded as an [`EditBody::Flip`] —
+//! nothing at all — and undone by flipping again. That works only because the
+//! timeline is stepped rather than seeked: an older patch is reached with the
+//! flip above it already undone, so it applies verbatim at the rectangle it was
+//! recorded at. See [`EditKind`].
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::brush::BrushMode;
-use crate::geom::PixelRect;
+use crate::geom::{FlipAxis, PixelRect};
 use crate::time::Timestamp;
 
 /// What one document's history is allowed to hold unless it is told otherwise,
@@ -80,6 +87,17 @@ pub fn default_budget() -> usize {
 /// why it is not a variant of its own: what the engine holds is a rectangle of
 /// pixels either way, and two rows that undo identically should not have two
 /// names.
+///
+/// The two flips earn it a different way, and they are the first entries that
+/// carry **no pixels at all** — see [`EditBody::Flip`]. A canvas flip keeps the
+/// canvas size, so unlike a resize it does not invalidate a single recorded
+/// rectangle; and it is its own inverse, so the engine can undo one without
+/// having stored anything. Undo here is strictly sequential — [`History::
+/// steps_to`] turns a jump into that many single steps and there is nothing to
+/// seek to — so by the time an older patch is reached the flip above it has
+/// already been undone and the canvas is back in the orientation that patch was
+/// recorded in. That is what makes "no coordinate mapping, no mirrored bytes"
+/// true rather than merely convenient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
     Paint,
@@ -87,10 +105,20 @@ pub enum EditKind {
     /// Pixels moved, scaled or turned — or pasted, which is the same patch with
     /// nothing where they came from.
     Transform,
+    /// The whole canvas mirrored left to right.
+    FlipHorizontal,
+    /// The whole canvas mirrored top to bottom.
+    FlipVertical,
 }
 
 impl EditKind {
-    pub const ALL: [EditKind; 3] = [Self::Paint, Self::Erase, Self::Transform];
+    pub const ALL: [EditKind; 5] = [
+        Self::Paint,
+        Self::Erase,
+        Self::Transform,
+        Self::FlipHorizontal,
+        Self::FlipVertical,
+    ];
 
     /// Which kind a stroke in `mode` records.
     ///
@@ -103,17 +131,79 @@ impl EditKind {
         }
     }
 
+    /// Which kind a flip about `axis` records.
+    pub fn for_axis(axis: FlipAxis) -> Self {
+        match axis {
+            FlipAxis::Horizontal => Self::FlipHorizontal,
+            FlipAxis::Vertical => Self::FlipVertical,
+        }
+    }
+
+    /// The axis this entry mirrors about, for the kinds that mirror.
+    ///
+    /// The axis is read back off the kind rather than stored beside it, because
+    /// there is exactly one kind per axis and a second copy could disagree with
+    /// the row the History list draws.
+    pub fn flip_axis(self) -> Option<FlipAxis> {
+        match self {
+            Self::FlipHorizontal => Some(FlipAxis::Horizontal),
+            Self::FlipVertical => Some(FlipAxis::Vertical),
+            Self::Paint | Self::Erase | Self::Transform => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Paint => "Stroke",
             Self::Erase => "Erase",
             Self::Transform => "Transform",
+            Self::FlipHorizontal => "Flip horizontally",
+            Self::FlipVertical => "Flip vertically",
         }
     }
 }
 
-/// One undoable edit: what it was, when it happened, and the pixels it
-/// replaced.
+/// What an entry holds in order to be undone.
+///
+/// Two shapes, because there are two ways an edit can be reversible and only
+/// one of them costs memory:
+///
+/// * [`EditBody::Pixels`] is everything that paints. The engine cannot work out
+///   what was under a stroke, so it keeps it.
+/// * [`EditBody::Flip`] is an edit that is **its own inverse**, so there is
+///   nothing to keep. Undoing it is doing it again.
+///
+/// Deliberately not a third arm for "some other self-inverse thing later": the
+/// axis is in the [`EditKind`], and a body that carried its own copy of it
+/// would be a second place for the row's icon and the pixels to disagree.
+#[derive(Clone, Debug)]
+pub enum EditBody {
+    /// The pixels the edit replaced.
+    Pixels(PixelPatch),
+    /// Nothing. See [`EditKind::flip_axis`] for which way.
+    Flip,
+}
+
+impl From<PixelPatch> for EditBody {
+    fn from(patch: PixelPatch) -> Self {
+        Self::Pixels(patch)
+    }
+}
+
+impl EditBody {
+    /// What this costs in memory, which is what the budget counts. A flip is
+    /// free, and the list is allowed to hold as many of them as somebody has
+    /// the patience to press.
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Pixels(patch) => patch.byte_len(),
+            Self::Flip => 0,
+        }
+    }
+}
+
+/// One undoable edit: what it was, when it happened, and whatever it takes to
+/// put it back.
 #[derive(Clone, Debug)]
 pub struct Edit {
     pub kind: EditKind,
@@ -124,16 +214,19 @@ pub struct Edit {
     /// for it rather than a plausible-looking time it made up, because a wrong
     /// timestamp is indistinguishable from a right one.
     pub at: Option<Timestamp>,
-    pub patch: PixelPatch,
+    pub body: EditBody,
 }
 
 impl Edit {
     /// An edit made *now*.
-    pub fn new(kind: EditKind, patch: PixelPatch) -> Self {
+    ///
+    /// `impl Into<EditBody>` so the overwhelmingly common caller — something
+    /// that has just captured a patch — writes what it means and nothing else.
+    pub fn new(kind: EditKind, body: impl Into<EditBody>) -> Self {
         Self {
             kind,
             at: Some(Timestamp::now()),
-            patch,
+            body: body.into(),
         }
     }
 
@@ -145,12 +238,24 @@ impl Edit {
     /// rewrite the history's own clock, so the gaps in the list would churn
     /// every time the user pressed Ctrl+Z. The reader of a saved document is
     /// the other, and it is where `None` comes from.
-    pub fn made_at(kind: EditKind, at: Option<Timestamp>, patch: PixelPatch) -> Self {
-        Self { kind, at, patch }
+    pub fn made_at(kind: EditKind, at: Option<Timestamp>, body: impl Into<EditBody>) -> Self {
+        Self {
+            kind,
+            at,
+            body: body.into(),
+        }
+    }
+
+    /// The pixels this entry replaced, for the entries that hold any.
+    pub fn patch(&self) -> Option<&PixelPatch> {
+        match &self.body {
+            EditBody::Pixels(patch) => Some(patch),
+            EditBody::Flip => None,
+        }
     }
 
     fn byte_len(&self) -> usize {
-        self.patch.byte_len()
+        self.body.byte_len()
     }
 }
 
@@ -520,6 +625,12 @@ impl History {
 
     /// Drop the oldest undo entries until we fit. The most recent history is
     /// what users actually reach for, so age out from the bottom.
+    ///
+    /// An entry that costs nothing — a flip — frees nothing when it goes, and
+    /// that is correct rather than a hole in the loop: eviction is in timeline
+    /// order, so a free entry older than the patch that is actually over the
+    /// budget still has to go first. The loop advances regardless, because it
+    /// removes an entry every pass and stops at one.
     fn evict_to_budget(&mut self) {
         while self.used_bytes > self.budget_bytes && self.undo.len() > 1 {
             let e = self.undo.remove(0);
@@ -563,11 +674,11 @@ mod tests {
 
         let undone = h.take_undo().unwrap();
         h.push_redo(edit(4, 4, 2));
-        assert_eq!(undone.patch.pieces()[0].bytes()[0], 1);
+        assert_eq!(undone.patch().unwrap().pieces()[0].bytes()[0], 1);
         assert!(h.can_redo());
 
         let redone = h.take_redo().unwrap();
-        assert_eq!(redone.patch.pieces()[0].bytes()[0], 2);
+        assert_eq!(redone.patch().unwrap().pieces()[0].bytes()[0], 2);
     }
 
     #[test]
@@ -591,7 +702,10 @@ mod tests {
         }
         assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
         // The newest entry must survive eviction.
-        assert_eq!(h.take_undo().unwrap().patch.pieces()[0].bytes()[0], 7);
+        assert_eq!(
+            h.take_undo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
+            7
+        );
     }
 
     #[test]
@@ -697,22 +811,30 @@ mod tests {
             let (a, b) = (original.entry_at(i).unwrap(), restored.entry_at(i).unwrap());
             assert_eq!(a.kind, b.kind, "entry {i}");
             assert_eq!(a.at, b.at, "entry {i}");
-            assert_eq!(a.patch.rect, b.patch.rect, "entry {i}");
-            assert_eq!(a.patch.slot, b.patch.slot, "entry {i}");
             assert_eq!(
-                a.patch.pieces()[0].bytes(),
-                b.patch.pieces()[0].bytes(),
+                a.patch().unwrap().rect,
+                b.patch().unwrap().rect,
+                "entry {i}"
+            );
+            assert_eq!(
+                a.patch().unwrap().slot,
+                b.patch().unwrap().slot,
+                "entry {i}"
+            );
+            assert_eq!(
+                a.patch().unwrap().pieces()[0].bytes(),
+                b.patch().unwrap().pieces()[0].bytes(),
                 "entry {i}"
             );
         }
 
         // And the cursor is where it was: one redo available, two undos.
         assert_eq!(
-            restored.take_redo().unwrap().patch.pieces()[0].bytes()[0],
+            restored.take_redo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
             9
         );
         assert_eq!(
-            restored.take_undo().unwrap().patch.pieces()[0].bytes()[0],
+            restored.take_undo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
             2
         );
     }
@@ -816,7 +938,7 @@ mod tests {
         assert_eq!(kept + lost, 8);
         // Aged out from the bottom, so the newest is still the next undo.
         assert_eq!(
-            h.entry_at(kept - 1).unwrap().patch.pieces()[0].bytes()[0],
+            h.entry_at(kept - 1).unwrap().patch().unwrap().pieces()[0].bytes()[0],
             7
         );
 
@@ -880,5 +1002,243 @@ mod tests {
             patch * 2 > budget,
             "two now fit, so the panel's note names the wrong reason"
         );
+    }
+
+    // --- canvas flips ------------------------------------------------------
+
+    /// A canvas small enough to write out, so a test can say exactly which byte
+    /// went where.
+    ///
+    /// This exists because the claim a flip entry rests on is not about the
+    /// history's bookkeeping at all — it is that stepping back over a flip and
+    /// then over an older patch lands on the pixels that patch was recorded
+    /// against. That is a statement about an ordering, and an ordering is
+    /// testable without a GPU.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Model {
+        w: u32,
+        h: u32,
+        px: Vec<u8>,
+    }
+
+    impl Model {
+        fn new(w: u32, h: u32) -> Self {
+            Self {
+                w,
+                h,
+                px: (0..w * h * 4).map(|i| i as u8).collect(),
+            }
+        }
+
+        fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            let i = ((y * self.w + x) * 4) as usize;
+            self.px[i..i + 4].try_into().unwrap()
+        }
+
+        /// Exactly what `flip.wgsl` does: a permutation of whole pixels.
+        fn flip(&mut self, axis: FlipAxis) {
+            let mut out = vec![0u8; self.px.len()];
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    let (sx, sy) = match axis {
+                        FlipAxis::Horizontal => (self.w - 1 - x, y),
+                        FlipAxis::Vertical => (x, self.h - 1 - y),
+                    };
+                    let d = ((y * self.w + x) * 4) as usize;
+                    out[d..d + 4].copy_from_slice(&self.at(sx, sy));
+                }
+            }
+            self.px = out;
+        }
+
+        /// Read a patch's rectangle back, which is what a commit captures.
+        fn read(&self, rect: PixelRect) -> Vec<u8> {
+            let mut out = Vec::with_capacity((rect.area() * 4) as usize);
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    out.extend_from_slice(&self.at(x, y));
+                }
+            }
+            out
+        }
+
+        /// Write one back, which is what an undo does.
+        fn write(&mut self, rect: PixelRect, bytes: &[u8]) {
+            let mut i = 0;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    let d = ((y * self.w + x) * 4) as usize;
+                    self.px[d..d + 4].copy_from_slice(&bytes[i..i + 4]);
+                    i += 4;
+                }
+            }
+        }
+
+        /// Paint `rect` a flat colour, recording what was there — a stroke's
+        /// commit, in miniature.
+        fn paint(&mut self, rect: PixelRect, fill: u8) -> PixelPatch {
+            let before = self.read(rect);
+            self.write(rect, &vec![fill; before.len()]);
+            PixelPatch::new(rect, 0, before)
+        }
+    }
+
+    /// Step one entry backwards the way `app.rs` does, and hand back what
+    /// putting it forward again would be.
+    fn reverse(model: &mut Model, edit: Edit) -> Edit {
+        let body = match edit.body {
+            EditBody::Pixels(patch) => {
+                let now = model.read(patch.rect);
+                model.write(patch.rect, &patch.pieces()[0].bytes());
+                EditBody::Pixels(PixelPatch::new(patch.rect, patch.slot, now))
+            }
+            // The whole of it: a flip is undone by flipping.
+            EditBody::Flip => {
+                model.flip(edit.kind.flip_axis().expect("a flip entry names an axis"));
+                EditBody::Flip
+            }
+        };
+        Edit::made_at(edit.kind, edit.at, body)
+    }
+
+    /// The claim the flip design rests on, end to end.
+    ///
+    /// A flip records **no pixels**, so undoing one can only be flipping again
+    /// — and that is sound only because the timeline is stepped rather than
+    /// seeked. Stepping back over the flip puts the canvas into the orientation
+    /// the older patch was recorded in, so that patch applies verbatim at the
+    /// rectangle it names: no coordinate mapping, no mirrored bytes. Anything
+    /// less than a byte-for-byte return would show up here, because the
+    /// document is compared against the copy it started as.
+    #[test]
+    fn stepping_back_over_a_flip_puts_older_patches_where_they_were_recorded() {
+        let start = Model::new(8, 6);
+        let mut model = start.clone();
+        let mut h = History::default();
+
+        // Paint in a corner, so a flip plainly moves it.
+        let mark = PixelRect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+        h.record(Edit::new(EditKind::Paint, model.paint(mark, 200)));
+        let after_paint = model.clone();
+
+        model.flip(FlipAxis::Horizontal);
+        h.record(Edit::new(EditKind::FlipHorizontal, EditBody::Flip));
+        let after_flip = model.clone();
+        assert_ne!(after_flip, after_paint, "the flip did nothing");
+
+        // And a second mark, recorded in the *flipped* orientation.
+        let second = PixelRect {
+            x: 5,
+            y: 4,
+            width: 2,
+            height: 2,
+        };
+        h.record(Edit::new(EditKind::Erase, model.paint(second, 9)));
+
+        assert_eq!(h.position(), 3);
+        assert_eq!(
+            (h.kind_at(0), h.kind_at(1), h.kind_at(2)),
+            (
+                Some(EditKind::Paint),
+                Some(EditKind::FlipHorizontal),
+                Some(EditKind::Erase)
+            )
+        );
+
+        // Back one: the second mark goes, the picture stays flipped.
+        let e = h.take_undo().unwrap();
+        h.push_redo(reverse(&mut model, e));
+        assert_eq!(model, after_flip);
+
+        // Back another: the flip is undone by flipping.
+        let e = h.take_undo().unwrap();
+        h.push_redo(reverse(&mut model, e));
+        assert_eq!(model, after_paint, "undoing the flip did not put it back");
+
+        // And back to the beginning, through a patch recorded before the flip
+        // ever happened. This is the assertion the design exists for.
+        let e = h.take_undo().unwrap();
+        h.push_redo(reverse(&mut model, e));
+        assert_eq!(model, start, "the older patch landed in the wrong pixels");
+
+        // Forward again, by the same route, to exactly where it was.
+        while let Some(e) = h.take_redo() {
+            let back = reverse(&mut model, e);
+            h.push_undo(back);
+        }
+        assert_eq!(h.position(), 3);
+        let mut expected = after_flip.clone();
+        expected.paint(second, 9);
+        assert_eq!(model, expected, "redoing did not arrive where undoing left");
+    }
+
+    /// The timeline has to read the same through a flip as through anything
+    /// else — the kinds in order, the cursor within them, and the entry keeping
+    /// its own moment as it crosses between the stacks.
+    #[test]
+    fn a_flip_is_an_entry_like_any_other_in_the_timeline() {
+        let at = |secs: i64| Some(Timestamp::from_unix_millis(secs * 1000));
+        let mut h = History::default();
+        h.record(Edit::made_at(EditKind::Paint, at(10), patch(4, 4, 1)));
+        h.record(Edit::made_at(
+            EditKind::FlipVertical,
+            at(12),
+            EditBody::Flip,
+        ));
+        h.record(Edit::made_at(EditKind::Paint, at(20), patch(4, 4, 2)));
+
+        let before: Vec<_> = (0..h.len()).map(|i| h.kind_at(i)).collect();
+        assert_eq!(h.gap_at(1), Some(Duration::from_secs(2)));
+        assert_eq!(h.gap_at(2), Some(Duration::from_secs(8)));
+        assert_eq!(h.steps_to(1), Jump::Undo(2));
+
+        for _ in 0..2 {
+            let e = h.take_undo().unwrap();
+            h.push_redo(Edit::made_at(e.kind, e.at, e.body));
+        }
+        assert_eq!(h.position(), 1);
+        assert_eq!(h.len(), 3, "undoing discarded something");
+        assert_eq!(
+            before,
+            (0..h.len()).map(|i| h.kind_at(i)).collect::<Vec<_>>()
+        );
+        assert_eq!(h.time_at(1), at(12), "the flip lost the moment it was made");
+        assert_eq!(h.steps_to(3), Jump::Redo(2));
+        assert_eq!(
+            EditKind::for_axis(FlipAxis::Vertical),
+            EditKind::FlipVertical
+        );
+        assert_eq!(EditKind::FlipVertical.flip_axis(), Some(FlipAxis::Vertical));
+        assert_eq!(EditKind::Paint.flip_axis(), None);
+    }
+
+    /// A flip stores nothing, so it costs nothing and the budget cannot be made
+    /// to age one out on its own account. The list may hold as many as somebody
+    /// has the patience to press.
+    #[test]
+    fn a_flip_entry_costs_the_budget_nothing() {
+        let mut h = History::with_budget(2500);
+        for _ in 0..1000 {
+            h.record(Edit::new(EditKind::FlipHorizontal, EditBody::Flip));
+        }
+        assert_eq!(h.used_bytes(), 0);
+        assert_eq!(h.len(), 1000, "a free entry was evicted");
+        assert_eq!(h.dropped(), 0);
+
+        // But it is still an entry, so eviction driven by the patches around it
+        // takes it in timeline order like anything else — oldest first, and the
+        // accounting stays balanced across it.
+        for i in 0..8u8 {
+            h.record(edit(16, 16, i));
+        }
+        assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
+        assert!(h.dropped() >= 1000, "the free entries outlived their turn");
+        while h.take_undo().is_some() {}
+        assert_eq!(h.used_bytes(), 0);
     }
 }

@@ -6,8 +6,8 @@ use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{
-    Affine, Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, Selection,
-    TipMask, transform,
+    Affine, Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, FlipAxis, PixelRect,
+    Selection, TipMask, transform,
 };
 use wgpu::util::DeviceExt;
 
@@ -20,6 +20,20 @@ use wgpu::util::DeviceExt;
 /// sRGB-typed target distributes precision perceptually. Blending stays correct
 /// — the hardware decodes to linear, blends, and re-encodes on write.
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// The same bits, viewed without the transfer function.
+///
+/// Used by one pass and one pass only: [`CanvasRenderer::flip_layers`], which
+/// has to be an exact permutation of texels. Reading through an sRGB view
+/// decodes to linear and writing through one re-encodes, and a round trip
+/// through that pair is a promise about rounding rather than about pixels —
+/// which matters here more than anywhere else in the renderer, because undoing
+/// a flip *is* another flip, so any drift compounds every time. Read as raw
+/// `u8 / 255` and written back, an f32 carries the byte exactly.
+///
+/// Listed in the layer array's `view_formats`, which is what makes such a view
+/// legal at all.
+const LAYER_FORMAT_LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The stroke scratch only needs coverage, so one channel instead of four —
 /// a 4x saving on the bandwidth of the hottest texture in the frame.
 ///
@@ -780,6 +794,19 @@ struct CommitUniforms {
     _pad2: [f32; 2],
 }
 
+/// Mirrors `Flip` in `flip.wgsl`.
+///
+/// `vec2<u32>` is 8-aligned on both sides and the two scalars after it pack
+/// into the same 16 bytes, so the block is 16 wide with no surprises. Scalar
+/// padding, not a `vec3`: see the uniform-layout note in CLAUDE.md.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FlipUniforms {
+    doc_size: [u32; 2],
+    axis: u32,
+    _pad: u32,
+}
+
 /// The layer texture array and the views onto it.
 struct LayerStore {
     texture: wgpu::Texture,
@@ -787,6 +814,10 @@ struct LayerStore {
     array_view: wgpu::TextureView,
     /// One per slice, used as render targets by commit and clear.
     slot_views: Vec<wgpu::TextureView>,
+    /// The same slices seen as [`LAYER_FORMAT_LINEAR`], for the flip pass and
+    /// nothing else. Built here rather than per flip because a view is cheap to
+    /// hold and the alternative is allocating one per slice per command.
+    raw_slot_views: Vec<wgpu::TextureView>,
     capacity: u32,
 }
 
@@ -807,7 +838,11 @@ impl LayerStore {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            // The flip pass needs to see these bytes without the transfer
+            // function on the way in or out — see [`LAYER_FORMAT_LINEAR`].
+            // Declared here because a view of a format the texture was not
+            // created for is a validation error, not a conversion.
+            view_formats: &[LAYER_FORMAT_LINEAR],
         });
 
         let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -828,10 +863,24 @@ impl LayerStore {
             })
             .collect();
 
+        let raw_slot_views = (0..capacity)
+            .map(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("umber-layer-slot-raw"),
+                    format: Some(LAYER_FORMAT_LINEAR),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
         Self {
             texture,
             array_view,
             slot_views,
+            raw_slot_views,
             capacity,
         }
     }
@@ -873,6 +922,11 @@ struct Shared {
     commit_layout: wgpu::BindGroupLayout,
     commit_pipeline: wgpu::RenderPipeline,
     commit_erase_pipeline: wgpu::RenderPipeline,
+
+    /// Mirrors one layer slice. See `flip.wgsl` for why it is its own pass
+    /// rather than a copy or a use of the transform resampler.
+    flip_layout: wgpu::BindGroupLayout,
+    flip_pipeline: wgpu::RenderPipeline,
 
     transform_layout: wgpu::BindGroupLayout,
     /// `dst * cov` — takes the selected pixels into the floating copy.
@@ -1196,6 +1250,51 @@ impl Shared {
             },
         );
 
+        // ---- flip pass ------------------------------------------------------
+        //
+        // No sampler in the layout at all: `flip.wgsl` reads with
+        // `textureLoad`, and a sampler nothing uses would be a suggestion that
+        // it filters. The target is `LAYER_FORMAT_LINEAR` and the blend is
+        // `None`, which together are what make the pass an exact permutation.
+        let flip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("flip"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/flip.wgsl").into()),
+        });
+        let flip_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("flip-bgl"),
+            entries: &[uniform_entry(0), texture_entry(1)],
+        });
+        let flip_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("flip-pl"),
+            bind_group_layouts: &[Some(&flip_layout)],
+            immediate_size: 0,
+        });
+        let flip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("flip"),
+            layout: Some(&flip_pl),
+            vertex: wgpu::VertexState {
+                module: &flip_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &flip_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: LAYER_FORMAT_LINEAR,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // ---- transform pass -------------------------------------------------
         let transform_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("transform"),
@@ -1287,6 +1386,8 @@ impl Shared {
             commit_layout,
             commit_pipeline,
             commit_erase_pipeline,
+            flip_layout,
+            flip_pipeline,
             transform_layout,
             transform_keep_pipeline,
             transform_take_pipeline,
@@ -2187,6 +2288,160 @@ impl CanvasRenderer {
         for view in &self.layers.slot_views {
             clear_view(encoder, view, "clear-layer");
         }
+    }
+
+    // --- flipping the canvas ------------------------------------------------
+
+    /// Mirror `slots` about the canvas's centre line, in place.
+    ///
+    /// **Exactly reversible, texel for texel.** That is the requirement, not a
+    /// nicety: the history entry a flip records stores no pixels at all and is
+    /// undone by flipping again ([`umber_core::EditBody::Flip`]), so anything
+    /// lossy here would move the picture a little every time somebody flipped
+    /// and undid. `flip.wgsl` has the three things that make it exact — integer
+    /// `textureLoad`, non-sRGB views on both sides, and no blending.
+    ///
+    /// A texture cannot be its own render attachment and
+    /// `copy_texture_to_texture` cannot mirror, so each slice is drawn into one
+    /// scratch texture and copied straight back. The scratch is canvas-sized
+    /// and lives only for the call: a flip is an explicit command, not
+    /// something the drawing path does, and holding a spare canvas for the rest
+    /// of the session in case somebody presses the key would cost every
+    /// document that never does.
+    ///
+    /// The canvas size does not change, which is the whole reason a flip can
+    /// keep the undo history where a resize cannot. Nothing here reallocates.
+    ///
+    /// The caller owes this **no stroke and no float in flight** — the scratch
+    /// surface and the floating copy are not mirrored, so a stroke would commit
+    /// unmirrored over the flipped picture and a preview would put its pixels
+    /// down in the place they were dragged to before the flip.
+    pub fn flip_layers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slots: &[u32],
+        axis: FlipAxis,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        // A sample recorded against the picture as it was would be read back as
+        // though it belonged to the picture as it is.
+        self.reset_probes();
+        // And a capture part-way through would assemble a file out of layers
+        // that were mirrored and layers that were not. The scheduler's half of
+        // this is the caller's — see `app.rs`'s `stop_autosave_of`.
+        self.cancel_capture();
+
+        let scratch = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-flip"),
+            size: wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LAYER_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[LAYER_FORMAT_LINEAR],
+        });
+        let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("umber-flip-raw"),
+            format: Some(LAYER_FORMAT_LINEAR),
+            ..Default::default()
+        });
+
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flip-uniforms"),
+            contents: bytemuck::bytes_of(&FlipUniforms {
+                doc_size: [self.doc_size.x, self.doc_size.y],
+                axis: match axis {
+                    FlipAxis::Horizontal => 0,
+                    FlipAxis::Vertical => 1,
+                },
+                _pad: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("flip-canvas"),
+        });
+        for &slot in slots {
+            let Some(source) = self.layers.raw_slot_views.get(slot as usize) else {
+                log::error!("flip of slot {slot} beyond capacity");
+                continue;
+            };
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("flip-bg"),
+                layout: &self.shared.flip_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(source),
+                    },
+                ],
+            });
+            {
+                // `Clear` rather than `Load`: every texel of the scratch is
+                // written by the pass, so loading whatever the last slice left
+                // there would only be a dependency the driver has to honour.
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("flip-slice"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &scratch_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.shared.flip_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // A raw byte copy, so the trip back through the array costs the
+            // picture nothing. Commands within one encoder run in order, so
+            // this reads what the pass above wrote and the next slice's pass
+            // may reuse the scratch.
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &scratch,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: slot,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.doc_size.x,
+                    height: self.doc_size.y,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(Some(enc.finish()));
     }
 
     // --- floating transforms ------------------------------------------------

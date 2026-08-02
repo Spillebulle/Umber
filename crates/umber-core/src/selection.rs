@@ -100,7 +100,7 @@
 //! none is drawn in the interface, which is the rule this file lives by as much
 //! as any other.
 
-use crate::geom::{PixelRect, Rect};
+use crate::geom::{FlipAxis, PixelRect, Rect};
 use glam::{UVec2, Vec2};
 
 /// Sub-scanlines per pixel row. See the module docs.
@@ -272,6 +272,32 @@ impl Selection {
     /// The closed rings, for drawing the outline.
     pub fn rings(&self) -> &[Vec<Vec2>] {
         &self.rings
+    }
+
+    /// The same selection on a canvas that has been mirrored.
+    ///
+    /// The rings are geometry, so this is the mirror applied to them and a
+    /// re-rasterisation — exactly what `Editor::carry_selection` does when a
+    /// transform commits, and for exactly the same reason: an outline left
+    /// where the picture used to be is one that lies about what it covers.
+    /// Nothing here rasterises: [`Selection::from_rings`] is the one
+    /// rasteriser, and a second one that mirrored the *mask* would have to
+    /// agree with it about the antialiased band along every edge.
+    ///
+    /// Mirroring reverses the winding of every ring, which the nonzero rule
+    /// does not care about — a winding number of -1 is as inside as +1.
+    ///
+    /// `None` cannot arise from a selection that had any coverage, since a
+    /// mirror preserves area; it is an `Option` because `from_rings` is, and
+    /// the answer for "nothing selected" is `None` everywhere in this file.
+    pub fn flipped(&self, axis: FlipAxis, doc: UVec2) -> Option<Self> {
+        let size = Vec2::new(doc.x as f32, doc.y as f32);
+        let rings = self
+            .rings
+            .iter()
+            .map(|ring| ring.iter().map(|p| axis.mirror(*p, size)).collect())
+            .collect();
+        Self::from_rings(rings, doc)
     }
 
     /// Build a selection from a coverage mask, trimming it to what is actually
@@ -1299,5 +1325,52 @@ mod tests {
         poly.moved(vec2(10.0, 10.0));
         poly.outline_into(&mut buf);
         assert_eq!(buf.len(), 3, "the rubber band is part of the outline");
+    }
+
+    /// The marquee has to travel with a flipped canvas, or it goes on clipping
+    /// a region that no longer holds what the artist marked out.
+    ///
+    /// Pinned on a rectangle because that is the one shape the rasteriser is
+    /// exact on both axes for, so this is equality rather than a tolerance: the
+    /// mirrored selection covers exactly the pixels the mirrored picture put
+    /// under it.
+    #[test]
+    fn a_flipped_selection_covers_the_pixels_the_flip_moved_under_it() {
+        let s = rect(10.0, 12.0, 20.0, 18.0);
+        let flipped = s.flipped(FlipAxis::Horizontal, DOC).expect("a mirror");
+        assert_eq!(
+            flipped.bounds(),
+            PixelRect {
+                x: 44,
+                y: 12,
+                width: 10,
+                height: 6
+            },
+            "64 - 20 .. 64 - 10"
+        );
+        assert_eq!(flipped.coverage_at(44, 12), 255);
+        assert_eq!(flipped.coverage_at(43, 12), 0);
+        assert_eq!(flipped.coverage_at(53, 17), 255);
+
+        let vertical = s.flipped(FlipAxis::Vertical, DOC).expect("a mirror");
+        assert_eq!(
+            vertical.bounds(),
+            PixelRect {
+                x: 10,
+                y: 46,
+                width: 10,
+                height: 6
+            }
+        );
+
+        // And it is its own inverse, which is what lets undoing a flip be
+        // another flip on this side as well as on the GPU's. Compared on the
+        // mask rather than on the rings, because that is what actually clips a
+        // stroke.
+        let back = flipped
+            .flipped(FlipAxis::Horizontal, DOC)
+            .expect("a mirror back");
+        assert_eq!(back.bounds(), s.bounds());
+        assert_eq!(back.coverage(), s.coverage());
     }
 }

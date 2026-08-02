@@ -207,7 +207,10 @@ fn main() {
     let (mut t_deflate, mut t_fast, mut t_balanced) = (0.0, 0.0, 0.0);
 
     for i in 0..history.len() {
-        let patch = &history.entry_at(i).unwrap().patch;
+        let patch = history
+            .entry_at(i)
+            .and_then(Edit::patch)
+            .expect("every entry this example records holds pixels");
         raw += patch.byte_len();
 
         // One dense piece each: `capture` above is the pre-tiles shape of a

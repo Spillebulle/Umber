@@ -51,10 +51,10 @@ use std::path::Path;
 use glam::UVec2;
 
 use crate::document::{Background, Document};
-use crate::history::{Edit, History, PatchPiece, PixelPatch};
+use crate::history::{Edit, EditBody, History, PatchPiece, PixelPatch};
 use crate::layer::{BlendMode, LayerStack};
 
-pub use history::{ImportedEdit, ImportedHistory, ImportedPiece};
+pub use history::{ImportedBody, ImportedEdit, ImportedHistory, ImportedPiece};
 
 /// Formats [`import`] can read.
 ///
@@ -278,21 +278,29 @@ impl ImportedDocument {
             .and_then(|saved| {
                 let mut entries = Vec::with_capacity(saved.entries.len());
                 for edit in saved.entries {
-                    let slot = stack.get(edit.layer)?.slot();
                     // `made_at`, never `new`: an edit read out of a file was
                     // made when the file says, and stamping it with the moment
                     // the document was opened would tell the History list that
                     // yesterday's afternoon of painting happened in one second.
-                    let pieces = edit
-                        .pieces
-                        .into_iter()
-                        .map(|p| PatchPiece::new(p.rect, p.bytes))
-                        .collect();
-                    entries.push(Edit::made_at(
-                        edit.kind,
-                        edit.at,
-                        PixelPatch::from_pieces(edit.rect, slot, pieces),
-                    ));
+                    let body = match edit.body {
+                        ImportedBody::Pixels {
+                            layer,
+                            rect,
+                            pieces,
+                        } => {
+                            let slot = stack.get(layer)?.slot();
+                            let pieces = pieces
+                                .into_iter()
+                                .map(|p| PatchPiece::new(p.rect, p.bytes))
+                                .collect();
+                            EditBody::Pixels(PixelPatch::from_pieces(rect, slot, pieces))
+                        }
+                        // Nothing to place: a flip belongs to the whole
+                        // document, so there is no layer for it to be replayed
+                        // into the wrong one of.
+                        ImportedBody::Flip => EditBody::Flip,
+                    };
+                    entries.push(Edit::made_at(edit.kind, edit.at, body));
                 }
                 let mut history = History::default();
                 history.restore(entries, saved.position, saved.dropped);

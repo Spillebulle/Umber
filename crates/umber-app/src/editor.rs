@@ -771,6 +771,45 @@ impl Editor {
         resized
     }
 
+    /// Mirror the live document, in everything but its pixels.
+    ///
+    /// The pixels are the renderer's — see `CanvasRenderer::flip_layers` — and
+    /// the history entry is `app.rs`'s, because it has to be recorded only if
+    /// the GPU work actually happened. What is here is the selection, which is
+    /// geometry and belongs to the document.
+    ///
+    /// **Called for the flip and again for its undo**, and it is its own
+    /// inverse on both halves, which is the whole reason the history can record
+    /// a flip without storing a pixel. The canvas size does not change, so
+    /// unlike a resize nothing recorded against this canvas stops being valid —
+    /// the history and the camera are deliberately untouched.
+    ///
+    /// The one thing that is not exactly reversible is a selection that has
+    /// already been through a boolean: its rings were traced back out of the
+    /// mask and are pixel-quantised, so mirroring them re-rasterises a
+    /// staircase. That is the loss `selection`'s module docs already own, and
+    /// it is a one-pixel one; a mirrored *mask* would be a second rasteriser
+    /// that had to agree with the first about every antialiased edge.
+    pub fn flip_canvas(&mut self, axis: umber_core::FlipAxis) {
+        let doc = self.doc.size;
+        // A selection that mirrors to nothing cannot arise — a mirror preserves
+        // area — but `flipped` is an `Option` because `from_rings` is, and
+        // dropping it is the right answer if it ever does: an outline covering
+        // nothing is no selection.
+        self.selection = self
+            .selection
+            .as_deref()
+            .and_then(|sel| sel.flipped(axis, doc))
+            .map(Arc::new);
+        // The gesture belongs to the pointer and was drawn on the picture as it
+        // was. Abandoned rather than mirrored, exactly as a tab switch does —
+        // and through `cancel_selection_draft` rather than by clearing the
+        // field, for the reason `set_tool` gives: a shortcut can fire with the
+        // button still down, and an interaction left in `Selecting` with no
+        // draft to answer for it is one that nothing ever ends.
+        self.cancel_selection_draft();
+    }
+
     /// Make tab `index` the live document.
     ///
     /// Returns false when there is nothing to do, so the caller can skip the

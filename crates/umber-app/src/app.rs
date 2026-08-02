@@ -19,7 +19,7 @@ use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::history::PatchPiece;
 use umber_core::{
-    Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
+    Brush, Color, Dab, Document, Edit, EditBody, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
     SelectionOp, Transform,
 };
 use umber_render::{
@@ -429,20 +429,15 @@ impl UmberApp {
         // module's rows and `jump_history` all reach this, and one of the three
         // would have been forgotten.
         self.finish_transform();
-        let id = self.editor.session.active_id();
-        let Some(gfx) = self.gfx.as_mut() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
+        if !self.canvas_is_ready() {
             return;
-        };
+        }
         // The history is the live document's own, so this can only ever undo
         // work done on the canvas the user is looking at.
         let Some(edit) = self.editor.history.take_undo() else {
             return;
         };
-        // The pieces of the patch, not its bounding box: swapping them is what
-        // an undo *is*, and the pixels between them were never touched.
-        let patch = edit.patch;
-        let inverse = swap_patch(canvas, &gfx.gpu, &patch);
+        let inverse = self.reverse(edit.kind, edit.body);
         // The label and the time travel with the entry rather than being
         // recomputed, so an undone stroke keeps its name and the moment it was
         // painted on the far side of the cursor — the list neither renumbers
@@ -455,20 +450,127 @@ impl UmberApp {
 
     fn redo(&mut self) {
         self.finish_transform();
-        let id = self.editor.session.active_id();
-        let Some(gfx) = self.gfx.as_mut() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
+        if !self.canvas_is_ready() {
             return;
-        };
+        }
         let Some(edit) = self.editor.history.take_redo() else {
             return;
         };
-        let patch = edit.patch;
-        let inverse = swap_patch(canvas, &gfx.gpu, &patch);
+        let inverse = self.reverse(edit.kind, edit.body);
         self.editor
             .history
             .push_undo(Edit::made_at(edit.kind, edit.at, inverse));
         self.editor.mark_modified();
+    }
+
+    /// Does the document in front have GPU storage to be undone into?
+    ///
+    /// Asked *before* the entry is taken off the stack, because taking one and
+    /// then finding there is nowhere to apply it would lose it.
+    fn canvas_is_ready(&self) -> bool {
+        let id = self.editor.session.active_id();
+        self.gfx
+            .as_ref()
+            .is_some_and(|gfx| gfx.canvases.contains_key(&id))
+    }
+
+    /// Carry out one entry backwards, and return what putting it back would be.
+    ///
+    /// The two bodies reverse in genuinely different ways, and this is the one
+    /// place that knows it:
+    ///
+    /// * A patch is swapped for the pixels it replaces, so the entry that goes
+    ///   on the other stack holds what was there a moment ago.
+    /// * A flip is **its own inverse**, so it is carried out again and the
+    ///   entry that goes on the other stack is the same nothing. This is what
+    ///   the history's whole flip design rests on: no coordinate mapping, no
+    ///   mirrored bytes, and every older patch reached with the canvas already
+    ///   back in the orientation it was recorded in.
+    fn reverse(&mut self, kind: EditKind, body: EditBody) -> EditBody {
+        match body {
+            EditBody::Pixels(patch) => {
+                let id = self.editor.session.active_id();
+                let Some(gfx) = self.gfx.as_mut() else {
+                    return EditBody::Pixels(patch);
+                };
+                let Some(canvas) = gfx.canvases.get(&id) else {
+                    return EditBody::Pixels(patch);
+                };
+                // The pieces of the patch, not its bounding box: swapping them
+                // is what an undo *is*, and the pixels between them were never
+                // touched.
+                EditBody::Pixels(swap_patch(canvas, &gfx.gpu, &patch))
+            }
+            EditBody::Flip => {
+                if let Some(axis) = kind.flip_axis() {
+                    self.mirror_document(axis);
+                }
+                EditBody::Flip
+            }
+        }
+    }
+
+    /// Mirror every layer's pixels and the selection with them.
+    ///
+    /// The one route, shared by the command and by stepping over it in either
+    /// direction — a flip is its own inverse, so a second implementation for
+    /// the undo would be a second thing to keep exact.
+    ///
+    /// Returns false when the document has no GPU storage, in which case
+    /// nothing at all was mirrored and the caller must not record an entry
+    /// saying otherwise.
+    fn mirror_document(&mut self, axis: umber_core::FlipAxis) -> bool {
+        let slots: Vec<u32> = self
+            .editor
+            .layers
+            .layers()
+            .iter()
+            .map(|l| l.slot())
+            .collect();
+        let id = self.editor.session.active_id();
+        let Some(gfx) = self.gfx.as_mut() else {
+            return false;
+        };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return false;
+        };
+        canvas.flip_layers(&gfx.gpu.device, &gfx.gpu.queue, &slots, axis);
+        self.editor.flip_canvas(axis);
+        true
+    }
+
+    /// Mirror the whole document, and record it.
+    ///
+    /// Photoshop's Image ▸ Flip Canvas: the pixels of every layer, not the
+    /// view. The canvas size is unchanged, which is exactly why this does not
+    /// clear the undo history the way a resize does — every patch already in it
+    /// is a rectangle of a canvas that still exists, and the entry recorded
+    /// here is what puts the orientation back before any of them is reached.
+    fn flip_canvas(&mut self, axis: umber_core::FlipAxis) {
+        // The floating pixels are in no layer, so they would not be mirrored
+        // with the picture and would then be put down in the place they were
+        // dragged to before the flip. Put them down first, as every path that
+        // leaves the document behind does.
+        self.finish_transform();
+        // The scratch surface is not mirrored either, so a stroke still in
+        // flight would commit unmirrored over a flipped picture.
+        self.finish_stroke();
+        let id = self.editor.session.active_id();
+        // A capture part-way through would assemble a file out of layers that
+        // were mirrored and layers that were not. `flip_layers` cancels the
+        // renderer's half; this is the scheduler's.
+        self.stop_autosave_of(id);
+
+        if !self.mirror_document(axis) {
+            return;
+        }
+        // No pixels: undoing this is flipping again. See
+        // `umber_core::history::EditBody`.
+        self.editor
+            .history
+            .record(Edit::new(EditKind::for_axis(axis), EditBody::Flip));
+        self.editor.mark_modified();
+        self.request_redraw();
     }
 
     // --- the transform tool -------------------------------------------------
@@ -765,7 +867,7 @@ impl UmberApp {
                 title: "The paste was cropped".to_string(),
                 lines: vec![format!(
                     "What was copied is {} × {} and this canvas is {} × {}, so only the \
-                     middle of it was pasted. Enlarge the canvas under Image → Canvas \
+                     middle of it was pasted. Enlarge the canvas under File → Canvas \
                      settings and paste again to keep the rest.",
                     clip.size().x,
                     clip.size().y,
@@ -932,6 +1034,8 @@ impl UmberApp {
             Action::Deselect => self.editor.deselect(),
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
+            Action::FlipCanvasHorizontal => self.flip_canvas(umber_core::FlipAxis::Horizontal),
+            Action::FlipCanvasVertical => self.flip_canvas(umber_core::FlipAxis::Vertical),
             Action::BrushTool => self.pick_tool(Tool::Brush),
             Action::EraserTool => self.pick_tool(Tool::Eraser),
             Action::SelectTool => self.pick_tool(Tool::Select),
@@ -1658,6 +1762,9 @@ impl UmberApp {
         }
         if actions.redo {
             self.redo();
+        }
+        if let Some(axis) = actions.flip_canvas {
+            self.flip_canvas(axis);
         }
         if let Some(position) = actions.history_jump {
             self.jump_history(position);

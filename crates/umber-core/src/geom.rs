@@ -43,6 +43,37 @@ pub fn drag_towards_more(delta: Vec2) -> f32 {
     delta.length() * (delta.x - delta.y) / lean
 }
 
+/// Which way a mirror faces.
+///
+/// Named for the direction the picture *moves*, which is how every application
+/// with the command words it: a horizontal flip swaps left and right.
+///
+/// A flip is its own inverse on both axes, and that is the property the whole
+/// of the undo design rests on — see [`crate::history::EditKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipAxis {
+    /// Left to right, about the canvas's vertical centre line.
+    Horizontal,
+    /// Top to bottom, about its horizontal centre line.
+    Vertical,
+}
+
+impl FlipAxis {
+    /// Mirror a point of a `size`-wide document.
+    ///
+    /// The mirror of the *continuous* canvas, not of a texel index: the span
+    /// `0 ..= w` maps onto itself, so the pixel covering `x .. x + 1` lands on
+    /// the one covering `w - x - 1 .. w - x`. That is the same permutation the
+    /// flip pass performs with integers, stated in the space the selection's
+    /// rings live in.
+    pub fn mirror(self, point: Vec2, size: Vec2) -> Vec2 {
+        match self {
+            Self::Horizontal => Vec2::new(size.x - point.x, point.y),
+            Self::Vertical => Vec2::new(point.x, size.y - point.y),
+        }
+    }
+}
+
 /// An axis-aligned rectangle in document space (float pixels).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {

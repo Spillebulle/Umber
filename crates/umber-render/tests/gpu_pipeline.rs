@@ -10,8 +10,8 @@ use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
-    InputPoint, Modulation, PixelRect, Rect, ResponseCurve, Selection, StrokeBuilder, TileMask,
-    TipMask, Transform,
+    FlipAxis, InputPoint, Modulation, PixelRect, Rect, ResponseCurve, Selection, StrokeBuilder,
+    TileMask, TipMask, Transform,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource, Gpu,
@@ -3370,4 +3370,84 @@ fn pieces_read_together_match_pieces_read_one_at_a_time() {
             "a readback limit of {limit} sheared the pieces"
         );
     }
+}
+
+// --- flipping the canvas ---------------------------------------------------
+
+/// The one thing `flip_layers` has to be: **an exact permutation of texels**.
+///
+/// The history entry a canvas flip records stores no pixels at all — undoing it
+/// is flipping again — so any loss here would not be a one-off rounding error
+/// but a drift compounding every time somebody flipped and undid. That is why
+/// the pass reads with `textureLoad` through non-sRGB views and blends nothing.
+/// A decode to linear and a re-encode would very nearly pass a test that only
+/// looked at the mirror, which is why the second half of this reads the *whole*
+/// layer back and demands the bytes it started with.
+///
+/// Noise rather than a flat fill for the reason `noisy_canvas` gives, and every
+/// layer of a two-layer stack, because the command mirrors the picture rather
+/// than the layer in front.
+#[test]
+fn a_flip_mirrors_the_canvas_and_flipping_twice_restores_it_exactly() {
+    let Some(gpu) = shared_gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    const SIDE: u32 = 64;
+    let mut canvas = noisy_canvas(gpu, SIDE);
+    canvas.ensure_slots(&gpu.device, &gpu.queue, 2);
+    // A second layer, distinct from the first, so a flip that quietly mirrored
+    // only slot 0 — or mirrored one slice into another — cannot pass.
+    let second: Vec<u8> = (0..(SIDE as usize * SIDE as usize * 4))
+        .map(|i| if i % 4 == 3 { 255 } else { (i * 7) as u8 })
+        .collect();
+    canvas.write_layer_rect(&gpu.queue, 1, whole_of(SIDE), &second);
+
+    let before: Vec<Vec<u8>> = (0..2)
+        .map(|slot| canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE)))
+        .collect();
+
+    for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
+        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+
+        for slot in 0..2 {
+            let after = canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE));
+            assert_eq!(
+                after,
+                mirrored(&before[slot as usize], SIDE, axis),
+                "slot {slot} is not the mirror of what it was, about {axis:?}"
+            );
+        }
+
+        // And back. This is the assertion the design rests on: not "close
+        // enough", but the same bytes.
+        canvas.flip_layers(&gpu.device, &gpu.queue, &[0, 1], axis);
+        for slot in 0..2 {
+            assert_eq!(
+                canvas.read_layer_rect(&gpu.device, &gpu.queue, slot, whole_of(SIDE)),
+                before[slot as usize],
+                "flipping slot {slot} twice about {axis:?} moved the picture"
+            );
+        }
+    }
+}
+
+/// The mirror of a tightly packed square of RGBA8, done on the CPU.
+fn mirrored(px: &[u8], side: u32, axis: FlipAxis) -> Vec<u8> {
+    let mut out = vec![0u8; px.len()];
+    for y in 0..side {
+        for x in 0..side {
+            let (sx, sy) = match axis {
+                FlipAxis::Horizontal => (side - 1 - x, y),
+                FlipAxis::Vertical => (x, side - 1 - y),
+            };
+            let d = ((y * side + x) * 4) as usize;
+            let s = ((sy * side + sx) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    out
 }

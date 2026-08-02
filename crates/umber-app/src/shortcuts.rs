@@ -21,6 +21,8 @@ pub enum Action {
     Deselect,
     Copy,
     Paste,
+    FlipCanvasHorizontal,
+    FlipCanvasVertical,
     BrushTool,
     EraserTool,
     SelectTool,
@@ -42,7 +44,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 22] = [
         Action::Save,
         Action::SaveAs,
         Action::Undo,
@@ -50,6 +52,8 @@ impl Action {
         Action::Deselect,
         Action::Copy,
         Action::Paste,
+        Action::FlipCanvasHorizontal,
+        Action::FlipCanvasVertical,
         Action::BrushTool,
         Action::EraserTool,
         Action::SelectTool,
@@ -75,6 +79,8 @@ impl Action {
             Action::Deselect => "Deselect",
             Action::Copy => "Copy",
             Action::Paste => "Paste",
+            Action::FlipCanvasHorizontal => "Flip canvas horizontally",
+            Action::FlipCanvasVertical => "Flip canvas vertically",
             Action::BrushTool => "Brush tool",
             Action::EraserTool => "Eraser tool",
             Action::SelectTool => "Selection tool",
@@ -96,6 +102,10 @@ impl Action {
         match self {
             Action::Save | Action::SaveAs => "File",
             Action::Undo | Action::Redo | Action::Deselect | Action::Copy | Action::Paste => "Edit",
+            // Its own group rather than "Edit": these change the document
+            // itself rather than the last thing done to it, and they are the
+            // pair every other application files under Image.
+            Action::FlipCanvasHorizontal | Action::FlipCanvasVertical => "Image",
             Action::BrushTool
             | Action::EraserTool
             | Action::SelectTool
@@ -253,6 +263,21 @@ pub fn defaults() -> Vec<Binding> {
         binding(Action::Deselect, KeyCode::KeyD, true, false, false),
         binding(Action::Copy, KeyCode::KeyC, true, false, false),
         binding(Action::Paste, KeyCode::KeyV, true, false, false),
+        // Image
+        //
+        // H and V for the two axes, which is the only mnemonic anybody
+        // remembers, under Ctrl+Shift because the unmodified keys are the pan
+        // tool and nothing. Neither chord is taken: `resolve` compares every
+        // modifier exactly, so Ctrl+Shift+V cannot fire on Paste's Ctrl+V, and
+        // Umber has no paste-special for it to be mistaken for.
+        binding(
+            Action::FlipCanvasHorizontal,
+            KeyCode::KeyH,
+            true,
+            true,
+            false,
+        ),
+        binding(Action::FlipCanvasVertical, KeyCode::KeyV, true, true, false),
         // Tools
         binding(Action::BrushTool, KeyCode::KeyB, false, false, false),
         binding(Action::EraserTool, KeyCode::KeyE, false, false, false),
@@ -938,6 +963,29 @@ mod tests {
         assert_eq!(hit(KeyCode::KeyB, ALT), None);
         assert_eq!(hit(KeyCode::KeyZ, CTRL | ALT), None);
         assert_eq!(hit(KeyCode::KeyZ, CTRL | SHIFT | ALT), None);
+    }
+
+    /// The two canvas flips, and the two chords they sit next to.
+    ///
+    /// Both share a key with something already bound — H is the pan tool and V
+    /// is Paste — so this is the case `resolve_in`'s exact modifier comparison
+    /// exists for. Getting it wrong in either direction is a command that fires
+    /// when nobody asked: a flipped canvas instead of a paste, or a flip on
+    /// every press of H.
+    #[test]
+    fn the_canvas_flips_do_not_take_the_keys_they_sit_beside() {
+        assert_eq!(
+            hit(KeyCode::KeyH, CTRL | SHIFT),
+            Some(Action::FlipCanvasHorizontal)
+        );
+        assert_eq!(
+            hit(KeyCode::KeyV, CTRL | SHIFT),
+            Some(Action::FlipCanvasVertical)
+        );
+        assert_eq!(hit(KeyCode::KeyH, NONE), Some(Action::PanTool));
+        assert_eq!(hit(KeyCode::KeyV, CTRL), Some(Action::Paste));
+        assert_eq!(hit(KeyCode::KeyV, NONE), None);
+        assert_eq!(hit(KeyCode::KeyH, CTRL), None);
     }
 
     #[test]
