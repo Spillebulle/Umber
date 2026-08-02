@@ -12,6 +12,75 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.4 — 2026-08-02
+
+Masks, locks and links on the layer stack; brushes you can make yourself,
+including drawing the stamp on the canvas; an export dialog with five formats;
+and a transform that turns the way you expect it to.
+
+### The layer stack
+
+- **Layer masks.** Paint a greyscale mask to hide and reveal part of a layer
+  without touching its pixels. A switch on the layer row says whether a stroke
+  lands in the layer or in its mask, and the row shows which you are aimed at.
+  Taking a mask off clears the undo history, and the button says so first.
+- **Clipping masks.** Clip a layer to the one below it, so it only shows where
+  that layer has paint. A run of clipped layers answers to the nearest unclipped
+  one under it.
+- **Locking.** A locked layer refuses strokes, transforms, clearing, deletion
+  and canvas flips. Nothing offers you an action it will then refuse — the
+  controls go quiet and say why.
+- **Linking.** Linked layers move through the stack together. They do not
+  transform together yet; the README says why.
+- **Drag the layers to reorder them**, as well as the arrow buttons.
+- The blend mode and opacity controls now say they belong to the selected layer.
+  They always did; nothing about them said so.
+
+### Making brushes
+
+- **New brush**, beside Import in the library.
+- **Give any brush a bitmap stamp** — one already in your library, or an image
+  you import.
+- **Draw the stamp yourself.** Umber opens a canvas set up for it and says at
+  the top which brush it is for. What you paint is the coverage: colour is
+  ignored, opacity is the strength, and the eraser takes coverage back off.
+- **Collections you make yourself**, to file brushes into.
+- The preview beside each brush is now a real stroke with a loop in it, drawn by
+  the engine that draws on the canvas — so a rake, a chisel or a brush that
+  follows the stroke previews as what it is, instead of as the same flat bar
+  every other brush drew.
+
+### Exporting
+
+- **PNG, JPEG, TIFF, GIF and BMP**, from a dialog that names what each one
+  costs before it writes: the colour transparency is painted onto, GIF's 256
+  colours, JPEG discarding a little more every time. A document with nothing to
+  lose is told so rather than warned at.
+
+### The transform tool
+
+- **Rotation worked out badly and now works.** It applied the whole angle
+  between your hand and the grab point on *every* frame, so the box spun away
+  from the pointer, always in the same direction. Turning now follows the
+  pointer: grab at 45° and move to 50°, and it turns five degrees.
+- **Turn from anywhere outside the box**, not only from a small ring at the
+  corners.
+- **Flip buttons** above the box, and dragging a handle past the opposite side
+  flips as well.
+
+### Elsewhere
+
+- **Flip the whole canvas**, horizontally or vertically, without losing your
+  undo history — the flip is recorded as an edit like any other.
+- **The undo memory limit is yours to set**, in Settings. It was a fixed 512 MB
+  per document.
+- **The settings window stops changing size** as you move between its pages.
+- **Type the number.** The colour wheel's angle and the interface scale can both
+  be typed as well as dragged, and each lands on useful steps — 45° and 25%.
+- The colour wheel's triangle is no longer jagged when you turn it.
+- Every dropdown in the interface is the same control; there were four.
+- The dashed outlines in layout edit mode have corners again.
+
 ## 0.0.3 — 2026-08-01
 
 Getting around the canvas, and a crash on large documents. The wheel now

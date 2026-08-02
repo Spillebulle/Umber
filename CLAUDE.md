@@ -265,6 +265,45 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   it. Structural undo is the real fix and is not built yet.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
   when a new layer takes it.
+- **A mask is another slice of the *same* layer array, not a second
+  `R8Unorm` one.** It costs 3 bytes a pixel on a texture most documents never
+  allocate, and buys that a mask *is* a layer to `read_layer_pieces`,
+  `PixelPatch`, `resize`, `flip_layers` and the autosave capture — where a
+  dedicated array would have meant its own banded readback, resize, flip,
+  capture, patch width and history revision, six paths duplicating six that
+  exist. A layer without a mask allocates nothing and fetches nothing: the
+  sample is behind a **uniform** branch on `has_mask`, which is legal because
+  `textureSampleLevel` takes no derivatives. `MAX_SLOTS` is therefore *not*
+  `MAX_LAYERS` — the latter still sizes the uniform array.
+- **Removing a mask clears the undo history**, for exactly the reason deleting a
+  layer does: the slice goes back on the free list, and a patch naming a freed
+  slot would replay into whatever inherits it. The tooltip says so before the
+  click.
+- **`StrokeStyle::on_mask` is the one edit-target switch**, in the struct that
+  already carries "the preview and the commit must be handed the same style",
+  and `Editor::stroke_target` is the single place it becomes a slot — falling
+  back to the layer where there is no mask, so nothing downstream ever sees an
+  impossible state. The commit needs **no new pipeline**: a mask is an ordinary
+  slice, so what `on_mask` decides is only where the preview blends, and that
+  blend is written to match `commit.wgsl`'s on one channel.
+  `a_stroke_on_a_mask_previews_exactly_as_it_commits` reads both.
+- **A clipped run answers to the nearest unclipped layer below**, through one
+  running `clip_alpha` in the composite loop, set from a layer's alpha *after*
+  its own mask and its wet stroke. **A clipped layer at the bottom shows
+  nothing.** Starting that accumulator at 1.0 would make the flag mean something
+  different depending on where the layer sat.
+- **A lock is refused at one gate per operation, never at the call sites** —
+  `begin_stroke`, `begin_float` (lift and paste both), `clear_active_layer`,
+  `delete_layer`, `mirror_document`. A canvas flip is refused **whole** when any
+  layer is locked: a half-mirrored picture is not a state the flip's pixel-less
+  undo entry can describe. A paste onto a locked layer raises a notice; a canvas
+  press does not, or the pen going down would be a dialog.
+- **Linking carries a set through the stack, and deliberately not through a
+  transform.** `Float` holds one layer's pixels, one base, one bind group, and
+  `EditBody::Pixels` holds one patch — so moving several at once needs N of each
+  *and* an entry holding several patches, or an undo would step through a
+  multi-layer move one layer at a time and leave the document in states it was
+  never in. The README says so rather than the flag half-working.
 - **Reordering does not clear the undo history; deleting does.** The difference
   is whether a slot changes hands — a `PixelPatch` names one, and only a delete
   frees one for the next layer to inherit. `LayerStack::reorder` is the whole of
@@ -378,7 +417,18 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   approximate — without it, reopening Umber's own file reports a loss that did
   not happen. `umber-version` is bumped only when a revision stores something an
   older build would drop silently, and an older build then **refuses** the file
-  rather than opening it with pieces missing.
+  rather than opening it with pieces missing. It is at **2**, for masks and
+  clipping: a build ignoring either shows a picture that is *wrong* — what the
+  mask hid comes back, and the clipped layer paints everywhere. Locks and links
+  ride along, because ignoring them changes no pixel.
+- **The writer emits the lowest revision the file actually needs**
+  (`required_version`), so a document with no mask and no clipping still
+  declares 1 and still opens in every older Umber. A version number is a
+  statement about what a file *contains*, not about what wrote it.
+- **A mask goes outside the ORA layer stack**, under `umber/masks/`, pointed at
+  by `umber-mask`. Krita's `svg:dst-in` nested-stack convention would be read by
+  GIMP and MyPaint as a layer that erases the one below — a file that opens
+  *wrong* elsewhere, which is worse than one that opens plain.
 - **The undo history is written too**, under `umber/`, pointed at by
   `umber-history`. `docformat::history` has the argument; the rules it lives by:
   - **A slot is never written down.** `PixelPatch::slot` is a texture slice and
@@ -578,6 +628,26 @@ when nobody asked for it.
   was the alternative and loses on all three counts: every edit rewrites the
   whole archive, the atomic write would have to risk the masks as well as the
   index, and a stamp is a picture people want to be able to open.
+- **A tip document is a 256×256 transparent square, and coverage is its
+  alpha.** What you paint is what stamps: the eraser takes coverage off, opacity
+  is the strength, and colour is discarded because a tip has none. Square
+  because a stamp is stretched over the dab's bounding square and
+  `TipMask::aspect` narrows it back, so a square is the one shape that says
+  nothing the artist did not; 256 because below ~128 a stamp cannot hold detail
+  a large brush magnifies, and above ~512 it is megabytes per brush. The
+  white-page-and-read-darkness alternative is wrong twice here: a white stroke
+  would have to mean "erase" while Umber's eraser means something else, and a
+  fully covered canvas would be indistinguishable from a blank one.
+- **An imported *picture* cannot use that rule, so it gets its own, stated
+  one** — alpha where anything is less than opaque, darkness otherwise, decided
+  **once for the whole image** and never per pixel, and the notice always names
+  which reading it took. This is exactly why a tip *document* does not go
+  through `coverage_of`: a fully painted canvas would flip the rule and invert
+  the stamp.
+- **A tip is never written outside `UserLibrary::save`.** A mask drawn or
+  imported sits in the editor's hand until a Save or an Update; writing it
+  earlier would leave a picture no preset names, which `prune_tips` deletes on
+  the next write.
 - **`BrushPreset::tip` is a *name*, not a mask.** It resolves through
   `UserLibrary::tip`, which is what lets two brushes share one stamp and one GPU
   upload. A name that resolves to nothing **paints round** — a library copied
