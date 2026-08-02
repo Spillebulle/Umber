@@ -1,6 +1,6 @@
 //! Editor state — everything that is not a GPU resource or a window.
 
-use crate::colorpicker::{PickerMode, WheelShape};
+use crate::colorpicker::{PickerMode, WheelAngles, WheelShape};
 use crate::dock::Layout;
 use crate::session::{DocId, DocumentState, Session};
 use crate::settings::SettingsTab;
@@ -117,9 +117,12 @@ pub struct UiState {
     pub selection_menu_open: bool,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
-    /// Whether the wheel's triangle turns to follow the hue. Meaningless while
-    /// the centre is the square, which has no orientation.
+    /// Whether the wheel's triangle turns to follow the hue. Meaningless for the
+    /// square, which has no corner that is the hue to keep beside the marker.
     pub wheel_rotates: bool,
+    /// How far each wheel centre is turned from its neutral pose, when the hue
+    /// is not deciding it. One angle per shape — see [`WheelAngles`].
+    pub wheel_angles: WheelAngles,
     /// Open state of the picker-mode dropdown in the Colour panel header.
     pub picker_menu_open: bool,
     pub brush_editor_open: bool,
@@ -194,6 +197,8 @@ impl Default for UiState {
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
             wheel_rotates: true,
+            // Zero is the pose every build before the angle existed drew.
+            wheel_angles: WheelAngles::default(),
             picker_menu_open: false,
             brush_editor_open: false,
             brush_tab: BrushTab::Tip,

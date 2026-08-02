@@ -830,17 +830,28 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut shape = ed.ui.wheel_shape;
     let mut rotates = ed.ui.wheel_rotates;
-    let changed = colorpicker::show(ui, p, ed.ui.picker, &mut shape, &mut rotates, &mut ed.hsv);
-    // Both are kept between runs, though their controls are here rather than in
-    // the settings dialog — they are choices about the workspace, and where one
-    // is set does not decide whether it should still be true tomorrow.
+    let mut angles = ed.ui.wheel_angles;
+    let changed = colorpicker::show(
+        ui,
+        p,
+        ed.ui.picker,
+        &mut shape,
+        &mut rotates,
+        &mut angles,
+        &mut ed.hsv,
+    );
+    // All three are kept between runs, though their controls are here rather
+    // than in the settings dialog — they are choices about the workspace, and
+    // where one is set does not decide whether it should still be true tomorrow.
     //
     // Compared before and after rather than asked of the controls, because
     // `show` reports a change of *colour*: keying off its return would queue a
     // preferences write for every frame of a drag around the hue ring.
-    if shape != ed.ui.wheel_shape || rotates != ed.ui.wheel_rotates {
+    if shape != ed.ui.wheel_shape || rotates != ed.ui.wheel_rotates || angles != ed.ui.wheel_angles
+    {
         ed.ui.wheel_shape = shape;
         ed.ui.wheel_rotates = rotates;
+        ed.ui.wheel_angles = angles;
         crate::prefs::mark_dirty();
     }
     if changed {

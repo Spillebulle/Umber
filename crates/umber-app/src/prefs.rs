@@ -24,7 +24,7 @@
 //! above require.
 
 use crate::autosave;
-use crate::colorpicker::{PickerMode, WheelShape};
+use crate::colorpicker::{PickerMode, WheelAngles, WheelShape};
 use crate::editor::Editor;
 use crate::shortcuts::{self, Action, Binding, Chord};
 use crate::theme::{Accent, ThemeKind};
@@ -80,6 +80,13 @@ pub struct Prefs {
     /// works in sliders should not be handed the wheel again every morning.
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
+    /// How far each wheel centre is turned from its neutral pose, in degrees.
+    ///
+    /// Two keys rather than one, for the reason [`WheelAngles`] gives: the two
+    /// shapes do not share a neutral, and an angle is a choice about a shape.
+    /// Both are absent from a file written before the setting existed, which
+    /// gives the pose those builds drew.
+    pub wheel_angles: WheelAngles,
     /// Whether a saved document carries its undo history.
     pub save_history: bool,
     /// Whether open documents are written out on a timer at all.
@@ -118,6 +125,7 @@ impl Default for Prefs {
             wheel_rotates: true,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
+            wheel_angles: WheelAngles::default(),
             save_history: true,
             autosave: true,
             autosave_interval_minutes: autosave::DEFAULT_INTERVAL_MINUTES,
@@ -300,6 +308,13 @@ pub fn to_text(prefs: &Prefs) -> String {
         "wheel_shape = {}\n",
         wheel_shape_id(prefs.wheel_shape)
     ));
+    for shape in WheelShape::ALL {
+        out.push_str(&format!(
+            "{} = {:.1}\n",
+            wheel_angle_key(shape),
+            prefs.wheel_angles.of(shape)
+        ));
+    }
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
     out.push_str(&format!("autosave = {}\n", prefs.autosave));
     out.push_str(&format!(
@@ -404,6 +419,21 @@ pub fn from_text(text: &str) -> Prefs {
             "wheel_shape" => {
                 if let Some(v) = wheel_shape_from_id(value) {
                     prefs.wheel_shape = v;
+                }
+            }
+            // Wrapped rather than clamped, unlike every other number here: an
+            // angle's range is a period, so a hand-edited 400 means 40 rather
+            // than "as far round as the slider goes". `WheelAngles::set` is the
+            // one door that does it, so the file, the slider and the default
+            // cannot disagree — and it is also what refuses a NaN, which would
+            // otherwise reach `sin_cos` and take the picker's mesh with it.
+            "wheel_triangle_angle" | "wheel_square_angle" => {
+                if let Some(shape) = WheelShape::ALL
+                    .into_iter()
+                    .find(|s| wheel_angle_key(*s) == key)
+                    && let Some(v) = parse_f32(value, -MAX_TURNS, MAX_TURNS)
+                {
+                    prefs.wheel_angles.set(shape, v);
                 }
             }
             "save_history" => {
@@ -595,6 +625,23 @@ fn wheel_shape_from_id(id: &str) -> Option<WheelShape> {
         .find(|s| wheel_shape_id(*s) == id)
 }
 
+/// The key each shape's angle is written under, for the same reason
+/// [`wheel_shape_id`] is a `match`: adding a third centre has to be a decision
+/// about what a file written a year from now will call it.
+fn wheel_angle_key(shape: WheelShape) -> &'static str {
+    match shape {
+        WheelShape::Triangle => "wheel_triangle_angle",
+        WheelShape::Square => "wheel_square_angle",
+    }
+}
+
+/// How far out of a single turn a hand-edited angle is still read.
+///
+/// [`parse_f32`] clamps, and an angle wants wrapping — so the bound is only
+/// there to keep a number large enough to lose its low bits away from
+/// `rem_euclid`. Anything inside it wraps exactly.
+const MAX_TURNS: f32 = 360.0 * 1000.0;
+
 fn pressure_id(source: PressureSource) -> &'static str {
     match source {
         PressureSource::Device => "device",
@@ -635,6 +682,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_rotates: ed.ui.wheel_rotates,
         picker: ed.ui.picker,
         wheel_shape: ed.ui.wheel_shape,
+        wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
         autosave: ed.autosave.enabled,
         autosave_interval_minutes: (ed.autosave.interval.as_secs() / 60).max(1) as u32,
@@ -659,6 +707,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_rotates = prefs.wheel_rotates;
     ed.ui.picker = prefs.picker;
     ed.ui.wheel_shape = prefs.wheel_shape;
+    ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
     ed.autosave.enabled = prefs.autosave;
     ed.autosave.interval =
@@ -723,6 +772,13 @@ mod tests {
     use super::*;
     use winit::keyboard::KeyCode;
 
+    fn turned(triangle: f32, square: f32) -> WheelAngles {
+        let mut angles = WheelAngles::default();
+        angles.set(WheelShape::Triangle, triangle);
+        angles.set(WheelShape::Square, square);
+        angles
+    }
+
     #[test]
     fn defaults_match_what_the_app_starts_with() {
         // A missing preferences file must change nothing, so these two have to
@@ -738,6 +794,7 @@ mod tests {
         assert_eq!(prefs.wheel_rotates, editor.ui.wheel_rotates);
         assert_eq!(prefs.picker, editor.ui.picker);
         assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
+        assert_eq!(prefs.wheel_angles, editor.ui.wheel_angles);
         assert_eq!(prefs.save_history, editor.ui.save_history);
         assert_eq!(prefs.autosave, editor.autosave.enabled);
         assert_eq!(
@@ -800,6 +857,72 @@ mod tests {
             "a bad id keeps the default"
         );
         assert_eq!(prefs.wheel_shape, WheelShape::Triangle);
+    }
+
+    /// The angle is set on the Colour panel, like the rotation above it, and has
+    /// to reach the picker rather than only the `Prefs` struct — and each shape
+    /// has to arrive with its own number, since that is the whole point of
+    /// keeping two.
+    #[test]
+    fn each_wheel_shapes_angle_survives_a_restart() {
+        let prefs = Prefs {
+            wheel_angles: turned(30.0, 200.0),
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert_eq!(back.wheel_angles.of(WheelShape::Triangle), 30.0);
+        assert_eq!(back.wheel_angles.of(WheelShape::Square), 200.0);
+
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        apply(&back, &ctx, &mut editor);
+        assert_eq!(
+            editor.ui.wheel_angles, back.wheel_angles,
+            "reading the file must reach the picker, not just the Prefs struct"
+        );
+        assert_eq!(capture(&ctx, &editor).wheel_angles, back.wheel_angles);
+    }
+
+    /// A file written before the setting existed says nothing about it, and must
+    /// therefore draw both centres exactly where that build drew them.
+    #[test]
+    fn a_file_without_an_angle_leaves_both_centres_where_they_were() {
+        let prefs = from_text("version = 1\npicker = wheel\nwheel_shape = square\n");
+        assert_eq!(prefs.wheel_angles, WheelAngles::default());
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Triangle), 0.0);
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Square), 0.0);
+    }
+
+    /// An angle's range is a period, not a limit, so a hand-edited number is
+    /// wrapped where every other value here is clamped. The one that must not
+    /// get through is a NaN: it would reach `sin_cos` and take the picker's mesh
+    /// with it.
+    #[test]
+    fn a_hand_edited_angle_is_wrapped_rather_than_clamped() {
+        let prefs = from_text(concat!(
+            "wheel_triangle_angle = 400\n",
+            "wheel_square_angle = -30\n",
+        ));
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Triangle), 40.0);
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Square), 330.0);
+
+        for bad in ["NaN", "inf", "", "sideways"] {
+            let prefs = from_text(&format!("wheel_triangle_angle = {bad}\n"));
+            assert_eq!(
+                prefs.wheel_angles.of(WheelShape::Triangle),
+                0.0,
+                "{bad} must leave the default in place"
+            );
+        }
+    }
+
+    /// The two keys are separate, and one must never be read as the other — the
+    /// same trap `picker` and `wheel_shape` share.
+    #[test]
+    fn the_two_angle_keys_do_not_read_each_other() {
+        let prefs = from_text("wheel_triangle_angle = 90\n");
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Triangle), 90.0);
+        assert_eq!(prefs.wheel_angles.of(WheelShape::Square), 0.0);
     }
 
     #[test]
@@ -934,6 +1057,7 @@ mod tests {
             wheel_rotates: false,
             picker: PickerMode::Sliders,
             wheel_shape: WheelShape::Square,
+            wheel_angles: turned(30.0, 200.0),
             save_history: false,
             autosave: false,
             autosave_interval_minutes: 12,
@@ -961,6 +1085,7 @@ mod tests {
         assert_eq!(back.wheel_rotates, prefs.wheel_rotates);
         assert_eq!(back.picker, prefs.picker);
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
+        assert_eq!(back.wheel_angles, prefs.wheel_angles);
         assert_eq!(back.save_history, prefs.save_history);
         assert_eq!(back.autosave, prefs.autosave);
         assert_eq!(
