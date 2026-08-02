@@ -27,6 +27,7 @@ pub mod style;
 pub mod time;
 pub mod tip;
 mod tip_table;
+pub mod transform;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
@@ -45,3 +46,4 @@ pub use selection::{Selection, SelectionDraft, SelectionMode};
 pub use stroke::{Dab, StrokeBuilder};
 pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, stroke_coverage};
+pub use transform::{Affine, Handle, Transform};
