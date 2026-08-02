@@ -843,6 +843,28 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             .color(if last.is_some() { p.text } else { p.text_dim }),
         );
     });
+
+    // What the last press was *taken to mean*, which is a different question
+    // from what arrived and the one that settles a whole class of pen report.
+    // Three gestures — the Alt-drag brush resize, the Pan tool and the Zoom
+    // tool — were once decided in the mouse arm of the event loop alone, so
+    // under a pen they silently became a stroke; this row is where that shows.
+    // Recorded by `gesture::press`'s one real call, never recomputed here.
+    let last_gesture = ed.input.last_gesture();
+    controls::row(ui, p, "Last press became", |ui| {
+        ui.label(
+            egui::RichText::new(match last_gesture {
+                Some(g) => g.label(),
+                None => "nothing yet",
+            })
+            .size(text::SMALL)
+            .color(if last_gesture.is_some() {
+                p.text
+            } else {
+                p.text_dim
+            }),
+        );
+    });
 }
 
 /// Where pressure comes from: the one setting on this page, and the two knobs

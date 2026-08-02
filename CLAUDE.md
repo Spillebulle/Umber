@@ -1375,6 +1375,13 @@ Three things follow, and all three were bugs:
     *is* a mouse move with nothing held. `last_cursor` is saved and put back
     across it: it is the previous point of a *gesture*, and a pen waved about in
     mid-air is not one.
+- **Settings → Input & pen records which gesture a press resolved to**, beside
+  the route and the motion, because "the pen arrived and became the wrong
+  gesture" is invisible in the other two columns — which is exactly why the
+  three above shipped. `InputLog::note_gesture` takes the answer the one real
+  `gesture::press` call gave and lands it only on a sample that is itself a
+  press, since `note` records the left button and touches and nothing else.
+  Same rule as `note_resolved`, and observation only.
 
 The pressure resolution is 1024 levels, which is what the `WM_POINTER` API
 carries however many the tablet itself distinguishes. `PressureSource::Device`

@@ -2445,6 +2445,11 @@ impl UmberApp {
         pointer: gesture::Pointer,
     ) -> gesture::Press {
         let decision = gesture::press(pointer);
+        // Observation only, and the *resolved* answer rather than a second run
+        // of the decision — the same rule `note_resolved` lives by. See
+        // `inputlog`.
+        self.editor.input.note_gesture(decision);
+
         // Every press ends the brush-size drag except the one that is carrying
         // it on. A mouse press is never a contact, so `press` can never answer
         // `ResizeBrush` for one and this stays exactly the rule it always was:
