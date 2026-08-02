@@ -1081,6 +1081,20 @@ design shows a whole row of them.
   and if that button only exists while the row is hovered, the two oscillate
   once a frame. Allocate the row unconditionally and test `contains_pointer`,
   which is geometry alone. This was a real bug on the Shortcuts page's `+`.
+- **egui's finished textures are given back *after* `Queue::submit`, never
+  before**, and `app::submit_frame` is the one place that does both so the two
+  cannot be put the wrong way round. `egui_wgpu::Renderer::free_texture` calls
+  `wgpu::Texture::destroy`, which takes effect immediately rather than when the
+  last reference goes — so a texture named in `textures_delta.free` and also
+  named by a draw already recorded this frame fails validation at submit, and
+  wgpu's default handler makes that a panic that takes the application down.
+  A same-frame free is legitimate and unavoidable: egui frees a texture when
+  the last `TextureHandle` to it drops, and a cache replacing an entry mid-pass
+  does that after an earlier widget has already queued a `Shape` carrying the
+  id. After the submit no deferral is needed — wgpu keeps the resource alive
+  for the submission using it — so this is the ordering, not a frame of grace.
+  `egui_wgpu`'s own painter says the same thing in the same place. This was a
+  real bug: opening the brush library crashed the application.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
