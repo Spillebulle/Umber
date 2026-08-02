@@ -66,6 +66,18 @@ pub struct Placed {
     pub pixels: Vec<u8>,
 }
 
+/// A cut: what went on the clipboard, and what the layer is left holding.
+///
+/// The two halves are produced by one pass over one buffer, deliberately —
+/// see [`Clip::cut_from_layer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub clip: Clip,
+    /// `rect`-sized, in **layer-texture form** — sRGB with alpha premultiplied
+    /// in linear space — ready for `write_layer_rect`.
+    pub remainder: Vec<u8>,
+}
+
 impl Clip {
     /// Take `rect` of a layer, clipped by `mask`.
     ///
@@ -78,18 +90,59 @@ impl Clip {
     /// gamma curve, which is the same trap `srgb`'s module docs describe for an
     /// import — and it is invisible on anything fully opaque, so it would ship.
     pub fn from_layer(rect: PixelRect, bytes: &[u8], mask: Option<&Selection>) -> Option<Self> {
+        Self::take(rect, bytes, mask, false).map(|cut| cut.clip)
+    }
+
+    /// The same take, plus **what the layer must be left holding**: a cut.
+    ///
+    /// The removal has to be the exact complement of what the copy took, or a
+    /// cut leaves the ghost outline a masked lift used to leave — the copy
+    /// keeping `alpha × coverage` while the layer gave up `alpha × (1 −
+    /// coverage)` computed separately, the two rounding the same way and a rim
+    /// of coverage surviving in both places.
+    ///
+    /// So it is not computed separately. One pass produces both, the share that
+    /// leaves is subtracted from the alpha that was there, and `taken + left ==
+    /// before` is therefore true byte for byte rather than to within a rounding
+    /// rule — `a_cut_takes_exactly_what_it_leaves_behind` drives every
+    /// (alpha, coverage) pair through it.
+    ///
+    /// `None` on exactly the terms [`Clip::from_layer`] answers `None`: nothing
+    /// was taken, so there is nothing to remove either and the layer must not
+    /// be written to.
+    pub fn cut_from_layer(rect: PixelRect, bytes: &[u8], mask: Option<&Selection>) -> Option<Cut> {
+        Self::take(rect, bytes, mask, true)
+    }
+
+    /// The one implementation of "what a selection takes off a layer".
+    ///
+    /// `remove` decides only whether the other half — what is left — is built
+    /// as well; the share taken is arrived at identically either way, which is
+    /// what makes a copy and a cut agree about the edge of a soft selection.
+    fn take(rect: PixelRect, bytes: &[u8], mask: Option<&Selection>, remove: bool) -> Option<Cut> {
         if rect.width == 0 || rect.height == 0 || bytes.len() as u64 != rect.area() * 4 {
             return None;
         }
         let mut pixels = Vec::with_capacity(bytes.len());
+        let mut remainder = Vec::with_capacity(if remove { bytes.len() } else { 0 });
         for row in 0..rect.height {
             for col in 0..rect.width {
                 let i = ((row * rect.width + col) * 4) as usize;
                 let mut px =
                     srgb::decode_pixel([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                let before = px[3];
                 if let Some(mask) = mask {
                     let cov = mask.coverage_at(rect.x + col, rect.y + row) as u32;
-                    px[3] = ((px[3] as u32 * cov + 127) / 255) as u8;
+                    px[3] = ((before as u32 * cov + 127) / 255) as u8;
+                }
+                if remove {
+                    // The colour is untouched — a cut is about coverage, not
+                    // about what was painted — and only the alpha moves. By
+                    // *subtraction*, so the two halves add back up to the pixel
+                    // that was there whatever the rounding did.
+                    let mut left = px;
+                    left[3] = before - px[3];
+                    remainder.extend_from_slice(&srgb::encode_pixel(left));
                 }
                 pixels.extend_from_slice(&px);
             }
@@ -100,10 +153,13 @@ impl Clip {
         if pixels.chunks_exact(4).all(|px| px[3] == 0) {
             return None;
         }
-        Some(Self {
-            width: rect.width,
-            height: rect.height,
-            pixels,
+        Some(Cut {
+            clip: Self {
+                width: rect.width,
+                height: rect.height,
+                pixels,
+            },
+            remainder,
         })
     }
 
@@ -281,6 +337,91 @@ mod tests {
         // A buffer that does not match its rectangle is a caller bug, and
         // reading past it would be worse than refusing.
         assert!(Clip::from_layer(rect(0, 0, 4, 4), &[1, 2, 3, 4], None).is_none());
+    }
+
+    /// **The invariant a cut lives by.** What goes on the clipboard and what
+    /// stays on the layer are the two halves of the pixel that was there, so
+    /// they must add back up to it — exactly, on every pixel, for every
+    /// coverage a soft edge can produce. Computing the removal separately as
+    /// `alpha × (1 − coverage)` looks equivalent and is not: both sides round
+    /// to nearest, so a rim of the selection's edge survives in the copy *and*
+    /// on the layer, which is the ghost outline a masked lift used to leave.
+    #[test]
+    fn a_cut_takes_exactly_what_it_leaves_behind() {
+        const N: u32 = 16;
+        let doc = UVec2::splat(N);
+        // A triangle, so the edge runs diagonally across the pixel grid and
+        // every intermediate coverage the rasteriser can make is exercised.
+        let selection = Selection::from_rings(
+            vec![vec![vec2(1.0, 1.0), vec2(14.5, 3.5), vec2(4.5, 14.0)]],
+            doc,
+        )
+        .expect("a selection");
+
+        // Every alpha from 0 to 255 across the rectangle, at a colour that is
+        // not grey so a channel swap would show up too.
+        let layer: Vec<u8> = (0..N * N)
+            .flat_map(|i| {
+                let a = (i * 255 / (N * N - 1)) as u8;
+                srgb::encode_pixel([200, 90, 30, a])
+            })
+            .collect();
+        let r = rect(0, 0, N, N);
+        let cut = Clip::cut_from_layer(r, &layer, Some(&selection)).expect("a cut");
+
+        assert_eq!(cut.remainder.len(), layer.len());
+        let mut partials = 0;
+        for i in (0..layer.len()).step_by(4) {
+            let before = layer[i + 3];
+            let taken = cut.clip.pixels()[i + 3];
+            let left = cut.remainder[i + 3];
+            assert_eq!(
+                taken as u32 + left as u32,
+                before as u32,
+                "pixel {} lost or gained coverage",
+                i / 4
+            );
+            if taken > 0 && left > 0 {
+                partials += 1;
+            }
+        }
+        assert!(
+            partials > 0,
+            "the fixture found no partly covered pixels, so it is testing nothing"
+        );
+
+        // And the copy is the same copy: a cut must not take a different share
+        // from what Ctrl+C would have taken.
+        let copied = Clip::from_layer(r, &layer, Some(&selection)).expect("a clip");
+        assert_eq!(cut.clip, copied);
+    }
+
+    /// No selection means the whole rectangle, so the layer is left with
+    /// nothing — which is what "cut everything" has to mean. Stated because the
+    /// complement rule above is what produces it rather than a special case.
+    #[test]
+    fn a_cut_with_nothing_selected_empties_the_rectangle() {
+        let layer: Vec<u8> = (0..4).flat_map(|_| [90, 40, 20, 128]).collect();
+        let cut = Clip::cut_from_layer(rect(0, 0, 2, 2), &layer, None).expect("a cut");
+        assert!(
+            cut.remainder.iter().all(|b| *b == 0),
+            "something was left behind"
+        );
+        // And what it took is byte for byte what a copy of the same rectangle
+        // would have taken, which is the round trip pinned above.
+        let placed = cut.clip.place(DOC, vec2(32.0, 32.0)).expect("somewhere");
+        assert_eq!(placed.pixels, layer);
+    }
+
+    /// A cut over empty canvas must not write to the layer at all. `None` on
+    /// exactly the terms a copy answers `None`: there is nothing to put on the
+    /// clipboard, so there is nothing to take off the layer, and an undo entry
+    /// for it would be a row that restores pixels nothing changed.
+    #[test]
+    fn cutting_nothing_leaves_the_layer_alone() {
+        let layer = vec![0u8; 4 * 4 * 4];
+        assert!(Clip::cut_from_layer(rect(0, 0, 4, 4), &layer, None).is_none());
+        assert!(Clip::cut_from_layer(rect(0, 0, 0, 4), &[], None).is_none());
     }
 
     /// A paste arrives where the artist is looking, and comes back on to the
