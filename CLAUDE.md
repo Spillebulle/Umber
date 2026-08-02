@@ -320,6 +320,26 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
+- **A tick is a field on the layer and is never written to the file.** Every
+  other flag is a property of the picture; a tick says what the painter is
+  *about to do*, and reopening a document to find four layers still ticked is an
+  instruction nobody gave. A field rather than a set beside the stack, because a
+  set would be keyed by slot and would then have to be kept in step with
+  reordering and deletion by hand — as a field both come free, which is the
+  argument `linked` already makes for itself. It is also not a document
+  modification: a tick puts no dot on the tab.
+- **`LayerStack::targets` is the one rule for what a bulk operation reaches** —
+  every ticked layer, or the selected one alone when nothing is ticked. The
+  fallback is what stops there being a second, single-layer spelling of "hide
+  this" to drift from this one, and it is why the strip's buttons are never
+  dead. `App::delete_picked_layers` is written in terms of `delete_layer` for
+  the same reason: the lock gate, the float being put down and the history being
+  cleared are each stated once.
+- **The ticked-layers strip is drawn only when something is ticked**, and the
+  tick box is drawn on every row whether or not anything is. A strip that was
+  always there costs the list a row of height on every three-layer document; a
+  box that appeared only after you had found the first one is a feature nobody
+  finds.
 - **A thumbnail is the layer's *content*, and it is two passes because the
   bounding box of that content is on the GPU.** `thumbnail.wgsl` reduces a
   rectangle of one slice to a 64-square: first the whole slice to the

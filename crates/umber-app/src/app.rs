@@ -1037,6 +1037,23 @@ impl UmberApp {
         self.editor.mark_modified();
     }
 
+    /// Delete every ticked layer.
+    ///
+    /// Written in terms of [`Self::delete_layer`] rather than beside it, so the
+    /// lock gate, the float being put down and the history being cleared are
+    /// each stated once — a second delete that forgot one of the three is
+    /// exactly the bug the "one gate per operation" rule exists to prevent.
+    ///
+    /// **Top-down**, because removing a layer shifts every index above it. And
+    /// `delete_layer` refuses to empty the stack all by itself, so the last
+    /// survivor stays whether or not it was ticked; it is left ticked, which is
+    /// what says the request was not carried out in full.
+    fn delete_picked_layers(&mut self) {
+        for index in self.editor.layers.targets().into_iter().rev() {
+            self.delete_layer(index);
+        }
+    }
+
     /// Give the selected layer a mask, filled opaque white so nothing about the
     /// picture changes until something is painted into it.
     fn add_mask(&mut self) {
@@ -2041,6 +2058,9 @@ impl UmberApp {
         }
         if let Some(index) = actions.delete_layer {
             self.delete_layer(index);
+        }
+        if actions.delete_picked {
+            self.delete_picked_layers();
         }
         if let Some(index) = actions.move_layer_up {
             self.editor.layers.move_up(index);

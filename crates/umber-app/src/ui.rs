@@ -64,6 +64,11 @@ pub struct UiActions {
     pub reset_zoom: bool,
     pub add_layer: bool,
     pub delete_layer: Option<usize>,
+    /// Delete every ticked layer. A `bool` rather than the list, because
+    /// [`UiActions`] is `Copy` — the caller reads the ticks off the editor in
+    /// the frame the flag was set, which is the frame the request was made in.
+    /// Same arrangement, and the same reason, as [`UiActions::new_tip`].
+    pub delete_picked: bool,
     pub move_layer_up: Option<usize>,
     pub move_layer_down: Option<usize>,
     /// Give the selected layer a mask, or take its mask off. The caller's,

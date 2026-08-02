@@ -924,6 +924,19 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 /// one after it should the stack ever gain another.
 const BLEND_WIDTH: f32 = 80.0;
 
+/// What the ticked-layers strip was pressed for.
+///
+/// Collected and applied below the layout closure rather than inside it,
+/// because every arm needs `ed.layers` mutably and the closure is already
+/// holding it for the labels.
+#[derive(Clone, Copy)]
+enum Bulk {
+    Visible(bool),
+    Lock(bool),
+    Untick,
+    Delete,
+}
+
 fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     let count = ed.layers.len();
     let active = ed.layers.active_index();
@@ -1124,6 +1137,94 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
 
     ui.add_space(7.0);
 
+    // What ticking rows is *for*, drawn only once something is ticked.
+    //
+    // A strip that was always there would cost the list a row of height on
+    // every document, most of which have three layers and no use for it; and a
+    // row of controls that do nothing is the thing CLAUDE.md refuses
+    // everywhere else. The count is the label, because "3 ticked" is the one
+    // fact a strip like this has to tell you before you press Delete.
+    if ed.layers.picked_count() > 0 {
+        let picked = ed.layers.picked_count();
+        let any_locked = ed.layers.targets().iter().any(|i| ed.layers.locked_at(*i));
+        let mut act: Option<Bulk> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{picked} ticked"))
+                    .size(text::SMALL)
+                    .color(p.text_muted),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(
+                    ui,
+                    p,
+                    Icon::Trash,
+                    picked < count && !any_locked,
+                    match (picked < count, any_locked) {
+                        (false, _) => "A document needs a layer to paint on",
+                        (_, true) => "One of them is locked — unlock it to delete it",
+                        _ => "Delete the ticked layers — clears undo history",
+                    },
+                ) {
+                    act = Some(Bulk::Delete);
+                }
+                if icon_button(ui, p, Icon::Unlock, true, "Unlock the ticked layers") {
+                    act = Some(Bulk::Lock(false));
+                }
+                if icon_button(ui, p, Icon::Lock, true, "Lock the ticked layers") {
+                    act = Some(Bulk::Lock(true));
+                }
+                if icon_button(ui, p, Icon::EyeOff, true, "Hide the ticked layers") {
+                    act = Some(Bulk::Visible(false));
+                }
+                if icon_button(ui, p, Icon::Eye, true, "Show the ticked layers") {
+                    act = Some(Bulk::Visible(true));
+                }
+                if ui
+                    .selectable_label(
+                        false,
+                        egui::RichText::new("None")
+                            .size(text::SMALL)
+                            .color(p.text_dim),
+                    )
+                    .on_hover_text("Untick every layer")
+                    .clicked()
+                {
+                    act = Some(Bulk::Untick);
+                }
+            });
+        });
+        match act {
+            // Straight onto the flags: nothing here touches the GPU or the
+            // history, so there is no reason to send it round through
+            // `UiActions` and back. Deleting is the one that does.
+            Some(Bulk::Visible(on)) => {
+                for index in ed.layers.targets() {
+                    if let Some(layer) = ed.layers.get_mut(index) {
+                        layer.visible = on;
+                    }
+                }
+                changed = true;
+            }
+            Some(Bulk::Lock(on)) => {
+                for index in ed.layers.targets() {
+                    if let Some(layer) = ed.layers.get_mut(index) {
+                        layer.locked = on;
+                    }
+                }
+                changed = true;
+            }
+            Some(Bulk::Untick) => ed.layers.pick_all(false),
+            // Slots go back on the free list, so this clears the undo history
+            // and has to happen where the GPU is. `UiActions` is `Copy` and
+            // cannot carry the list; the caller reads the ticks off the editor
+            // in the frame the flag was set, exactly as `new_tip` does.
+            Some(Bulk::Delete) => actions.delete_picked = true,
+            None => {}
+        }
+        ui.add_space(6.0);
+    }
+
     // What is being carried, if anything. Kept in egui's temporary store rather
     // than on `Editor`, which is where `history_body`'s scroll memo lives and
     // for the same reason: this belongs to the list, not to the document, and a
@@ -1156,6 +1257,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // Stored bottom-first; shown top-first, the way it is drawn.
     let mut select = None;
     let mut toggle = None;
+    let mut tick = None;
     let mut aim_at_mask = None;
     let editing_mask = ed.editing_mask();
     for index in (0..count).rev() {
@@ -1189,6 +1291,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     locked: layer.locked,
                     linked: layer.linked,
                     thumb: ed.thumbs.picture(layer.slot()),
+                    picked: layer.picked,
                 },
             )
         });
@@ -1209,7 +1312,9 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         if drag.is_some() {
             continue;
         }
-        if row.eye_clicked {
+        if row.pick_clicked {
+            tick = Some(index);
+        } else if row.eye_clicked {
             toggle = Some(index);
         } else if row.mask_clicked {
             // Selecting the layer as well as its mask: painting a mask on a
@@ -1274,6 +1379,15 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     {
         layer.visible = !layer.visible;
         changed = true;
+    }
+    // A tick is not a change to the document: it says what is about to be done,
+    // not what the picture holds, which is also why it is never written to the
+    // file. Marking the tab modified for one would put a dot on it for a
+    // gesture that changed no pixel.
+    if let Some(index) = tick
+        && let Some(layer) = ed.layers.get_mut(index)
+    {
+        layer.picked = !layer.picked;
     }
     if let Some(index) = select {
         ed.layers.set_active(index);

@@ -1687,6 +1687,10 @@ pub struct LayerRowResponse {
     /// The mask chip was clicked, which is how the edit target is switched from
     /// the list rather than from the toggle row.
     pub mask_clicked: bool,
+    /// The tick box was clicked. Its own target, like the eye's: ticking a row
+    /// for a bulk operation must not also select it, or every tick would move
+    /// the brush.
+    pub pick_clicked: bool,
 }
 
 /// What one row has to draw besides its name.
@@ -1721,6 +1725,10 @@ pub struct LayerRow<'a> {
     /// yet. Distinguishing them would mean a spinner on every row of a freshly
     /// opened document for the two frames it takes.
     pub thumb: Option<&'a egui::TextureHandle>,
+    /// Ticked for a bulk operation. Drawn on every row whether or not anything
+    /// is ticked: a box that only appeared once you had found the first one is
+    /// a feature nobody finds.
+    pub picked: bool,
 }
 
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
@@ -1754,9 +1762,32 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         painter.rect_filled(rect, metrics::RADIUS, p.control);
     }
 
-    // The eye is its own hit target inside the row, so toggling visibility
-    // does not also change the selection.
-    let eye = Rect::from_min_size(rect.left_top() + vec2(5.0, 6.0), vec2(18.0, 18.0));
+    // The tick box, and then the eye. Both are their own hit targets inside the
+    // row, so neither also changes the selection: ticking four rows to hide
+    // them would otherwise move the brush four times on the way.
+    let pick = Rect::from_min_size(rect.left_top() + vec2(4.0, 6.0), vec2(18.0, 18.0));
+    let pick_response = ui.interact(pick, ui.id().with(("pick", slot)), Sense::click());
+    let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(12.0));
+    if row.picked {
+        ui.painter().rect_filled(box_rect, 2.0, p.accent);
+        icons::draw(ui.painter(), box_rect.shrink(1.0), Icon::Check, p.window);
+    } else {
+        ui.painter().rect_stroke(
+            box_rect,
+            2.0,
+            Stroke::new(
+                1.0,
+                if pick_response.hovered() {
+                    p.text_dim
+                } else {
+                    p.border
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let eye = Rect::from_min_size(rect.left_top() + vec2(23.0, 6.0), vec2(18.0, 18.0));
     let eye_response = ui.interact(eye, ui.id().with(("eye", slot)), Sense::click());
 
     icons::draw(
@@ -1773,7 +1804,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     // laying it on a flat fill would say the layer was opaque. Where there is
     // no picture at all the checker is the whole chip, and that is the stated
     // "nothing on this layer" state; see [`LayerRow::thumb`].
-    let thumb = Rect::from_min_size(rect.left_top() + vec2(27.0, 3.0), vec2(24.0, 24.0));
+    let thumb = Rect::from_min_size(rect.left_top() + vec2(45.0, 3.0), vec2(24.0, 24.0));
     painter.rect_filled(thumb, 3.0, p.window);
     for i in 0..4 {
         for j in 0..4 {
@@ -1886,6 +1917,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         clicked: response.clicked(),
         eye_clicked: eye_response.clicked(),
         mask_clicked,
+        pick_clicked: pick_response.clicked(),
     }
 }
 

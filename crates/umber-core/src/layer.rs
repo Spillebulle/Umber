@@ -110,6 +110,21 @@ pub struct Layer {
     pub locked: bool,
     /// Travels with the other linked layers when any of them is moved.
     pub linked: bool,
+    /// Ticked in the list, for an operation that is about to be done to
+    /// several layers at once.
+    ///
+    /// **Deliberately not written to the file.** Every other flag here is a
+    /// property of the picture; this one is a statement about what the painter
+    /// is *about to do*, and reopening a document to find four layers still
+    /// ticked from last week would be an instruction nobody gave. It is a field
+    /// rather than a set held beside the stack because a set would have to be
+    /// keyed by slot and then kept in step with reordering and deletion by
+    /// hand — as a field both come free, which is the same argument
+    /// [`Layer::linked`] makes for itself.
+    ///
+    /// Read through [`LayerStack::targets`], never off the field: what a bulk
+    /// operation reaches is one rule and it has one place.
+    pub picked: bool,
     /// Texture-array slice holding this layer's pixels. Stable for the layer's
     /// lifetime.
     slot: u32,
@@ -147,6 +162,7 @@ impl Layer {
             clipped: false,
             locked: false,
             linked: false,
+            picked: false,
             slot,
             mask: None,
         }
@@ -362,6 +378,49 @@ impl LayerStack {
     /// part.
     pub fn any_locked(&self) -> bool {
         self.layers.iter().any(|l| l.locked)
+    }
+
+    // --- ticking several layers ---------------------------------------------
+
+    /// Stack positions of every ticked layer, ascending.
+    pub fn picked_indices(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.picked)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// How many layers are ticked.
+    pub fn picked_count(&self) -> usize {
+        self.layers.iter().filter(|l| l.picked).count()
+    }
+
+    /// **What a bulk operation reaches**, and the one place that is decided:
+    /// every ticked layer, or the selected one alone when nothing is ticked.
+    ///
+    /// The fallback is what keeps the buttons from being dead half the time. It
+    /// also means there is no second, single-layer spelling of "hide this" to
+    /// drift from this one — the ordinary case is this rule with an empty tick
+    /// list, so a bulk operation and a single one are the same code.
+    ///
+    /// Ascending, so a caller deleting them can walk the list backwards and
+    /// have every index still be valid as it goes.
+    pub fn targets(&self) -> Vec<usize> {
+        let picked = self.picked_indices();
+        if picked.is_empty() {
+            vec![self.active]
+        } else {
+            picked
+        }
+    }
+
+    /// Tick or untick every layer at once.
+    pub fn pick_all(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            layer.picked = on;
+        }
     }
 
     /// Stack positions of every linked layer, ascending.
@@ -881,6 +940,53 @@ mod tests {
         s.reorder(0, 3);
         assert_eq!(s.active_slot(), slot);
         assert_eq!(s.active_index(), 0, "two layers moved up past it");
+    }
+
+    // --- ticking -----------------------------------------------------------
+
+    /// The one rule for what a bulk operation reaches. The fallback is what
+    /// keeps a bulk operation and a single one from being two pieces of code.
+    #[test]
+    fn a_bulk_operation_reaches_the_ticked_layers_or_the_selected_one() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.set_active(1);
+        assert_eq!(s.targets(), vec![1], "nothing ticked is the selected layer");
+        assert_eq!(s.picked_count(), 0);
+
+        s.get_mut(0).unwrap().picked = true;
+        s.get_mut(2).unwrap().picked = true;
+        assert_eq!(s.targets(), vec![0, 2]);
+        assert_eq!(s.picked_count(), 2);
+        assert!(
+            !s.targets().contains(&1),
+            "the selected layer is not reached once something is ticked"
+        );
+
+        s.pick_all(false);
+        assert_eq!(s.targets(), vec![1]);
+        s.pick_all(true);
+        assert_eq!(s.targets(), vec![0, 1, 2]);
+    }
+
+    /// A tick belongs to the layer, not to a position — which is the whole
+    /// reason it is a field rather than a set of positions held beside the
+    /// stack. Both of these would have had to be maintained by hand.
+    #[test]
+    fn a_tick_follows_its_layer_and_goes_when_the_layer_does() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.get_mut(0).unwrap().picked = true;
+        let slot = s.get(0).unwrap().slot();
+
+        s.reorder(0, 2);
+        assert_eq!(s.picked_indices(), vec![2]);
+        assert_eq!(s.get(2).unwrap().slot(), slot);
+
+        s.remove(2);
+        assert_eq!(s.picked_indices(), Vec::<usize>::new());
     }
 
     #[test]
