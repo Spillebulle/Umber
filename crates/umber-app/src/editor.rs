@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, BrushPreset, Camera, Color, Document, History, Hsv, InputPoint, LayerStack,
-    Selection, SelectionDraft, SelectionMode, StrokeBuilder, TipMask,
+    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, Handle, History, Hsv, InputPoint,
+    LayerStack, Selection, SelectionDraft, SelectionMode, StrokeBuilder, TipMask, Transform,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -52,12 +52,13 @@ pub struct BrushResize {
 }
 
 /// The selected tool. Brush and eraser paint, select marks out where they may,
-/// and pan and zoom navigate.
+/// transform moves what they marked, and pan and zoom navigate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Brush,
     Eraser,
     Select,
+    Transform,
     Pan,
     Zoom,
 }
@@ -67,6 +68,34 @@ impl Tool {
         matches!(self, Self::Brush | Self::Eraser)
     }
 }
+
+/// Pixels picked up off a layer — or pasted onto one — being moved about.
+///
+/// Transient like [`Editor::stroke`], and for the same reason it sits above the
+/// `--- documents ---` line: every path that would leave the document behind
+/// puts it down first, so it never has to travel. Its pixels live in the
+/// renderer; what is here is only where they have been dragged to.
+#[derive(Clone, Copy, Debug)]
+pub struct Floating {
+    pub xf: Transform,
+    /// The layer slot the pixels belong to, snapshotted for the same reason
+    /// [`Editor::stroke_slot`] is: selecting another layer mid-gesture must not
+    /// land the commit somewhere else.
+    pub slot: u32,
+    /// True when the pixels were taken *out* of the layer, so the commit has to
+    /// restore the hole as well as the destination. A paste is the other case.
+    pub lifted: bool,
+    /// What the pointer has hold of, and the document point it grabbed at.
+    /// Absolute against that point rather than accumulated per event — see
+    /// [`Transform::drag`].
+    pub drag: Option<(Handle, Vec2)>,
+}
+
+/// How near a handle a press has to land, in *screen* pixels. Divided by the
+/// zoom at the point of use, exactly as the polygon lasso's close distance is:
+/// a fixed document distance would be impossible to hit at 10% and impossible
+/// to avoid at 800%.
+pub const HANDLE_GRAB_PIXELS: f32 = 8.0;
 
 /// Presentation state — what the interface looks like, not what the document
 /// contains. Kept apart from the document so it can be persisted separately
@@ -271,6 +300,17 @@ pub struct Editor {
     pub pixels_per_point: f32,
 
     pub stroke: StrokeBuilder,
+    /// The floating transform in progress, if there is one.
+    ///
+    /// Transient, like [`Editor::stroke`]: everything that would leave the
+    /// document behind commits it first, so it never crosses a tab switch.
+    pub float: Option<Floating>,
+    /// What was last copied, ready to be pasted.
+    ///
+    /// Genuinely session-wide rather than per-document — copying out of one tab
+    /// and into another is most of what a clipboard is for — so it belongs
+    /// above the `--- documents ---` line and stays there across a switch.
+    pub clipboard: Option<Clip>,
     /// The selection outline being drawn, if one is. Transient like
     /// [`Editor::stroke`], and abandoned rather than carried across a tab
     /// switch — half a lasso belongs to the gesture, not to the document.
@@ -378,6 +418,8 @@ impl Default for Editor {
             pixels_per_point: 1.0,
             selection: None,
             stroke: StrokeBuilder::new(),
+            float: None,
+            clipboard: None,
             selection_draft: None,
             selection_outline: Vec::new(),
             history: History::default(),
@@ -510,7 +552,7 @@ impl Editor {
         match tool {
             Tool::Brush => self.brush.mode = BrushMode::Paint,
             Tool::Eraser => self.brush.mode = BrushMode::Erase,
-            Tool::Select | Tool::Pan | Tool::Zoom => {}
+            Tool::Select | Tool::Transform | Tool::Pan | Tool::Zoom => {}
         }
     }
 
@@ -616,6 +658,13 @@ impl Editor {
         // The gesture, unlike the selection, does not travel: it belonged to
         // the pointer, and the pointer is now over a different document.
         self.selection_draft = None;
+        // Belt and braces. Every caller owes this a document with nothing
+        // floating — the pixels live in the *outgoing* document's renderer, so
+        // carrying the record across would leave a preview standing in front of
+        // a layer in a tab nobody is looking at. `app.rs` commits it before
+        // every one of these; clearing it here means a path that forgot leaves
+        // an abandoned transform rather than a corrupted one.
+        self.float = None;
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*
         // document being carried into the next commit.
@@ -881,15 +930,127 @@ impl Editor {
         self.cancel_selection_draft();
     }
 
+    // --- floating transforms ------------------------------------------------
+
+    /// How near a handle a press has to land, in document pixels.
+    pub fn handle_tolerance(&self) -> f32 {
+        HANDLE_GRAB_PIXELS / self.camera.zoom.max(1e-3)
+    }
+
+    /// The rectangle a transform would pick up: the selection, or the whole
+    /// canvas where there is none.
+    ///
+    /// The whole canvas rather than the layer's own ink, because the engine
+    /// does not know where a layer's ink is — finding out means reading it
+    /// back, which blocks — and a transform of an empty region is harmless.
+    pub fn transform_region(&self) -> umber_core::PixelRect {
+        match self.selection.as_ref() {
+            Some(sel) => sel.bounds(),
+            None => umber_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: self.doc.size.x,
+                height: self.doc.size.y,
+            },
+        }
+    }
+
+    /// Would a press here pick something up?
+    ///
+    /// Inside the selection, or anywhere on the canvas where there is none.
+    /// Answered from the **outline** rather than from its bounding rectangle,
+    /// which is what makes pressing beside a lasso mean "not this" instead of
+    /// lifting the whole box the lasso happens to fit in.
+    pub fn transform_would_grab(&self, doc: Vec2) -> bool {
+        match self.selection.as_ref() {
+            Some(sel) => sel.contains(doc),
+            None => {
+                let size = self.doc.size_vec2();
+                doc.x >= 0.0 && doc.y >= 0.0 && doc.x < size.x && doc.y < size.y
+            }
+        }
+    }
+
+    /// A press on the canvas with the transform tool in hand, in document
+    /// space. Returns what it took hold of, if anything.
+    ///
+    /// Only ever called with a float already up: picking one up needs the GPU,
+    /// so `app.rs` does that first.
+    pub fn transform_press(&mut self, doc: Vec2) -> Option<Handle> {
+        let tolerance = self.handle_tolerance();
+        let float = self.float.as_mut()?;
+        let handle = float.xf.grab(doc, tolerance)?;
+        float.drag = Some((handle, doc));
+        Some(handle)
+    }
+
+    /// The pointer moved with a handle held. `uniform` is Shift.
+    pub fn transform_moved(&mut self, doc: Vec2, uniform: bool) -> bool {
+        let Some(float) = self.float.as_mut() else {
+            return false;
+        };
+        let Some((handle, from)) = float.drag else {
+            return false;
+        };
+        float.xf.drag(handle, from, doc, uniform);
+        // A move accumulates — it has nothing to be absolute against — so its
+        // origin walks with the pointer. Every other handle is absolute against
+        // where it was grabbed, which is what makes coming back to that point
+        // come back to the transform it started with.
+        if handle == Handle::Move {
+            float.drag = Some((handle, doc));
+        }
+        true
+    }
+
+    pub fn transform_release(&mut self) {
+        if let Some(float) = self.float.as_mut() {
+            float.drag = None;
+        }
+    }
+
+    /// Move the selection outline along with the pixels it described.
+    ///
+    /// Called at commit. Without it the marquee stays where the artist dragged
+    /// the picture *from*, which then clips the next stroke to a region that no
+    /// longer holds anything — an outline that lies about what it covers.
+    ///
+    /// The rings are geometry, so this is the forward transform applied to
+    /// them and a re-rasterisation. Nothing in `selection.rs` needed changing
+    /// for it.
+    pub fn carry_selection(&mut self, xf: &Transform) {
+        let Some(selection) = self.selection.as_ref() else {
+            return;
+        };
+        let m = xf.matrix();
+        let rings: Vec<Vec<Vec2>> = selection
+            .rings()
+            .iter()
+            .map(|ring| ring.iter().map(|p| m.apply(*p)).collect())
+            .collect();
+        self.selection = Selection::from_rings(rings, self.doc.size).map(Arc::new);
+    }
+
     /// Flatten the layer stack into what the composite pass consumes.
     ///
     /// Bottom-to-top, matching the shader's iteration order.
-    pub fn layer_draws(&self) -> Vec<LayerDraw> {
+    ///
+    /// `float` is `CanvasRenderer::float_preview`'s answer — the layer slot a
+    /// floating transform stands in front of, and the slice holding the preview
+    /// of it. Swapping the slot here is the **whole** of how a float reaches the
+    /// screen: the preview slice already holds what the layer will hold once the
+    /// pixels are put down, so the composite shader draws it at the right
+    /// position, under the right blend mode, at the right opacity, without
+    /// knowing a transform exists. See `CanvasRenderer::float_preview`.
+    pub fn layer_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerDraw> {
         self.layers
             .layers()
             .iter()
             .map(|l| LayerDraw {
-                slot: l.slot(),
+                slot: match float {
+                    Some((from, to)) if from == l.slot() => to,
+                    _ => l.slot(),
+                },
                 opacity: l.opacity,
                 blend: l.blend.index(),
                 visible: l.visible,

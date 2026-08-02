@@ -221,6 +221,14 @@ Next, roughly in order:
 - **`lock_alpha`** — painting only where the layer already has coverage. Nothing
   in the shipped library needs it; it is worth building as a painting feature in
   its own right.
+- **The system clipboard.** Copy and paste move pixels inside Umber and between
+  its tabs today; nothing goes to or comes from another application. What stands
+  in the way is a dependency that has to hold to the standard `ureq` does — no C
+  toolchain, and working on the aarch64 cross-builds and inside the Flatpak
+  sandbox — rather than anything about the pixels, which `umber_core::clipboard`
+  already holds in the straight-alpha sRGB form an interchange format wants.
+- **Adding to and subtracting from a selection**, and a feather. Both live in
+  `umber_core::selection`, which today builds one mask from one gesture.
 - Scatter that reacts to pen speed
 - Per-brush blend modes
 - **rubberduck's stamps in the shipped library.** Three packs' stamps ship now;

@@ -1,7 +1,7 @@
 //! Window lifecycle, input translation and the frame loop.
 
 use crate::canvasdlg;
-use crate::editor::{Editor, Interaction, Tool};
+use crate::editor::{Editor, Floating, Interaction, Tool};
 use crate::keylayout;
 use crate::logo;
 use crate::session::{DocId, DocumentState};
@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::{
-    Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
+    Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect, Transform,
 };
-use umber_render::{CanvasRenderer, CompositeParams, DabStyle, Gpu, ProbeParams};
+use umber_render::{
+    CanvasRenderer, CompositeParams, DabStyle, FloatParams, FloatSource, Gpu, ProbeParams,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
@@ -379,6 +381,13 @@ impl UmberApp {
     }
 
     fn undo(&mut self) {
+        // Put the floating picture down first. Undo writes straight into the
+        // layer, and a preview standing in front of it would go on showing the
+        // state the undo just replaced — and would then commit back over it.
+        // Here rather than at the call sites: the keyboard, the History
+        // module's rows and `jump_history` all reach this, and one of the three
+        // would have been forgotten.
+        self.finish_transform();
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
@@ -406,6 +415,7 @@ impl UmberApp {
     }
 
     fn redo(&mut self) {
+        self.finish_transform();
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
@@ -424,6 +434,273 @@ impl UmberApp {
             PixelPatch::new(patch.rect, patch.slot, current),
         ));
         self.editor.mark_modified();
+    }
+
+    // --- the transform tool -------------------------------------------------
+
+    /// Which layer slice the composite pass must be shown a preview slice for
+    /// instead, if a transform is floating over the document in front.
+    ///
+    /// One call rather than a field, because the answer is the renderer's and a
+    /// second copy of it could go stale — a resize or a tab switch ends a float
+    /// on the renderer's side.
+    fn float_preview(&self) -> Option<(u32, u32)> {
+        let id = self.editor.session.active_id();
+        self.gfx.as_ref()?.canvases.get(&id)?.float_preview()
+    }
+
+    /// Everything a float needs from the GPU, in one place.
+    ///
+    /// `pixels` is `Some` for a paste and `None` for a lift out of the layer;
+    /// that is also what decides whether the commit has a hole to restore.
+    /// Returns false when there was no room, which is when the layer stack is
+    /// already using every slice the composite shader's array has.
+    fn begin_float(&mut self, rect: PixelRect, pixels: Option<&[u8]>) -> bool {
+        let slot = self.editor.layers.active_slot();
+        let reserved = self.editor.layers.slot_capacity_needed();
+        // A lift is clipped by the selection; a paste puts down exactly what it
+        // was given, having been masked when it was copied.
+        let mask = pixels
+            .is_none()
+            .then(|| self.editor.selection.clone())
+            .flatten();
+        let id = self.editor.session.active_id();
+
+        let started = {
+            let Some(gfx) = self.gfx.as_mut() else {
+                return false;
+            };
+            let Some(canvas) = gfx.canvases.get_mut(&id) else {
+                return false;
+            };
+            canvas
+                .begin_float(
+                    &gfx.gpu.device,
+                    &gfx.gpu.queue,
+                    reserved,
+                    &FloatSource {
+                        slot,
+                        rect,
+                        pixels,
+                        mask: mask.as_deref(),
+                    },
+                )
+                .is_some()
+        };
+        if !started {
+            self.editor.notice = Some(Notice {
+                title: "Nothing was picked up".to_string(),
+                lines: vec![
+                    "A transform needs a spare texture slice to preview into, and this \
+                     document's layers are using every one Umber has. Merging or deleting \
+                     a layer will free one."
+                        .to_string(),
+                ],
+            });
+            return false;
+        }
+        self.editor.float = Some(Floating {
+            xf: Transform::identity(rect),
+            slot,
+            lifted: pixels.is_none(),
+            drag: None,
+        });
+        true
+    }
+
+    /// A press on the canvas with the transform tool in hand.
+    ///
+    /// With no float up, a press inside the region picks it up and the same
+    /// press starts dragging it — one gesture, as it would be with any other
+    /// tool. With one up, a press that has hold of nothing puts the pixels
+    /// down; the next press picks up again.
+    fn transform_press(&mut self, screen: Vec2) {
+        let doc = self.editor.screen_to_doc(screen);
+        if self.editor.float.is_some() {
+            if self.editor.transform_press(doc).is_none() {
+                self.finish_transform();
+            }
+            return;
+        }
+        if !self.editor.transform_would_grab(doc) {
+            return;
+        }
+        // A stroke still in flight belongs to the layer this is about to lift
+        // out of, and would otherwise be baked in underneath the hole.
+        self.finish_stroke();
+        let rect = self.editor.transform_region();
+        if self.begin_float(rect, None) {
+            self.editor.transform_press(doc);
+        }
+    }
+
+    /// Put the floating pixels down, recording the edit.
+    ///
+    /// The undo patch is captured here rather than when the pixels were picked
+    /// up, for exactly the reason `finish_stroke`'s is: the layer is untouched
+    /// until this moment, so reading it now yields the pre-transform pixels —
+    /// and only now is the damaged rectangle known.
+    fn finish_transform(&mut self) {
+        let Some(float) = self.editor.float.take() else {
+            return;
+        };
+        let doc = self.editor.doc.size;
+        let params = FloatParams {
+            inverse: float.xf.inverse(),
+            dest: float.xf.dest_rect(doc),
+        };
+        // A lift that never moved puts back exactly what it took, so there is
+        // nothing to write and nothing to name in the history. A *paste* is
+        // never in that case even at identity: its pixels were not there
+        // before.
+        let unchanged = float.lifted && float.xf.is_identity();
+        let damage = float.xf.damage(doc, float.lifted).filter(|_| !unchanged);
+
+        let id = self.editor.session.active_id();
+        let Some(gfx) = self.gfx.as_mut() else {
+            return;
+        };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
+        let Some(damage) = damage else {
+            canvas.end_float();
+            return;
+        };
+
+        // Blocks on the GPU, and is submitted on its own encoder so it observes
+        // the layer before the commit below touches it. Once per gesture, at
+        // pointer-up, exactly as a stroke's is.
+        let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage);
+        self.editor.history.record(Edit::new(
+            EditKind::Transform,
+            PixelPatch::new(damage, float.slot, before),
+        ));
+
+        let mut enc = gfx
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("finish-transform"),
+            });
+        canvas.commit_float(&gfx.gpu.queue, &mut enc, damage, &params);
+        gfx.gpu.queue.submit(Some(enc.finish()));
+        canvas.end_float();
+
+        // The marquee follows the picture it described. Only for a lift: a
+        // paste did not come out of the selection, so moving it would be a
+        // claim about the artist's intent that nothing supports.
+        if float.lifted {
+            self.editor.carry_selection(&float.xf);
+        }
+        self.editor.mark_modified();
+    }
+
+    /// Abandon a floating transform. The layer was never written to, so this is
+    /// only giving the storage back.
+    fn cancel_transform(&mut self) -> bool {
+        if self.editor.float.take().is_none() {
+            return false;
+        }
+        let id = self.editor.session.active_id();
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(canvas) = gfx.canvases.get_mut(&id)
+        {
+            canvas.end_float();
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Take the selection — or the whole layer where there is none — onto
+    /// Umber's clipboard.
+    ///
+    /// `read_layer_rect` blocks, which is acceptable here for the same reason
+    /// it is acceptable in a save: this is an explicit action and is nowhere
+    /// near the drawing loop.
+    fn copy_selection(&mut self) {
+        self.finish_transform();
+        self.finish_stroke();
+        let rect = self.editor.transform_region();
+        let slot = self.editor.layers.active_slot();
+        let mask = self.editor.selection.clone();
+        let id = self.editor.session.active_id();
+
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
+        let bytes = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
+        match umber_core::Clip::from_layer(rect, &bytes, mask.as_deref()) {
+            Some(clip) => {
+                log::info!("copied {} × {}", clip.size().x, clip.size().y);
+                self.editor.clipboard = Some(clip);
+            }
+            // Nothing under the selection. The previous clipboard is left
+            // alone: wiping it because a copy landed on an empty patch of
+            // canvas would lose whatever the artist actually meant to keep.
+            None => log::info!("nothing to copy"),
+        }
+    }
+
+    /// Put the clipboard down as a floating transform, ready to be moved.
+    ///
+    /// It arrives floating rather than committed, which is the whole reason the
+    /// two features are one: a paste that had already been baked into the layer
+    /// would have to be undone to be repositioned.
+    fn paste(&mut self) {
+        let Some(clip) = self.editor.clipboard.clone() else {
+            return;
+        };
+        self.finish_transform();
+        self.finish_stroke();
+
+        let doc = self.editor.doc.size;
+        // Into the middle of the selection where there is one — "paste into
+        // what I marked out" — and otherwise into the middle of what the artist
+        // is looking at. A paste that lands in a corner of the canvas nobody is
+        // looking at appears to have done nothing.
+        let centre = match self.editor.selection.as_ref() {
+            Some(sel) => {
+                let b = sel.bounds();
+                Vec2::new(
+                    b.x as f32 + b.width as f32 * 0.5,
+                    b.y as f32 + b.height as f32 * 0.5,
+                )
+            }
+            None => self
+                .editor
+                .camera
+                .center
+                .clamp(Vec2::ZERO, self.editor.doc.size_vec2()),
+        };
+        let Some(placed) = clip.place(doc, centre) else {
+            log::info!("the paste landed entirely off the canvas");
+            return;
+        };
+        if placed.rect.width < clip.size().x || placed.rect.height < clip.size().y {
+            // Said out loud rather than logged, for the same reason an import
+            // that loses something says so: silently cropping somebody's
+            // picture is worse than refusing to.
+            self.editor.notice = Some(Notice {
+                title: "The paste was cropped".to_string(),
+                lines: vec![format!(
+                    "What was copied is {} × {} and this canvas is {} × {}, so only the \
+                     middle of it was pasted. Enlarge the canvas under Image → Canvas \
+                     settings and paste again to keep the rest.",
+                    clip.size().x,
+                    clip.size().y,
+                    doc.x,
+                    doc.y,
+                )],
+            });
+        }
+        if self.begin_float(placed.rect, Some(&placed.pixels)) {
+            // The box has handles, and they are the transform tool's. Landing
+            // in another tool would leave a preview nothing could act on.
+            self.editor.set_tool(Tool::Transform);
+            self.request_redraw();
+        }
     }
 
     /// Move the document to `position` in the history — the number of recorded
@@ -456,6 +733,10 @@ impl UmberApp {
 
     /// Erase the active layer, leaving the rest of the stack alone.
     fn clear_active_layer(&mut self) {
+        // Abandoned rather than committed: clearing the layer is the artist
+        // saying they want none of it, and putting the floating pixels down
+        // first only to wipe them would be theatre.
+        self.cancel_transform();
         let slot = self.editor.layers.active_slot();
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
@@ -478,6 +759,9 @@ impl UmberApp {
     }
 
     fn add_layer(&mut self) {
+        // A new layer takes the next slot, which is the one a float would be
+        // previewing into. Put the picture down before the two can collide.
+        self.finish_transform();
         let Some(slot) = self.editor.layers.add() else {
             log::warn!("layer limit reached");
             return;
@@ -504,6 +788,7 @@ impl UmberApp {
     }
 
     fn delete_layer(&mut self, index: usize) {
+        self.finish_transform();
         if self.editor.layers.remove(index).is_none() {
             return;
         }
@@ -540,6 +825,17 @@ impl UmberApp {
             self.editor.finish_selection();
             return true;
         }
+        // The same pair for a floating transform, and claimed on the same
+        // terms: only while one is up, so Escape goes on reaching whatever
+        // else wants it. Escape throws the move away — the layer was never
+        // written to — and Enter puts the pixels down.
+        if matches!(key, KeyCode::Escape) && self.cancel_transform() {
+            return true;
+        }
+        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter) && self.editor.float.is_some() {
+            self.finish_transform();
+            return true;
+        }
 
         let Some(action) = shortcuts::resolve(&self.bindings, key, self.modifiers) else {
             return false;
@@ -555,11 +851,14 @@ impl UmberApp {
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
             Action::Deselect => self.editor.deselect(),
-            Action::BrushTool => self.editor.set_tool(Tool::Brush),
-            Action::EraserTool => self.editor.set_tool(Tool::Eraser),
-            Action::SelectTool => self.editor.set_tool(Tool::Select),
-            Action::PanTool => self.editor.set_tool(Tool::Pan),
-            Action::ZoomTool => self.editor.set_tool(Tool::Zoom),
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste(),
+            Action::BrushTool => self.pick_tool(Tool::Brush),
+            Action::EraserTool => self.pick_tool(Tool::Eraser),
+            Action::SelectTool => self.pick_tool(Tool::Select),
+            Action::TransformTool => self.pick_tool(Tool::Transform),
+            Action::PanTool => self.pick_tool(Tool::Pan),
+            Action::ZoomTool => self.pick_tool(Tool::Zoom),
             Action::SwapColours => self.editor.swap_colors(),
             Action::SizeDown => {
                 self.editor.brush.size =
@@ -575,6 +874,18 @@ impl UmberApp {
             Action::ZoomOut => self.editor.zoom_by(1.0 / ZOOM_KEY_STEP),
         }
         true
+    }
+
+    /// Choose a tool, putting any floating transform down on the way out.
+    ///
+    /// The per-frame invariant in `render` would catch this a frame later, but
+    /// a shortcut that changes tool should have finished with the pixels by the
+    /// time the next event arrives.
+    fn pick_tool(&mut self, tool: Tool) {
+        if tool != Tool::Transform {
+            self.finish_transform();
+        }
+        self.editor.set_tool(tool);
     }
 
     /// Start or stop the brush-size drag — Alt held down with nothing else.
@@ -614,7 +925,7 @@ impl UmberApp {
             return;
         }
 
-        let layers = self.editor.layer_draws();
+        let layers = self.editor.layer_draws(self.float_preview());
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
@@ -660,6 +971,10 @@ impl UmberApp {
     }
 
     fn save_document(&mut self, always_ask: bool) -> bool {
+        // The floating pixels are not in any layer yet, so a save that ran
+        // round them would write a file that disagreed with the screen. Put
+        // them down first, which is what the artist meant by saving.
+        self.finish_transform();
         let id = self.editor.session.active_id();
         // An autosave already reading this document would land on the file
         // about to be written, a stroke or two behind it. The explicit save
@@ -730,8 +1045,11 @@ impl UmberApp {
                 .collect();
             // The flattened preview the format requires comes from the same
             // composite pass the screen uses, so it cannot disagree with it.
-            let merged =
-                canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &self.editor.layer_draws());
+            let merged = canvas.export_rgba(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                &self.editor.layer_draws(None),
+            );
 
             let layers: Vec<SaveLayer<'_>> = stack
                 .iter()
@@ -831,6 +1149,7 @@ impl UmberApp {
 
     /// Flatten the visible stack and write it to a PNG the user picks.
     fn export_png(&mut self) {
+        self.finish_transform();
         let id = self.editor.session.active_id();
         // The tab is named after its file once it has one, so the suggestion
         // has to lose that extension or it comes out as `sketch.ora.png`.
@@ -853,7 +1172,7 @@ impl UmberApp {
             return;
         };
 
-        let layers = self.editor.layer_draws();
+        let layers = self.editor.layer_draws(None);
         let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
 
         let size = self.editor.doc.size;
@@ -1044,8 +1363,13 @@ impl UmberApp {
         // pointer is doing anything at all — so "every five minutes" is really
         // "at the first quiet moment after five minutes", which is also what a
         // painter would choose.
+        // A float counts as busy even with the pointer up. Its pixels are not
+        // in any layer yet, so a document autosaved mid-transform would be
+        // written without them — and the file would then disagree with the
+        // screen, which is the one thing an autosave must not do.
         let quiet = self.editor.interaction == Interaction::Idle
             && !self.editor.stroke.is_active()
+            && self.editor.float.is_none()
             && self.editor.touches.is_empty();
         crate::autosave::drive(
             &mut self.editor,
@@ -1078,7 +1402,22 @@ impl UmberApp {
             );
         }
 
-        let layer_draws = self.editor.layer_draws();
+        // Before the composite, into the same encoder: the preview slice has to
+        // hold this frame's position of the picture by the time the stack is
+        // drawn. It restores only what the previous frame wrote plus what this
+        // one will, and allocates nothing.
+        if let Some(float) = self.editor.float {
+            canvas.draw_float(
+                &gfx.gpu.queue,
+                &mut encoder,
+                &FloatParams {
+                    inverse: float.xf.inverse(),
+                    dest: float.xf.dest_rect(self.editor.doc.size),
+                },
+            );
+        }
+
+        let layer_draws = self.editor.layer_draws(canvas.float_preview());
 
         // A smudging brush needs to know what it is passing over. The read is
         // asynchronous: this records a sample and collects whichever earlier one
@@ -1187,6 +1526,21 @@ impl UmberApp {
         }
 
         // Applied after the `gfx` borrow ends, since these take `&mut self`.
+
+        // A float only ever exists with the transform tool in hand and on the
+        // layer it was picked up from. Checked here, once, rather than at every
+        // control that can change either: the rail, the Window menu's
+        // shortcuts, the layer list and a preset all reach one of them, and an
+        // invariant enforced at five call sites is one that will be forgotten
+        // at the sixth. The preview would otherwise go on standing in front of
+        // a layer nobody is editing.
+        if let Some(float) = self.editor.float
+            && (self.editor.ui.tool != Tool::Transform
+                || self.editor.layers.active_slot() != float.slot)
+        {
+            self.finish_transform();
+        }
+
         if actions.undo {
             self.undo();
         }
@@ -1301,6 +1655,7 @@ impl UmberApp {
         if index == self.editor.session.active_index() {
             return;
         }
+        self.finish_transform();
         self.finish_stroke();
         if self.editor.switch_tab(index) {
             self.request_redraw();
@@ -1314,6 +1669,7 @@ impl UmberApp {
 
     /// Open a blank document with the settings the New dialog was given.
     fn create_document(&mut self, doc: Document) {
+        self.finish_transform();
         self.finish_stroke();
         let id = self.editor.create_document(doc);
         let slots = self.editor.layers.slot_capacity_needed();
@@ -1330,6 +1686,10 @@ impl UmberApp {
     /// the editor takes the new document — which is also what clears the undo
     /// history when the geometry moves — and the GPU carries the pixels across.
     fn apply_canvas(&mut self, change: canvasdlg::CanvasChange) {
+        // Before the stroke, because a resize throws the float's storage away
+        // too — and its rectangles name pixels of a canvas that is about to
+        // stop existing.
+        self.finish_transform();
         self.finish_stroke();
         let id = self.editor.session.active_id();
         // A resize throws the layer textures away and rebuilds them, so a
@@ -1353,6 +1713,7 @@ impl UmberApp {
 
     /// Close a document and free the GPU storage that was holding its pixels.
     fn close_document(&mut self, index: usize) {
+        self.finish_transform();
         self.finish_stroke();
         self.editor.ui.close_prompt = None;
         // Before the tab goes: the renderer is about to be dropped, and the
@@ -1391,6 +1752,11 @@ impl UmberApp {
     }
 
     fn open_path(&mut self, path: &Path) {
+        // The document in front is about to be parked, and a float belongs to
+        // it — its preview lives in *that* document's renderer, which would go
+        // on standing in front of a layer when the tab came back.
+        self.finish_transform();
+        self.finish_stroke();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1760,6 +2126,13 @@ impl ApplicationHandler<Wake> for UmberApp {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Drop the surface but keep editor state; Android tears the window
         // down when backgrounded.
+        //
+        // A floating transform does not survive it, and cannot: its pixels are
+        // in textures that go with the renderers. Dropped rather than
+        // committed, because committing needs the GPU that is being taken
+        // away — the same bargain the pixels themselves have always struck on
+        // this path.
+        self.editor.float = None;
         self.gfx = None;
     }
 
@@ -1866,6 +2239,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                 // the pen's dot gives way to the ordinary arrow. A pen sends
                 // none of these — see `Editor::pen_pointer`.
                 self.editor.pen_pointer = false;
+                let mut dragging_float = false;
 
                 match self.editor.interaction {
                     Interaction::Drawing => {
@@ -1915,10 +2289,22 @@ impl ApplicationHandler<Wake> for UmberApp {
                             let doc = self.editor.screen_to_doc(pos);
                             self.editor.selection_moved(doc);
                             self.editor.interaction = Interaction::Selecting;
+                        } else {
+                            // A transform handle, which is a third thing that
+                            // lives in this arm — and is exclusive with the
+                            // other two the same way, since a float only exists
+                            // with the transform tool in hand and the resize
+                            // needs Alt with nothing pressed. Shift constrains a
+                            // corner to one scale on both axes, as it does
+                            // everywhere else.
+                            let doc = self.editor.screen_to_doc(pos);
+                            dragging_float =
+                                self.editor.transform_moved(doc, self.modifiers.shift_key());
                         }
                     }
                 }
                 if (self.editor.interaction != Interaction::Idle
+                    || dragging_float
                     || self.editor.brush_resize.is_some())
                     && let Some(g) = self.gfx.as_ref()
                 {
@@ -1968,6 +2354,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                                 let doc = self.editor.screen_to_doc(pos);
                                 self.editor.selection_press(doc);
                             }
+                            Tool::Transform => self.transform_press(pos),
                             Tool::Pan => self.editor.interaction = Interaction::Panning,
                             Tool::Zoom => {
                                 self.editor.zoom_anchor = pos;
@@ -1975,6 +2362,10 @@ impl ApplicationHandler<Wake> for UmberApp {
                             }
                         }
                     } else if !pressed {
+                        // A handle let go of. The float itself stays up — the
+                        // box is still there to be dragged again — so this ends
+                        // the drag and not the transform.
+                        self.editor.transform_release();
                         match self.editor.interaction {
                             Interaction::Drawing => self.finish_stroke(),
                             // The polygon is the one gesture a release does not

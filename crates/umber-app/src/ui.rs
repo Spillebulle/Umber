@@ -220,6 +220,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         .show(root, |ui| {
             let rect = ui.max_rect();
             selection_outline(ui, &p, ed, rect);
+            transform_box(ui, &p, ed, rect);
             canvas_scrollbars(ui, &p, ed, rect);
             brush_size_preview(ui, &p, ed);
             // After the preview, so the pen sits on top of the ring rather
@@ -331,6 +332,53 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
             &ed.selection_outline,
             draft.mode() == SelectionMode::Rectangle,
         );
+    }
+}
+
+/// The box round a floating transform, and the handles that act on it.
+///
+/// Every one of these handles does something: the four corners scale both axes,
+/// the four edges scale one, and the ring just outside a corner turns the box.
+/// `Transform::grab` is what decides which, so what is drawn here and what the
+/// pointer takes hold of are the same eight positions read out of the same
+/// function — a handle that was painted somewhere the hit test did not agree
+/// with would be the worst kind of control that lies.
+///
+/// A solid line, not the selection's dashes. The two are often on screen
+/// together and they mean different things: the dashes are where an edit may
+/// land, and this is a picture that has not been put down yet.
+fn transform_box(ui: &mut egui::Ui, p: &Palette, ed: &Editor, rect: Rect) {
+    let Some(float) = ed.float.as_ref() else {
+        return;
+    };
+
+    // This frame's canvas rect, for the reason `selection_outline` gives:
+    // `Editor::canvas_pivot` is written after this runs and is a frame behind
+    // while the panels are being dragged.
+    let scale = ed.pixels_per_point.max(1e-3);
+    let pivot = glam::Vec2::new(rect.center().x, rect.center().y) * scale;
+    let camera = ed.camera;
+    let to_screen = |doc: glam::Vec2| {
+        let s = camera.doc_to_screen(doc, pivot);
+        pos2(s.x / scale, s.y / scale)
+    };
+
+    let painter = ui.painter().with_clip_rect(rect);
+    let quad = float.xf.quad();
+    let corners: Vec<egui::Pos2> = quad.iter().copied().map(to_screen).collect();
+    for i in 0..4 {
+        // Two passes, dark then light, so the box reads over both a white
+        // canvas and a black one — the same trick the selection outline uses,
+        // and neither colour is a literal.
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        painter.line_segment([a, b], Stroke::new(2.0, p.backdrop));
+        painter.line_segment([a, b], Stroke::new(1.0, p.accent));
+    }
+
+    for handle in umber_core::Handle::BOX {
+        let at = to_screen(float.xf.handle_at(handle));
+        painter.circle_filled(at, 4.0, p.backdrop);
+        painter.circle_filled(at, 3.0, p.accent);
     }
 }
 
@@ -685,6 +733,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Tool::Brush => (Icon::Brush, "Brush"),
             Tool::Eraser => (Icon::Eraser, "Eraser"),
             Tool::Select => (Icon::Select, "Select"),
+            Tool::Transform => (Icon::Transform, "Transform"),
             Tool::Pan => (Icon::Pan, "Pan"),
             Tool::Zoom => (Icon::Zoom, "Zoom"),
         };
@@ -739,6 +788,23 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                      Edit brush, on the Tip tab.",
                 );
             }
+        } else if ed.ui.tool == Tool::Transform {
+            // What the tool actually does, said plainly, because none of it is
+            // discoverable from a box with dots on it. Two sentences rather
+            // than a row of controls: there is nothing here to set — the whole
+            // gesture is the pointer's.
+            let hint = if ed.float.is_some() {
+                "Drag inside the box to move it, a handle to scale, or just                  outside a corner to turn it. Shift keeps the proportions.                  Enter puts it down, Escape throws the move away."
+            } else if ed.selection.is_some() {
+                "Press inside the selection to pick it up."
+            } else {
+                "Press on the canvas to pick the whole layer up. Select                  something first to move only part of it."
+            };
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
         } else if ed.ui.tool == Tool::Select {
             selection_mode_switch(ui, p, ed);
             ui.add_space(4.0);

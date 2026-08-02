@@ -723,7 +723,7 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing = vec2(metrics::TOOL_GAP, metrics::TOOL_GAP);
 
-        // Umber has five tools where the design shows sixteen; the rest are
+        // Umber has six tools where the design shows sixteen; the rest are
         // simply not drawn, rather than shown as buttons that do nothing.
         //
         // The keys come from the binding table rather than being written in:
@@ -744,6 +744,11 @@ fn tools_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                 Tool::Select,
                 Icon::Select,
                 shortcuts::labelled("Select", Action::SelectTool),
+            ),
+            (
+                Tool::Transform,
+                Icon::Transform,
+                shortcuts::labelled("Transform", Action::TransformTool),
             ),
             (
                 Tool::Pan,

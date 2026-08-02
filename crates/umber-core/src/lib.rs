@@ -8,6 +8,7 @@
 pub mod brush;
 pub mod brushimport;
 pub mod camera;
+pub mod clipboard;
 pub mod color;
 pub mod curve;
 pub mod docformat;
@@ -31,6 +32,7 @@ pub mod transform;
 
 pub use brush::{Brush, BrushMode, GrainPattern};
 pub use camera::{Camera, ScrollSpan};
+pub use clipboard::Clip;
 pub use color::{Color, Hsv};
 pub use curve::ResponseCurve;
 pub use docformat::{SaveDocument, SaveError, SaveLayer, SaveWarning};

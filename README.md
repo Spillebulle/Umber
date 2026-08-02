@@ -12,10 +12,10 @@ Umber paints on the GPU, reads brushes written for MyPaint, GIMP, Krita and
 Photoshop, opens documents from Krita and Photoshop, and saves to OpenRaster, so
 nothing you make here is trapped here.
 
-> **Early days.** Painting, layers, brushes, documents, selections and settings
-> all work on desktop. There is no mobile build yet, and no text or transform
-> tools. [What is not there yet](#what-is-not-there-yet) is honest about the
-> rest.
+> **Early days.** Painting, layers, brushes, documents, selections, transforms
+> and settings all work on desktop. There is no mobile build yet, and no text or
+> shape tools. [What is not there yet](#what-is-not-there-yet) is honest about
+> the rest.
 
 ![The Umber workspace: the tool rail, the canvas, and the Colour, Brushes,
 Layers and History modules](docs/images/window.png)
@@ -284,14 +284,45 @@ your painting is being held back. It is a plain dashed line rather than
 animated marching ants: animating it means asking for a new frame for ever, and
 Umber sits still when you do.
 
+## Moving things about
+
+The **Transform** tool picks a region up and lets you move, scale and turn it
+before putting it down. Press inside the selection to take it — or anywhere on
+the canvas, if nothing is selected, to take the whole layer. Then:
+
+| | |
+|---|---|
+| Drag inside the box | Move it |
+| Drag a corner or an edge handle | Scale it; the opposite handle stays put |
+| Hold `Shift` while scaling a corner | Keep the proportions |
+| Drag just outside a corner | Turn it about the centre |
+| `Enter`, or a press outside the box | Put it down |
+| `Esc` | Throw the move away |
+
+Nothing is written to the layer until you put it down, so abandoning a move
+costs nothing and undoing one restores both where the pixels went **and** the
+hole they came from, in a single step. The marquee travels with the picture it
+described. Scaling and rotation resample bilinearly, which is what the preview
+shows — the picture you are dragging is the picture that gets committed.
+
+`Ctrl` + `C` copies the selection, or the whole layer where there is none, and
+`Ctrl` + `V` pastes it back as a floating region the transform tool is already
+holding. A paste lands in the middle of the selection if there is one and
+otherwise in the middle of what you are looking at, nudged back on to the canvas
+if it would hang off. Something copied from a larger canvas is cropped to what
+fits, and Umber says so rather than doing it quietly. The clipboard is Umber's
+own: it carries between tabs but not yet to and from other applications.
+
 ## Controls
 
 | Input | Action |
 |---|---|
 | Left drag | Use the selected tool |
-| `B` / `E` / `S` / `H` / `Z` | Brush / eraser / select / pan / zoom |
+| `B` / `E` / `S` / `T` / `H` / `Z` | Brush / eraser / select / transform / pan / zoom |
 | `Ctrl` + `D` | Deselect |
+| `Ctrl` + `C` / `Ctrl` + `V` | Copy / paste |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
+| `Enter` / `Esc` while transforming | Put the picture down / throw the move away |
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
 | `Alt` + move, nothing held | Resize the brush, against a circle drawn at the size — right and up bigger |
@@ -321,10 +352,11 @@ platforms is on the roadmap.
 
 ## What is not there yet
 
-- **Text, shapes and transforms.** The tool rail has five tools. Selections
-  work — rectangle, freehand lasso and polygon, and painting is clipped to them
-  — but there is nothing yet to move, scale or rotate what one holds, no way to
-  add to or subtract from one, and no feather.
+- **Text and shapes.** The tool rail has six tools where the design draws
+  sixteen. Selections and transforms work; there is no way yet to add to or
+  subtract from a selection, and no feather.
+- **The system clipboard.** Copy and paste work inside Umber and between its
+  tabs. Nothing goes to or comes from other applications yet.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
   been built or run. Do not believe anyone who says otherwise.
 - **Automatic crash recovery.** Autosave keeps copies and Settings will open the

@@ -150,6 +150,72 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
   requesting a frame for ever, which is the cost `render`'s `repaint_at` exists
   to avoid.
 
+### Transforms and the clipboard
+
+`umber-core::transform` is the model, `transform.wgsl` and `CanvasRenderer`'s
+float methods are the pixels, and `umber-core::clipboard` is what copy and paste
+put on and take off.
+
+- **The preview and the commit are the same two commands, not two renderings.**
+  `Float::base` is the layer as the float will sit on it — the original pixels
+  with the lifted region taken out. `render_float` restores the damaged
+  rectangle out of it and draws the transformed copy over it, into a **spare
+  slice of the layer array**; the commit is that function again with the layer's
+  own slice as the target. So unlike the stroke there is no second copy of the
+  blend maths to keep in step, and there is nothing to get wrong: what the
+  screen showed during the drag is byte for byte what gets written.
+- **`composite.wgsl` was not touched, and must not be.** `Editor::layer_draws`
+  swaps the active layer's slot for the preview slice, which already holds what
+  the layer will hold — so the float composites at the right stack position,
+  under the right blend mode, at the right opacity, with none of that restated.
+  A uniform and a branch in the composite would be the divergence the selection
+  clip and this both exist to avoid.
+- **The layer is untouched until the commit.** That is what makes Escape free,
+  and it is what makes the undo patch — captured at commit, like a stroke's —
+  the pre-transform pixels.
+- **The patch spans source ∪ destination.** `Transform::damage`. One covering
+  only where the pixels went would undo to a document that still had the hole
+  in it. A paste has no source, so its damage is the destination alone.
+- **The destination is the bounding box of the *quad*, plus a pixel.** Exactly
+  `StrokeBuilder::bounds`'s rule and the same failure if it is too tight: a
+  turned rectangle reaches `half × sqrt(2)`, and an edge left uncommitted
+  redraws as a preview and is baked in by the next edit.
+- **Filtering is the hardware sampler's, and there is deliberately no CPU
+  resampler beside it.** The layer array is already `Linear`, so bilinear is
+  free; a second implementation called by nothing is the drift refused
+  everywhere else. What `umber-core` owns is the *map*, and
+  `a_transform_and_its_inverse_are_exact_opposites` pins it.
+- **A float exists only with the transform tool in hand, on the layer it came
+  from.** Checked once per frame in `render` rather than at the rail, the
+  shortcuts, the layer list and the preset — an invariant enforced at five call
+  sites is one that will be forgotten at the sixth. Every path that leaves the
+  document (tab switch, save, export, resize, close) commits it first, which is
+  what lets it live *above* the `--- documents ---` line like the stroke.
+- **A float counts as busy for the autosave**, pointer up or not. Its pixels are
+  in no layer, so a document written mid-transform would disagree with the
+  screen.
+- **The mask passes need their own bind group.** A colour target is an exclusive
+  usage, so the floating copy cannot be bound for sampling in the pass that
+  renders into it. `fs_mask` never reads that slot, so the mask stands in.
+- **`begin_float` submits twice.** `Queue::write_texture` is flushed *before*
+  the command buffers of the submission it precedes, so a paste cleared in the
+  same encoder is wiped. Once per gesture, where `start_stroke` already submits.
+- **The clipboard holds straight-alpha sRGB**, not layer bytes, and both
+  directions go through `docimport::srgb`'s exact-inverse pair — so a copy and a
+  paste straight back restore the bytes they started with, and the day a system
+  clipboard arrives the form it wants is already what is held. Masking scales
+  **alpha on the straight side**; scaling the stored bytes is wrong by a gamma
+  curve and invisible on anything opaque.
+- **`Clip::place` decides what a paste does**, in `umber-core`, because "where
+  does the picture go" is a rule and rules are testable without a window:
+  centred on the selection or on the view, nudged back on where it fits,
+  **centred and cropped** where the clip is larger than the canvas — and the
+  crop is said out loud, because a floating region lives in canvas-sized storage
+  and there is nowhere to hold the overhang.
+- **The marquee travels with the picture**, at commit, by transforming the rings
+  and rasterising again. Nothing in `selection.rs` was changed for it. Only for
+  a lift: a paste did not come out of the selection.
+
 ### Layers
 
 Layers occupy slices ("slots") of one texture array, and the whole stack
@@ -603,14 +669,16 @@ acceptable once per stroke but must never move into the drawing loop.
   so switching tool mid-stroke cannot change what the stroke that is ending
   turns out to have been.
 - **`EditKind` has a variant only for something the engine can restore.** It is
-  Paint and Erase because an entry exists only where a patch was captured.
-  Adding "Clear layer" or "Delete layer" means making those undoable *first*; a
-  row naming an action that clicking it will not undo is worse than one the list
-  stays quiet about, and the History module's footnote exists to say so. The
-  same bound governs the icons: `panels::edit_icon` is exhaustive over
-  `EditKind` deliberately, so a new variant cannot be added without deciding
-  what it looks like — and an icon set richer than the enum would be a promise
-  about what the engine records.
+  Paint, Erase and Transform because an entry exists only where a patch was
+  captured. Adding "Clear layer" or "Delete layer" means making those undoable
+  *first*; a row naming an action that clicking it will not undo is worse than
+  one the list stays quiet about, and the History module's footnote exists to
+  say so. The same bound governs the icons: `panels::edit_icon` is exhaustive
+  over `EditKind` deliberately, so a new variant cannot be added without
+  deciding what it looks like — and an icon set richer than the enum would be a
+  promise about what the engine records. **A paste is not a variant of its
+  own**: it is a Transform patch with nothing where the pixels came from, and
+  two rows that undo identically should not have two names.
 - **The time is wall-clock, and may be absent.** `Instant` means nothing outside
   the run that produced it and these go into a file, so `umber_core::time`
   carries a `Timestamp` in Unix milliseconds. `Edit::at` is an `Option`, and
@@ -675,7 +743,7 @@ page — go by it.
 Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
 brush editor's Wet edges section, Palette and Harmony picker modes,
-eleven of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
+ten of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
 listed in the README's "What is not there yet", with the reasoning in
 `docs/architecture.md`'s roadmap and, for the brush settings, `docs/brushes.md`. **Do not add UI for features that do not work** — a
 disabled control with an explanatory tooltip is better than a live one that
@@ -750,6 +818,11 @@ design shows a whole row of them.
   *and* build-up, because both are about a mark made of many faint stamps rather
   than one solid one. Between them they expose every field of `Brush` — adding
   one means adding a control, or the library can use a brush nobody can make.
+- **The transform tool's handles are `Transform::grab`'s positions, painted.**
+  `ui::transform_box` reads the same eight `handle_at` answers the hit test
+  does, so a handle cannot be drawn where the pointer disagrees with it — which
+  is the worst kind of control that lies. Solid line, not the selection's
+  dashes: the two are often on screen together and mean different things.
 - **The selection tool's mode is a dropdown, and it is the Colour panel's
   dropdown pattern.** A painted trigger and a popup of `selectable_label`s, the
   same shape `picker_mode_switch` uses. One dropdown pattern in the interface

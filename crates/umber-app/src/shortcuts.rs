@@ -19,9 +19,12 @@ pub enum Action {
     Undo,
     Redo,
     Deselect,
+    Copy,
+    Paste,
     BrushTool,
     EraserTool,
     SelectTool,
+    TransformTool,
     PanTool,
     ZoomTool,
     SizeDown,
@@ -39,15 +42,18 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 20] = [
         Action::Save,
         Action::SaveAs,
         Action::Undo,
         Action::Redo,
         Action::Deselect,
+        Action::Copy,
+        Action::Paste,
         Action::BrushTool,
         Action::EraserTool,
         Action::SelectTool,
+        Action::TransformTool,
         Action::PanTool,
         Action::ZoomTool,
         Action::SizeDown,
@@ -67,9 +73,12 @@ impl Action {
             Action::Undo => "Undo",
             Action::Redo => "Redo",
             Action::Deselect => "Deselect",
+            Action::Copy => "Copy",
+            Action::Paste => "Paste",
             Action::BrushTool => "Brush tool",
             Action::EraserTool => "Eraser tool",
             Action::SelectTool => "Selection tool",
+            Action::TransformTool => "Transform tool",
             Action::PanTool => "Pan tool",
             Action::ZoomTool => "Zoom tool",
             Action::SizeDown => "Decrease brush size",
@@ -86,10 +95,11 @@ impl Action {
     pub fn category(self) -> &'static str {
         match self {
             Action::Save | Action::SaveAs => "File",
-            Action::Undo | Action::Redo | Action::Deselect => "Edit",
+            Action::Undo | Action::Redo | Action::Deselect | Action::Copy | Action::Paste => "Edit",
             Action::BrushTool
             | Action::EraserTool
             | Action::SelectTool
+            | Action::TransformTool
             | Action::PanTool
             | Action::ZoomTool => "Tools",
             Action::SizeDown | Action::SizeUp => "Brush",
@@ -241,10 +251,17 @@ pub fn defaults() -> Vec<Binding> {
         // action can carry more than one.
         binding(Action::Redo, KeyCode::KeyY, true, false, false),
         binding(Action::Deselect, KeyCode::KeyD, true, false, false),
+        binding(Action::Copy, KeyCode::KeyC, true, false, false),
+        binding(Action::Paste, KeyCode::KeyV, true, false, false),
         // Tools
         binding(Action::BrushTool, KeyCode::KeyB, false, false, false),
         binding(Action::EraserTool, KeyCode::KeyE, false, false, false),
         binding(Action::SelectTool, KeyCode::KeyS, false, false, false),
+        // T for transform, which is where Photoshop, Krita and Affinity all
+        // put it — as Ctrl+T rather than plain T in the first two, but Umber's
+        // tool keys are unmodified throughout and a rail that was consistent
+        // everywhere except here would be worse than following the crowd.
+        binding(Action::TransformTool, KeyCode::KeyT, false, false, false),
         binding(Action::PanTool, KeyCode::KeyH, false, false, false),
         binding(Action::ZoomTool, KeyCode::KeyZ, false, false, false),
         // Brush
