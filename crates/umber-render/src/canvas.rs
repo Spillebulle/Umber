@@ -3686,6 +3686,19 @@ impl CanvasRenderer {
         self.thumb.is_some()
     }
 
+    /// True when the thumbnail in flight has finished its bounds pass and is
+    /// waiting to draw its picture.
+    ///
+    /// Exists for one test — the one that pins what happens when a layer is
+    /// written *between* the two passes, which is the gap a stroke's commit
+    /// lands in every time. Nothing in the application asks.
+    #[doc(hidden)]
+    pub fn thumb_phase_is_picture(&self) -> bool {
+        self.thumb
+            .as_ref()
+            .is_some_and(|job| job.phase == ThumbPhase::Picture)
+    }
+
     /// Start reading a thumbnail of `slot` back, without blocking.
     ///
     /// Returns false when one is already in flight — the caller's cue to ask
@@ -3879,7 +3892,29 @@ impl CanvasRenderer {
     pub fn take_thumb(&mut self, device: &wgpu::Device) -> Option<Thumbnail> {
         let _ = device.poll(wgpu::PollType::Poll);
 
+        // A disowned job is dropped as soon as nothing is outstanding on the
+        // GPU, **whatever state it is in** — which is the whole of why this is
+        // here rather than folded into the `Mapping` arm below.
+        //
+        // The bounds pass leaves the job `Waiting` at the end of one frame and
+        // the picture pass is not recorded until the next, so every route that
+        // writes a layer — a stroke committing, an undo, a clear, a flip —
+        // lands in that gap routinely and marks it. Left in `Waiting` it would
+        // be refused by `drive_thumb` (abandoned), by `submit_thumb` (not
+        // `Rendering`) and by the test below (not `Mapping`), so `self.thumb`
+        // would stay `Some` for the life of the renderer: no thumbnail would
+        // ever update again, and `thumb_in_flight` would request a redraw every
+        // frame for ever — the exact "the app never gets to wait" regression
+        // `render`'s `repaint_at` exists to prevent. `take_capture` has always
+        // checked its own flag at the top for the same reason.
         let job = self.thumb.as_mut()?;
+        if job.abandoned && job.state != StepState::Mapping {
+            // `Rendering` means a copy is recorded but no map is outstanding,
+            // so the buffer is free the moment nothing intends to map it —
+            // and dropping the job is what stops `submit_thumb` doing so.
+            self.thumb = None;
+            return None;
+        }
         if job.state != StepState::Mapping {
             return None;
         }

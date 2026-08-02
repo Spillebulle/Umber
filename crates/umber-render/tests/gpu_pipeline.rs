@@ -3897,6 +3897,62 @@ fn a_thumbnail_shows_the_layers_content_and_not_the_whole_canvas() {
     assert_eq!(&px[mid..mid + 3], &[255, 0, 0]);
 }
 
+/// A layer written to **between** a thumbnail's two passes must not wedge the
+/// job.
+///
+/// This was a real bug. The bounds pass leaves the job waiting at the end of one
+/// frame and the picture pass is recorded on the next, so a stroke committing —
+/// which is to say every pointer-up — lands in that gap and disowns it. With the
+/// abandoned check folded into the mapped arm alone, the job could never be
+/// collected, never be re-driven and never be dropped: `thumb_in_flight` stayed
+/// true for the life of the renderer, so no layer thumbnail ever updated again
+/// *and* `app.rs` requested a redraw every frame for ever.
+#[test]
+fn a_layer_written_between_a_thumbnails_two_passes_does_not_wedge_it() {
+    let Some(mut h) = Harness::new() else { return };
+    let block = PixelRect {
+        x: 4,
+        y: 4,
+        width: 8,
+        height: 8,
+    };
+    h.write_block(0, block, [255, 0, 0, 255]);
+
+    assert!(h.canvas.begin_thumb(0));
+    // Drive until the bounds pass has come home — the job is then waiting, with
+    // its region decided and its picture pass not yet recorded.
+    for _ in 0..8 {
+        let mut enc = h.encoder();
+        h.canvas.drive_thumb(&h.gpu.device, &mut enc);
+        h.gpu.queue.submit(Some(enc.finish()));
+        h.canvas.submit_thumb();
+        let _ = h.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(
+            h.canvas.take_thumb(&h.gpu.device).is_none(),
+            "the picture cannot have arrived before the second pass ran"
+        );
+        if h.canvas.thumb_phase_is_picture() {
+            break;
+        }
+    }
+    assert!(
+        h.canvas.thumb_phase_is_picture(),
+        "the bounds pass never came home"
+    );
+
+    // Paint on the layer, which is what disowns the job.
+    h.write_block(0, block, [0, 255, 0, 255]);
+
+    // One collection is all it should take to give the job back.
+    assert!(h.canvas.take_thumb(&h.gpu.device).is_none());
+    assert!(
+        !h.canvas.thumb_in_flight(),
+        "the disowned job was never dropped — the list is frozen and the loop \
+         will never sleep again"
+    );
+    assert!(h.canvas.begin_thumb(0), "and a fresh one can be asked for");
+}
+
 /// The invalidation rule, at the level that owns it. Every route that writes a
 /// slice moves that slice's counter and no other — which is what lets the layer
 /// list cache a picture and know exactly when it has stopped being true.
