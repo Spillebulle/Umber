@@ -1226,6 +1226,12 @@ struct MarkBox {
     span: Vec2,
     /// What a dab draws at, at full size and full pressure.
     radius: f32,
+    /// The sample's own height, in points, which is what tells the panel's list
+    /// from the browser's — and is therefore what [`preview_texture`] keys on
+    /// beside the brush. Held in points rather than buffer pixels so the set of
+    /// values is the handful of row shapes there are, rather than one per
+    /// interface scale anybody has ever dragged through.
+    shape: u32,
 }
 
 /// A little more than the sample's own rectangle: scatter and jitter throw
@@ -1256,6 +1262,7 @@ impl MarkBox {
             origin: vec2(sample.left() - field.left(), sample.top() - field.top()) * ppp + inset,
             span: (vec2(sample.width(), sample.height()) * ppp - inset * 2.0).max(Vec2::splat(1.0)),
             radius,
+            shape: sample.height().round().clamp(0.0, 255.0) as u32,
         }
     }
 
@@ -1502,14 +1509,26 @@ fn preview_image(mark: &Mark, brush: &Brush, at: &MarkBox, inks: [Color32; 2]) -
 /// One row's stamped stroke, cached against the brush it was stamped from.
 ///
 /// A few hundred stamps is cheap once and not cheap 201 times a frame, and the
-/// picture only changes when the brush does. Keyed by the preset's own address,
-/// exactly as the tip thumbnails are keyed by their mask's — and what is
-/// *compared* is everything the picture depends on: the brush by value, so a
-/// slider moved in the editor redraws on the next frame; the tip by `Arc`
-/// identity, so two brushes cut from one stamp share the downsample rather than
-/// comparing a megabyte of coverage; both inks, so switching theme does not
-/// leave every row the old colour; and the buffer's size, which every other
-/// figure in [`MarkBox`] is a fixed fraction of.
+/// picture only changes when the brush does. Keyed by the preset's own address
+/// **and the shape of the row it is drawn in** — and what is *compared* is
+/// everything else the picture depends on: the brush by value, so a slider
+/// moved in the editor redraws on the next frame; the tip by `Arc` identity, so
+/// two brushes cut from one stamp share the downsample rather than comparing a
+/// megabyte of coverage; both inks, so switching theme does not leave every row
+/// the old colour; and the buffer's size, which every other figure in
+/// [`MarkBox`] is a fixed fraction of.
+///
+/// The row shape has to be in the *key* rather than only in the comparison, and
+/// that was a crash rather than a nicety. The Brushes panel and the library
+/// browser draw the same presets at 14 and 24 points, and the browser is a modal
+/// over the panel — so both are in the same pass. Sharing one entry, the second
+/// row to draw replaced the first's, dropping the last `TextureHandle` to a
+/// texture the first had already queued a `Shape` against; egui then reported
+/// the free in that very pass's delta, and destroying a texture a recorded draw
+/// still names fails validation at submit. `app::submit_frame` is what makes
+/// such a free survivable at all — this is what stops the library producing one
+/// every frame, along with the two rasterisations and two uploads per visible
+/// preset per frame that came with it.
 fn preview_texture(
     ctx: &egui::Context,
     brush: &Brush,
@@ -1530,7 +1549,11 @@ fn preview_texture(
         _ => false,
     };
 
-    let id = egui::Id::new(("brush-preview", std::ptr::from_ref(brush) as usize));
+    let id = egui::Id::new((
+        "brush-preview",
+        std::ptr::from_ref(brush) as usize,
+        at.shape,
+    ));
     let cached: Option<Held> = ctx.data(|d| d.get_temp(id));
     if let Some((held, held_tip, held_inks, size, texture)) = cached
         && held == *brush
@@ -2633,6 +2656,81 @@ mod tests {
             assert!(peak > 0.99, "the stroke never covered anything: {peak}");
             // Which is the opacity asked for, once, and not once per overlap.
             assert!((peak * brush.opacity - 0.4).abs() < 1e-4);
+        }
+    }
+
+    /// Nothing may be freed by the pass that still draws it.
+    ///
+    /// The Brushes panel and the library browser show the same presets at two
+    /// different row heights, and both are on screen together — the browser is
+    /// a modal drawn over the panel. So one preset is one `&Brush`, drawn twice
+    /// in one pass, at two sizes. Keyed on the address alone the two shared a
+    /// single cache entry: the browser's row replaced the panel's, dropping the
+    /// last `TextureHandle` to a texture the panel had already queued a `Shape`
+    /// against. egui reports that as a free in the *same* pass's
+    /// `textures_delta`, and `egui_wgpu::Renderer::free_texture` destroys a
+    /// texture outright — so the frame failed validation at `Queue::submit` and
+    /// the application went down with it. Opening the library was enough.
+    ///
+    /// This is the CPU half of the guard, and it is the half worth having:
+    /// `app::submit_frame` makes a same-pass free survivable, and this makes
+    /// the library stop asking it to. It also pins the cost — two lists fighting
+    /// over one entry re-rasterised and re-uploaded every visible row of both,
+    /// every frame the browser was open.
+    #[test]
+    fn a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws() {
+        use egui::epaint::Primitive;
+        use std::collections::HashSet;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+        let p = Palette::of(crate::theme::ThemeKind::Graphite);
+        // One brush at one address, exactly as `Editor::presets` hands the same
+        // element to both lists.
+        let brush = Brush::default();
+        let row = |ui: &mut Ui, height: f32| {
+            brush_row(
+                ui,
+                &p,
+                BrushRow {
+                    name: "Pencil",
+                    detail: "",
+                    brush: &brush,
+                    tip: None,
+                    selected: false,
+                    user: false,
+                    height,
+                    trailing: 0.0,
+                    draggable: false,
+                },
+            );
+        };
+
+        // Three passes: the first builds the font atlas and both entries, and
+        // the failure is a *replacement*, so it needs a pass with something
+        // already there to replace.
+        for pass in 0..3 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                row(ui, metrics::BRUSH_ROW);
+                row(ui, metrics::BRUSH_ROW_DETAIL);
+            });
+            let drawn: HashSet<egui::TextureId> = ctx
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .filter_map(|job| match &job.primitive {
+                    Primitive::Mesh(mesh) => Some(mesh.texture_id),
+                    Primitive::Callback(_) => None,
+                })
+                .collect();
+            for id in &output.textures_delta.free {
+                assert!(
+                    !drawn.contains(id),
+                    "pass {pass}: {id:?} was freed by the pass that drew it"
+                );
+            }
         }
     }
 }
