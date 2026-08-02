@@ -367,6 +367,9 @@ impl LayerStack {
         if self.active >= self.layers.len() {
             self.active = self.layers.len() - 1;
         }
+        // Deleting one of a pair would otherwise leave the survivor in a group
+        // of one — see `dissolve_lone_groups`.
+        self.dissolve_lone_groups();
         Some(layer.slot)
     }
 
@@ -418,10 +421,13 @@ impl LayerStack {
     /// **What a bulk operation reaches**, and the one place that is decided:
     /// every ticked layer, or the selected one alone when nothing is ticked.
     ///
-    /// The fallback is what keeps the buttons from being dead half the time. It
-    /// also means there is no second, single-layer spelling of "hide this" to
-    /// drift from this one — the ordinary case is this rule with an empty tick
-    /// list, so a bulk operation and a single one are the same code.
+    /// The fallback makes the rule total, so a caller never has to special-case
+    /// an empty tick list. It is not currently reached — the strip that holds
+    /// every caller is only drawn once something is ticked — and it is
+    /// deliberately not what the *single-layer* controls use: a row's own eye
+    /// writes `visible` directly, because that control means "this layer" and
+    /// routing it through here would let a tick on another row change what it
+    /// does.
     ///
     /// Ascending, so a caller deleting them can walk the list backwards and
     /// have every index still be valid as it goes.
@@ -486,6 +492,18 @@ impl LayerStack {
     /// already in another group **leaves it**: belonging to two sets that move
     /// independently is not a state the stack can be in.
     pub fn link(&mut self, indices: &[usize]) -> Option<u8> {
+        // Counted rather than taken on trust. `link(&[0, 0])` and an index off
+        // the end both pass a bare length test and then make the group of one
+        // this refuses — and the refusal is the whole reason `unlink` and
+        // `remove` have to dissolve one afterwards.
+        let mut members: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|i| *i < self.layers.len())
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        let indices = &members[..];
         if indices.len() < 2 {
             return None;
         }
@@ -516,6 +534,28 @@ impl LayerStack {
         for index in indices {
             if let Some(layer) = self.layers.get_mut(*index) {
                 layer.link = None;
+            }
+        }
+        self.dissolve_lone_groups();
+    }
+
+    /// Take the last member of any group out of it.
+    ///
+    /// [`LayerStack::link`] refuses to *make* a group of one, so nothing may
+    /// leave one behind either — and two things can: unlinking one member of a
+    /// pair, and deleting one. A lone member would draw a coloured chain
+    /// meaning "moves together with nothing", which is a mark that lies, and it
+    /// would hold its number so [`LayerStack::free_group`] could not hand the
+    /// colour back — six such strays and the chain button reports every group
+    /// in use with no real group anywhere.
+    ///
+    /// Called from the two places that can shrink a group and from nowhere
+    /// else: nothing but a removal reduces one.
+    fn dissolve_lone_groups(&mut self) {
+        for group in 0..Self::LINK_GROUPS as u8 {
+            let members = self.group_indices(group);
+            if let [only] = members[..] {
+                self.layers[only].link = None;
             }
         }
     }
@@ -1100,6 +1140,53 @@ mod tests {
         );
         assert_eq!(s.group_indices(0), vec![0]);
         assert_eq!(s.group_indices(1), vec![1, 2]);
+    }
+
+    /// Nothing may leave a group of one standing, because `link` refuses to
+    /// make one: a lone member draws a chain meaning "moves together with
+    /// nothing", and it holds a colour `free_group` can then never hand back.
+    /// Both routes that can shrink a group are covered.
+    #[test]
+    fn a_group_that_falls_to_one_member_dissolves() {
+        let mut s = LayerStack::new();
+        for _ in 0..3 {
+            s.add();
+        }
+        // Unticking down to one and pressing the chain: the strip's own path.
+        assert_eq!(s.link(&[0, 1]), Some(0));
+        s.unlink(&[0]);
+        assert_eq!(s.get(1).unwrap().link, None, "the survivor is not a group");
+        assert_eq!(s.free_group(), Some(0), "and the colour came back");
+
+        // Deleting one of a pair.
+        assert_eq!(s.link(&[2, 3]), Some(0));
+        s.remove(3);
+        assert_eq!(s.get(2).unwrap().link, None);
+        assert_eq!(s.free_group(), Some(0));
+
+        // A group of three losing one is still a group.
+        let mut s = LayerStack::new();
+        for _ in 0..2 {
+            s.add();
+        }
+        assert_eq!(s.link(&[0, 1, 2]), Some(0));
+        s.unlink(&[0]);
+        assert_eq!(s.group_indices(0), vec![1, 2]);
+    }
+
+    /// A caller that hands the same layer twice, or one off the end, must not
+    /// get round the "two or more" rule by arithmetic.
+    #[test]
+    fn linking_counts_layers_rather_than_indices() {
+        let mut s = LayerStack::new();
+        s.add();
+        assert_eq!(s.link(&[0, 0]), None, "one layer named twice is one layer");
+        assert_eq!(
+            s.link(&[0, 99]),
+            None,
+            "an index off the end is not a layer"
+        );
+        assert_eq!(s.link(&[0, 1, 1]), Some(0));
     }
 
     /// Numbers — and therefore colours — come back when a group empties, so a
