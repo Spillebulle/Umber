@@ -760,22 +760,24 @@ fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui:
 /// What each optional group on the tool options strip costs, in points.
 ///
 /// The strip is a single unwrapped row, so a window narrow enough to overrun it
-/// does not reflow — the controls simply carry on past the right edge and under
-/// the Edit brush link. These budgets decide which groups are drawn, in reverse
-/// order of how constantly a painter reaches for them: the stabiliser readout
-/// goes first, then opacity, then size.
+/// does not reflow — the controls simply carry on past the right edge. These
+/// budgets decide which groups are drawn, in reverse order of how constantly a
+/// painter reaches for them: the stabiliser readout goes first, then opacity,
+/// then size.
 ///
 /// They are the design's own widths (a 90 point rail, a 24 point readout) plus
 /// the labels and egui's item spacing, rather than anything measured. Measuring
 /// would mean laying the strip out twice to find out whether to lay it out, and
 /// these only decide *whether* a group appears, never where it lands.
+///
+/// There used to be a fourth: 92 points held clear at the right for an "Edit
+/// brush…" link. The way into the brush editor is the pencil in the Brushes
+/// panel *header* now, so the reserve went with the link and every group here
+/// is measured against the whole strip again.
 mod strip_budget {
     pub const SIZE: f32 = 160.0;
     pub const OPACITY: f32 = 185.0;
     pub const STABILISER: f32 = 110.0;
-    /// Kept clear at the right for the link into the brush editor, which is the
-    /// only way to reach half the brush's settings and so is never dropped.
-    pub const EDIT_LINK: f32 = 92.0;
     /// The line naming the modifiers that add to and subtract from a selection.
     pub const COMBINE: f32 = 175.0;
 }
@@ -822,7 +824,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         divider(ui, p);
 
         if ed.ui.tool.paints() {
-            let room = ui.available_width() - strip_budget::EDIT_LINK;
+            let room = ui.available_width();
             if room >= strip_budget::SIZE {
                 widgets::inline_slider(
                     ui,
@@ -857,8 +859,9 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     p,
                     "Stabiliser",
                     &format!("{:.0}", ed.brush.stabilization * 100.0),
-                    "How much this brush smooths the stroke. Change it under \
-                     Edit brush, on the Tip tab.",
+                    "How much this brush smooths the stroke. Change it in the \
+                     brush editor — the pencil in the Brushes panel header — \
+                     on the Tip tab.",
                 );
             }
         } else if ed.ui.tool == Tool::Transform {
@@ -889,7 +892,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // Dropped first when the window is narrow: the gesture the mode
             // needs is the line somebody is stuck without, and this one is
             // about a gesture they have not reached for yet.
-            if ui.available_width() >= strip_budget::COMBINE + strip_budget::EDIT_LINK {
+            if ui.available_width() >= strip_budget::COMBINE {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(combine_hint())
@@ -918,15 +921,6 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     .color(p.text_dim),
             );
         }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if text_icon_link(ui, p, Icon::Pencil, "Edit brush…")
-                .on_hover_text("Open the brush editor")
-                .clicked()
-            {
-                ed.ui.brush_editor_open = true;
-            }
-        });
     });
 }
 
