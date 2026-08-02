@@ -265,6 +265,19 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   it. Structural undo is the real fix and is not built yet.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
   when a new layer takes it.
+- **Reordering does not clear the undo history; deleting does.** The difference
+  is whether a slot changes hands — a `PixelPatch` names one, and only a delete
+  frees one for the next layer to inherit. `LayerStack::reorder` is the whole of
+  it, and `move_up`/`move_down` are written in terms of it so the rule that the
+  selection follows the *layer* rather than the position exists once instead of
+  in three places that have to agree.
+- **The drag that reorders the list is a model, `layerdrag.rs`, with no drawing
+  in it** — the same division `brushdrag.rs` keeps. It has **two** hit tests and
+  needs both: a press must land strictly inside a row, where a drop rounds to
+  the nearest, because the opacity slider sits directly above the list in the
+  same column and a press that rounded would turn dragging the slider into
+  dragging the bottom layer. Rows are read by their carried index, never by
+  their position in the slice, because the panel draws the stack upside down.
 - **The in-progress stroke blends inside the stack**, at the active layer's
   position, not over the finished composite. Otherwise painting beneath a
   Multiply layer previews wrongly and jumps on release.
@@ -424,6 +437,43 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
 - **`docformat::write_encoded` is the one atomic write.** `save` is `encode`
   plus that; the autosave needs the halves apart because it puts one archive in
   two places. A second temp-and-rename would be a second thing to get right.
+
+### Exporting
+
+`umber-core::export` is what a format is; `exportdlg.rs` is the dialog.
+
+- **Export is encoding and nothing else.** `export_rgba` hands over straight
+  alpha sRGB out of the *screen* composite pass and `export` turns it into a
+  file. There is no second flattening path, which is why the background rule
+  holds for free: a white-backed document exports opaque, a transparent one
+  keeps its alpha, and `app.rs`'s export never mentions `Background`.
+- **PNG stays on the `png` crate** — the direct encoder is what lets an exported
+  PNG carry the `sRGB` chunk stating what the composite already did. The other
+  four go through `image` with `default-features = false` and only their own
+  features; its PNG *decoder* is a dev-dependency alone, so the round-trip tests
+  can read back what they wrote without one reaching the shipped binary. **WebP
+  is refused**: `image`'s encoder is lossless-only, which delivers neither a
+  small lossy file nor wider support than PNG.
+- **A format that cannot carry alpha mattes onto a colour the artist chose,
+  white by default, mixed in linear light.** Silently onto black is the classic
+  version of this bug. Every loss is named *before* the write — the matte, GIF's
+  256 colours, JPEG discarding more every time — and `losses` takes whether
+  **this** document has transparency, so an opaque one is told it loses nothing.
+  A warning shown every time is one nobody reads.
+- **What a format is stays in `umber-core`**: extensions, what each can carry,
+  the suggested name, and what to do when a typed name disagrees with the picker
+  — report it, never let a filename overrule the choice. Same division
+  `CanvasCopy::plan` and `Clip::place` keep, and it is what makes the whole of
+  it testable without a device.
+- **`write_encoded` is still the one atomic write**, and its temporary now takes
+  the *target's* extension so an exported `a.png` cannot collide with a
+  concurrent autosave of `a.ora` beside it.
+- **Not threaded, deliberately.** The file dialog above it already blocks, no
+  stroke can be live, and a threaded encode would hold the whole picture and
+  report failure into what may by then be a different document. The autosave
+  threads its writer because nobody asked for it; an export was asked for. GIF's
+  quantiser on a very large canvas is the slow case, and if it ever bites the
+  fix is a thread for the encode alone, never a second readback.
 
 ### Autosave
 
@@ -1060,12 +1110,28 @@ design shows a whole row of them.
   no numeric field, and a canvas size is one of the few values here that people
   type exactly rather than feel for on a rail. Everything else in those dialogs
   is `widgets.rs`'s.
-- **The brush list's samples are stamped from the brush**, not drawn from two of
-  its numbers. `widgets::brush_sample` is a miniature dab loop under a pressure
-  ramp; it seeds its RNG identically on every row, so two rows differ because
-  their settings differ and the list does not shimmer as it scrolls. A stamp
-  brush draws its *mask*, from one texture per mask cached by `Arc` identity and
-  one mesh per row — not one texture per row, and never one per stamp.
+- **The brush list's samples are a real stroke, drawn by the real dab
+  generator.** `umber_core::preview` is the path — a sweep with a full turn
+  folded into it, so it crosses itself and has a direction that changes, which
+  is the only way a rake, a chisel or an angle-following brush previews as
+  anything but the bar every brush used to draw. It is a parametric curve rather
+  than a traced bitmap for the reason everything else here is computed: an asset
+  would have nothing to check it against, where the loop, the continuity, the
+  absence of a cusp and the taper are all pinned by tests that need no window.
+  `widgets::preview_dabs` runs it through `StrokeBuilder` in *document* units so
+  no dab is distorted by the preview's scale, and seeds the RNG identically on
+  every row, so two rows differ because their settings differ and the list does
+  not shimmer as it scrolls.
+- **The preview rasterises coverage with a `max` and applies opacity once**, and
+  that is not optional now that the path overlaps itself: one translucent shape
+  per dab compounds exactly as the wet-layer scheme exists to prevent. It is a
+  deliberate second implementation of three rules for a thumbnail — a GPU pass
+  per row is not the answer at 201 presets in a list that scrolls — and the only
+  place in Umber where a second copy of any of this is allowed to live. The
+  coverage is cached against the brush's address and validated by value, so an
+  edit in the brush editor redraws next frame; a stamp brush's mask is still one
+  texture per mask cached by `Arc` identity, and a row scrolled out of view
+  returns before any of it.
 - `ResponseCurve` is a fixed array of evenly spaced samples, not free control
   points. That keeps `Brush` `Copy`, makes sampling a lerp with no search, and
   means the editor's handles move only vertically — so the curve can never be
