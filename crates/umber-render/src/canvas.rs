@@ -2652,11 +2652,18 @@ impl CanvasRenderer {
             })
         };
         let bind_group = make_bind_group(&floating_view, "transform-bg");
-        // The mask passes render *into* the floating copy, so they cannot have
-        // it bound for sampling as well — a colour target is an exclusive usage
-        // and wgpu refuses the pass outright. `fs_mask` never reads slot 1, so
-        // the mask stands in for it: what is bound there only has to exist.
-        let mask_bind_group = make_bind_group(&mask_view, "transform-mask-bg");
+        // The mask passes need the layer as it stands, because what they compute
+        // is a *share* of what is already there rather than the mask on its own
+        // — see `fs_mask`, and the ghost outline that reading the mask alone
+        // left behind. It has to be the layer's own slice and not either of
+        // their targets: the base and the floating copy are colour attachments
+        // here, an exclusive usage, and wgpu refuses a pass that also samples
+        // one. The layer is untouched until the commit, so it is the one
+        // pristine copy both passes can share.
+        let mask_bind_group = make_bind_group(
+            &self.layers.slot_views[source.slot as usize],
+            "transform-mask-bg",
+        );
 
         // First submission: the floating copy starts empty, whatever the
         // allocation held. See the note on this function.
@@ -2768,8 +2775,8 @@ impl CanvasRenderer {
         );
         if lifting {
             // A lift outside a selection takes the rectangle whole, and with
-            // `use_mask` clear the shader's coverage is exactly 1.0 — so this
-            // pass would be the identity and is skipped rather than run.
+            // `use_mask` clear the shader's share is exactly 1.0 — so this pass
+            // would be the identity and is skipped rather than run.
             if use_mask != 0 {
                 self.mask_pass(
                     &mut enc,

@@ -3430,6 +3430,261 @@ fn a_transform_moves_only_what_the_selection_covers() {
     );
 }
 
+// --- a lift is a complement -------------------------------------------------
+
+/// Lift `sel`'s bounding rectangle out of slot 0, carry it `by` and put it
+/// down, exactly as the transform tool does. Returns the destination rectangle.
+fn lift_and_move(h: &mut Harness, sel: &Selection, by: Vec2) -> PixelRect {
+    let source = sel.bounds();
+    let mut xf = Transform::identity(source);
+    h.canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: source,
+                pixels: None,
+                mask: Some(sel),
+            },
+        )
+        .expect("no room for a preview");
+
+    xf.offset = by;
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let damage = xf.damage(UVec2::splat(DOC), true).expect("something to do");
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float();
+
+    PixelRect {
+        x: (source.x as f32 + by.x) as u32,
+        y: (source.y as f32 + by.y) as u32,
+        ..source
+    }
+}
+
+fn read_rect(h: &Harness, slot: u32, rect: PixelRect) -> Vec<u8> {
+    h.canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, slot, rect)
+}
+
+/// The alpha channel alone, which is the one that adds: it is linear 8-bit even
+/// in an sRGB format, so a complement can be stated on it exactly where two
+/// gamma-encoded colours could only be compared.
+fn alphas(px: &[u8]) -> Vec<u8> {
+    px.iter().skip(3).step_by(4).copied().collect()
+}
+
+/// The bug the whole of this section exists for: paint inside a selection, move
+/// it away, and a one-pixel ghost of the outline was left behind at the source.
+///
+/// The lift used to scale the layer by the selection's coverage — but painting
+/// is *already* clipped by that same coverage, so a half-covered pixel holding
+/// half a stroke's alpha had the mask applied to it twice: a quarter went into
+/// the float and a quarter stayed on the layer. Every antialiased pixel of the
+/// boundary kept a share of the paint, which is exactly a faint tracing of
+/// where the selection had been.
+///
+/// Stated as a complement rather than as a value: everything that was there is
+/// now at the destination, and the source is back to what it held before a
+/// stroke ever went near it. Neither half is a number anybody worked out by
+/// hand, so the test says nothing about the falloff except that it moved whole.
+#[test]
+fn a_lift_leaves_no_ghost_of_the_selection_it_was_painted_through() {
+    let mut h = harness_or_skip!();
+
+    // A triangle, so the boundary runs through every coverage between 0 and 255
+    // rather than through the one exact half a fractional rectangle gives.
+    let sel = Selection::polygon(
+        &[
+            Vec2::new(8.0, 8.0),
+            Vec2::new(28.0, 12.0),
+            Vec2::new(14.0, 28.0),
+        ],
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    let source = sel.bounds();
+    let empty = read_rect(&h, 0, source);
+    assert!(
+        empty.iter().all(|b| *b == 0),
+        "the layer did not start bare"
+    );
+
+    // Paint through it, as the artist did. The dab covers the whole bounding
+    // rectangle, so what shapes the mark is the selection and nothing else.
+    h.set_selection(Some(sel.clone()));
+    h.stamp(&[dab(18.0, 18.0, 30.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let painted = read_rect(&h, 0, source);
+    assert!(
+        alphas(&painted).iter().any(|a| *a > 0 && *a < 255),
+        "the selection's edge did not come out antialiased, so this test would \
+         pass on a hard-edged mask that never had the bug"
+    );
+
+    let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 32.0));
+
+    assert_eq!(
+        read_rect(&h, 0, source),
+        empty,
+        "a ghost of the selection was left where the paint was lifted from"
+    );
+    assert_eq!(
+        read_rect(&h, 0, dest),
+        painted,
+        "the float did not carry every pixel the layer gave up"
+    );
+}
+
+/// The cheap case, and the one that should be exact on both axes: an integer
+/// rectangle, whose coverage is only ever 0 or 255. Here the lift takes the
+/// selected pixels whole and leaves the rest of the layer untouched — the
+/// property `a_transform_moves_only_what_the_selection_covers` checks a corner
+/// of, stated over every pixel of the rectangle.
+#[test]
+fn a_hard_edged_rectangular_lift_is_exact() {
+    let mut h = harness_or_skip!();
+
+    let block = PixelRect {
+        x: 8,
+        y: 8,
+        width: 24,
+        height: 24,
+    };
+    let red = [220, 40, 30, 255];
+    h.write_block(0, block, red);
+
+    let sel = Selection::rectangle(
+        Vec2::new(12.0, 12.0),
+        Vec2::new(28.0, 28.0),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    let source = sel.bounds();
+    let before = read_rect(&h, 0, source);
+
+    let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 32.0));
+
+    let kept = read_rect(&h, 0, source);
+    let moved = read_rect(&h, 0, dest);
+    assert!(kept.iter().all(|b| *b == 0), "the hole is not clean");
+    assert_eq!(moved, before, "the block did not arrive whole");
+    // The corner of the block outside the selection is nobody's business but
+    // the layer's: a lift that reached past its mask would take it too.
+    assert_eq!(
+        h.pixel(10, 10),
+        red,
+        "the lift reached outside the selection"
+    );
+}
+
+/// A selection dragged off the edge of the canvas. Its bounding rectangle is
+/// clamped, so the mask's own rectangle now shares a border with the document —
+/// which is where `fs_mask`'s arithmetic decision about "outside the mask" and
+/// `fs_sample`'s about "outside the canvas" both have to hold at once.
+#[test]
+fn a_selection_running_off_the_canvas_lifts_as_cleanly_as_one_inside_it() {
+    let mut h = harness_or_skip!();
+
+    let sel = Selection::rectangle(
+        Vec2::new(-6.5, 10.5),
+        Vec2::new(20.5, 30.5),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    let source = sel.bounds();
+    assert_eq!(
+        source.x, 0,
+        "the selection was expected to reach the border"
+    );
+    let empty = read_rect(&h, 0, source);
+
+    h.set_selection(Some(sel.clone()));
+    h.stamp(&[dab(10.0, 20.0, 34.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let painted = read_rect(&h, 0, source);
+
+    let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 32.0));
+
+    assert_eq!(
+        read_rect(&h, 0, source),
+        empty,
+        "a ghost was left along a selection that ran off the canvas"
+    );
+    assert_eq!(
+        read_rect(&h, 0, dest),
+        painted,
+        "the float dropped pixels at the border"
+    );
+}
+
+/// The other half of the fix, and the reason it is a `min` rather than "take
+/// everything the selection touches": paint the selection did **not** make must
+/// still be split between the hole and the float, with the selection's own
+/// antialiasing on both sides of the cut.
+///
+/// The complement is stated on alpha, which is linear 8-bit even in an sRGB
+/// format and therefore actually adds.
+#[test]
+fn a_lift_still_splits_paint_the_selection_did_not_make() {
+    let mut h = harness_or_skip!();
+
+    let block = PixelRect {
+        x: 4,
+        y: 4,
+        width: 32,
+        height: 24,
+    };
+    h.write_block(0, block, [220, 40, 30, 255]);
+
+    // The boundary falls down the middle of column 20 and of row 20.
+    let sel = Selection::rectangle(
+        Vec2::new(8.5, 8.5),
+        Vec2::new(20.5, 20.5),
+        UVec2::splat(DOC),
+    )
+    .expect("a selection");
+    let source = sel.bounds();
+    let before = alphas(&read_rect(&h, 0, source));
+
+    let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 32.0));
+
+    let kept = alphas(&read_rect(&h, 0, source));
+    let moved = alphas(&read_rect(&h, 0, dest));
+    for (i, was) in before.iter().enumerate() {
+        let sum = u16::from(kept[i]) + u16::from(moved[i]);
+        assert!(
+            sum.abs_diff(u16::from(*was)) <= 1,
+            "pixel {i}: the hole kept {} and the float took {}, which is not \
+             the {was} that was there",
+            kept[i],
+            moved[i]
+        );
+    }
+    // And the cut is soft, on both sides. A lift that simply took everything
+    // the mask touched would leave nothing here and pass the complement above.
+    let edge = (source.height / 2 * source.width + (source.width - 1)) as usize;
+    assert!(
+        (1..255).contains(&moved[edge]),
+        "the moved edge lost the selection's antialiasing, got {}",
+        moved[edge]
+    );
+    assert!(
+        (1..255).contains(&kept[edge]),
+        "the hole's edge lost the selection's antialiasing, got {}",
+        kept[edge]
+    );
+}
+
 /// A paste puts pixels down over a layer without disturbing it, which is what
 /// makes an abandoned paste cost nothing. Its damage is the destination alone:
 /// there is no hole to restore, so a patch spanning back to where the pixels

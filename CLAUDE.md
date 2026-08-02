@@ -170,6 +170,27 @@ put on and take off.
   own slice as the target. So unlike the stroke there is no second copy of the
   blend maths to keep in step, and there is nothing to get wrong: what the
   screen showed during the drag is byte for byte what gets written.
+- **A lift is a `min` against the selection, never a multiply.** Painting is
+  clipped by the mask in the dab pass, so a pixel the selection half covers
+  *already* holds half a stroke's alpha; scaling that by the coverage applies
+  the mask a second time and carries a quarter into the float while leaving a
+  quarter on the layer. That is a one-pixel ghost of the outline behind every
+  lift, and it is exactly what it looked like to the artist. `transform.wgsl`'s
+  `fs_mask` takes the share as `min(a, m) / a` instead: of the alpha that is
+  there, the part inside the selection is at most the coverage, and this takes
+  it to be exactly that. Opaque pixels lassoed out of a picture are untouched by
+  the change — `min(1, m)` is `m`, the old behaviour and the old antialiasing —
+  and content softer than the mask keeps its *own* falloff rather than having
+  the mask's multiplied into it. One number drives both passes, the float scaled
+  by the share and the hole by its complement, so the two cannot disagree about
+  where the paint went, for the reason `render_float` is one function called
+  twice. It needs the **layer's own slice** bound for sampling, because the
+  share is a share of what is there and neither of the passes' own targets may
+  be read while it is a colour attachment; the layer is untouched until the
+  commit, so it is the one pristine copy both can share.
+  `a_lift_leaves_no_ghost_of_the_selection_it_was_painted_through` is the guard,
+  and `a_lift_still_splits_paint_the_selection_did_not_make` refuses the
+  tempting over-correction of simply taking everything the mask touches.
 - **`composite.wgsl` was not touched, and must not be.** `Editor::layer_draws`
   swaps the active layer's slot for the preview slice, which already holds what
   the layer will hold — so the float composites at the right stack position,
@@ -236,9 +257,14 @@ put on and take off.
 - **The clipboard holds straight-alpha sRGB**, not layer bytes, and both
   directions go through `docimport::srgb`'s exact-inverse pair — so a copy and a
   paste straight back restore the bytes they started with, and the day a system
-  clipboard arrives the form it wants is already what is held. Masking scales
-  **alpha on the straight side**; scaling the stored bytes is wrong by a gamma
-  curve and invisible on anything opaque.
+  clipboard arrives the form it wants is already what is held. Masking **bounds
+  alpha, on the straight side** — two rules and each was a bug. `min(alpha,
+  coverage)`, for the reason the lift is a `min`: a multiply applies the
+  selection to paint the dab pass had already clipped by it, so a copy of an
+  antialiased edge came back at a quarter of the mark it was taken from, and the
+  exact-inverse promise above was false for anything painted inside a selection.
+  And on the *straight* side: scaling the stored bytes is wrong by a gamma curve
+  and invisible on anything opaque.
 - **`Clip::place` decides what a paste does**, in `umber-core`, because "where
   does the picture go" is a rule and rules are testable without a window:
   centred on the selection or on the view, nudged back on where it fits,
