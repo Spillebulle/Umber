@@ -695,7 +695,8 @@ impl UmberApp {
                 self.editor.notice = Some(Notice {
                     title: "A folder is selected".to_string(),
                     lines: vec![
-                        "Nothing was pasted. A folder holds no pixels — select a layer                          in the Layers panel and paste again."
+                        "Nothing was pasted. A folder holds no pixels — select a \
+                         layer in the Layers panel and paste again."
                             .to_string(),
                     ],
                 });
@@ -1089,59 +1090,60 @@ impl UmberApp {
     }
 
     fn delete_layer(&mut self, index: usize) {
+        self.delete_entries(&[index]);
+    }
+
+    /// Delete every ticked layer.
+    ///
+    /// Written in terms of [`Self::delete_entries`], like the single delete, so
+    /// the lock gate, the float being put down and the history being cleared
+    /// are each stated once — a second delete that forgot one of the three is
+    /// exactly the bug the "one gate per operation" rule exists to prevent.
+    fn delete_picked_layers(&mut self) {
+        let targets = self.editor.layers.targets();
+        self.delete_entries(&targets);
+    }
+
+    /// Delete a set of entries, and everything inside any folder among them.
+    ///
+    /// **One call to `remove_many`, never a loop of single deletes**, and that
+    /// is a correctness rule rather than tidiness. A folder's contents sit
+    /// *below* it, so deleting one shifts every index beneath it; a loop —
+    /// even one walking backwards, which is what this used to be — hands the
+    /// next iteration an index that now names a different entry. Ticking a
+    /// layer and a group above it deleted a third layer nobody chose, and
+    /// because a delete clears the undo history it could not be taken back.
+    /// `LayerStack::remove_many` resolves the whole set against the stack as it
+    /// stands before anything moves.
+    fn delete_entries(&mut self, indices: &[usize]) {
         // **The one gate a lock has on deletion.** A lock that stopped strokes
         // and let the layer be thrown away would protect nothing worth
         // protecting.
         //
-        // Over the whole subtree, so a folder's lock protects what is inside it
-        // and a locked layer inside an unlocked group stops the *group* being
-        // deleted — because deleting a folder deletes its contents, and half a
-        // deletion is not a state to leave a stack in.
-        if self
-            .editor
-            .layers
-            .subtree(index)
-            .any(|i| self.editor.layers.effective_locked(i))
-        {
+        // Over the whole subtree of everything named, so a folder's lock
+        // protects what is inside it and a locked layer inside an unlocked
+        // group stops the *group* being deleted — because deleting a folder
+        // deletes its contents, and half a deletion is not a state to leave a
+        // stack in.
+        let locked = indices.iter().any(|i| {
+            self.editor
+                .layers
+                .subtree(*i)
+                .any(|j| self.editor.layers.effective_locked(j))
+        });
+        if locked {
             return;
         }
         self.finish_transform();
-        if self.editor.layers.remove(index).is_none() {
+        if self.editor.layers.remove_many(indices).is_none() {
             return;
         }
-        // Slots are recycled — both of them, where the layer had a mask — so an
+        // Slots are recycled — both of them, where a layer had a mask — so an
         // undo entry recorded against a freed slot would later be replayed into
         // whichever layer or mask inherits it. Dropping history is the blunt but
         // safe fix; structural undo is the real one.
         self.editor.history.clear();
         self.editor.mark_modified();
-    }
-
-    /// Delete every ticked layer.
-    ///
-    /// Written in terms of [`Self::delete_layer`] rather than beside it, so the
-    /// lock gate, the float being put down and the history being cleared are
-    /// each stated once — a second delete that forgot one of the three is
-    /// exactly the bug the "one gate per operation" rule exists to prevent.
-    ///
-    /// **Top-down**, because removing a layer shifts every index above it.
-    ///
-    /// A request that would empty the stack cannot arrive — the strip disables
-    /// the button when every layer is ticked — and `delete_layer` refuses the
-    /// last one anyway, which is the backstop rather than the visible
-    /// behaviour. Keeping both is the point: this function must stay callable
-    /// from somewhere that has not made that check.
-    fn delete_picked_layers(&mut self) {
-        for index in self.editor.layers.targets().into_iter().rev() {
-            // An index a previous removal already took with it, because a
-            // folder carries its contents and both were ticked. Skipped rather
-            // than prevented at the tick, since ticking a folder ticks
-            // everything in it by design — see `LayerStack::pick`.
-            if index >= self.editor.layers.len() {
-                continue;
-            }
-            self.delete_layer(index);
-        }
     }
 
     /// Put the ticked layers — or the selected one — into a new group.

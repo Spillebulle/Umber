@@ -991,28 +991,35 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             // group has nowhere to go without changing its nesting, which is
             // something dragging says and a chevron cannot.
             let span = ed.layers.subtree(active);
+            let depth = depth_of(ed, active);
+            let can_down = span.start > 0 && ed.layers.can_reorder(active, span.start - 1, depth);
+            let can_up = span.end < count && ed.layers.can_reorder(active, span.end, depth);
+            // The tooltip says why when it is dead, and names the gesture that
+            // *can* do it — a step keeps the nesting it has, so leaving a group
+            // is something only a drag can say.
+            let step_tip = |can: bool, way: &'static str| {
+                if can {
+                    if way == "up" {
+                        "Move layer up"
+                    } else {
+                        "Move layer down"
+                    }
+                } else if depth > 0 {
+                    "Nowhere to step inside this group — drag it sideways to leave"
+                } else {
+                    "Already at the end of the stack"
+                }
+            };
             if icon_button(
                 ui,
                 p,
                 Icon::ChevronDown,
-                span.start > 0
-                    && ed
-                        .layers
-                        .can_reorder(active, span.start - 1, depth_of(ed, active)),
-                "Move layer down",
+                can_down,
+                step_tip(can_down, "down"),
             ) {
                 actions.move_layer_down = Some(active);
             }
-            if icon_button(
-                ui,
-                p,
-                Icon::ChevronUp,
-                span.end < count
-                    && ed
-                        .layers
-                        .can_reorder(active, span.end, depth_of(ed, active)),
-                "Move layer up",
-            ) {
+            if icon_button(ui, p, Icon::ChevronUp, can_up, step_tip(can_up, "up")) {
                 actions.move_layer_up = Some(active);
             }
             if icon_button(
@@ -1034,12 +1041,22 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             // pass-through folder has no opacity and no blend mode, and a slider
             // that did nothing would be exactly the control that lies. See
             // `docs/layer-folders.md`.
+            // Asked of the model, like the chevrons above: a full stack and a
+            // set that would nest too deep are both refusals `group` makes and
+            // neither is visible from here.
+            let can_group = ed.layers.can_group(&ed.layers.targets());
             if icon_button(
                 ui,
                 p,
                 Icon::Folder,
-                count < LayerStack::MAX,
-                "Put the ticked layers — or the selected one — in a group",
+                can_group,
+                if can_group {
+                    "Put the ticked layers — or the selected one — in a group"
+                } else if count >= LayerStack::MAX {
+                    "The stack is full — a group is an entry too"
+                } else {
+                    "That would nest deeper than Umber can hold"
+                },
             ) {
                 actions.group_layers = true;
             }

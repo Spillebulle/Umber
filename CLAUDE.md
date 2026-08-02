@@ -426,12 +426,21 @@ are the contiguous run immediately below it whose `depth` is greater.
   "layer 3" means. A folder holds no slot so it can never be what a patch
   resolves to; what it does is occupy a position, which is exactly why it has to
   be counted. A position that names a folder drops the whole history.
-- **Every structural change is judged before it is written.** `well_formed` is
-  run over the depth sequence a move *would* produce, so `reorder_to` cannot
-  invent a layer nested inside nothing, and a refusal changes nothing.
-  `can_reorder` is that same plan without the writes — the drag asks it rather
-  than restating the rule, so a row cannot light up promising a move the model
-  will refuse.
+- **Every operation a control offers has a `can_` beside it, sharing its plan.**
+  `plan_reorder`/`can_reorder`, `plan_group`/`can_group`, `can_remove` against
+  `remove_many`. The drag, the Group button, the chevrons and both bins draw
+  themselves from those, so a control cannot light up promising something the
+  model will then decline. `reorder` and `group` are judged on the depth
+  sequence they *would* produce — `well_formed` over the whole projected
+  stack — so neither can invent a layer nested inside nothing and a refusal
+  changes nothing at all.
+- **A set of entries is deleted in one pass, never a loop of single deletes.**
+  A folder's contents sit *below* it, so removing one shifts every index
+  beneath it, including ones a backwards walk has not reached. That is not a
+  hypothetical: `delete_picked_layers` was a reverse loop and it deleted a layer
+  nobody ticked, then cleared the undo history so it could not be taken back.
+  `LayerStack::remove_many` resolves the whole set before anything moves, and
+  `App::delete_entries` is the single gate both delete commands go through.
 - **`MAX_DEPTH` is enforced in `umber-core`**, not hoped for: the eventual group
   stack in the fragment shader is a fixed-size array and a document too deep for
   it has to be refused where somebody can be told. An import too deep is
@@ -457,15 +466,6 @@ are the contiguous run immediately below it whose `depth` is greater.
 - **The autosave snapshot has its own `pixel_index`.** A folder is read back as
   nothing, so the capture is shorter than the stack and a positional zip would
   pair every layer above a folder with the pixels of the one below it.
-- **The stack is flat, and folders are designed but not built.**
-  `docs/layer-folders.md` is the design; the two things to know before starting
-  are that a *pass-through* folder needs no change to `composite.wgsl` and no
-  `umber-version` bump, and that a folder with its own opacity or blend mode
-  needs both — an accumulator stack in the composite loop, because a group at
-  50% over two overlapping children is not two children at 50%, and revision 3,
-  because an older build folding that opacity into each child opens the document
-  showing something else. Do not draw a folder's opacity control before the
-  second exists.
 - **A tick is a field on the layer and is never written to the file.** Every
   other flag is a property of the picture; a tick says what the painter is
   *about to do*, and reopening a document to find four layers still ticked is an

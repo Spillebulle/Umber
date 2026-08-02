@@ -310,7 +310,19 @@ fn parse_stack(
                                 mask_src: None,
                                 clipped: false,
                                 locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
-                                link: None,
+                                // A folder can belong to a link group — read
+                                // exactly as a layer's is, or a set that
+                                // contained one comes back a member short and
+                                // the survivor draws a chain meaning "moves
+                                // together with nothing".
+                                link: attrs
+                                    .get(docformat::LINK_GROUP_ATTR)
+                                    .and_then(|g| g.parse::<u8>().ok())
+                                    .filter(|g| (*g as usize) < LayerStack::LINK_GROUPS)
+                                    .or_else(|| {
+                                        (attrs.get(docformat::LINK_ATTR) == Some("true"))
+                                            .then_some(0)
+                                    }),
                                 depth: depth.saturating_sub(2).min(u8::MAX as usize) as u8,
                                 folder: true,
                             });
@@ -405,6 +417,7 @@ fn load_layer(
     if spec.folder {
         let mut folder = ImportedLayer::folder(spec.name.clone(), spec.depth, spec.visible);
         folder.locked = spec.locked;
+        folder.link = spec.link;
         return Ok(folder);
     }
     let png = container::read_optional_entry(zip, &spec.src, FORMAT)
@@ -717,6 +730,34 @@ mod tests {
                 .any(|w| matches!(w, ImportWarning::GroupFlattened { .. })),
             "the group was kept, so nothing was flattened"
         );
+    }
+
+    /// `<stack/>` — an empty group written self-closing — never gets an `End`
+    /// event, so the depth bookkeeping has a branch of its own. Umber's writer
+    /// does not produce that form, which is exactly why it needs a test: it
+    /// arrives from other applications and nothing else exercises it.
+    ///
+    /// Getting it wrong leaves the depth counter one too deep for the rest of
+    /// the file, so every layer after it comes back nested inside a group that
+    /// closed before them.
+    #[test]
+    fn a_self_closing_empty_group_does_not_swallow_what_follows_it() {
+        let doc = read(&fixtures::ora_with_empty_group()).unwrap();
+
+        let shape: Vec<(&str, u8, bool)> = doc
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.depth, l.folder))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![("After", 0, false), ("Empty", 0, true)],
+            "the empty group must close before the layer after it"
+        );
+        // And the stack it opens as is a tree, with the folder holding nothing.
+        let opened = doc.open();
+        assert_eq!(opened.stack.subtree(1), 1..2, "the group is empty");
+        assert_eq!(opened.stack.pixel_count(), 1);
     }
 
     #[test]

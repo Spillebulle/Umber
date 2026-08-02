@@ -200,7 +200,16 @@ pub const VERSION: u32 = 2;
 /// from older ones in exchange for nothing: a revision number is a statement
 /// about what a file *contains*, not about what wrote it.
 fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
-    if layers.iter().any(|l| l.mask.is_some() || l.clipped) {
+    // Folders are skipped, and not merely because they never carry either
+    // today: `clipped` is a public field on `Layer` and nothing stops it being
+    // set on a folder, where it means nothing and is written nowhere. Reading
+    // it here would push a document to revision 2 — shutting it out of every
+    // older Umber — for a flag with no effect on the picture at all.
+    if layers
+        .iter()
+        .filter(|l| !l.folder)
+        .any(|l| l.mask.is_some() || l.clipped)
+    {
         2
     } else {
         1
@@ -916,6 +925,19 @@ fn folder_xml(layer: &SaveLayer<'_>, selected: bool) -> String {
     if layer.locked {
         out.push_str(&format!(" {LOCK_ATTR}=\"true\""));
     }
+    // **A folder can be linked, so its group has to be written.** `targets`
+    // includes a ticked folder and `LayerStack::moving_with` is built for
+    // exactly that, so a set of "these travel together" can name one. Dropping
+    // it here lost the folder out of the group silently — and worse, brought
+    // the *other* member back alone, which `dissolve_lone_groups` exists to
+    // make impossible: a chain in one colour meaning "moves together with
+    // nothing", holding a number `free_group` could then never hand back.
+    if layer.link.is_some() {
+        out.push_str(&format!(" {LINK_ATTR}=\"true\""));
+    }
+    if let Some(group) = layer.link {
+        out.push_str(&format!(" {LINK_GROUP_ATTR}=\"{group}\""));
+    }
     out.push('>');
     out
 }
@@ -1263,6 +1285,62 @@ mod tests {
         assert!(
             folder_line.contains("visibility=\"hidden\""),
             "{folder_line}"
+        );
+    }
+
+    /// **A folder can belong to a link group, so the file has to carry it.**
+    ///
+    /// `targets` includes a ticked folder and `moving_with` is built for one,
+    /// so a set of "these travel together" can name a group. Writing the
+    /// attribute on the `<layer>` and not on the `<stack>` lost the folder out
+    /// of the set silently — and brought the other member back *alone*, which
+    /// `dissolve_lone_groups` exists to make unreachable: a chain in one colour
+    /// meaning "moves together with nothing", holding a number `free_group`
+    /// could never hand back.
+    #[test]
+    fn a_folder_in_a_link_group_comes_back_in_it() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [7, 7, 7, 255]);
+        let layers = vec![
+            SaveLayer {
+                link: Some(2),
+                ..layer("Loose", &px)
+            },
+            SaveLayer {
+                depth: 1,
+                ..layer("Inside", &px)
+            },
+            SaveLayer {
+                link: Some(2),
+                ..SaveLayer::folder("Group", 0, true)
+            },
+        ];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &px,
+            history: None,
+        })
+        .unwrap();
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains(&format!("{LINK_GROUP_ATTR}=\"2\"")),
+            "the group number is not on the stack tag:\n{xml}"
+        );
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        let links: Vec<Option<u8>> = doc.layers.iter().map(|l| l.link).collect();
+        assert_eq!(links, vec![Some(2), None, Some(2)]);
+
+        // And the stack it opens as agrees, so nothing dissolves the pair.
+        let opened = doc.open();
+        assert_eq!(
+            opened.stack.group_indices(2),
+            vec![0, 2],
+            "the folder and the loose layer still travel together"
         );
     }
 

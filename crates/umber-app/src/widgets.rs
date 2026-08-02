@@ -1772,6 +1772,15 @@ pub struct LayerRow<'a> {
     /// construction and never changes hands while a layer exists.
     /// Unique per entry within the frame. A layer's slot, and something no
     /// slot can be for a folder — which holds none.
+    ///
+    /// A layer's is *stable* for its lifetime, which is what the id needs to
+    /// be: names are not unique in an imported document and two widgets sharing
+    /// an id is an egui clash. A folder's is positional and therefore changes
+    /// whenever the stack is rearranged; the only consequence is that egui's
+    /// per-widget state on a folder's row — a hover, a pressed chevron — resets
+    /// when it moves, which is a frame nobody sees mid-drag. Nothing on a
+    /// folder's row holds state worth carrying, so it is not worth a second
+    /// identity scheme.
     pub key: u64,
     pub visible: bool,
     /// How deeply nested. Every hit target and every mark in the row is offset

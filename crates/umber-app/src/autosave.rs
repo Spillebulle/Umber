@@ -1854,6 +1854,152 @@ mod tests {
         );
     }
 
+    // --- folders ------------------------------------------------------------
+
+    /// A snapshot of a stack with a folder in it, bottom first:
+    ///
+    /// ```text
+    ///   3  Above          slot 2
+    ///   2  Group          folder, no slot
+    ///   1    Inside       slot 1, with a mask
+    ///   0  Below          slot 0
+    /// ```
+    fn nested_candidate() -> Candidate {
+        let layer = |name: &str, slot: u32, depth: u8, mask: Option<u32>| LayerMeta {
+            name: name.to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            slot: Some(slot),
+            depth,
+            folder: false,
+            mask,
+            clipped: false,
+            locked: false,
+            link: None,
+        };
+        let mut doc = candidate(Session::default().active_id(), "nested");
+        doc.layers = vec![
+            layer("Below", 0, 0, None),
+            layer("Inside", 1, 1, Some(3)),
+            LayerMeta {
+                name: "Group".to_string(),
+                visible: true,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                slot: None,
+                depth: 0,
+                folder: true,
+                mask: None,
+                clipped: false,
+                locked: false,
+                link: None,
+            },
+            layer("Above", 2, 0, None),
+        ];
+        doc
+    }
+
+    /// **A folder is read back as nothing, so the capture is shorter than the
+    /// stack**, and every layer above a folder would be handed the pixels of
+    /// the one below it by a positional zip. That is somebody's unattended file
+    /// written with its layers shifted, which is why `pixel_index` exists.
+    #[test]
+    fn a_folder_does_not_shift_a_layer_onto_another_layers_pixels() {
+        let doc = nested_candidate();
+        assert_eq!(
+            doc.slots(),
+            vec![0, 1, 2, 3],
+            "three layer slices then the one mask, and no folder"
+        );
+
+        // Entry position -> where its pixels are in the capture. The folder at
+        // 2 has none, and "Above" at 3 must not be handed slot 1's.
+        assert_eq!(doc.pixel_index(0), Some(0), "Below");
+        assert_eq!(doc.pixel_index(1), Some(1), "Inside");
+        assert_eq!(doc.pixel_index(2), None, "the folder holds no pixels");
+        assert_eq!(doc.pixel_index(3), Some(2), "Above, not shifted down one");
+        assert_eq!(doc.pixel_index(9), None, "off the end");
+
+        // Every layer's index into the capture names its own slice.
+        for (entry, meta) in doc.layers.iter().enumerate() {
+            let Some(slot) = meta.slot else { continue };
+            let k = doc.pixel_index(entry).expect("a layer has pixels");
+            assert_eq!(
+                doc.slots()[k],
+                slot,
+                "layer “{}” was pointed at another layer's pixels",
+                meta.name
+            );
+        }
+    }
+
+    /// The mask tail begins past every *layer* slice, which is the count of
+    /// entries that have one — not the entry count, which folders inflate. Get
+    /// that wrong and a masked layer is written with a layer's pixels as its
+    /// mask, hiding whatever it covers.
+    #[test]
+    fn a_folder_does_not_shift_the_mask_tail() {
+        let doc = nested_candidate();
+        let k = doc.mask_index(1).expect("“Inside” has a mask");
+        assert_eq!(doc.slots()[k], 3, "that is the mask's own slice");
+        assert_eq!(doc.mask_index(0), None);
+        assert_eq!(doc.mask_index(2), None, "a folder has no mask");
+        assert_eq!(doc.mask_index(3), None);
+    }
+
+    /// The flattened preview the file carries has to match the screen, so the
+    /// snapshot's reading of "is this drawn" has to match
+    /// `LayerStack::effective_visible`'s. A folder contributes no draw and its
+    /// eye reaches its contents.
+    #[test]
+    fn the_preview_hides_what_a_hidden_folder_hides() {
+        let mut doc = nested_candidate();
+        assert_eq!(doc.draws().len(), 3, "the folder is not a draw");
+        assert!(doc.draws().iter().all(|d| d.visible));
+
+        doc.layers[2].visible = false;
+        let draws = doc.draws();
+        assert_eq!(
+            draws.iter().map(|d| d.visible).collect::<Vec<_>>(),
+            vec![true, false, true],
+            "only the layer inside the folder goes"
+        );
+
+        // And against the model, which is the rule this is a second reading
+        // of. The same shape, built through the public API: three layers with
+        // the middle one grouped.
+        let mut stack = umber_core::LayerStack::new();
+        stack.add();
+        stack.add();
+        stack.set_active(1);
+        stack
+            .group(&[1])
+            .expect("the middle layer alone in a group");
+        assert_eq!(
+            stack
+                .layers()
+                .iter()
+                .map(|l| (l.depth, l.is_folder()))
+                .collect::<Vec<_>>(),
+            doc.layers
+                .iter()
+                .map(|l| (l.depth, l.folder))
+                .collect::<Vec<_>>(),
+            "the fixture and the model are not the same shape"
+        );
+        for (i, meta) in doc.layers.iter().enumerate() {
+            stack.get_mut(i).unwrap().visible = meta.visible;
+        }
+        for i in 0..doc.layers.len() {
+            assert_eq!(
+                doc.effective_visible(i),
+                stack.effective_visible(i),
+                "the snapshot and the model disagree about entry {i}"
+            );
+        }
+    }
+
     #[test]
     fn the_temporary_a_dead_write_leaves_is_recognised_as_ours() {
         assert!(is_autosave_name(Path::new("hands-0.ora")));

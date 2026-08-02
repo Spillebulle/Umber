@@ -69,12 +69,22 @@
 //! ## Well-formedness
 //!
 //! Not every sequence of depths describes a tree, and the one that does not is
-//! a layer nested inside no folder. Rather than reason about each mutation
-//! separately, every structural change builds the depth sequence it would
-//! produce and runs [`well_formed`] over it before committing — the stack is at
-//! most [`LayerStack::MAX`] entries, so that costs nothing, and it means
-//! `reorder` cannot be made to invent a state the drawing code has no way to
-//! draw.
+//! a layer nested inside no folder.
+//!
+//! The two mutations that could produce one — [`LayerStack::reorder_to`] and
+//! [`LayerStack::group`] — build the depth sequence they *would* produce and
+//! run [`well_formed`] over it **before** committing, so a refusal changes
+//! nothing at all. The stack is at most [`LayerStack::MAX`] entries, so that
+//! costs nothing. Each has a `can_` beside it sharing the same plan, which is
+//! what lets a button or a drag ask whether an operation will happen rather
+//! than offering it and being refused.
+//!
+//! The rest — `add`, `remove_many`, `flatten_ill_formed` — cannot produce a
+//! malformed stack by construction: one inserts at a depth it derives from a
+//! neighbour, one removes whole subtrees, and one exists to straighten a
+//! sequence. They carry a `debug_assert` rather than a gate, which is a
+//! statement that the argument is expected to hold and not a check that runs
+//! in a release build.
 
 use crate::color::Color;
 
@@ -578,12 +588,23 @@ impl LayerStack {
         !going.is_empty() && self.pixel_count() > lost
     }
 
-    /// Put the entries of `indices` — each expanded to its whole subtree — into
-    /// a new folder, and select it.
+    /// Would [`LayerStack::group`] do anything?
     ///
-    /// Returns the folder's position. `None` where it would not fit, where the
-    /// contents would end up deeper than [`LayerStack::MAX_DEPTH`], or where
-    /// nothing was named.
+    /// What the Group button draws itself from, for the reason
+    /// [`LayerStack::can_reorder`] exists: the refusals here — a full stack, a
+    /// set that would nest past [`LayerStack::MAX_DEPTH`], and naming nothing —
+    /// are invisible at the call site, and a live button that does nothing and
+    /// says nothing is the control the interface rules forbid.
+    pub fn can_group(&self, indices: &[usize]) -> bool {
+        self.plan_group(indices).is_some()
+    }
+
+    /// The members of a grouping and the depth each would take, or `None` where
+    /// it is refused.
+    ///
+    /// Shared by [`LayerStack::group`] and [`LayerStack::can_group`], so the
+    /// button and the operation cannot disagree — the same arrangement
+    /// `plan_reorder` and `can_reorder` keep.
     ///
     /// The group lands where its **topmost** member was, and the members arrive
     /// in the order they were already in. Gathering entries that were not
@@ -595,7 +616,7 @@ impl LayerStack {
     /// **Frees no slot and reassigns none**, so it does not clear the undo
     /// history. It is a `Vec` shuffle plus one entry that holds no pixels,
     /// which is exactly [`LayerStack::reorder`]'s argument for itself.
-    pub fn group(&mut self, indices: &[usize]) -> Option<usize> {
+    fn plan_group(&self, indices: &[usize]) -> Option<(Vec<usize>, Vec<u8>)> {
         if self.layers.len() >= Self::MAX {
             return None;
         }
@@ -636,6 +657,15 @@ impl LayerStack {
         if depths.iter().any(|d| *d > Self::MAX_DEPTH) {
             return None;
         }
+        Some((members, depths))
+    }
+
+    /// Put the entries of `indices` — each expanded to its whole subtree — into
+    /// a new folder, and select it. See [`LayerStack::plan_group`] for the
+    /// refusals and [`LayerStack::can_group`] for the button's half.
+    pub fn group(&mut self, indices: &[usize]) -> Option<usize> {
+        let (members, depths) = self.plan_group(indices)?;
+        let base = members.iter().map(|i| self.layers[*i].depth).min()?;
 
         // **Before the members are lifted out.** A folder being grouped is one
         // of them, so asking afterwards would not see it and would hand the new
@@ -806,37 +836,62 @@ impl LayerStack {
     /// GPU before they are handed out again. Refuses to leave the document with
     /// no layer holding pixels: a folder is not somewhere to paint.
     pub fn remove(&mut self, index: usize) -> Option<Vec<u32>> {
-        if index >= self.layers.len() {
+        self.remove_many(&[index])
+    }
+
+    /// Delete every entry of `indices`, and everything inside any folder among
+    /// them, in **one** pass.
+    ///
+    /// **One pass is the whole point, and deleting them one at a time is a bug
+    /// this had.** A folder's subtree runs *below* it, so removing one shifts
+    /// every index beneath it — including indices a caller walking the list
+    /// backwards has not reached yet. `delete_picked_layers` did exactly that
+    /// and deleted a layer nobody ticked, and cleared the undo history on the
+    /// way out, so it could not even be taken back. Resolving the whole set
+    /// against the stack as it stands now, before anything moves, is the only
+    /// arrangement where no index goes stale.
+    ///
+    /// Returns the slices freed, ascending — the caller has to clear them on the
+    /// GPU before they are handed out again, and **clear the undo history**,
+    /// because every one of them is now on the free list for another layer to
+    /// inherit. Refuses whole, changing nothing, where it would leave the
+    /// document with no layer holding pixels: a folder is not somewhere to
+    /// paint. [`LayerStack::can_remove`] is that same question, for the buttons.
+    pub fn remove_many(&mut self, indices: &[usize]) -> Option<Vec<u32>> {
+        if !self.can_remove(indices) {
             return None;
         }
-        let span = self.subtree(index);
-        let going = self.layers[span.clone()]
+        let mut going: Vec<usize> = indices
             .iter()
-            .filter(|l| !l.folder)
-            .count();
-        if self.pixel_count() - going == 0 {
-            return None;
-        }
+            .filter(|i| **i < self.layers.len())
+            .flat_map(|i| self.subtree(*i))
+            .collect();
+        going.sort_unstable();
+        going.dedup();
+
         let mut freed = Vec::new();
-        for layer in self.layers.drain(span.clone()) {
+        // Descending, so each removal only moves entries this loop has already
+        // dealt with. The set itself was resolved above and does not change.
+        for i in going.iter().rev() {
+            let layer = self.layers.remove(*i);
             freed.extend(layer.slot);
             freed.extend(layer.mask);
         }
         freed.sort_unstable();
         self.free_slots.extend(freed.iter().copied());
-        // The selection follows the stack rather than the number: a layer below
-        // the block that went shifts down by its length, one inside it is gone
-        // and the clamp catches it. Written out rather than left to the clamp
-        // alone because a folder deep in a tall stack moves every index above it
-        // and "it happens to still be in range" is not the same as "it is still
-        // the same layer".
-        self.active = if self.active >= span.end {
-            self.active - span.len()
-        } else {
-            self.active.min(span.start)
-        }
-        .min(self.layers.len() - 1);
-        debug_assert!(well_formed(&self.shape()), "remove left a malformed stack");
+
+        // The selection follows the stack rather than the number: it shifts
+        // down by however many entries below it went, and where it was one of
+        // them the clamp catches it.
+        let below = going.iter().filter(|i| **i < self.active).count();
+        self.active = self
+            .active
+            .saturating_sub(below)
+            .min(self.layers.len().saturating_sub(1));
+        debug_assert!(
+            well_formed(&self.shape()),
+            "removing a set of subtrees left a malformed stack"
+        );
         // Deleting one of a pair would otherwise leave the survivor in a group
         // of one — see `dissolve_lone_groups`.
         self.dissolve_lone_groups();
@@ -1197,10 +1252,24 @@ impl LayerStack {
         // moving: after everything at or before `to` when it is travelling up,
         // before whatever is at `to` when it is travelling down. For a single
         // entry this is exactly `remove(from); insert(to)`.
-        let moving_up = to > from;
+        //
+        // **A drop *into* the folder at `to` is the exception, and it is the
+        // gesture the whole depth argument exists for.** A folder sits above
+        // its contents, so landing inside it means landing immediately *below*
+        // its row — the "insert before" placement, whichever direction the
+        // entry travelled from. Without this, dropping onto a folder's own row
+        // from below put the entry above the folder at a depth the folder no
+        // longer enclosed, `well_formed` refused it, and nesting was reachable
+        // only by aiming at a row already inside the group — which left an
+        // *empty* folder impossible to fill by dragging at all.
+        let into = self
+            .layers
+            .get(to)
+            .is_some_and(|t| t.folder && depth > t.depth);
+        let after = to > from && !into;
         let at = (0..self.layers.len())
             .filter(|i| !members.contains(i))
-            .filter(|i| if moving_up { *i <= to } else { *i < to })
+            .filter(|i| if after { *i <= to } else { *i < to })
             .count();
 
         // The whole result, as (which entry, what depth), judged before a byte
@@ -1934,12 +2003,12 @@ mod tests {
             .collect()
     }
 
-    /// Four layers, the top two put in a group:
+    /// Three layers, the top two put in a group:
     ///
     /// ```text
     ///   3  Group 1    depth 0   folder
-    ///   2    Layer 4  depth 1
-    ///   1    Layer 3  depth 1
+    ///   2    Layer 3  depth 1
+    ///   1    Layer 2  depth 1
     ///   0  Layer 1    depth 0
     /// ```
     ///
@@ -2194,6 +2263,60 @@ mod tests {
         assert_eq!(s.slot_capacity_needed(), capacity);
     }
 
+    /// **Deleting a set takes exactly the set, and this was a bug.**
+    ///
+    /// A folder's contents sit *below* it, so removing one shifts every index
+    /// beneath it. Deleting the ticked entries one at a time — even backwards,
+    /// which looks like the safe direction and is the direction that fails —
+    /// handed the next step an index naming a different entry, and took a layer
+    /// nobody had ticked. `remove_many` resolves the whole set first.
+    #[test]
+    fn deleting_a_set_takes_the_set_and_nothing_else() {
+        // [A, B(1), F(0) over B, C] — the shape that breaks a reverse walk,
+        // because F's subtree reaches *down* past B.
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.add();
+        s.set_active(1);
+        assert_eq!(s.group(&[1]), Some(2), "Layer 2 alone in a group");
+        let names: Vec<String> = s.layers().iter().map(|l| l.name.clone()).collect();
+        assert_eq!(
+            names,
+            ["Layer 1", "Layer 2", "Group 1", "Layer 3", "Layer 4"]
+        );
+
+        // Tick the bottom layer and the group. `pick` cascades, so the tick set
+        // is {0, 1, 2} — and 1 is *below* 2.
+        s.pick(0, true);
+        s.pick(2, true);
+        assert_eq!(s.targets(), vec![0, 1, 2]);
+
+        s.remove_many(&s.targets()).expect("two layers survive");
+        assert_eq!(
+            s.layers()
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>(),
+            ["Layer 3", "Layer 4"],
+            "an entry nobody ticked was deleted"
+        );
+    }
+
+    /// A refusal changes nothing at all — it must not delete the entries it got
+    /// through before discovering the last one would empty the document.
+    #[test]
+    fn a_refused_deletion_removes_nothing() {
+        let mut s = LayerStack::new();
+        s.add();
+        let before: Vec<Option<u32>> = s.layers().iter().map(Layer::slot).collect();
+        assert!(s.remove_many(&[0, 1]).is_none(), "that is every layer");
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            before
+        );
+    }
+
     /// A document needs somewhere to paint, and a folder is not somewhere. So
     /// the folder holding the last layer cannot be deleted either — the
     /// refusal counts *pixel layers*, not entries.
@@ -2410,6 +2533,60 @@ mod tests {
                 ("Group 1".into(), 0, true),
                 ("Layer 4".into(), 0, false),
                 ("Layer 3".into(), 0, false),
+            ]
+        );
+    }
+
+    /// **Dropping onto a folder's own row puts the entry inside it**, from
+    /// above and from below alike, and an *empty* folder can be filled that way
+    /// — which is the only way it can be filled by dragging at all.
+    ///
+    /// This is the gesture `layerdrag`'s depth rule exists for, and it was
+    /// broken in one direction: a folder sits above its contents, so "insert at
+    /// the folder's position" placed the entry *above* the folder, at a depth
+    /// that folder no longer enclosed, and `well_formed` rightly refused it.
+    #[test]
+    fn a_folders_own_row_takes_a_drop_inside_it_from_either_side() {
+        // From below, into an empty folder at the top.
+        let mut s = LayerStack::new();
+        s.add();
+        assert_eq!(s.group(&[1]), Some(2));
+        // [Layer 1, Layer 2(1), Group 1] — now empty the group out again.
+        assert!(s.reorder_to(1, 0, 0));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 2".into(), 0, false),
+                ("Layer 1".into(), 0, false),
+                ("Group 1".into(), 0, true),
+            ],
+            "an empty folder at the top"
+        );
+        assert_eq!(s.subtree(2), 2..3, "and it really is empty");
+
+        assert!(
+            s.reorder_to(0, 2, 1),
+            "the bottom layer, dropped onto the empty folder's row"
+        );
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 2".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ]
+        );
+        assert_eq!(s.subtree(2), 1..3, "the folder now holds it");
+
+        // And from above: the layer below the folder, dropped onto its row.
+        assert!(s.reorder_to(0, 2, 1));
+        assert_eq!(s.subtree(2), 0..3, "both are inside now");
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 2".into(), 1, false),
+                ("Layer 1".into(), 1, false),
+                ("Group 1".into(), 0, true),
             ]
         );
     }
