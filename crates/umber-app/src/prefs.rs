@@ -750,14 +750,19 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
 /// edited *now*, and it is what makes turning the limit down give the memory
 /// back at once rather than at the next stroke.
 ///
-/// Documents open in *other* tabs are not reached, and that is the gap: a
-/// parked history keeps the ceiling it was built with until something replaces
-/// it. Closing it needs a mutable walk over `Session`'s parked states, which
-/// `Session` does not currently offer.
+/// The documents parked in other tabs are reached too, and have to be: the
+/// budget is *per document*, so a session of four tabs is four ceilings, and
+/// one lowered to give memory back that left three untouched would give back a
+/// quarter of what the dialog said.
 pub fn set_undo_budget(ed: &mut Editor, megabytes: u32) {
     let bytes = undo_budget_bytes(megabytes);
     umber_core::history::set_default_budget(bytes);
     ed.history.set_budget(bytes);
+    for i in 0..ed.session.len() {
+        if let Some(state) = ed.session.parked_mut(i) {
+            state.history.set_budget(bytes);
+        }
+    }
 }
 
 /// Push stored preferences into the running app.

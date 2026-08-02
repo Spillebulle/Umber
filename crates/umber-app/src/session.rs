@@ -218,6 +218,16 @@ impl Session {
         self.tabs.get(index)?.parked.as_ref()
     }
 
+    /// The state of a background document, to be changed in place.
+    ///
+    /// Unlike [`Session::take_parked`], which lifts the state out to make it
+    /// live: this is for a setting that has to reach every document at once —
+    /// the undo budget — where taking each one out and putting it back would
+    /// be four moves per tab to change one number.
+    pub fn parked_mut(&mut self, index: usize) -> Option<&mut DocumentState> {
+        self.tabs.get_mut(index)?.parked.as_mut()
+    }
+
     /// Note that an autosave has written this document to the file it already
     /// had, so the tab no longer holds anything the file does not.
     ///
