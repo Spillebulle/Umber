@@ -49,15 +49,31 @@ is one. The first run says so *before* the first request goes out, and you can
 switch the check off in **Settings → General**. The request carries nothing
 about you or your work.
 
-Whether it can then install the update depends on how you installed it:
+What you get is an offer: which release, the version you are on, and that
+release's own notes beside them. Update now, not now, or never ask again — the
+last of which is the same switch as the one in Settings, and can be turned back
+on there.
+
+Say yes and the same dialog shows the work: a progress bar over the stage it is
+actually in — contacting GitHub, downloading with a real percentage, checking
+the length, unpacking, installing — and a cancel for as long as stopping costs
+nothing, which is up to the moment anything is written. Then five seconds'
+notice before it restarts, with a button to do it now and one to stay where you
+are.
+
+Whether it can install the update at all depends on how you installed it:
 
 | | |
 |---|---|
-| Portable zip or tarball | Replaced in place; the new build runs next start |
-| AppImage | The one file is replaced |
-| Windows `.msi` | The new installer is downloaded and handed to `msiexec` |
+| Portable zip or tarball | Replaced in place; Umber restarts into it |
+| AppImage | The one file is replaced; Umber restarts into it |
+| Windows `.msi` | Handed to `msiexec`, which needs Umber to close first |
 | `.deb`, `.rpm`, Arch | Named, with the command to run — never overwritten |
 | Flatpak | Not checked at all; Flatpak keeps it current itself |
+
+The Windows row is the honest limit of the progress bar: once `msiexec` has the
+package, Windows owns the installation and shows its own progress. Umber says
+so at that point rather than animating a bar over something it cannot see.
 
 Those last two rows matter. Those files belong to a package manager that keeps
 its own record of them, so writing over them is usually not permitted, makes
