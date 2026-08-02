@@ -1,37 +1,37 @@
-//! About, and the two dialogs the update check needs.
+//! About, and the notice the update check needs before its first request.
 //!
-//! Three modals, in the order a user meets them:
+//! Two modals, in the order a user meets them:
 //!
 //! * [`first_run_notice`] — shown once, before the first check goes out, saying
 //!   that Umber asks GitHub for the release list when it starts. The check is
 //!   on by default (see [`crate::update::Updates::check_on_startup`] for why),
 //!   and this is what makes that defensible: nothing leaves the machine until
 //!   the user has read the sentence and answered it.
-//! * [`update_prompt`] — raised by the automatic check when a newer release
-//!   exists. It offers to install where that is legitimate, and **where it is
-//!   not it still says so and points at the releases page**: an installation
-//!   Umber may not replace is not a reason to leave somebody on an old build
-//!   without telling them.
 //! * [`dialog`] — Help, About. The mark, the version, the repository, the
 //!   licence, how this copy was installed, and a check-for-updates button that
 //!   reports its own outcome.
 //!
-//! All three use `tabs::dialog_frame` and `tabs::button`, so they are the same
+//! The third — the offer, and the work it leads to — is `updatedlg.rs`. It used
+//! to live here as a one-screen prompt that started a download and then said
+//! nothing until the installer appeared; it is now two screens with a state
+//! machine behind it, which is more than this module should be about.
+//!
+//! All of them use `tabs::dialog_frame` and `tabs::button`, so they are the same
 //! object as the close prompt and the import notice rather than a second family
-//! of dialogs.
+//! of dialogs — which is also why the small text pieces at the foot of this file
+//! are `pub(crate)`.
 
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::logo;
 use crate::tabs;
 use crate::theme::{Palette, text};
-use crate::update::{self, Applied, Status, Version};
+use crate::update::{self, Status, Version};
 use egui::{Align2, FontId, Sense, vec2};
 
-/// Draw whichever of the three is due. Called once per frame from `ui::draw`.
+/// Draw whichever of the two is due. Called once per frame from `ui::draw`.
 pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     first_run_notice(root, p, ed);
-    update_prompt(root, p, ed);
     dialog(root, p, ed);
 }
 
@@ -90,89 +90,6 @@ fn first_run_notice(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ed.updates.notice_seen = true;
         ed.updates.check_on_startup = wanted;
         crate::prefs::mark_dirty();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// A newer release
-// ---------------------------------------------------------------------------
-
-/// The prompt the automatic check raises.
-fn update_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    if !ed.updates.prompt_open {
-        return;
-    }
-    let Status::Available(release) = ed.updates.status().clone() else {
-        ed.updates.prompt_open = false;
-        return;
-    };
-    let installable = ed.updates.installable(&release).is_some();
-    let obstacle = ed.updates.kind().cannot_update();
-    let mut install = false;
-    let mut open_page = false;
-    let mut dismiss = false;
-
-    let modal = egui::Modal::new(egui::Id::new("update-available"))
-        .frame(tabs::dialog_frame(p))
-        .show(root.ctx(), |ui| {
-            ui.set_width(460.0);
-            heading(ui, p, &format!("Umber {} is available", release.version));
-            ui.add_space(4.0);
-            note(ui, p, &format!("You are running {}.", Version::current()));
-
-            if !release.notes.trim().is_empty() {
-                ui.add_space(10.0);
-                // The release notes are `CHANGELOG.md`'s own section, published
-                // verbatim by the workflow — so this is the repository's text,
-                // not a second wording of it.
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        body(ui, p, release.notes.trim());
-                    });
-            }
-
-            // Where Umber may not do the update itself, the prompt still
-            // appears and still says where the build is. Being unable to
-            // install something is not a reason to leave somebody unaware that
-            // it exists.
-            if let Some(obstacle) = obstacle.as_deref() {
-                ui.add_space(12.0);
-                note(ui, p, obstacle);
-            } else if !installable {
-                ui.add_space(12.0);
-                note(
-                    ui,
-                    p,
-                    "This release does not carry a build for this machine. The \
-                     releases page has everything that was published.",
-                );
-            }
-
-            ui.add_space(14.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if installable && obstacle.is_none() {
-                    if tabs::button(ui, p, "Update now", true) {
-                        install = true;
-                    }
-                } else if tabs::button(ui, p, "Open the releases page", true) {
-                    open_page = true;
-                }
-                if tabs::button(ui, p, "Not now", false) {
-                    dismiss = true;
-                }
-            });
-        });
-
-    if install {
-        ed.updates.install_available();
-    }
-    if open_page {
-        update::open_in_browser(&release.page);
-        dismiss = true;
-    }
-    if dismiss || modal.should_close() {
-        ed.updates.prompt_open = false;
     }
 }
 
@@ -253,15 +170,22 @@ fn dialog(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 
 /// The update half of the About dialog: a button, whatever the last check said,
 /// and the honest limit of what Umber can promise about a download.
+///
+/// It reports and it does not *do*. An update itself — the offer, the notes,
+/// the bar, the countdown — is `updatedlg.rs`, and this hands over to it rather
+/// than growing a second, smaller version of the same thing inside a section of
+/// About.
 fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let status = ed.updates.status().clone();
-    let obstacle = ed.updates.kind().cannot_update();
     // An installation that never asks GitHub at all — the Flatpak, whose
     // sandbox has no network and whose updates are Flatpak's own job.
     let unavailable = ed.updates.check_unavailable();
+    let working = ed.updates.flow().and_then(|flow| match flow.phase() {
+        crate::update::Phase::Working(stage) => Some(stage.label()),
+        _ => None,
+    });
     let mut check = false;
-    let mut install = false;
-    let mut quit = false;
+    let mut show = false;
 
     ui.horizontal(|ui| {
         let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(15.0), Sense::hover());
@@ -294,6 +218,13 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         return;
     }
 
+    // An update already under way outranks whatever the check last said: it is
+    // the newer fact, and the dialog carrying it is on top of this one anyway.
+    if let Some(stage) = working {
+        note(ui, p, &format!("An update is in progress — {stage}."));
+        return;
+    }
+
     match &status {
         Status::Idle => note(
             ui,
@@ -310,24 +241,6 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             p,
             &format!("Umber {} is the newest release.", Version::current()),
         ),
-        Status::Downloading => note(ui, p, "Downloading…"),
-        Status::Applied(Applied::Restart) => note(
-            ui,
-            p,
-            "The new version is in place. It runs the next time you start Umber.",
-        ),
-        Status::Applied(Applied::Installer) => {
-            note(
-                ui,
-                p,
-                "The Windows installer is running. It needs Umber to close before \
-                 it can replace the program.",
-            );
-            ui.add_space(6.0);
-            if tabs::button(ui, p, "Close Umber", true) {
-                quit = true;
-            }
-        }
         Status::Failed(message) => {
             note(ui, p, message);
         }
@@ -337,26 +250,12 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     .size(text::SMALL)
                     .color(p.text_strong),
             );
-            match obstacle.as_deref() {
-                Some(obstacle) => {
-                    ui.add_space(6.0);
-                    note(ui, p, obstacle);
-                }
-                None if ed.updates.installable(release).is_none() => {
-                    ui.add_space(6.0);
-                    note(
-                        ui,
-                        p,
-                        "That release carries no build for this machine. The \
-                         releases page has everything that was published.",
-                    );
-                }
-                None => {
-                    ui.add_space(6.0);
-                    if tabs::button(ui, p, "Download and install", true) {
-                        install = true;
-                    }
-                }
+            ui.add_space(6.0);
+            // What that release carries, whether this copy may take it, and the
+            // notes themselves are all the update dialog's — stated once, where
+            // the buttons that act on them are.
+            if tabs::button(ui, p, "Show the update…", true) {
+                show = true;
             }
         }
     }
@@ -380,11 +279,8 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if check {
         ed.updates.check();
     }
-    if install {
-        ed.updates.install_available();
-    }
-    if quit {
-        ed.updates.request_quit();
+    if show {
+        ed.updates.open_offer();
     }
 }
 
@@ -392,7 +288,7 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 // Small pieces
 // ---------------------------------------------------------------------------
 
-fn heading(ui: &mut egui::Ui, p: &Palette, title: &str) {
+pub(crate) fn heading(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.label(
         egui::RichText::new(title)
             .size(text::CONTROL)
@@ -401,7 +297,7 @@ fn heading(ui: &mut egui::Ui, p: &Palette, title: &str) {
     );
 }
 
-fn body(ui: &mut egui::Ui, p: &Palette, message: &str) {
+pub(crate) fn body(ui: &mut egui::Ui, p: &Palette, message: &str) {
     ui.label(
         egui::RichText::new(message)
             .size(text::SMALL)
@@ -410,7 +306,7 @@ fn body(ui: &mut egui::Ui, p: &Palette, message: &str) {
     );
 }
 
-fn note(ui: &mut egui::Ui, p: &Palette, message: &str) {
+pub(crate) fn note(ui: &mut egui::Ui, p: &Palette, message: &str) {
     ui.label(
         egui::RichText::new(message)
             .size(10.0)
@@ -420,7 +316,7 @@ fn note(ui: &mut egui::Ui, p: &Palette, message: &str) {
 }
 
 /// A label and its value, on one line.
-fn fact(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str) {
+pub(crate) fn fact(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.set_width(90.0);
@@ -488,7 +384,7 @@ fn link_row(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str) -> bool {
 }
 
 /// The hairline the design puts between sections of a dialog.
-fn rule(ui: &mut egui::Ui, p: &Palette) {
+pub(crate) fn rule(ui: &mut egui::Ui, p: &Palette) {
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(line, 0.0, p.border);
 }

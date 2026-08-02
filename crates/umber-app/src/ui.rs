@@ -219,6 +219,9 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // closes the moment it is clicked, and a dialog owned by something that is
     // no longer on screen cannot be shut.
     crate::about::show(root, &p, ed);
+    // After About, so it is the modal on top: an update in progress is the more
+    // urgent of the two, and About's own update section defers to it.
+    crate::updatedlg::show(root, &p, ed);
 
     // Drawn here rather than from a panel body, for the same reason the brush
     // library's modals are: the layout can hide a panel, and a modal that goes
@@ -960,6 +963,7 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     ed.ui.about_open = true;
                     ui.close();
                 }
+                update_rehearsal(ui, ed);
             });
         });
 
@@ -1009,6 +1013,73 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         }
     });
 }
+
+/// A way to look at each of the update dialog's screens without a release to
+/// install.
+///
+/// Nobody working on Umber can run a real update against a real release — it
+/// would mean cutting one — so every screen of `updatedlg.rs` would otherwise
+/// ship having been reasoned about and never seen. This walks the model to each
+/// of them with a release that does not exist.
+///
+/// **It is `debug_assertions` only, and so is everything it reaches.** A live
+/// control that fabricates a release has no business in a build somebody paints
+/// with, and the reason it is a compile-time gate rather than a hidden flag is
+/// that a hidden flag is a thing somebody finds.
+#[cfg(debug_assertions)]
+fn update_rehearsal(ui: &mut egui::Ui, ed: &mut Editor) {
+    use crate::update::{Applied, Phase, Stage, flow::Countdown};
+
+    ui.separator();
+    ui.menu_button("Update dialog (debug)…", |ui| {
+        let screens: [(&str, Phase); 7] = [
+            ("The offer", Phase::Offer),
+            (
+                "Downloading",
+                Phase::Working(Stage::Downloading {
+                    received: 12 * 1024 * 1024,
+                    total: 31 * 1024 * 1024,
+                }),
+            ),
+            ("Unpacking", Phase::Working(Stage::Unpacking)),
+            ("Installing — Windows", Phase::Working(Stage::HandingOver)),
+            (
+                "Done — restart",
+                Phase::Done {
+                    outcome: Applied::Restart,
+                    countdown: Countdown::stopped(),
+                },
+            ),
+            (
+                "Done — installer",
+                Phase::Done {
+                    outcome: Applied::Installer,
+                    countdown: Countdown::stopped(),
+                },
+            ),
+            (
+                "Failed",
+                Phase::Failed(
+                    "Umber could not download umber-0.0.5-x64.msi: connection reset \
+                     by peer."
+                        .to_string(),
+                ),
+            ),
+        ];
+        for (label, phase) in screens {
+            if ui.button(label).clicked() {
+                // The countdown is the real one — started here, not faked — so
+                // what is on screen is the drawing a real update produces.
+                ed.updates.demo(phase, std::time::Instant::now());
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Nothing in a release build.
+#[cfg(not(debug_assertions))]
+fn update_rehearsal(_ui: &mut egui::Ui, _ed: &mut Editor) {}
 
 /// A menu entry that shows the chord currently bound to it.
 ///

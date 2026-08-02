@@ -1101,6 +1101,13 @@ design shows a whole row of them.
   `keylayout::name_for` is a pure function of an injected reading, which is the
   only way the Norwegian and German answers are tested at all, and the reading is
   cached — the platform is asked from the *input* path, never while painting.
+- **A dialog's button strip goes inside a `horizontal`.** A bare
+  `Layout::right_to_left(Align::Center)` takes the *whole* of the remaining
+  height of the `Ui` it is in, because the align is the cross axis — so on a
+  short modal it stretches the dialog to the height of the window and leaves the
+  buttons floating in the middle of it. `canvasdlg.rs` already wraps its footer
+  for this reason and `updatedlg::actions_row` is the same wrap named; it is
+  invisible on a dialog whose content is tall, which is why it went unnoticed.
 - **A widget revealed on hover must not be what decides the hover.** egui stops
   its hover search at the topmost *interactive* widget, so a `Sense::hover()`
   row reads as not-hovered the moment the pointer is over a button inside it —
@@ -1756,8 +1763,79 @@ must not learn about HTTP, the same boundary that keeps them testable.
   and inside the Flatpak sandbox; roots are compiled in because an AppImage
   cannot rely on the host's certificate store.
 - **No test may touch the network.** The release parsing is driven from a
-  fixture, the install detection from injected readings, and the archive
-  handling from archives the test builds itself.
+  fixture, the install detection from injected readings, the archive handling
+  from archives the test builds itself, and the dialog's whole state machine
+  from `update::flow` — see below.
+
+#### The update dialog
+
+`umber-app::update::flow` is the model — which screen, which stage, the
+countdown, and which actions this installation may be offered — and
+`updatedlg.rs` paints it, with no drawing in the one and no decisions in the
+other. Same division `dock.rs` keeps against `panels.rs`. It is what makes an
+update testable at all: nobody here can cut a release to run the real thing
+against, so an offer → download → unpack → install → countdown → restart, and
+every failure and cancellation off it, are `Flow`'s tests and need neither a
+window nor a socket.
+
+- **There is one record of what an update is doing.** `Status` is the *check's*
+  outcome and nothing else; the flow is the update's. `Status::Downloading` and
+  `Status::Applied` used to exist beside a dialog that also tracked them, which
+  is two things to keep in step and one of them eventually stale. About's update
+  section reports and hands over; it does not run a second, smaller update.
+- **Only the worker decides how an update ended.** Cancel *asks*
+  (`Phase::Stopping`) and the thread answers. Marking the flow cancelled at the
+  click would let the dialog say a release was not installed in the half second
+  after it was — the one case a boolean on the button gets wrong.
+- **A cancel is only offered while stopping costs nothing.** `Stage::can_stop`
+  is true up to and including the length check, because the download is held in
+  memory and nothing has been written; from the unpack on, the control comes off
+  the screen rather than being drawn and refused. A stop landing mid-swap is the
+  one outcome that costs somebody their installation.
+- **Progress is throttled to one report per whole percent.** The rule that the
+  check must wake the loop applies to every byte that arrives, and a wake per
+  64 KiB chunk is five hundred full-interface redraws on a 30 MB release. A
+  hundred is enough to move a bar.
+- **The bar never animates over something it does not know.**
+  `Stage::progress` returns `Option`, and `None` draws an empty track. The one
+  place Umber genuinely cannot report progress — Windows' installer, once
+  `msiexec` has the package — is `Stage::HandingOver`, a stage that *says* so,
+  and then a completion screen that says it again. A progress bar that lies is
+  the class of control this project refuses everywhere else.
+- **Nothing on screen calls anything verified.** Umber does not sign its
+  releases, so the stage that compares lengths is called checking the length,
+  the footnote states HTTPS and an address from the API and a size, and
+  `no_stage_calls_anything_verified` fails the build on "verif", "authentic",
+  "secure", "signed" or "signature" appearing in a stage label.
+- **"Never ask again" writes `check_on_startup`**, the same preference Settings,
+  General shows and can undo. A second switch is two things that can disagree
+  about whether Umber checks.
+- **`Applied::Restart` restarts and `Applied::Installer` closes**, and the
+  difference is not cosmetic: a copy Umber replaced itself is at its own path
+  and can be started from there, while the MSI cannot touch Program Files until
+  Umber is gone and offers to start the new version itself. `relaunch` therefore
+  *reports* rather than exiting — `app.rs` exits only on `Ok`, so an update that
+  could not start the new copy leaves the old one running instead of leaving the
+  user with none. Same guarantee `swap_in`'s rename-then-replace makes.
+- **The dialog cannot be dismissed while work is in flight.** Escape and the
+  click outside are refused by `Flow::holds_work`; a modal that vanished
+  mid-download would leave a thread running with nothing on screen to stop it.
+- **`Phase::Stopping` carries the stage it was stopped from**, so the bar holds
+  the reading it had while the worker answers. Emptying it reads as a reset, and
+  the download is still running until the worker says otherwise. That is also
+  why `working` takes a fraction and a line rather than a `Stage`: on that one
+  screen the two come from different places.
+- **The notes are the release's own**, out of the API reply — which is
+  `CHANGELOG.md`'s section, published verbatim by the workflow. The changelog
+  compiled into the binary describes the build already *running* and is exactly
+  the wrong thing to show. They go in one vertical `ScrollArea` with
+  `auto_shrink([false, false])` inside a box `theme::metrics` sizes, for the
+  reason `BRUSH_LIBRARY` is fixed: it is text nobody here wrote.
+- **The rehearsal menu is `debug_assertions` only.** Help → "Update dialog
+  (debug)…" walks the model to each screen with a release that does not exist,
+  because otherwise every one of them ships having been reasoned about and never
+  looked at. A compile-time gate rather than a hidden preference, which is a
+  thing somebody finds.
 
 ### What is built, and what is deliberately not
 
