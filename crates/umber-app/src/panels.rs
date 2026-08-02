@@ -968,11 +968,20 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 ui,
                 p,
                 Icon::Trash,
-                count > 1 && !locked,
-                if locked {
-                    "The layer is locked — unlock it to delete it"
-                } else {
-                    "Delete layer — clears undo history"
+                // Asked of the model rather than counted here: a folder is not
+                // somewhere to paint, so "more than one entry" is not the same
+                // question as "something would be left to paint on", and
+                // deleting a folder takes every layer inside it.
+                ed.layers.can_remove(&[active]) && !locked,
+                match (
+                    ed.layers.can_remove(&[active]),
+                    locked,
+                    ed.layers.active_is_folder(),
+                ) {
+                    (_, true, _) => "The layer is locked — unlock it to delete it",
+                    (false, _, _) => "A document needs a layer to paint on",
+                    (_, _, true) => "Delete the group and everything in it — clears undo history",
+                    _ => "Delete layer — clears undo history",
                 },
             ) {
                 actions.delete_layer = Some(active);
@@ -1165,10 +1174,23 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 layer.locked = !is_locked;
                 changed = true;
             }
+            // **Not a label beside it.** A label in an egui horizontal layout
+            // defaults to `TextWrapMode::Extend`, so a sentence here sizes the
+            // strip — and with it the panel and the window — instead of being
+            // sized by it. That is the exact failure `brushlib::notice_bar` and
+            // `controls::banner` were written to avoid, and putting one here
+            // pushed the layer list past the right edge of the window: the
+            // blend labels read "Nor". Seen in a running window, which is the
+            // only way this shows up.
             ui.label(
-                egui::RichText::new("A group carries its layers. It has no blend mode.")
+                egui::RichText::new("A group carries its layers")
                     .size(text::TINY)
                     .color(p.text_muted),
+            )
+            .on_hover_text(
+                "A group has no blend mode and no opacity of its own — its \
+                 layers composite in place. Its eye and its lock reach \
+                 everything inside it.",
             );
         });
     }
@@ -1222,7 +1244,14 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // fact a strip like this has to tell you before you press Delete.
     if ed.layers.picked_count() > 0 {
         let picked = ed.layers.picked_count();
-        let any_locked = ed.layers.targets().iter().any(|i| ed.layers.locked_at(*i));
+        // Through `effective_locked`, so a folder's lock protects what is
+        // inside it — the same question `delete_layer`'s gate asks.
+        let any_locked = ed
+            .layers
+            .targets()
+            .iter()
+            .any(|i| ed.layers.effective_locked(*i));
+        let can_delete = ed.layers.can_remove(&ed.layers.targets());
         let mut act: Option<Bulk> = None;
         ui.horizontal(|ui| {
             ui.label(
@@ -1235,8 +1264,8 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     ui,
                     p,
                     Icon::Trash,
-                    picked < count && !any_locked,
-                    match (picked < count, any_locked) {
+                    can_delete && !any_locked,
+                    match (can_delete, any_locked) {
                         (false, _) => "A document needs a layer to paint on",
                         (_, true) => "One of them is locked — unlock it to delete it",
                         _ => "Delete the ticked layers — clears undo history",
@@ -1389,8 +1418,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         if ed
             .layers
             .ancestors_of(index)
-            .iter()
-            .any(|a| ed.layers.get(*a).is_some_and(|f| f.collapsed))
+            .any(|a| ed.layers.get(a).is_some_and(|f| f.collapsed))
         {
             continue;
         }

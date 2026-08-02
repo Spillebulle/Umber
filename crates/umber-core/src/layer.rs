@@ -498,22 +498,28 @@ impl LayerStack {
     /// Walking *up* the list: the enclosing folder of an entry at depth `d` is
     /// the first entry above it at depth `d - 1`, which well-formedness
     /// guarantees is a folder.
-    pub fn ancestors_of(&self, index: usize) -> Vec<usize> {
-        let mut out = Vec::new();
-        let Some(entry) = self.layers.get(index) else {
-            return out;
-        };
-        let mut want = entry.depth;
-        for (i, above) in self.layers.iter().enumerate().skip(index + 1) {
-            if want == 0 {
-                break;
+    ///
+    /// **An iterator and not a `Vec`**, because this is on the drawing path:
+    /// `effective_visible` asks it for every layer of every frame, from
+    /// `Editor::layer_draws`, and the layer list asks it again for every row.
+    /// A short-lived allocation per layer per frame is exactly what the rule
+    /// about the drawing path exists to keep out, and a tall stack would pay it
+    /// a hundred and twenty times a frame for an answer that is at most eight
+    /// steps of arithmetic.
+    pub fn ancestors_of(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut want = self.layers.get(index).map_or(0, |l| l.depth);
+        let mut i = index + 1;
+        std::iter::from_fn(move || {
+            while want > 0 && i < self.layers.len() {
+                let here = i;
+                i += 1;
+                if self.layers[here].depth < want {
+                    want = self.layers[here].depth;
+                    return Some(here);
+                }
             }
-            if above.depth < want {
-                out.push(i);
-                want = above.depth;
-            }
-        }
-        out
+            None
+        })
     }
 
     /// Does this entry actually contribute to the picture?
@@ -527,10 +533,7 @@ impl LayerStack {
     /// there is no `effective_opacity` beside this and no control to feed one.
     pub fn effective_visible(&self, index: usize) -> bool {
         self.layers.get(index).is_some_and(|l| l.visible)
-            && self
-                .ancestors_of(index)
-                .iter()
-                .all(|i| self.layers[*i].visible)
+            && self.ancestors_of(index).all(|i| self.layers[i].visible)
     }
 
     /// Is this entry locked, by its own flag or by a folder it is in?
@@ -540,10 +543,7 @@ impl LayerStack {
     /// about a lock is read at — see [`LayerStack::locked_at`].
     pub fn effective_locked(&self, index: usize) -> bool {
         self.layers.get(index).is_some_and(|l| l.locked)
-            || self
-                .ancestors_of(index)
-                .iter()
-                .any(|i| self.layers[*i].locked)
+            || self.ancestors_of(index).any(|i| self.layers[i].locked)
     }
 
     /// The depth sequence this stack would have with `change` applied, for
@@ -555,6 +555,27 @@ impl LayerStack {
     /// How many entries hold pixels. A document needs at least one.
     pub fn pixel_count(&self) -> usize {
         self.layers.iter().filter(|l| !l.folder).count()
+    }
+
+    /// Would deleting all of `indices` leave somewhere to paint?
+    ///
+    /// What the delete buttons ask before they draw themselves enabled, and it
+    /// is the same arithmetic [`LayerStack::remove`] refuses on — so the
+    /// control cannot promise an operation the model will decline. It has to be
+    /// asked rather than guessed at from the entry count, because **a folder is
+    /// not somewhere to paint**: a stack of one layer inside one folder is two
+    /// entries and still cannot give either of them up, and deleting a folder
+    /// takes every layer inside it.
+    pub fn can_remove(&self, indices: &[usize]) -> bool {
+        let mut going: Vec<usize> = indices
+            .iter()
+            .filter(|i| **i < self.layers.len())
+            .flat_map(|i| self.subtree(*i))
+            .collect();
+        going.sort_unstable();
+        going.dedup();
+        let lost = going.iter().filter(|i| !self.layers[**i].folder).count();
+        !going.is_empty() && self.pixel_count() > lost
     }
 
     /// Put the entries of `indices` — each expanded to its whole subtree — into
@@ -601,10 +622,13 @@ impl LayerStack {
             .map(|i| {
                 // The outermost enclosing folder that is *itself* moving is the
                 // root this entry hangs off; failing that it is its own root.
+                // The *outermost* enclosing folder that is itself moving —
+                // `ancestors_of` runs innermost first, so that is the last one
+                // it yields that is a member.
                 let root = self
                     .ancestors_of(*i)
-                    .into_iter()
-                    .rfind(|a| members.contains(a))
+                    .filter(|a| members.contains(a))
+                    .last()
                     .unwrap_or(*i);
                 self.layers[*i].depth + base + 1 - self.layers[root].depth
             })
@@ -1071,8 +1095,8 @@ impl LayerStack {
             .map(|i| {
                 let root = self
                     .ancestors_of(*i)
-                    .into_iter()
-                    .rfind(|a| members.contains(a))
+                    .filter(|a| members.contains(a))
+                    .last()
                     .unwrap_or(*i);
                 let root_depth = self.layers[root].depth;
                 // Signed, because a folder dragged out to the top level takes
@@ -1946,8 +1970,8 @@ mod tests {
         assert_eq!(s.subtree(3), 1..4, "the folder and both its layers");
         assert_eq!(s.subtree(1), 1..2, "a layer owns only itself");
         assert_eq!(s.subtree(0), 0..1);
-        assert_eq!(s.ancestors_of(1), vec![3]);
-        assert_eq!(s.ancestors_of(0), Vec::<usize>::new());
+        assert_eq!(s.ancestors_of(1).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(s.ancestors_of(0).collect::<Vec<_>>(), Vec::<usize>::new());
         assert_eq!(s.pixel_count(), 3, "a folder holds no pixels");
         assert_eq!(s.len(), 4, "three layers and one folder");
     }
@@ -2146,7 +2170,7 @@ mod tests {
                 .collect::<Vec<_>>()
         ));
         // The layer at the bottom of it all is as deep as anything gets.
-        assert_eq!(s.ancestors_of(0).len(), LayerStack::MAX_DEPTH as usize);
+        assert_eq!(s.ancestors_of(0).count(), LayerStack::MAX_DEPTH as usize);
     }
 
     /// Deleting a folder takes its contents, frees every slice inside it, and
@@ -2184,6 +2208,52 @@ mod tests {
         );
         assert!(s.remove(0).is_none(), "and so would deleting the layer");
         assert_eq!(s.len(), 2);
+    }
+
+    /// The delete buttons draw themselves from this, so it has to agree with
+    /// [`LayerStack::remove`] exactly — a control offering an operation the
+    /// model then declines is the lying control the interface rules refuse.
+    ///
+    /// "More than one entry" is emphatically **not** the same question: two
+    /// entries can be one layer inside one folder, which cannot give up either.
+    #[test]
+    fn the_delete_buttons_ask_the_same_question_the_removal_answers() {
+        let mut s = LayerStack::new();
+        assert!(!s.can_remove(&[0]), "the only layer");
+        assert!(!s.can_remove(&[]), "nothing named is nothing to delete");
+
+        s.group(&[0]);
+        assert_eq!(s.len(), 2, "two entries, and still only one layer");
+        assert!(!s.can_remove(&[1]), "the group holding the only layer");
+        assert!(!s.can_remove(&[0]));
+
+        // A second layer beside the group, and now either can go.
+        s.set_active(1);
+        s.add().expect("room for another layer");
+        let added = s.active_index();
+        s.reorder_to(added, 1, 0);
+        assert_eq!(s.pixel_count(), 2);
+        assert!(s.can_remove(&[s.len() - 1]) || s.can_remove(&[0]));
+
+        // And a set that covers every layer is refused whole, however it is
+        // spelled — which is what stops the ticked strip's bin emptying a
+        // document.
+        let everything: Vec<usize> = (0..s.len()).collect();
+        assert!(!s.can_remove(&everything));
+
+        // The refusal matches what `remove` actually does.
+        for i in 0..s.len() {
+            let allowed = s.can_remove(&[i]);
+            let mut copy = LayerStack::empty();
+            for l in s.layers() {
+                copy.push_imported(l.is_folder(), l.depth, l.name.clone());
+            }
+            assert_eq!(
+                copy.remove(i).is_some(),
+                allowed,
+                "entry {i}: the button and the model disagree"
+            );
+        }
     }
 
     /// A new layer made with a folder selected goes **inside** it, which is
