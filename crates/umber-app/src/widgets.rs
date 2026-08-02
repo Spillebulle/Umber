@@ -10,7 +10,9 @@ use crate::theme::{Palette, metrics, text};
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use umber_core::{Brush, ResponseCurve, ScrollSpan, TipMask};
+use umber_core::{
+    Brush, Dab, InputPoint, ResponseCurve, ScrollSpan, StrokeBuilder, TipMask, preview,
+};
 
 /// Narrowest anything here will draw itself.
 ///
@@ -1039,12 +1041,13 @@ pub struct BrushRow<'a> {
 
 /// A brush preset: a stroke sample, then the name.
 ///
-/// The sample is stamped from the preset's own settings — spacing, shape,
-/// angle, scatter, jitter and colour pickup, all under a pressure ramp — so a
-/// chisel reads as a chisel and a spray as a spray. Drawing it from opacity and
-/// hardness alone made two hundred rows look like one row repeated, which in a
-/// list this long is the difference between choosing a brush and scrolling past
-/// it.
+/// The sample is a real stroke, laid down by the real dab engine along
+/// [`preview::stroke`]'s path — a hand that presses and lifts, a line that
+/// curves, and a loop that turns the brush through every heading. So a chisel
+/// reads as a chisel, a rake turns, a spray sprays and a blender carries what
+/// it picked up. Drawing it from opacity and hardness alone made two hundred
+/// rows look like one row repeated, which in a list this long is the difference
+/// between choosing a brush and scrolling past it.
 pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), row.height),
@@ -1055,10 +1058,11 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
         },
     );
 
-    // The library is 239 presets deep and both lists are scrolled, so most
-    // rows on most frames are off screen. Each sample is a few dozen stamps;
-    // painting the invisible ones is the one part of this that would show up
-    // in a frame time.
+    // The library is 239 presets deep and both lists are scrolled, so most rows
+    // on most frames are off screen. A sample is a few hundred stamps
+    // rasterised the first time it is asked for — cached afterwards, but a row
+    // nobody can see should not build one at all, and this early return is the
+    // whole of how it does not.
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1070,7 +1074,10 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
         painter.rect_filled(rect, metrics::RADIUS, p.control);
     }
 
-    let sample_h = (row.height - 12.0).clamp(10.0, 16.0);
+    // The browser's rows are half as tall again as the panel's, and the sample
+    // is now a stroke with a loop in it rather than a bar — so where there is
+    // room, it takes it. The panel's 26 px row lands on 14 exactly as before.
+    let sample_h = (row.height - 12.0).clamp(10.0, 24.0);
     let sample = Rect::from_center_size(
         pos2(rect.left() + 7.0 + 32.0, rect.center().y),
         vec2(64.0, sample_h),
@@ -1116,37 +1123,396 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
     response
 }
 
-/// A deterministic scatter source for the previews.
+/// How many points of [`preview::stroke`] are fed to the dab engine.
 ///
-/// The same xorshift the stroke builder uses, and started from the same seed on
-/// every row: two brushes then differ because their *settings* differ, not
-/// because one happened to draw a luckier set of numbers. A seed off the clock
-/// would also make the list shimmer as it scrolled.
-struct Scatter(u32);
+/// A pointer reports a few hundred samples over a mark this long, and the
+/// figure matters for more than smoothness: `Brush::stabilization` is an
+/// exponential filter *per sample*, so a path fed too coarsely would round the
+/// loop off a brush that would actually draw it.
+const PATH_SAMPLES: usize = 96;
 
-impl Scatter {
-    fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 17;
-        self.0 ^= self.0 << 5;
-        (self.0 as f32 / u32::MAX as f32) * 2.0 - 1.0
+/// How long the preview stroke is taken to have taken.
+///
+/// Only a timed brush and the speed inputs read the clock, and both need a
+/// plausible figure rather than none: an airbrush given no time at all deposits
+/// a single dab, and a brush whose size follows speed would see a stroke at
+/// rest.
+const STROKE_SECONDS: f64 = 0.6;
+
+/// What a preview's dab draws at, at full size and full pressure, as a fraction
+/// of the sample's height.
+///
+/// The straight-line sample used a half, which filled the row — and that is
+/// exactly the room the loop needs. Measured against a solid round brush at
+/// full pressure, which is the worst case: at a half the turn is a solid blot
+/// and the whole row is ink, at a fifth the loop is still closing up at the
+/// panel's 14 px sample, and below about an eighth the mark stops reading as
+/// paint at all. The mark is therefore thinner than it was, deliberately: a
+/// narrow stroke that shows a shape says more than a bar that shows none.
+const MARK_RADIUS: f32 = 0.18;
+
+/// Ceiling on how many stamps one preview rasterises.
+///
+/// A finely spaced brush over the six-odd diameters the path spans is a few
+/// hundred. The cap is for the pathological preset rather than the ordinary
+/// one, because this runs while a slider in the brush editor is being dragged.
+const MAX_PREVIEW_DABS: usize = 4096;
+
+/// Where a preview's stroke sits inside its own buffer, in buffer pixels.
+#[derive(Clone, Copy, Debug)]
+struct MarkBox {
+    width: usize,
+    height: usize,
+    /// Top-left of the box the unit path is fitted into.
+    origin: Vec2,
+    /// And its size.
+    span: Vec2,
+    /// What a dab draws at, at full size and full pressure.
+    radius: f32,
+}
+
+/// A little more than the sample's own rectangle: scatter and jitter throw
+/// stamps off the line, and a spray squashed back onto its axis is a spray that
+/// looks like a line. This used to be a clip on the painter and is now the
+/// buffer's own extent — a stamp outside it is simply not written.
+fn sample_field(sample: Rect) -> Rect {
+    sample.expand2(vec2(2.0, 3.0))
+}
+
+impl MarkBox {
+    /// The geometry of one row's preview: a buffer covering [`sample_field`],
+    /// with the path fitted inside `sample` itself.
+    ///
+    /// One statement of it, so the tests below drive the same arithmetic the
+    /// rows do.
+    fn of(sample: Rect, ppp: f32) -> Self {
+        let field = sample_field(sample);
+        let radius = (sample.height() * MARK_RADIUS * ppp).max(0.75);
+        // Room for a full-width mark at either end of the path. Less of it
+        // vertically than horizontally: the loop wants the height, and the
+        // pixel or two the widest dab then overhangs by is inside the buffer's
+        // own margin rather than outside the picture.
+        let inset = vec2(radius, radius * 0.65);
+        Self {
+            width: ((field.width() * ppp).round() as usize).clamp(8, 512),
+            height: ((field.height() * ppp).round() as usize).clamp(8, 256),
+            origin: vec2(sample.left() - field.left(), sample.top() - field.top()) * ppp + inset,
+            span: (vec2(sample.width(), sample.height()) * ppp - inset * 2.0).max(Vec2::splat(1.0)),
+            radius,
+        }
     }
 
-    /// Roughly normal, mean 0, sd 1 — three uniforms summed, as in
-    /// `umber_core::stroke`, so a preview scatters in the same shape the
-    /// engine does.
-    fn gaussian(&mut self) -> f32 {
-        self.next() + self.next() + self.next()
+    /// Document pixels to buffer pixels.
+    ///
+    /// The brush is drawn at whatever scale puts a full-pressure dab at
+    /// [`MarkBox::radius`], so a row shows the brush's *response* to pressure
+    /// rather than its absolute size — a 400 px wash and a 4 px pen both fill
+    /// their row, which is the only way a list of 201 of them is readable.
+    fn scale(&self, brush: &Brush) -> f32 {
+        self.radius / (brush.size * 0.5).max(0.5)
     }
+}
+
+/// The stamps one preview lays down, from the engine that lays down real ones.
+///
+/// [`StrokeBuilder`] already turns a path and a pressure into dabs with every
+/// dynamic applied — size, opacity, hardness, spacing, scatter, angle, the
+/// modulation table, the speed filters and the direction the stroke is
+/// travelling in. None of that is restated here, which is the whole point: a
+/// second dab loop beside it would be a second thing to keep in step, and the
+/// row would slowly stop showing what the brush does.
+fn preview_dabs(brush: &Brush, at: &MarkBox) -> Vec<Dab> {
+    let scale = at.scale(brush);
+    // The path in **document** pixels: the box the preview will occupy, taken
+    // back through the scale. Everything the engine then decides — spacing,
+    // scatter, the speed filters — is in the brush's own units, and the map
+    // back to the buffer is one uniform factor that distorts no dab.
+    let span = glam::Vec2::new(at.span.x / scale, at.span.y / scale);
+
+    // A fresh builder per row is what makes the seeding identical: it seeds its
+    // RNG from the number of strokes it has begun, so the first stroke of a new
+    // builder always scatters the same way. Two rows differ because their
+    // settings differ, and the list does not shimmer as it scrolls.
+    let mut builder = StrokeBuilder::new();
+    for (i, point) in preview::stroke(PATH_SAMPLES).iter().enumerate() {
+        let sample = InputPoint::new(
+            glam::Vec2::new(point.pos.x * span.x, point.pos.y * span.y),
+            point.pressure,
+            i as f64 / (PATH_SAMPLES - 1) as f64 * STROKE_SECONDS,
+        );
+        if i == 0 {
+            // White, and the deposited colour is then ignored: the row's ink is
+            // a palette token, so a hue jitter shown here would be a second
+            // colour in the interface rather than a brush setting.
+            builder.begin(*brush, [1.0; 3], sample);
+        } else {
+            builder.extend(sample);
+        }
+    }
+    builder.drain_pending().take(MAX_PREVIEW_DABS).collect()
+}
+
+/// A tip's coverage, box-averaged down to something a preview can sample.
+struct TipThumb {
+    width: usize,
+    height: usize,
+    coverage: Vec<f32>,
+    /// The mask's proportions with its longer side at 1 — [`TipMask::aspect`],
+    /// which is exactly what the dab pass hands its vertex shader.
+    aspect: (f32, f32),
+}
+
+impl TipThumb {
+    /// Through [`tip_image`] rather than beside it: a second box-average would
+    /// be a second thing to get right, and that one is already what the
+    /// library's stamp thumbnails are drawn from. Point-sampling the full mask
+    /// instead is what makes a sparse spatter tip an empty square half the
+    /// time.
+    fn new(mask: &TipMask) -> Self {
+        let image = tip_image(mask, Color32::WHITE, ROW_TIP_TEXELS);
+        Self {
+            width: image.width(),
+            height: image.height(),
+            coverage: image
+                .pixels
+                .iter()
+                .map(|texel| f32::from(texel.a()) / 255.0)
+                .collect(),
+            aspect: mask.aspect(),
+        }
+    }
+
+    /// Bilinear coverage at `(u, v)`, and nothing at all outside the mask's own
+    /// square: the dab pass's sampler clamps, but its quad never reaches past
+    /// the mask either.
+    fn at(&self, u: f32, v: f32) -> f32 {
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return 0.0;
+        }
+        let x = (u * self.width as f32 - 0.5).clamp(0.0, (self.width - 1) as f32);
+        let y = (v * self.height as f32 - 0.5).clamp(0.0, (self.height - 1) as f32);
+        let (fx, fy) = (x.fract(), y.fract());
+        let (x0, y0) = (x as usize, y as usize);
+        let (x1, y1) = ((x0 + 1).min(self.width - 1), (y0 + 1).min(self.height - 1));
+        let at = |x: usize, y: usize| self.coverage[y * self.width + x];
+        let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * fx;
+        let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * fx;
+        top + (bottom - top) * fy
+    }
+}
+
+/// One preview's rasterised stroke.
+struct Mark {
+    /// Coverage in `0..=1` per pixel, **before** the stroke's opacity.
+    coverage: Vec<f32>,
+    /// How much of the picked-up colour the paint at that pixel is carrying.
+    carried: Vec<f32>,
+}
+
+/// `dab.wgsl`'s falloff, on the CPU.
+fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
+    let t = ((x - from) / (to - from).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Stamp a brush's whole preview stroke into a coverage buffer.
+///
+/// **This is a deliberate second implementation of the coverage rules, for a
+/// thumbnail, and it holds to all three of them.** Dabs saturate under a `max`
+/// — or accumulate, where [`Brush::build_up`] asks them to, which is a choice
+/// of accumulation and not a different shape. `Brush::opacity` is applied
+/// exactly once, afterwards, in [`preview_image`], and never folded into a
+/// dab's coverage. And the falloff, the antialiasing margin sized from the
+/// *short* axis, and the tip's proportions are `dab.wgsl`'s.
+///
+/// The alternative — one translucent egui shape per dab, which is what the row
+/// used to draw — is the compounding bug the wet-layer scheme exists to
+/// prevent: overlaps darken, so a 30% brush previews at 90% and a stroke that
+/// crosses itself previews darker where it crosses. A loop crosses itself by
+/// construction, so the old approximation stopped being survivable the moment
+/// the path gained one. A preview that lies about opacity is worse than a plain
+/// line, because opacity is one of the numbers people choose a brush by.
+///
+/// The other alternative — a real GPU pass per row — is not the answer either.
+/// The library is 201 presets deep and both lists scroll, so it would be a
+/// pass, a target and a readback per visible row per change, from inside a
+/// scroll area, to draw a picture 70 pixels wide. This is a few hundred stamps
+/// of arithmetic, once per brush, and the result is cached.
+fn preview_mark(brush: &Brush, tip: Option<&TipThumb>, at: &MarkBox) -> Mark {
+    let mut mark = Mark {
+        coverage: vec![0.0; at.width * at.height],
+        carried: vec![0.0; at.width * at.height],
+    };
+    let dabs = preview_dabs(brush, at);
+    let scale = at.scale(brush);
+    let (tsx, tsy) = tip.map_or((1.0, 1.0), |thumb| thumb.aspect);
+    // A blender's mark carries the colour it found rather than the palette's,
+    // and the row has to show that or every Blenders entry looks like a paint.
+    // There is no canvas here to pick anything up from, so the decay is stated
+    // rather than sampled: a short smear loses what it carries within a stamp
+    // or two, a long one keeps it the whole way.
+    let smudge = brush.smudge.clamp(0.0, 1.0);
+    let keep = brush.smudge_length.clamp(0.0, 0.99);
+    let last = dabs.len().saturating_sub(1).max(1) as f32;
+
+    for (i, dab) in dabs.iter().enumerate() {
+        let centre = at.origin + vec2(dab.pos[0], dab.pos[1]) * scale;
+        let radius = (dab.radius * scale).max(0.4);
+        let short = radius / dab.aspect.max(1.0);
+        // The quad the dab pass builds: semi-axes carrying the tip's own
+        // proportions, so a portrait stamp stays portrait, then rotated.
+        let (long_axis, short_axis) = (radius * tsx, short * tsy);
+        let (sin, cos) = dab.angle.sin_cos();
+        // Its axis-aligned box, plus a pixel for the antialiased edge — the
+        // same bound `StrokeBuilder::bounds` takes, and too tight for the same
+        // reason: a rotated quad reaches out to its corners.
+        let reach = vec2(
+            (long_axis * cos).abs() + (short_axis * sin).abs() + 1.0,
+            (long_axis * sin).abs() + (short_axis * cos).abs() + 1.0,
+        );
+        let x0 = (centre.x - reach.x).floor().max(0.0) as usize;
+        let y0 = (centre.y - reach.y).floor().max(0.0) as usize;
+        let x1 = ((centre.x + reach.x).ceil().max(0.0) as usize).min(at.width);
+        let y1 = ((centre.y + reach.y).ceil().max(0.0) as usize).min(at.height);
+
+        // At least one pixel of falloff whatever the hardness, sized from the
+        // *short* axis because that is the demanding one: a chisel two pixels
+        // across needs the softening a two-pixel round brush does.
+        let aa = (1.0 / long_axis.min(short_axis).max(1.0)).clamp(0.001, 0.5);
+        let inner = dab.hardness.clamp(0.0, 1.0 - aa);
+        // `0f32.powf(0.0)` is 1, so the head of the stroke is always fully
+        // loaded — which is what a blender does.
+        let held = smudge * keep.powf(i as f32 / last * 6.0);
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = vec2(x as f32 + 0.5, y as f32 + 0.5) - centre;
+                // Into the dab's own frame, where the ellipse is a unit circle
+                // and the mask fills the square — which is what keeps this
+                // identical to the shader for every shape.
+                let local = vec2(
+                    (d.x * cos + d.y * sin) / long_axis,
+                    (d.y * cos - d.x * sin) / short_axis,
+                );
+                let shape = match tip {
+                    Some(thumb) => thumb.at(local.x * 0.5 + 0.5, local.y * 0.5 + 0.5),
+                    None => 1.0 - smoothstep(inner, 1.0, local.length()),
+                };
+                let cov = shape * dab.coverage;
+                if cov <= 0.0 {
+                    continue;
+                }
+                let at = y * at.width + x;
+                if brush.build_up {
+                    mark.coverage[at] += cov * (1.0 - mark.coverage[at]);
+                } else {
+                    mark.coverage[at] = mark.coverage[at].max(cov);
+                }
+                // Colour blends `over` while coverage does not, exactly as the
+                // second scratch target does along a real smudging stroke: the
+                // smear trails along the stroke instead of averaging everything
+                // the brush has been over. Guarded, so a brush that carries
+                // nothing pays nothing.
+                if held > 0.0 {
+                    mark.carried[at] = held * cov + mark.carried[at] * (1.0 - cov);
+                }
+            }
+        }
+    }
+    mark
+}
+
+/// The mark, inked and with the stroke's opacity applied — once, here.
+fn preview_image(mark: &Mark, brush: &Brush, at: &MarkBox, inks: [Color32; 2]) -> egui::ColorImage {
+    let pixels = mark
+        .coverage
+        .iter()
+        .zip(&mark.carried)
+        .map(|(coverage, carried)| {
+            let alpha = (coverage * brush.opacity).clamp(0.0, 1.0);
+            let ink = mix(inks[0], inks[1], *carried);
+            Color32::from_rgba_unmultiplied(
+                ink.r(),
+                ink.g(),
+                ink.b(),
+                (alpha * 255.0).round() as u8,
+            )
+        })
+        .collect();
+    egui::ColorImage::new([at.width, at.height], pixels)
+}
+
+/// One row's stamped stroke, cached against the brush it was stamped from.
+///
+/// A few hundred stamps is cheap once and not cheap 201 times a frame, and the
+/// picture only changes when the brush does. Keyed by the preset's own address,
+/// exactly as the tip thumbnails are keyed by their mask's — and what is
+/// *compared* is everything the picture depends on: the brush by value, so a
+/// slider moved in the editor redraws on the next frame; the tip by `Arc`
+/// identity, so two brushes cut from one stamp share the downsample rather than
+/// comparing a megabyte of coverage; both inks, so switching theme does not
+/// leave every row the old colour; and the buffer's size, which every other
+/// figure in [`MarkBox`] is a fixed fraction of.
+fn preview_texture(
+    ctx: &egui::Context,
+    brush: &Brush,
+    tip: Option<&Arc<TipMask>>,
+    inks: [Color32; 2],
+    at: &MarkBox,
+) -> egui::TextureHandle {
+    type Held = (
+        Brush,
+        Option<Arc<TipMask>>,
+        [Color32; 2],
+        [usize; 2],
+        egui::TextureHandle,
+    );
+    let same_tip = |held: &Option<Arc<TipMask>>| match (held, tip) {
+        (None, None) => true,
+        (Some(held), Some(mask)) => Arc::ptr_eq(held, mask),
+        _ => false,
+    };
+
+    let id = egui::Id::new(("brush-preview", std::ptr::from_ref(brush) as usize));
+    let cached: Option<Held> = ctx.data(|d| d.get_temp(id));
+    if let Some((held, held_tip, held_inks, size, texture)) = cached
+        && held == *brush
+        && same_tip(&held_tip)
+        && held_inks == inks
+        && size == [at.width, at.height]
+    {
+        return texture;
+    }
+
+    let thumb = tip.map(|mask| TipThumb::new(mask));
+    let mark = preview_mark(brush, thumb.as_ref(), at);
+    let texture = ctx.load_texture(
+        "brush-preview",
+        preview_image(&mark, brush, at, inks),
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            id,
+            (
+                *brush,
+                tip.cloned(),
+                inks,
+                [at.width, at.height],
+                texture.clone(),
+            ),
+        );
+    });
+    texture
 }
 
 /// Stamp one brush's mark into `sample`.
 ///
-/// A miniature of the real dab loop: a pressure ramp along the stroke drives
-/// size, coverage, hardness and scatter through the brush's own curves, and
-/// each stamp is the ellipse the engine would lay down. It is not a simulation
-/// — there is no wet layer, so overlaps here do compound where the canvas would
-/// saturate — but every difference it *does* show is a real one.
+/// Not a miniature of the real dab loop any more — it *is* the real dab loop,
+/// over [`preview::stroke`]'s path. The hand presses and lifts, the line curves
+/// and crosses itself, and every dab is the one [`StrokeBuilder`] would emit,
+/// so a rake turns through the loop, a chisel goes thick and thin round it, a
+/// spray sprays and a pressure-tapered brush tapers.
 fn brush_sample(
     painter: &egui::Painter,
     p: &Palette,
@@ -1154,186 +1520,24 @@ fn brush_sample(
     brush: &Brush,
     tip: Option<&Arc<TipMask>>,
 ) {
-    // Scatter and jitter throw stamps off the line, and the sample sits inside
-    // a row that also holds a name. Clip rather than clamp: a spray squashed
-    // back onto its own axis is a spray that looks like a line.
-    let painter = painter.with_clip_rect(sample.expand2(vec2(2.0, 3.0)));
-
-    // A stamp brush's mark is its mask, so the row draws the mask. One texture
-    // per *mask* — not per row and not per stamp — cached by `Arc` identity, so
-    // two brushes cut from one stamp share one upload exactly as they do on the
-    // GPU. Everything else below is unchanged, including the RNG seeding: two
-    // rows still differ because their settings differ.
-    let stamp = tip.and_then(|mask| row_tip_texture(painter.ctx(), mask, p.text_strong));
-    // One mesh for the whole row rather than one per stamp. The list is 201
-    // presets deep, and this is the drawing path.
-    let mut mesh = stamp
-        .as_ref()
-        .map(|texture| egui::Mesh::with_texture(texture.id()));
-    let (tsx, tsy) = tip.map_or((1.0, 1.0), |mask| mask.aspect());
-
-    let radius = sample.height() * 0.5;
-    // Spacing is a fraction of the diameter, so this is the real dab count for
-    // a stroke this long — which is what makes a widely spaced spray read as
-    // separate blobs rather than as a thinner line.
-    let steps =
-        (sample.width() / (radius * 2.0 * brush.spacing).max(0.5)).clamp(6.0, 40.0) as usize;
-
-    let mut rng = Scatter(0x9E37_79B9);
-    let aspect = brush.dab_ratio.max(1.0);
-    // A blender's mark carries the colour it found rather than the palette's,
-    // and the row has to show that or every Blenders entry looks like a paint.
+    let at = MarkBox::of(sample, painter.ctx().pixels_per_point().clamp(0.5, 4.0));
     // The "found" colour is the dim ink: it reads as canvas rather than as a
     // second palette colour, and it needs no token of its own.
-    let carried = brush.smudge.clamp(0.0, 1.0);
-    let keep = brush.smudge_length.clamp(0.0, 0.99);
-
-    for i in 0..steps {
-        let t = i as f32 / (steps - 1).max(1) as f32;
-        // The ramp stands in for pressure: nothing at the ends, full in the
-        // middle. That is what gives a tapered stroke, and feeding it through
-        // the brush's curves is what makes the pressure dynamics visible here.
-        //
-        // The `max(0.0)` is load-bearing: `sin(PI)` in f32 lands just *below*
-        // zero, and a negative base with a fractional exponent is NaN, which
-        // propagates into the alpha and trips ecolor's assert.
-        let pressure = (t * std::f32::consts::PI).sin().max(0.0);
-        // Width comes from the brush's own size response, not from the ramp: a
-        // marker that ignores pressure should draw a bar of even width, and
-        // tapering it anyway is exactly the flattery that made every row look
-        // the same.
-        let width = brush.radius_at(pressure) / (brush.size * 0.5).max(0.5);
-        let mut r = radius * width.clamp(0.0, 1.0);
-        if brush.radius_jitter > 0.0 {
-            r *= (rng.gaussian() * brush.radius_jitter).exp();
-            r = r.min(radius * 1.6);
-        }
-        if r <= 0.25 {
-            continue;
-        }
-
-        let mut centre = pos2(sample.left() + sample.width() * t, sample.center().y);
-        let scatter = brush.scatter_at(pressure);
-        if scatter > 0.0 {
-            let spread = r * scatter;
-            centre += vec2(rng.gaussian(), rng.gaussian()) * spread;
-        }
-
-        // The sample stroke runs left to right, so a dab that follows the
-        // stroke sits at zero and one that does not sits at its own angle.
-        let mut angle = if brush.dab_angle_follows_stroke {
-            0.0
-        } else {
-            brush.dab_angle.to_radians()
-        };
-        if brush.dab_angle_jitter > 0.0 {
-            angle += rng.next() * brush.dab_angle_jitter.to_radians() * 0.5;
-        }
-
-        // Softer brushes read as a wider, fainter smear.
-        let hardness = brush.hardness_at(pressure);
-        let alpha = (brush.opacity * brush.coverage_at(pressure))
-            * pressure.powf(1.0 + (1.0 - hardness) * 1.5);
-        // How much of the picked-up colour a stamp is still carrying. A short
-        // smear loses it within a stamp or two; a long one keeps it the whole
-        // way. `0f32.powf(0.0)` is 1, so the head of the stroke is always fully
-        // loaded — which is what a blender does.
-        let held = carried * keep.powf(t * 6.0);
-        let ink = mix(p.text_strong, p.text_dim, held).gamma_multiply(alpha.clamp(0.0, 1.0));
-
-        if let Some(mesh) = mesh.as_mut() {
-            // The stamp, on the same footing as the engine's: the quad carries
-            // the tip's proportions, `size` is its long axis, and `dab_ratio`
-            // squashes on top of that. A tipped dab has an angle whatever its
-            // roundness — a bitmap is not rotationally symmetric — so this is
-            // also the one place jitter shows on a round-ratio brush.
-            push_stamp(mesh, centre, vec2(r * tsx, r * tsy / aspect), angle, ink);
-            continue;
-        }
-
-        if aspect > 1.05 {
-            // A 10:1 dab whose long axis fits a 14 px row has a short axis of
-            // less than a pixel. The floor is legibility, not flattery: below
-            // it the mark stops being a thin shape and becomes an absent one,
-            // and a row that shows nothing tells you less than one that
-            // exaggerates slightly.
-            let minor = (r / aspect).max(0.6);
-            painter.add(egui::Shape::convex_polygon(
-                ellipse(centre, r, minor, angle),
-                ink,
-                Stroke::NONE,
-            ));
-        } else {
-            painter.circle_filled(centre, r, ink);
-        }
-    }
-
-    // One shape for the whole row's stamps, added last so it sits where the
-    // circles would have.
-    if let Some(mesh) = mesh
-        && !mesh.indices.is_empty()
-    {
-        painter.add(egui::Shape::mesh(mesh));
-    }
-}
-
-/// Add one rotated, tinted copy of the tip texture to `mesh`.
-///
-/// `half` is the quad's semi-axes before rotation, so the tip's proportions and
-/// the brush's roundness are both already in it.
-fn push_stamp(mesh: &mut egui::Mesh, centre: egui::Pos2, half: Vec2, angle: f32, tint: Color32) {
-    let (sin, cos) = angle.sin_cos();
-    let base = mesh.vertices.len() as u32;
-    for (sx, sy, u, v) in [
-        (-1.0, -1.0, 0.0, 0.0),
-        (1.0, -1.0, 1.0, 0.0),
-        (1.0, 1.0, 1.0, 1.0),
-        (-1.0, 1.0, 0.0, 1.0),
-    ] {
-        let (x, y) = (sx * half.x, sy * half.y);
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: centre + vec2(x * cos - y * sin, x * sin + y * cos),
-            uv: pos2(u, v),
-            color: tint,
-        });
-    }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-}
-
-/// The row-sized thumbnail of one mask, cached by `Arc` identity and ink.
-///
-/// In egui's temporary store rather than in a field, because the sample is
-/// painted from a `Painter` deep inside a scroll area and the alternative is
-/// threading a cache through every call site. Keyed by ink as well as by mask so
-/// that switching theme does not leave every stamp row the old colour.
-fn row_tip_texture(
-    ctx: &egui::Context,
-    mask: &Arc<TipMask>,
-    ink: Color32,
-) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(("brush-row-tip", Arc::as_ptr(mask) as usize));
-    let cached: Option<(Arc<TipMask>, Color32, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-    if let Some((held, held_ink, texture)) = cached
-        && Arc::ptr_eq(&held, mask)
-        && held_ink == ink
-    {
-        return Some(texture);
-    }
-    let texture = ctx.load_texture(
-        "brush-row-tip",
-        tip_image(mask, ink, ROW_TIP_TEXELS),
-        egui::TextureOptions::LINEAR,
+    let texture = preview_texture(painter.ctx(), brush, tip, [p.text_strong, p.text_dim], &at);
+    painter.image(
+        texture.id(),
+        sample_field(sample),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
     );
-    ctx.data_mut(|d| d.insert_temp(id, (Arc::clone(mask), ink, texture.clone())));
-    Some(texture)
 }
 
 /// Widest a mask is downsampled to for a library row.
 ///
-/// The row's sample is 14 points tall and holds up to forty stamps, so 32 texels
-/// is already more than the screen can show. It is also what keeps the upload
-/// small enough to do eagerly the first time a stamp row scrolls into view.
+/// The row's sample is 14 to 24 points tall and a stamp in it is a few pixels
+/// across, so 32 texels is already more than the screen can show. It is also
+/// what keeps the work small enough to do the first time a stamp row scrolls
+/// into view.
 const ROW_TIP_TEXELS: u32 = 32;
 
 /// Box-average a coverage mask down to a thumbnail, tinted with an ink.
@@ -1372,23 +1576,6 @@ pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage 
         }
     }
     egui::ColorImage::new([w as usize, h as usize], pixels)
-}
-
-/// Points around an ellipse with semi-axes `a` (along `angle`) and `b`.
-///
-/// Ten segments: enough that a 10:1 chisel reads as a straight-edged sliver at
-/// 14 px tall, and few enough that forty of them per row stay off the frame
-/// budget.
-fn ellipse(centre: egui::Pos2, a: f32, b: f32, angle: f32) -> Vec<egui::Pos2> {
-    const SEGMENTS: usize = 10;
-    let (sin, cos) = angle.sin_cos();
-    (0..SEGMENTS)
-        .map(|k| {
-            let theta = k as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-            let (x, y) = (a * theta.cos(), b * theta.sin());
-            centre + vec2(x * cos - y * sin, x * sin + y * cos)
-        })
-        .collect()
 }
 
 /// Linear blend of two opaque palette colours.
@@ -2128,6 +2315,170 @@ mod tests {
         let row = angle();
         for text in ["", " ", "°", "ninety", "9 0", "1/2", "--3", "nan", "inf"] {
             assert_eq!(row.parse(text), None, "{text:?} parsed");
+        }
+    }
+
+    /// The brush library panel's own sample, at the size it is actually drawn
+    /// at, so the assertions below are about the picture the rows show.
+    fn sample_box() -> MarkBox {
+        MarkBox::of(Rect::from_min_size(pos2(0.0, 0.0), vec2(64.0, 14.0)), 1.0)
+    }
+
+    fn preview_of(brush: &Brush) -> Mark {
+        preview_mark(brush, None, &sample_box())
+    }
+
+    /// The row as it is actually inked — which is the coverage *and* the
+    /// opacity applied to it, and the two palette colours a blender's mark is
+    /// drawn between.
+    fn pixels_of(brush: &Brush) -> Vec<Color32> {
+        let at = sample_box();
+        preview_image(
+            &preview_mark(brush, None, &at),
+            brush,
+            &at,
+            [Color32::WHITE, Color32::GRAY],
+        )
+        .pixels
+    }
+
+    /// The reason the sample is stamped from the brush at all: two presets that
+    /// differ in one setting have to make two different marks. Drawing the row
+    /// from a couple of numbers is what made two hundred rows look like one row
+    /// repeated, and every setting here is one somebody would expect to see.
+    #[test]
+    fn two_brushes_that_differ_draw_different_marks() {
+        let base = Brush::default();
+        let plain = pixels_of(&base);
+        for (what, brush) in [
+            (
+                "roundness",
+                Brush {
+                    dab_ratio: 6.0,
+                    ..base
+                },
+            ),
+            (
+                "angle",
+                Brush {
+                    dab_ratio: 6.0,
+                    dab_angle: 60.0,
+                    ..base
+                },
+            ),
+            (
+                "spacing",
+                Brush {
+                    spacing: 0.9,
+                    ..base
+                },
+            ),
+            (
+                "hardness",
+                Brush {
+                    hardness: 0.05,
+                    ..base
+                },
+            ),
+            (
+                "opacity",
+                Brush {
+                    opacity: 0.3,
+                    ..base
+                },
+            ),
+            (
+                "scatter",
+                Brush {
+                    scatter: 1.5,
+                    ..base
+                },
+            ),
+            (
+                "size response",
+                Brush {
+                    min_size_ratio: 1.0,
+                    ..base
+                },
+            ),
+            (
+                "pickup",
+                Brush {
+                    smudge: 0.9,
+                    ..base
+                },
+            ),
+            (
+                "build-up",
+                Brush {
+                    build_up: true,
+                    opacity: 0.4,
+                    ..base
+                },
+            ),
+        ] {
+            // Not `assert_ne!`: these are a few thousand pixels each, and a
+            // failure that prints both of them says less than one that names
+            // the setting.
+            assert!(
+                pixels_of(&brush) != plain,
+                "{what} made no difference to the row"
+            );
+        }
+    }
+
+    /// And one brush draws the same mark every time, because the engine's RNG
+    /// is seeded from a builder that has begun exactly one stroke.
+    ///
+    /// Byte for byte, on the brush with every random feature turned on. A seed
+    /// off the clock — or one carried between rows — would make two presets
+    /// differ because one drew luckier numbers, and would make the list shimmer
+    /// as it scrolled.
+    #[test]
+    fn one_brush_draws_the_same_mark_twice() {
+        let brush = Brush {
+            scatter: 1.4,
+            radius_jitter: 0.5,
+            dab_angle_jitter: 180.0,
+            dab_ratio: 3.0,
+            ..Default::default()
+        };
+        assert!(
+            preview_of(&brush).coverage == preview_of(&brush).coverage,
+            "the same brush drew two different rows"
+        );
+    }
+
+    /// The wet-layer guarantee, in a thumbnail: a stroke that crosses itself
+    /// does not darken where it crosses, and the stroke's opacity is what the
+    /// heaviest pixel comes out at.
+    ///
+    /// The path has a loop in it, so every preview overlaps itself by
+    /// construction — which is what makes this the one rule the row could not
+    /// go on approximating. One translucent shape per dab would put the middle
+    /// of this stroke at nearly full opacity whatever the brush asked for.
+    #[test]
+    fn overlapping_dabs_in_a_preview_do_not_compound() {
+        for build_up in [false, true] {
+            let brush = Brush {
+                spacing: 0.02,
+                opacity: 0.4,
+                hardness: 1.0,
+                pressure_size: false,
+                build_up,
+                ..Default::default()
+            };
+            let mark = preview_of(&brush);
+            let peak = mark.coverage.iter().copied().fold(0.0f32, f32::max);
+            assert!(
+                peak <= 1.0 + 1e-5,
+                "coverage compounded to {peak} with build_up {build_up}"
+            );
+            // And it does reach the top, or the bound above would hold for a
+            // row that drew nothing at all.
+            assert!(peak > 0.99, "the stroke never covered anything: {peak}");
+            // Which is the opacity asked for, once, and not once per overlap.
+            assert!((peak * brush.opacity - 0.4).abs() < 1e-4);
         }
     }
 }

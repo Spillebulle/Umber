@@ -22,6 +22,7 @@ pub mod input;
 pub mod layer;
 mod pattern_table;
 pub mod preset;
+pub mod preview;
 pub mod selection;
 mod sqlite;
 pub mod stroke;
