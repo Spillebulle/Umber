@@ -326,7 +326,20 @@ impl Transform {
                 let before = from - centre;
                 let after = to - centre;
                 if before.length_squared() > 1e-6 && after.length_squared() > 1e-6 {
-                    self.angle += after.y.atan2(after.x) - before.y.atan2(before.x);
+                    // The angle the pointer swept about the centre since the
+                    // *last* event, which is why a rotation is the one handle
+                    // besides Move whose origin walks with the pointer — see
+                    // the caller. Left absolute against the press, this `+=`
+                    // adds the whole offset again on every event, so a hand
+                    // held ten degrees off the grab point turns the box ten
+                    // degrees per frame and it spins away. That was a real bug.
+                    //
+                    // Wrapped into a half turn either way so that crossing the
+                    // ray behind the centre is a small step rather than a jump
+                    // of 2π. Summing the steps is also what lets a drag wind
+                    // past a full turn, which an absolute `atan2` cannot say.
+                    let swept = after.y.atan2(after.x) - before.y.atan2(before.x);
+                    self.angle += wrap_to_half_turn(swept);
                 }
             }
             Handle::Scale { .. } => self.scale_to(handle, to, uniform),
@@ -458,6 +471,23 @@ impl Transform {
             (a, b) => a.or(b),
         }
     }
+}
+
+/// An angle brought into `-π..=π`.
+///
+/// What makes the difference of two `atan2` readings the *short* way round.
+/// Without it, a pointer crossing the ray directly behind the centre reads as
+/// very nearly a whole turn in the opposite direction, which is a box that
+/// flips over as the hand passes six o'clock.
+fn wrap_to_half_turn(radians: f32) -> f32 {
+    let turn = std::f32::consts::TAU;
+    let mut a = radians % turn;
+    if a > std::f32::consts::PI {
+        a -= turn;
+    } else if a < -std::f32::consts::PI {
+        a += turn;
+    }
+    a
 }
 
 /// The smallest rectangle containing both.
@@ -813,6 +843,75 @@ mod tests {
         // The centre of the quad is the centre it turned about.
         let mid = t.quad().iter().fold(Vec2::ZERO, |a, b| a + *b) * 0.25;
         near(mid, centre, "the centre moved");
+    }
+
+    /// A rotation applies the angle the pointer swept and nothing more.
+    ///
+    /// The whole of the bug this guards: `drag` adds the offset between its two
+    /// points, so a caller that leaves the origin at the press point adds the
+    /// *same* offset on every event and the box accelerates away from the hand.
+    /// Grabbing at 45° and moving to 50° is five degrees, however many events
+    /// the pointer took to get there.
+    #[test]
+    fn a_rotation_applies_the_angle_the_pointer_swept() {
+        let one_step = {
+            let mut t = Transform::identity(source());
+            let centre = t.pivot();
+            let at = |deg: f32| centre + Vec2::from_angle(deg.to_radians()) * 30.0;
+            t.drag(Handle::Rotate, at(45.0), at(50.0), false);
+            t.angle
+        };
+        assert!(
+            (one_step.to_degrees() - 5.0).abs() < 1e-3,
+            "one step turned {} degrees",
+            one_step.to_degrees()
+        );
+
+        // The same sweep in five events, with the origin walking as the caller
+        // in `Editor::transform_moved` walks it, is the same five degrees.
+        let mut t = Transform::identity(source());
+        let centre = t.pivot();
+        let at = |deg: f32| centre + Vec2::from_angle(deg.to_radians()) * 30.0;
+        for i in 0..5 {
+            let (a, b) = (45.0 + i as f32, 46.0 + i as f32);
+            t.drag(Handle::Rotate, at(a), at(b), false);
+        }
+        assert!(
+            (t.angle - one_step).abs() < 1e-3,
+            "five events turned {} degrees, one turned {}",
+            t.angle.to_degrees(),
+            one_step.to_degrees()
+        );
+    }
+
+    /// Winding the long way round is a sum of small steps, not a jump.
+    ///
+    /// Two things at once: crossing the ray behind the centre must not read as
+    /// very nearly a whole turn backwards, and a drag that goes round more than
+    /// once must be able to say so — which an absolute `atan2` never could.
+    #[test]
+    fn a_drag_can_wind_past_a_whole_turn() {
+        let mut t = Transform::identity(source());
+        let centre = t.pivot();
+        let at = |deg: f32| centre + Vec2::from_angle(deg.to_radians()) * 30.0;
+        for i in 0..90 {
+            let (a, b) = (i as f32 * 5.0, (i + 1) as f32 * 5.0);
+            t.drag(Handle::Rotate, at(a), at(b), false);
+        }
+        assert!(
+            (t.angle.to_degrees() - 450.0).abs() < 1e-2,
+            "a turn and a quarter came out as {} degrees",
+            t.angle.to_degrees()
+        );
+    }
+
+    #[test]
+    fn an_angle_wraps_the_short_way_round() {
+        use std::f32::consts::{PI, TAU};
+        assert!((wrap_to_half_turn(0.1) - 0.1).abs() < 1e-6);
+        assert!((wrap_to_half_turn(TAU - 0.1) + 0.1).abs() < 1e-6);
+        assert!((wrap_to_half_turn(-TAU + 0.1) - 0.1).abs() < 1e-6);
+        assert!(wrap_to_half_turn(PI - 0.01) > 0.0);
     }
 
     /// A quarter turn swaps the box's width and height. Anything that gets the

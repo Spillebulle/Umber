@@ -1072,11 +1072,17 @@ impl Editor {
             return false;
         };
         float.xf.drag(handle, from, doc, uniform);
-        // A move accumulates — it has nothing to be absolute against — so its
-        // origin walks with the pointer. Every other handle is absolute against
-        // where it was grabbed, which is what makes coming back to that point
-        // come back to the transform it started with.
-        if handle == Handle::Move {
+        // A move and a rotation both accumulate — neither has anything to be
+        // absolute against — so their origin walks with the pointer, and each
+        // event applies only the distance or the angle since the last one. A
+        // *scale* is absolute against the handle it grabbed, which is what
+        // makes coming back to that point come back to the transform it
+        // started with.
+        //
+        // Leaving the rotation pinned to the press was a real bug: the same
+        // offset was added again on every event, so the box spun away from the
+        // hand, always in the direction of the first flick.
+        if matches!(handle, Handle::Move | Handle::Rotate) {
             float.drag = Some((handle, doc));
         }
         true
