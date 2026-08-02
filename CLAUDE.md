@@ -2066,11 +2066,19 @@ standing instruction and it overrides the usual reluctance to delegate.
   the same checkout will silently overwrite each other, and neither will notice.
   Give each `isolation: "worktree"`, have it commit on its own branch, and merge
   the branches one at a time afterwards.
-- **Point every worktree at one `CARGO_TARGET_DIR`.** `[profile.dev]` builds
-  dependencies at `opt-level = 3`, so six fresh worktrees is six full builds of
-  wgpu. Cargo's own lock serialises the concurrent builds, which is the right
-  trade. Shell state does not survive between tool calls, so it has to be set on
-  each invocation: `$env:CARGO_TARGET_DIR='…'; cargo test`.
+- **Every worktree needs its own `CARGO_TARGET_DIR`, and this was learned the
+  hard way.** Sharing one across concurrent worktrees looks like the obvious
+  saving — `[profile.dev]` builds dependencies at `opt-level = 3`, so six fresh
+  worktrees is six builds of wgpu — and it does not work. Cargo's lock
+  serialises the *builds*, but the workspace crates are keyed such that one
+  worktree is handed another's artefacts: the symptom is a compile error naming
+  a module that plainly exists ("no `thumbnail` in the root"), which reads as a
+  bug in your own change and is not one. Two agents' `umber.exe` also hold the
+  same binary against relink, which produces `Access is denied` on the link step
+  and tempts somebody into `taskkill`, killing another agent's session. Pay for
+  the six dependency builds. Shell state does not survive between tool calls, so
+  whichever directory is used has to be set on each invocation:
+  `$env:CARGO_TARGET_DIR='…'; cargo test`.
 - **An agent's report is not the same thing as a merged change.** The gates
   (`fmt --check`, `clippy`, `test`) run in the worktree *and* after the merge —
   a clean branch and a clean merge of several clean branches are different
