@@ -1898,8 +1898,9 @@ impl ApplicationHandler<Wake> for UmberApp {
                     //
                     // The resize reads the pointer's travel from where Alt went
                     // down as the size, absolutely rather than stepped per
-                    // event. Horizontal only, and right is bigger — the axis and
-                    // direction the zoom drag already uses for "more".
+                    // event. Both axes, right and up bigger — the directions the
+                    // zoom drag uses for "more", resolved onto one distance by
+                    // the same `geom::drag_towards_more`.
                     //
                     // The draft case is a polygon whose gesture was interrupted,
                     // by a middle drag to pan say, which takes the interaction
@@ -1909,7 +1910,7 @@ impl ApplicationHandler<Wake> for UmberApp {
                     Interaction::Idle => {
                         if let Some(resize) = self.editor.brush_resize {
                             self.editor.brush.size =
-                                Brush::size_after_drag(resize.from, pos.x - resize.origin.x);
+                                Brush::size_after_drag(resize.from, pos - resize.origin);
                         } else if self.editor.selection_draft.is_some() {
                             let doc = self.editor.screen_to_doc(pos);
                             self.editor.selection_moved(doc);

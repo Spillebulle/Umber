@@ -30,36 +30,12 @@ impl Camera {
 
     /// What a zoom-tool drag of `delta` screen pixels multiplies the zoom by.
     ///
-    /// Right and up zoom in, left and down zoom out — screen y being
-    /// down-positive is why the two axes are *subtracted*. The zoom-in
-    /// direction is therefore the diagonal `(1, -1)`, and the drag has to be
-    /// resolved onto it somehow.
-    ///
-    /// Adding the axes outright is the obvious way and is wrong: a 45° drag of
-    /// 100 pixels each way is 141 pixels of hand movement and would be worth
-    /// 200, so the same gesture zooms half again as fast for being made
-    /// diagonally. Projecting onto the diagonal is the other obvious way and
-    /// only moves the problem — it is the same expression times a constant, so
-    /// a diagonal still outruns an axis, and it slows the horizontal drag this
-    /// gesture has always been by 30%.
-    ///
-    /// So: **the distance the hand travelled, weighted by how far the drag
-    /// leans towards "in" rather than "out"**. `(dx - dy) / (|dx| + |dy|)` is
-    /// that lean, running from +1 for a drag purely towards in to -1 for one
-    /// purely towards out and passing through 0 on the neutral diagonal, where
-    /// a drag along `(1, 1)` asks for nothing. Every drag is then worth at most
-    /// its own length, a pure right drag is worth exactly what it was worth
-    /// before this took the vertical axis in, and a diagonal is worth its own
-    /// 141 pixels rather than 200.
+    /// Right and up zoom in, left and down zoom out. How the two axes resolve
+    /// into one signed distance is [`crate::geom::drag_towards_more`]'s, which
+    /// the Alt-held brush resize asks the same question of; the rate that
+    /// distance is spent at is this gesture's alone.
     pub fn zoom_drag_factor(delta: Vec2) -> f32 {
-        let lean = delta.x.abs() + delta.y.abs();
-        // A sample that did not move has no direction to lean in, and the
-        // division below would be 0/0.
-        if lean <= f32::EPSILON {
-            return 1.0;
-        }
-        let along = delta.length() * (delta.x - delta.y) / lean;
-        ZOOM_DRAG_RATE.powf(along)
+        ZOOM_DRAG_RATE.powf(crate::geom::drag_towards_more(delta))
     }
 
     /// Frame the whole document inside a region of `viewport` size.

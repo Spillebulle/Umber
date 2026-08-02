@@ -77,6 +77,17 @@ pub fn sidebars(
                 // put a dim rule over the highlight and the resize affordance
                 // never showed.
                 .show_separator_line(false)
+                // And egui's own resize handle has to go with it, or the edge
+                // cannot be dragged at all. A panel is resizable by default,
+                // and egui registers that handle *after* the body precisely so
+                // it beats anything inside — a five-point band either side of
+                // the edge, overlapping five of `width_splitter`'s seven. Since
+                // `exact_size` pins the range to a point, every drag that
+                // landed in the overlap was swallowed and did nothing. The
+                // width is the dock model's, not egui's: it is clamped per
+                // column by what the modules in it need and it is what gets
+                // written to the layout file, neither of which egui knows.
+                .resizable(false)
                 .show(root, |ui| sidebar(ui, p, ed, actions, side, column, at));
         }
     }

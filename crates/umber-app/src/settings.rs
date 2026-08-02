@@ -9,13 +9,22 @@
 //! Performance are; that one is shown disabled, with a tooltip saying why,
 //! rather than opening onto a pane of controls that do nothing.
 //!
-//! Input & pen is the exception that proves the rule, and is not a page of
-//! settings at all. There is genuinely nothing to *configure* about the pointer
-//! — Umber takes what the window system sends and has no tablet driver of its
-//! own — so instead the pane reports, live, what is arriving and what the
-//! pressure model makes of it. That is the one thing the machine this is
-//! written on cannot answer: nobody working on Umber has a pen, so the two pen
-//! fixes it exists to verify shipped unproven. See [`crate::inputlog`].
+//! **Pressure and Input & pen are one tab**, and the design's Pressure is the
+//! one that goes. Everything there is to set about pressure is three buttons
+//! and — under one of them — two sliders, and every one of them is only
+//! meaningful against a reading of what the pointer is actually doing: what
+//! "Device" is worth depends entirely on whether pen events are arriving at
+//! all, and the whole reason to reach for "Speed" is that they are not. Split
+//! across two tabs, the answer to "why is my pen painting flat?" lived on one
+//! page and the knob for it on another, and a Change button had to carry the
+//! reader between them. Together, the source is chosen a few lines above the
+//! trace and the strip that show what it did.
+//!
+//! So Input & pen is the one pane that is not only settings. It reports, live,
+//! what is arriving and what the pressure model makes of it — because that is
+//! the one thing the machine this is written on cannot answer: nobody working
+//! on Umber has a pen, so the two pen fixes it exists to verify shipped
+//! unproven. See [`crate::inputlog`].
 //!
 //! The page also owns the preferences file. [`show`] runs every frame whether
 //! the dialog is open or not, so its first call is where stored settings are
@@ -41,10 +50,10 @@ use umber_core::input::PressureSource;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
-    /// A live reading of the pointer stream rather than a page of settings —
-    /// see the module docs.
+    /// Where pressure comes from, and a live reading of the pointer stream to
+    /// judge it by. The design's Pressure tab folded into this one — see the
+    /// module docs.
     InputAndPen,
-    Pressure,
     Themes,
     Shortcuts,
     /// Designed but not built.
@@ -53,10 +62,9 @@ pub enum SettingsTab {
 
 impl SettingsTab {
     /// The rail, in the design's order, with the reason a tab is dead.
-    const RAIL: [(SettingsTab, &'static str, &'static str); 6] = [
+    const RAIL: [(SettingsTab, &'static str, &'static str); 5] = [
         (SettingsTab::General, "General", ""),
         (SettingsTab::InputAndPen, "Input & pen", ""),
-        (SettingsTab::Pressure, "Pressure", ""),
         (SettingsTab::Themes, "Themes", ""),
         (SettingsTab::Shortcuts, "Shortcuts", ""),
         (
@@ -236,12 +244,8 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
                     ),
                     SettingsTab::InputAndPen => (
                         "Input & pen",
-                        "A live reading of what the window system is sending. Move the \
-                         pointer, then draw in the strip.",
-                    ),
-                    SettingsTab::Pressure => (
-                        "Pressure",
-                        "Where a stroke's pressure comes from, and how it responds.",
+                        "Where a stroke's pressure comes from, and a live reading of what \
+                         the window system is sending to judge it by.",
                     ),
                     SettingsTab::Themes => (
                         "Themes",
@@ -285,7 +289,6 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
             match ed.ui.settings_tab {
                 SettingsTab::General => general_pane(ui, p, ed, actions),
                 SettingsTab::InputAndPen => input_pane(ui, p, ed),
-                SettingsTab::Pressure => pressure_pane(ui, p, ed),
                 SettingsTab::Themes => themes_pane(ui, p, ed),
                 SettingsTab::Shortcuts => shortcuts_pane(ui, p),
                 // The rail cannot select this; a preferences file naming it
@@ -546,14 +549,26 @@ const STRIP_HEIGHT: f32 = 88.0;
 /// Widest the test strip's mark gets, in points, at full pressure.
 const NIB_MAX: f32 = 9.0;
 
-/// A live reading of the pointer stream. Not a page of settings — see the
-/// module docs for why this one is different.
+/// Where pressure comes from, and a live reading of the pointer stream.
 ///
-/// Everything drawn here comes out of [`crate::inputlog`], which records the
-/// events as they arrive at the window. Nothing on this page asks the pressure
+/// Everything reported here comes out of [`crate::inputlog`], which records the
+/// events as they arrive at the window. Nothing on this page *asks* the pressure
 /// model anything: the resolved figure is the one the real call answered, and
 /// the strip runs on a copy. Reading a diagnostic must not be able to change
-/// what it is reading.
+/// what it is reading — which is a different thing from setting the source,
+/// where changing what is read is the whole point.
+///
+/// The order is what somebody testing a pen does, in the order they do it.
+/// What is arriving comes first because it depends on no setting and answers
+/// the first question — is the tablet driver in mouse mode, or is the pen
+/// reaching Umber at all. The source picker comes next, because the three
+/// figures under it are what it decides. Then the readings it produced, then
+/// somewhere to draw, then the prose.
+///
+/// The prose stays at the foot as one block rather than a caption under each
+/// reading: it is read once and the readings are watched, so keeping it apart
+/// is what lets the instruments sit on screen together, and what falls below
+/// the fold is then the part it does no harm to scroll to.
 fn input_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     // The pane is taller than the dialog on a small window, and the strip at
     // the foot is the part somebody has come here to use — so it scrolls rather
@@ -564,13 +579,9 @@ fn input_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            // Every instrument first and every paragraph after it, rather than
-            // each reading with its own explanation underneath. The prose is
-            // read once and the readings are watched, so the arrangement that
-            // fits all four on screen together is the one that works — and what
-            // falls below the fold is then the part it does no harm to scroll
-            // to.
             route_section(ui, p, ed);
+            ui.add_space(12.0);
+            source_section(ui, p, ed);
             ui.add_space(12.0);
             pressure_section(ui, p, ed);
             ui.add_space(12.0);
@@ -579,6 +590,17 @@ fn input_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             guide_section(ui, p, ed);
         });
 }
+
+/// The three names a pressure source goes by, in one place.
+///
+/// The picker and the line above the test strip used to carry a copy each, on
+/// two different tabs, with a comment on the second asking that they be kept in
+/// step. One table is the version that cannot drift.
+const SOURCES: [(PressureSource, &str); 3] = [
+    (PressureSource::Device, "Device"),
+    (PressureSource::Simulated, "Speed"),
+    (PressureSource::Constant, "Off"),
+];
 
 /// Which route the events are arriving by, and what the last one was.
 ///
@@ -655,9 +677,93 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     });
 }
 
+/// Where pressure comes from: the one setting on this page, and the two knobs
+/// that hang off one of its answers.
+///
+/// Above the readings rather than below them, because it is what they are
+/// readings *of*. Somebody comparing the three sources flips the picker and
+/// watches the meters, the trace and the strip underneath answer, which is the
+/// gesture this page exists for and the one thing splitting it off onto a tab of
+/// its own made impossible.
+fn source_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "Pressure source");
+
+    let mut source = ed.pressure.source;
+    ui.scope(|ui| {
+        ui.set_max_width(320.0);
+        if widgets::segmented(ui, p, &mut source, &SOURCES) {
+            ed.pressure.source = source;
+            prefs::mark_dirty();
+        }
+    });
+    ui.add_space(6.0);
+
+    match source {
+        PressureSource::Device => controls::note(
+            ui,
+            p,
+            "Touch screens report real pressure, and so do pens on Windows. Pens on \
+             macOS and Linux do not reach Umber through the window system yet, so \
+             there this behaves as Off — pick Speed for a stand-in. A mouse always \
+             paints at full pressure.",
+        ),
+        PressureSource::Simulated => controls::note(
+            ui,
+            p,
+            "Pressure is derived from how fast the stroke is moving: fast goes \
+             thin, slow goes thick.",
+        ),
+        PressureSource::Constant => controls::note(ui, p, "Every sample paints at full pressure."),
+    }
+
+    // These two knobs feed only the speed model, so they appear with it.
+    // Showing them permanently, greyed, would imply the device path has a
+    // sensitivity to set, which it does not.
+    if source == PressureSource::Simulated {
+        ui.add_space(14.0);
+        controls::section(ui, p, "Speed model");
+        ui.scope(|ui| {
+            ui.set_max_width(320.0);
+            if widgets::slider_row(
+                ui,
+                p,
+                "Speed for minimum pressure",
+                &mut ed.pressure.max_speed,
+                300.0..=8000.0,
+                true,
+                |v| format!("{v:.0} px/s"),
+            ) {
+                prefs::mark_dirty();
+            }
+            ui.add_space(8.0);
+            if widgets::slider_row(
+                ui,
+                p,
+                "Responsiveness",
+                &mut ed.pressure.responsiveness,
+                0.02..=1.0,
+                false,
+                |v| format!("{:.0}%", v * 100.0),
+            ) {
+                prefs::mark_dirty();
+            }
+        });
+        controls::note(
+            ui,
+            p,
+            "How quickly simulated pressure chases the speed. Lower is smoother \
+             and lags further behind.",
+        );
+    }
+}
+
 /// The two pressure figures, and the trace of them.
+///
+/// Headed for what it shows rather than "Pressure", now that the section above
+/// it is about pressure too — and "Reported and resolved" is the distinction
+/// the two meters are here to draw.
 fn pressure_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    controls::section(ui, p, "Pressure");
+    controls::section(ui, p, "Reported and resolved");
 
     let last = ed.input.ring.newest();
     widgets::value_meter(
@@ -721,24 +827,15 @@ fn legend(ui: &mut egui::Ui, p: &Palette, colour: Color32, label: &str) {
 
 /// The scribble strip: somewhere to drag that draws the live pressure.
 ///
-/// The source it is running under is named on the same line, and the way to
-/// change it beside that: the strip behaves completely differently on Device,
-/// Speed and Off, and somebody comparing the three should not have to remember
-/// which they last chose two tabs ago.
+/// The source it is running under is still named on the same line, even though
+/// the picker is now a few sections up: the strip behaves completely
+/// differently on Device, Speed and Off, and the pane is long enough that the
+/// picker can be scrolled off the top while somebody is scribbling. The button
+/// that used to sit beside it has gone with the tab it led to.
 fn strip_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.horizontal(|ui| {
         controls::section(ui, p, "Try it");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if controls::text_button(ui, p, "Change", false, true)
-                .on_hover_text(
-                    "The setting lives on the Pressure tab; this page only reports \
-                     what it does.",
-                )
-                .clicked()
-            {
-                ed.ui.settings_tab = SettingsTab::Pressure;
-            }
-            ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
                     "pressure from {}",
@@ -752,13 +849,12 @@ fn strip_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     test_strip(ui, p, ed);
 }
 
-/// The Pressure tab's own name for a source, so the two pages agree.
+/// The name the picker gives a source, so the strip's line agrees with it.
 fn source_label(source: PressureSource) -> &'static str {
-    match source {
-        PressureSource::Device => "Device",
-        PressureSource::Simulated => "Speed",
-        PressureSource::Constant => "Off",
-    }
+    SOURCES
+        .iter()
+        .find(|(s, _)| *s == source)
+        .map_or("", |(_, label)| label)
 }
 
 /// What all of the above means, and what is not on the page at all.
@@ -936,91 +1032,6 @@ fn test_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         }
         painter.circle_filled(at, half, p.text_strong);
         previous = Some((at, half));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pressure
-// ---------------------------------------------------------------------------
-
-fn pressure_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    controls::section(ui, p, "Source");
-
-    let mut source = ed.pressure.source;
-    ui.scope(|ui| {
-        ui.set_max_width(320.0);
-        if widgets::segmented(
-            ui,
-            p,
-            &mut source,
-            &[
-                (PressureSource::Device, "Device"),
-                (PressureSource::Simulated, "Speed"),
-                (PressureSource::Constant, "Off"),
-            ],
-        ) {
-            ed.pressure.source = source;
-            prefs::mark_dirty();
-        }
-    });
-    ui.add_space(6.0);
-
-    match source {
-        PressureSource::Device => controls::note(
-            ui,
-            p,
-            "Touch screens report real pressure, and so do pens on Windows. Pens on \
-             macOS and Linux do not reach Umber through the window system yet, so \
-             there this behaves as Off — pick Speed for a stand-in. A mouse always \
-             paints at full pressure.",
-        ),
-        PressureSource::Simulated => controls::note(
-            ui,
-            p,
-            "Pressure is derived from how fast the stroke is moving: fast goes \
-             thin, slow goes thick.",
-        ),
-        PressureSource::Constant => controls::note(ui, p, "Every sample paints at full pressure."),
-    }
-
-    // These two knobs feed only the speed model, so they appear with it.
-    // Showing them permanently, greyed, would imply the device path has a
-    // sensitivity to set, which it does not.
-    if source == PressureSource::Simulated {
-        ui.add_space(14.0);
-        controls::section(ui, p, "Speed model");
-        ui.scope(|ui| {
-            ui.set_max_width(320.0);
-            if widgets::slider_row(
-                ui,
-                p,
-                "Speed for minimum pressure",
-                &mut ed.pressure.max_speed,
-                300.0..=8000.0,
-                true,
-                |v| format!("{v:.0} px/s"),
-            ) {
-                prefs::mark_dirty();
-            }
-            ui.add_space(8.0);
-            if widgets::slider_row(
-                ui,
-                p,
-                "Responsiveness",
-                &mut ed.pressure.responsiveness,
-                0.02..=1.0,
-                false,
-                |v| format!("{:.0}%", v * 100.0),
-            ) {
-                prefs::mark_dirty();
-            }
-        });
-        controls::note(
-            ui,
-            p,
-            "How quickly simulated pressure chases the speed. Lower is smoother \
-             and lags further behind.",
-        );
     }
 }
 
