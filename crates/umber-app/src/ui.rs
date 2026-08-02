@@ -70,6 +70,10 @@ pub struct UiActions {
     pub fit_view: bool,
     pub reset_zoom: bool,
     pub add_layer: bool,
+    /// Put the ticked layers — or the selected one — into a new folder. The
+    /// caller's, because it commits a float first; nothing else about it
+    /// touches the GPU, since a folder holds no slice.
+    pub group_layers: bool,
     pub delete_layer: Option<usize>,
     /// Delete every ticked layer. A `bool` rather than the list, because
     /// [`UiActions`] is `Copy` — the caller reads the ticks off the editor in

@@ -197,6 +197,26 @@ besides:
 
 All four are written into the `.ora` and read back out of it.
 
+**Folders.** Press the folder button and the ticked layers — or the selected one
+— go into a group. A folder's row has a chevron that folds it shut, and its
+contents are stepped in beneath it. Drag a layer sideways as well as up and
+down: how far right the pointer is decides what it lands inside, one step of the
+indent per level, and dragging to the far left of the list takes it back out.
+Eight levels of nesting, and a folder travels with everything in it.
+
+A folder's **eye and lock reach what is inside it** — hide the group and every
+layer in it goes, without their own eyes changing, so opening it again brings
+them all back. Ticking a folder ticks its contents, which is how "show
+everything in this group" is said. Deleting one deletes what it holds.
+
+What a folder does not have is an **opacity or a blend mode of its own**; see
+[what is not there yet](#what-is-not-there-yet). Everything a folder *is* today
+composites exactly as its contents would in place, which is why it costs the
+renderer nothing — and why a document with folders still opens in Krita, GIMP
+and MyPaint, and in every older Umber, showing the identical picture and simply
+losing the grouping. They are written as OpenRaster's own nested `<stack>`, not
+as an extension of Umber's.
+
 **Tick several rows and act on all of them at once.** Every row has a tick box;
 tick as many as you like and a strip appears saying how many, with show, hide,
 lock, unlock, link and delete, and All and None for ticking the whole stack at
@@ -490,11 +510,14 @@ platforms is on the roadmap.
   carry today: a floating transform holds one layer's pixels and one undo entry
   holds one patch, so moving several at once on the *canvas* is a larger change
   than the groups were.
-- **Layer folders.** The stack is flat. Ticking several layers and acting on all
-  of them covers most of what folders are reached for; nesting, and a folder's
-  own visibility and opacity applying to what is inside it, do not exist.
-  [`docs/layer-folders.md`](docs/layer-folders.md) is the design and what it
-  would cost.
+- **A folder's own opacity and blend mode.** Folders exist and hold layers, and
+  a folder's eye and lock reach everything inside it. What one does *not* have
+  is an opacity or a blend mode of its own, and the controls for them are not
+  drawn rather than drawn dead. That is group compositing — the children have to
+  composite into an accumulator of their own before it is blended into the stack
+  — and it needs an accumulator stack in the composite shader and a file-format
+  revision. [`docs/layer-folders.md`](docs/layer-folders.md) has the design and
+  what it would cost.
 - **Layer masks from other applications.** Umber reads and writes its own; a
   `.kra` or `.psd` mask is still reported as lost rather than converted.
 - **Pen pressure on macOS and Linux**, as above. Windows works.

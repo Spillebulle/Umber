@@ -190,6 +190,20 @@ pub fn ora_with_group() -> Vec<u8> {
     archive.finish()
 }
 
+/// An ORA whose first element is a **self-closing** empty group.
+///
+/// `<stack/>` never produces an `End` event, so the reader's depth bookkeeping
+/// has a branch of its own for it. Umber's writer does not emit that form —
+/// which is exactly why this exists: it arrives from other applications, and
+/// nothing else in the suite reaches that branch.
+pub fn ora_with_empty_group() -> Vec<u8> {
+    let mut archive = Archive::new("image/openraster");
+    archive.add("data/a.png", &png_rgba(1, 1, &[255, 0, 0, 255]));
+    let xml = "<image w=\"1\" h=\"1\"><stack>        <stack name=\"Empty\"/>        <layer name=\"After\" src=\"data/a.png\"/>        </stack></image>";
+    archive.add("stack.xml", xml.as_bytes());
+    archive.finish()
+}
+
 // ---------------------------------------------------------------- KRA
 
 /// One layer of a Krita fixture. Uppermost first, as `maindoc.xml` orders them.

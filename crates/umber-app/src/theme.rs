@@ -377,6 +377,16 @@ pub mod metrics {
     /// One entry in the History module: a marker and a line of text, tighter
     /// than a brush row because it carries no picture.
     pub const HISTORY_ROW: f32 = 20.0;
+
+    /// How far one level of layer nesting steps a row in.
+    ///
+    /// Small on purpose. The panel is [`PANEL`] wide and the row already spends
+    /// most of it on a tick box, an eye, a thumbnail and a blend label, so a
+    /// generous indent at four levels deep would leave a folder's contents with
+    /// no name to read. It is also what `layerdrag` measures "into that folder"
+    /// against, so there is one number rather than a paint-side and a
+    /// model-side one that can disagree.
+    pub const LAYER_INDENT: f32 = 12.0;
     /// The module library dialog. One card per module, each a picture beside
     /// two lines of text.
     pub const MODULE_LIBRARY_WIDTH: f32 = 470.0;

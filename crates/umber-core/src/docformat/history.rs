@@ -262,8 +262,15 @@ impl<'a> SaveHistory<'a> {
                     // layer or a removed mask — and both of those clear the
                     // history, so reaching here at all means something went
                     // wrong and the whole history is refused.
+                    //
+                    // The position counts **every stack entry, folders
+                    // included**, and the manifest's name fingerprint is built
+                    // the same way, so the two cannot disagree about what
+                    // "layer 3" means. A folder holds no slot, so it can never
+                    // be what a patch resolves to; what it does is occupy a
+                    // position, which is exactly why it has to be counted.
                     let (layer, mask) = layers.layers().iter().enumerate().find_map(|(i, l)| {
-                        if l.slot() == patch.slot {
+                        if l.slot() == Some(patch.slot) {
                             Some((i, false))
                         } else if l.mask() == Some(patch.slot) {
                             Some((i, true))
@@ -632,7 +639,10 @@ mod tests {
     #[test]
     fn a_history_survives_a_round_trip() {
         let stack = stack(&["Paper", "Ink"]);
-        let (a, b) = (stack.get(0).unwrap().slot(), stack.get(1).unwrap().slot());
+        let (a, b) = (
+            stack.get(0).unwrap().slot().unwrap(),
+            stack.get(1).unwrap().slot().unwrap(),
+        );
 
         // Fixed stamps rather than the clock, so the assertions below are
         // equality rather than a tolerance — and so the gaps between them are
@@ -703,11 +713,11 @@ mod tests {
                 .stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == after.patch().unwrap().slot);
+                .position(|l| l.slot() == Some(after.patch().unwrap().slot));
             let was = stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == before.patch().unwrap().slot);
+                .position(|l| l.slot() == Some(before.patch().unwrap().slot));
             assert_eq!(slot, was, "entry {i} came back on a different layer");
         }
         assert!(back.can_undo() && back.can_redo());
@@ -723,7 +733,7 @@ mod tests {
         let mut stack = stack(&["Paper", "Ink", "Wash"]);
         // Positions 0,1,2 hold slots 0,1,2; after this they hold 0,2,1.
         stack.move_down(2).unwrap();
-        let slots: Vec<u32> = stack.layers().iter().map(|l| l.slot()).collect();
+        let slots: Vec<u32> = stack.layers().iter().filter_map(|l| l.slot()).collect();
         assert_eq!(slots, [0, 2, 1], "the fixture is not testing anything");
 
         // A patch on the middle layer — "Wash", holding slot 2.
@@ -739,7 +749,7 @@ mod tests {
             .stack
             .layers()
             .iter()
-            .find(|l| l.slot() == slot)
+            .find(|l| l.slot() == Some(slot))
             .expect("the patch names a layer of the reopened stack");
         assert_eq!(
             landed.name, "Wash",
@@ -955,7 +965,7 @@ mod tests {
     #[test]
     fn a_flip_survives_a_round_trip_and_carries_no_pixels() {
         let stack = stack(&["Paper", "Ink"]);
-        let slot = stack.get(1).unwrap().slot();
+        let slot = stack.get(1).unwrap().slot().unwrap();
         let at = |secs: i64| Some(Timestamp::from_unix_millis(secs * 1000));
 
         let mut history = History::default();
@@ -1035,7 +1045,7 @@ mod tests {
     fn a_patch_on_a_mask_comes_back_on_that_mask() {
         let mut stack = stack(&["Paper", "Ink"]);
         let mask = stack.add_mask(1).expect("the layer can take a mask");
-        let pixels = stack.get(1).unwrap().slot();
+        let pixels = stack.get(1).unwrap().slot().unwrap();
         assert_ne!(mask, pixels, "the fixture is not testing anything");
 
         let mut history = History::default();
@@ -1049,7 +1059,7 @@ mod tests {
 
         let slot_of = |i: usize| opened.history.entry_at(i).unwrap().patch().unwrap().slot;
         let layer = opened.stack.get(1).unwrap();
-        assert_eq!(slot_of(0), layer.slot(), "the layer entry moved");
+        assert_eq!(Some(slot_of(0)), layer.slot(), "the layer entry moved");
         assert_eq!(
             slot_of(1),
             layer.mask().expect("the mask came back"),

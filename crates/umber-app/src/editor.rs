@@ -767,7 +767,10 @@ impl Editor {
         // The stroke that was in flight, if any, was finished by the caller
         // before the swap; this only stops a stale slot from the *previous*
         // document being carried into the next commit.
-        self.stroke_slot = self.layers.active_slot();
+        // A folder is selected in the incoming document, so there is no slot
+        // to carry: left as it was, since nothing will read it until a stroke
+        // begins and `begin_stroke` refuses a folder outright.
+        self.stroke_slot = self.layers.active_slot().unwrap_or(self.stroke_slot);
         self.interaction = Interaction::Idle;
     }
 
@@ -975,16 +978,21 @@ impl Editor {
     /// error and not a refusal — it paints the layer, because the alternative
     /// is a brush that silently does nothing and a switch that has to be kept
     /// in step with which layer is selected.
-    pub fn stroke_target(&self) -> (u32, bool) {
+    /// `None` where a folder is selected — it holds neither pixels nor a mask,
+    /// so there is nowhere for a stroke to land. Every route to a stroke passes
+    /// [`Editor::begin_stroke`], which refuses on it at the same gate a lock is
+    /// refused at, so this is the shape rather than a case anything downstream
+    /// has to invent an answer for.
+    pub fn stroke_target(&self) -> Option<(u32, bool)> {
         match (self.edit_target, self.layers.active_mask()) {
-            (EditTarget::Mask, Some(slot)) => (slot, true),
-            _ => (self.layers.active_slot(), false),
+            (EditTarget::Mask, Some(slot)) => Some((slot, true)),
+            _ => Some((self.layers.active_slot()?, false)),
         }
     }
 
     /// True when the interface should show the mask as the thing being painted.
     pub fn editing_mask(&self) -> bool {
-        self.stroke_target().1
+        self.stroke_target().is_some_and(|(_, mask)| mask)
     }
 
     /// What a stroke on a mask puts down.
@@ -1023,7 +1031,13 @@ impl Editor {
         if self.layers.active_is_locked() {
             return false;
         }
-        let (slot, on_mask) = self.stroke_target();
+        // A folder holds no pixels and no mask, so there is nowhere for the
+        // stroke to go. Refused at this same one gate rather than at the four
+        // routes that reach it, exactly as the lock above is — and silently,
+        // because this is reached every time the pen goes down.
+        let Some((slot, on_mask)) = self.stroke_target() else {
+            return false;
+        };
         let (color, mode) = if on_mask {
             self.mask_paint()
         } else {
@@ -1277,26 +1291,75 @@ impl Editor {
     /// pixels are put down, so the composite shader draws it at the right
     /// position, under the right blend mode, at the right opacity, without
     /// knowing a transform exists. See `CanvasRenderer::float_preview`.
+    /// **Folders are flattened away here, and that is the whole of what a
+    /// pass-through folder costs the renderer.**
+    ///
+    /// A folder holds no pixels and has no opacity or blend mode of its own, so
+    /// its contents composited in place *are* the group — which is why
+    /// `composite.wgsl` was not touched for folders, why the four other things
+    /// that reuse that pass (`export_rgba`, `pick_colour`, `probe_canvas` and
+    /// the autosave's capture) needed nothing, and why a document of folders
+    /// still declares the same file-format revision. All a folder contributes
+    /// is its eye, and that folds into its contents because visibility is a
+    /// boolean: `hidden ∧ anything = hidden`. An *opacity* would not fold, and
+    /// is exactly the thing that would need an accumulator stack in the shader —
+    /// see `docs/layer-folders.md`.
+    ///
+    /// The consequence to hold on to is that a draw's position is **not** a
+    /// stack position once a document has folders in it. Anything handing the
+    /// composite a stack index has to map it through
+    /// [`Editor::active_draw_index`].
     pub fn layer_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerDraw> {
         self.layers
             .layers()
             .iter()
-            .map(|l| LayerDraw {
-                slot: match float {
-                    Some((from, to)) if from == l.slot() => to,
-                    _ => l.slot(),
-                },
-                opacity: l.opacity,
-                blend: l.blend.index(),
-                visible: l.visible,
-                // The mask is *not* swapped for the preview slice: a floating
-                // transform moves the layer's pixels, not what hides them, and
-                // the preview has to be masked exactly as the committed result
-                // will be.
-                mask: l.mask(),
-                clipped: l.clipped,
+            .enumerate()
+            .filter_map(|(i, l)| {
+                Some(LayerDraw {
+                    slot: match (l.slot()?, float) {
+                        (slot, Some((from, to))) if from == slot => to,
+                        (slot, _) => slot,
+                    },
+                    opacity: l.opacity,
+                    blend: l.blend.index(),
+                    visible: self.layers.effective_visible(i),
+                    // The mask is *not* swapped for the preview slice: a
+                    // floating transform moves the layer's pixels, not what
+                    // hides them, and the preview has to be masked exactly as
+                    // the committed result will be.
+                    mask: l.mask(),
+                    clipped: l.clipped,
+                })
             })
             .collect()
+    }
+
+    /// Where the selected layer sits in [`Editor::layer_draws`].
+    ///
+    /// The composite is told which draw carries the stroke in flight, and with
+    /// folders in the stack that is no longer the stack position: every folder
+    /// below the active layer shifts it by one. Getting this wrong previews the
+    /// stroke on the wrong layer — under the wrong blend mode, at the wrong
+    /// opacity — and then it jumps at pointer-up when the commit puts it where
+    /// it really went.
+    ///
+    /// A folder cannot be painted on, so a folder selected answers with a
+    /// position past the end, which the shader's `i == active_index` simply
+    /// never matches.
+    pub fn active_draw_index(&self) -> u32 {
+        let active = self.layers.active_index();
+        if self.layers.active_is_folder() {
+            // Deliberately not "the layer below it". Counting the layers under
+            // a folder and subtracting one lands on a real draw, and the stroke
+            // preview would then appear on a layer the painter did not choose.
+            return u32::MAX;
+        }
+        self.layers
+            .layers()
+            .iter()
+            .take(active)
+            .filter(|l| !l.is_folder())
+            .count() as u32
     }
 
     pub fn record_frame_time(&mut self, dt: f32) {
@@ -1416,11 +1479,14 @@ mod tests {
             edit_target: EditTarget::Mask,
             ..Default::default()
         };
-        assert_eq!(ed.stroke_target(), (ed.layers.active_slot(), false));
+        assert_eq!(
+            ed.stroke_target(),
+            ed.layers.active_slot().map(|s| (s, false))
+        );
         assert!(!ed.editing_mask());
 
         let mask = ed.layers.add_mask(0).unwrap();
-        assert_eq!(ed.stroke_target(), (mask, true));
+        assert_eq!(ed.stroke_target(), Some((mask, true)));
         assert!(ed.editing_mask());
     }
 
@@ -1460,8 +1526,137 @@ mod tests {
 
         assert!(ed.begin_stroke(point()));
         assert!(!ed.stroke_style.on_mask);
-        assert_eq!(ed.stroke_slot, ed.layers.active_slot());
+        assert_eq!(Some(ed.stroke_slot), ed.layers.active_slot());
         assert_eq!(ed.stroke_style.color, ed.color);
         assert_eq!(ed.stroke_style.mode, BrushMode::Erase);
+    }
+
+    // --- folders ------------------------------------------------------------
+
+    /// A stack with a folder holding the top two of three layers.
+    fn with_a_folder() -> Editor {
+        let mut ed = Editor::default();
+        ed.layers.add();
+        ed.layers.add();
+        ed.layers.group(&[1, 2]).expect("the top two");
+        ed
+    }
+
+    /// **A folder never reaches the composite.** This is the whole of why
+    /// `composite.wgsl` was not touched for folders, and why the four other
+    /// things that reuse that pass — `export_rgba`, `pick_colour`,
+    /// `probe_canvas` and the autosave's capture — needed nothing at all.
+    #[test]
+    fn a_folder_is_flattened_out_of_the_draw_list() {
+        let ed = with_a_folder();
+        assert_eq!(ed.layers.len(), 4, "three layers and one folder");
+        let draws = ed.layer_draws(None);
+        assert_eq!(draws.len(), 3, "the folder contributes no draw");
+        let slots: Vec<u32> = draws.iter().map(|d| d.slot).collect();
+        let expected: Vec<u32> = ed.layers.layers().iter().filter_map(|l| l.slot()).collect();
+        assert_eq!(slots, expected, "and the rest are in stack order");
+    }
+
+    /// A folder's eye folds into its contents, because visibility is a boolean
+    /// and `hidden ∧ anything = hidden`. An *opacity* would not fold, which is
+    /// why a pass-through folder has none — see `docs/layer-folders.md`.
+    #[test]
+    fn hiding_a_folder_hides_its_contents_in_the_draw_list() {
+        let mut ed = with_a_folder();
+        assert!(ed.layer_draws(None).iter().all(|d| d.visible));
+
+        ed.layers.get_mut(3).unwrap().visible = false;
+        let draws = ed.layer_draws(None);
+        assert_eq!(
+            draws.iter().map(|d| d.visible).collect::<Vec<_>>(),
+            vec![true, false, false],
+            "the layer outside the folder still draws"
+        );
+        assert!(
+            ed.layers.get(1).unwrap().visible,
+            "the layers' own eyes are untouched, so opening the folder reveals \
+             them again"
+        );
+    }
+
+    /// **A draw's position is not a stack position** once there is a folder in
+    /// the document, and the composite is told which draw carries the stroke in
+    /// flight. Getting this wrong previews the stroke on the wrong layer —
+    /// under the wrong blend mode, at the wrong opacity — and it then jumps at
+    /// pointer-up when the commit puts it where it really went.
+    #[test]
+    fn the_stroke_is_previewed_on_the_draw_the_layer_actually_is() {
+        let mut ed = Editor::default();
+        ed.layers.add();
+        ed.layers.add();
+        // Group the *bottom* layer, so the folder sits below the other two and
+        // shifts every draw index above it.
+        ed.layers.group(&[0]).expect("one layer in a group");
+        // Stack: [Layer 1 (in), Group 1, Layer 2, Layer 3]
+        assert_eq!(ed.layers.len(), 4);
+
+        for (stack, draw) in [(0usize, 0u32), (2, 1), (3, 2)] {
+            ed.layers.set_active(stack);
+            assert_eq!(
+                ed.active_draw_index(),
+                draw,
+                "stack position {stack} is draw {draw}"
+            );
+            assert_eq!(
+                ed.layer_draws(None)[draw as usize].slot,
+                ed.layers.active_slot().unwrap()
+            );
+        }
+    }
+
+    /// A folder selected answers with a position past the end, which the
+    /// shader's `i == active_index` simply never matches. Deliberately not "the
+    /// layer below it", which is a real draw and would preview the stroke on a
+    /// layer nobody chose.
+    #[test]
+    fn a_selected_folder_carries_no_stroke() {
+        let mut ed = with_a_folder();
+        ed.layers.set_active(3);
+        assert!(ed.layers.active_is_folder());
+        assert_eq!(ed.active_draw_index(), u32::MAX);
+        assert!(
+            ed.active_draw_index() as usize >= ed.layer_draws(None).len(),
+            "no draw may match a folder"
+        );
+    }
+
+    /// The gate. A folder holds neither pixels nor a mask, so there is nowhere
+    /// for a stroke to land — refused at the same one place a lock is, rather
+    /// than at the four routes that reach it.
+    #[test]
+    fn a_folder_refuses_a_stroke() {
+        let mut ed = with_a_folder();
+        ed.layers.set_active(3);
+        assert_eq!(ed.stroke_target(), None);
+        assert!(!ed.begin_stroke(point()), "a folder must refuse");
+        assert_eq!(
+            ed.interaction,
+            Interaction::Idle,
+            "a refused stroke must not leave the pointer drawing"
+        );
+        assert!(!ed.stroke.is_active());
+    }
+
+    /// A lock on a folder reaches every layer inside it, through the same one
+    /// gate every operation asks.
+    #[test]
+    fn a_lock_on_a_folder_refuses_a_stroke_on_what_is_inside_it() {
+        let mut ed = with_a_folder();
+        ed.layers.set_active(1);
+        assert!(ed.begin_stroke(point()), "unlocked, so it paints");
+        ed.stroke.end();
+        ed.interaction = Interaction::Idle;
+
+        ed.layers.get_mut(3).unwrap().locked = true;
+        assert!(
+            !ed.begin_stroke(point()),
+            "the folder's lock has to reach it"
+        );
+        assert_eq!(ed.interaction, Interaction::Idle);
     }
 }

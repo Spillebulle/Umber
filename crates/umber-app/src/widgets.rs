@@ -1750,6 +1750,10 @@ pub struct LayerRowResponse {
     /// for a bulk operation must not also select it, or every tick would move
     /// the brush.
     pub pick_clicked: bool,
+    /// A folder's disclosure chevron was clicked. Its own target for exactly
+    /// the reason the eye and the tick box are theirs: folding a group shut to
+    /// see past it must not also move the brush onto the folder.
+    pub fold_clicked: bool,
 }
 
 /// What one row has to draw besides its name.
@@ -1766,8 +1770,33 @@ pub struct LayerRow<'a> {
     /// called the same thing, and two widgets sharing an id is an egui id clash
     /// — one of the two eyes then stops answering. A slot is unique by
     /// construction and never changes hands while a layer exists.
-    pub slot: u32,
+    /// Unique per entry within the frame. A layer's slot, and something no
+    /// slot can be for a folder — which holds none.
+    ///
+    /// A layer's is *stable* for its lifetime, which is what the id needs to
+    /// be: names are not unique in an imported document and two widgets sharing
+    /// an id is an egui clash. A folder's is positional and therefore changes
+    /// whenever the stack is rearranged; the only consequence is that egui's
+    /// per-widget state on a folder's row — a hover, a pressed chevron — resets
+    /// when it moves, which is a frame nobody sees mid-drag. Nothing on a
+    /// folder's row holds state worth carrying, so it is not worth a second
+    /// identity scheme.
+    pub key: u64,
     pub visible: bool,
+    /// How deeply nested. Every hit target and every mark in the row is offset
+    /// by it, so the indent is one number rather than a set that can disagree.
+    pub depth: u8,
+    /// This row is a folder: a chevron and a folder mark in place of the
+    /// thumbnail, no blend label, and no mask chip.
+    pub folder: bool,
+    /// A folder folded shut, so the rows inside it are not drawn at all.
+    pub collapsed: bool,
+    /// Hidden by a folder it is inside, rather than by its own eye.
+    ///
+    /// Drawn dim like anything else that is not showing, but the row's *own*
+    /// eye stays open — because it is: clicking it would not reveal the layer,
+    /// and an eye drawn shut that could not be opened is a control that lies.
+    pub hidden_by_folder: bool,
     pub active: bool,
     pub blend: &'a str,
     pub has_mask: bool,
@@ -1803,32 +1832,40 @@ pub struct LayerRow<'a> {
 pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowResponse {
     let LayerRow {
         name,
-        slot,
+        key,
         visible,
         active,
         blend,
         ..
     } = row;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let (full, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    // Everything inside the row is placed against `rect`, which is the full row
+    // stepped in by the nesting. The *fill* still uses the full width: a
+    // highlight that stepped in with the contents would make a nested row read
+    // as a different kind of control rather than as the same row further in.
+    let rect = Rect::from_min_max(
+        full.left_top() + vec2(row.depth as f32 * metrics::LAYER_INDENT, 0.0),
+        full.right_bottom(),
+    );
 
     let painter = ui.painter();
     if active {
-        painter.rect_filled(rect, metrics::RADIUS, p.control_active);
+        painter.rect_filled(full, metrics::RADIUS, p.control_active);
         painter.rect_stroke(
-            rect,
+            full,
             metrics::RADIUS,
             Stroke::new(1.0, p.accent_dim),
             egui::StrokeKind::Inside,
         );
     } else if response.hovered() {
-        painter.rect_filled(rect, metrics::RADIUS, p.control);
+        painter.rect_filled(full, metrics::RADIUS, p.control);
     }
 
     // The tick box, and then the eye. Both are their own hit targets inside the
     // row, so neither also changes the selection: ticking four rows to hide
     // them would otherwise move the brush four times on the way.
     let pick = Rect::from_min_size(rect.left_top() + vec2(4.0, 6.0), vec2(18.0, 18.0));
-    let pick_response = ui.interact(pick, ui.id().with(("pick", slot)), Sense::click());
+    let pick_response = ui.interact(pick, ui.id().with(("pick", key)), Sense::click());
     let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(12.0));
     if row.picked {
         ui.painter().rect_filled(box_rect, 2.0, p.accent);
@@ -1850,13 +1887,20 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     }
 
     let eye = Rect::from_min_size(rect.left_top() + vec2(23.0, 6.0), vec2(18.0, 18.0));
-    let eye_response = ui.interact(eye, ui.id().with(("eye", slot)), Sense::click());
+    let eye_response = ui.interact(eye, ui.id().with(("eye", key)), Sense::click());
 
     icons::draw(
         ui.painter(),
         eye,
         if visible { Icon::Eye } else { Icon::EyeOff },
-        if visible { p.text } else { p.text_dim },
+        // Dim where a folder above is what is hiding it: the layer is not
+        // showing, and saying so is the point, but its own eye is still open
+        // and clicking it would change nothing.
+        if visible && !row.hidden_by_folder {
+            p.text
+        } else {
+            p.text_dim
+        },
     );
 
     // The layer's own content, scaled to fill the chip, over a checker.
@@ -1867,26 +1911,61 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     // no picture at all the checker is the whole chip, and that is the stated
     // "nothing on this layer" state; see [`LayerRow::thumb`].
     let thumb = Rect::from_min_size(rect.left_top() + vec2(45.0, 3.0), vec2(24.0, 24.0));
-    painter.rect_filled(thumb, 3.0, p.window);
-    for i in 0..4 {
-        for j in 0..4 {
-            if (i + j) % 2 == 0 {
-                continue;
-            }
-            let cell = Rect::from_min_size(
-                thumb.left_top() + vec2(i as f32 * 6.0, j as f32 * 6.0),
-                vec2(6.0, 6.0),
-            );
-            painter.rect_filled(cell.intersect(thumb), 0.0, p.control_hover);
-        }
-    }
-    if let Some(picture) = row.thumb {
-        painter.image(
-            picture.id(),
-            thumb,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
+    // A folder gets a chevron and a folder mark where a layer gets its picture.
+    // Not a composite of its contents, which is the honest thumbnail and is a
+    // third mode for `thumbnail.wgsl`; and emphatically not one arbitrary
+    // child, which would be a picture that lies about what the group holds.
+    let mut fold_clicked = false;
+    if row.folder {
+        let fold = ui.interact(thumb, ui.id().with(("fold", key)), Sense::click());
+        fold_clicked = fold.clicked();
+        let painter = ui.painter();
+        icons::draw(
+            painter,
+            Rect::from_min_size(thumb.left_top() + vec2(-2.0, 5.0), Vec2::splat(14.0)),
+            if row.collapsed {
+                Icon::ChevronRight
+            } else {
+                Icon::ChevronDown
+            },
+            if fold.hovered() {
+                p.text_strong
+            } else {
+                p.text
+            },
         );
+        icons::draw(
+            painter,
+            Rect::from_min_size(thumb.left_top() + vec2(11.0, 5.0), Vec2::splat(14.0)),
+            Icon::Folder,
+            if visible && !row.hidden_by_folder {
+                p.text
+            } else {
+                p.text_dim
+            },
+        );
+    } else {
+        painter.rect_filled(thumb, 3.0, p.window);
+        for i in 0..4 {
+            for j in 0..4 {
+                if (i + j) % 2 == 0 {
+                    continue;
+                }
+                let cell = Rect::from_min_size(
+                    thumb.left_top() + vec2(i as f32 * 6.0, j as f32 * 6.0),
+                    vec2(6.0, 6.0),
+                );
+                painter.rect_filled(cell.intersect(thumb), 0.0, p.control_hover);
+            }
+        }
+        if let Some(picture) = row.thumb {
+            painter.image(
+                picture.id(),
+                thumb,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
     }
 
     // The mask chip, beside the layer's own, and only where there is a mask.
@@ -1897,7 +1976,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     let mut text_left = thumb.right() + 8.0;
     if row.has_mask {
         let chip = Rect::from_min_size(thumb.right_top() + vec2(4.0, 3.0), vec2(18.0, 18.0));
-        let hit = ui.interact(chip, ui.id().with(("mask", slot)), Sense::click());
+        let hit = ui.interact(chip, ui.id().with(("mask", key)), Sense::click());
         mask_clicked = hit.clicked();
         ui.painter().rect_filled(chip, 3.0, p.window);
         icons::draw(
@@ -1927,6 +2006,10 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     // list's job is to let a stack be read at a glance.
     let painter = ui.painter();
     let mut marks_left = rect.right() - 7.0;
+    // A pass-through folder has no blend mode, so it has no label. Drawing
+    // "Normal" on one would be a control-shaped statement about something that
+    // does not exist — see `docs/layer-folders.md`.
+    let blend = if row.folder { "" } else { blend };
     let blend_width = painter
         .layout_no_wrap(blend.to_owned(), FontId::proportional(9.0), p.text_dim)
         .size()
@@ -1987,6 +2070,7 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
         eye_clicked: eye_response.clicked(),
         mask_clicked,
         pick_clicked: pick_response.clicked(),
+        fold_clicked,
     }
 }
 

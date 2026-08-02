@@ -159,6 +159,17 @@ pub struct ImportedLayer {
     /// Which link group this layer belongs to, if any. See
     /// [`crate::docformat::LINK_GROUP_ATTR`].
     pub link: Option<u8>,
+    /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
+    ///
+    /// Only ORA can carry nesting today. `.kra` has groups and `.psd` has them
+    /// too, and both still flatten — reading either is a change to that
+    /// decoder, not to this field.
+    pub depth: u8,
+    /// This entry is a folder: it holds no pixels and takes no slot.
+    ///
+    /// `pixels` is empty for one, which is why nothing that walks the layer
+    /// list for something to upload may assume every entry has any.
+    pub folder: bool,
 }
 
 impl ImportedLayer {
@@ -177,6 +188,18 @@ impl ImportedLayer {
             clipped: false,
             locked: false,
             link: None,
+            depth: 0,
+            folder: false,
+        }
+    }
+
+    /// A folder: a name, an eye, a nesting level and no pixels at all.
+    pub fn folder(name: impl Into<String>, depth: u8, visible: bool) -> Self {
+        Self {
+            visible,
+            depth,
+            folder: true,
+            ..Self::new(name, BlendMode::Normal, Vec::new())
         }
     }
 }
@@ -274,22 +297,28 @@ impl ImportedDocument {
     /// slot and the document is open.
     pub fn open(self) -> Opened {
         let document = self.document();
-        let mut stack = LayerStack::new();
+        let mut stack = LayerStack::empty();
         let mut uploads = Vec::with_capacity(self.layers.len());
         let saved_history = self.history;
 
-        // A fresh stack already has one layer, so only the rest are added. The
+        // Built entry by entry rather than by adding layers and then correcting
+        // them, because a folder is not something `add` can be asked for: it
+        // takes no slot, and `add`'s whole contract is to hand one back. The
         // count is guaranteed to fit by `validate`.
-        for _ in 1..self.layers.len() {
-            stack.add();
+        for layer in &self.layers {
+            stack.push_imported(layer.folder, layer.depth, layer.name.clone());
         }
+        // Whatever the file said about nesting, the stack has to describe a
+        // tree — a depth capped at `MAX_DEPTH` on the way in can leave a folder
+        // and its contents at the same level. The pixels are all present either
+        // way; only the grouping changes, and the reader has already said so.
+        stack.flatten_ill_formed();
 
         for (i, layer) in self.layers.into_iter().enumerate() {
             let slot = {
                 let dst = stack
                     .get_mut(i)
                     .expect("the stack was sized to the import; see `validate`");
-                dst.name = layer.name;
                 dst.visible = layer.visible;
                 dst.opacity = layer.opacity;
                 dst.blend = layer.blend;
@@ -298,6 +327,9 @@ impl ImportedDocument {
                 dst.link = layer.link;
                 dst.slot()
             };
+            // A folder holds no pixels and takes no slice, so there is nothing
+            // to upload and nothing to clear.
+            let Some(slot) = slot else { continue };
             uploads.push(LayerUpload {
                 slot,
                 pixels: layer.pixels,
@@ -318,11 +350,17 @@ impl ImportedDocument {
         }
 
         // Umber's own documents remember which layer was selected; for
-        // everything else the top one is what an artist expects to land on.
-        let active = self
-            .active
-            .filter(|i| *i < stack.len())
-            .unwrap_or(stack.len() - 1);
+        // everything else the top one is what an artist expects to land on —
+        // and the top *layer*, not the top entry, because a document whose
+        // topmost entry is a folder would otherwise open with nowhere to paint
+        // and no indication why.
+        let active = self.active.filter(|i| *i < stack.len()).unwrap_or_else(|| {
+            stack
+                .layers()
+                .iter()
+                .rposition(|l| !l.is_folder())
+                .unwrap_or(stack.len() - 1)
+        });
         stack.set_active(active);
 
         // The one place a saved history's stack positions become texture slots,
@@ -353,8 +391,14 @@ impl ImportedDocument {
                             // replayed into the pixels, which is what the `?`
                             // does — the same rule the positions themselves
                             // answer to.
+                            // A position naming a *folder* is one whose patch
+                            // has nowhere to be replayed, and it drops the
+                            // whole history for the reason a position out of
+                            // range does: an entry replayed into the wrong
+                            // layer is the failure this design exists to avoid,
+                            // and a shorter history is not a safer one.
                             let dst = stack.get(layer)?;
-                            let slot = if mask { dst.mask()? } else { dst.slot() };
+                            let slot = if mask { dst.mask()? } else { dst.slot()? };
                             let pieces = pieces
                                 .into_iter()
                                 .map(|p| PatchPiece::new(p.rect, p.bytes))
@@ -399,7 +443,9 @@ impl ImportedDocument {
     /// grew a flattening fallback could still hand back something the stack
     /// cannot hold; this is the one place that has to be true.
     fn validate(&self) -> Result<(), ImportError> {
-        if self.layers.is_empty() {
+        // A document of nothing but folders has nothing to show and nowhere to
+        // paint, so it is as empty as one with no entries at all.
+        if !self.layers.iter().any(|l| !l.folder) {
             return Err(ImportError::Empty {
                 format: self.format,
             });
@@ -411,7 +457,10 @@ impl ImportedDocument {
             });
         }
         let expected = self.size.x as usize * self.size.y as usize * 4;
-        for layer in &self.layers {
+        // Folders are skipped: one holds no pixels, so "canvas-sized" is not a
+        // thing to be true of it. Everything else has to be exactly that,
+        // because it goes straight to `write_texture`.
+        for layer in self.layers.iter().filter(|l| !l.folder) {
             debug_assert_eq!(
                 layer.pixels.len(),
                 expected,
@@ -696,7 +745,7 @@ mod tests {
         // Slots are the renderer's contract: every upload must name the slot of
         // the layer at the same stack position.
         for (i, upload) in uploads.iter().enumerate() {
-            assert_eq!(upload.slot, stack.get(i).unwrap().slot());
+            assert_eq!(Some(upload.slot), stack.get(i).unwrap().slot());
         }
     }
 

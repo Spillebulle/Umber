@@ -593,7 +593,7 @@ impl UmberApp {
             .layers
             .layers()
             .iter()
-            .flat_map(|l| [Some(l.slot()), l.mask()])
+            .flat_map(|l| [l.slot(), l.mask()])
             .flatten()
             .collect();
         let id = self.editor.session.active_id();
@@ -686,7 +686,23 @@ impl UmberApp {
             }
             return false;
         }
-        let slot = self.editor.layers.active_slot();
+        // A folder holds no pixels, so there is nothing to lift out of it and
+        // nowhere to paste into it. Refused at the same one gate the lock is,
+        // and silently for the same reason a locked *canvas press* is: this is
+        // reached every time the pen goes down with the transform tool in hand.
+        let Some(slot) = self.editor.layers.active_slot() else {
+            if pixels.is_some() {
+                self.editor.notice = Some(Notice {
+                    title: "A folder is selected".to_string(),
+                    lines: vec![
+                        "Nothing was pasted. A folder holds no pixels — select a \
+                         layer in the Layers panel and paste again."
+                            .to_string(),
+                    ],
+                });
+            }
+            return false;
+        };
         let reserved = self.editor.layers.slot_capacity_needed();
         // A lift is clipped by the selection; a paste puts down exactly what it
         // was given, having been masked when it was copied.
@@ -927,8 +943,14 @@ impl UmberApp {
     /// it is acceptable in a save: this is an explicit action and is nowhere
     /// near the drawing loop.
     fn copy_selection(&mut self) {
+        // `take_region` puts any float down and answers for whichever state the
+        // copy was asked in — that is what lets a copy mid-transform read the
+        // float's own region rather than the selection it came from.
         let (rect, mask) = self.take_region();
-        let slot = self.editor.layers.active_slot();
+        // Nothing to copy out of a folder: it holds no pixels of its own.
+        let Some(slot) = self.editor.layers.active_slot() else {
+            return;
+        };
         let id = self.editor.session.active_id();
 
         let Some(gfx) = self.gfx.as_ref() else { return };
@@ -986,7 +1008,13 @@ impl UmberApp {
             return;
         }
         let (rect, mask) = self.take_region();
-        let slot = self.editor.layers.active_slot();
+        // Nothing to cut out of a folder: it holds no pixels of its own, so
+        // there is nothing to take and nothing to write back. Silent rather
+        // than a notice, for the reason the copy above is — a folder is a
+        // perfectly ordinary thing to have selected.
+        let Some(slot) = self.editor.layers.active_slot() else {
+            return;
+        };
         let id = self.editor.session.active_id();
 
         // Mutable because writing a slice bumps its thumbnail revision — the
@@ -1114,7 +1142,11 @@ impl UmberApp {
         // saying they want none of it, and putting the floating pixels down
         // first only to wipe them would be theatre.
         self.cancel_transform();
-        let slot = self.editor.layers.active_slot();
+        // A folder has nothing to clear. Deleting it is a different command and
+        // is the one that would remove what is inside it.
+        let Some(slot) = self.editor.layers.active_slot() else {
+            return;
+        };
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(canvas) = gfx.canvases.get_mut(&id) else {
@@ -1165,17 +1197,55 @@ impl UmberApp {
     }
 
     fn delete_layer(&mut self, index: usize) {
+        self.delete_entries(&[index]);
+    }
+
+    /// Delete every ticked layer.
+    ///
+    /// Written in terms of [`Self::delete_entries`], like the single delete, so
+    /// the lock gate, the float being put down and the history being cleared
+    /// are each stated once — a second delete that forgot one of the three is
+    /// exactly the bug the "one gate per operation" rule exists to prevent.
+    fn delete_picked_layers(&mut self) {
+        let targets = self.editor.layers.targets();
+        self.delete_entries(&targets);
+    }
+
+    /// Delete a set of entries, and everything inside any folder among them.
+    ///
+    /// **One call to `remove_many`, never a loop of single deletes**, and that
+    /// is a correctness rule rather than tidiness. A folder's contents sit
+    /// *below* it, so deleting one shifts every index beneath it; a loop —
+    /// even one walking backwards, which is what this used to be — hands the
+    /// next iteration an index that now names a different entry. Ticking a
+    /// layer and a group above it deleted a third layer nobody chose, and
+    /// because a delete clears the undo history it could not be taken back.
+    /// `LayerStack::remove_many` resolves the whole set against the stack as it
+    /// stands before anything moves.
+    fn delete_entries(&mut self, indices: &[usize]) {
         // **The one gate a lock has on deletion.** A lock that stopped strokes
         // and let the layer be thrown away would protect nothing worth
         // protecting.
-        if self.editor.layers.locked_at(index) {
+        //
+        // Over the whole subtree of everything named, so a folder's lock
+        // protects what is inside it and a locked layer inside an unlocked
+        // group stops the *group* being deleted — because deleting a folder
+        // deletes its contents, and half a deletion is not a state to leave a
+        // stack in.
+        let locked = indices.iter().any(|i| {
+            self.editor
+                .layers
+                .subtree(*i)
+                .any(|j| self.editor.layers.effective_locked(j))
+        });
+        if locked {
             return;
         }
         self.finish_transform();
-        if self.editor.layers.remove(index).is_none() {
+        if self.editor.layers.remove_many(indices).is_none() {
             return;
         }
-        // Slots are recycled — both of them, where the layer had a mask — so an
+        // Slots are recycled — both of them, where a layer had a mask — so an
         // undo entry recorded against a freed slot would later be replayed into
         // whichever layer or mask inherits it. Dropping history is the blunt but
         // safe fix; structural undo is the real one.
@@ -1183,24 +1253,23 @@ impl UmberApp {
         self.editor.mark_modified();
     }
 
-    /// Delete every ticked layer.
+    /// Put the ticked layers — or the selected one — into a new group.
     ///
-    /// Written in terms of [`Self::delete_layer`] rather than beside it, so the
-    /// lock gate, the float being put down and the history being cleared are
-    /// each stated once — a second delete that forgot one of the three is
-    /// exactly the bug the "one gate per operation" rule exists to prevent.
-    ///
-    /// **Top-down**, because removing a layer shifts every index above it.
-    ///
-    /// A request that would empty the stack cannot arrive — the strip disables
-    /// the button when every layer is ticked — and `delete_layer` refuses the
-    /// last one anyway, which is the backstop rather than the visible
-    /// behaviour. Keeping both is the point: this function must stay callable
-    /// from somewhere that has not made that check.
-    fn delete_picked_layers(&mut self) {
-        for index in self.editor.layers.targets().into_iter().rev() {
-            self.delete_layer(index);
+    /// **Does not clear the undo history**, and for exactly the reason
+    /// reordering does not: no slot changes hands. A folder holds none at all,
+    /// and the layers moving into it keep the slices they always had, so every
+    /// recorded patch still names the pixels it was captured from.
+    fn group_layers(&mut self) {
+        // The float previews into a spare slice and is anchored to a layer's
+        // slot; grouping moves that layer. Put it down first, exactly as adding
+        // a layer does.
+        self.finish_transform();
+        let targets = self.editor.layers.targets();
+        if self.editor.layers.group(&targets).is_none() {
+            log::warn!("nothing to group, or the stack is full");
+            return;
         }
+        self.editor.mark_modified();
     }
 
     /// Give the selected layer a mask, filled opaque white so nothing about the
@@ -1538,10 +1607,18 @@ impl UmberApp {
             // format that keeps layers, and `read_layer_rect` blocks, which is
             // why this is only ever reached from an explicit Save and never
             // from the drawing loop.
+            // A folder holds no slice, so it reads back as nothing at all and
+            // `SaveLayer::folder` writes it as a nested `<stack>` with no
+            // `src`. Kept in step with the stack positionally rather than
+            // filtered out, because `doc.active` and the history's positions
+            // both count every entry.
             let pixels: Vec<Vec<u8>> = stack
                 .iter()
-                .map(|layer| {
-                    canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, layer.slot(), rect)
+                .map(|layer| match layer.slot() {
+                    Some(slot) => {
+                        canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect)
+                    }
+                    None => Vec::new(),
                 })
                 .collect();
             // The masks, read the same way and only where there is one. A
@@ -1573,6 +1650,8 @@ impl UmberApp {
                     clipped: layer.clipped,
                     locked: layer.locked,
                     link: layer.link,
+                    depth: layer.depth,
+                    folder: layer.is_folder(),
                     ..SaveLayer::new(&layer.name, layer.blend, px)
                 })
                 .collect();
@@ -2020,7 +2099,7 @@ impl UmberApp {
                 &mut encoder,
                 &ProbeParams {
                     layers: &layer_draws,
-                    active_index: self.editor.layers.active_index() as u32,
+                    active_index: self.editor.active_draw_index(),
                     stroke: self.editor.stroke_style,
                     doc_point: point,
                     radius,
@@ -2046,7 +2125,7 @@ impl UmberApp {
                 camera: &self.editor.camera,
                 pivot: self.editor.canvas_pivot,
                 layers: &layer_draws,
-                active_index: self.editor.layers.active_index() as u32,
+                active_index: self.editor.active_draw_index(),
                 stroke: self.editor.stroke_style,
                 backdrop: theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent)
                     .backdrop_display(),
@@ -2160,7 +2239,7 @@ impl UmberApp {
         // a layer nobody is editing.
         if let Some(float) = self.editor.float
             && (self.editor.ui.tool != Tool::Transform
-                || self.editor.layers.active_slot() != float.slot)
+                || self.editor.layers.active_slot() != Some(float.slot))
         {
             self.finish_transform();
         }
@@ -2225,6 +2304,9 @@ impl UmberApp {
             if self.commit_tip() {
                 self.close_document(index);
             }
+        }
+        if actions.group_layers {
+            self.group_layers();
         }
         if actions.add_layer {
             self.add_layer();
