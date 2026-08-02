@@ -2461,8 +2461,17 @@ impl ApplicationHandler<Wake> for UmberApp {
                         self.editor.touches.insert(touch.id, pos);
                         if self.editor.touches.len() > 1 {
                             // A second finger means the gesture was a pinch,
-                            // not a stroke. Abandon the stroke in progress.
+                            // not a stroke. Abandon whatever the first finger
+                            // was making — all three are gestures that must not
+                            // half-happen because a hand landed on the glass.
+                            // The transform's *float* survives it and only the
+                            // drag is dropped: the picture is still there to be
+                            // moved, and throwing it away because somebody
+                            // pinched to look closer at it would be the
+                            // opposite of what they asked for.
                             self.cancel_stroke();
+                            self.editor.cancel_selection_draft();
+                            self.editor.transform_release();
                             self.editor.drawing_touch = None;
                             self.update_pinch();
                         } else if !self
@@ -2476,9 +2485,26 @@ impl ApplicationHandler<Wake> for UmberApp {
                             // entirely — see `ui_owns_pointer`.
                             self.editor.cursor = pos;
                             self.editor.last_cursor = pos;
-                            let point = self.editor.sample(pos, reported);
-                            self.start_stroke(point);
                             self.editor.drawing_touch = Some(touch.id);
+                            // Dispatched on the tool, exactly as a mouse press
+                            // is. Without this every tool painted under a pen:
+                            // a stroke was started whatever was in hand, so the
+                            // selection tool drew a line instead of an outline.
+                            match self.editor.ui.tool {
+                                Tool::Brush | Tool::Eraser => {
+                                    let point = self.editor.sample(pos, reported);
+                                    self.start_stroke(point);
+                                }
+                                Tool::Select => {
+                                    let doc = self.editor.screen_to_doc(pos);
+                                    self.editor.selection_press(doc);
+                                }
+                                Tool::Transform => self.transform_press(pos),
+                                // One finger navigates nothing: panning and
+                                // zooming by touch are the two-finger gesture
+                                // below, which is what a hand expects anyway.
+                                Tool::Pan | Tool::Zoom => {}
+                            }
                         }
                         // Otherwise it landed on the interface, which egui has
                         // already been handed. Deliberately *not* the pinch
@@ -2527,8 +2553,24 @@ impl ApplicationHandler<Wake> for UmberApp {
                         if self.editor.drawing_touch == Some(touch.id) {
                             self.editor.last_cursor = self.editor.cursor;
                             self.editor.cursor = pos;
-                            let point = self.editor.sample(pos, reported);
-                            self.editor.stroke.extend(point);
+                            match self.editor.ui.tool {
+                                Tool::Brush | Tool::Eraser => {
+                                    let point = self.editor.sample(pos, reported);
+                                    self.editor.stroke.extend(point);
+                                }
+                                Tool::Select => {
+                                    let doc = self.editor.screen_to_doc(pos);
+                                    self.editor.selection_moved(doc);
+                                }
+                                Tool::Transform => {
+                                    let doc = self.editor.screen_to_doc(pos);
+                                    // No Shift to hold on a touch screen, so a
+                                    // corner drag is always free there. The
+                                    // mouse keeps the constraint.
+                                    self.editor.transform_moved(doc, false);
+                                }
+                                Tool::Pan | Tool::Zoom => {}
+                            }
                         } else {
                             self.update_pinch();
                         }
@@ -2536,7 +2578,18 @@ impl ApplicationHandler<Wake> for UmberApp {
                     TouchPhase::Ended | TouchPhase::Cancelled => {
                         self.editor.touches.remove(&touch.id);
                         if self.editor.drawing_touch == Some(touch.id) {
-                            self.finish_stroke();
+                            match self.editor.ui.tool {
+                                Tool::Brush | Tool::Eraser => self.finish_stroke(),
+                                Tool::Select => {
+                                    let doc = self.editor.screen_to_doc(pos);
+                                    self.editor.selection_release(doc);
+                                }
+                                // The float stays up, exactly as it does when a
+                                // mouse button comes up: the box is still there
+                                // to be dragged again.
+                                Tool::Transform => self.editor.transform_release(),
+                                Tool::Pan | Tool::Zoom => {}
+                            }
                             self.editor.drawing_touch = None;
                         }
                         self.editor.pinch = None;
