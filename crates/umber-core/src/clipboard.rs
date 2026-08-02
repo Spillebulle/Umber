@@ -73,10 +73,25 @@ impl Clip {
     /// `read_layer_rect`. `None` when there is nothing worth copying — a
     /// zero-area rectangle, or a buffer that does not match it.
     ///
-    /// The mask scales **alpha**, and it does so on the straight-alpha side of
-    /// the conversion. Scaling the stored bytes instead is wrong by a full
-    /// gamma curve, which is the same trap `srgb`'s module docs describe for an
-    /// import — and it is invisible on anything fully opaque, so it would ship.
+    /// The mask **bounds** alpha rather than scaling it, and it does so on the
+    /// straight-alpha side of the conversion. Two rules, and each was a bug:
+    ///
+    /// * `min(alpha, coverage)`, not `alpha * coverage`. Painting is clipped by
+    ///   the selection in the dab pass, so a pixel the selection half covers
+    ///   already holds half a stroke's alpha; multiplying by the coverage again
+    ///   would take a quarter of it and the copy would come back with an edge
+    ///   fainter than the mark it was taken from — which also made the module's
+    ///   own promise that a copy and a paste straight back restore the bytes
+    ///   they started with false for anything painted inside a selection. Of the
+    ///   alpha that is there, the part inside the selection is at most the
+    ///   coverage, and this takes it to be exactly that. `transform.wgsl`'s
+    ///   `fs_mask` is the same rule for the lift, and the two must agree: a copy
+    ///   and a cut of the same selection differ in what they leave behind, never
+    ///   in what they pick up.
+    /// * On the straight-alpha side. Scaling the stored bytes instead is wrong
+    ///   by a full gamma curve, which is the same trap `srgb`'s module docs
+    ///   describe for an import — and it is invisible on anything fully opaque,
+    ///   so it would ship.
     pub fn from_layer(rect: PixelRect, bytes: &[u8], mask: Option<&Selection>) -> Option<Self> {
         if rect.width == 0 || rect.height == 0 || bytes.len() as u64 != rect.area() * 4 {
             return None;
@@ -88,8 +103,7 @@ impl Clip {
                 let mut px =
                     srgb::decode_pixel([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
                 if let Some(mask) = mask {
-                    let cov = mask.coverage_at(rect.x + col, rect.y + row) as u32;
-                    px[3] = ((px[3] as u32 * cov + 127) / 255) as u8;
+                    px[3] = px[3].min(mask.coverage_at(rect.x + col, rect.y + row));
                 }
                 pixels.extend_from_slice(&px);
             }
@@ -268,6 +282,56 @@ mod tests {
         // And the colour is untouched where it was kept: masking is about
         // coverage, not about what colour the artist painted.
         assert_eq!(px(0, 0)[0], srgb::decode_pixel([200, 100, 50, 255])[0]);
+    }
+
+    /// Paint made *through* a selection is copied whole, and pasting it back
+    /// restores the bytes it came from.
+    ///
+    /// The mask used to scale alpha, which applied it a second time to pixels
+    /// that had already been clipped by it in the dab pass: an edge painted at
+    /// half coverage came back at a quarter. That is the module's own promise —
+    /// a copy and a paste straight back restore what they started with — broken
+    /// for every antialiased boundary, and the same arithmetic that left a ghost
+    /// of the outline behind a lift.
+    #[test]
+    fn a_copy_of_paint_made_inside_the_selection_takes_it_whole() {
+        // The boundary falls down the middle of column 1, so it is covered
+        // 128/255 and the paint there is 128/255 — exactly what painting
+        // through this selection produces.
+        let selection =
+            Selection::rectangle(vec2(0.0, 0.0), vec2(1.5, 4.0), DOC).expect("a selection");
+        assert_eq!(selection.coverage_at(0, 0), 255, "column 0 is fully in");
+        let edge = selection.coverage_at(1, 0);
+        assert!(
+            (1..255).contains(&edge),
+            "the selection's edge is not antialiased, so this test would pass \
+             on the arithmetic it exists to refuse"
+        );
+
+        // A layer holding exactly what a white stroke clipped to this selection
+        // leaves: alpha is the coverage, premultiplied and encoded.
+        let mut layer: Vec<u8> = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                layer.extend_from_slice(&srgb::encode_pixel([
+                    255,
+                    255,
+                    255,
+                    selection.coverage_at(x, y),
+                ]));
+            }
+        }
+
+        let clip = Clip::from_layer(rect(0, 0, 4, 4), &layer, Some(&selection)).expect("a clip");
+        // Alpha of pixel (1, 0) — the half-covered column.
+        assert_eq!(
+            clip.pixels()[7],
+            edge,
+            "the selection was applied to paint it had already clipped"
+        );
+
+        let placed = clip.place(DOC, vec2(2.0, 2.0)).expect("somewhere to go");
+        assert_eq!(placed.pixels, layer, "a paste straight back moved a pixel");
     }
 
     /// Nothing selected but nothing under it either. An empty clipboard and no

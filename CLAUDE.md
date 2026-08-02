@@ -257,9 +257,14 @@ put on and take off.
 - **The clipboard holds straight-alpha sRGB**, not layer bytes, and both
   directions go through `docimport::srgb`'s exact-inverse pair — so a copy and a
   paste straight back restore the bytes they started with, and the day a system
-  clipboard arrives the form it wants is already what is held. Masking scales
-  **alpha on the straight side**; scaling the stored bytes is wrong by a gamma
-  curve and invisible on anything opaque.
+  clipboard arrives the form it wants is already what is held. Masking **bounds
+  alpha, on the straight side** — two rules and each was a bug. `min(alpha,
+  coverage)`, for the reason the lift is a `min`: a multiply applies the
+  selection to paint the dab pass had already clipped by it, so a copy of an
+  antialiased edge came back at a quarter of the mark it was taken from, and the
+  exact-inverse promise above was false for anything painted inside a selection.
+  And on the *straight* side: scaling the stored bytes is wrong by a gamma curve
+  and invisible on anything opaque.
 - **`Clip::place` decides what a paste does**, in `umber-core`, because "where
   does the picture go" is a rule and rules are testable without a window:
   centred on the selection or on the view, nudged back on where it fits,
