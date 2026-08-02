@@ -488,11 +488,15 @@ fn write<T>(
 // The Brushes panel
 // ---------------------------------------------------------------------------
 
-/// The two marks in the Brushes panel's header: browse, and save.
+/// The three marks in the Brushes panel's header: save, browse, and edit.
 ///
-/// The design puts a `＋` there. The second mark is this module's addition —
-/// with 239 presets the panel is a shortlist rather than the library, and
-/// something has to open the rest of it.
+/// The design puts a `＋` there and nothing else. The other two are this
+/// module's: with 239 presets the panel is a shortlist rather than the library,
+/// so something has to open the rest of it, and the way into the brush editor
+/// used to be a `✎ Edit "<name>"…` link at the foot of the panel body. A link
+/// is what the design draws, and it was wrong on two counts — it sat below a
+/// scrolling list, so a panel dragged short hid the only way to change a brush,
+/// and it spent a whole row of a 264 px panel on one verb.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
     let writable = state.writable();
@@ -515,6 +519,19 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     }
     if icon_button(ui, p, Icon::Grid, true, "Browse the whole brush library") {
         state.browser_open = true;
+    }
+    // Left of the library mark, and the same pencil the link it replaces
+    // carried. The brush is named in the tooltip because the mark cannot say
+    // which one it would open, and that is the whole of what the link's label
+    // was doing.
+    if icon_button(
+        ui,
+        p,
+        Icon::Pencil,
+        true,
+        &format!("Edit \"{}\" in the brush editor", active_name(ed)),
+    ) {
+        ed.ui.brush_editor_open = true;
     }
 
     store(ui.ctx(), state);
@@ -560,19 +577,13 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     store(ui.ctx(), state);
 }
 
-/// The design's `✎ Edit "<name>"…` link, plus the way into an import.
+/// The way into an import.
+///
+/// The design's `✎ Edit "<name>"…` link was here too, and is now a pencil in
+/// the panel header — see [`header_controls`]. This one stays a link because
+/// it opens a file dialog rather than switching a view, and because a mark
+/// alone could not carry which four applications' brushes Umber will read.
 fn panel_links(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
-    // The design writes the brush's own name into the link. It drew five
-    // presets with short names; the shipped library has "Coarse Bulk 1", so the
-    // label is elided rather than allowed to push the row past the panel edge.
-    let label = format!("Edit \"{}\"…", active_name(ed));
-    if link(ui, p, Icon::Pencil, &label, true)
-        .on_hover_text("Open the brush editor")
-        .clicked()
-    {
-        ed.ui.brush_editor_open = true;
-    }
-
     let writable = state.writable();
     if link(ui, p, Icon::Import, "Import brushes…", writable)
         .on_hover_text(if writable {
