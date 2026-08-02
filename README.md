@@ -294,7 +294,7 @@ Umber sits still when you do.
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `X` | Swap foreground and background colours |
 | `Alt` + click | Pick the colour under the cursor |
-| `Alt` + move, nothing held | Resize the brush, against a circle drawn at the size |
+| `Alt` + move, nothing held | Resize the brush, against a circle drawn at the size — right and up bigger |
 | `[` / `]` | Decrease / increase brush size |
 | Middle drag, or `Space` + drag | Pan |
 | Wheel | Scroll the canvas up and down |

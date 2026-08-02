@@ -1,5 +1,6 @@
 //! Brush parameters.
 
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::curve::ResponseCurve;
@@ -439,7 +440,7 @@ impl Brush {
         self.dab_ratio > 1.01 || self.modulations.drives(DabTarget::Ratio)
     }
 
-    /// The size a resize drag of `dx` screen pixels asks for, having started
+    /// The size a resize drag of `delta` screen pixels asks for, having started
     /// from `from`.
     ///
     /// Measured from where the drag began rather than stepped per event, so
@@ -450,16 +451,22 @@ impl Brush {
     /// Logarithmic, because size is: the difference between a 3-pixel liner
     /// and a 6-pixel one is the whole character of the brush, and the same six
     /// pixels added to a 300-pixel wash is nothing. So the drag doubles rather
-    /// than adds, at [`Brush::RESIZE_DOUBLE_PX`] pixels a doubling, and right
-    /// is bigger — the same direction the zoom tool's drag calls "more".
-    pub fn size_after_drag(from: f32, dx: f32) -> f32 {
-        (from * (dx / Self::RESIZE_DOUBLE_PX).exp2()).clamp(Self::MIN_SIZE, Self::MAX_SIZE)
+    /// than adds, at [`Brush::RESIZE_DOUBLE_PX`] pixels a doubling.
+    ///
+    /// Right and up are bigger, left and down smaller — the same directions the
+    /// zoom tool's drag calls "more", and resolved onto one signed distance by
+    /// the same [`crate::geom::drag_towards_more`]. Only the rate differs, and
+    /// deliberately: a brush and a zoom are not the same scale.
+    pub fn size_after_drag(from: f32, delta: Vec2) -> f32 {
+        let along = crate::geom::drag_towards_more(delta);
+        (from * (along / Self::RESIZE_DOUBLE_PX).exp2()).clamp(Self::MIN_SIZE, Self::MAX_SIZE)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::vec2;
 
     #[test]
     fn pressure_scales_radius_between_min_and_full() {
@@ -476,17 +483,52 @@ mod tests {
     #[test]
     fn a_resize_drag_doubles_to_the_right_and_halves_to_the_left() {
         let d = Brush::RESIZE_DOUBLE_PX;
-        assert!((Brush::size_after_drag(40.0, d) - 80.0).abs() < 1e-3);
-        assert!((Brush::size_after_drag(40.0, -d) - 20.0).abs() < 1e-3);
-        assert_eq!(Brush::size_after_drag(40.0, 0.0), 40.0);
+        assert!((Brush::size_after_drag(40.0, vec2(d, 0.0)) - 80.0).abs() < 1e-3);
+        assert!((Brush::size_after_drag(40.0, vec2(-d, 0.0)) - 20.0).abs() < 1e-3);
+        assert_eq!(Brush::size_after_drag(40.0, Vec2::ZERO), 40.0);
+    }
+
+    /// The vertical axis is worth exactly what the horizontal one is, and up is
+    /// the bigger direction — screen y being down-positive.
+    #[test]
+    fn a_resize_drag_reads_both_axes() {
+        let d = Brush::RESIZE_DOUBLE_PX;
+        assert!((Brush::size_after_drag(40.0, vec2(0.0, -d)) - 80.0).abs() < 1e-3);
+        assert!((Brush::size_after_drag(40.0, vec2(0.0, d)) - 20.0).abs() < 1e-3);
+        // Down-right and up-left sit exactly between bigger and smaller, and a
+        // gesture between two answers must not pick one.
+        assert_eq!(Brush::size_after_drag(40.0, vec2(30.0, 30.0)), 40.0);
+        assert_eq!(Brush::size_after_drag(40.0, vec2(-30.0, -30.0)), 40.0);
+    }
+
+    /// No direction is a fast lane: a diagonal is worth the distance the hand
+    /// travelled and not the sum of its axes, and the pure horizontal drag this
+    /// gesture used to be is still the bound. Nothing got faster by the
+    /// vertical axis being taken in.
+    #[test]
+    fn no_resize_drag_is_worth_more_than_the_distance_the_hand_moved() {
+        let diagonal = Brush::size_after_drag(40.0, vec2(40.0, -40.0));
+        let same_distance = Brush::size_after_drag(40.0, vec2(40.0 * 2f32.sqrt(), 0.0));
+        assert!(
+            (diagonal - same_distance).abs() < 1e-3,
+            "{diagonal} vs {same_distance}"
+        );
+
+        let bound = Brush::size_after_drag(40.0, vec2(50.0, 0.0));
+        for step in 0..64 {
+            let angle = step as f32 * std::f32::consts::TAU / 64.0;
+            let size = Brush::size_after_drag(40.0, vec2(angle.cos(), angle.sin()) * 50.0);
+            assert!(size <= bound + 1e-3, "{angle} gave {size}");
+            assert!(size >= 40.0 * 40.0 / bound - 1e-3, "{angle} gave {size}");
+        }
     }
 
     #[test]
     fn a_resize_drag_is_worth_the_same_wherever_it_starts() {
         // The point of doubling rather than adding: the same flick of the
         // wrist is a useful change to a liner and to a wash.
-        let small = Brush::size_after_drag(4.0, 25.0) / 4.0;
-        let large = Brush::size_after_drag(400.0, 25.0) / 400.0;
+        let small = Brush::size_after_drag(4.0, vec2(25.0, 0.0)) / 4.0;
+        let large = Brush::size_after_drag(400.0, vec2(25.0, 0.0)) / 400.0;
         assert!((small - large).abs() < 1e-4, "{small} vs {large}");
     }
 
@@ -495,12 +537,16 @@ mod tests {
         // What measuring from where the drag began buys, and why the size is
         // not stepped per pointer event: at 500 events a second, an accumulated
         // size would come home a different brush.
+        //
+        // Out along a diagonal and back, so the round trip is pinned for a hand
+        // that wandered on both axes rather than only for one that ran along a
+        // rail.
         let mut size = 63.0;
         for step in 0..200 {
-            size = Brush::size_after_drag(63.0, step as f32 * 0.5);
+            size = Brush::size_after_drag(63.0, vec2(step as f32 * 0.5, step as f32 * -0.3));
         }
         for step in (0..200).rev() {
-            size = Brush::size_after_drag(63.0, step as f32 * 0.5);
+            size = Brush::size_after_drag(63.0, vec2(step as f32 * 0.5, step as f32 * -0.3));
         }
         assert_eq!(size, 63.0);
     }
@@ -509,8 +555,14 @@ mod tests {
     fn a_resize_drag_cannot_leave_the_brush_outside_its_limits() {
         // A drag has no end, so the clamp is the only thing between it and a
         // brush the engine will not paint.
-        assert_eq!(Brush::size_after_drag(1000.0, 5000.0), Brush::MAX_SIZE);
-        assert_eq!(Brush::size_after_drag(1.5, -5000.0), Brush::MIN_SIZE);
+        assert_eq!(
+            Brush::size_after_drag(1000.0, vec2(5000.0, -5000.0)),
+            Brush::MAX_SIZE
+        );
+        assert_eq!(
+            Brush::size_after_drag(1.5, vec2(-5000.0, 5000.0)),
+            Brush::MIN_SIZE
+        );
     }
 
     #[test]

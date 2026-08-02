@@ -2,6 +2,47 @@
 
 use glam::Vec2;
 
+/// How far a screen-space drag of `delta` travelled *towards "more"*, in
+/// pixels, where right and up are more and left and down are less.
+///
+/// Two of Umber's gestures ask the same question of a drag — the zoom tool's
+/// and the Alt-held brush resize — and neither is naturally one-dimensional:
+/// the hand goes where it goes. Screen y is down-positive, which is why the two
+/// axes are *subtracted*, so the "more" direction is the diagonal `(1, -1)` and
+/// a drag has to be resolved onto it somehow.
+///
+/// Adding the axes outright is the obvious way and is wrong: a 45° drag of 100
+/// pixels each way is 141 pixels of hand movement and would be worth 200, so
+/// the same gesture asks for half again as much for being made diagonally.
+/// Projecting onto the diagonal is the other obvious way and only moves the
+/// problem — it is the same expression times a constant, so a diagonal still
+/// outruns an axis, and it slows the horizontal drag both these gestures have
+/// always been by 30%.
+///
+/// So: **the distance the hand travelled, weighted by how far the drag leans
+/// towards "more" rather than "less"**. `(dx - dy) / (|dx| + |dy|)` is that
+/// lean, running from +1 for a drag purely towards more to -1 for one purely
+/// towards less and passing through 0 on the neutral diagonal, where a drag
+/// along `(1, 1)` asks for nothing. Every drag is then worth at most its own
+/// length, a pure right drag is worth exactly what it was worth before either
+/// gesture took the vertical axis in, and a diagonal is worth its own 141
+/// pixels rather than 200.
+///
+/// What a pixel of it *buys* is the caller's, and the two callers differ by
+/// three orders of magnitude — a zoom doubles in 90 and a brush in 100, but one
+/// is spent on a rate raised to a power and the other on a doubling. Sharing
+/// the shape is what stops the reasoning above being written twice; sharing a
+/// rate would make one gesture's feel hostage to the other's.
+pub fn drag_towards_more(delta: Vec2) -> f32 {
+    let lean = delta.x.abs() + delta.y.abs();
+    // A drag that did not move has no direction to lean in, and the division
+    // below would be 0/0.
+    if lean <= f32::EPSILON {
+        return 0.0;
+    }
+    delta.length() * (delta.x - delta.y) / lean
+}
+
 /// An axis-aligned rectangle in document space (float pixels).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -117,5 +158,40 @@ mod tests {
         let mut r = Rect::empty();
         r.union_circle(vec2(-100.0, -100.0), 4.0);
         assert!(r.to_pixels_clamped(UVec2::new(64, 64)).is_none());
+    }
+
+    /// The shape both drag gestures are built on, in its own units — so a
+    /// change to it is caught here rather than as two puzzling failures in
+    /// `Camera` and `Brush`.
+    #[test]
+    fn a_drag_leans_towards_more_and_is_worth_at_most_its_own_length() {
+        use super::drag_towards_more as more;
+
+        // Right and up are more, left and down are less, and a drag that did
+        // not move asks for nothing.
+        assert!(more(vec2(20.0, 0.0)) > 0.0);
+        assert!(more(vec2(0.0, -20.0)) > 0.0, "screen y is down-positive");
+        assert!(more(vec2(-20.0, 0.0)) < 0.0);
+        assert!(more(vec2(0.0, 20.0)) < 0.0);
+        assert_eq!(more(Vec2::ZERO), 0.0);
+
+        // Neither axis is the "real" one with the other bolted on.
+        assert!((more(vec2(17.0, 0.0)) - more(vec2(0.0, -17.0))).abs() < 1e-4);
+
+        // The neutral diagonal is exactly between the two answers, so it must
+        // not pick one.
+        assert_eq!(more(vec2(30.0, 30.0)), 0.0);
+        assert_eq!(more(vec2(-30.0, -30.0)), 0.0);
+
+        // A pure axis drag is worth exactly its length — which is what it was
+        // worth before either gesture read the second axis — and no direction
+        // is worth more. That is the whole reason the axes are weighted rather
+        // than added.
+        assert!((more(vec2(50.0, 0.0)) - 50.0).abs() < 1e-3);
+        for step in 0..64 {
+            let angle = step as f32 * std::f32::consts::TAU / 64.0;
+            let along = more(vec2(angle.cos(), angle.sin()) * 50.0);
+            assert!(along.abs() <= 50.0 + 1e-3, "{angle} gave {along}");
+        }
     }
 }
