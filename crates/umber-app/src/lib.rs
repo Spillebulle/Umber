@@ -40,6 +40,7 @@ mod taskbar;
 mod theme;
 mod ui;
 mod update;
+mod updatedlg;
 mod widgets;
 
 pub use app::{UmberApp, Wake};

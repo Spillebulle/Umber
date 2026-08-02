@@ -1,7 +1,7 @@
 //! Checking GitHub for a newer Umber, and installing one where that is
 //! legitimate.
 //!
-//! Four rules shape everything here, and each of them is a way this feature
+//! Five rules shape everything here, and each of them is a way this feature
 //! goes wrong if it is not stated:
 //!
 //! 1. **The check never delays the window or the first stroke.** It runs on a
@@ -11,26 +11,36 @@
 //!    which `app.rs` fills in with the event loop's proxy. Without that the
 //!    result would sit in the channel until the user happened to move the
 //!    mouse.
-//! 2. **Nothing is fetched without the user knowing.** The startup check is on
+//! 2. **The download reports as it happens, and does not wake per byte.** The
+//!    same channel and the same waker carry [`flow::Stage`] messages, throttled
+//!    to one per whole percent — a hundred wake-ups for a download of any size,
+//!    against one per 64 KiB chunk, which on a 30 MB release would be five
+//!    hundred frames drawn to move a bar by a pixel.
+//! 3. **Nothing is fetched without the user knowing.** The startup check is on
 //!    by default — an update nobody is told about is an update nobody
 //!    installs, and this is a painting application people will leave alone for
 //!    months — but the first run says so before the first request goes out, and
 //!    the switch is in Settings, General.
-//! 3. **Only installations Umber owns are replaced.** [`install`] decides that,
+//! 4. **Only installations Umber owns are replaced.** [`install`] decides that,
 //!    and every other kind is told where to get the build instead. A package
 //!    manager's files are never written.
-//! 4. **What comes back is checked as far as it can be.** HTTPS only, including
+//! 5. **What comes back is checked as far as it can be.** HTTPS only, including
 //!    across redirects; the address comes from the API rather than being built
 //!    here; and the download has to be exactly the number of bytes the API
 //!    reported. Umber does **not** sign its releases, so that is the whole of
-//!    the guarantee, and the About dialog says so rather than implying more.
+//!    the guarantee, and nothing on screen may imply more.
+//!
+//! The dialog's own state — which screen, which stage, the countdown — is
+//! [`flow`], a model with no drawing in it, and `updatedlg.rs` paints it.
 
 pub mod apply;
+pub mod flow;
 pub mod install;
 pub mod release;
 pub mod version;
 
-pub use apply::{Applied, sweep_previous_binary};
+pub use apply::{Applied, relaunch, sweep_previous_binary};
+pub use flow::{Flow, Phase, Stage};
 pub use install::InstallKind;
 pub use release::{RELEASES_PAGE, REPOSITORY, Release};
 pub use version::Version;
@@ -38,8 +48,9 @@ pub use version::Version;
 use install::{Arch, Os, Probe};
 use release::Asset;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the whole exchange may take before it is abandoned.
 ///
@@ -52,13 +63,31 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// The JSON reply is a few tens of kilobytes; a megabyte is already absurd.
 const MAX_REPLY: u64 = 4 * 1024 * 1024;
 
+/// How much is read from the socket at a time.
+///
+/// Sized so a slow connection still produces a report often enough to see, and
+/// a fast one does not spend its time in `read` calls.
+const CHUNK: usize = 64 * 1024;
+
+/// How many bytes may arrive between two progress reports when the release
+/// carries no recorded length.
+///
+/// The ordinary throttle is one report per whole percent, which needs a total
+/// to be a percent *of*. This is the fallback, and it is the only case where
+/// the dialog cannot show a percentage at all.
+const UNMEASURED_STEP: u64 = 4 * 1024 * 1024;
+
 /// Something that wakes the event loop.
 ///
 /// A closure rather than a `winit` type, so this module stays free of the
 /// windowing layer — the same reason `umber-core` knows nothing about wgpu.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// Where the check has got to.
+/// Where the *check* has got to.
+///
+/// Only the check: what an update is doing once it has started lives in
+/// [`Updates::flow`]. Two records of "downloading" would be two things to keep
+/// in step, and the one on screen would eventually be the stale one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
     /// Nothing has been asked yet.
@@ -70,10 +99,34 @@ pub enum Status {
     /// A newer release exists. Whether Umber can install it is a separate
     /// question — see [`Updates::installable`].
     Available(Release),
-    Downloading,
-    /// The new build is in place, or an installer is running.
-    Applied(Applied),
     /// Something went wrong, in a sentence written for the user.
+    Failed(String),
+}
+
+/// Why the event loop should stop.
+///
+/// Both are ways an update ends, and they are genuinely different: a portable
+/// or AppImage copy has already been replaced and can be started again from
+/// here, while the Windows installer needs Umber *gone* and will start the new
+/// version itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// Close, and start the new build.
+    Restart,
+    /// Close, and leave it at that.
+    Quit,
+}
+
+/// What a background job has to say.
+enum Report {
+    /// The check's answer, and the end of that job.
+    Checked(Status),
+    /// An update has moved on. Not terminal.
+    Stage(Stage),
+    /// An update finished.
+    Installed(Applied),
+    /// An update stopped before writing anything.
+    Stopped,
     Failed(String),
 }
 
@@ -95,17 +148,21 @@ pub struct Updates {
     /// all — the notice is shown first, and answering it is what sets both this
     /// and `check_on_startup`.
     pub notice_seen: bool,
-    /// Whether the "a newer Umber is available" prompt is up. Only ever raised
-    /// by the automatic check; a check the user asked for reports in the dialog
-    /// they asked from.
-    pub prompt_open: bool,
-    /// The user has agreed to close so an installer can finish.
-    quit_requested: bool,
+
+    /// The update dialog, or `None` when it is shut. Raised by the automatic
+    /// check, and by the About dialog's button; a check the user asked for
+    /// reports where they asked it and does not throw a modal at them.
+    flow: Option<Flow>,
+    /// Set by the Cancel on the download screen, read by the worker between
+    /// chunks. `None` when nothing is in flight.
+    cancel: Option<Arc<AtomicBool>>,
+    /// The user has agreed to close, or asked to restart into the new build.
+    exit: Option<Exit>,
 
     kind: InstallKind,
     status: Status,
-    /// The job in flight, if any. Dropped when it reports.
-    inbox: Option<Receiver<Status>>,
+    /// The job in flight, if any. Dropped when it reports something terminal.
+    inbox: Option<Receiver<Report>>,
     /// Set once, so the automatic check happens once per run.
     started: bool,
     wake: Option<Waker>,
@@ -116,8 +173,9 @@ impl Default for Updates {
         Self {
             check_on_startup: true,
             notice_seen: false,
-            prompt_open: false,
-            quit_requested: false,
+            flow: None,
+            cancel: None,
+            exit: None,
             // Decided once, at start-up, from the executable's own path. It
             // cannot change while Umber is running, and asking the file system
             // about it per frame would be work for an answer that never moves.
@@ -144,9 +202,14 @@ impl Updates {
         &self.kind
     }
 
-    /// True while a check or a download is in flight.
+    /// The dialog, for the module that draws it.
+    pub fn flow(&self) -> Option<&Flow> {
+        self.flow.as_ref()
+    }
+
+    /// True while a check or an update is in flight.
     pub fn busy(&self) -> bool {
-        matches!(self.status, Status::Checking | Status::Downloading)
+        matches!(self.status, Status::Checking) || self.flow.as_ref().is_some_and(Flow::holds_work)
     }
 
     /// Why Umber does not ask GitHub at all on this installation, if it does not.
@@ -180,34 +243,102 @@ impl Updates {
         release.asset_for(&self.kind, Os::CURRENT, arch)
     }
 
+    /// Which buttons the offer screen puts up for this installation.
+    pub fn actions(&self, release: &Release) -> flow::Actions {
+        flow::actions(&self.kind, self.installable(release).is_some())
+    }
+
     /// Collect whatever a background job has reported.
     ///
     /// Called once per frame, before the interface is drawn, so a result that
     /// arrived while the loop was asleep is on screen in the frame the wake-up
-    /// produced rather than the one after it.
-    pub fn poll(&mut self) {
-        let Some(inbox) = self.inbox.as_ref() else {
+    /// produced rather than the one after it. Drains the channel rather than
+    /// taking one message: a burst of download progress collapses into the
+    /// newest reading, which is the only one worth drawing.
+    pub fn poll(&mut self, now: Instant) {
+        let Some(inbox) = self.inbox.take() else {
             return;
         };
-        match inbox.try_recv() {
-            Ok(status) => {
-                // A prompt is only raised by the automatic check, and only for
-                // something the user has not already been shown. A check the
-                // user asked for answers where they asked it.
-                if self.started && matches!(status, Status::Available(_)) && !self.prompt_open {
-                    self.prompt_open = true;
+        loop {
+            match inbox.try_recv() {
+                // A terminal report ends the job, and dropping the receiver
+                // with it is what stops the next frame reading a disconnect as
+                // a crash.
+                Ok(report) => {
+                    if self.apply_report(report, now) {
+                        return;
+                    }
+                }
+                // The worker is still running.
+                Err(TryRecvError::Empty) => {
+                    self.inbox = Some(inbox);
+                    return;
+                }
+                // The thread ended without reporting, which can only be a panic
+                // in it. Say so rather than sitting on "Checking…" for ever.
+                Err(TryRecvError::Disconnected) => {
+                    self.worker_vanished();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Fold one report into the state. Returns true if it ended the job.
+    fn apply_report(&mut self, report: Report, now: Instant) -> bool {
+        match report {
+            Report::Checked(status) => {
+                // The dialog is only raised by the automatic check, and only
+                // where one is not already up. A check the user asked for
+                // answers in the dialog they asked it from.
+                if self.started
+                    && self.flow.is_none()
+                    && let Status::Available(release) = &status
+                {
+                    self.flow = Some(Flow::offering(release.clone()));
                 }
                 self.status = status;
-                self.inbox = None;
+                true
             }
-            // The worker is still running.
-            Err(TryRecvError::Empty) => {}
-            // The thread ended without reporting, which can only be a panic in
-            // it. Say so rather than sitting on "Checking…" for ever.
-            Err(TryRecvError::Disconnected) => {
-                self.status = Status::Failed("The update check stopped unexpectedly.".to_string());
-                self.inbox = None;
+            Report::Stage(stage) => {
+                if let Some(flow) = self.flow.as_mut() {
+                    flow.stage(stage);
+                }
+                false
             }
+            Report::Installed(applied) => {
+                self.cancel = None;
+                if let Some(flow) = self.flow.as_mut() {
+                    flow.finished(applied, now);
+                }
+                true
+            }
+            Report::Stopped => {
+                self.cancel = None;
+                if let Some(flow) = self.flow.as_mut() {
+                    flow.stopped();
+                }
+                true
+            }
+            Report::Failed(message) => {
+                self.cancel = None;
+                match self.flow.as_mut() {
+                    Some(flow) if flow.holds_work() => flow.failed(message),
+                    _ => self.status = Status::Failed(message),
+                }
+                true
+            }
+        }
+    }
+
+    /// A worker thread that ended without saying anything, which is a panic in
+    /// it.
+    fn worker_vanished(&mut self) {
+        self.cancel = None;
+        let message = "The update stopped unexpectedly.".to_string();
+        match self.flow.as_mut() {
+            Some(flow) if flow.holds_work() => flow.failed(message),
+            _ => self.status = Status::Failed(message),
         }
     }
 
@@ -239,23 +370,64 @@ impl Updates {
             return;
         }
         self.status = Status::Checking;
-        self.spawn("umber-update-check", || match latest_release() {
-            Ok(Some(release)) if release.version > Version::current() => Status::Available(release),
-            Ok(_) => Status::UpToDate,
-            Err(message) => Status::Failed(message),
+        self.spawn("umber-update-check", |reporter| {
+            reporter.send(Report::Checked(match latest_release() {
+                Ok(Some(release)) if release.version > Version::current() => {
+                    Status::Available(release)
+                }
+                Ok(_) => Status::UpToDate,
+                Err(message) => Status::Failed(message),
+            }));
         });
     }
 
-    /// Fetch and install the release currently on offer.
+    /// Raise the dialog for a release the check has already found.
+    ///
+    /// The way in from About's "Show the update…" — and the only other way in
+    /// besides the automatic check.
+    pub fn open_offer(&mut self) {
+        if self.flow.is_some() {
+            return;
+        }
+        if let Status::Available(release) = self.status.clone() {
+            self.flow = Some(Flow::offering(release));
+        }
+    }
+
+    /// Shut the dialog. Refused while a download or an install is running —
+    /// a modal that vanished mid-update would leave a thread with nothing on
+    /// screen to stop it.
+    pub fn dismiss(&mut self) {
+        if self.flow.as_ref().is_some_and(Flow::holds_work) {
+            return;
+        }
+        self.flow = None;
+    }
+
+    /// "Never ask again": switch the startup check off and shut the dialog.
+    ///
+    /// Writes the *existing* preference rather than a second switch of its own,
+    /// so Settings, General shows what was chosen here and can undo it. A
+    /// second flag would be two things that can disagree about whether Umber
+    /// checks.
+    pub fn never_ask_again(&mut self) {
+        self.check_on_startup = false;
+        // Somebody who has answered this has plainly been told what the check
+        // does, so the first-run notice has no business appearing again.
+        self.notice_seen = true;
+        self.dismiss();
+    }
+
+    /// Fetch and install the release the dialog is offering.
     ///
     /// Does nothing unless there is one *and* this installation is Umber's to
     /// replace — the last of several places that check, because the one thing
     /// that must never happen is a package manager's files being written over.
-    pub fn install_available(&mut self) {
+    pub fn install_offered(&mut self) {
         if self.busy() {
             return;
         }
-        let Status::Available(release) = self.status.clone() else {
+        let Some(release) = self.flow.as_ref().map(|flow| flow.release.clone()) else {
             return;
         };
         if !self.kind.is_self_updatable() {
@@ -264,57 +436,165 @@ impl Updates {
         let Some(asset) = self.installable(&release).cloned() else {
             return;
         };
-
         let kind = self.kind.clone();
-        self.prompt_open = false;
-        self.status = Status::Downloading;
-        self.spawn("umber-update-fetch", move || match fetch(&asset) {
-            Ok(bytes) => match apply::apply(&kind, &asset.name, &bytes) {
-                Ok(applied) => Status::Applied(applied),
-                Err(message) => Status::Failed(message),
-            },
-            Err(message) => Status::Failed(message),
+        if !self.flow.as_mut().is_some_and(Flow::begin) {
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.spawn("umber-update-fetch", move |reporter| {
+            install_job(reporter, &kind, &asset, &cancel);
         });
     }
 
-    /// Note that the user has agreed to close so an installer can proceed.
-    pub fn request_quit(&mut self) {
-        self.quit_requested = true;
+    /// The Cancel on the download screen.
+    ///
+    /// Sets the flag the worker reads between chunks and moves the dialog to
+    /// "stopping". What actually happened is the worker's to report — see
+    /// [`flow`]'s module comment.
+    pub fn stop_update(&mut self) {
+        if !self.flow.as_mut().is_some_and(Flow::request_stop) {
+            return;
+        }
+        if let Some(cancel) = self.cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Whether the event loop should exit, consuming the request.
-    pub fn take_quit_request(&mut self) -> bool {
-        std::mem::take(&mut self.quit_requested)
+    /// Start over after a stop or a failure: back to the offer screen.
+    ///
+    /// Deliberately does not start the download itself. "Try again" puts the
+    /// choice back in front of the user rather than making it for them, which
+    /// also means one route into the download and one place that decides
+    /// whether this installation may have one.
+    pub fn retry(&mut self) {
+        if let Some(flow) = self.flow.as_mut() {
+            flow.reoffer();
+        }
     }
 
-    /// Run `job` on a thread and deliver its answer to [`Updates::poll`].
-    fn spawn(&mut self, name: &str, job: impl FnOnce() -> Status + Send + 'static) {
+    /// Stop the restart countdown, leaving Umber running.
+    pub fn cancel_countdown(&mut self) {
+        if let Some(flow) = self.flow.as_mut() {
+            flow.cancel_countdown();
+        }
+    }
+
+    /// Ask the event loop to close, and — for a copy Umber replaced itself —
+    /// to start the new build on the way out.
+    pub fn request_exit(&mut self, exit: Exit) {
+        self.exit = Some(exit);
+    }
+
+    /// Whether the event loop should stop, consuming the request.
+    pub fn take_exit_request(&mut self) -> Option<Exit> {
+        self.exit.take()
+    }
+
+    /// The restart could not be started, so Umber is still running and has to
+    /// say why.
+    pub fn restart_failed(&mut self, message: String) {
+        if let Some(flow) = self.flow.as_mut() {
+            flow.cancel_countdown();
+        }
+        self.status = Status::Failed(message);
+    }
+
+    /// Run `job` on a thread and deliver its reports to [`Updates::poll`].
+    fn spawn(&mut self, name: &str, job: impl FnOnce(&Reporter) + Send + 'static) {
         let (tx, rx) = channel();
-        let wake = self.wake.clone();
+        let reporter = Reporter {
+            tx,
+            wake: self.wake.clone(),
+        };
         let spawned = std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || report(tx, wake, job()));
+            .spawn(move || job(&reporter));
         match spawned {
             Ok(_) => self.inbox = Some(rx),
             // A machine that cannot start a thread is in enough trouble that
             // blocking the interface on a network request would not help.
             Err(e) => {
                 log::warn!("could not start {name}: {e}");
-                self.status =
-                    Status::Failed(format!("Umber could not start the update check: {e}"));
+                let message = format!("Umber could not start the update check: {e}");
+                match self.flow.as_mut() {
+                    Some(flow) if flow.holds_work() => flow.failed(message),
+                    _ => self.status = Status::Failed(message),
+                }
             }
         }
     }
 }
 
-/// Hand a result back and wake the loop to collect it.
-fn report(tx: Sender<Status>, wake: Option<Waker>, status: Status) {
-    // Send first: the wake-up is what makes the frame happen, so waking before
-    // the value is in the channel would produce a frame that finds nothing and
-    // then no further frame until the next input.
-    let _ = tx.send(status);
-    if let Some(wake) = wake {
-        wake();
+/// The end a worker thread reports through.
+struct Reporter {
+    tx: Sender<Report>,
+    wake: Option<Waker>,
+}
+
+impl Reporter {
+    /// Hand a report back and wake the loop to collect it.
+    fn send(&self, report: Report) {
+        // Send first: the wake-up is what makes the frame happen, so waking
+        // before the value is in the channel would produce a frame that finds
+        // nothing and then no further frame until the next input.
+        let _ = self.tx.send(report);
+        if let Some(wake) = &self.wake {
+            wake();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The work
+// ---------------------------------------------------------------------------
+
+/// Download a release and put it in place, reporting every stage.
+///
+/// The stages are the ones that genuinely happen, in the order they happen, and
+/// the length check is its own step because it is the one guarantee an unsigned
+/// release has and is worth naming.
+fn install_job(reporter: &Reporter, kind: &InstallKind, asset: &Asset, cancel: &AtomicBool) {
+    reporter.send(Report::Stage(Stage::Contacting));
+    let bytes = match fetch(asset, cancel, &|received| {
+        reporter.send(Report::Stage(Stage::Downloading {
+            received,
+            total: asset.size,
+        }));
+    }) {
+        Ok(Some(bytes)) => bytes,
+        // Stopped between chunks. Nothing has been written: the download is
+        // held in memory until the install begins, so there is no half-file to
+        // clear up and no thread left writing one.
+        Ok(None) => return reporter.send(Report::Stopped),
+        Err(message) => return reporter.send(Report::Failed(message)),
+    };
+
+    reporter.send(Report::Stage(Stage::CheckingLength));
+    if bytes.len() as u64 != asset.size {
+        return reporter.send(Report::Failed(format!(
+            "The download of {} is {} bytes where GitHub reported {}. It has been \
+             discarded.",
+            asset.name,
+            bytes.len(),
+            asset.size,
+        )));
+    }
+
+    // The last moment a stop costs nothing. From here the swap is under way,
+    // and a half-replaced binary is the one outcome that costs somebody their
+    // installation — which is also why `flow::Stage::can_stop` takes the button
+    // off the screen rather than leaving it there to be refused.
+    if cancel.load(Ordering::Relaxed) {
+        return reporter.send(Report::Stopped);
+    }
+
+    match apply::apply(kind, &asset.name, &bytes, &|stage| {
+        reporter.send(Report::Stage(stage));
+    }) {
+        Ok(applied) => reporter.send(Report::Installed(applied)),
+        Err(message) => reporter.send(Report::Failed(message)),
     }
 }
 
@@ -360,13 +640,22 @@ fn latest_release() -> Result<Option<Release>, String> {
     release::newest(&body).map_err(|e| format!("GitHub's reply could not be understood: {e}"))
 }
 
-/// Download an asset, refusing anything that is not the length the API reported.
+/// Download an asset, reporting how much has arrived and stopping when asked.
 ///
-/// The length check is not a signature and is not described as one. It catches
-/// a truncated download and a proxy that served something else, which is what
-/// it is for; a `docs`-level answer to tampering is release signing, which
+/// `Ok(None)` means the caller asked it to stop. The length is *not* checked
+/// here — [`install_job`] does that as a stage of its own, so the dialog can
+/// name it. The limit below is still what stops an endless response from
+/// exhausting memory before any comparison could run.
+///
+/// The length check is not a signature and is not described as one anywhere.
+/// It catches a truncated download and a proxy that served something else,
+/// which is what it is for; the answer to tampering is release signing, which
 /// Umber does not do yet.
-fn fetch(asset: &Asset) -> Result<Vec<u8>, String> {
+fn fetch(
+    asset: &Asset,
+    cancel: &AtomicBool,
+    report: &dyn Fn(u64),
+) -> Result<Option<Vec<u8>>, String> {
     if !asset.is_fetchable() {
         return Err("The release offers that file over an insecure address.".to_string());
     }
@@ -376,26 +665,55 @@ fn fetch(asset: &Asset) -> Result<Vec<u8>, String> {
         .call()
         .map_err(|e| format!("Umber could not download {}: {e}", asset.name))?;
 
-    let bytes = response
+    let mut reader = response
         .body_mut()
         .with_config()
         // One byte over what was promised is already a mismatch, and the limit
-        // is what stops an endless response from exhausting memory before the
-        // comparison below ever runs.
+        // is what stops an endless response from exhausting memory.
         .limit(asset.size.saturating_add(1))
-        .read_to_vec()
-        .map_err(|e| format!("The download of {} failed: {e}", asset.name))?;
+        .reader();
 
-    if bytes.len() as u64 != asset.size {
-        return Err(format!(
-            "The download of {} is {} bytes where GitHub reported {}. It has been \
-             discarded.",
-            asset.name,
-            bytes.len(),
-            asset.size,
-        ));
+    // Reserved rather than grown from nothing: the size is known, and a 64 MB
+    // ceiling keeps a lying `size` from being an allocation of its own.
+    let mut bytes = Vec::with_capacity(asset.size.min(64 * 1024 * 1024) as usize);
+    let mut chunk = vec![0u8; CHUNK];
+    let mut last_report = 0u64;
+    let mut last_percent = u64::MAX;
+    report(0);
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let read = std::io::Read::read(&mut reader, &mut chunk)
+            .map_err(|e| format!("The download of {} failed: {e}", asset.name))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+
+        // One report per whole percent. A wake per chunk would be five hundred
+        // frames on a 30 MB release, each redrawing the whole interface to move
+        // a bar by less than a pixel.
+        let received = bytes.len() as u64;
+        let worth_saying = match asset.size {
+            0 => received - last_report >= UNMEASURED_STEP,
+            size => {
+                let percent = received.saturating_mul(100) / size;
+                percent != last_percent
+            }
+        };
+        if worth_saying {
+            last_percent = received.saturating_mul(100) / asset.size.max(1);
+            last_report = received;
+            report(received);
+        }
     }
-    Ok(bytes)
+
+    // The last reading, whatever the throttle had reached: a bar left at 99%
+    // while the length is checked looks stuck.
+    report(bytes.len() as u64);
+    Ok(Some(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +752,74 @@ pub fn open_in_browser(url: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Looking at the dialog without a release to install
+// ---------------------------------------------------------------------------
+
+/// Put the dialog into a state, with a release that does not exist.
+///
+/// Nobody working on Umber can perform a real update against a real release —
+/// it would mean cutting one — so every screen here would otherwise ship having
+/// been reasoned about and never looked at. This is how they get looked at, and
+/// it is `debug_assertions` only: a live control that fabricates a release has
+/// no business in a build somebody paints with. The menu entry that reaches it
+/// is behind the same gate.
+///
+/// It moves the *model*, and nothing else. No thread starts, no request goes
+/// out, and the countdown on the completion screen is the real one — so what is
+/// on screen is the same drawing code a real update produces, which is the only
+/// version of this worth having.
+#[cfg(debug_assertions)]
+pub fn demo_release() -> Release {
+    let mut version = Version::current();
+    version.patch += 1;
+    Release {
+        version,
+        tag: format!("v{version}"),
+        page: RELEASES_PAGE.to_string(),
+        notes: "### Added\n- A rehearsal release. This one does not exist, and \
+                nothing here will be downloaded.\n- A second line, so the notes \
+                box has something to scroll.\n\n### Fixed\n- A very long line, to \
+                prove that a release note cannot push this dialog wider than the \
+                screen the way the brush importer's notices once did.\n"
+            .to_string(),
+        assets: Vec::new(),
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Updates {
+    /// Open the dialog on a fabricated release, at `phase`.
+    pub fn demo(&mut self, phase: Phase, now: Instant) {
+        let mut flow = Flow::offering(demo_release());
+        match phase {
+            Phase::Offer => {}
+            Phase::Working(stage) => {
+                flow.begin();
+                flow.stage(stage);
+            }
+            Phase::Stopping => {
+                flow.begin();
+                flow.request_stop();
+            }
+            Phase::Stopped => {
+                flow.begin();
+                flow.request_stop();
+                flow.stopped();
+            }
+            Phase::Done { outcome, .. } => {
+                flow.begin();
+                flow.finished(outcome, now);
+            }
+            Phase::Failed(message) => {
+                flow.begin();
+                flow.failed(message);
+            }
+        }
+        self.flow = Some(flow);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,12 +849,15 @@ mod tests {
     }
 
     #[test]
-    fn a_quit_request_is_taken_once() {
+    fn an_exit_request_is_taken_once() {
         let mut updates = Updates::default();
-        assert!(!updates.take_quit_request());
-        updates.request_quit();
-        assert!(updates.take_quit_request());
-        assert!(!updates.take_quit_request(), "and not a second time");
+        assert_eq!(updates.take_exit_request(), None);
+        updates.request_exit(Exit::Quit);
+        assert_eq!(updates.take_exit_request(), Some(Exit::Quit));
+        assert_eq!(updates.take_exit_request(), None, "and not a second time");
+
+        updates.request_exit(Exit::Restart);
+        assert_eq!(updates.take_exit_request(), Some(Exit::Restart));
     }
 
     #[test]
@@ -485,6 +874,12 @@ mod tests {
         assert_eq!(*updates.status(), Status::Idle);
         updates.check();
         assert_eq!(*updates.status(), Status::Idle, "not even when asked");
+        // And with no check there is no release, so the dialog cannot be raised.
+        updates.open_offer();
+        assert!(
+            updates.flow().is_none(),
+            "the dialog must never appear here"
+        );
 
         // Every other kind still checks. Compared on `check_unavailable` rather
         // than by starting one, because starting one is a network request.
@@ -502,15 +897,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_managed_installation_is_offered_nothing_to_install() {
-        // Belt and braces over `release::asset_for`: this is the path the
-        // button actually takes.
-        let mut updates = Updates {
-            kind: InstallKind::Managed(install::Manager::Dpkg),
-            ..Updates::default()
-        };
-        let release = Release {
+    fn release() -> Release {
+        Release {
             version: Version::parse("9.9.9").expect("parses"),
             tag: "v9.9.9".into(),
             page: RELEASES_PAGE.into(),
@@ -520,13 +908,186 @@ mod tests {
                 size: 1,
                 browser_download_url: "https://github.com/x/y.tar.gz".into(),
             }],
+        }
+    }
+
+    #[test]
+    fn a_managed_installation_is_offered_nothing_to_install() {
+        // Belt and braces over `release::asset_for` and `flow::actions`: this is
+        // the path the button actually takes.
+        let mut updates = Updates {
+            kind: InstallKind::Managed(install::Manager::Dpkg),
+            ..Updates::default()
         };
+        let release = release();
         assert_eq!(updates.installable(&release), None);
+        assert!(!updates.actions(&release).update_now);
 
         updates.status = Status::Available(release);
-        updates.install_available();
-        // Still on offer, not downloading: the request was refused.
-        assert!(matches!(updates.status(), Status::Available(_)));
+        updates.open_offer();
+        updates.install_offered();
+        // Still on the offer screen, not downloading: the request was refused.
+        assert_eq!(
+            updates.flow().map(Flow::phase),
+            Some(&Phase::Offer),
+            "a managed copy must not start a download",
+        );
+        assert!(!updates.busy());
+    }
+
+    #[test]
+    fn never_ask_again_writes_the_setting_the_dialog_can_undo() {
+        // One switch, not two. Settings, General reads exactly this field, so
+        // the choice made here is visible there and reversible from there.
+        let mut updates = Updates {
+            notice_seen: true,
+            ..Updates::default()
+        };
+        updates.status = Status::Available(release());
+        updates.open_offer();
+        assert!(updates.flow().is_some());
+
+        updates.never_ask_again();
+        assert!(!updates.check_on_startup);
+        assert!(
+            updates.notice_seen,
+            "and the first-run notice stays answered"
+        );
+        assert!(updates.flow().is_none(), "the dialog closes");
+
+        // And it stays off across a start.
+        updates.started = false;
+        updates.start_if_due();
+        assert_eq!(*updates.status(), Status::Available(release()));
+        assert!(!updates.busy());
+    }
+
+    #[test]
+    fn the_dialog_cannot_be_dismissed_while_it_is_working() {
+        let mut updates = Updates {
+            status: Status::Available(release()),
+            ..Updates::default()
+        };
+        updates.open_offer();
+
+        updates.dismiss();
+        assert!(updates.flow().is_none(), "an offer may be dismissed");
+
+        // Put it back and start the work by hand — `install_offered` would
+        // reach the network.
+        updates.flow = Some(Flow::offering(release()));
+        updates.flow.as_mut().expect("a flow").begin();
+        updates.dismiss();
+        assert!(
+            updates.flow().is_some(),
+            "a running update must not be left with nothing on screen to stop it",
+        );
+        updates.never_ask_again();
+        assert!(updates.flow().is_some(), "and that route is closed too");
+    }
+
+    #[test]
+    fn a_stop_reaches_the_worker_and_the_dialog_together() {
+        let mut updates = Updates {
+            flow: Some(Flow::offering(release())),
+            ..Updates::default()
+        };
+        updates.flow.as_mut().expect("a flow").begin();
+        let cancel = Arc::new(AtomicBool::new(false));
+        updates.cancel = Some(cancel.clone());
+
+        updates.stop_update();
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the worker has to be told, or the download runs to the end",
+        );
+        assert_eq!(updates.flow().map(Flow::phase), Some(&Phase::Stopping));
+    }
+
+    #[test]
+    fn a_report_arriving_after_a_stop_decides_what_actually_happened() {
+        let now = Instant::now();
+        let mut updates = Updates {
+            flow: Some(Flow::offering(release())),
+            ..Updates::default()
+        };
+        updates.flow.as_mut().expect("a flow").begin();
+        updates.cancel = Some(Arc::new(AtomicBool::new(false)));
+        updates.stop_update();
+
+        // The worker got there first. The dialog says what happened, not what
+        // was asked for.
+        assert!(updates.apply_report(Report::Installed(Applied::Restart), now));
+        assert!(matches!(
+            updates.flow().map(Flow::phase),
+            Some(Phase::Done {
+                outcome: Applied::Restart,
+                ..
+            }),
+        ));
+        assert!(updates.cancel.is_none(), "the flag is given back");
+    }
+
+    #[test]
+    fn a_failure_during_a_check_does_not_touch_a_dialog_that_is_up() {
+        // Two jobs never run at once, but the routing has to be right anyway:
+        // a check's failure belongs in the status line, and an update's belongs
+        // on the screen the user is watching.
+        let now = Instant::now();
+        let mut updates = Updates {
+            flow: Some(Flow::offering(release())),
+            ..Updates::default()
+        };
+        assert!(updates.apply_report(Report::Failed("no route to host".into()), now));
+        assert_eq!(
+            *updates.status(),
+            Status::Failed("no route to host".into()),
+            "an idle dialog is not the place for a check's failure",
+        );
+        assert_eq!(updates.flow().map(Flow::phase), Some(&Phase::Offer));
+
+        updates.flow.as_mut().expect("a flow").begin();
+        assert!(updates.apply_report(Report::Failed("the download failed".into()), now));
+        assert_eq!(
+            updates.flow().map(Flow::phase),
+            Some(&Phase::Failed("the download failed".into())),
+        );
+    }
+
+    #[test]
+    fn a_worker_that_panics_is_reported_rather_than_waited_for() {
+        let mut updates = Updates {
+            flow: Some(Flow::offering(release())),
+            ..Updates::default()
+        };
+        updates.flow.as_mut().expect("a flow").begin();
+        updates.worker_vanished();
+        assert!(matches!(
+            updates.flow().map(Flow::phase),
+            Some(Phase::Failed(_)),
+        ));
+    }
+
+    #[test]
+    fn an_automatic_check_raises_the_dialog_and_a_manual_one_does_not() {
+        let now = Instant::now();
+        // `started` is what tells the two apart: it is set by `start_if_due`
+        // and never by the About dialog's button.
+        let mut manual = Updates::default();
+        assert!(manual.apply_report(Report::Checked(Status::Available(release())), now));
+        assert!(
+            manual.flow().is_none(),
+            "a check the user asked for answers where they asked it",
+        );
+        manual.open_offer();
+        assert!(manual.flow().is_some(), "and the button opens it");
+
+        let mut automatic = Updates {
+            started: true,
+            ..Updates::default()
+        };
+        assert!(automatic.apply_report(Report::Checked(Status::Available(release())), now));
+        assert_eq!(automatic.flow().map(Flow::phase), Some(&Phase::Offer));
     }
 
     #[test]

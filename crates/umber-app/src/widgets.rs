@@ -155,6 +155,42 @@ pub fn icon_toggle(
     response.on_hover_text(tip).clicked()
 }
 
+/// A progress bar: a track the full width, filled to `fraction`.
+///
+/// `None` means there is no honest figure to draw, and it produces an **empty
+/// track** rather than an animation. A bar that moves without knowing anything
+/// is the control that lies, and the one place in Umber where progress cannot
+/// be reported — Windows' installer, once it has been handed the package —
+/// says so in words beside the bar instead.
+///
+/// The splash paints its own copy of this shape and has to: it runs before wgpu
+/// exists, on a `softbuffer` framebuffer with no egui in the process at all.
+/// This one is the interface's. They share the palette tokens and the
+/// proportions, which is as much as two renderers with no common drawing API
+/// can share.
+pub fn progress_bar(ui: &mut Ui, p: &Palette, fraction: Option<f32>) {
+    let width = ui.available_width().max(MIN_TRACK);
+    let height = metrics::PROGRESS_BAR;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let radius = height * 0.5;
+    let painter = ui.painter();
+    // Track first, then the fill over it, so the fill's rounded cap sits on the
+    // track rather than knocking a notch out of it. `rail` is the slider-track
+    // token, which is what this is.
+    painter.rect_filled(rect, radius, p.rail);
+    let Some(fraction) = fraction else {
+        return;
+    };
+    let filled = width * fraction.clamp(0.0, 1.0);
+    // Below one radius the rounded fill draws as a lens narrower than it should
+    // be; a bar that reads as empty at 1% is better than one that reads as
+    // started at 0%.
+    if filled >= radius {
+        let end = Rect::from_min_size(rect.min, vec2(filled, height));
+        painter.rect_filled(end, radius, p.accent);
+    }
+}
+
 /// Pill toggle, 28×16 with a sliding knob.
 pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(vec2(28.0, 16.0), Sense::click());

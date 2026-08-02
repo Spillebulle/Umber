@@ -12,6 +12,7 @@ use crate::tabs::{self, Notice};
 use crate::taskbar;
 use crate::theme::{self, Accent, ThemeKind};
 use crate::ui;
+use crate::update;
 use glam::{UVec2, Vec2};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1615,7 +1616,7 @@ impl UmberApp {
         // Before the interface is built, so an answer that arrived while the
         // loop was asleep is on screen in the frame the wake-up produced rather
         // than in the one after it.
-        self.editor.updates.poll();
+        self.editor.updates.poll(std::time::Instant::now());
 
         let Some(gfx) = self.gfx.as_mut() else { return };
 
@@ -2658,12 +2659,27 @@ impl ApplicationHandler<Wake> for UmberApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // The Windows installer cannot replace a program that is running, so
-        // handing it the package is only half of the update — the other half is
-        // getting out of its way, which the user asks for in the About dialog.
-        if self.editor.updates.take_quit_request() {
-            event_loop.exit();
-            return;
+        // How an update ends. The Windows installer cannot replace a program
+        // that is running, so handing it the package is only half of the update
+        // — the other half is getting out of its way. A portable or AppImage
+        // copy has already been replaced, and the new build is started here on
+        // the way out.
+        match self.editor.updates.take_exit_request() {
+            Some(update::Exit::Restart) => match update::relaunch() {
+                Ok(()) => {
+                    event_loop.exit();
+                    return;
+                }
+                // A restart that could not start anything must leave the copy
+                // that is running running. The new build is in place either
+                // way; it simply waits for the next start.
+                Err(message) => self.editor.updates.restart_failed(message),
+            },
+            Some(update::Exit::Quit) => {
+                event_loop.exit();
+                return;
+            }
+            None => {}
         }
         // The quit prompt's answer. It is drawn from `ui::draw`, which has no
         // `ActiveEventLoop` — so it sets a flag and this is where the loop

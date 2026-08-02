@@ -22,6 +22,7 @@
 //! the old inode open and carries on, while the name points at the new file
 //! from that moment.
 
+use super::flow::Stage;
 use super::install::InstallKind;
 use std::ffi::OsString;
 use std::io::Read;
@@ -45,15 +46,28 @@ pub enum Applied {
 ///
 /// `bytes` is exactly what the release carried, already length-checked against
 /// what the API reported.
-pub fn apply(kind: &InstallKind, asset_name: &str, bytes: &[u8]) -> Result<Applied, String> {
+///
+/// `report` is told which stage is beginning, so the dialog's bar names what is
+/// happening rather than sitting on one label from the end of the download to
+/// the end of the install. The stages differ per installation kind and that is
+/// the honest reading: there is no archive to unpack in an AppImage, and the
+/// MSI is not installed by Umber at all — it is handed over.
+pub fn apply(
+    kind: &InstallKind,
+    asset_name: &str,
+    bytes: &[u8],
+    report: &dyn Fn(Stage),
+) -> Result<Applied, String> {
     match kind {
         InstallKind::Msi => {
+            report(Stage::HandingOver);
             hand_to_msiexec(asset_name, bytes)?;
             Ok(Applied::Installer)
         }
 
         // One file, and the download is it. No archive to open.
         InstallKind::AppImage(path) => {
+            report(Stage::Installing);
             swap_in(path, bytes)?;
             Ok(Applied::Restart)
         }
@@ -61,11 +75,13 @@ pub fn apply(kind: &InstallKind, asset_name: &str, bytes: &[u8]) -> Result<Appli
         InstallKind::Portable => {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("Umber could not find its own program file: {e}"))?;
+            report(Stage::Unpacking);
             let binary = if asset_name.ends_with(".zip") {
                 binary_from_zip(bytes, "umber.exe")?
             } else {
                 binary_from_tar_gz(bytes, "umber")?
             };
+            report(Stage::Installing);
             swap_in(&exe, &binary)?;
             Ok(Applied::Restart)
         }
@@ -177,6 +193,41 @@ pub fn sweep_previous_binary() {
             log::info!("removed {} from a previous update", leftover.display());
         }
     }
+}
+
+/// Start the build that is now at Umber's own path, so the caller can exit into
+/// it.
+///
+/// Only ever called after [`Applied::Restart`], which means the swap succeeded
+/// and the new binary is at exactly the name the running one was started from —
+/// so `current_exe` is the new build, not the old one, on every platform.
+///
+/// **The failure has to be recoverable**, which is why this reports rather than
+/// exiting itself: an update that could not start the new copy must leave the
+/// old one running, not leave the user with no Umber at all. `app.rs` exits only
+/// on `Ok`.
+///
+/// On Windows the displaced `umber.exe.old` is still locked by *this* process
+/// while the new one starts, so the sweep the new process runs may find it
+/// undeletable and leave it. That is the untidy case [`sweep_previous_binary`]
+/// already describes, and it is cleared by the start after next; it is not worth
+/// delaying a restart to avoid.
+pub fn relaunch() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Umber could not find its own program file: {e}"))?;
+    // No arguments carried over. Umber's are a document to open, and reopening
+    // whatever was on the command line an hour ago is not what "restart" means
+    // — the session's own documents are the autosave's business.
+    std::process::Command::new(&exe)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "Umber could not start the new version: {e}\n\n\
+                 It is installed at {}, and runs the next time you start Umber.",
+                exe.display(),
+            )
+        })
 }
 
 /// Lift one file out of a zip.
@@ -428,7 +479,31 @@ mod tests {
             InstallKind::Managed(super::super::install::Manager::Flatpak),
             InstallKind::Unknown,
         ] {
-            assert!(apply(&kind, "umber-1.0.0-x64.msi", b"anything").is_err());
+            assert!(apply(&kind, "umber-1.0.0-x64.msi", b"anything", &|_| {}).is_err());
         }
+    }
+
+    #[test]
+    fn a_portable_update_names_its_two_stages_in_order() {
+        // The bar's labels come from here, so the order they arrive in is the
+        // order they happen in — and a refusal must report neither, rather than
+        // announcing an unpack it never began.
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        // A zip with nothing in it: far enough to report the unpack, not far
+        // enough to touch a file.
+        let mut buf = Vec::new();
+        {
+            let zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.finish().expect("finish the zip");
+        }
+        assert!(
+            apply(&InstallKind::Portable, "umber-1.0.0.zip", &buf, &|stage| {
+                seen.borrow_mut().push(stage);
+            })
+            .is_err(),
+            "an archive with no binary in it is a refusal",
+        );
+        assert_eq!(seen.into_inner(), vec![Stage::Unpacking]);
     }
 }

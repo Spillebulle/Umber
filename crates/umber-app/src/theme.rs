@@ -356,6 +356,21 @@ pub mod metrics {
     /// two-column layout all put one somewhere, and four heights is how the
     /// four separate triggers this replaced came to look like four controls.
     pub const DROPDOWN: f32 = 18.0;
+    /// The update dialog. Two columns on its offer screen — the versions on the
+    /// left, the release notes on the right — so it is wider than About and
+    /// narrower than the brush editor.
+    ///
+    /// Fixed, for the reason [`BRUSH_LIBRARY`] is: what it shows is a release's
+    /// own notes, which is text nobody here wrote and nobody here can size. A
+    /// modal that grew to fit them would be as wide as the longest line in
+    /// somebody's changelog.
+    pub const UPDATE_DIALOG_WIDTH: f32 = 560.0;
+    /// The notes box on that screen. Tall enough for a release section, and
+    /// scrolling rather than growing.
+    pub const UPDATE_NOTES: [f32; 2] = [300.0, 170.0];
+    /// A progress bar — the update dialog's, and the same weight the splash
+    /// draws its own at.
+    pub const PROGRESS_BAR: f32 = 4.0;
     /// The tallest a dropdown's menu grows before it scrolls.
     ///
     /// Some of the lists are long — thirteen dab inputs, ten blend modes, a
