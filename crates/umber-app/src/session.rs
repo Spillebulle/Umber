@@ -39,6 +39,15 @@ use umber_core::{Camera, Document, EditTarget, History, LayerStack, Selection};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocId(u64);
 
+impl DocId {
+    /// A fixed id, so a test can key something on a document without building
+    /// a whole [`Session`] to mint one. Never compiled into the application.
+    #[cfg(test)]
+    pub fn for_test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 /// The engine state belonging to one document.
 ///
 /// Moving one of these in and out of the editor is what a tab switch is. Every
