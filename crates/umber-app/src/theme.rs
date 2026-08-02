@@ -270,9 +270,10 @@ pub mod metrics {
     /// `padding: 0 12px`.
     pub const STRIP_PAD: i8 = 12;
     /// The tool rail's width, now that the rail is a dockable module rather
-    /// than a strip of chrome: the design's 76-point rail plus what a panel
-    /// costs around it — [`PANEL_PAD`] either side of the body, and room for
-    /// the body's scroll bar.
+    /// than a strip of chrome: the design's two-column button grid plus what a
+    /// panel costs around it — [`PANEL_PAD`] either side of the body, and the
+    /// [`SCROLL_BAR`] gutter. `the_tool_grid_fits_the_panel_it_sits_in` adds
+    /// the three up.
     ///
     /// It is the narrowest a Tools column may be dragged, and *only* that:
     /// below it the design's two-column tool grid wraps to one and the rail
@@ -295,6 +296,19 @@ pub mod metrics {
     /// The canvas scrollbars, along the bottom and right of the document
     /// region. Thin, because they sit over the picture rather than beside it.
     pub const SCROLLBAR: f32 = 11.0;
+    /// egui's scroll bar — every panel body, the settings panes, the brush
+    /// library — and the gap between it and the content.
+    ///
+    /// Deliberately *not* the canvas's [`SCROLLBAR`] above, which is the one
+    /// place in Umber a bar legitimately floats: it lies over a picture that
+    /// extends underneath it either way. Everywhere else a bar covering the
+    /// content is a control hiding a reading, so [`super::apply`] makes these
+    /// solid and they cost their own width.
+    pub const SCROLL_BAR: f32 = 6.0;
+    /// Between the content and the bar. The two together are what a solid
+    /// vertical bar takes off the width a body has to lay out in, so anything
+    /// sizing a column or a pane around its contents has to leave both over.
+    pub const SCROLL_BAR_GAP: f32 = 4.0;
     /// Radius of the dot Umber draws where a pen is, in place of the arrow.
     ///
     /// Small on purpose: it says where the nib is and nothing else — how wide
@@ -399,6 +413,20 @@ fn style_from(style: &mut egui::Style, palette: &Palette) {
         ),
     ]
     .into();
+
+    // egui's default scroll bar *floats*: it is drawn over the content and
+    // allocates nothing (`ScrollStyle::floating`, whose
+    // `floating_allocated_width` is zero), so it sat on top of the settings
+    // dialog's readings and over the right-hand edge of every panel body.
+    // Solid instead — the bar takes its own gutter and the content is laid out
+    // in what is left. Set here rather than on each `ScrollArea` because a
+    // gutter chosen per call site is how two panes end up with different ones.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        bar_width: metrics::SCROLL_BAR,
+        bar_inner_margin: metrics::SCROLL_BAR_GAP,
+        bar_outer_margin: 0.0,
+        ..egui::style::ScrollStyle::solid()
+    };
 
     let v = &mut style.visuals;
     v.dark_mode = palette.is_dark();
@@ -521,14 +549,21 @@ mod tests {
     /// either side and the scroll bar. Widening the buttons without widening
     /// the rail would wrap the grid to one column — which is what the grid
     /// falls back to when it has to, and not the shape it should ship in.
+    ///
+    /// The gutter is counted rather than assumed to be somewhere in the slack.
+    /// It used to be: the sum came to 90 against a 100-point rail, and the ten
+    /// points left over happened to be exactly the gutter — which held only
+    /// because nothing said so, and a scroll bar that floated over the buttons
+    /// would have passed this either way.
     #[test]
     fn the_tool_grid_fits_the_panel_it_sits_in() {
         let grid = metrics::TOOL_BUTTON * 2.0 + metrics::TOOL_GAP;
         let padding = metrics::PANEL_PAD as f32 * 2.0;
+        let gutter = metrics::SCROLL_BAR + metrics::SCROLL_BAR_GAP;
         assert!(
-            grid + padding <= metrics::TOOL_RAIL,
-            "a {grid}-point grid and {padding} points of panel padding do not fit \
-             a {}-point rail",
+            grid + padding + gutter <= metrics::TOOL_RAIL,
+            "a {grid}-point grid, {padding} points of panel padding and a \
+             {gutter}-point scroll gutter do not fit a {}-point rail",
             metrics::TOOL_RAIL,
         );
     }
