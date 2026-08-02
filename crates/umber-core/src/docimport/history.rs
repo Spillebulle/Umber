@@ -39,6 +39,17 @@ pub struct ImportedEdit {
     /// date, say — would be indistinguishable from a recorded one and would
     /// make the list assert something nobody measured.
     pub at: Option<Timestamp>,
+    /// The whole region the stroke damaged.
+    pub rect: PixelRect,
+    /// The parts of it the stroke actually touched. One covering the whole of
+    /// `rect` for an entry out of a revision-1 manifest, which is what that
+    /// revision could say.
+    pub pieces: Vec<ImportedPiece>,
+}
+
+/// One piece of a recorded edit.
+#[derive(Clone, Debug)]
+pub struct ImportedPiece {
     pub rect: PixelRect,
     /// Layer-texture bytes, `rect.area() * 4` of them — sRGB-encoded with alpha
     /// premultiplied, exactly as `write_layer_rect` wants them.
@@ -134,12 +145,63 @@ fn load(
             return Err("one of its entries covers an area outside the canvas".into());
         }
 
-        let png = container::read_optional_entry(zip, &entry.src, format)
-            .map_err(|e| e.to_string())?
-            .ok_or("part of it is missing from the file")?;
-        let image = flat::decode_png(&png, format).map_err(|e| e.to_string())?;
-        if image.size != UVec2::new(entry.w, entry.h) {
-            return Err("part of it is not the size it says it is".into());
+        // Revision 1 said one rectangle and named one PNG; revision 2 names the
+        // pieces of it the stroke actually touched. Reading the former as a
+        // single piece is the whole of the difference — see
+        // [`fmt::VERSION`].
+        let listed: Vec<(PixelRect, &str)> = if entry.pieces.is_empty() {
+            vec![(
+                PixelRect {
+                    x: entry.x,
+                    y: entry.y,
+                    width: entry.w,
+                    height: entry.h,
+                },
+                entry.src.as_str(),
+            )]
+        } else {
+            entry
+                .pieces
+                .iter()
+                .map(|p| {
+                    (
+                        PixelRect {
+                            x: p.x,
+                            y: p.y,
+                            width: p.w,
+                            height: p.h,
+                        },
+                        p.src.as_str(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut pieces = Vec::with_capacity(listed.len());
+        for (rect, src) in listed {
+            // Every piece bounded on its own. A piece is what gets written back
+            // into the layer, so a rectangle running off the canvas here is the
+            // one that would land on whatever the arithmetic reached.
+            if rect.width == 0
+                || rect.height == 0
+                || rect.x.saturating_add(rect.width) > canvas.x
+                || rect.y.saturating_add(rect.height) > canvas.y
+            {
+                return Err("one of its entries covers an area outside the canvas".into());
+            }
+            let png = container::read_optional_entry(zip, src, format)
+                .map_err(|e| e.to_string())?
+                .ok_or("part of it is missing from the file")?;
+            let image = flat::decode_png(&png, format).map_err(|e| e.to_string())?;
+            if image.size != UVec2::new(rect.width, rect.height) {
+                return Err("part of it is not the size it says it is".into());
+            }
+            pieces.push(ImportedPiece {
+                rect,
+                // Unconverted: these are layer-texture bytes, not a picture
+                // anyone else reads. See the writer's module docs.
+                bytes: image.rgba,
+            });
         }
 
         entries.push(ImportedEdit {
@@ -157,9 +219,7 @@ fn load(
                 width: entry.w,
                 height: entry.h,
             },
-            // Unconverted: these are layer-texture bytes, not a picture anyone
-            // else reads. See the writer's module docs.
-            bytes: image.rgba,
+            pieces,
         });
     }
 

@@ -51,10 +51,10 @@ use std::path::Path;
 use glam::UVec2;
 
 use crate::document::{Background, Document};
-use crate::history::{Edit, History, PixelPatch};
+use crate::history::{Edit, History, PatchPiece, PixelPatch};
 use crate::layer::{BlendMode, LayerStack};
 
-pub use history::{ImportedEdit, ImportedHistory};
+pub use history::{ImportedEdit, ImportedHistory, ImportedPiece};
 
 /// Formats [`import`] can read.
 ///
@@ -283,10 +283,15 @@ impl ImportedDocument {
                     // made when the file says, and stamping it with the moment
                     // the document was opened would tell the History list that
                     // yesterday's afternoon of painting happened in one second.
+                    let pieces = edit
+                        .pieces
+                        .into_iter()
+                        .map(|p| PatchPiece::new(p.rect, p.bytes))
+                        .collect();
                     entries.push(Edit::made_at(
                         edit.kind,
                         edit.at,
-                        PixelPatch::new(edit.rect, slot, edit.bytes),
+                        PixelPatch::from_pieces(edit.rect, slot, pieces),
                     ));
                 }
                 let mut history = History::default();

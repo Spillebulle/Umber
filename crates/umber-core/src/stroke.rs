@@ -16,6 +16,7 @@
 
 use crate::brush::Brush;
 use crate::color::Color;
+use crate::damage::TileMask;
 use crate::dynamics::{
     DabInput, DabInputs, Modulated, SLOW_SPEED_SLOWNESS, SPEED_GAMMA_LOG, SPEED_SLOWNESS,
     speed_input,
@@ -169,6 +170,10 @@ pub struct StrokeBuilder {
     time_residual: f32,
     pending: Vec<Dab>,
     bounds: Rect,
+    /// Which cells of the canvas the dabs have reached. The bounding box says
+    /// where the stroke *is*; this says what of it the stroke touched, and it
+    /// is what the undo patch and the commit pass are both cut to.
+    damage: TileMask,
     /// The palette colour this stroke started with, in linear RGB.
     paint: [f32; 3],
     /// Colour carried along by a smudging brush: what it has picked up, decayed
@@ -223,6 +228,7 @@ impl StrokeBuilder {
             time_residual: 0.0,
             pending: Vec::with_capacity(1024),
             bounds: Rect::empty(),
+            damage: TileMask::default(),
             paint: [0.0; 3],
             smudge: None,
             rng: Rng::new(1),
@@ -326,6 +332,15 @@ impl StrokeBuilder {
         self.bounds
     }
 
+    /// The cells of the canvas this stroke has reached.
+    ///
+    /// Survives [`Self::end`] along with the bounds, because both are read
+    /// after the stroke is over — the commit and the undo capture happen at
+    /// pointer-up, and [`Self::begin`] is what clears them.
+    pub fn damage(&self) -> &TileMask {
+        &self.damage
+    }
+
     /// Start a stroke, laying down one dab immediately so a tap makes a mark.
     ///
     /// `paint` is the palette colour in linear RGB. It is snapshotted here for
@@ -353,6 +368,7 @@ impl StrokeBuilder {
         self.residual = 0.0;
         self.time_residual = 0.0;
         self.bounds = Rect::empty();
+        self.damage.clear();
         self.pending.clear();
 
         self.emit(point.pos, point.pressure);
@@ -630,13 +646,16 @@ impl StrokeBuilder {
         // unrotated ellipse it is *tighter* than the circle was.
         let (sin, cos) = angle.sin_cos();
         let short = radius / self.brush.dab_ratio.max(1.0);
-        self.bounds.union_box(
-            centre,
-            Vec2::new(
-                (radius * cos).abs() + (short * sin).abs(),
-                (radius * sin).abs() + (short * cos).abs(),
-            ),
+        let half = Vec2::new(
+            (radius * cos).abs() + (short * sin).abs(),
+            (radius * sin).abs() + (short * cos).abs(),
         );
+        self.bounds.union_box(centre, half);
+        // The same box, on the cell grid. Both have to be fed from here and
+        // from the same numbers: a cell mask that did not cover what the
+        // bounding box covers is the under-tight damaged rect above, back
+        // again and harder to see.
+        self.damage.mark(centre, half);
     }
 
     /// The colour this dab deposits: the palette colour, pulled towards

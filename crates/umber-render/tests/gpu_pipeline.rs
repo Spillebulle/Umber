@@ -10,7 +10,7 @@ use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
-    InputPoint, Modulation, PixelRect, ResponseCurve, StrokeBuilder, TipMask,
+    InputPoint, Modulation, PixelRect, Rect, ResponseCurve, StrokeBuilder, TileMask, TipMask,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, Gpu, LayerDraw, ProbeParams,
@@ -127,11 +127,15 @@ impl Harness {
             height: size.y,
         };
         let mut enc = self.encoder();
+        // The whole rect as one piece: these tests commit everything they
+        // stamped. `a_stroke_only_touches_the_cells_its_dabs_reached` is the
+        // one that exercises a patch cut to a damage mask.
         self.canvas.commit_stroke(
             &self.gpu.queue,
             &mut enc,
             slot,
             rect,
+            &[rect],
             StrokeStyle {
                 color,
                 opacity,
@@ -891,6 +895,7 @@ fn a_stamp_gets_the_same_shape_dynamics_a_round_dab_does() {
         &mut enc,
         0,
         rect,
+        &[rect],
         StrokeStyle {
             color: Color::WHITE,
             ..Default::default()
@@ -1174,6 +1179,7 @@ fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
         &mut enc,
         0,
         rect,
+        &[rect],
         StrokeStyle {
             color: Color::WHITE,
             ..Default::default()
@@ -2099,16 +2105,18 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
     let mut enc = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let whole = PixelRect {
+        x: 0,
+        y: 0,
+        width: DOC,
+        height: DOC,
+    };
     canvas.commit_stroke(
         &gpu.queue,
         &mut enc,
         0,
-        PixelRect {
-            x: 0,
-            y: 0,
-            width: DOC,
-            height: DOC,
-        },
+        whole,
+        &[whole],
         StrokeStyle {
             color: Color::from_srgb_u8(200, 20, 20, 255),
             opacity: 1.0,
@@ -2687,4 +2695,196 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
         h.canvas.begin_capture(&[0], &draws),
         "the slot stayed taken"
     );
+}
+
+// --- patches cut to the cells a stroke reached -----------------------------
+
+/// A canvas large enough to hold several damage cells, with a layer full of
+/// pixels no two of which are alike.
+///
+/// Random, because the point of every test below is that certain bytes come
+/// back *exactly*: a flat layer would pass them all while restoring nothing.
+fn noisy_canvas(gpu: &Gpu, side: u32) -> CanvasRenderer {
+    let canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.clear_all_layers(&mut enc);
+    canvas.clear_stroke(&mut enc);
+    gpu.queue.submit(Some(enc.finish()));
+
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let pixels: Vec<u8> = (0..(side as usize * side as usize * 4))
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // Alpha always full, so every pixel is a valid premultiplied one
+            // whatever the noise did to the colour.
+            if i % 4 == 3 { 255 } else { (seed >> 24) as u8 }
+        })
+        .collect();
+    canvas.write_layer_rect(&gpu.queue, 0, whole_of(side), &pixels);
+    canvas
+}
+
+fn whole_of(side: u32) -> PixelRect {
+    PixelRect {
+        x: 0,
+        y: 0,
+        width: side,
+        height: side,
+    }
+}
+
+/// One diagonal stroke's dabs, the damage they mark and the box they span.
+fn diagonal_stroke(side: u32) -> (Vec<Dab>, TileMask, PixelRect) {
+    let mut mask = TileMask::default();
+    let mut bounds = Rect::empty();
+    let dabs: Vec<Dab> = (0..side / 4)
+        .map(|i| {
+            let p = i as f32 * 4.0 + 2.0;
+            let r = 5.0;
+            mask.mark(Vec2::new(p, p), Vec2::splat(r));
+            bounds.union_box(Vec2::new(p, p), Vec2::splat(r));
+            dab(p, p, r, 1.0)
+        })
+        .collect();
+    let rect = bounds
+        .to_pixels_clamped(UVec2::splat(side))
+        .expect("the stroke is on the canvas");
+    (dabs, mask, rect)
+}
+
+/// The guarantee the whole tiled-patch scheme rests on: **an undo restores
+/// every pixel the stroke changed, and changes nothing else.**
+///
+/// A patch no longer holds the stroke's bounding box, so this is no longer made
+/// true by the size of the box. It is true because the commit is scissored to
+/// the same pieces the patch was captured from — and if those two ever
+/// disagree, either a pixel is committed with no record of what it replaced or
+/// the mask misses a cell a dab reached. Both show up here as a layer that does
+/// not come back, and nothing cheaper than reading the whole of it twice
+/// catches either.
+#[test]
+fn an_undo_restores_every_pixel_a_tiled_stroke_changed() {
+    let Some(gpu) = shared_gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    const SIDE: u32 = 512;
+    let mut canvas = noisy_canvas(gpu, SIDE);
+    let before = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, whole_of(SIDE));
+
+    let (dabs, mask, rect) = diagonal_stroke(SIDE);
+    let pieces = mask.pieces(rect);
+    // The stroke has to be one tiles actually help with, or this would pass on
+    // a patch that was still a bounding box.
+    let kept: u64 = pieces.iter().map(PixelRect::area).sum();
+    assert!(
+        kept * 2 < rect.area(),
+        "the pieces are {kept} of {} — not a tiled patch at all",
+        rect.area()
+    );
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.begin_frame();
+    canvas.draw_dabs(
+        &gpu.device,
+        &gpu.queue,
+        &mut enc,
+        &dabs,
+        DabStyle::default(),
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    // Captured before the commit, exactly as `finish_stroke` does it.
+    let patch = canvas.read_layer_pieces(&gpu.device, &gpu.queue, 0, &pieces);
+
+    let mut enc = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    canvas.commit_stroke(
+        &gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        &pieces,
+        StrokeStyle {
+            color: Color::from_srgb_u8(200, 20, 20, 255),
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            per_dab_color: false,
+        },
+    );
+    gpu.queue.submit(Some(enc.finish()));
+
+    let painted = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, whole_of(SIDE));
+    assert_ne!(painted, before, "the stroke painted nothing");
+
+    for (piece, bytes) in pieces.iter().zip(&patch) {
+        canvas.write_layer_rect(&gpu.queue, 0, *piece, bytes);
+    }
+    let restored = canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, whole_of(SIDE));
+
+    // Byte for byte, over the whole layer — not only inside the stroke.
+    if restored != before {
+        let differing = restored.iter().zip(&before).filter(|(a, b)| a != b).count();
+        panic!(
+            "the undo left {differing} bytes of {} changed",
+            before.len()
+        );
+    }
+}
+
+/// Reading the pieces together must give exactly what reading them one at a
+/// time gives, whatever the device's buffer limit does to the batching.
+///
+/// The batched path is the one every stroke takes, and the failure it is prone
+/// to is a piece landing at the wrong offset in the shared staging buffer —
+/// which looks like an undo pasting one part of the canvas over another, on
+/// large documents only.
+#[test]
+fn pieces_read_together_match_pieces_read_one_at_a_time() {
+    let Some(gpu) = shared_gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    const SIDE: u32 = 512;
+    let mut canvas = noisy_canvas(gpu, SIDE);
+    let (_, mask, rect) = diagonal_stroke(SIDE);
+    let pieces = mask.pieces(rect);
+    assert!(pieces.len() > 4, "the fixture is not testing batching");
+
+    let one_at_a_time: Vec<Vec<u8>> = pieces
+        .iter()
+        .map(|p| canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, *p))
+        .collect();
+
+    assert_eq!(
+        canvas.read_layer_pieces(&gpu.device, &gpu.queue, 0, &pieces),
+        one_at_a_time,
+        "one submission for all the pieces read something else"
+    );
+
+    // And again with a limit small enough that the batch has to be broken up,
+    // and then small enough that a single piece will not fit and falls through
+    // to the banded reader. Both are what a large canvas does on real hardware,
+    // and neither is reachable on a document a test can afford.
+    for limit in [40 * 1024, 8 * 1024] {
+        canvas.set_readback_limit(limit);
+        assert_eq!(
+            canvas.read_layer_pieces(&gpu.device, &gpu.queue, 0, &pieces),
+            one_at_a_time,
+            "a readback limit of {limit} sheared the pieces"
+        );
+    }
 }

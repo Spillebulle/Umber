@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::history::PatchPiece;
 use umber_core::{
     Brush, Color, Dab, Document, Edit, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
 };
@@ -265,16 +266,29 @@ impl UmberApp {
 
         let slot = self.editor.stroke_slot;
 
-        // Capture undo state first. `read_layer_rect` submits and blocks on its
-        // own encoder, so it observes the layer before `enc` commits anything.
-        let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, rect);
+        // The parts of that rectangle the dabs actually reached. A stroke's
+        // bounding box is a dreadful description of a diagonal — 381 MB to
+        // record a few million pixels on a 10000² canvas — so the patch and the
+        // commit are both cut to these, and to the *same* ones: what is
+        // committed and what was captured have to be the same pixels or an undo
+        // does not undo.
+        let pieces = self.editor.stroke.damage().pieces(rect);
+
+        // Capture undo state first. The readback submits and blocks on its own
+        // encoder, so it observes the layer before `enc` commits anything.
+        let before = canvas.read_layer_pieces(&gfx.gpu.device, &gfx.gpu.queue, slot, &pieces);
+        let captured = pieces
+            .iter()
+            .zip(before)
+            .map(|(rect, bytes)| PatchPiece::new(*rect, bytes))
+            .collect();
         // Labelled from the *snapshotted* style rather than from the brush in
         // hand, for the same reason the commit is: switching tool mid-stroke
         // must not change what the stroke that is ending turns out to have
         // been, in the history list any more than on the canvas.
         self.editor.history.record(Edit::new(
             EditKind::for_mode(self.editor.stroke_style.mode),
-            PixelPatch::new(rect, slot, before),
+            PixelPatch::from_pieces(rect, slot, captured),
         ));
 
         canvas.commit_stroke(
@@ -282,6 +296,7 @@ impl UmberApp {
             &mut enc,
             slot,
             rect,
+            &pieces,
             self.editor.stroke_style,
         );
         gfx.gpu.queue.submit(Some(enc.finish()));
@@ -376,19 +391,17 @@ impl UmberApp {
         let Some(edit) = self.editor.history.take_undo() else {
             return;
         };
+        // The pieces of the patch, not its bounding box: swapping them is what
+        // an undo *is*, and the pixels between them were never touched.
         let patch = edit.patch;
-        let current =
-            canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
-        canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
+        let inverse = swap_patch(canvas, &gfx.gpu, &patch);
         // The label and the time travel with the entry rather than being
         // recomputed, so an undone stroke keeps its name and the moment it was
         // painted on the far side of the cursor — the list neither renumbers
         // nor re-times itself as it is stepped through.
-        self.editor.history.push_redo(Edit::made_at(
-            edit.kind,
-            edit.at,
-            PixelPatch::new(patch.rect, patch.slot, current),
-        ));
+        self.editor
+            .history
+            .push_redo(Edit::made_at(edit.kind, edit.at, inverse));
         self.editor.mark_modified();
     }
 
@@ -402,14 +415,10 @@ impl UmberApp {
             return;
         };
         let patch = edit.patch;
-        let current =
-            canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, patch.slot, patch.rect);
-        canvas.write_layer_rect(&gfx.gpu.queue, patch.slot, patch.rect, &patch.bytes);
-        self.editor.history.push_undo(Edit::made_at(
-            edit.kind,
-            edit.at,
-            PixelPatch::new(patch.rect, patch.slot, current),
-        ));
+        let inverse = swap_patch(canvas, &gfx.gpu, &patch);
+        self.editor
+            .history
+            .push_undo(Edit::made_at(edit.kind, edit.at, inverse));
         self.editor.mark_modified();
     }
 
@@ -1980,6 +1989,31 @@ fn with_extension(path: PathBuf) -> PathBuf {
     name.push(".");
     name.push(docformat::EXTENSION);
     PathBuf::from(name)
+}
+
+/// Put a patch back on the canvas and hand back the patch that undoes *that*.
+///
+/// The one place undo and redo differ is which stack the result goes on, so the
+/// pixels are moved here rather than twice. Piece by piece, over exactly the
+/// rectangles that were captured: the pixels between them were never part of
+/// the edit, and reading or writing them would be work in proportion to a
+/// bounding box this whole scheme exists to stop paying for.
+///
+/// The read blocks, once, for all the pieces together. Acceptable on an
+/// explicit undo and nowhere near the drawing loop — the same rule the capture
+/// at pointer-up lives by.
+fn swap_patch(canvas: &CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> PixelPatch {
+    let rects: Vec<PixelRect> = patch.pieces().iter().map(|p| p.rect).collect();
+    let current = canvas.read_layer_pieces(&gpu.device, &gpu.queue, patch.slot, &rects);
+    for piece in patch.pieces() {
+        canvas.write_layer_rect(&gpu.queue, patch.slot, piece.rect, &piece.bytes());
+    }
+    let pieces = rects
+        .iter()
+        .zip(current)
+        .map(|(rect, bytes)| PatchPiece::new(*rect, bytes))
+        .collect();
+    PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
 }
 
 /// Write straight-alpha RGBA8 out as a PNG.

@@ -196,15 +196,21 @@ fn main() {
         let patch = &history.entry_at(i).unwrap().patch;
         raw += patch.byte_len();
 
-        let t = Instant::now();
-        deflate += deflated_len(&patch.bytes);
-        t_deflate += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        fast += png_len(patch.rect, &patch.bytes, png::Compression::Fast);
-        t_fast += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        balanced += png_len(patch.rect, &patch.bytes, png::Compression::Balanced);
-        t_balanced += t.elapsed().as_secs_f64();
+        // One dense piece each: `capture` above is the pre-tiles shape of a
+        // patch, which is what this example is measuring the *file* cost of.
+        // `measure-undo.rs` is the one that measures the pieces.
+        for piece in patch.pieces() {
+            let bytes = piece.bytes();
+            let t = Instant::now();
+            deflate += deflated_len(&bytes);
+            t_deflate += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            fast += png_len(piece.rect, &bytes, png::Compression::Fast);
+            t_fast += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            balanced += png_len(piece.rect, &bytes, png::Compression::Balanced);
+            t_balanced += t.elapsed().as_secs_f64();
+        }
     }
 
     println!("{strokes} strokes, grain {grain}, scale {scale}");
