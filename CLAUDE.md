@@ -1698,6 +1698,32 @@ must not learn about HTTP, the same boundary that keeps them testable.
   bundle attached to a release is not a substitute and must not be described as
   one.
 
+## Working in parallel
+
+**Independent pieces of work get an agent each, run at the same time.** A
+session that arrives with six unrelated tasks in it is six agents, not six turns
+of one conversation — wall-clock time is the thing being spent here. This is a
+standing instruction and it overrides the usual reluctance to delegate.
+
+- **Trees are allowed and often better than a flat fan-out.** A planner feeding
+  an implementer, a critic reading an implementer's diff before it is reported,
+  a supervisor over several implementers — all of these are fair game. Use one
+  where the task is large enough that a first draft nobody read is likely to be
+  wrong.
+- **Overlapping files mean a worktree each.** Two agents editing `panels.rs` in
+  the same checkout will silently overwrite each other, and neither will notice.
+  Give each `isolation: "worktree"`, have it commit on its own branch, and merge
+  the branches one at a time afterwards.
+- **Point every worktree at one `CARGO_TARGET_DIR`.** `[profile.dev]` builds
+  dependencies at `opt-level = 3`, so six fresh worktrees is six full builds of
+  wgpu. Cargo's own lock serialises the concurrent builds, which is the right
+  trade. Shell state does not survive between tool calls, so it has to be set on
+  each invocation: `$env:CARGO_TARGET_DIR='…'; cargo test`.
+- **An agent's report is not the same thing as a merged change.** The gates
+  (`fmt --check`, `clippy`, `test`) run in the worktree *and* after the merge —
+  a clean branch and a clean merge of several clean branches are different
+  claims.
+
 ## Conventions
 
 - **Commit after every change, and say in the message what changed and why.**
