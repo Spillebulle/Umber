@@ -13,6 +13,7 @@ mod canvasdlg;
 mod colorpicker;
 mod controls;
 mod cputext;
+mod crash;
 mod dock;
 /// Redrawing the pictures in `docs/images/` from the interface itself.
 ///
@@ -51,6 +52,19 @@ use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Run Umber. Blocks until the window closes.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // This executable is also its own crash reporter: a panic hook writes a
+    // report and spawns this binary again with `--crash-report <path>`, which
+    // draws the box on a device that has not just died. So the command line is
+    // read before anything else is set up, and the reporter path never touches
+    // the editor, the autosave or the update check at all. See `crash`.
+    if let crash::Launch::Report(path) = crash::parse_args(std::env::args()) {
+        return crash::show_report(&path);
+    }
+
+    // Only on the ordinary path. Installing it in the reporter would mean a
+    // crash inside the crash box spawning another crash box, for ever.
+    crash::install_hook();
+
     // Before anything else: a Windows update leaves the binary it displaced
     // beside the new one, because a running executable cannot be deleted. This
     // is the first moment it can go.

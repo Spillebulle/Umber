@@ -321,6 +321,23 @@ for.
 Closing the window with unsaved work asks first, and names every document at
 risk.
 
+### If Umber stops
+
+Software fails, and this one drives a graphics driver. If Umber hits something
+it cannot carry on from, a window opens saying so — and, more to the point,
+saying whether your work was written down and where. A document with an
+autosaved copy is named with its path, and the box says plainly whether that
+copy holds everything you had done or stops short of your last few strokes; a
+document with no copy anywhere is named too, rather than passed over.
+
+**Technical details** folds out to the message, the place it happened and the
+stack behind it. All of that is also written to a file, whose path the box
+shows and whose folder it will open for you — that is the copy to attach to a
+bug report. Nothing is sent anywhere: the report is a file on your machine and
+stays there unless you send it.
+
+There are two buttons: close, or start Umber again.
+
 ## Selections
 
 The **Select** tool marks out where edits may land, in one of three ways,

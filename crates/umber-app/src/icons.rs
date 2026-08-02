@@ -86,6 +86,12 @@ pub enum Icon {
     /// A brush with a plus beside it: make a brush from nothing, as against
     /// `Plus` alone, which everywhere else means "save what is in your hand".
     BrushNew,
+    /// A triangle with a bar and a dot in it — the crash box's mark, and the
+    /// only place in the interface that something has gone irrecoverably wrong.
+    /// A triangle rather than a circle: a circled `i` is information and a
+    /// circled `!` is a warning somebody can carry on past, and this is
+    /// neither.
+    Alert,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -453,6 +459,20 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             painter.circle_filled(at(5.0, 19.0), 2.6 * scale, colour);
             line(at(17.5, 3.5), at(17.5, 11.5));
             line(at(13.5, 7.5), at(21.5, 7.5));
+        }
+
+        Icon::Alert => {
+            // Drawn with a flat top-left to bottom-right sweep rather than as
+            // an equilateral triangle: at 16 px an equilateral one loses its
+            // apex to the stroke weight and reads as a blob.
+            path(vec![
+                at(12.0, 3.5),
+                at(22.0, 20.5),
+                at(2.0, 20.5),
+                at(12.0, 3.5),
+            ]);
+            line(at(12.0, 9.5), at(12.0, 15.0));
+            painter.circle_filled(at(12.0, 18.0), 1.3 * scale, colour);
         }
 
         Icon::HalfCircle => {

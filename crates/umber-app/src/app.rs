@@ -1,6 +1,7 @@
 //! Window lifecycle, input translation and the frame loop.
 
 use crate::canvasdlg;
+use crate::crash;
 use crate::editor::{Editor, Floating, Interaction, Tool};
 use crate::gesture;
 use crate::keylayout;
@@ -1664,6 +1665,16 @@ impl UmberApp {
         // than in the one after it.
         self.editor.updates.poll(std::time::Instant::now());
 
+        // What the panic hook is allowed to say about the artist's documents.
+        // The hook cannot borrow the editor — it has no reference to one, and
+        // the frame that panicked may be halfway through changing it — so the
+        // answer is kept in a snapshot beside it. Sitting on the drawing path
+        // is only defensible because this reduces the tab strip to one number
+        // first and returns without allocating while that number is unchanged,
+        // which is every frame but the handful where something opened, closed,
+        // was saved or was painted on. See `crash::note_documents`.
+        crash::note_documents(&self.editor.session);
+
         let Some(gfx) = self.gfx.as_mut() else { return };
 
         let now = std::time::Instant::now();
@@ -2747,6 +2758,20 @@ impl ApplicationHandler<Wake> for UmberApp {
             .expect("failed to create surface");
         let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))
             .expect("failed to initialise GPU");
+
+        // wgpu's default for an error nobody asked it to hand back is one log
+        // line and a panic from inside `wgpu_core`. Routed here it keeps the
+        // log line, gains Umber's own wording, and travels down the same path
+        // as every other crash — which is what turns "wgpu error: Validation
+        // Error" in a terminal into a box that names the file the artist's work
+        // is in. It stays fatal; see `crash::device_error`.
+        gpu.device
+            .on_uncaptured_error(std::sync::Arc::new(crash::device_error));
+
+        // What the crash report says the picture was drawn on. Recorded as soon
+        // as there is a device, because "no device had been created" is itself
+        // one of the more useful things a report can say.
+        crash::note_adapter(&gpu.adapter.get_info());
 
         splash.adapter(&gpu.adapter.get_info());
         splash.show(splash::Stage::Surface);

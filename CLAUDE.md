@@ -621,6 +621,92 @@ when nobody asked for it.
   frame so one saved while it is up stops being named. `Editor::quit_requested`
   is a flag because `ui::draw` has no `ActiveEventLoop`.
 
+### Crash reporting
+
+`umber-app/src/crash/`. A panic hook that writes a report and a **second
+process** that draws the box. `mod.rs` is the hook and the command line,
+`report.rs` is the record and every sentence it can produce, `window.rs` is the
+reporter's own window.
+
+- **The box is drawn by a fresh process, and that is the whole design.** The
+  hook writes a `Report` to a file and spawns *this same executable* with
+  `--crash-report <path>`; that process gets its own adapter, its own surface
+  and its own egui context, and draws the dialog out of `theme`, `widgets`,
+  `icons` and `tabs::dialog_frame`. Restart is then the same spawn with no
+  argument. The two alternatives lose, and the reasons are the module docs':
+  **in-process** is unreliable exactly when it is needed — the crash this was
+  built for was a wgpu validation error in `Queue::submit` followed, *while
+  unwinding*, by `wgpu-hal` refusing to destroy a swapchain semaphore a surface
+  texture still held, so the device is poisoned and egui's own textures may be
+  among the destroyed objects; drawing with it asks the failing subsystem to
+  report its own failure, and a panic inside the panic handler replaces a
+  legible stderr message with a double fault. **A plain OS message box** always
+  works but has no expandable section, cannot scroll a backtrace, cannot offer
+  a restart, and is three implementations with three capabilities. It is the
+  right *fallback*, so the fallback here is **stderr**: an unwritable report, an
+  unspawnable child and a window that will not open all end with the process
+  dying exactly as it does today.
+- **Nothing is made quieter.** The previous hook — the standard library's — is
+  called **first and unconditionally**, so the message, the backtrace and
+  `RUST_LOG` are untouched. This is an addition to what a crash does.
+- **The hook must not panic, and must not report a worker.** No `unwrap`, no
+  indexing, no slicing between `set_hook` and `spawn`; every failure is a log
+  line and a return. A panicking thread that is not `main` ends that thread and
+  leaves the application running, so a box saying Umber stopped would be false —
+  it is logged and passed over. `REPORTING` latches so the second panic during
+  unwinding cannot spawn a second reporter.
+- **The hook reads a snapshot, never live state**, because it cannot borrow
+  `Editor` and the frame that panicked may be halfway through changing one.
+  `crash::note_documents` is called once per frame from `render` and returns
+  without allocating unless a reduction of the tab strip to one `u64` has
+  changed — which is what lets it sit on the drawing path at all. The hook takes
+  the snapshot with **`try_lock`**: the panicking thread may be the thread
+  holding that lock, and `lock()` would deadlock the hook against itself.
+- **A rescue sentence may never overstate.** `Report::rescued` lists a document
+  only where `Tab::modified` was true — the flag that means "closing this would
+  lose something", already cleared by `Session::mark_autosaved` where the
+  artist's own file was written — and compares the copy's revision against the
+  document's to say whether it holds everything or stops short. A modified
+  document with no copy is named by `at_risk` rather than passed over, because a
+  box that lists two rescued documents and is silent about the third reads as a
+  promise about the third. Same rule as the autosave's: claiming work is safe
+  when it is not is worse than claiming nothing.
+- **wgpu's `on_uncaptured_error` goes down the same path.** `crash::device_error`
+  logs the error in full and then panics with Umber's own wording, so the report
+  says what happened instead of `wgpu_core`'s line number. It stays fatal: a
+  device that has reported an uncaptured error produces undefined results from
+  then on, and a quietly wrong canvas is what this codebase refuses everywhere.
+- **`panic = "abort"` changes nothing and there is no `catch_unwind`.** The hook
+  runs before the abort exactly as it runs before unwinding, and nothing here
+  needs the stack unwound. Catching around `run_app` would happen *after* every
+  destructor that produced the second panic, `run_app` is not `UnwindSafe`, and
+  on Windows the loop unwinds through a Win32 message callback where catching is
+  not dependable.
+- **There is no "Copy details" button, and that is not an oversight.**
+  `egui-winit` is built `default-features = false`, so its `clipboard` feature
+  is not compiled in and `Context::copy_text` is a no-op — the same reason
+  `about::link_row` paints its own hyperlink. A button that looks like it copies
+  and does nothing is the control that lies; turning the feature on means
+  `arboard`, a new linked dependency `packaging/linux/build-packages.sh` and the
+  `PKGBUILD` would have to declare by hand. The report is already a *file*, so
+  the box names its path and opens its folder, and the details are a read-only
+  `TextEdit` — genuinely selectable, bounded by a `ScrollArea` rather than
+  sizing the window, which is `TextWrapMode::Extend` and the brush browser
+  again with worse text.
+- **Reports are never deleted.** Each is a few kilobytes and is the only record
+  of what happened. `autosave::Reaper` is deliberately the only thing in Umber
+  that deletes a file on the user's behalf, and its containment is careful for a
+  reason; a second deleter for kilobytes is the wrong trade.
+- **The heading is "Oh no, oopsy", and it is the author's own voice.** It is not
+  behind a preference and there is no second heading under it. What carries the
+  information is the paragraph and the "Your work" section beneath — a crash box
+  whose only content is a joke leaves the artist with nothing to act on, which
+  is why those two are held to the rules above.
+- **`parse_args` is a pure function of the arguments**, like `install::detect`,
+  and an argument it does not recognise is logged and ignored. Umber is launched
+  by file managers, desktop entries and `cargo run --`; refusing to start a
+  painting application over a stray word is a far worse failure than starting.
+
 ### Importing other applications' files
 
 `umber-core::docimport` reads `.ora`, `.kra`, `.psd` and `.png`.

@@ -713,6 +713,17 @@ impl Autosave {
         out
     }
 
+    /// Where this document's internal copy has been put, if one has been.
+    ///
+    /// Read by [`crate::crash`] so a crash box can name the file rather than
+    /// the directory. Not the same as [`Autosave::internal_path_for`], which
+    /// *chooses* a path and is therefore `&mut`: this only reports one that has
+    /// already been decided, so it cannot invent a destination for a document
+    /// that was never written.
+    pub fn internal_copy(&self, id: DocId) -> Option<&Path> {
+        self.docs.get(&id)?.internal.as_deref()
+    }
+
     /// Where this document's internal copy goes, chosen once and remembered.
     fn internal_path_for(&mut self, doc: &Candidate) -> Option<PathBuf> {
         if let Some(existing) = self.docs.get(&doc.id).and_then(|r| r.internal.clone()) {
@@ -868,6 +879,21 @@ pub fn collect(
                 // than no autosave at all.
                 if wrote_user_file {
                     editor.session.mark_autosaved(id, revision);
+                }
+                // Where a crash box would send somebody, if the next frame
+                // turns out to be the one that fails. The document's own file
+                // where that was written — it is what the artist would go
+                // looking for — and the internal copy otherwise, which is the
+                // only destination a never-saved document has. `revision` is
+                // the number the capture began with, so the box can say whether
+                // the copy holds everything or is a stroke behind rather than
+                // claiming work was safe when it was not.
+                let written = wrote_user_file
+                    .then(|| editor.session.tab_of(id).and_then(|t| t.path.clone()))
+                    .flatten()
+                    .or_else(|| editor.autosave.internal_copy(id).map(Path::to_path_buf));
+                if let Some(path) = written {
+                    crate::crash::note_autosave(id, path, revision);
                 }
             }
             Report::Failed { title, message } => {
