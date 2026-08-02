@@ -46,6 +46,30 @@ const FILE: &str = "preferences.conf";
 pub const MIN_SCALE: f32 = 0.75;
 pub const MAX_SCALE: f32 = 2.0;
 
+/// Bounds on the undo memory budget, in megabytes **per document**.
+///
+/// The floor is not zero, and could not usefully be: a patch is the whole
+/// rectangle a stroke damaged, so below about this a single broad stroke on an
+/// ordinary canvas is the entire history and undo stops being worth having. The
+/// ceiling is where a few open tabs would be most of a machine's memory — the
+/// budget is per document, so four tabs at the top of the range is 16 GB, which
+/// is why the setting has to say so rather than reading as free depth.
+pub const MIN_UNDO_BUDGET_MB: u32 = 64;
+pub const MAX_UNDO_BUDGET_MB: u32 = 4096;
+
+/// The budgets the dialog offers, in megabytes.
+///
+/// A ladder rather than a free slider, like the autosave's expiry: the useful
+/// answers are doublings, and nobody is trying to land on 813 MB by dragging.
+/// The preferences file still takes any number in range, which is what makes a
+/// hand-edited value honoured rather than snapped.
+pub const UNDO_BUDGET_LADDER: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+/// A number of megabytes as the history counts bytes.
+pub fn undo_budget_bytes(megabytes: u32) -> usize {
+    megabytes as usize * 1024 * 1024
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub theme: ThemeKind,
@@ -89,6 +113,12 @@ pub struct Prefs {
     pub wheel_angles: WheelAngles,
     /// Whether a saved document carries its undo history.
     pub save_history: bool,
+    /// How much memory one document's undo history may hold, in megabytes.
+    ///
+    /// Per document, not per session — see [`MIN_UNDO_BUDGET_MB`]. Stored in
+    /// megabytes because that is the unit the dialog says it in and the unit a
+    /// hand-edited file wants; the history counts bytes.
+    pub undo_budget_mb: u32,
     /// Whether open documents are written out on a timer at all.
     pub autosave: bool,
     /// How often, in minutes.
@@ -127,6 +157,9 @@ impl Default for Prefs {
             wheel_shape: WheelShape::Triangle,
             wheel_angles: WheelAngles::default(),
             save_history: true,
+            // Exactly what every build before the setting existed held, so a
+            // missing or older preferences file changes nobody's behaviour.
+            undo_budget_mb: (umber_core::history::DEFAULT_BUDGET_BYTES / (1024 * 1024)) as u32,
             autosave: true,
             autosave_interval_minutes: autosave::DEFAULT_INTERVAL_MINUTES,
             autosave_expiry_hours: autosave::DEFAULT_EXPIRY_HOURS,
@@ -316,6 +349,7 @@ pub fn to_text(prefs: &Prefs) -> String {
         ));
     }
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
+    out.push_str(&format!("undo_budget_mb = {}\n", prefs.undo_budget_mb));
     out.push_str(&format!("autosave = {}\n", prefs.autosave));
     out.push_str(&format!(
         "autosave_interval_minutes = {}\n",
@@ -439,6 +473,14 @@ pub fn from_text(text: &str) -> Prefs {
             "save_history" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.save_history = v;
+                }
+            }
+            // Clamped like every other number here. A line that cannot be read
+            // leaves the shipped 512 MB in place, which is the direction that
+            // costs memory rather than somebody's undo history.
+            "undo_budget_mb" => {
+                if let Some(v) = parse_u32(value, MIN_UNDO_BUDGET_MB, MAX_UNDO_BUDGET_MB) {
+                    prefs.undo_budget_mb = v;
                 }
             }
             "autosave" => {
@@ -684,6 +726,10 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_shape: ed.ui.wheel_shape,
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
+        // Read off the live history, like every other value here is read off
+        // the thing that uses it, so the file cannot come to disagree with what
+        // the running documents are actually held to.
+        undo_budget_mb: (ed.history.budget_bytes() / (1024 * 1024)) as u32,
         autosave: ed.autosave.enabled,
         autosave_interval_minutes: (ed.autosave.interval.as_secs() / 60).max(1) as u32,
         autosave_expiry_hours: ed
@@ -693,6 +739,25 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
             .unwrap_or(0),
         shortcuts: shortcuts::published(),
     }
+}
+
+/// Hand a new undo budget to the running application.
+///
+/// Two halves, because they answer different questions, and one door so that
+/// neither call site can do only one of them. The published value is what a
+/// document opened from here on takes — a blank canvas, a new tab, an import —
+/// none of which can see a `Prefs`. The second reaches the document being
+/// edited *now*, and it is what makes turning the limit down give the memory
+/// back at once rather than at the next stroke.
+///
+/// Documents open in *other* tabs are not reached, and that is the gap: a
+/// parked history keeps the ceiling it was built with until something replaces
+/// it. Closing it needs a mutable walk over `Session`'s parked states, which
+/// `Session` does not currently offer.
+pub fn set_undo_budget(ed: &mut Editor, megabytes: u32) {
+    let bytes = undo_budget_bytes(megabytes);
+    umber_core::history::set_default_budget(bytes);
+    ed.history.set_budget(bytes);
 }
 
 /// Push stored preferences into the running app.
@@ -709,6 +774,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_shape = prefs.wheel_shape;
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
+    set_undo_budget(ed, prefs.undo_budget_mb);
     ed.autosave.enabled = prefs.autosave;
     ed.autosave.interval =
         std::time::Duration::from_secs(prefs.autosave_interval_minutes.max(1) as u64 * 60);
@@ -796,6 +862,14 @@ mod tests {
         assert_eq!(prefs.wheel_shape, editor.ui.wheel_shape);
         assert_eq!(prefs.wheel_angles, editor.ui.wheel_angles);
         assert_eq!(prefs.save_history, editor.ui.save_history);
+        // Against the constant rather than against `editor.history`, which
+        // reads a published value another test in this process may have moved.
+        // What has to hold is that the shipped default is the figure every
+        // build before the setting existed used.
+        assert_eq!(
+            undo_budget_bytes(prefs.undo_budget_mb),
+            umber_core::history::DEFAULT_BUDGET_BYTES
+        );
         assert_eq!(prefs.autosave, editor.autosave.enabled);
         assert_eq!(
             prefs.autosave_interval_minutes as u64 * 60,
@@ -976,6 +1050,76 @@ mod tests {
         );
     }
 
+    /// The undo budget has to reach the *history*, not only the `Prefs` struct,
+    /// and come back out of it again — otherwise the dialog would show a figure
+    /// no document was ever held to.
+    ///
+    /// Raised rather than lowered, and put back: `apply` publishes the value for
+    /// every history built afterwards, so a smaller ceiling left behind here
+    /// would arrive underneath another test's document.
+    #[test]
+    fn the_undo_budget_reaches_the_history_and_back() {
+        let prefs = Prefs {
+            undo_budget_mb: 1024,
+            ..Prefs::default()
+        };
+        let back = from_text(&to_text(&prefs));
+        assert_eq!(back.undo_budget_mb, 1024);
+
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        apply(&back, &ctx, &mut editor);
+        assert_eq!(
+            editor.history.budget_bytes(),
+            undo_budget_bytes(1024),
+            "the setting must reach the document being edited"
+        );
+        assert_eq!(
+            umber_core::history::default_budget(),
+            undo_budget_bytes(1024),
+            "and the document opened next"
+        );
+        assert_eq!(capture(&ctx, &editor).undo_budget_mb, 1024);
+
+        apply(&Prefs::default(), &ctx, &mut editor);
+        assert_eq!(
+            umber_core::history::default_budget(),
+            umber_core::history::DEFAULT_BUDGET_BYTES
+        );
+    }
+
+    /// A hand-edited budget is clamped into the range the dialog offers, and a
+    /// line that cannot be read leaves the shipped figure in place — the
+    /// direction that costs memory rather than somebody's undo history.
+    #[test]
+    fn a_hand_edited_undo_budget_is_clamped_rather_than_dropped() {
+        assert_eq!(
+            from_text("undo_budget_mb = 1\n").undo_budget_mb,
+            MIN_UNDO_BUDGET_MB
+        );
+        assert_eq!(
+            from_text("undo_budget_mb = 999999\n").undo_budget_mb,
+            MAX_UNDO_BUDGET_MB
+        );
+        assert_eq!(
+            from_text("undo_budget_mb = plenty\n").undo_budget_mb,
+            Prefs::default().undo_budget_mb
+        );
+        // The dialog's ladder and the file's range are two statements of the
+        // same bounds, and a dialog offering a value the file would clamp would
+        // be a control that lies about what it set.
+        assert_eq!(UNDO_BUDGET_LADDER[0], MIN_UNDO_BUDGET_MB);
+        assert_eq!(
+            *UNDO_BUDGET_LADDER.last().unwrap(),
+            MAX_UNDO_BUDGET_MB,
+            "the ladder must reach the top of the range"
+        );
+        assert!(
+            UNDO_BUDGET_LADDER.contains(&Prefs::default().undo_budget_mb),
+            "the shipped default has to be a rung, or the slider cannot show it"
+        );
+    }
+
     /// The autosave's settings, and — the part that matters — which way each of
     /// them fails.
     #[test]
@@ -1059,6 +1203,7 @@ mod tests {
             wheel_shape: WheelShape::Square,
             wheel_angles: turned(30.0, 200.0),
             save_history: false,
+            undo_budget_mb: 1024,
             autosave: false,
             autosave_interval_minutes: 12,
             autosave_expiry_hours: 48,
@@ -1087,6 +1232,7 @@ mod tests {
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
         assert_eq!(back.wheel_angles, prefs.wheel_angles);
         assert_eq!(back.save_history, prefs.save_history);
+        assert_eq!(back.undo_budget_mb, prefs.undo_budget_mb);
         assert_eq!(back.autosave, prefs.autosave);
         assert_eq!(
             back.autosave_interval_minutes,

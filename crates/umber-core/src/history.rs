@@ -22,11 +22,47 @@
 //! caller the same work as that many presses of undo and no new pixel path.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::brush::BrushMode;
 use crate::geom::PixelRect;
 use crate::time::Timestamp;
+
+/// What one document's history is allowed to hold unless it is told otherwise,
+/// and what every build before the setting existed held.
+///
+/// Named rather than written into [`History::default`] so the preference that
+/// now governs it has something to default *to* — a settings page that stated
+/// 512 MB in its own words would be a second copy of this number.
+pub const DEFAULT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// The ceiling a [`History`] built with no explicit one takes.
+///
+/// Published rather than passed, for the reason [`set_default_budget`] gives.
+static BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_BUDGET_BYTES);
+
+/// Set the ceiling every history built from here on takes.
+///
+/// A published value rather than an argument because a `History` is created in
+/// places that have no business knowing preferences exist — a blank document, a
+/// new tab, an import — and threading a number through all of them would put
+/// the setting into the signature of everything that opens a picture. The same
+/// shape the application's shortcut table already uses, and for the same
+/// reason: one published value, read where it is needed.
+///
+/// It does **not** reach a history that already exists. That is
+/// [`History::set_budget`]'s job, and it is deliberately separate: lowering the
+/// limit has to drop entries from the documents already open *now*, which is a
+/// mutation of each of them and not a change of a global.
+pub fn set_default_budget(bytes: usize) {
+    BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// The ceiling a history built now would take.
+pub fn default_budget() -> usize {
+    BUDGET.load(Ordering::Relaxed)
+}
 
 /// What one recorded edit was, so a list of them can be named.
 ///
@@ -270,7 +306,7 @@ pub struct History {
 
 impl Default for History {
     fn default() -> Self {
-        Self::with_budget(512 * 1024 * 1024)
+        Self::with_budget(default_budget())
     }
 }
 
@@ -306,6 +342,24 @@ impl History {
     /// panel so the note cannot come to name a figure this no longer holds.
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    /// Change the ceiling of a history that already exists, and answer to it at
+    /// once.
+    ///
+    /// The eviction is the whole point. Lowering the limit has to give the
+    /// memory back now rather than at the next stroke — somebody who has just
+    /// been told a session is using too much gets no relief from a promise about
+    /// the next pointer-up. Raising it resurrects nothing: an entry the budget
+    /// has already aged out is gone, and [`History::dropped`] still counts it,
+    /// so the list goes on admitting it does not reach the beginning.
+    ///
+    /// Separate from [`set_default_budget`] because the two answer different
+    /// questions — what a *new* document holds, and what the ones already open
+    /// hold. The setting drives both.
+    pub fn set_budget(&mut self, bytes: usize) {
+        self.budget_bytes = bytes;
+        self.evict_to_budget();
     }
 
     // --- the timeline ------------------------------------------------------
@@ -736,6 +790,73 @@ mod tests {
         assert_eq!(h.dropped(), 0, "a cleared history reaches its beginning");
     }
 
+    /// The setting has to reach the documents already open, and the two
+    /// directions fail differently. Lowering must give the memory back at once
+    /// — the whole reason somebody turns it down — while raising must not
+    /// resurrect an entry the old limit already discarded, because those pixels
+    /// are not held anywhere any more and the count of them is what lets the
+    /// list say it does not reach the document's beginning.
+    #[test]
+    fn changing_the_budget_evicts_at_once_and_never_resurrects() {
+        let mut h = History::with_budget(100_000);
+        for i in 0..8u8 {
+            h.record(edit(16, 16, i));
+        }
+        assert_eq!(h.len(), 8, "nothing should have been dropped yet");
+        assert_eq!(h.dropped(), 0);
+        let full = h.used_bytes();
+
+        // Down: the oldest go immediately, without waiting for another stroke.
+        h.set_budget(2500);
+        assert_eq!(h.budget_bytes(), 2500);
+        assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
+        let kept = h.len();
+        let lost = h.dropped();
+        assert!(lost > 0, "lowering the budget dropped nothing");
+        assert_eq!(kept + lost, 8);
+        // Aged out from the bottom, so the newest is still the next undo.
+        assert_eq!(
+            h.entry_at(kept - 1).unwrap().patch.pieces()[0].bytes()[0],
+            7
+        );
+
+        // Up: the ceiling moves and nothing else does.
+        h.set_budget(full * 4);
+        assert_eq!(h.budget_bytes(), full * 4);
+        assert_eq!(h.len(), kept, "raising the budget brought an entry back");
+        assert_eq!(h.dropped(), lost, "the count of what was lost moved");
+        assert!(h.used_bytes() < full);
+
+        // And a raise is not a licence to exceed the new limit either: recording
+        // still evicts against whatever was last set.
+        h.set_budget(2500);
+        h.record(edit(16, 16, 9));
+        assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
+    }
+
+    /// A document opened *after* the setting was changed has to take it too,
+    /// which is the half `History::set_budget` cannot do — a blank document, a
+    /// new tab and an import all build their own history and none of them can
+    /// see the preferences.
+    ///
+    /// Raises the published value rather than lowering it, and puts it back:
+    /// every other test in this process builds `History::default()`, and a
+    /// smaller ceiling arriving underneath one of them would evict.
+    #[test]
+    fn a_history_built_after_the_setting_moved_takes_the_new_ceiling() {
+        assert_eq!(History::default().budget_bytes(), default_budget());
+
+        let raised = DEFAULT_BUDGET_BYTES * 2;
+        set_default_budget(raised);
+        assert_eq!(default_budget(), raised);
+        assert_eq!(History::default().budget_bytes(), raised);
+        // An explicit budget is still an explicit budget.
+        assert_eq!(History::with_budget(64).budget_bytes(), 64);
+
+        set_default_budget(DEFAULT_BUDGET_BYTES);
+        assert_eq!(History::default().budget_bytes(), DEFAULT_BUDGET_BYTES);
+    }
+
     /// A patch is the *rectangle* a stroke covered, so its size follows the
     /// canvas and not the mark. On a 10000² document a stroke drawn across the
     /// picture damages the whole of it — 400 MB — and the default budget then
@@ -749,7 +870,10 @@ mod tests {
     /// would be a test nobody can run on a small machine.
     #[test]
     fn one_broad_stroke_on_a_large_canvas_all_but_fills_the_budget() {
-        let budget = History::default().budget_bytes();
+        // The shipped default rather than `History::default()`'s, which a
+        // preference can now move and which another test in this process may
+        // therefore have moved.
+        let budget = DEFAULT_BUDGET_BYTES;
         let patch = 10_000usize * 10_000 * 4;
         assert!(patch < budget, "not even one such stroke is held");
         assert!(

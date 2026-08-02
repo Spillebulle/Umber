@@ -401,7 +401,81 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
     );
 
     ui.add_space(16.0);
+    undo_section(ui, p, ed);
+
+    ui.add_space(16.0);
     autosave_section(ui, p, ed, actions);
+}
+
+/// How much memory one document's undo history may hold.
+///
+/// A section of its own rather than a line under Documents: the setting above
+/// is about what goes in a *file*, and this is about what a running session
+/// holds. They are both "the undo history" and they trade different things.
+fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "Undo memory");
+
+    ui.scope(|ui| {
+        ui.set_max_width(320.0);
+        // A ladder of doublings, like the autosave's expiry — the nearest rung
+        // to whatever the history is actually holding itself to, so a
+        // hand-edited figure between two rungs shows as the one it is closest
+        // to rather than resetting the setting the moment the pane is drawn.
+        let held = (ed.history.budget_bytes() / (1024 * 1024)) as u32;
+        let nearest = prefs::UNDO_BUDGET_LADDER
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, mb)| mb.abs_diff(held))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut step = nearest as f32;
+        if widgets::slider_row(
+            ui,
+            p,
+            "Keep up to",
+            &mut step,
+            0.0..=(prefs::UNDO_BUDGET_LADDER.len() - 1) as f32,
+            false,
+            |v| budget_label(prefs::UNDO_BUDGET_LADDER[budget_index(v)]),
+        ) {
+            let chosen = prefs::UNDO_BUDGET_LADDER[budget_index(step)];
+            // The one door, so the document being edited and the one opened
+            // next cannot end up on different limits — see `set_undo_budget`.
+            prefs::set_undo_budget(ed, chosen);
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        "Per document, not per session: four tabs at 1 GB each is four \
+         gigabytes of memory. How many steps that buys depends on the canvas, \
+         because an entry holds the whole rectangle a stroke covered — a sketch \
+         gets hundreds, while on a very large canvas a few broad strokes fill \
+         any figure offered here and the oldest are dropped. More costs memory \
+         the rest of the machine cannot then use; less costs how far back you \
+         can go. The History panel says when it has started dropping edits.",
+    );
+}
+
+/// A ladder step, clamped — a slider's value is a float and the ends can land a
+/// hair outside. [`ladder_index`]'s counterpart for the undo budget.
+fn budget_index(value: f32) -> usize {
+    (value.round().max(0.0) as usize).min(prefs::UNDO_BUDGET_LADDER.len() - 1)
+}
+
+/// A budget as the dialog says it: megabytes up to a gigabyte, then gigabytes.
+fn budget_label(megabytes: u32) -> String {
+    if megabytes < 1024 {
+        format!("{megabytes} MB")
+    } else {
+        let gb = megabytes as f32 / 1024.0;
+        if (gb - gb.round()).abs() < 0.01 {
+            format!("{} GB", gb.round() as u32)
+        } else {
+            format!("{gb:.1} GB")
+        }
+    }
 }
 
 /// Autosave: whether, how often, how long the internal copies are kept, and the
