@@ -989,8 +989,11 @@ about it:
 - **It asymptotes one level short of solid.** The scratch is `R8Unorm`, so once
   coverage reaches 254/255 a further half-coverage dab contributes `0.5/255` and
   rounds to nothing. A dab of *full* coverage does reach 255, because
-  `a + 1(1 − a)` is exactly 1. Sixteen-bit coverage would close a 0.4 % gap at
-  four times the bandwidth of the hottest texture in the frame.
+  `a + 1(1 − a)` is exactly 1. An `R16Float` scratch would close a 0.4 % gap at
+  twice the bandwidth of the hottest texture in the frame — measured against the
+  one shipped build-up preset it is worth at most 3 levels of 255, and it could
+  not carry the pen's 1024 pressure levels any further, because the layer alpha
+  it commits into is 8-bit too. CLAUDE.md's "Pressure" section has the working.
 
 Build-up only means anything where a dab is not solid: a bitmap tip, paper
 grain, or a pressure-opacity ramp. For an ordinary brush per-dab coverage is

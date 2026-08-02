@@ -22,6 +22,16 @@ use wgpu::util::DeviceExt;
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// The stroke scratch only needs coverage, so one channel instead of four —
 /// a 4x saving on the bandwidth of the hottest texture in the frame.
+///
+/// Eight bits because that is exactly the width of where the coverage is going:
+/// `LAYER_FORMAT`'s alpha channel is linear 8-bit (an sRGB format encodes RGB
+/// only), so commit re-quantises to 256 levels whatever the scratch held. The
+/// scratch therefore adds no loss of its own, and widening it cannot make the
+/// pen's 1024 pressure levels reach the canvas — only a wider *layer* could.
+/// `a_pressure_step_finer_than_the_layer_makes_no_mark` pins that, and the
+/// build-up target below has the one case where the width is not a wash.
+///
+/// Shared with the tip and grain masks, which are 8-bit source data anyway.
 const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// Instance buffer capacity, in dabs. A single frame only ever holds the dabs
@@ -87,10 +97,27 @@ const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
 /// opacity is still applied exactly once, at commit.
 ///
 /// The floor worth knowing about: the scratch is `R8Unorm`, so a dab weaker
-/// than about `1/255` rounds away and a stroke of them never builds. Real
-/// texture stamps are nowhere near that faint — the sparsest pack measured runs
-/// to a peak of 0.49 — and widening the hottest texture in the frame to sixteen
-/// bits to hold a coverage nobody can see would be the wrong trade.
+/// than about `1/255` rounds away and a stroke of them never builds, and one
+/// only a little above it stalls partway — an increment of `cov * (1 - a)` that
+/// falls below half a level stops moving the accumulator at all.
+///
+/// This is the one place a wider scratch would buy anything, and it was
+/// measured rather than argued. Against exact arithmetic, over the whole of the
+/// one shipped preset that sets `build_up` (`pack01-drybrush`, stamped along a
+/// stroke at its own spacing, 50 dabs deep), `R8Unorm` is at most **3 levels of
+/// 255** out and 2.8% of the stroke's pixels are more than one level out. The
+/// pathological case needs a *constant* faint coverage on one pixel for a
+/// hundred dabs, which a bitmap tip cannot produce: the mask slides under the
+/// stroke, so a pixel sees a different texel every dab. The mask is itself
+/// `R8Unorm` too — filtering can interpolate below `1/255` at the edge of an
+/// inked texel, but no *stored* value is that faint, so there is nothing for a
+/// wider scratch to recover.
+///
+/// The other half of the answer is that `R16Unorm` is not available: it needs
+/// `Features::TEXTURE_FORMAT_16BIT_NORM`, which Umber does not request, and
+/// even with it wgpu guarantees only `storage` usage — not `RENDER_ATTACHMENT`.
+/// `R16Float` is the only candidate that is a guaranteed blendable target on
+/// `Features::empty()`. See the pressure note in CLAUDE.md.
 const COVERAGE_BUILDUP_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
     format: STROKE_FORMAT,
     blend: Some(wgpu::BlendState {
