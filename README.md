@@ -230,13 +230,14 @@ rows and left for you to settle.
 
 ![The settings dialog, Shortcuts pane](docs/images/settings-shortcuts.png)
 
-**Input & pen** is not a page of settings — there is nothing to configure about
-the pointer — but a live reading of what your tablet is actually sending.
-Counters for mouse against pen events, the pressure the device reported beside
-the pressure Umber resolved from it, a trace of the last couple of hundred
-samples, and a strip to scribble in. It is the page to open when a pen feels
-wrong: it says whether the pen is reaching Umber as a pen at all, and whether
-pressure really falls to zero as you lift off.
+**Input & pen** is where pressure comes from, next to a live reading of what
+your tablet is actually sending. Counters for mouse against pen events, the
+choice of pressure source, the pressure the device reported beside the pressure
+Umber resolved from it, a trace of the last couple of hundred samples, and a
+strip to scribble in. It is the page to open when a pen feels wrong: it says
+whether the pen is reaching Umber as a pen at all, and whether pressure really
+falls to zero as you lift off — and the switch to a speed-derived stand-in is a
+few lines above the trace that shows what it did.
 
 Settings are a plain `key = value` file you can read, in
 `%APPDATA%\Umber\config`, `~/.config/umber` or
@@ -313,10 +314,10 @@ Everything except the held modifiers is rebindable. On macOS `Ctrl` here is
 **Pen pressure**: touch screens report it properly, and so do pens on Windows —
 a pen arrives through Windows Ink carrying 1024 levels. **Pens on macOS and
 Linux do not reach Umber through the window system yet**, so there it falls back
-to a flat setting or a speed-derived approximation, chosen in Settings →
-Pressure; a mouse always paints at full pressure. Settings → Input & pen shows
-you which of those is happening on your machine. A native tablet path for the
-other two platforms is on the roadmap.
+to a flat setting or a speed-derived approximation, chosen in Settings → Input &
+pen; a mouse always paints at full pressure. The same page shows you which of
+those is happening on your machine. A native tablet path for the other two
+platforms is on the roadmap.
 
 ## What is not there yet
 
