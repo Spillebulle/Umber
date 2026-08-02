@@ -287,9 +287,10 @@ already picks up a colour and resizes the brush. The modifier is read when the
 gesture starts, so you can let go of it part way through a lasso.
 
 The outline stays drawn whatever tool you pick up, because it is how you know
-your painting is being held back. It is a plain dashed line rather than
-animated marching ants: animating it means asking for a new frame for ever, and
-Umber sits still when you do.
+your painting is being held back, and its dashes travel — the classic marching
+ants. They march at sixteen frames a second rather than your monitor's rate,
+and only while something is selected, so a document you are not touching still
+sits still.
 
 ## Controls
 

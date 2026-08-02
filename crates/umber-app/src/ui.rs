@@ -258,18 +258,42 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     }
 }
 
+/// Length of one dash and the gap after it, in points.
+const ANT_DASH: f32 = 4.0;
+
+/// How fast the dashes travel along the outline, in points per second.
+///
+/// One full dash-and-gap period a second. Faster reads as a shimmer rather than
+/// a direction; slower and it is hard to be sure the line is moving at all,
+/// which is the whole point of the animation.
+const ANT_SPEED: f32 = 2.0 * ANT_DASH;
+
+/// How often a frame is asked for while a selection is on screen.
+///
+/// **This is the cost of the animation and it is the only thing paid for it.**
+/// Marching ants at the display's rate would mean a frame every 16 ms for as
+/// long as a document is open with something selected — the fifth of a core
+/// `render`'s `repaint_at` exists to stop being spent on a picture nobody is
+/// touching. Sixteen frames a second is a sixth of that: below about ten the
+/// dashes visibly hop rather than slide, and above about twenty nothing is
+/// gained that anybody can see in a four-point dash. At this rate the pattern
+/// advances half a point per frame, which reads as movement.
+///
+/// Asked for only where a selection or a gesture actually exists, so a document
+/// with nothing selected is exactly as idle as it was before.
+const ANT_FRAME_MS: u64 = 60;
+
 /// The selection, and the outline being drawn if one is.
 ///
 /// Drawn whatever tool is in hand, because it is how the artist knows their
-/// painting is being clipped. Not animated: "marching" ants would mean asking
-/// egui for a repaint every frame for ever, which is a fifth of a core spent on
-/// a document nobody is touching — the exact cost `render`'s `repaint_at`
-/// exists to avoid. A static dashed line says the same thing.
+/// painting is being clipped.
 ///
 /// Two passes, dark then light, so the outline reads over both a white canvas
 /// and a black one. Neither colour is a literal: `backdrop` and `accent` are
 /// each dark in one theme and light in the other, which is what makes the pair
-/// work on any artwork.
+/// work on any artwork. **Only the accent dashes move.** The dark line under
+/// them stays solid, so the pair still reads on any artwork at every instant of
+/// the animation rather than only when a dash happens to be over a dark pixel.
 fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     if ed.selection.is_none() && ed.selection_draft.is_none() {
         return;
@@ -288,10 +312,40 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         pos2(s.x / scale, s.y / scale)
     };
 
+    // egui's own clock, so the ants keep step with the frames actually painted
+    // rather than with how many of them there were. A dropped frame slides the
+    // pattern further; it does not make it fall behind.
+    //
+    // The offset counts *backwards* through the period so it stays positive:
+    // `dashes_from_line` starts its walk at `dash_offset` along the path, so a
+    // negative one would place the first dash before the path begins and draw
+    // it hanging off the end.
+    //
+    // Wrapped in f64 and only then narrowed: egui's clock counts from when the
+    // application started, and an f32 holding a day's worth of seconds has
+    // steps coarser than the dash is long — the ants would end a long session
+    // hopping between two positions.
+    let period = f64::from(2.0 * ANT_DASH);
+    let travelled = ui.input(|i| i.time) * f64::from(ANT_SPEED);
+    let phase = (period - travelled.rem_euclid(period)) as f32;
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(ANT_FRAME_MS));
+
     // Clipped to the canvas region: a selection scrolled under a panel must
     // not draw its outline across it.
     let painter = ui.painter().with_clip_rect(rect);
-    let mut screen: Vec<egui::Pos2> = Vec::new();
+    // Field by field, so the buffers can be borrowed while the selection and
+    // the draft are read. They are the editor's for the reason given there:
+    // this path now runs several times a second for as long as the document is
+    // open, so anything it allocates it allocates for ever.
+    let Editor {
+        selection,
+        selection_draft,
+        selection_outline,
+        selection_screen: screen,
+        selection_dashes: dashes,
+        ..
+    } = ed;
     let mut draw_ring = |ring: &[glam::Vec2], closed: bool| {
         if ring.len() < 2 {
             return;
@@ -306,31 +360,32 @@ fn selection_outline(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
         for pair in screen.windows(2) {
             painter.line_segment([pair[0], pair[1]], Stroke::new(1.0, p.backdrop));
         }
-        painter.extend(egui::Shape::dashed_line(
-            &screen,
+        dashes.clear();
+        egui::Shape::dashed_line_many_with_offset(
+            screen,
             Stroke::new(1.0, p.accent),
-            4.0,
-            4.0,
-        ));
+            &[ANT_DASH],
+            &[ANT_DASH],
+            phase,
+            dashes,
+        );
+        painter.extend(dashes.drain(..));
     };
 
-    if let Some(selection) = ed.selection.as_ref() {
+    if let Some(selection) = selection.as_ref() {
         for ring in selection.rings() {
             draw_ring(ring, true);
         }
     }
-    if let Some(draft) = ed.selection_draft.as_ref() {
+    if let Some(draft) = selection_draft.as_ref() {
         // Into the editor's own buffer rather than a fresh one: this is the
         // one part of the selection path that runs every frame.
-        draft.outline_into(&mut ed.selection_outline);
+        draft.outline_into(selection_outline);
         // Only the rectangle is closed while it is being drawn: its four
         // corners *are* the shape. A lasso mid-drag and a polygon two clicks in
         // are paths, and drawing the edge back to the start would promise a
         // shape the next moment is going to change.
-        draw_ring(
-            &ed.selection_outline,
-            draft.mode() == SelectionMode::Rectangle,
-        );
+        draw_ring(selection_outline, draft.mode() == SelectionMode::Rectangle);
     }
 }
 

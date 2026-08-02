@@ -281,6 +281,15 @@ pub struct Editor {
     /// `SelectionDraft::outline_into` takes a buffer at all: drawing the
     /// outline is the one part of the selection path that runs every frame.
     pub selection_outline: Vec<glam::Vec2>,
+    /// The same ring in screen points, and the dashes cut from it.
+    ///
+    /// Two more buffers for the same reason, and a stronger one since the ants
+    /// march: a document with a selection asks for a frame several times a
+    /// second for as long as it is open, so anything this path allocates it
+    /// allocates for ever. `Shape::dashed_line` returns a fresh `Vec` per ring
+    /// per frame; `dashed_line_many_with_offset` fills these instead.
+    pub selection_screen: Vec<egui::Pos2>,
+    pub selection_dashes: Vec<egui::Shape>,
     pub history: History,
     pub pressure: PressureModel,
     /// What the pointer stream has been doing lately, for Settings → Input &
@@ -380,6 +389,8 @@ impl Default for Editor {
             stroke: StrokeBuilder::new(),
             selection_draft: None,
             selection_outline: Vec::new(),
+            selection_screen: Vec::new(),
+            selection_dashes: Vec::new(),
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
