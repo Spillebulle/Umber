@@ -6,7 +6,8 @@ use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{
-    Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, Selection, TipMask,
+    Affine, Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, PixelRect, Selection,
+    TipMask, transform,
 };
 use wgpu::util::DeviceExt;
 
@@ -527,6 +528,88 @@ impl DabStyle {
     }
 }
 
+/// The pixels a floating transform starts from, and where they sit.
+///
+/// One struct for both ways in, because everything after the first submission is
+/// identical: a lift and a paste differ only in where the pixels come from and
+/// whether the layer beneath keeps them.
+pub struct FloatSource<'a> {
+    /// The layer the float sits over. Its contents are the backdrop the float
+    /// is previewed against, and a commit lands here.
+    pub slot: u32,
+    /// Where the floating pixels are before anything has been dragged, in
+    /// document space.
+    pub rect: PixelRect,
+    /// Pixels to put down, in layer-texture form (sRGB, alpha premultiplied in
+    /// linear space) and `rect`-sized. `None` **lifts** them out of `slot`
+    /// instead, leaving a hole where they were.
+    pub pixels: Option<&'a [u8]>,
+    /// Clips both the lift and the hole it leaves. Ignored for a paste, which
+    /// puts down exactly what it was given.
+    pub mask: Option<&'a Selection>,
+}
+
+/// Where a floating transform's pixels have been dragged to.
+#[derive(Clone, Copy, Debug)]
+pub struct FloatParams {
+    /// Destination document pixel back to where it came from — see
+    /// `umber_core::transform`. The resampler walks the destination, so this is
+    /// the direction the shader needs.
+    pub inverse: Affine,
+    /// The rectangle the result lands in, or `None` when the drag has carried
+    /// it clean off the canvas. `None` is not "nothing to do": the previous
+    /// destination still has to be restored.
+    pub dest: Option<PixelRect>,
+}
+
+/// A floating region: pixels lifted out of a layer or pasted onto one, being
+/// moved about before they are put down.
+///
+/// # How the preview cannot disagree with the commit
+///
+/// The stroke pipeline has two implementations of one blend — `composite.wgsl`
+/// previews and `commit.wgsl` bakes — and CLAUDE.md is emphatic about keeping
+/// them in step. This has none, and it is arranged that way rather than
+/// disciplined that way:
+///
+/// * [`Float::base`] holds the layer as it will be *underneath* the float — the
+///   original pixels, with the lifted region taken out. It is built once.
+/// * The preview is `base` restored over the damaged rectangle, then the
+///   transformed source drawn over it, into a spare slice of the layer array.
+///   The composite pass is handed that slice **in place of the layer's own**,
+///   so it composites a floating transform without knowing there is one: no new
+///   uniform, no new branch, not a line of `composite.wgsl` touched.
+/// * The commit is [`CanvasRenderer::render_float`] again, byte for byte, with
+///   the layer's own slice as the target instead of the spare one.
+///
+/// So the preview and the committed result are not two renderings that have to
+/// agree. They are the same two commands run twice, and the second one is the
+/// first with a different destination.
+struct Float {
+    /// The layer this float sits over, and where a commit lands.
+    layer_slot: u32,
+    /// The layer-array slice the composite pass draws in place of
+    /// [`Float::layer_slot`].
+    preview_slot: u32,
+    /// The layer with the lifted region removed. Canvas-sized.
+    base: wgpu::Texture,
+    /// The floating pixels at identity: canvas-sized, zero outside the region
+    /// that was lifted or pasted. Held so it outlives the bind group.
+    #[allow(dead_code)]
+    source: wgpu::Texture,
+    /// The selection's coverage, or a 1x1 placeholder. Snapshotted here rather
+    /// than read off the renderer's stroke-path mask, so the two features
+    /// cannot reach into each other. Held so it outlives the bind group.
+    #[allow(dead_code)]
+    mask: wgpu::Texture,
+    uniforms: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Where the previous preview landed. The next one restores this as well as
+    /// its own rectangle — without it the picture leaves a trail behind the
+    /// drag.
+    last_dest: Option<PixelRect>,
+}
+
 /// Where a smudging brush should sample the canvas, and what it is painting.
 ///
 /// The stack and stroke are the same ones the screen composite is given, and
@@ -636,6 +719,27 @@ struct ViewUniforms {
     layers: [[f32; 4]; MAX_LAYERS],
 }
 
+/// Mirrors `Xf` in `transform.wgsl`. Every member is a `vec2<f32>`, which is
+/// 8-aligned on both sides, so the packing is the obvious one — see the
+/// uniform-layout note in CLAUDE.md for why a `mat2x2` here would not be.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TransformUniforms {
+    rect_min: [f32; 2],
+    rect_max: [f32; 2],
+    doc_size: [f32; 2],
+    inv_x: [f32; 2],
+    inv_y: [f32; 2],
+    inv_t: [f32; 2],
+    mask_min: [f32; 2],
+    mask_size: [f32; 2],
+    use_mask: u32,
+    /// Scalar padding, not a vec3: see the uniform-layout note in CLAUDE.md.
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CommitUniforms {
@@ -742,6 +846,15 @@ struct Shared {
     commit_layout: wgpu::BindGroupLayout,
     commit_pipeline: wgpu::RenderPipeline,
     commit_erase_pipeline: wgpu::RenderPipeline,
+
+    transform_layout: wgpu::BindGroupLayout,
+    /// `dst * cov` — takes the selected pixels into the floating copy.
+    transform_keep_pipeline: wgpu::RenderPipeline,
+    /// `dst * (1 - cov)` — leaves the hole behind in the base.
+    transform_take_pipeline: wgpu::RenderPipeline,
+    /// The resampler: the floating copy through the inverse transform,
+    /// premultiplied source-over.
+    transform_draw_pipeline: wgpu::RenderPipeline,
 }
 
 pub struct CanvasRenderer {
@@ -819,6 +932,12 @@ pub struct CanvasRenderer {
 
     commit_bind_group: wgpu::BindGroup,
     commit_uniforms: wgpu::Buffer,
+
+    /// The floating transform in progress, if there is one. Everything it owns
+    /// is allocated when the gesture starts and given back when it ends —
+    /// two canvas-sized textures and a slice of the layer array is not
+    /// something to hold for a session in case somebody presses T.
+    float: Option<Float>,
 }
 
 impl Shared {
@@ -1050,6 +1169,86 @@ impl Shared {
             },
         );
 
+        // ---- transform pass -------------------------------------------------
+        let transform_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("transform"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/transform.wgsl").into()),
+        });
+        let transform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("transform-bgl"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(1),
+                sampler_entry(2),
+                texture_entry(3),
+            ],
+        });
+        let transform_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transform-pl"),
+            bind_group_layouts: &[Some(&transform_layout)],
+            immediate_size: 0,
+        });
+
+        // The two mask pipelines differ only in their blend state, and the
+        // blend state is the whole of what they do: `fs_mask` writes coverage
+        // into alpha and zero into colour, so with the source factor zeroed the
+        // target is scaled by the mask or by its complement. Written as one
+        // closure rather than two descriptors, for the reason the dab
+        // pipelines are.
+        let make_transform_pipeline = |label: &str, entry: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&transform_pl),
+                vertex: wgpu::VertexState {
+                    module: &transform_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &transform_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: LAYER_FORMAT,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let scale_by = |dst: wgpu::BlendFactor| {
+            let c = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: dst,
+                operation: wgpu::BlendOperation::Add,
+            };
+            wgpu::BlendState { color: c, alpha: c }
+        };
+        let transform_keep_pipeline = make_transform_pipeline(
+            "transform-keep",
+            "fs_mask",
+            scale_by(wgpu::BlendFactor::SrcAlpha),
+        );
+        let transform_take_pipeline = make_transform_pipeline(
+            "transform-take",
+            "fs_mask",
+            scale_by(wgpu::BlendFactor::OneMinusSrcAlpha),
+        );
+        let transform_draw_pipeline = make_transform_pipeline(
+            "transform-draw",
+            "fs_sample",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
+
         Self {
             sampler,
             grain_sampler,
@@ -1061,6 +1260,10 @@ impl Shared {
             commit_layout,
             commit_pipeline,
             commit_erase_pipeline,
+            transform_layout,
+            transform_keep_pipeline,
+            transform_take_pipeline,
+            transform_draw_pipeline,
         }
     }
 }
@@ -1219,6 +1422,7 @@ impl CanvasRenderer {
             view_uniforms,
             commit_bind_group,
             commit_uniforms,
+            float: None,
         }
     }
 
@@ -1407,6 +1611,12 @@ impl CanvasRenderer {
         self.clear_stroke(&mut enc);
         queue.submit(Some(enc.finish()));
 
+        // Its base and its floating copy are canvas-sized and its rectangles
+        // name pixels that no longer exist. Thrown away rather than resampled,
+        // for the reason the scratch is: a half-finished gesture has no meaning
+        // at a new size, and the caller owes this no stroke and no float in
+        // flight anyway.
+        self.end_float();
         // A sample recorded against the old canvas would be read back as if it
         // belonged to the new one.
         self.reset_probes();
@@ -1928,6 +2138,500 @@ impl CanvasRenderer {
         for view in &self.layers.slot_views {
             clear_view(encoder, view, "clear-layer");
         }
+    }
+
+    // --- floating transforms ------------------------------------------------
+
+    /// The layer whose slice the composite pass must be shown the preview slice
+    /// for instead, and that slice — or `None` when nothing is floating.
+    ///
+    /// This is the whole of how a floating transform reaches the screen. The
+    /// caller swaps the slot in its `LayerDraw` for this one and
+    /// `composite.wgsl` is untouched: the preview slice holds exactly what the
+    /// layer will hold once the float is put down, so it composites at the
+    /// right position, under the right blend mode, at the right opacity,
+    /// without any of that being restated here. See [`Float`].
+    pub fn float_preview(&self) -> Option<(u32, u32)> {
+        self.float.as_ref().map(|f| (f.layer_slot, f.preview_slot))
+    }
+
+    pub fn float_in_flight(&self) -> bool {
+        self.float.is_some()
+    }
+
+    /// Pick pixels up off a layer, or put pasted ones down over it, ready to be
+    /// dragged about.
+    ///
+    /// `reserved` is the document's slot high-water mark — everything the layer
+    /// stack might use — because the preview needs a slice of the same array
+    /// and must not take one a layer could later be given. Returns the preview
+    /// slice, or `None` when there is no room for it: a document already using
+    /// every slice the shader's array has cannot also hold a preview, and
+    /// refusing is better than previewing into a layer.
+    ///
+    /// Submits twice, deliberately. A paste arrives through
+    /// `Queue::write_texture`, whose writes are flushed *before* the command
+    /// buffers of the submission they precede — so clearing the floating copy
+    /// in the same encoder would wipe the pixels that were just written into
+    /// it. The clear therefore goes in its own submission. This runs once per
+    /// gesture, where `start_stroke` already submits.
+    pub fn begin_float(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        reserved: u32,
+        source: &FloatSource<'_>,
+    ) -> Option<u32> {
+        self.end_float();
+        if reserved as usize >= MAX_LAYERS {
+            log::error!("no room for a transform preview beside {reserved} layer slots");
+            return None;
+        }
+        let preview_slot = reserved;
+        self.ensure_slots(device, queue, preview_slot + 1);
+        if source.slot >= self.layers.capacity {
+            log::error!("transform of slot {} beyond capacity", source.slot);
+            return None;
+        }
+
+        let base = self.make_float_texture(device, "umber-float-base");
+        let base_view = base.create_view(&wgpu::TextureViewDescriptor::default());
+        let floating = self.make_float_texture(device, "umber-float-source");
+        let floating_view = floating.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Snapshotted rather than shared with the dab pass's mask: the two
+        // features never run at once, and a binding reached across would tie a
+        // live transform to whatever the next stroke set.
+        let (mask, mask_min, mask_size, use_mask) = match source.mask {
+            Some(sel) => {
+                let r = sel.bounds();
+                (
+                    upload_coverage(
+                        device,
+                        queue,
+                        r.width,
+                        r.height,
+                        sel.coverage(),
+                        "umber-float-mask",
+                    ),
+                    [r.x as f32, r.y as f32],
+                    [r.width as f32, r.height as f32],
+                    1,
+                )
+            }
+            // Not zero for the size: the shader divides by it, and a NaN would
+            // take the whole quad with it rather than merely being discarded.
+            None => (
+                make_coverage_texture(device, 1, 1, "umber-float-mask"),
+                [0.0, 0.0],
+                [1.0, 1.0],
+                0,
+            ),
+        };
+        let mask_view = mask.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transform-uniforms"),
+            size: std::mem::size_of::<TransformUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let make_bind_group = |source: &wgpu::TextureView, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.shared.transform_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.shared.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&mask_view),
+                    },
+                ],
+            })
+        };
+        let bind_group = make_bind_group(&floating_view, "transform-bg");
+        // The mask passes render *into* the floating copy, so they cannot have
+        // it bound for sampling as well — a colour target is an exclusive usage
+        // and wgpu refuses the pass outright. `fs_mask` never reads slot 1, so
+        // the mask stands in for it: what is bound there only has to exist.
+        let mask_bind_group = make_bind_group(&mask_view, "transform-mask-bg");
+
+        // First submission: the floating copy starts empty, whatever the
+        // allocation held. See the note on this function.
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("begin-float-clear"),
+        });
+        clear_view(&mut enc, &floating_view, "clear-float-source");
+        queue.submit(Some(enc.finish()));
+
+        let lifting = source.pixels.is_none();
+        if let Some(pixels) = source.pixels {
+            write_rect(
+                queue,
+                &floating,
+                wgpu::Origin3d {
+                    x: source.rect.x,
+                    y: source.rect.y,
+                    z: 0,
+                },
+                source.rect,
+                pixels,
+            );
+        }
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("begin-float"),
+        });
+        // The base is the layer as the float will sit on it. Copied whole
+        // because the drag can carry the picture anywhere on the canvas, and
+        // every later frame restores out of this.
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: source.slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &base,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        if lifting {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: source.rect.x,
+                        y: source.rect.y,
+                        z: source.slot,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &floating,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: source.rect.x,
+                        y: source.rect.y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: source.rect.width,
+                    height: source.rect.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        // One write, two passes: the mask is applied to the floating copy and
+        // its complement to the base, over the same rectangle with the same
+        // mask, so both read the same uniforms. Two writes here would be a bug
+        // — `write_buffer` is staged, so both passes in one encoder would see
+        // whichever was written last.
+        queue.write_buffer(
+            &uniforms,
+            0,
+            bytemuck::bytes_of(&TransformUniforms {
+                rect_min: [source.rect.x as f32, source.rect.y as f32],
+                rect_max: [
+                    (source.rect.x + source.rect.width) as f32,
+                    (source.rect.y + source.rect.height) as f32,
+                ],
+                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
+                inv_x: [1.0, 0.0],
+                inv_y: [0.0, 1.0],
+                inv_t: [0.0, 0.0],
+                mask_min,
+                mask_size,
+                use_mask,
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            }),
+        );
+        if lifting {
+            // A lift outside a selection takes the rectangle whole, and with
+            // `use_mask` clear the shader's coverage is exactly 1.0 — so this
+            // pass would be the identity and is skipped rather than run.
+            if use_mask != 0 {
+                self.mask_pass(
+                    &mut enc,
+                    &self.shared.transform_keep_pipeline,
+                    &mask_bind_group,
+                    &floating_view,
+                    "float-keep",
+                );
+            }
+            self.mask_pass(
+                &mut enc,
+                &self.shared.transform_take_pipeline,
+                &mask_bind_group,
+                &base_view,
+                "float-take",
+            );
+        }
+        // The preview starts as the base: the hole is visible the moment the
+        // pixels are picked up, before anything has been dragged.
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &base,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: preview_slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+
+        self.float = Some(Float {
+            layer_slot: source.slot,
+            preview_slot,
+            base,
+            source: floating,
+            mask,
+            uniforms,
+            bind_group,
+            last_dest: None,
+        });
+        Some(preview_slot)
+    }
+
+    /// Redraw the preview for a transform that has moved.
+    ///
+    /// Cheap enough for the drawing path: it restores only the rectangle the
+    /// previous preview and this one between them cover, and draws only where
+    /// the pixels land. Nothing is allocated.
+    ///
+    /// One uniform write per encoder — see [`Self::begin_float`] — so this and
+    /// [`Self::commit_float`] must not share one.
+    pub fn draw_float(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &FloatParams,
+    ) {
+        let Some(float) = self.float.as_ref() else {
+            return;
+        };
+        let (preview_slot, last) = (float.preview_slot, float.last_dest);
+        if let Some(restore) = span(last, params.dest) {
+            self.render_float(queue, encoder, preview_slot, restore, params);
+        }
+        if let Some(float) = self.float.as_mut() {
+            float.last_dest = params.dest;
+        }
+    }
+
+    /// Put the floating pixels down into the layer they belong to.
+    ///
+    /// `damage` must cover the source *and* the destination — see
+    /// `Transform::damage` — and the caller must have captured that rectangle
+    /// for undo before calling, exactly as `finish_stroke` does.
+    ///
+    /// This is [`Self::draw_float`]'s own body with the layer's slice as the
+    /// target instead of the preview's, which is what makes the committed
+    /// result the preview rather than a second rendering of it.
+    pub fn commit_float(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        damage: PixelRect,
+        params: &FloatParams,
+    ) {
+        let Some(float) = self.float.as_ref() else {
+            return;
+        };
+        self.render_float(queue, encoder, float.layer_slot, damage, params);
+    }
+
+    /// Give the floating transform's storage back. Nothing is written: the
+    /// layer was never touched, so abandoning a transform is exactly this.
+    pub fn end_float(&mut self) {
+        self.float = None;
+    }
+
+    /// Restore `restore` from the base and draw the floating pixels over it,
+    /// into the layer-array slice `slot`.
+    fn render_float(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+        restore: PixelRect,
+        params: &FloatParams,
+    ) {
+        let Some(float) = self.float.as_ref() else {
+            return;
+        };
+        let Some(view) = self.layers.slot_views.get(slot as usize) else {
+            log::error!("transform into slot {slot} beyond capacity");
+            return;
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &float.base,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: restore.x,
+                    y: restore.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.layers.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: restore.x,
+                    y: restore.y,
+                    z: slot,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: restore.width,
+                height: restore.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let Some(dest) = params.dest else {
+            return;
+        };
+        let columns = params.inverse.columns();
+        queue.write_buffer(
+            &float.uniforms,
+            0,
+            bytemuck::bytes_of(&TransformUniforms {
+                rect_min: [dest.x as f32, dest.y as f32],
+                rect_max: [(dest.x + dest.width) as f32, (dest.y + dest.height) as f32],
+                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
+                inv_x: columns[0],
+                inv_y: columns[1],
+                inv_t: columns[2],
+                // Unused by `fs_sample`: the mask was applied once, when the
+                // pixels were lifted. Applying it again per frame would clip
+                // the *moved* picture by where it used to be.
+                mask_min: [0.0, 0.0],
+                mask_size: [1.0, 1.0],
+                use_mask: 0,
+                _pad0: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            }),
+        );
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("float-draw"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.shared.transform_draw_pipeline);
+        pass.set_bind_group(0, &float.bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    /// One of the two mask passes: scale a target by the selection's coverage
+    /// or by its complement, over whatever rectangle the uniforms name.
+    fn mask_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        view: &wgpu::TextureView,
+        label: &str,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    /// A canvas-sized texture in layer form, for the two a float holds.
+    fn make_float_texture(&self, device: &wgpu::Device, label: &str) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: self.doc_size.x,
+                height: self.doc_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LAYER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
     }
 
     /// A document-sized offscreen target for the export composite.
@@ -2817,30 +3521,59 @@ impl CanvasRenderer {
             );
             return;
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.layers.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: rect.x,
-                    y: rect.y,
-                    z: slot,
-                },
-                aspect: wgpu::TextureAspect::All,
+        write_rect(
+            queue,
+            &self.layers.texture,
+            wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y,
+                z: slot,
             },
+            rect,
             bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(rect.width * 4),
-                rows_per_image: Some(rect.height),
-            },
-            wgpu::Extent3d {
-                width: rect.width,
-                height: rect.height,
-                depth_or_array_layers: 1,
-            },
         );
     }
+}
+
+/// The smallest rectangle covering both, where either may be absent.
+///
+/// What a preview has to restore: the rectangle it wrote last time and the one
+/// it is about to write. Missing either leaves a trail of the drag behind on
+/// the canvas.
+fn span(a: Option<PixelRect>, b: Option<PixelRect>) -> Option<PixelRect> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(transform::union(a, b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Upload tightly packed RGBA8 into a rectangle of a texture.
+fn write_rect(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    origin: wgpu::Origin3d,
+    rect: PixelRect,
+    bytes: &[u8],
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(rect.width * 4),
+            rows_per_image: Some(rect.height),
+        },
+        wgpu::Extent3d {
+            width: rect.width,
+            height: rect.height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn mode_index(mode: BrushMode) -> u32 {

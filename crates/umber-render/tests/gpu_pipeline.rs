@@ -10,11 +10,11 @@ use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
-    InputPoint, Modulation, PixelRect, ResponseCurve, Selection, StrokeBuilder, TipMask,
+    InputPoint, Modulation, PixelRect, ResponseCurve, Selection, StrokeBuilder, TipMask, Transform,
 };
 use umber_render::{
-    CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, Gpu, LayerDraw, ProbeParams,
-    StrokeStyle,
+    CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource, Gpu,
+    LayerDraw, ProbeParams, StrokeStyle,
 };
 
 const DOC: u32 = 64;
@@ -174,6 +174,23 @@ impl Harness {
 
     fn set_background(&mut self, background: Background) {
         self.canvas.set_background(background);
+    }
+
+    /// Put an exact block of bytes into a layer.
+    ///
+    /// Straight into the texture rather than through a dab, because the
+    /// transform tests need a crisp rectangle whose every pixel is known: a
+    /// stamped dab has an antialiased edge, and half the point of those tests is
+    /// asserting where the edge of a moved region ended up.
+    fn write_block(&mut self, slot: u32, rect: PixelRect, rgba: [u8; 4]) {
+        let bytes: Vec<u8> = rgba
+            .iter()
+            .copied()
+            .cycle()
+            .take((rect.area() * 4) as usize)
+            .collect();
+        self.canvas
+            .write_layer_rect(&self.gpu.queue, slot, rect, &bytes);
     }
 
     /// Paint a slot solid with `color` around the sample point.
@@ -2847,4 +2864,262 @@ fn a_cancelled_capture_hands_its_buffers_back_rather_than_being_dropped() {
         h.canvas.begin_capture(&[0], &draws),
         "the slot stayed taken"
     );
+}
+
+// --- floating transforms ----------------------------------------------------
+
+/// Everything the transform tool asks of the GPU, in the order it asks it.
+///
+/// The offset is a whole number of pixels on purpose: the resampler's bilinear
+/// taps then land exactly on texel centres, so the moved block is byte for byte
+/// the block that was lifted and the assertions can be exact rather than
+/// approximate. Filtering itself is the sampler's and is not what this is for —
+/// what it is for is that the picture lands where `Transform` said it would,
+/// that the layer is untouched until the commit, and that one undo patch puts
+/// back both the hole and the place it went.
+#[test]
+fn a_transform_lands_where_the_maths_says_and_undo_restores_both_ends() {
+    let mut h = harness_or_skip!();
+    let block = PixelRect {
+        x: 10,
+        y: 10,
+        width: 10,
+        height: 10,
+    };
+    let red = [220, 40, 30, 255];
+    h.write_block(0, block, red);
+    assert_eq!(h.pixel(12, 12), red, "the block did not go in");
+
+    let mut xf = Transform::identity(block);
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: block,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+    assert_eq!(h.canvas.float_preview(), Some((0, preview)));
+
+    // Picking the pixels up leaves a hole in the *preview*, and leaves the
+    // layer exactly as it was: nothing is written until the commit, which is
+    // what makes abandoning a transform free and what makes the undo patch
+    // captured at commit time the pre-transform pixels.
+    assert_eq!(h.pixel_in(preview, 12, 12), [0, 0, 0, 0], "no hole");
+    assert_eq!(h.pixel(12, 12), red, "the layer was written to early");
+
+    xf.offset = Vec2::splat(20.0);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    assert_eq!(h.pixel_in(preview, 32, 32), red, "the preview did not move");
+    assert_eq!(h.pixel_in(preview, 12, 12), [0, 0, 0, 0], "the hole filled");
+    assert_eq!(h.pixel(32, 32), [0, 0, 0, 0], "the layer moved too early");
+
+    // Commit, capturing undo first exactly as `finish_stroke` does.
+    let damage = xf.damage(UVec2::splat(DOC), true).expect("something to do");
+    let before = h
+        .canvas
+        .read_layer_rect(&h.gpu.device, &h.gpu.queue, 0, damage);
+    let mut enc = h.encoder();
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float();
+    assert_eq!(h.canvas.float_preview(), None);
+
+    assert_eq!(h.pixel(32, 32), red, "the commit did not land");
+    assert_eq!(h.pixel(12, 12), [0, 0, 0, 0], "the hole was not committed");
+
+    // One patch, both ends. A patch covering only where the pixels went would
+    // undo to a document that still had the hole in it.
+    h.canvas.write_layer_rect(&h.gpu.queue, 0, damage, &before);
+    assert_eq!(h.pixel(12, 12), red, "undo did not restore the source");
+    assert_eq!(h.pixel(32, 32), [0, 0, 0, 0], "undo left the copy behind");
+}
+
+/// A transform with a selection in hand moves what the selection covers and
+/// leaves the rest of the layer alone — both the pixels it takes and the hole
+/// it leaves.
+#[test]
+fn a_transform_moves_only_what_the_selection_covers() {
+    let mut h = harness_or_skip!();
+    let block = PixelRect {
+        x: 10,
+        y: 10,
+        width: 20,
+        height: 20,
+    };
+    let red = [220, 40, 30, 255];
+    h.write_block(0, block, red);
+
+    // The top-left quarter of the block.
+    let selection = Selection::rectangle(Vec2::splat(10.0), Vec2::splat(20.0), UVec2::splat(DOC))
+        .expect("a selection");
+    let source = selection.bounds();
+    let mut xf = Transform::identity(source);
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: source,
+                pixels: None,
+                mask: Some(&selection),
+            },
+        )
+        .expect("no room for a preview");
+
+    xf.offset = Vec2::new(30.0, 0.0);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    assert_eq!(h.pixel_in(preview, 12, 12), [0, 0, 0, 0], "no hole");
+    assert_eq!(h.pixel_in(preview, 42, 12), red, "the copy did not arrive");
+    assert_eq!(
+        h.pixel_in(preview, 25, 25),
+        red,
+        "the unselected part of the block was taken too"
+    );
+}
+
+/// A paste puts pixels down over a layer without disturbing it, which is what
+/// makes an abandoned paste cost nothing. Its damage is the destination alone:
+/// there is no hole to restore, so a patch spanning back to where the pixels
+/// were first placed would write over work the paste never touched.
+#[test]
+fn a_pasted_float_leaves_the_layer_beneath_it_alone() {
+    let mut h = harness_or_skip!();
+    let under = PixelRect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 40,
+    };
+    let blue = [30, 60, 220, 255];
+    let green = [40, 200, 60, 255];
+    h.write_block(0, under, blue);
+
+    let landing = PixelRect {
+        x: 20,
+        y: 20,
+        width: 8,
+        height: 8,
+    };
+    let pixels: Vec<u8> = green
+        .iter()
+        .copied()
+        .cycle()
+        .take((landing.area() * 4) as usize)
+        .collect();
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: landing,
+                pixels: Some(&pixels),
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+
+    let xf = Transform::identity(landing);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    assert_eq!(h.pixel_in(preview, 24, 24), green, "the paste is not there");
+    assert_eq!(h.pixel_in(preview, 5, 5), blue, "the layer under it moved");
+    assert_eq!(h.pixel(24, 24), blue, "the layer was written to early");
+
+    let damage = xf
+        .damage(UVec2::splat(DOC), false)
+        .expect("something to do");
+    let mut enc = h.encoder();
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float();
+    assert_eq!(h.pixel(24, 24), green, "the paste did not commit");
+    assert_eq!(h.pixel(5, 5), blue, "the commit reached past its damage");
+}
+
+/// The drag has to clean up after itself. A preview that only drew where the
+/// pixels are now would leave every earlier position of them on the canvas —
+/// which is why `draw_float` restores the span of the previous destination and
+/// this one rather than only its own.
+#[test]
+fn a_dragged_float_leaves_no_trail_behind_it() {
+    let mut h = harness_or_skip!();
+    let block = PixelRect {
+        x: 4,
+        y: 4,
+        width: 8,
+        height: 8,
+    };
+    let red = [220, 40, 30, 255];
+    h.write_block(0, block, red);
+
+    let mut xf = Transform::identity(block);
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: block,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+
+    for step in 1..=3 {
+        xf.offset = Vec2::splat(10.0 * step as f32);
+        let params = FloatParams {
+            inverse: xf.inverse(),
+            dest: xf.dest_rect(UVec2::splat(DOC)),
+        };
+        let mut enc = h.encoder();
+        h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+        h.gpu.queue.submit(Some(enc.finish()));
+    }
+
+    assert_eq!(h.pixel_in(preview, 36, 36), red, "the block is not here");
+    for at in [(6, 6), (16, 16), (26, 26)] {
+        assert_eq!(
+            h.pixel_in(preview, at.0, at.1),
+            [0, 0, 0, 0],
+            "a copy was left at {at:?}"
+        );
+    }
 }
