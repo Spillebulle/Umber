@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
     Brush, Color, Dab, Document, Edit, EditBody, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
@@ -1029,6 +1030,9 @@ impl UmberApp {
             Action::SaveAs => {
                 self.save_document(true);
             }
+            // Only the dialog. The chord asks the question; it does not write a
+            // file behind the artist's back.
+            Action::Export => self.editor.export_form.open = true,
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
             Action::Deselect => self.editor.deselect(),
@@ -1363,38 +1367,95 @@ impl UmberApp {
         true
     }
 
-    /// Flatten the visible stack and write it to a PNG the user picks.
-    fn export_png(&mut self) {
+    /// Flatten the visible stack and write it out in the format the export
+    /// dialog settled on.
+    ///
+    /// The pixels come from `export_rgba` — the screen composite pass with an
+    /// export flag — and nothing here flattens anything. That is the whole
+    /// reason a white-backed document exports opaque and a transparent one
+    /// keeps its alpha without this function knowing a `Background` exists: the
+    /// background composites under the stack *inside* that pass.
+    ///
+    /// Encoding and writing happen here, on the event loop, exactly as an
+    /// explicit Save's blocking readback does. It is not threaded, and that is
+    /// a decision rather than an omission: the file dialog immediately above
+    /// blocks the application anyway, no stroke can be in flight (the
+    /// transform is committed and the pointer is on a menu), and a threaded
+    /// encode would have to hold a copy of the whole picture and report its
+    /// failure into a document that may by then be a different one. The
+    /// autosave threads its writer because *nobody asked for it*; this one was
+    /// asked for.
+    fn export(&mut self, options: umber_core::ExportOptions) {
         self.finish_transform();
         let id = self.editor.session.active_id();
-        // The tab is named after its file once it has one, so the suggestion
-        // has to lose that extension or it comes out as `sketch.ora.png`.
-        let stem = self.editor.session.active_title();
-        let stem = stem
-            .strip_suffix(&format!(".{}", docformat::EXTENSION))
-            .unwrap_or(stem);
-        let suggested = format!("{stem}.png");
+        let suggested =
+            export::default_file_name(self.editor.session.active_title(), options.format);
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
             return;
         };
 
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Export PNG")
-            .add_filter("PNG image", &["png"])
+        let Some(picked) = rfd::FileDialog::new()
+            .set_title(format!("Export {}", options.format.label()))
+            .add_filter(options.format.filter(), options.format.extensions())
             .set_file_name(suggested)
             .save_file()
         else {
             return;
         };
+        // The format is the dialog's, so a name that disagrees with it is
+        // reported rather than obeyed — a filename must not overrule a control
+        // the artist just set. See `export::target`.
+        let target = export::target(&picked, options.format);
+        let name = file_name_of(&target.path);
 
         let layers = self.editor.layer_draws(None);
         let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
-
         let size = self.editor.doc.size;
-        match write_png(&path, size.x, size.y, &pixels) {
-            Ok(()) => log::info!("exported {}", path.display()),
-            Err(e) => log::error!("could not write {}: {e}", path.display()),
+
+        let written = export::encode(&pixels, size.x, size.y, &options)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                // `docformat`'s atomic write, not a second temp-and-rename: an
+                // export that dies halfway must not replace a good file with a
+                // truncated one either.
+                docformat::write_encoded(&target.path, &bytes)
+                    .map(|()| bytes.len())
+                    .map_err(|e| e.to_string())
+            });
+
+        match written {
+            Ok(bytes) => {
+                log::info!(
+                    "exported {} — {} × {} as {}, {bytes} bytes",
+                    target.path.display(),
+                    size.x,
+                    size.y,
+                    options.format.label(),
+                );
+                // Said out loud, because it is the one thing about this export
+                // the artist did not choose. Silence would leave them looking
+                // for a file under the name they typed.
+                if let Some(named) = target.named {
+                    self.editor.notice = Some(Notice {
+                        title: format!("Exported as “{name}”"),
+                        lines: vec![format!(
+                            "The name given ended in .{} but {} was the format chosen, so \
+                             {}'s own extension was added.",
+                            named.extension(),
+                            options.format.label(),
+                            options.format.label(),
+                        )],
+                    });
+                }
+            }
+            Err(error) => {
+                log::error!("could not export {}: {error}", target.path.display());
+                self.editor.notice = Some(Notice {
+                    title: format!("Could not export “{name}”"),
+                    lines: vec![error],
+                });
+            }
         }
     }
 
@@ -1772,8 +1833,11 @@ impl UmberApp {
         if actions.clear {
             self.clear_active_layer();
         }
-        if actions.export {
-            self.export_png();
+        if actions.open_export {
+            self.editor.export_form.open = true;
+        }
+        if let Some(options) = actions.export {
+            self.export(options);
         }
         if actions.save {
             self.save_document(false);
@@ -2891,23 +2955,6 @@ fn swap_patch(canvas: &CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> PixelPa
         .map(|(rect, bytes)| PatchPiece::new(*rect, bytes))
         .collect();
     PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
-}
-
-/// Write straight-alpha RGBA8 out as a PNG.
-fn write_png(
-    path: &std::path::Path,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::create(path)?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    // The composite shader gamma-encodes on the way out, so the bytes are sRGB.
-    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-    encoder.write_header()?.write_image_data(pixels)?;
-    Ok(())
 }
 
 #[cfg(test)]

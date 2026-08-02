@@ -356,7 +356,8 @@ pub enum CloseChoice {
     Cancel,
     /// Write the document out, keeping its layers, and then close it.
     Save,
-    /// Export a flat PNG — everything visible, but as one image.
+    /// Open the export dialog — everything visible, but as one image, in
+    /// whichever format it settles on.
     Export,
     Close,
 }
@@ -403,9 +404,11 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Saving keeps every layer. A flat PNG keeps only the picture.")
-                    .size(text::SMALL)
-                    .color(p.text_dim),
+                egui::RichText::new(
+                    "Saving keeps every layer. An exported image keeps only the picture.",
+                )
+                .size(text::SMALL)
+                .color(p.text_dim),
             );
 
             ui.add_space(16.0);
@@ -420,7 +423,7 @@ pub fn close_prompt(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) -> Option
                     if button(ui, p, if has_file { "Save" } else { "Save…" }, true) {
                         choice = Some(CloseChoice::Save);
                     }
-                    if button(ui, p, "Export PNG…", false) {
+                    if button(ui, p, "Export…", false) {
                         choice = Some(CloseChoice::Export);
                     }
                 });

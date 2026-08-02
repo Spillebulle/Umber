@@ -22,6 +22,7 @@ mod dock;
 /// `panels` — stays private behind [`docshot::generate`].
 pub mod docshot;
 mod editor;
+mod exportdlg;
 mod icons;
 mod inputlog;
 mod keylayout;

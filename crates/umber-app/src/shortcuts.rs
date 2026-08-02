@@ -16,6 +16,7 @@ use winit::keyboard::{KeyCode, ModifiersState};
 pub enum Action {
     Save,
     SaveAs,
+    Export,
     Undo,
     Redo,
     Deselect,
@@ -44,9 +45,10 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::Save,
         Action::SaveAs,
+        Action::Export,
         Action::Undo,
         Action::Redo,
         Action::Deselect,
@@ -74,6 +76,7 @@ impl Action {
         match self {
             Action::Save => "Save",
             Action::SaveAs => "Save as…",
+            Action::Export => "Export image…",
             Action::Undo => "Undo",
             Action::Redo => "Redo",
             Action::Deselect => "Deselect",
@@ -100,7 +103,7 @@ impl Action {
     /// Grouping for the settings list.
     pub fn category(self) -> &'static str {
         match self {
-            Action::Save | Action::SaveAs => "File",
+            Action::Save | Action::SaveAs | Action::Export => "File",
             Action::Undo | Action::Redo | Action::Deselect | Action::Copy | Action::Paste => "Edit",
             // Its own group rather than "Edit": these change the document
             // itself rather than the last thing done to it, and they are the
@@ -253,6 +256,10 @@ pub fn defaults() -> Vec<Binding> {
         // File
         binding(Action::Save, KeyCode::KeyS, true, false, false),
         binding(Action::SaveAs, KeyCode::KeyS, true, true, false),
+        // Ctrl+Shift+E, which is what every other painting application binds
+        // export to. Plain Ctrl+E is free, but the dialog it opens leads to a
+        // file dialog, and the shifted chord is the one people's hands know.
+        binding(Action::Export, KeyCode::KeyE, true, true, false),
         // Edit
         binding(Action::Undo, KeyCode::KeyZ, true, false, false),
         binding(Action::Redo, KeyCode::KeyZ, true, true, false),

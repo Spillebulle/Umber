@@ -178,8 +178,13 @@ one that refuses: a refusal sends you to export an `.ora`, while a wrong import
 wastes an afternoon before you notice the colours moved.
 
 Several documents are open at once, in tabs, each with its own layers, history
-and view. **Export flat PNG** means what it says — one image, for showing
-people. Save is what keeps the layers.
+and view. **Export image** (`Ctrl+Shift+E`) flattens everything visible into one
+picture, for showing people; Save is what keeps the layers. It writes PNG, JPEG,
+TIFF, GIF or BMP, and it says what each one will cost *this* document before it
+writes anything: three of them hold no transparency, so a document with any is
+painted onto a matte colour you choose — white, not black — and GIF's 256
+colours are named as well. An opaque document is told it loses nothing, because
+a warning shown every time is a warning nobody reads.
 
 **A saved document carries its undo history**, so one reopened tomorrow can
 still be stepped back through, redo included, with the times intact. It rides as

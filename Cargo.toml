@@ -42,6 +42,20 @@ env_logger = "0.11"
 # *compressor* we would never call.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 png = "0.18"
+# Flat image export (umber-core::export), and *only* the four formats the
+# export dialog offers on top of PNG. `default-features = false` matters here:
+# the default set drags in AVIF, EXR, HDR, DDS and half a dozen more decoders
+# Umber never calls, and `rayon` with them.
+#
+# PNG is not in the list on purpose — it stays on the `png` crate above, which
+# is what lets an exported PNG carry the `sRGB` chunk saying what the composite
+# shader already did. See `export`'s module docs.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "tiff",
+    "gif",
+    "bmp",
+] }
 quick-xml = "0.41"
 psd = "0.3.5"
 # Brush library data. These are plain-data crates with no GPU or windowing

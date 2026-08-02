@@ -35,7 +35,13 @@ use umber_core::{
 #[derive(Default, Clone, Copy)]
 pub struct UiActions {
     pub clear: bool,
-    pub export: bool,
+    /// Put the Export dialog up. Nothing is written by this: it only asks the
+    /// format, and the answer comes back as `export`.
+    pub open_export: bool,
+    /// Ask for a file and write the flattened document into it, encoded like
+    /// this. The caller's, because the file dialog blocks and the pixels come
+    /// off the GPU. See [`crate::exportdlg`].
+    pub export: Option<umber_core::ExportOptions>,
     /// Write the document to the file it came from, asking for one if it has
     /// none yet.
     pub save: bool,
@@ -189,6 +195,13 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     actions.create_document = canvas.create;
     actions.canvas_change = canvas.change;
 
+    // Here for the same reason, and it answers with an encoding rather than
+    // doing one: the file dialog it leads to blocks, and the pixels are the
+    // GPU's.
+    let mut exporting = crate::exportdlg::Outcome::default();
+    crate::exportdlg::show(root, &p, ed, &mut exporting);
+    actions.export = exporting.export;
+
     // Before the close prompt, and above it: this one is the answer to "the
     // window is closing", which supersedes any question about a single tab.
     match tabs::quit_prompt(root, &p, ed) {
@@ -205,7 +218,7 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         Some(tabs::CloseChoice::Save) => actions.save_and_close = ed.ui.close_prompt.take(),
         // Export keeps a copy of the picture but is not an answer to "close
         // this?", so the prompt stays open behind it.
-        Some(tabs::CloseChoice::Export) => actions.export = true,
+        Some(tabs::CloseChoice::Export) => actions.open_export = true,
         Some(tabs::CloseChoice::Cancel) | None => {}
     }
     tabs::notice(root, &p, ed);
@@ -815,14 +828,14 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     actions.clear = true;
                     ui.close();
                 }
-                if ui
-                    .button("Export flat PNG…")
+                if menu_item(ui, "Export image…", Action::Export)
                     .on_hover_text(
-                        "One flattened image, for showing people. Save keeps the layers.",
+                        "One flattened image — PNG, JPEG, TIFF, GIF or BMP — for showing \
+                         people. Save keeps the layers.",
                     )
                     .clicked()
                 {
-                    actions.export = true;
+                    actions.open_export = true;
                     ui.close();
                 }
             });

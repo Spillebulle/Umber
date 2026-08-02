@@ -427,7 +427,7 @@ verbatim.
   new code at all — which is, in miniature, the whole argument for this choice.
 - The tab takes the file's name, and the status bar shows the full path. The
   modified dot clears on a successful save.
-- Closing a document with unsaved work offers **Save**, Export PNG, Discard and
+- Closing a document with unsaved work offers **Save**, Export, Discard and
   Cancel. Save closes the tab only if a file was actually written: a cancelled
   file dialog is not permission to discard.
 - **Settings → General → Save the undo history in the document** turns the

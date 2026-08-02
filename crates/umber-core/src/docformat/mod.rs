@@ -374,9 +374,15 @@ pub fn save(path: &Path, doc: &SaveDocument<'_>) -> Result<Vec<SaveWarning>, Sav
 /// places — the document's own file and an internal copy — and encoding a
 /// document twice to do it would double the only expensive part. Having the
 /// atomic write in one place is what stops the second caller reinventing it
-/// slightly differently.
+/// slightly differently. [`crate::export`] is the third caller, which is why
+/// the temporary is named after the *target's* extension rather than after
+/// `.ora`: for a document that is the same `sketch.ora.saving` it always was,
+/// and for an exported `sketch.png` it is `sketch.png.saving` rather than a
+/// name that would collide with the save of a document beside it.
 pub fn write_encoded(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
-    let temporary = path.with_extension(format!("{EXTENSION}.saving"));
+    let mut temporary = path.to_path_buf().into_os_string();
+    temporary.push(".saving");
+    let temporary = std::path::PathBuf::from(temporary);
     std::fs::write(&temporary, bytes)?;
     if let Err(e) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);

@@ -257,6 +257,11 @@ pub struct Editor {
     /// has the same reason to be its own source of truth here as in the Colour
     /// panel. Seeded from the live document when a dialog opens.
     pub canvas_form: crate::canvasdlg::CanvasForm,
+    /// State of the Export dialog, kept out of [`UiState`] for the reason
+    /// `canvas_form` is — it holds a colour picker's HSV, for the matte. Not
+    /// seeded per document and not cleared when one closes: a format and a
+    /// quality are a way of working rather than a property of the picture.
+    pub export_form: crate::exportdlg::ExportForm,
     /// The update check: whether it runs, what it last said, and how this copy
     /// was installed. Kept out of [`UiState`] because it holds a channel and a
     /// downloaded release, neither of which is `Copy`.
@@ -425,6 +430,7 @@ impl Default for Editor {
             notice: None,
             ui: UiState::default(),
             canvas_form: crate::canvasdlg::CanvasForm::default(),
+            export_form: crate::exportdlg::ExportForm::default(),
             updates: crate::update::Updates::default(),
             autosave: crate::autosave::Autosave::default(),
             quit_requested: false,

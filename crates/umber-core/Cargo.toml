@@ -10,13 +10,22 @@ repository.workspace = true
 glam = { workspace = true }
 bytemuck = { workspace = true }
 
-# `docimport` only. Data-format crates, no GPU or windowing types, so the
-# crate boundary in CLAUDE.md still holds.
+# `docimport` and `export` only. Data-format crates, no GPU or windowing types,
+# so the crate boundary in CLAUDE.md still holds.
 zip = { workspace = true }
 png = { workspace = true }
+image = { workspace = true }
 quick-xml = { workspace = true }
 psd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ron = { workspace = true }
 directories = { workspace = true }
+
+[dev-dependencies]
+# The export tests decode what the encoders wrote, and one of the formats they
+# have to check is PNG — which the crate itself only ever *writes*, through the
+# `png` crate. Enabling the feature here rather than above is what keeps the
+# decoder out of the shipped binary: Cargo only unifies a dev-dependency's
+# features when it is building tests.
+image = { workspace = true, features = ["png"] }
