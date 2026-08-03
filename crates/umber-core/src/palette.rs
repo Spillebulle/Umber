@@ -33,8 +33,9 @@
 //! and for a stronger reason: **the interchange format is the storage format**.
 //!
 //! GIMP's `.gpl` is the universal palette format. It is a dozen lines of plain
-//! text, and GIMP, Krita, Inkscape, Aseprite, Blender and Scribus all read and
-//! write it. Storing the library as one `.gpl` per palette means:
+//! text, and GIMP, Krita, Inkscape and Aseprite all read and write it — the
+//! four named because those four are checkable, not because the list ends
+//! there. Storing the library as one `.gpl` per palette means:
 //!
 //! - **There is one decoder and one encoder.** Import is reading a file into
 //!   the directory and export is copying one out; neither is a second parser to
@@ -114,10 +115,6 @@ pub const UNTITLED: &str = "Untitled palette";
 pub enum PaletteError {
     /// The file does not begin with `GIMP Palette`.
     NotAPalette(PathBuf),
-    /// A palette with no colours in it. Refused on the way *in* only: a palette
-    /// the artist has just made is legitimately empty until they put something
-    /// in it, and it is written out that way.
-    NoColours(PathBuf),
     TooManySwatches {
         path: PathBuf,
         found: usize,
@@ -140,9 +137,6 @@ impl fmt::Display for PaletteError {
                 "{} is not a GIMP palette — the first line has to be “{GPL_HEADER}”",
                 path.display()
             ),
-            Self::NoColours(path) => {
-                write!(f, "{} has no colours in it", path.display())
-            }
             Self::TooManySwatches { path, found, max } => write!(
                 f,
                 "{} holds {found} colours, and Umber reads at most {max} in one palette",
@@ -381,9 +375,13 @@ pub fn read_gpl(text: &str, path: &Path) -> Result<GplRead, PaletteError> {
         }
     }
 
-    if palette.swatches.is_empty() {
-        return Err(PaletteError::NoColours(path.to_path_buf()));
-    }
+    // A palette with no colours in it is **not** refused, and that is not an
+    // oversight. [`PaletteLibrary::create`] writes one out empty — a palette
+    // exists from the moment it is named, so that closing the window does not
+    // lose it — and a reader that turned round and refused its own output would
+    // make every new palette vanish on the next launch, with a dialog saying it
+    // had no colours in it. There is nothing to warn about either: the panel
+    // shows an empty grid and says so.
     if palette.name.trim().is_empty() {
         // The filename is what every other reader falls back to, so fall back
         // to the same thing rather than to the word "Untitled".
@@ -848,8 +846,8 @@ mod tests {
     }
 
     /// A file that is not a palette is refused rather than read as an empty
-    /// one, and a palette with no colours is refused rather than imported as a
-    /// row of nothing.
+    /// one — otherwise anything at all could be dragged into the library and
+    /// would land there as a row with no colours in it.
     #[test]
     fn something_that_is_not_a_palette_is_refused() {
         assert!(matches!(
@@ -857,13 +855,31 @@ mod tests {
             Err(PaletteError::NotAPalette(_))
         ));
         assert!(matches!(
-            read_gpl("GIMP Palette\nName: Empty\n#\n", &here()),
-            Err(PaletteError::NoColours(_))
-        ));
-        assert!(matches!(
             read_gpl("", &here()),
             Err(PaletteError::NotAPalette(_))
         ));
+    }
+
+    /// A palette with a header and no colours is a palette, and refusing one
+    /// would be the reader refusing its own output: `create` writes an empty
+    /// palette so that naming one is enough to keep it, so a refusal here means
+    /// every new palette vanishes on the next launch — with a dialog saying it
+    /// had no colours in it.
+    #[test]
+    fn a_new_and_empty_palette_survives_being_closed_and_reopened() {
+        let read = read_gpl("GIMP Palette\nName: Empty\n#\n", &here()).expect("still a palette");
+        assert_eq!(read.palette.name, "Empty");
+        assert!(read.palette.is_empty());
+
+        let dir = temp_dir("empty");
+        let mut library = PaletteLibrary::load_from(&dir);
+        let id = library.create("Empty one").expect("made");
+        let reopened = PaletteLibrary::load_from(&dir);
+        assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
+        let back = reopened.get(&id).expect("still there");
+        assert_eq!(back.name, "Empty one");
+        assert!(back.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A line that is prose must not be read as a colour, and a component out
