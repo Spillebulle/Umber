@@ -89,7 +89,10 @@
 //! no second copy of the picture in memory, because the bytes to compare
 //! against are the clip's own ([`OnDesktop::TheClipItself`]). Everything else
 //! pays one extra decode per copy to be correct rather than fast, which is the
-//! direction this project takes that trade everywhere.
+//! direction this project takes that trade everywhere. The second *copy* of
+//! the picture is only kept where the echo actually came back different: an
+//! echo equal to the clip records [`OnDesktop::TheClipItself`], which is the
+//! same comparison and hundreds of megabytes lighter on a full-canvas copy.
 //!
 //! **Nobody working on Umber has a Mac, and no part of the macOS clipboard path
 //! has ever been run** — the same statement the pen and the mobile targets are
@@ -246,7 +249,13 @@ pub enum OnDesktop {
     /// second copy of them is held.
     TheClipItself,
     /// Umber's clip is there, and this is what the desktop hands back for it.
-    /// Only reached where [`TRANSPORT_IS_EXACT`] is false.
+    ///
+    /// Only reached where [`TRANSPORT_IS_EXACT`] is false **and the echo
+    /// actually differed** — an echo equal to the clip is recorded as
+    /// [`OnDesktop::TheClipItself`], because it is the same comparison without
+    /// a second copy of the picture. That is a memory saving and not a
+    /// judgement about the platform: the next copy takes its echo just the
+    /// same.
     Echo(Clip),
 }
 
@@ -426,22 +435,26 @@ impl Board {
             OnDesktop::TheClipItself
         } else {
             match self.read_image() {
+                // The echo agrees, so holding it would be a second copy of a
+                // picture already in `Editor::clipboard` — on a full-canvas
+                // copy, hundreds of megabytes to say what `TheClipItself`
+                // says in a word. The two are the same comparison, because
+                // the two pictures are equal.
+                //
+                // **This is not the platform being promoted to exact.** The
+                // next copy takes its echo exactly as this one did, and it
+                // must: the transport suspected here is a premultiply, which
+                // is the identity on anything fully opaque, so one agreeing
+                // picture is no evidence at all about the next.
+                Some(echo) if echo == *clip => {
+                    log::debug!("the clipboard echoed this picture unchanged");
+                    OnDesktop::TheClipItself
+                }
                 Some(echo) => {
-                    if echo == *clip {
-                        // The suspicion about this platform was unfounded for
-                        // this picture at least. Kept as an echo anyway rather
-                        // than promoted to `TheClipItself`: the transport that
-                        // is suspected here is a premultiply, which is the
-                        // exact identity on anything fully opaque, so one
-                        // agreeing picture is no evidence at all about the next
-                        // one. It costs a `Clip` of memory and nothing else.
-                        log::debug!("the clipboard echoed this picture unchanged");
-                    } else {
-                        log::info!(
-                            "this platform's clipboard did not hand back the picture it was \
-                             given, so the copy is recognised by its echo instead"
-                        );
-                    }
+                    log::info!(
+                        "this platform's clipboard did not hand back the picture it was \
+                         given, so the copy is recognised by its echo instead"
+                    );
                     OnDesktop::Echo(echo)
                 }
                 None => {
