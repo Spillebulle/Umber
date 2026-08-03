@@ -1247,6 +1247,13 @@ fn floored(curve: ResponseCurve, floor: f32) -> ResponseCurve {
 /// two of them is the product of their samples and there is nothing to resample
 /// — which is the whole reason two Clip Studio settings that multiply can be
 /// carried by one Umber curve.
+///
+/// Exact at every knot and at both ends, and an approximation between them: the
+/// product of two piecewise-linear curves is quadratic, and this re-linearises
+/// it over each quarter of the range. That is the resolution [`ResponseCurve`]
+/// has at all — the same bound [`Effector::curve_for`] already accepts when it
+/// resamples Clip Studio's own control points onto five knots — so the error is
+/// below what could be recorded either way.
 fn multiplied(a: ResponseCurve, b: ResponseCurve) -> ResponseCurve {
     let mut out = a;
     for i in 0..ResponseCurve::N {
