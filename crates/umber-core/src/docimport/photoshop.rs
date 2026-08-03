@@ -32,6 +32,51 @@
 //! `catch_unwind`, so a bad file refuses to open instead of taking the
 //! application with it.
 //!
+//! # Why a mask is still reported lost, when a `.kra`'s is not
+//!
+//! `psd` 0.3.5 does not carry a layer mask out of the file, and that is a
+//! limit rather than a decision here. It was checked rather than assumed, and
+//! this is what is in the way — all four, not just the first:
+//!
+//! - **The mask's rectangle never leaves the parser.** `read_layer_record`
+//!   reads the length of the "Layer mask / adjustment layer data" block and
+//!   skips the block — the comment in the crate says so. That block is where
+//!   the mask's own rectangle lives, and a mask's pixels are stored in *that*
+//!   rectangle rather than the layer's, so without it the bytes cannot be put
+//!   anywhere. The default colour outside the rectangle, and the flags saying
+//!   whether Photoshop has the mask switched off, are in the same block.
+//! - **The bytes are unreachable anyway.** They are kept, in
+//!   `PsdLayer::channels`, but that field is `pub(crate)` and `get_channel` is
+//!   private. The one public thing about them is `compression()`, which
+//!   answers how they are packed and never hands them over — which is exactly
+//!   why [`has_mask`] is written the way it is: asking for the compression of
+//!   a channel that is not there is an error, and that is enough to *know* a
+//!   mask was dropped without being able to read it.
+//! - **RLE mask data would decode to rubbish even so.** `read_layer_channels`
+//!   skips the per-scanline length table using the **layer's** height for
+//!   every channel, so a mask whose rectangle is a different height than the
+//!   layer's — the ordinary case — starts decoding at the wrong offset.
+//! - **There is no newer version to move to.** 0.3.5 is the latest published
+//!   (January 2024).
+//!
+//! Reading it would therefore mean parsing the layer record here, in parallel
+//! with the crate — and that is the fork the module docs above decline. Two
+//! parsers walking the same bytes and disagreeing about where a section ends
+//! is a worse failure than a named loss, because it produces a picture.
+//!
+//! So every masked layer raises [`ImportWarning::MaskIgnored`] and the layer
+//! comes back covering more than it did. The rest of what a Photoshop mask
+//! carries — its density, its feather, whether it is switched off, and the
+//! separate vector mask — is in the same block and equally out of reach, so it
+//! is stated here rather than claimed per layer: a warning naming a feather
+//! this module cannot see would be an invention.
+//!
+//! One trap that is *not* waiting here: the mask flags byte has "disabled" at
+//! bit 1, which is the same bit position as the layer flags' inverted
+//! `visible` above. Nothing reads it, so nothing can read it the wrong way
+//! round — and anything that starts reading it must decide that question
+//! against a real file, exactly as the three inversions above were.
+//!
 //! # What is refused
 //!
 //! Anything that is not 8-bit RGB. The crate reads channel bytes without
@@ -253,7 +298,14 @@ fn is_clipped(psd_flag: bool) -> bool {
 ///
 /// The crate does not expose masks, but it does keep their channels, and
 /// asking for the compression of a channel that is not there is an error —
-/// which is enough to tell the user their mask was dropped.
+/// which is enough to tell the user their mask was dropped. See the module
+/// docs for why that is as far as this goes.
+///
+/// Both kinds are asked after: `-2` is the user-supplied layer mask and `-3`
+/// is the "real" one Photoshop writes when a layer carries a vector mask as
+/// well. A layer with only the second is still a masked layer, and reporting
+/// one and not the other would be a loss that depends on which controls the
+/// artist happened to use.
 fn has_mask(layer: &psd::PsdLayer) -> bool {
     layer
         .compression(PsdChannelKind::UserSuppliedLayerMask)
@@ -312,7 +364,7 @@ fn blend_name(mode: impl std::fmt::Debug) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{self, PsdLayerSpec};
+    use super::super::fixtures::{self, PsdLayerSpec, PsdMask};
     use super::*;
 
     fn two_layers() -> Vec<u8> {
@@ -461,6 +513,107 @@ mod tests {
         psd.truncate(30);
         let err = read(&psd).unwrap_err();
         assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
+    }
+
+    // ------------------------------------------------------------- masks
+
+    /// A masked layer is reported as masked, and its **own** pixels are not
+    /// disturbed by the extra channel sitting beside them.
+    ///
+    /// Until this test the mask path had never been exercised at all: every
+    /// PSD fixture wrote "no mask data", so `has_mask` was a function nothing
+    /// had ever called with a mask in front of it. The second half matters
+    /// more than the first — a fifth channel whose length the reader got wrong
+    /// would desynchronise every layer after it, and the symptom would be
+    /// wrong pixels rather than a missing warning.
+    #[test]
+    fn a_masked_layer_is_reported_and_keeps_its_own_pixels() {
+        let psd = fixtures::psd(
+            4,
+            4,
+            &[
+                PsdLayerSpec::new("Paper", [255, 0, 0, 255]),
+                // Deliberately a rectangle unlike the layer's, which is the
+                // ordinary case and the one that makes the reason a mask
+                // cannot be read out of `psd` 0.3.5 concrete: the block naming
+                // this rectangle is skipped by the crate.
+                PsdLayerSpec::new("Ink", [0, 0, 255, 255]).mask(PsdMask::new((1, 1, 3, 3), 128)),
+            ],
+        );
+        let doc = read(&psd).unwrap();
+
+        assert_eq!(doc.layers.len(), 2, "{:?}", doc.warnings);
+        assert_eq!(doc.layers[0].name, "Paper");
+        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &doc.layers[1].pixels[0..4],
+            &[0, 0, 255, 255],
+            "the mask channel must not be read as the layer's own"
+        );
+
+        assert!(doc.layers[1].mask.is_none(), "see the module docs");
+        assert_eq!(
+            doc.warnings,
+            vec![ImportWarning::MaskIgnored {
+                layer: "Ink".into()
+            }],
+            "a dropped mask must be named exactly once"
+        );
+    }
+
+    /// A mask Photoshop has switched off is reported the same as a live one,
+    /// and that is honest rather than lazy.
+    ///
+    /// The flag saying it is off lives in the block `psd` 0.3.5 skips, so this
+    /// module genuinely cannot tell the two apart. Reporting only the ones it
+    /// could see would be a warning list that depends on what a crate happens
+    /// to parse; reporting both is a true statement — a mask was there and did
+    /// not come across. If a future version exposes the flag, the disabled
+    /// case can join Krita's under `MaskUnsupported`, where the picture is
+    /// right and only the mask is lost.
+    #[test]
+    fn a_disabled_mask_is_reported_because_this_module_cannot_see_that_it_is_off() {
+        let psd = fixtures::psd(
+            2,
+            2,
+            &[PsdLayerSpec::new("Ink", [0, 0, 0, 255])
+                .mask(PsdMask::new((0, 0, 2, 2), 255).disabled())],
+        );
+        let doc = read(&psd).unwrap();
+        assert_eq!(
+            doc.warnings,
+            vec![ImportWarning::MaskIgnored {
+                layer: "Ink".into()
+            }]
+        );
+    }
+
+    /// `psd` 0.3.5 hands over no route to a mask's bytes, and this pins that
+    /// the reader is not quietly relying on one.
+    ///
+    /// `compression()` is the whole of the public surface: it says how the
+    /// channel is packed and never yields it. The day that changes, this test
+    /// is where to start — and the module docs list the other three things
+    /// that would have to change with it.
+    #[test]
+    fn the_crate_reports_a_mask_channel_and_still_hands_over_none_of_it() {
+        let bytes = fixtures::psd(
+            2,
+            2,
+            &[PsdLayerSpec::new("Ink", [0, 0, 0, 255]).mask(PsdMask::new((0, 0, 2, 2), 200))],
+        );
+        let psd = psd::Psd::from_bytes(&bytes).unwrap();
+        let layer = &psd.layers()[0];
+
+        assert!(
+            layer
+                .compression(PsdChannelKind::UserSuppliedLayerMask)
+                .is_ok(),
+            "the fixture does not carry a mask channel at all"
+        );
+        assert!(has_mask(layer));
+        // And the layer this crate *can* build is the layer without it.
+        assert_eq!(&layer.rgba()[0..4], &[0, 0, 0, 255]);
     }
 
     #[test]

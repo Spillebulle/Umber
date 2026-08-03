@@ -640,6 +640,47 @@ pub fn kra_with_vector_layer() -> Vec<u8> {
 // all read back out of those files before being written here. A fixture that
 // merely agreed with our own reader would prove nothing.
 
+/// A layer mask, as the "Layer mask / adjustment layer data" block describes
+/// it.
+///
+/// Adobe's 20-byte form: the mask's own rectangle, the byte outside it, a flags
+/// byte, and two of padding. The mask's pixels then arrive as channel `-2`,
+/// alongside the layer's own three colours and its alpha — **and in the mask's
+/// rectangle, not the layer's**, which is exactly why that block has to be read
+/// before the bytes mean anything.
+pub struct PsdMask {
+    /// top, left, bottom, right; the last two exclusive.
+    rect: (i32, i32, i32, i32),
+    /// Outside the rectangle.
+    default: u8,
+    /// Bit 1 set means Photoshop has switched the mask off.
+    flags: u8,
+    /// A flat coverage for the whole rectangle.
+    value: u8,
+}
+
+impl PsdMask {
+    pub fn new(rect: (i32, i32, i32, i32), value: u8) -> Self {
+        Self {
+            rect,
+            default: 0,
+            flags: 0,
+            value,
+        }
+    }
+
+    /// A mask Photoshop has switched off, which bounds nothing there.
+    pub fn disabled(mut self) -> Self {
+        self.flags |= 0b10;
+        self
+    }
+
+    fn pixels(&self) -> usize {
+        let (top, left, bottom, right) = self.rect;
+        ((bottom - top) as usize) * ((right - left) as usize)
+    }
+}
+
 /// One layer of a PSD fixture. Bottom first, the order the file stores them in.
 pub struct PsdLayerSpec {
     name: String,
@@ -648,6 +689,7 @@ pub struct PsdLayerSpec {
     visible: bool,
     clipped: bool,
     blend: [u8; 4],
+    mask: Option<PsdMask>,
 }
 
 impl PsdLayerSpec {
@@ -659,7 +701,13 @@ impl PsdLayerSpec {
             visible: true,
             clipped: false,
             blend: *b"norm",
+            mask: None,
         }
+    }
+
+    pub fn mask(mut self, mask: PsdMask) -> Self {
+        self.mask = Some(mask);
+        self
     }
 
     pub fn opacity(mut self, opacity: u8) -> Self {
@@ -707,11 +755,21 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
         records.extend_from_slice(&0i32.to_be_bytes());
         records.extend_from_slice(&(height as i32).to_be_bytes());
         records.extend_from_slice(&(width as i32).to_be_bytes());
-        records.extend_from_slice(&4u16.to_be_bytes()); // channel count
-        for id in [0i16, 1, 2, -1] {
+        // A layer mask arrives as one more channel, `-2`, and its plane is the
+        // size of the *mask's* rectangle rather than the layer's.
+        let channels: &[i16] = match layer.mask {
+            Some(_) => &[0, 1, 2, -1, -2],
+            None => &[0, 1, 2, -1],
+        };
+        records.extend_from_slice(&(channels.len() as u16).to_be_bytes()); // channel count
+        for id in channels {
             records.extend_from_slice(&id.to_be_bytes());
+            let plane = match (*id, &layer.mask) {
+                (-2, Some(mask)) => mask.pixels(),
+                _ => pixels,
+            };
             // Two bytes of compression marker plus the plane itself.
-            records.extend_from_slice(&(pixels as u32 + 2).to_be_bytes());
+            records.extend_from_slice(&(plane as u32 + 2).to_be_bytes());
         }
         records.extend_from_slice(b"8BIM");
         records.extend_from_slice(&layer.blend);
@@ -721,7 +779,20 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
         records.push(0); // filler
 
         let mut extra = Vec::new();
-        extra.extend_from_slice(&0u32.to_be_bytes()); // no mask data
+        match &layer.mask {
+            None => extra.extend_from_slice(&0u32.to_be_bytes()), // no mask data
+            Some(mask) => {
+                // Adobe's 20-byte form of the layer mask block.
+                extra.extend_from_slice(&20u32.to_be_bytes());
+                let (top, left, bottom, right) = mask.rect;
+                for edge in [top, left, bottom, right] {
+                    extra.extend_from_slice(&edge.to_be_bytes());
+                }
+                extra.push(mask.default);
+                extra.push(mask.flags);
+                extra.extend_from_slice(&[0, 0]); // padding to twenty
+            }
+        }
         extra.extend_from_slice(&0u32.to_be_bytes()); // no blending ranges
         let name = layer.name.as_bytes();
         extra.push(name.len() as u8);
@@ -735,6 +806,10 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
         for component in [0usize, 1, 2, 3] {
             channel_data.extend_from_slice(&0u16.to_be_bytes()); // raw
             channel_data.extend(std::iter::repeat_n(layer.pixel[component], pixels));
+        }
+        if let Some(mask) = &layer.mask {
+            channel_data.extend_from_slice(&0u16.to_be_bytes()); // raw
+            channel_data.extend(std::iter::repeat_n(mask.value, mask.pixels()));
         }
     }
 
