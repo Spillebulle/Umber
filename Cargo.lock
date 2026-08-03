@@ -2903,6 +2903,7 @@ dependencies = [
  "env_logger",
  "log",
  "umber-app",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
