@@ -87,7 +87,10 @@
 //!   does not know until the stroke is over.
 //! - **The paper texture becomes one of Umber's three.** Umber's grain is a
 //!   closed set (see [`GrainPattern`]), so the strength and the tile size carry
-//!   across and the picture does not.
+//!   across and the picture does not. It is read only where the reference
+//!   actually names a material: grain multiplies coverage, so a stale
+//!   reference left behind by a texture that was switched off would be a brush
+//!   painting through paper it does not have.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
 //!   have no engine behind them at all** and are named.
 //! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
@@ -1090,7 +1093,27 @@ fn convert(
     }
 
     // ---- grain ---------------------------------------------------------
-    if settings.blob("TextureImage").is_some() {
+    // Gated on the reference actually **naming a material**, not on the column
+    // holding a blob at all. Clip Studio leaves a setting's value in the file
+    // when the setting itself is switched off — which is why the taper reads
+    // `BrushUseIn` rather than `BrushInLength`, why the angle jitter reads its
+    // effector rather than `BrushRotationRandomScale`, and why the spacing
+    // reads `BrushAutoIntervalType`. A texture reference is the same trap and
+    // the failure is worse than any of those, because grain **multiplies
+    // coverage**: a brush that was never textured arrives painting through a
+    // paper it does not have — mottled, weaker than its opacity says, and
+    // darker each time the stroke is laid down again, since the pits are
+    // anchored to the document and a second pass composites over the first.
+    //
+    // Deliberately not gated on the material being *present*: Clip Studio
+    // leaves an installed one out of the file and expects to find it locally,
+    // exactly as it does for a tip, and the strength and the tile size are
+    // still the author's numbers. What is checked is that the reference names
+    // one at all.
+    if settings
+        .blob("TextureImage")
+        .is_some_and(|r| reference_count(r) > 0 && reference_path(r).is_some())
+    {
         brush.grain = settings
             .percent("TextureDensity")
             .unwrap_or(0.0)
@@ -2113,6 +2136,40 @@ mod tests {
                 declared.1 & VELOCITY != 0,
                 "{column} routes velocity and would still be reported as lost"
             );
+        }
+    }
+
+    /// Clip Studio leaves a setting's value in the file when the setting is
+    /// switched off — the trap the taper, the angle jitter and the spacing are
+    /// each guarded against by name. The texture reference is the same trap and
+    /// the worst of them: grain **multiplies coverage**, so a brush that was
+    /// never textured painted through a paper it does not have — mottled,
+    /// weaker than its opacity claimed, and darker every time the stroke was
+    /// laid down again.
+    #[test]
+    fn a_texture_reference_that_names_no_material_leaves_the_brush_ungrained() {
+        for stale in [
+            // A reference holding no materials at all.
+            reference(".:paper:data:material_0.layer", 0),
+            // And one whose text is not a member path, which is what a stub
+            // left over from an unset texture looks like.
+            reference("", 1),
+        ] {
+            let bytes = sut(
+                &[(
+                    "Untextured",
+                    Variant::plain(1)
+                        .set("TextureImage", stale)
+                        .int("TextureDensity", 80)
+                        .real("TextureScale2", 100.0),
+                )],
+                &[],
+            );
+            let tool = from_sut(&bytes).expect("read").tools.remove(0);
+            assert_eq!(tool.brush.grain, 0.0);
+            assert!(!tool.brush.has_grain());
+            // And nothing is claimed to have been lost, because nothing was.
+            assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
         }
     }
 

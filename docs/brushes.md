@@ -975,6 +975,18 @@ carries and how dense it is, so the stronger of "carries none" and "is dense" is
 what survives — which puts a pure blender at 1.0 and an oil brush at its density,
 and says it approximated either way.
 
+**The paper is read only where the reference names a material.** Clip Studio
+leaves a setting's value in the file when the setting is switched off — the trap
+`BrushUseIn`, `BrushRotationEffector` and `BrushAutoIntervalType` are each read
+to avoid — and a stale texture reference is the same trap with the worst
+consequence of the three, because grain **multiplies coverage**: a brush that was
+never textured paints through a paper it does not have, mottled, weaker than its
+opacity claims, and darker each time the stroke is laid down again, since the
+pits are anchored to the document and a second pass composites over the first.
+Deliberately not gated on the material being *present*, only on it being named:
+Clip Studio leaves an installed one out of the file and expects to find it
+locally, exactly as it does for a tip.
+
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
 brush in both sample files is set that way, so a note about it would appear on
