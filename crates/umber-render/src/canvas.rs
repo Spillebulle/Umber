@@ -2762,8 +2762,16 @@ impl CanvasRenderer {
         source: &FloatSource<'_>,
     ) -> Option<u32> {
         self.end_float();
-        if reserved as usize >= MAX_LAYERS {
-            log::error!("no room for a transform preview beside {reserved} layer slots");
+        // Against [`MAX_SLOTS`], not [`MAX_LAYERS`]: `reserved` counts *slices*
+        // — a layer, a layer's mask — and the array holds twice the stack's
+        // positions plus one. That `+ 1` is this preview's spare, so the
+        // refusal is unreachable for any legal stack and exists only so a
+        // future ceiling cannot silently preview into a layer. Comparing
+        // against 64 refused every document past its 64th slice: 33 masked
+        // layers could not be transformed at all, with 63 slices free, under a
+        // notice that said Umber had run out.
+        if reserved as usize >= MAX_SLOTS {
+            log::error!("no room for a transform preview beside {reserved} layer slices");
             return None;
         }
         let preview_slot = reserved;
