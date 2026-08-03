@@ -960,11 +960,17 @@ impl UmberApp {
     ///
     /// **Both clipboards are written, and Umber's own is the one that must not
     /// fail.** The desktop's is best effort — a machine with no clipboard, or
-    /// an allocation it refuses — but the outcome is *remembered* rather than
-    /// only logged, because a refusal leaves the desktop holding an older
+    /// an allocation it refuses — but what became of it is *remembered* rather
+    /// than only logged, because a refusal leaves the desktop holding an older
     /// picture and `sysclip::decide` would otherwise believe that one over the
     /// region just copied. Copy and paste inside Umber are unaffected either
     /// way, which is what makes the failure survivable rather than invisible.
+    ///
+    /// What is remembered is a *picture*, not a flag, and on a platform whose
+    /// clipboard does not hand back the bytes it was given it is read straight
+    /// back to get one. That second read is the echo; `sysclip` has the whole
+    /// argument, including which platforms pay for it and why the answer is a
+    /// `const` rather than a `cfg`.
     fn copy_selection(&mut self) {
         // `take_region` puts any float down and answers for whichever state the
         // copy was asked in — that is what lets a copy mid-transform read the
@@ -1098,25 +1104,28 @@ impl UmberApp {
     /// loop may not. It is not threaded, and the reason is in `sysclip`.
     fn paste(&mut self) {
         // The desktop is asked *first*, so a picture copied in another
-        // application half a second ago is the one that lands. `published` says
-        // whether Umber's own clip is known to have got there, without which a
-        // copy the desktop refused would be overruled by whatever it held
-        // before — see `sysclip`.
+        // application half a second ago is the one that lands. `on_desktop` is
+        // what the desktop should be handing back for Umber's own clip, without
+        // which a copy the desktop refused would be overruled by whatever it
+        // held before, and a platform that does not return what it was given
+        // would never have its own copy recognised — see `sysclip`.
         let taken = self.sysclip.take_image();
-        let published = self.sysclip.published();
-        let (clip, foreign) =
-            match sysclip::decide(taken, self.editor.clipboard.as_ref(), published) {
-                Paste::Nothing => return,
-                Paste::Mine(clip) => (clip, false),
-                Paste::Theirs(clip) => {
-                    log::info!(
-                        "pasting {} × {} off the desktop's clipboard",
-                        clip.size().x,
-                        clip.size().y
-                    );
-                    (clip, true)
-                }
-            };
+        let (clip, foreign) = match sysclip::decide(
+            taken,
+            self.editor.clipboard.as_ref(),
+            self.sysclip.on_desktop(),
+        ) {
+            Paste::Nothing => return,
+            Paste::Mine(clip) => (clip, false),
+            Paste::Theirs(clip) => {
+                log::info!(
+                    "pasting {} × {} off the desktop's clipboard",
+                    clip.size().x,
+                    clip.size().y
+                );
+                (clip, true)
+            }
+        };
         self.finish_transform();
         self.finish_stroke();
 
