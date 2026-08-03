@@ -935,8 +935,6 @@ enum Bulk {
     Lock(bool),
     Link,
     Unlink,
-    /// Tick or untick every layer at once.
-    Tick(bool),
     Delete,
 }
 
@@ -1257,8 +1255,9 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     // A strip that was always there would cost the list a row of height on
     // every document, most of which have three layers and no use for it; and a
     // row of controls that do nothing is the thing CLAUDE.md refuses
-    // everywhere else. The count is the label, because "3 ticked" is the one
-    // fact a strip like this has to tell you before you press Delete.
+    // everywhere else. How many are ticked is not stated here: the boxes
+    // themselves say it, and a count sharing this line with six icon buttons is
+    // what the buttons overdrew at the panel's real width.
     if ed.layers.picked_count() > 0 {
         let picked = ed.layers.picked_count();
         // Through `effective_locked`, so a folder's lock protects what is
@@ -1271,11 +1270,9 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         let can_delete = ed.layers.can_remove(&ed.layers.targets());
         let mut act: Option<Bulk> = None;
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("{picked} ticked"))
-                    .size(text::SMALL)
-                    .color(p.text_muted),
-            );
+            // Still wrapped, for the reason every dialog's footer is: a bare
+            // right-to-left layout takes the whole remaining *height* of the ui
+            // it is in, because the align is the cross axis.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icon_button(
                     ui,
@@ -1326,26 +1323,6 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 if icon_button(ui, p, Icon::Eye, true, "Show the ticked layers") {
                     act = Some(Bulk::Visible(true));
                 }
-                // Words rather than marks, because "tick all of them" has no
-                // icon anybody would recognise and `icons::Icon` gaining one
-                // that has to be explained is worse than two short labels.
-                for (label, tip, all) in [
-                    ("None", "Untick every layer", false),
-                    ("All", "Tick every layer", true),
-                ] {
-                    if ui
-                        .selectable_label(
-                            false,
-                            egui::RichText::new(label)
-                                .size(text::SMALL)
-                                .color(p.text_dim),
-                        )
-                        .on_hover_text(tip)
-                        .clicked()
-                    {
-                        act = Some(Bulk::Tick(all));
-                    }
-                }
             });
         });
         match act {
@@ -1376,7 +1353,6 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 ed.layers.unlink(&ed.layers.targets());
                 changed = true;
             }
-            Some(Bulk::Tick(on)) => ed.layers.pick_all(on),
             // Slots go back on the free list, so this clears the undo history
             // and has to happen where the GPU is. `UiActions` is `Copy` and
             // cannot carry the list; the caller reads the ticks off the editor
@@ -1415,6 +1391,26 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
     });
     let watching = drag.is_some() || down;
     let mut rows: Vec<layerdrag::Row> = Vec::new();
+
+    // The head of the tick column. Drawn always, like the row boxes and unlike
+    // the strip above: it is how somebody finds ticking at all, so hiding it
+    // until something is ticked would hide the way in behind itself.
+    //
+    // Counted over the whole stack rather than over `targets`, which falls back
+    // to the selected layer when nothing is ticked — this box says what the
+    // *boxes* hold, and with none ticked that is none.
+    let picked = ed.layers.picked_count();
+    let state = match picked {
+        0 => widgets::PickAll::None,
+        n if n == count => widgets::PickAll::All,
+        _ => widgets::PickAll::Some,
+    };
+    if widgets::pick_all_box(ui, p, state) {
+        // Everything, or nothing once it is already everything — which is the
+        // All and None pair this replaced, in the one place where "all of them"
+        // is the thing being looked at.
+        ed.layers.pick_all(state != widgets::PickAll::All);
+    }
 
     // Stored bottom-first; shown top-first, the way it is drawn.
     let mut select = None;
@@ -2328,5 +2324,76 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
     {
         ed.layout.reset();
         ui.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The Layers module at the panel's real width, in each of the three states
+    /// the tick column's header can be in.
+    ///
+    /// Written rather than asserted because what went wrong here was a *layout*:
+    /// a "3 ticked" label and an All/None pair shared a line with six icon
+    /// buttons, which fit in the abstract and were drawn over each other at
+    /// [`metrics::PANEL`]. No assertion about widgets would have caught that, and
+    /// `docshot::Stage` is the only thing in the crate that can look at a piece
+    /// of interface. Same idiom as `updatedlg`'s `update_dialog_preview`.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app layers_panel_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn layers_panel_preview() {
+        use crate::dock::{Layout, PanelKind};
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, metrics};
+        use egui::{Pos2, Rect, vec2};
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/layers-panel");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        for (name, ticks) in [
+            ("1-none", &[] as &[usize]),
+            ("2-some", &[1, 2]),
+            ("3-all", &[0, 1, 2, 3]),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = Layout::default();
+            for _ in 0..3 {
+                ed.layers.add();
+            }
+            for (n, index) in (0..4).enumerate() {
+                if let Some(layer) = ed.layers.get_mut(index) {
+                    layer.name = format!("Layer {}", n + 1);
+                }
+            }
+            for index in ticks {
+                ed.layers.pick(*index, true);
+            }
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(metrics::PANEL, 300.0);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                let mut actions = crate::ui::UiActions::default();
+                super::panel(
+                    root,
+                    &palette,
+                    &mut ed,
+                    &mut actions,
+                    PanelKind::Layers,
+                    rect,
+                );
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 3 shots to {}", dir.display());
     }
 }

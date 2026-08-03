@@ -1822,6 +1822,90 @@ pub struct LayerRow<'a> {
     pub picked: bool,
 }
 
+/// Where a row's tick box sits, measured from the row's own left edge, and how
+/// large its hit target and its mark are.
+///
+/// Named because [`pick_all_box`] draws the same box at the head of the same
+/// column: the header has to line up with the boxes underneath it, and two
+/// statements of 4.0 is how it stops doing so the first time a row is restyled.
+const PICK_AT: Vec2 = vec2(4.0, 6.0);
+const PICK_HIT: f32 = 18.0;
+const PICK_MARK: f32 = 12.0;
+
+/// How much of the stack the tick column's header stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PickAll {
+    None,
+    /// Some but not all — drawn as a bar rather than a tick.
+    ///
+    /// This is a third state, and the layer stack refuses one on a *folder's*
+    /// box deliberately: ticking a folder cascades, so "ticked, contents not"
+    /// is unreachable there and drawing it would be drawing an impossible
+    /// state. Here it is not only reachable but the ordinary case — one layer
+    /// ticked out of five — and an empty box would say nothing was.
+    Some,
+    All,
+}
+
+/// The head of the tick column: one box that ticks the whole stack, or unticks
+/// it once it is all ticked.
+///
+/// It replaces a "3 ticked" label and an All/None pair that shared a line with
+/// six icon buttons and were overdrawn by them at the panel's real width. One
+/// box in the column it acts on says which control it is by where it sits, so
+/// it needs no label to be overdrawn; and being drawn always — like the row
+/// boxes, and unlike the strip below it — it is the way *in* to ticking rather
+/// than something that appears once you have found ticking by yourself.
+pub fn pick_all_box(ui: &mut Ui, p: &Palette, state: PickAll) -> bool {
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), PICK_HIT), Sense::hover());
+    // The box alone senses the click, not the width of the row: the space
+    // beside it is the head of the name column and clicking a name's heading
+    // has never meant anything.
+    let hit = Rect::from_min_size(row.left_top() + vec2(PICK_AT.x, 0.0), Vec2::splat(PICK_HIT));
+    let response = ui
+        .interact(hit, ui.id().with("pick_all"), Sense::click())
+        .on_hover_text(match state {
+            PickAll::All => "Untick every layer",
+            _ => "Tick every layer",
+        });
+    let mark = Rect::from_center_size(hit.center(), Vec2::splat(PICK_MARK));
+    let painter = ui.painter();
+    match state {
+        PickAll::None => {
+            painter.rect_stroke(
+                mark,
+                2.0,
+                Stroke::new(
+                    1.0,
+                    if response.hovered() {
+                        p.text_dim
+                    } else {
+                        p.border
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+        }
+        PickAll::Some => {
+            painter.rect_filled(mark, 2.0, p.accent);
+            // A bar rather than a tick, and painted rather than an `Icon`: the
+            // mark is two rectangles, and a variant of `icons::Icon` that
+            // appears in one place and has to be explained is what the icon set
+            // is kept clear of.
+            painter.rect_filled(
+                Rect::from_center_size(mark.center(), vec2(PICK_MARK - 5.0, 2.0)),
+                0.0,
+                p.window,
+            );
+        }
+        PickAll::All => {
+            painter.rect_filled(mark, 2.0, p.accent);
+            icons::draw(painter, mark.shrink(1.0), Icon::Check, p.window);
+        }
+    }
+    response.clicked()
+}
+
 /// One row of the layer stack: visibility, a thumbnail chip, name and blend.
 ///
 /// The flags are **shown** here and changed from the panel's toggle row. Four
@@ -1864,9 +1948,9 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     // The tick box, and then the eye. Both are their own hit targets inside the
     // row, so neither also changes the selection: ticking four rows to hide
     // them would otherwise move the brush four times on the way.
-    let pick = Rect::from_min_size(rect.left_top() + vec2(4.0, 6.0), vec2(18.0, 18.0));
+    let pick = Rect::from_min_size(rect.left_top() + PICK_AT, Vec2::splat(PICK_HIT));
     let pick_response = ui.interact(pick, ui.id().with(("pick", key)), Sense::click());
-    let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(12.0));
+    let box_rect = Rect::from_center_size(pick.center(), Vec2::splat(PICK_MARK));
     if row.picked {
         ui.painter().rect_filled(box_rect, 2.0, p.accent);
         icons::draw(ui.painter(), box_rect.shrink(1.0), Icon::Check, p.window);

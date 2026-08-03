@@ -560,6 +560,20 @@ are the contiguous run immediately below it whose `depth` is greater.
   always there costs the list a row of height on every three-layer document; a
   box that appeared only after you had found the first one is a feature nobody
   finds.
+- **"All" is a box at the head of the tick column, not words on the strip.**
+  There used to be a "3 ticked" label and an All/None pair sharing that line
+  with six icon buttons: they fit in the abstract and were drawn over each other
+  at `metrics::PANEL`'s real 264 px. One box in the column it acts on says which
+  control it is by *where it sits*, so it needs no label to be overdrawn, and it
+  is drawn always — like the row boxes and unlike the strip — because it is the
+  way in to ticking rather than something you find after ticking. It ticks
+  everything, or unticks it once everything already is, which is the pair in one
+  control. Its geometry is `widgets`' `PICK_AT`/`PICK_HIT`/`PICK_MARK`, shared
+  with `layer_row`, or the header drifts out of the column the first time a row
+  is restyled. **It has three states and a folder's box has two**, and that is
+  not an inconsistency: ticking a folder cascades, so "ticked, contents not" is
+  unreachable there, while "some of the stack" is the ordinary case here and an
+  empty box would say none was ticked.
 - **A thumbnail is the layer's *content*, and it is two passes because the
   bounding box of that content is on the GPU.** `thumbnail.wgsl` reduces a
   rectangle of one slice to a 64-square: first the whole slice to the
