@@ -12,6 +12,88 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.5 — 2026-08-03
+
+Layer folders, a selection that carries its own commands, and three bugs that
+had no business shipping: opening the brush library could take the application
+down, half the canvas gestures did nothing at all with a pen, and moving part of
+a picture left a faint outline of the selection behind.
+
+### Three things that were broken
+
+- **Opening the brush library crashed Umber.** A texture was handed back to the
+  graphics card while a drawing command still named it, which is a fatal error
+  and takes the process with it. The library and the Brushes panel also shared
+  one preview per brush while showing it at two sizes, so each was throwing away
+  the other's picture every frame.
+- **A pen could not reach half the canvas gestures.** Alt-drag to resize the
+  brush, the Pan tool, the Zoom tool, Alt to pick up a colour, the space bar,
+  and the polygon selection's rubber band all worked with a mouse and did
+  nothing with a pen — the resize worse than nothing, since the press fell
+  through and painted. What a press *means* is now decided in one place for both
+  kinds of pointer, so a gesture reaches both or neither.
+- **Moving a selection left a ghost of it behind.** Lifting pixels through a
+  selection applied its edge a second time, so a one-pixel outline of the
+  marquee stayed on the layer and the piece that moved was fainter than it
+  should have been. Copying had the same fault, at a quarter of the mark it was
+  taken from.
+
+### Layers
+
+- **Folders.** Group layers, nest them, fold them shut. A folder's eye and lock
+  reach everything inside it, and they travel as one when moved. They are saved
+  as ordinary nested stacks, so another application opens the file and shows the
+  identical picture.
+- **Thumbnails show what is on the layer**, scaled to fill the row rather than
+  the whole canvas shrunk into it, so a single stroke reads as a single stroke.
+- **Tick boxes**, and one line of buttons that act on everything ticked: show,
+  hide, lock, unlock, link, group, delete.
+- **Link groups.** Up to six sets of layers that move through the stack
+  together, each with a colour of its own, so a row says *which* set it belongs
+  to and not merely that it belongs to one.
+- **Dragging a layer says where it will land**, as a dashed outline stepped in
+  to the nesting it would take — inside a group, or beside it. Dragging past
+  either end of the list means the top level, which is how a layer comes out of
+  a folder and how a second top-level folder gets made.
+- A layer inside a locked folder now shows a padlock. It refused strokes before
+  and said nothing about why.
+
+### Selections
+
+- **Deselect, Copy and Cut, on buttons over the canvas**, beside the selection
+  itself. They go away while a selection is being transformed, where the flip
+  buttons take that place.
+- **Cut**, which there was not one of. Copy and paste already worked; cut takes
+  exactly what it leaves behind, so an antialiased edge does not lose a rim to
+  rounding.
+
+### When something goes wrong
+
+- **A crash gets a real dialog** instead of a window that vanishes: what
+  happened, which documents were rescued and which were not, the full technical
+  details in a box you can expand and select, where the report was written, and
+  a button to start Umber again. It is drawn by a fresh process, so it still
+  works when what died was the graphics device.
+- **The Windows build no longer opens a console window** behind the
+  application.
+
+### Updating
+
+- **Updating is a dialog with real progress**, rather than a silent download and
+  an installer appearing. It shows the release's own notes, the version you are
+  on and the one you would move to, and then what it is actually doing —
+  downloading, unpacking, installing — with a countdown to restart at the end
+  that can be stopped. "Never ask again" is the same setting Settings has.
+
+### Known limits
+
+- **A folder has no opacity or blend mode of its own.** It composites exactly as
+  its contents do in place, which is why an older Umber and other applications
+  read the file correctly. Group compositing is a larger change and is not
+  built.
+- **Linked layers still do not transform together.** They move through the stack
+  together; a transform reaches one layer.
+
 ## 0.0.4 — 2026-08-02
 
 Masks, locks and links on the layer stack; brushes you can make yourself,
