@@ -1863,13 +1863,18 @@ pub enum PickAll {
 /// six icon buttons and were overdrawn by them at the panel's real width. One
 /// box in the column it acts on says which control it is by where it sits, so
 /// it needs no label to be overdrawn; and being drawn always — like the row
-/// boxes, and unlike the strip below it — it is the way *in* to ticking rather
+/// boxes, and unlike the strip beside it — it is the way *in* to ticking rather
 /// than something that appears once you have found ticking by yourself.
+///
+/// It takes **only its own width**, not the line's. The ticked-layers strip
+/// shares this line and right-aligns into what is left, so a full-width
+/// allocation here would leave it none. The step in front of the box is
+/// `PICK_AT.x` rather than a margin of the caller's, which is what lands it at
+/// the same x as the boxes on the rows below.
 pub fn pick_all_box(ui: &mut Ui, p: &Palette, state: PickAll) -> bool {
-    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), PICK_HIT), Sense::hover());
-    // The box alone senses the click, not the width of the row: the space
-    // beside it is the head of the name column and clicking a name's heading
-    // has never meant anything.
+    let (row, _) = ui.allocate_exact_size(vec2(PICK_AT.x + PICK_HIT, PICK_HIT), Sense::hover());
+    // The box alone senses the click, not the step in front of it: that space
+    // is the row margin, and the rows do not treat it as a target either.
     let hit = Rect::from_min_size(row.left_top() + vec2(PICK_AT.x, 0.0), Vec2::splat(PICK_HIT));
     let response = ui
         .interact(hit, ui.id().with("pick_all"), Sense::click())

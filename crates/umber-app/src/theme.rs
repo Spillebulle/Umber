@@ -387,6 +387,19 @@ pub mod metrics {
     /// against, so there is one number rather than a paint-side and a
     /// model-side one that can disagree.
     pub const LAYER_INDENT: f32 = 12.0;
+    /// The line above the layer list: the tick column's header at its left, and
+    /// the ticked-layers strip right-aligned on the same line.
+    ///
+    /// A *fixed* height, and that is the whole reason it is a constant. The two
+    /// halves are different sizes — the header box is
+    /// `widgets`' `PICK_HIT` at 18 and the strip's chain is a 20 px
+    /// `icon_toggle` — so a line sized by whatever is on it would be two
+    /// pixels shorter with nothing ticked, and ticking the first layer would
+    /// shunt the whole list down under the pointer that had just ticked it.
+    /// That is the smaller version of the bug the shared line was made to fix,
+    /// and the one that would have been left behind. The tallest thing on the
+    /// line, so nothing is clipped.
+    pub const LAYER_TICK_ROW: f32 = 20.0;
     /// The module library dialog. One card per module, each a picture beside
     /// two lines of text.
     pub const MODULE_LIBRARY_WIDTH: f32 = 470.0;
