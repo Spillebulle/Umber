@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use umber_core::Harmony;
 use umber_core::input::PressureSource;
 
 /// Bumped only when a value's *meaning* changes, which has not happened yet.
@@ -104,6 +105,10 @@ pub struct Prefs {
     /// works in sliders should not be handed the wheel again every morning.
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
+    /// Which relation the Harmony picker mode shows. Kept for the reason
+    /// [`Prefs::picker`] is: it is a way of working, not something to choose
+    /// again every morning.
+    pub harmony: Harmony,
     /// How far each wheel centre is turned from its neutral pose, in degrees.
     ///
     /// Two keys rather than one, for the reason [`WheelAngles`] gives: the two
@@ -155,6 +160,7 @@ impl Default for Prefs {
             wheel_rotates: true,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
+            harmony: Harmony::default(),
             wheel_angles: WheelAngles::default(),
             save_history: true,
             // Exactly what every build before the setting existed held, so a
@@ -341,6 +347,7 @@ pub fn to_text(prefs: &Prefs) -> String {
         "wheel_shape = {}\n",
         wheel_shape_id(prefs.wheel_shape)
     ));
+    out.push_str(&format!("harmony = {}\n", harmony_id(prefs.harmony)));
     for shape in WheelShape::ALL {
         out.push_str(&format!(
             "{} = {:.1}\n",
@@ -453,6 +460,11 @@ pub fn from_text(text: &str) -> Prefs {
             "wheel_shape" => {
                 if let Some(v) = wheel_shape_from_id(value) {
                     prefs.wheel_shape = v;
+                }
+            }
+            "harmony" => {
+                if let Some(v) = harmony_from_id(value) {
+                    prefs.harmony = v;
                 }
             }
             // Wrapped rather than clamped, unlike every other number here: an
@@ -647,7 +659,26 @@ fn picker_id(mode: PickerMode) -> &'static str {
         PickerMode::Wheel => "wheel",
         PickerMode::Square => "square",
         PickerMode::Sliders => "sliders",
+        PickerMode::Harmony => "harmony",
     }
+}
+
+/// Stable names for the harmony relations, for the reason [`picker_id`] gives.
+///
+/// A `match` rather than a slug of the label, so adding a relation is a missing
+/// arm rather than a name that changes silently the day the label is reworded.
+fn harmony_id(harmony: Harmony) -> &'static str {
+    match harmony {
+        Harmony::Complementary => "complementary",
+        Harmony::Analogous => "analogous",
+        Harmony::Triad => "triad",
+        Harmony::SplitComplementary => "split-complementary",
+        Harmony::Tetrad => "tetrad",
+    }
+}
+
+fn harmony_from_id(id: &str) -> Option<Harmony> {
+    Harmony::ALL.into_iter().find(|h| harmony_id(*h) == id)
 }
 
 fn picker_from_id(id: &str) -> Option<PickerMode> {
@@ -724,6 +755,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         wheel_rotates: ed.ui.wheel_rotates,
         picker: ed.ui.picker,
         wheel_shape: ed.ui.wheel_shape,
+        harmony: ed.ui.harmony,
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
         // Read off the live history, like every other value here is read off
@@ -777,6 +809,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.wheel_rotates = prefs.wheel_rotates;
     ed.ui.picker = prefs.picker;
     ed.ui.wheel_shape = prefs.wheel_shape;
+    ed.ui.harmony = prefs.harmony;
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
     set_undo_budget(ed, prefs.undo_budget_mb);
@@ -1204,6 +1237,7 @@ mod tests {
             check_updates: false,
             update_notice_seen: true,
             wheel_rotates: false,
+            harmony: Harmony::Tetrad,
             picker: PickerMode::Sliders,
             wheel_shape: WheelShape::Square,
             wheel_angles: turned(30.0, 200.0),

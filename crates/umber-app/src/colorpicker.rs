@@ -1,34 +1,42 @@
 //! The colour picker from the design's Colour panel.
 //!
-//! Three of the design's five modes are implemented: a hue ring with a
-//! triangle or square centre, a plain saturation/value square with a hue bar,
-//! and RGB sliders. Palette and Harmony are not built.
+//! Four of the design's five modes are implemented: a hue ring with a triangle
+//! or square centre, a plain saturation/value square with a hue bar, RGB
+//! sliders, and a harmony wheel. Palette is not one of these — it is a module
+//! of its own, [`crate::palettelib`], because a palette is something the artist
+//! *keeps* rather than a way of arriving at one colour, and it has a library
+//! and a file format behind it that no picker mode wants.
 //!
 //! HSV is the picker's state, not the colour. Deriving hue from RGB each frame
 //! would lose it whenever saturation or value hits zero — drag the value to
-//! black and the hue would snap back to red on the way out.
+//! black and the hue would snap back to red on the way out. The Harmony mode
+//! leans on that hardest: a harmony is a function of hue alone, so a mode that
+//! read the hue off the colour would offer a red harmony for every grey.
 
-use crate::theme::Palette;
+use crate::theme::{Palette, metrics};
 use egui::{
-    Color32, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, epaint::Vertex, pos2, vec2,
+    Color32, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+    epaint::Vertex, pos2, vec2,
 };
-use umber_core::Hsv;
+use umber_core::{Harmony, Hsv};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerMode {
     Wheel,
     Square,
     Sliders,
+    Harmony,
 }
 
 impl PickerMode {
-    pub const ALL: [PickerMode; 3] = [Self::Wheel, Self::Square, Self::Sliders];
+    pub const ALL: [PickerMode; 4] = [Self::Wheel, Self::Square, Self::Sliders, Self::Harmony];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Wheel => "Wheel",
             Self::Square => "Square",
             Self::Sliders => "Sliders",
+            Self::Harmony => "Harmony",
         }
     }
 }
@@ -198,6 +206,7 @@ fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
 const RING_GRIP: f32 = 0.92;
 
 /// Draw the picker. Returns true when the colour changed.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     p: &Palette,
@@ -205,13 +214,29 @@ pub fn show(
     shape: &mut WheelShape,
     rotate: &mut bool,
     angles: &mut WheelAngles,
+    harmony: &mut Harmony,
     hsv: &mut Hsv,
 ) -> bool {
     match mode {
         PickerMode::Wheel => wheel(ui, p, shape, rotate, angles, hsv),
         PickerMode::Square => square(ui, p, hsv),
         PickerMode::Sliders => sliders(ui, p, hsv),
+        PickerMode::Harmony => harmony_wheel(ui, p, harmony, hsv),
     }
+}
+
+/// The RGB sliders alone, for the dialogs that mix a colour without being a
+/// picker.
+///
+/// The New document and Export dialogs each want the Colour panel's own slider
+/// mode so the two mix a colour the same way, and neither has anywhere for the
+/// wheel's shape, spin, angle or harmony to live — a dialog must not be able to
+/// turn the picker in the panel behind it. Both used to declare four throwaway
+/// locals and call [`show`], which is the same block written twice and one more
+/// place to edit every time this signature grows. It is the same `sliders` the
+/// mode draws, so the two cannot diverge.
+pub fn show_sliders(ui: &mut Ui, p: &Palette, hsv: &mut Hsv) -> bool {
+    sliders(ui, p, hsv)
 }
 
 /// The angle the wheel's centre is drawn at, in degrees from its neutral pose —
@@ -289,54 +314,11 @@ fn wheel(
         changed = true;
     }
 
-    let f = feather(ui);
-    // Enough segments that the facets are shorter than the feather is wide,
-    // otherwise a smooth edge is drawn along a visibly polygonal outline. Scaled
-    // to the wheel rather than fixed: a picker in a narrow panel does not need
-    // the segments a wide one does, and a wide one needed more than the flat 96
-    // this used to draw.
-    let segments = ((outer * 0.9) as usize).clamp(RING_SEGMENTS, 320);
-
-    let painter = ui.painter();
-    let mut mesh = Mesh::default();
-    // Four radii across the ring: a transparent skirt, the ring itself, and
-    // another skirt. See `feather`.
-    let radii = [
-        ((inner - f).max(0.0), false),
-        (inner, true),
-        (outer, true),
-        (outer + f, false),
-    ];
-    for i in 0..segments {
-        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
-        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
-
-        let base = mesh.vertices.len() as u32;
-        for angle in [a0, a1] {
-            let dir = vec2(angle.cos(), angle.sin());
-            let colour = hue_colour(angle.to_degrees());
-            for (radius, solid) in radii {
-                mesh.vertices.push(Vertex {
-                    pos: centre + dir * radius,
-                    uv: egui::epaint::WHITE_UV,
-                    color: if solid { colour } else { faded(colour) },
-                });
-            }
-        }
-        // Three bands between the four radii, each a quad spanning the segment.
-        for band in 0..radii.len() as u32 - 1 {
-            let l = base + band;
-            let r = base + radii.len() as u32 + band;
-            mesh.indices
-                .extend_from_slice(&[l, l + 1, r, l + 1, r + 1, r]);
-        }
-    }
-    painter.add(Shape::mesh(mesh));
+    hue_ring(ui, centre, inner, outer);
 
     // Hue marker, on the middle of the ring wherever the ring ended up.
-    let ha = hsv.h.to_radians();
-    let marker = centre + vec2(ha.cos(), ha.sin()) * (inner + outer) * 0.5;
-    painter.circle_stroke(marker, 6.0, Stroke::new(2.0, Color32::WHITE));
+    ui.painter()
+        .circle_stroke(ring_point(centre, inner, outer, hsv.h), 6.0, MARKER_STROKE);
 
     // --- saturation / value shape ---
     let drag = if on_ring { None } else { at };
@@ -446,6 +428,73 @@ fn angle_row() -> crate::widgets::NumberRow<'static> {
     }
 }
 
+/// The white ring every marker in this picker is drawn with.
+///
+/// One value rather than a number typed at each of the four call sites: the
+/// hue marker, the triangle's, the field's and the harmony's members are the
+/// same instrument saying "you are here", and a marker that was two points on
+/// one control and one on another would read as two different things.
+const MARKER_STROKE: Stroke = Stroke {
+    width: 2.0,
+    color: Color32::WHITE,
+};
+
+/// The middle of the ring at a given hue — where a marker for that hue goes.
+fn ring_point(centre: Pos2, inner: f32, outer: f32, hue: f32) -> Pos2 {
+    let a = hue.to_radians();
+    centre + vec2(a.cos(), a.sin()) * (inner + outer) * 0.5
+}
+
+/// The hue ring itself, drawn between two radii about `centre`.
+///
+/// Its own function because the Wheel and Harmony modes both draw one and a
+/// second copy of a hand-built mesh is a second thing to keep feathered. See
+/// [`feather`] for why the mesh carries its own skirt at all.
+fn hue_ring(ui: &Ui, centre: Pos2, inner: f32, outer: f32) {
+    let f = feather(ui);
+    // Enough segments that the facets are shorter than the feather is wide,
+    // otherwise a smooth edge is drawn along a visibly polygonal outline. Scaled
+    // to the wheel rather than fixed: a picker in a narrow panel does not need
+    // the segments a wide one does, and a wide one needed more than the flat 96
+    // this used to draw.
+    let segments = ((outer * 0.9) as usize).clamp(RING_SEGMENTS, 320);
+
+    let mut mesh = Mesh::default();
+    // Four radii across the ring: a transparent skirt, the ring itself, and
+    // another skirt. See `feather`.
+    let radii = [
+        ((inner - f).max(0.0), false),
+        (inner, true),
+        (outer, true),
+        (outer + f, false),
+    ];
+    for i in 0..segments {
+        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+
+        let base = mesh.vertices.len() as u32;
+        for angle in [a0, a1] {
+            let dir = vec2(angle.cos(), angle.sin());
+            let colour = hue_colour(angle.to_degrees());
+            for (radius, solid) in radii {
+                mesh.vertices.push(Vertex {
+                    pos: centre + dir * radius,
+                    uv: egui::epaint::WHITE_UV,
+                    color: if solid { colour } else { faded(colour) },
+                });
+            }
+        }
+        // Three bands between the four radii, each a quad spanning the segment.
+        for band in 0..radii.len() as u32 - 1 {
+            let l = base + band;
+            let r = base + radii.len() as u32 + band;
+            mesh.indices
+                .extend_from_slice(&[l, l + 1, r, l + 1, r + 1, r]);
+        }
+    }
+    ui.painter().add(Shape::mesh(mesh));
+}
+
 /// Saturation/value triangle inscribed in the ring, turned by `base` radians.
 ///
 /// The apex is the full hue, with white and black at the other two corners.
@@ -541,7 +590,7 @@ fn sv_triangle(
         hue_pt.x * a + white_pt.x * b + black_pt.x * c,
         hue_pt.y * a + white_pt.y * b + black_pt.y * c,
     );
-    painter.circle_stroke(marker, 5.0, Stroke::new(2.0, Color32::WHITE));
+    painter.circle_stroke(marker, 5.0, MARKER_STROKE);
 
     changed
 }
@@ -802,9 +851,187 @@ fn sv_field(
     painter.add(Shape::mesh(mesh));
 
     let marker = field_point(centre, half, angle, hsv.s, hsv.v);
-    painter.circle_stroke(marker, 5.5, Stroke::new(2.0, Color32::WHITE));
+    painter.circle_stroke(marker, 5.5, MARKER_STROKE);
 
     changed
+}
+
+/// How tall a harmony swatch is, and how far apart two of them sit.
+const HARMONY_SWATCH: f32 = 30.0;
+const HARMONY_GAP: f32 = 4.0;
+
+/// The hue ring with the chosen relation's other hues marked on it, a
+/// saturation/value square in the middle, and a row of the resulting colours
+/// underneath.
+///
+/// Three controls, and each does exactly one thing:
+///
+/// * **The ring** sets the hue in hand, by dragging, exactly as the Wheel
+///   mode's does. Every marker on it moves together, because a harmony is a
+///   rotation.
+/// * **The square** sets saturation and value. Without it this mode could not
+///   set them at all, and a picker mode you have to leave to finish choosing a
+///   colour is one nobody would stay in.
+/// * **The swatch row** takes one of the related colours, by clicking. That is
+///   the precise control: a click on the ring near a marker would land on
+///   *roughly* that hue, where the whole point of a harmony is the exact angle.
+///
+/// Saturation and value are the artist's own and are carried across every
+/// member — see [`umber_core::harmony`], which is where the argument for that
+/// lives. It also means a harmony of a grey is a row of identical greys, which
+/// is correct and is why the base swatch is marked rather than left to be told
+/// apart by its colour.
+fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv) -> bool {
+    let mut changed = false;
+
+    let size = ui.available_width().clamp(MIN_PICKER, 176.0);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width().max(size), size), Sense::hover());
+    let area = Rect::from_center_size(rect.center(), vec2(size, size));
+    let centre = area.center();
+    let outer = size * 0.5;
+    let inner = (outer - RING_THICKNESS).max(outer * 0.25);
+
+    // One interaction for the whole wheel, settled at the press, for exactly
+    // the reason the Wheel mode's is: the centre's rect covers the ring at the
+    // four diagonals, so two overlapping `interact` rects would send a hue drag
+    // begun there to the saturation and value field.
+    let response = ui.interact(area, ui.id().with("harmony-wheel"), Sense::click_and_drag());
+    let at = response.interact_pointer_pos();
+    let on_ring = gesture_origin(ui, &response)
+        .is_some_and(|from| (from - centre).length() > inner * RING_GRIP);
+
+    if on_ring && let Some(pos) = at {
+        let d = pos - centre;
+        hsv.h = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
+        changed = true;
+    }
+
+    hue_ring(ui, centre, inner, outer);
+
+    // The members, marked on the ring. The base wears the same ring the Wheel
+    // mode's hue marker does — it is the same thing — and the others are filled
+    // discs of their own colour, so which one is in hand is a difference of
+    // *mark* rather than of colour. That matters: at zero saturation every
+    // member is the same grey.
+    let hues = harmony.hues(hsv.h);
+    let painter = ui.painter();
+    for (index, hue) in hues.as_slice().iter().enumerate() {
+        let at = ring_point(centre, inner, outer, *hue);
+        if index == 0 {
+            painter.circle_stroke(at, 6.0, MARKER_STROKE);
+        } else {
+            painter.circle_filled(at, 5.0, hsv_colour(*hue, hsv.s, hsv.v));
+            painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+        }
+    }
+
+    // The saturation and value field, level and inscribed in the ring.
+    let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
+    let drag = if on_ring { None } else { at };
+    changed |= sv_field(ui, centre, Vec2::splat(half), 0.0, drag, hsv);
+
+    ui.add_space(8.0);
+
+    // Which relation. A dropdown rather than a segmented control: five names,
+    // the longest of them "Split complementary", in a panel 264 px wide.
+    let mut picked = *harmony;
+    crate::widgets::dropdown(
+        ui,
+        p,
+        crate::widgets::Dropdown::new(harmony.label()).width(crate::widgets::DropdownWidth::Fill),
+        |ui| {
+            for option in Harmony::ALL {
+                if ui
+                    .selectable_label(*harmony == option, option.label())
+                    .clicked()
+                {
+                    picked = option;
+                }
+            }
+        },
+    );
+    *harmony = picked;
+
+    ui.add_space(8.0);
+    changed |= harmony_swatches(ui, p, hues.as_slice(), hsv);
+
+    changed
+}
+
+/// Where one swatch of a row of `count` sits.
+///
+/// Its own function so the arithmetic can be checked without a `Ui`: it is the
+/// one part of the row that can be wrong in a way nobody notices — a cell that
+/// overlapped its neighbour would put two hit targets on the same pixels, and
+/// the one drawn second would take every click on the overlap.
+///
+/// A width of zero is a panel dragged to nothing, and a `Rect` built from a
+/// negative width has its max left of its min, which paints somewhere
+/// unrelated. Hence the floor.
+fn swatch_cell(row: Rect, index: usize, count: usize) -> Rect {
+    let count = count.max(1);
+    let each = ((row.width() - HARMONY_GAP * (count - 1) as f32) / count as f32).max(1.0);
+    Rect::from_min_size(
+        pos2(row.left() + index as f32 * (each + HARMONY_GAP), row.top()),
+        vec2(each, row.height()),
+    )
+}
+
+/// The row of colours a harmony reaches, the one in hand first. Returns true
+/// when one of them was taken.
+///
+/// Laid out by hand rather than in a `horizontal`, because the row has to
+/// divide the panel's width between however many members the relation has —
+/// two for a complementary, four for a tetrad — and share the remainder rather
+/// than leaving a ragged end.
+fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bool {
+    if hues.is_empty() {
+        return false;
+    }
+    let width = ui.available_width().max(MIN_PICKER);
+    let (row, _) = ui.allocate_exact_size(vec2(width, HARMONY_SWATCH), Sense::hover());
+
+    let mut taken = None;
+    for (index, hue) in hues.iter().enumerate() {
+        let cell = swatch_cell(row, index, hues.len());
+        let colour = Hsv::new(*hue, hsv.s, hsv.v).to_color(1.0);
+        let [r, g, b, _] = colour.to_srgb_u8();
+        let response = ui.interact(
+            cell,
+            ui.id().with(("harmony-swatch", index)),
+            Sense::click(),
+        );
+        ui.painter()
+            .rect_filled(cell, metrics::RADIUS, Color32::from_rgb(r, g, b));
+        // The one in hand is outlined in the accent — the mark this interface
+        // already uses for "this is the one" — and the rest carry the ordinary
+        // border so a swatch the same colour as the panel still has an edge.
+        let (stroke, hint) = if index == 0 {
+            (Stroke::new(2.0, p.accent), "The colour in hand")
+        } else {
+            (Stroke::new(1.0, p.border), "Take this colour")
+        };
+        ui.painter()
+            .rect_stroke(cell, metrics::RADIUS, stroke, StrokeKind::Inside);
+        if response
+            .on_hover_text(format!("{hint} — #{r:02X}{g:02X}{b:02X}"))
+            .clicked()
+            && index > 0
+        {
+            taken = Some(*hue);
+        }
+    }
+
+    // Applied after the loop rather than inside it: moving the hue mid-row
+    // would redraw the remaining swatches against a base that had already
+    // changed, so the second half of the row would be a different harmony from
+    // the first.
+    if let Some(hue) = taken {
+        hsv.h = hue;
+        return true;
+    }
+    false
 }
 
 /// R/G/B rows, each a gradient showing what moving that channel would do.
@@ -1192,6 +1419,71 @@ mod tests {
                 let out = outer[i] - centroid;
                 let inn = inner[i] - centroid;
                 assert!(out.length() > inn.length(), "corner {i} folded inwards");
+            }
+        }
+    }
+
+    /// A harmony's markers are on the ring at the hues the model answered, and
+    /// the base one is exactly where the Wheel mode's hue marker is — the two
+    /// are one function, and this is what says so.
+    #[test]
+    fn a_harmonys_markers_sit_on_the_ring_at_its_own_hues() {
+        let (inner, outer) = (40.0, 60.0);
+        let mid = (inner + outer) * 0.5;
+        for base in [0.0_f32, 47.0, 200.0, 359.0] {
+            let hues = Harmony::Complementary.hues(base);
+            let at: Vec<Pos2> = hues
+                .as_slice()
+                .iter()
+                .map(|h| ring_point(CENTRE, inner, outer, *h))
+                .collect();
+            for pt in &at {
+                assert!(
+                    (apart(*pt, CENTRE) - mid).abs() < 1e-3,
+                    "{pt:?} is not on the ring"
+                );
+            }
+            // A complementary is straight across, so the two markers are a
+            // diameter apart.
+            assert!(
+                (apart(at[0], at[1]) - mid * 2.0).abs() < 1e-2,
+                "at {base}: {at:?}"
+            );
+            // And the base marker is the wheel's own, at the same hue.
+            let angle = base.to_radians();
+            let expected = CENTRE + vec2(angle.cos(), angle.sin()) * mid;
+            assert!(apart(at[0], expected) < 1e-3);
+        }
+    }
+
+    /// Two swatches must never share a pixel: the second drawn would take every
+    /// click on the overlap, so one member of the harmony would be unreachable.
+    /// And the row has to end where it was given room to, whatever divides it.
+    #[test]
+    fn the_harmony_swatches_tile_their_row_without_overlapping() {
+        for width in [264.0_f32, 190.0, 48.0, 1.0, 0.0] {
+            let row = Rect::from_min_size(pos2(10.0, 20.0), vec2(width, HARMONY_SWATCH));
+            for count in 1..=umber_core::harmony::MAX_HUES {
+                let cells: Vec<Rect> = (0..count).map(|i| swatch_cell(row, i, count)).collect();
+                for cell in &cells {
+                    assert!(cell.width() > 0.0 && cell.height() > 0.0, "{cell:?}");
+                    assert_eq!(cell.top(), row.top());
+                    assert_eq!(cell.height(), row.height());
+                }
+                for pair in cells.windows(2) {
+                    assert!(
+                        pair[1].left() >= pair[0].right(),
+                        "width {width}, {count} swatches: {pair:?} overlap"
+                    );
+                }
+                // The row is filled exactly, so the last swatch does not stop
+                // short of the edge — except where the floor on a cell's width
+                // has already taken over, which is a panel too narrow to draw
+                // anything usable in.
+                if width >= MIN_PICKER {
+                    let last = cells.last().expect("at least one");
+                    assert!((last.right() - row.right()).abs() < 1e-3, "{last:?}");
+                }
             }
         }
     }

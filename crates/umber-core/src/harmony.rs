@@ -189,7 +189,10 @@ mod tests {
         assert_eq!(Harmony::Triad.hues(0.0).as_slice(), &[0.0, 120.0, 240.0]);
         // Analogous is symmetric about the base, and the split complementary is
         // symmetric about the base's opposite.
-        assert_eq!(Harmony::Analogous.hues(90.0).as_slice(), &[90.0, 60.0, 120.0]);
+        assert_eq!(
+            Harmony::Analogous.hues(90.0).as_slice(),
+            &[90.0, 60.0, 120.0]
+        );
         assert_eq!(
             Harmony::SplitComplementary.hues(0.0).as_slice(),
             &[0.0, 150.0, 210.0]

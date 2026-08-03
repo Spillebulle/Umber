@@ -257,7 +257,13 @@ mod tests {
         // A whole turn is red, not the magenta that indexing the sixth sextant
         // would give.
         assert_eq!(
-            Hsv { h: 360.0, s: 1.0, v: 1.0 }.to_color(1.0).to_srgb_u8(),
+            Hsv {
+                h: 360.0,
+                s: 1.0,
+                v: 1.0
+            }
+            .to_color(1.0)
+            .to_srgb_u8(),
             [255, 0, 0, 255]
         );
     }

@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, EditTarget, Handle, History, Hsv,
-    InputPoint, LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp, StrokeBuilder,
-    TipMask, Transform,
+    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, EditTarget, Handle, Harmony,
+    History, Hsv, InputPoint, LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp,
+    StrokeBuilder, TipMask, Transform,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -121,6 +121,10 @@ pub struct UiState {
     /// How far each wheel centre is turned from its neutral pose, when the hue
     /// is not deciding it. One angle per shape — see [`WheelAngles`].
     pub wheel_angles: WheelAngles,
+    /// Which relation the Harmony picker mode shows. Meaningless in the other
+    /// three, and kept anyway for the reason `wheel_shape` is: coming back to
+    /// the mode should find the choice where it was left.
+    pub harmony: Harmony,
     pub brush_editor_open: bool,
     pub brush_tab: BrushTab,
     pub settings_open: bool,
@@ -194,6 +198,7 @@ impl Default for UiState {
             wheel_rotates: true,
             // Zero is the pose every build before the angle existed drew.
             wheel_angles: WheelAngles::default(),
+            harmony: Harmony::default(),
             brush_editor_open: false,
             brush_tab: BrushTab::Tip,
             settings_open: false,

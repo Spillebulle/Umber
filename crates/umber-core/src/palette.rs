@@ -150,7 +150,10 @@ impl fmt::Display for PaletteError {
             ),
             Self::Unknown(id) => write!(f, "there is no palette called “{id}” in the library"),
             Self::NoDataDirectory => {
-                write!(f, "this system has no user data directory to keep palettes in")
+                write!(
+                    f,
+                    "this system has no user data directory to keep palettes in"
+                )
             }
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
@@ -197,10 +200,7 @@ impl Swatch {
 
     /// `#RRGGBB`, which is what the panel shows when a swatch has no name.
     pub fn hex(&self) -> String {
-        format!(
-            "#{:02X}{:02X}{:02X}",
-            self.rgb[0], self.rgb[1], self.rgb[2]
-        )
+        format!("#{:02X}{:02X}{:02X}", self.rgb[0], self.rgb[1], self.rgb[2])
     }
 }
 
@@ -339,7 +339,10 @@ pub fn read_gpl(text: &str, path: &Path) -> Result<GplRead, PaletteError> {
     let mut lines = text.lines();
     // Some writers put a byte-order mark on the first line, and refusing a file
     // over three invisible bytes would be a rejection nobody could act on.
-    let first = lines.next().unwrap_or_default().trim_start_matches('\u{feff}');
+    let first = lines
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('\u{feff}');
     if !first.trim().eq_ignore_ascii_case(GPL_HEADER) {
         return Err(PaletteError::NotAPalette(path.to_path_buf()));
     }
@@ -739,7 +742,10 @@ fn slug(name: &str) -> String {
     let trimmed = out.trim_matches('-');
     // Truncated at a length every filesystem accepts with room for the
     // disambiguating suffix and the extension.
-    let cut = trimmed.char_indices().nth(48).map_or(trimmed.len(), |(i, _)| i);
+    let cut = trimmed
+        .char_indices()
+        .nth(48)
+        .map_or(trimmed.len(), |(i, _)| i);
     match &trimmed[..cut] {
         "" => "palette".to_owned(),
         s => s.to_owned(),
@@ -780,10 +786,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "umber-palette-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("umber-palette-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -970,7 +973,10 @@ mod tests {
     fn a_library_is_the_directory_it_reads_back() {
         let dir = temp_dir("roundtrip");
         let mut library = PaletteLibrary::load_from(&dir);
-        assert!(library.is_empty(), "a missing directory is an empty library");
+        assert!(
+            library.is_empty(),
+            "a missing directory is an empty library"
+        );
 
         let id = library.create("Ochres").expect("made");
         let mut palette = library.get(&id).expect("in the library").clone();
@@ -987,7 +993,10 @@ mod tests {
         let mut library = reopened;
         library.rename(&id, "Earths").expect("renamed");
         assert_eq!(library.get(&id).expect("same id").name, "Earths");
-        assert_eq!(PaletteLibrary::load_from(&dir).get(&id).unwrap().name, "Earths");
+        assert_eq!(
+            PaletteLibrary::load_from(&dir).get(&id).unwrap().name,
+            "Earths"
+        );
 
         assert!(library.remove(&id).expect("deleted"));
         assert!(!library.remove(&id).expect("already gone is not an error"));
@@ -1027,7 +1036,11 @@ mod tests {
         let mine = library.create("Ochres").expect("made");
 
         let incoming = dir.join("incoming.gpl");
-        fs::write(&incoming, "GIMP Palette\nName: Ochres\n#\n9 9 9\nnonsense\n").unwrap();
+        fs::write(
+            &incoming,
+            "GIMP Palette\nName: Ochres\n#\n9 9 9\nnonsense\n",
+        )
+        .unwrap();
         let (imported, skipped) = library.import(&incoming).expect("read");
         assert_ne!(imported, mine);
         assert_eq!(skipped, 1, "the import says what it dropped");

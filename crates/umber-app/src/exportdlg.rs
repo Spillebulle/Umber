@@ -26,7 +26,7 @@ use egui::Ui;
 use umber_core::export::{self, ExportFormat, ExportOptions};
 use umber_core::{Background, Color, Hsv};
 
-use crate::colorpicker::{self, PickerMode, WheelAngles, WheelShape};
+use crate::colorpicker;
 use crate::editor::Editor;
 use crate::tabs;
 use crate::theme::{Palette, text};
@@ -218,21 +218,9 @@ fn matte_field(ui: &mut Ui, p: &Palette, form: &mut ExportForm) {
     if form.matte == Matte::Custom {
         ui.add_space(8.0);
         // The Colour panel's own slider mode, so the two mix a colour the same
-        // way. The wheel's shape, spin and angles belong to the wheel, which
-        // this mode does not draw, so they are throwaways rather than the
-        // editor's — a dialog must not be able to turn the picker behind it.
-        let mut shape = WheelShape::Triangle;
-        let mut rotate = false;
-        let mut angles = WheelAngles::default();
-        colorpicker::show(
-            ui,
-            p,
-            PickerMode::Sliders,
-            &mut shape,
-            &mut rotate,
-            &mut angles,
-            &mut form.hsv,
-        );
+        // way — and nothing of the wheel's, which this mode does not draw and
+        // which belongs to the panel behind this dialog.
+        colorpicker::show_sliders(ui, p, &mut form.hsv);
     }
 }
 
