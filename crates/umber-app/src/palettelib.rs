@@ -416,9 +416,20 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     let [r, g, b, _] = ed.color.to_srgb_u8();
     let in_hand = [r, g, b];
 
+    // What is actually on screen. A palette may hold `MAX_SWATCHES` of them,
+    // and this loop does an `interact` and two shapes per colour — four
+    // thousand of each, every frame, for a panel showing forty. The brush list
+    // skips rows scrolled out of view for exactly this reason; a swatch wholly
+    // outside the clip is neither drawn nor a target, so leaving it out changes
+    // nothing anybody can point at.
+    let visible = ui.clip_rect();
+
     let mut act = None;
     for (index, swatch) in palette.swatches.iter().enumerate() {
         let cell = swatch_rect(area.min, index, columns);
+        if !visible.intersects(cell) {
+            continue;
+        }
         let response = ui.interact(cell, ui.id().with(("swatch", index)), Sense::click());
         // Geometry, not `response.hovered()`. The remove mark below is an
         // interactive widget on top of this one, and egui stops its hover search
