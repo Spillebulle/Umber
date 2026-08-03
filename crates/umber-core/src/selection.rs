@@ -29,6 +29,8 @@
 //!
 //! Combining two selections is the one thing that cannot hold to that, and
 //! "What a boolean costs the outline" below says exactly what it gives up.
+//! Feathering is the one thing that cannot be described by the rings *at all*,
+//! and "Feather" below says how it is carried instead.
 //!
 //! # Antialiasing and the fill rule
 //!
@@ -48,24 +50,36 @@
 //!
 //! # Combining selections
 //!
-//! Holding a modifier while drawing adds the new shape to the selection or
-//! takes it away — [`SelectionOp`]. **The boolean happens on the coverage, not
-//! on the rings.** Coverage is a rectangle of bytes: union is `max`, difference
-//! is `min(a, 255 - b)`, both exact per pixel and both linear in the area
-//! touched. Polygon boolean geometry is the alternative and it is a large,
-//! bug-prone algorithm — self-intersection, coincident edges, degenerate
-//! vertices — for a result the mask already has exactly.
+//! A new shape replaces the selection, adds to it, takes it away, or keeps only
+//! what the two have in common — [`SelectionOp`]. **The boolean happens on the
+//! coverage, not on the rings.** Coverage is a rectangle of bytes: union is
+//! `max`, difference is `min(a, 255 - b)`, intersection is `min(a, b)`, all
+//! three exact per pixel and all three linear in the area touched. Polygon
+//! boolean geometry is the alternative and it is a large, bug-prone algorithm —
+//! self-intersection, coincident edges, degenerate vertices — for a result the
+//! mask already has exactly.
 //!
-//! `max`/`min(a, 255 - b)` rather than `a + b - ab` and its dual: they are
-//! idempotent, so adding a shape to itself is the identity where the
-//! probabilistic pair would fatten it a little every time; they are exact
-//! wherever either operand is fully in or fully out, which is every pixel
-//! except the one-wide antialiased band at an edge; and they never manufacture
-//! coverage the geometry does not have. What they cost is a seam: two shapes
-//! that meet along a shared edge each cover it about half, and `max` of two
-//! halves is a half rather than the whole the two together really do cover. It
-//! is one pixel wide, it is what Photoshop and GIMP do, and the alternative is
-//! to keep the geometry — which is the thing this avoids.
+//! The three are the Kleene operators, which is what makes them the set that
+//! composes: `max`, `min` and the complement, so intersect is difference's twin
+//! rather than a fourth idea, and De Morgan holds between them pixel for pixel.
+//! Rather than `a + b - ab` and its duals: they are idempotent, so adding a
+//! shape to itself is the identity where the probabilistic pair would fatten it
+//! a little every time; they are exact wherever either operand is fully in or
+//! fully out, which is every pixel except the band at an edge; and they never
+//! manufacture coverage the geometry does not have. What they cost is a seam:
+//! two shapes that meet along a shared edge each cover it about half, and `max`
+//! of two halves is a half rather than the whole the two together really do
+//! cover. It is one pixel wide on an unfeathered edge, it is what Photoshop and
+//! GIMP do, and the alternative is to keep the geometry — which is the thing
+//! this avoids.
+//!
+//! **The bounding rectangle moves differently for each**, and getting it wrong
+//! is silent — outside the rectangle is *not selected*, decided arithmetically
+//! rather than by clamping, so a rectangle that is too small quietly deselects
+//! and one that is too large costs a texture. Add takes the union of the two,
+//! Intersect their overlap, Subtract keeps this one's; every result is then
+//! trimmed to what is actually covered by [`Selection::from_mask`], so an
+//! intersection that grazes a corner ends up as small as it really is.
 //!
 //! # What a boolean costs the outline
 //!
@@ -91,14 +105,86 @@
 //!   edge the two can disagree by one pixel. They already could: `bounds` is
 //!   the outline's box rounded outwards.
 //!
-//! An unmodified gesture — much the commonest — keeps its exact rings. Tracing
-//! only ever runs where a boolean actually ran.
+//! A [`SelectionOp::Replace`] gesture — much the commonest — keeps its exact
+//! rings. Tracing only ever runs where a boolean actually ran.
+//!
+//! # Feather
+//!
+//! A feather is a softening radius in document pixels: coverage falls from full
+//! to nothing across a band `2 × radius` wide, centred on the outline.
+//!
+//! **It is a blur of the mask and the rings are left exactly where they were**,
+//! which is the opposite of the decision a boolean forces and is right for the
+//! same reason that one is. The kernel is symmetric, so the 50% contour of the
+//! softened mask *is* the sharp edge it was blurred from — exactly so along a
+//! straight edge, and within the curvature elsewhere. The rings are therefore
+//! still the honest place to draw the marquee, and [`Selection::contains`]
+//! still answers where the fill is half. Tracing a feathered mask would put the
+//! outline in the same place, pixel-quantised, having thrown away the exact
+//! geometry to get there.
+//!
+//! **The radius is a field**, because rings alone cannot describe a soft edge
+//! and the rings are re-rasterised twice in Umber: `Selection::flipped` when
+//! the canvas is mirrored, and `Editor::carry_selection` when a transform
+//! commits. Both rebuild the mask, so both have to re-apply the feather or a
+//! flip would quietly harden every soft edge in the picture. What a boolean
+//! records is the **larger** of the two radii — the softest edge in the
+//! result — because one number cannot say that half an outline is soft, and of
+//! the two answers available only that one cannot harden an edge that was soft.
+//! The drift it admits is small and real: subtracting a feathered shape from a
+//! hard selection and then flipping the canvas softens the whole outline.
+//!
+//! The kernel is a **tent**, two box passes of half-width `radius / 2` **per
+//! axis** — four passes, not two, because a tent is the box convolved with
+//! itself and convolution is per axis; one pass along each is a two-dimensional
+//! box, which reaches half as far as the radius asked for and has a corner in
+//! its profile. Three properties earn it: the running sums make it linear in the
+//! area whatever the radius; every partial sum is an exact integer, so the only
+//! rounding is the one store per pass and the result is exactly symmetric; and
+//! being separable over a mask that is itself separable, an axis-aligned
+//! rectangle keeps the exactness the fill rule gives it — its softened coverage
+//! is the product of two identical one-dimensional ramps, the same on both
+//! axes, mirrored exactly about the rectangle's centre. A Gaussian buys a
+//! smoother shoulder for a kernel with no compact support, which would have to
+//! be truncated somewhere and would then be neither exact nor symmetric.
+//!
+//! **Outside the canvas counts as unselected**, so a selection reaching the
+//! edge of the document fades at it. That is what Photoshop and GIMP do, and
+//! the alternative — treating the canvas edge as more of the same — would make
+//! a feathered Select All paint a hard edge the artist never drew.
+//!
+//! **A radius of zero is the exact identity**: the same bounds, the same bytes,
+//! no allocation and no pass, so a selection nobody feathered costs exactly
+//! what it did before feathering existed.
+//!
+//! # What a feather does to a lift, which is not new but is now the ordinary
+//! case
+//!
+//! `transform.wgsl`'s `fs_mask` takes the share of a pixel that leaves as
+//! `min(a, m) / a` rather than `a × m`, because painting is *already* clipped
+//! by this same mask in the dab pass and multiplying applies it twice. The
+//! third of the three cases that rule enumerates — `a < m`, content softer than
+//! the mask — reads "the float takes it whole, with that falloff intact rather
+//! than multiplied by the mask's". Against an antialiased edge that is a
+//! one-pixel band. Against a feather it is a band `2 × radius` wide, so
+//! **lifting a soft wash through a wide feather takes it whole wherever it is
+//! fainter than the ramp**, and the feather shows only where the content is
+//! more opaque than the mask.
+//!
+//! That is the documented rule behaving as documented and nothing here changed
+//! it, but it is worth saying out loud in the place a feather is defined,
+//! because a feather is exactly what somebody reaches for when they want a soft
+//! edge on a lift. `a_lift_still_splits_paint_the_selection_did_not_make`
+//! refuses the tempting over-correction — taking everything the mask touches —
+//! and the argument for `min` is in `transform.wgsl`'s own comments; changing
+//! it is a decision about the transform, not about this module.
 //!
 //! # What is not here
 //!
-//! No intersect, no feather, no "select by colour". Each is a real feature and
-//! none is drawn in the interface, which is the rule this file lives by as much
-//! as any other.
+//! No "select by colour", no growing or shrinking a selection by a distance,
+//! and no saving one into the document. Each is a real feature and none is
+//! drawn in the interface, which is the rule this file lives by as much as any
+//! other.
 
 use crate::geom::{FlipAxis, PixelRect, Rect};
 use glam::{UVec2, Vec2};
@@ -168,6 +254,34 @@ pub enum SelectionOp {
     Add,
     /// Difference. The new shape is taken out of what was selected.
     Subtract,
+    /// Intersection. Only what both cover stays selected.
+    Intersect,
+}
+
+impl SelectionOp {
+    pub const ALL: [SelectionOp; 4] = [Self::Replace, Self::Add, Self::Subtract, Self::Intersect];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Replace => "Replace",
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+            Self::Intersect => "Intersect",
+        }
+    }
+
+    /// What the operation does, for the control that offers it.
+    ///
+    /// Each says what happens to the selection *already standing*, because that
+    /// is the half a name like "Intersect" does not carry on its own.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Replace => "The new shape becomes the selection.",
+            Self::Add => "The new shape joins what is already selected.",
+            Self::Subtract => "The new shape is taken out of what is selected.",
+            Self::Intersect => "Only what both the new shape and the selection cover stays.",
+        }
+    }
 }
 
 /// A region of the document, as an outline and a coverage mask over the
@@ -182,9 +296,24 @@ pub struct Selection {
     /// `bounds.width * bounds.height` bytes, row-major from `bounds`'s
     /// top-left. `0` is outside, `255` is fully inside.
     coverage: Vec<u8>,
+    /// The softening radius already applied to `coverage`, in document pixels.
+    ///
+    /// Kept because the rings cannot describe it and the rings are rasterised
+    /// again on a canvas flip and on a transform commit — see "Feather" in the
+    /// module docs. Zero is the ordinary case and the exact identity.
+    feather: f32,
 }
 
 impl Selection {
+    /// The widest feather a selection may carry, in document pixels.
+    ///
+    /// A bound rather than a taste: the radius decides how far the bounding
+    /// rectangle grows and therefore how much texture a selection costs, and
+    /// the number reaches this module from a control somebody can type into.
+    /// 250 px is already a falloff five hundred pixels wide, which is larger
+    /// than any edge a painter is softening.
+    pub const MAX_FEATHER: f32 = 250.0;
+
     /// Build a selection from closed rings in document space.
     ///
     /// Returns `None` when nothing of the shape lands on the canvas — an empty
@@ -209,6 +338,7 @@ impl Selection {
             rings,
             bounds,
             coverage,
+            feather: 0.0,
         })
     }
 
@@ -274,6 +404,60 @@ impl Selection {
         &self.rings
     }
 
+    /// The softening radius this selection's mask already carries, in document
+    /// pixels. Zero for every selection nobody feathered.
+    pub fn feather(&self) -> f32 {
+        self.feather
+    }
+
+    /// This selection with its edge softened by `radius` document pixels.
+    ///
+    /// **The rings are kept exactly**, and the module docs have the argument:
+    /// the kernel is symmetric, so the 50% contour of the result is the sharp
+    /// edge it was blurred from, and that is where the marquee belongs.
+    ///
+    /// **Not idempotent, deliberately.** It blurs whatever coverage is there
+    /// and *records* the radius it was given, so calling it twice softens
+    /// twice. Every caller in Umber hands it a sharp mask: a gesture's own
+    /// shape, or the re-rasterisation a flip and a transform commit do. Asking
+    /// it to notice `self.feather` and blur by the difference would be a
+    /// promise the tent cannot keep — two tents are not one wider tent.
+    ///
+    /// A radius at or below zero is the exact identity: the same bounds, the
+    /// same bytes, **no allocation and no copy** — which is why this takes
+    /// `self` by value rather than borrowing it. Every caller owns the
+    /// selection it is softening (a gesture's own shape, or the rebuild a flip
+    /// or a transform commit just made), so the common case is a move, and
+    /// consuming the sharp mask is also what stops the non-idempotence above
+    /// being reached by accident.
+    ///
+    /// `None` where a shape is so thin that softening it rounds every pixel to
+    /// nothing — the same answer as no selection everywhere else in this file.
+    ///
+    /// **A mask that survives but never reaches [`INSIDE`] is kept**, where
+    /// [`Selection::from_mask`] refuses one. The two look like the same
+    /// condition and are answers to different questions: there the *outline* is
+    /// what could not be found, and a selection with no outline is one nobody
+    /// can see; here the outline is the exact geometry of the shape somebody
+    /// drew and is unchanged, and a very soft selection whose peak coverage is
+    /// low is precisely what a feather wider than the shape means. Refusing it
+    /// would make the rail stop working part way along for no reason the artist
+    /// could see.
+    #[must_use]
+    pub fn feathered(self, radius: f32, doc: UVec2) -> Option<Self> {
+        let radius = radius.clamp(0.0, Self::MAX_FEATHER);
+        if radius <= 0.0 {
+            return Some(self);
+        }
+        let (bounds, coverage) = soften(self.bounds, &self.coverage, radius, doc)?;
+        Some(Self {
+            rings: self.rings,
+            bounds,
+            coverage,
+            feather: radius,
+        })
+    }
+
     /// The same selection on a canvas that has been mirrored.
     ///
     /// The rings are geometry, so this is the mirror applied to them and a
@@ -287,9 +471,25 @@ impl Selection {
     /// Mirroring reverses the winding of every ring, which the nonzero rule
     /// does not care about — a winding number of -1 is as inside as +1.
     ///
-    /// `None` cannot arise from a selection that had any coverage, since a
-    /// mirror preserves area; it is an `Option` because `from_rings` is, and
-    /// the answer for "nothing selected" is `None` everywhere in this file.
+    /// **The feather is re-applied**, because the rebuilt mask is the sharp
+    /// rasterisation of the mirrored rings and a flip that hardened every soft
+    /// edge in the picture would be a silent loss. The radius is a scalar and
+    /// a mirror is an isometry, so it needs no transforming — see "Feather" in
+    /// the module docs.
+    ///
+    /// **A feather that dissolves the mirror keeps the hard one instead**, and
+    /// this is not a hypothetical. A boolean traces its rings at the 50%
+    /// contour and records the *larger* of the two radii, so a small region
+    /// carrying a wide feather is reachable — intersect two heavily feathered
+    /// shapes that barely overlap — and re-rasterising those rings sharp and
+    /// softening them by that radius can round every pixel to nothing.
+    /// Deleting somebody's selection because they flipped the canvas is far
+    /// worse than mirroring it hard, and it would not even be undoable: undoing
+    /// a flip *is* another flip, so there is nothing to bring it back.
+    ///
+    /// `None` therefore still means only what it means everywhere else in this
+    /// file: the mirrored rings enclosed no pixel at all, which a mirror of
+    /// something with area cannot produce.
     pub fn flipped(&self, axis: FlipAxis, doc: UVec2) -> Option<Self> {
         let size = Vec2::new(doc.x as f32, doc.y as f32);
         let rings = self
@@ -297,19 +497,25 @@ impl Selection {
             .iter()
             .map(|ring| ring.iter().map(|p| axis.mirror(*p, size)).collect())
             .collect();
-        Self::from_rings(rings, doc)
+        let sharp = Self::from_rings(rings, doc)?;
+        Some(sharp.clone().feathered(self.feather, doc).unwrap_or(sharp))
     }
 
     /// Build a selection from a coverage mask, trimming it to what is actually
     /// covered and tracing its outline.
     ///
-    /// The two booleans below both end here, which is what keeps the trim and
+    /// The three booleans below all end here, which is what keeps the trim and
     /// the trace in one place. Trimming is not tidiness: a difference leaves
-    /// empty rows and columns behind, and `bounds` is what sizes the texture
-    /// the dab pass samples, so an untrimmed mask would upload the hole it just
-    /// cut. It is also how "subtracted down to nothing" becomes `None`, which
-    /// is the same answer as no selection everywhere else in this file.
-    fn from_mask(bounds: PixelRect, coverage: Vec<u8>) -> Option<Self> {
+    /// empty rows and columns behind and an intersection is usually far smaller
+    /// than either operand, and `bounds` is what sizes the texture the dab pass
+    /// samples, so an untrimmed mask would upload the hole it just cut. It is
+    /// also how "subtracted down to nothing" becomes `None`, which is the same
+    /// answer as no selection everywhere else in this file.
+    ///
+    /// `feather` is carried rather than derived: the mask handed in is already
+    /// as soft as its operands were, and what this records is the radius a
+    /// later re-rasterisation has to put back.
+    fn from_mask(bounds: PixelRect, coverage: Vec<u8>, feather: f32) -> Option<Self> {
         let (bounds, coverage) = trim(bounds, coverage)?;
         let rings = trace_rings(bounds, &coverage);
         // A mask can be non-empty and still trace nothing: coverage below
@@ -322,7 +528,17 @@ impl Selection {
             rings,
             bounds,
             coverage,
+            feather,
         })
+    }
+
+    /// The feather a combination of these two carries: the softer of the pair.
+    ///
+    /// One number cannot say that half an outline is soft, and of the two
+    /// answers available this is the one that cannot harden an edge that was
+    /// soft. See "Feather" in the module docs.
+    fn shared_feather(&self, other: &Self) -> f32 {
+        self.feather.max(other.feather)
     }
 
     /// This selection with `other` added to it.
@@ -336,7 +552,7 @@ impl Selection {
         // `max`, not a probabilistic add: see the module docs.
         self.blit_into(&mut coverage, bounds, |dst, src| dst.max(src));
         other.blit_into(&mut coverage, bounds, |dst, src| dst.max(src));
-        Self::from_mask(bounds, coverage)
+        Self::from_mask(bounds, coverage, self.shared_feather(other))
     }
 
     /// This selection with `other` taken out of it.
@@ -348,7 +564,27 @@ impl Selection {
         // `min(a, 255 - b)`, the dual of the `max` above: where `other` is
         // fully in, nothing survives; where it is half in, at most half does.
         other.blit_into(&mut coverage, self.bounds, |dst, src| dst.min(255 - src));
-        Self::from_mask(self.bounds, coverage)
+        Self::from_mask(self.bounds, coverage, self.shared_feather(other))
+    }
+
+    /// Only what both this selection and `other` cover.
+    ///
+    /// The bounds can only **shrink**, to the overlap of the two rectangles —
+    /// and where they do not overlap at all there is nothing to build, which
+    /// is `None` rather than a zero-area rectangle the renderer must not be
+    /// handed. Starting from the overlap rather than from this selection's own
+    /// rectangle is not an optimisation: `blit_into` only ever visits the
+    /// overlap, so a mask sized to the larger rectangle would keep this
+    /// selection's coverage untouched everywhere `other` does not reach — which
+    /// is a union of the two things intersect is supposed to reject.
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        let bounds = overlap_rect(self.bounds, other.bounds)?;
+        // Seeded with this selection's own coverage, then bounded by the
+        // other's: `min(a, b)`, the twin of the difference's `min(a, 255 - b)`.
+        let mut coverage = vec![0u8; bounds.area() as usize];
+        self.blit_into(&mut coverage, bounds, |_, src| src);
+        other.blit_into(&mut coverage, bounds, |dst, src| dst.min(src));
+        Self::from_mask(bounds, coverage, self.shared_feather(other))
     }
 
     /// Apply `op` to the selection standing, with the shape just drawn.
@@ -362,16 +598,24 @@ impl Selection {
     /// because "no selection" means the whole document and taking a shape out
     /// of it would be a bigger claim than the gesture made.
     ///
+    /// **Intersecting with nothing is the shape**, and it is the one empty case
+    /// that does not follow Subtract's. No selection means the whole document,
+    /// and the whole document intersected with a shape is exactly that shape —
+    /// no more than the gesture drew, which is the test Subtract fails. So the
+    /// first intersect of a session behaves as a replace, which is also what it
+    /// means.
+    ///
     /// `shape` is taken by value so `Replace` — much the commonest — moves it
     /// through untouched, with no copy of the mask and no outline traced.
     pub fn combined(base: Option<&Self>, shape: Option<Self>, op: SelectionOp) -> Option<Self> {
         match (op, base, shape) {
             (SelectionOp::Replace, _, shape) => shape,
             (SelectionOp::Subtract, None, _) => None,
-            (SelectionOp::Add, None, shape) => shape,
+            (SelectionOp::Add | SelectionOp::Intersect, None, shape) => shape,
             (_, Some(base), None) => Some(base.clone()),
             (SelectionOp::Add, Some(base), Some(shape)) => base.union(&shape),
             (SelectionOp::Subtract, Some(base), Some(shape)) => base.difference(&shape),
+            (SelectionOp::Intersect, Some(base), Some(shape)) => base.intersection(&shape),
         }
     }
 
@@ -411,6 +655,27 @@ fn union_rects(a: PixelRect, b: PixelRect) -> PixelRect {
         width: right - x,
         height: bottom - y,
     }
+}
+
+/// The rectangle both cover, or `None` where they do not meet.
+///
+/// A zero-width or zero-height overlap is `None` rather than an empty
+/// rectangle: two selections that share only an edge have no pixel in common,
+/// and every other function here treats "nothing selected" as `None`.
+fn overlap_rect(a: PixelRect, b: PixelRect) -> Option<PixelRect> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    if right <= x || bottom <= y {
+        return None;
+    }
+    Some(PixelRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
 }
 
 /// Shrink `rect` to the rows and columns of `coverage` that hold anything, and
@@ -555,6 +820,158 @@ fn add_span(acc: &mut [f32], origin: f32, x0: f32, x1: f32, weight: f32) {
         if hi > lo {
             *cell += (hi - lo) * weight;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Softening an edge
+// ---------------------------------------------------------------------------
+
+/// Soften `coverage` over `bounds` by `radius` document pixels, growing the
+/// rectangle to hold the falloff and clamping it to the canvas.
+///
+/// Two separable box passes of half-width `radius / 2`, which is a tent of
+/// half-width `radius`: coverage runs from full to nothing across a band twice
+/// the radius wide, centred on the edge it was blurred from. The module docs
+/// have the argument for the shape of the kernel; these are the two things the
+/// code has to get right.
+///
+/// **The grown rectangle is a bound, not a measurement.** The discrete box has
+/// a tap one beyond its own half-width carrying the fractional weight, so the
+/// pair reaches `2 × (⌊radius / 2⌋ + 1)` — never less than the radius, and up
+/// to a pixel more. Growing by exactly `radius` would clip the last of the
+/// falloff to zero along a straight line, which is a visible ledge on a wide
+/// feather. [`trim`] then takes the rectangle back to the pixels that actually
+/// hold anything, so what a selection costs is measured rather than guessed.
+///
+/// **Everything outside the mask is zero**, including everything outside the
+/// canvas, which is what makes a selection fade at the edge of the document.
+///
+/// **What it costs, said the way [`trace_rings`] says it.** Linear in the area
+/// whatever the radius, but with a real constant: two byte buffers the size of
+/// the grown rectangle, so a full-canvas feathered selection on a 2048²
+/// document is about 8 MB of scratch and on a 10000² one about 200 MB, given
+/// straight back. The vertical pass walks columns, which is a cache line per
+/// access on a wide rectangle. Unlike `trace_rings` this runs on *every*
+/// feathered gesture rather than only after a boolean — but still only at
+/// pointer-up, on a flip, and at a transform commit. **Nothing on the drawing
+/// path may reach it**, and nothing does: [`Selection::feathered`] is called
+/// from `SelectionDraft::finish`, [`Selection::flipped`] and
+/// `Editor::carry_selection`, and from nowhere else.
+fn soften(
+    bounds: PixelRect,
+    coverage: &[u8],
+    radius: f32,
+    doc: UVec2,
+) -> Option<(PixelRect, Vec<u8>)> {
+    let half = radius * 0.5;
+    let pad = 2 * (half.floor() as u32 + 1);
+    let x0 = bounds.x.saturating_sub(pad);
+    let y0 = bounds.y.saturating_sub(pad);
+    let x1 = (bounds.x + bounds.width + pad).min(doc.x.max(bounds.x + bounds.width));
+    let y1 = (bounds.y + bounds.height + pad).min(doc.y.max(bounds.y + bounds.height));
+    let grown = PixelRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    };
+
+    let w = grown.width as usize;
+    let h = grown.height as usize;
+    let src_w = bounds.width as usize;
+    let inset_x = (bounds.x - grown.x) as usize;
+    let inset_y = (bounds.y - grown.y) as usize;
+
+    // **Two box passes per axis, not one for the pair.** A single pass along
+    // each axis is a box in two dimensions, whose reach is `half` rather than
+    // the radius and whose profile has a corner in it; the tent this wants is
+    // the box convolved with itself, and convolution is per axis. Getting that
+    // wrong is a feather a quarter of the width asked for, which looks like a
+    // feather and is not the one on the control.
+    //
+    // The intermediate between the two axes is bytes rather than floats: it is
+    // the whole grown rectangle, and a canvas-sized selection in `f32` would be
+    // four times the mask it is softening. One store's worth of rounding is the
+    // price, and it is symmetric — every partial sum is an exact integer, so
+    // two equal inputs round to two equal outputs and a rectangle comes out
+    // exactly mirrored about its own centre.
+    let mut mid = vec![0u8; w * h];
+    let span = w.max(h);
+    let mut line = vec![0f32; span];
+    let mut scratch = vec![0f32; span];
+
+    for y in 0..h {
+        line[..w].fill(0.0);
+        if y >= inset_y && y - inset_y < bounds.height as usize {
+            let s = (y - inset_y) * src_w;
+            for (x, cell) in line[inset_x..inset_x + src_w].iter_mut().enumerate() {
+                *cell = f32::from(coverage[s + x]);
+            }
+        }
+        box_blur(&line[..w], &mut scratch[..w], half);
+        box_blur(&scratch[..w], &mut line[..w], half);
+        for (x, v) in line[..w].iter().enumerate() {
+            mid[y * w + x] = to_byte(*v);
+        }
+    }
+
+    let mut result = vec![0u8; w * h];
+    for x in 0..w {
+        for (y, cell) in line[..h].iter_mut().enumerate() {
+            *cell = f32::from(mid[y * w + x]);
+        }
+        box_blur(&line[..h], &mut scratch[..h], half);
+        box_blur(&scratch[..h], &mut line[..h], half);
+        for (y, v) in line[..h].iter().enumerate() {
+            result[y * w + x] = to_byte(*v);
+        }
+    }
+
+    trim(grown, result)
+}
+
+/// Round a coverage in 0..=255 back into a byte.
+fn to_byte(v: f32) -> u8 {
+    v.clamp(0.0, 255.0).round() as u8
+}
+
+/// One box pass of half-width `half` over `src`, into `dst`.
+///
+/// Weights are 1 for every tap within `⌊half⌋` and the fraction for the one
+/// beyond, normalised by `2 × half + 1` — so the kernel is continuous in the
+/// radius and a rail dragged through it does not step. Off either end reads as
+/// zero, which is what makes a selection fade at the edge of the canvas.
+///
+/// A running sum, so the cost is the length rather than the length times the
+/// radius: a 250-pixel feather over a full-canvas selection is otherwise five
+/// hundred multiply-adds per pixel per pass. The sum is only ever fed exact
+/// integers and only ever added to and subtracted from, so it stays exact —
+/// which is what makes the whole pass symmetric.
+fn box_blur(src: &[f32], dst: &mut [f32], half: f32) {
+    let n = src.len();
+    if half <= 0.0 || n == 0 {
+        dst[..n].copy_from_slice(src);
+        return;
+    }
+    let k = half.floor() as isize;
+    let frac = half - k as f32;
+    let norm = 1.0 / (2.0 * half + 1.0);
+    let at = |i: isize| -> f32 {
+        if i < 0 || i >= n as isize {
+            0.0
+        } else {
+            src[i as usize]
+        }
+    };
+
+    let mut sum = 0.0f32;
+    for j in -k..=k {
+        sum += at(j);
+    }
+    for i in 0..n as isize {
+        dst[i as usize] = (sum + frac * (at(i - k - 1) + at(i + k + 1))) * norm;
+        sum += at(i + k + 1) - at(i - k);
     }
 }
 
@@ -766,6 +1183,10 @@ pub struct SelectionDraft {
     /// the gesture *begins* and never read again — see
     /// [`SelectionDraft::combining`].
     op: SelectionOp,
+    /// How far the shape's edge is softened, in document pixels. Snapshotted
+    /// with the operation and for the same reason — see
+    /// [`SelectionDraft::feathered`].
+    feather: f32,
     /// Rectangle: the corner the drag started at. Lasso: every sampled point.
     /// Polygon: every vertex clicked so far.
     points: Vec<Vec2>,
@@ -788,6 +1209,7 @@ impl SelectionDraft {
         Self {
             mode,
             op: SelectionOp::Replace,
+            feather: 0.0,
             points: vec![at],
             cursor: at,
         }
@@ -815,8 +1237,27 @@ impl SelectionDraft {
         self.mode
     }
 
+    /// Soften the finished shape's edge by `radius` document pixels.
+    ///
+    /// Snapshotted at the start of the gesture, exactly as
+    /// [`SelectionDraft::combining`]'s operation is and for the same reason: a
+    /// polygon spans several clicks, and a rail dragged between two of them
+    /// must not change what the gesture already under way turns out to have
+    /// meant. It is also what makes the preview honest — the outline drawn
+    /// while the shape is being dragged is the rings, and the rings are exactly
+    /// where they will be however soft the mask ends up.
+    #[must_use]
+    pub fn feathered(mut self, radius: f32) -> Self {
+        self.feather = radius;
+        self
+    }
+
     pub fn op(&self) -> SelectionOp {
         self.op
+    }
+
+    pub fn feather(&self) -> f32 {
+        self.feather
     }
 
     /// A press, after the first. Returns true when the shape is now closed and
@@ -910,12 +1351,17 @@ impl SelectionDraft {
     }
 
     /// Turn the draft into a selection, or `None` if it encloses nothing.
+    ///
+    /// The shape is rasterised sharp and then softened, never rasterised soft:
+    /// [`Selection::from_rings`] stays the one rasteriser, and the feather is
+    /// one pass over the mask it produced.
     pub fn finish(&self, doc: UVec2) -> Option<Selection> {
-        match self.mode {
+        let sharp = match self.mode {
             SelectionMode::Rectangle => Selection::rectangle(self.points[0], self.cursor, doc),
             SelectionMode::Lasso => Selection::polygon(&self.points, doc),
             SelectionMode::Polygon => Selection::polygon(&self.points, doc),
-        }
+        };
+        sharp?.feathered(self.feather, doc)
     }
 }
 
@@ -1240,6 +1686,102 @@ mod tests {
     }
 
     #[test]
+    fn intersecting_two_overlapping_boxes_keeps_only_the_overlap() {
+        // The plain statement of what Intersect is for, and the one boolean
+        // whose bounding rectangle is smaller than *both* operands — which is
+        // the half that is silent when it is wrong, since outside the rectangle
+        // is unselected rather than clamped.
+        let a = rect(10.0, 10.0, 30.0, 30.0);
+        let b = rect(20.0, 20.0, 40.0, 40.0);
+        let both = a.intersection(&b).expect("the overlap");
+
+        assert_eq!(
+            both.bounds(),
+            PixelRect {
+                x: 20,
+                y: 20,
+                width: 10,
+                height: 10
+            }
+        );
+        assert_eq!(both.coverage().len(), 100);
+        assert_eq!(covered(&both), 100);
+        assert_eq!(both.coverage_at(20, 20), 255);
+        assert_eq!(both.coverage_at(29, 29), 255);
+        // Everything either one covered alone is gone. Reading these off
+        // `coverage_at` is the point: a mask sized to the larger rectangle
+        // would have left this selection's own coverage standing here, which is
+        // a union wearing intersect's name.
+        assert_eq!(both.coverage_at(15, 15), 0);
+        assert_eq!(both.coverage_at(35, 35), 0);
+        assert_eq!(both.rings().len(), 1);
+        assert!(both.contains(vec2(25.0, 25.0)));
+        assert!(!both.contains(vec2(15.0, 15.0)));
+    }
+
+    #[test]
+    fn intersecting_with_itself_is_the_identity_and_with_a_stranger_is_nothing() {
+        // `min`, like the union's `max`, is idempotent — so the round trip
+        // through the mask, the trim and the trace must give the same mask
+        // back. And two shapes that share no pixel intersect to `None` rather
+        // than to a zero-area rectangle the renderer must not be handed.
+        let a = rect(10.0, 10.0, 20.0, 20.0);
+        let again = a.intersection(&a).expect("itself");
+        assert_eq!(again.bounds(), a.bounds());
+        assert_eq!(again.coverage(), a.coverage());
+
+        let far = rect(40.0, 40.0, 50.0, 50.0);
+        assert!(a.intersection(&far).is_none());
+        // Touching along one edge is not overlapping: the rectangles meet at
+        // x = 20 and share no pixel, because the mask is half-open there.
+        let beside = rect(20.0, 10.0, 30.0, 20.0);
+        assert!(a.intersection(&beside).is_none());
+    }
+
+    #[test]
+    fn an_intersection_reads_the_same_from_either_side() {
+        // `min` is commutative and the overlap of two rectangles is symmetric,
+        // so the two orders have to agree pixel for pixel — antialiased band
+        // along the triangle's diagonal included, which is where a difference
+        // between the two would actually show up. Worth pinning because the
+        // implementation is *not* symmetric: one operand seeds the mask and the
+        // other bounds it.
+        let a = Selection::polygon(&[vec2(8.0, 8.0), vec2(40.0, 12.0), vec2(14.0, 44.0)], DOC)
+            .expect("a triangle");
+        let b = rect(16.0, 16.0, 36.0, 36.0);
+
+        let one = a.intersection(&b).expect("an overlap");
+        let other = b.intersection(&a).expect("the same overlap");
+        assert_eq!(one.bounds(), other.bounds());
+        assert_eq!(one.coverage(), other.coverage());
+    }
+
+    #[test]
+    fn intersecting_with_something_that_swallows_it_changes_nothing() {
+        // The case that says the operation is a *bound* rather than a second
+        // mask: where the other selection is fully inside, every pixel of this
+        // one is already the smaller of the two and the answer is itself.
+        let small =
+            Selection::polygon(&[vec2(20.0, 20.0), vec2(34.0, 24.0), vec2(24.0, 36.0)], DOC)
+                .expect("a triangle");
+        let around = rect(10.0, 10.0, 50.0, 50.0);
+        let same = small.intersection(&around).expect("itself");
+        // Compared over the document rather than as two masks: the result is
+        // trimmed to what it covers and the operand's rectangle is the outline's
+        // box rounded outwards, so the two can legitimately differ by a row that
+        // holds nothing.
+        for y in 0..DOC.y {
+            for x in 0..DOC.x {
+                assert_eq!(
+                    same.coverage_at(x, y),
+                    small.coverage_at(x, y),
+                    "at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_empty_cases_of_a_combination_each_answer_differently() {
         let base = rect(10.0, 10.0, 20.0, 20.0);
         let shape = rect(30.0, 30.0, 40.0, 40.0);
@@ -1325,6 +1867,257 @@ mod tests {
         poly.moved(vec2(10.0, 10.0));
         poly.outline_into(&mut buf);
         assert_eq!(buf.len(), 3, "the rubber band is part of the outline");
+    }
+
+    // --- feather ----------------------------------------------------------
+
+    #[test]
+    fn no_feather_is_the_exact_identity() {
+        // The same rule the grain's `mix(1.0, tile, strength)` and the dab
+        // pass's `use_selection` hold to: a selection nobody softened must cost
+        // exactly what it did before feathering existed, down to the bytes and
+        // the rectangle they sit in. A blur that "did nothing" by convolving
+        // with a one-tap kernel would still round every byte and still
+        // reallocate.
+        let s = rect(10.0, 10.0, 20.0, 20.0);
+        for radius in [0.0, -1.0] {
+            let same = s.clone().feathered(radius, DOC).expect("itself");
+            assert_eq!(same.bounds(), s.bounds());
+            assert_eq!(same.coverage(), s.coverage());
+            assert_eq!(same.feather(), 0.0);
+            assert_eq!(same.rings(), s.rings());
+        }
+    }
+
+    #[test]
+    fn a_feather_grows_the_rectangle_and_ramps_across_the_edge() {
+        // The bounding rectangle is what sizes the texture the dab pass
+        // samples, and outside it is decided arithmetically rather than by
+        // clamping — so a rectangle that did not grow would chop the falloff
+        // off square, which is the feather not happening at all.
+        let s = rect(20.0, 20.0, 40.0, 40.0)
+            .feathered(4.0, DOC)
+            .expect("a soft box");
+        let b = s.bounds();
+        assert!(b.x <= 16 && b.y <= 16, "the rectangle grew: {b:?}");
+        assert!(
+            b.x + b.width >= 44 && b.y + b.height >= 44,
+            "and grew at the far side too: {b:?}"
+        );
+        assert_eq!(s.feather(), 4.0);
+
+        // Full in the middle, nothing well outside, and monotone in between.
+        assert_eq!(s.coverage_at(30, 30), 255);
+        assert_eq!(s.coverage_at(30, 14), 0);
+        let ramp: Vec<u8> = (16..24).map(|y| s.coverage_at(30, y)).collect();
+        assert!(
+            ramp.windows(2).all(|w| w[0] <= w[1]),
+            "the falloff has to climb the whole way: {ramp:?}"
+        );
+        assert!(
+            ramp[0] < 40 && *ramp.last().expect("a ramp") > 215,
+            "and has to actually get from one end to the other: {ramp:?}"
+        );
+    }
+
+    #[test]
+    fn a_feathered_rectangle_is_still_exact_on_both_axes() {
+        // The promise the fill rule makes for an axis-aligned box, carried
+        // through the blur. The kernel is separable and the sharp mask of a
+        // rectangle is itself the product of two one-dimensional steps, so the
+        // softened coverage is the product of two identical ramps: the same
+        // figures across the left edge as down the top one, and mirrored
+        // exactly about the box's own centre. Any asymmetry here would mean a
+        // sub-scanline or a running sum had drifted.
+        let s = rect(20.0, 20.0, 40.0, 40.0)
+            .feathered(5.0, DOC)
+            .expect("a soft box");
+
+        for d in 0..12u32 {
+            let across = s.coverage_at(15 + d, 30);
+            let down = s.coverage_at(30, 15 + d);
+            assert_eq!(across, down, "the two axes disagree {d} in");
+            // The far side of the box is the same ramp run backwards: 20 and 40
+            // are the two edges, so 15 + d and 44 - d are the same distance out.
+            assert_eq!(
+                across,
+                s.coverage_at(44 - d, 30),
+                "the left and right edges are not mirrored, {d} in"
+            );
+            assert_eq!(across, s.coverage_at(30, 44 - d));
+        }
+        // And the outline is where the coverage is half — which is the property
+        // the whole "keep the rings" decision rests on. The edge is at document
+        // x = 20.0, which is the *line between* pixels 19 and 20 rather than
+        // either of their centres, so what has to come to 255 is the pair: the
+        // kernel is symmetric about that line and the two share the half.
+        let outside = u16::from(s.coverage_at(19, 30));
+        let inside = u16::from(s.coverage_at(20, 30));
+        assert!(
+            outside.abs_diff(255 - inside) <= 1,
+            "the falloff is not centred on the outline: {outside} outside and \
+             {inside} inside the edge at x = 20"
+        );
+    }
+
+    #[test]
+    fn a_feather_leaves_the_outline_exactly_where_it_was() {
+        // The decision the module docs defend: the blur is symmetric, so its
+        // 50% contour *is* the sharp edge, and the rings stay the exact
+        // geometry rather than being traced back out of a softened mask. The
+        // marquee, `contains`, and everything a transform commit or a canvas
+        // flip re-rasterises all read those rings.
+        let sharp =
+            Selection::polygon(&[vec2(10.0, 10.0), vec2(40.0, 14.0), vec2(16.0, 44.0)], DOC)
+                .expect("a triangle");
+        let soft = sharp.clone().feathered(6.0, DOC).expect("a soft triangle");
+        assert_eq!(soft.rings(), sharp.rings());
+        assert!(soft.contains(vec2(20.0, 20.0)));
+        assert!(!soft.contains(vec2(38.0, 40.0)));
+    }
+
+    #[test]
+    fn a_feather_fades_at_the_edge_of_the_canvas_rather_than_running_off_it() {
+        // Nothing downstream may be handed a rectangle that leaves the texture,
+        // and outside the canvas is not selected — so a selection against the
+        // edge softens into it. That is what Photoshop and GIMP do; treating
+        // the canvas edge as more of the same would put a hard edge nobody drew
+        // round a feathered Select All.
+        let s = rect(0.0, 0.0, 20.0, 20.0)
+            .feathered(4.0, DOC)
+            .expect("a soft box in the corner");
+        let b = s.bounds();
+        assert_eq!((b.x, b.y), (0, 0), "clamped to the canvas");
+        assert!(b.x + b.width <= DOC.x && b.y + b.height <= DOC.y);
+        assert!(
+            s.coverage_at(0, 0) < 200,
+            "the corner against the canvas edge fades like every other edge"
+        );
+        assert_eq!(s.coverage_at(10, 10), 255);
+    }
+
+    #[test]
+    fn a_feather_survives_a_canvas_flip() {
+        // `flipped` rebuilds the mask by rasterising the mirrored rings, which
+        // is sharp — so without re-applying the radius a flip would silently
+        // harden every soft edge in the picture, and undoing the flip would not
+        // put it back. Compared on the *mask*, because that is what clips a
+        // stroke.
+        let s = rect(10.0, 12.0, 30.0, 24.0)
+            .feathered(5.0, DOC)
+            .expect("a soft box");
+        let there = s.flipped(FlipAxis::Horizontal, DOC).expect("a mirror");
+        assert_eq!(there.feather(), 5.0);
+
+        let back = there
+            .flipped(FlipAxis::Horizontal, DOC)
+            .expect("a mirror back");
+        assert_eq!(back.bounds(), s.bounds());
+        assert_eq!(back.coverage(), s.coverage());
+    }
+
+    #[test]
+    fn a_flip_never_deletes_a_selection_it_cannot_soften() {
+        // A small region carrying a wide feather is reachable, because a
+        // boolean traces its rings at the 50% contour and records the *larger*
+        // of the two radii. Re-rasterising those rings sharp and softening them
+        // by that radius can round every pixel to nothing — and a flip that
+        // silently threw the selection away would not even be undoable, since
+        // undoing a flip is another flip.
+        let small = rect(28.0, 28.0, 32.0, 32.0);
+        // Softening it outright *is* nothing, which is the state the flip has
+        // to survive rather than pass on.
+        assert!(
+            small
+                .clone()
+                .feathered(Selection::MAX_FEATHER, DOC)
+                .is_none()
+        );
+
+        // The state a boolean can leave: these rings, that radius. Built by
+        // hand because reaching it through two feathered lassos would be a
+        // fixture nobody could check by eye, and the shape of the state is the
+        // whole point.
+        let awkward = Selection {
+            feather: Selection::MAX_FEATHER,
+            ..small
+        };
+        let flipped = awkward
+            .flipped(FlipAxis::Horizontal, DOC)
+            .expect("the selection must survive a flip");
+        assert!(
+            flipped.coverage().iter().any(|c| *c > 0),
+            "the flip left a selection with no coverage"
+        );
+        // And it is the hard mirror, in the mirrored place — 64 - 32 .. 64 - 28.
+        assert_eq!(flipped.bounds().x, 32);
+        assert_eq!(flipped.coverage_at(32, 30), 255);
+    }
+
+    #[test]
+    fn a_boolean_carries_the_softer_of_the_two_edges() {
+        // One number cannot say that half an outline is soft, and of the two
+        // answers available only the larger cannot harden an edge that was.
+        let hard = rect(10.0, 10.0, 30.0, 30.0);
+        let soft = rect(20.0, 20.0, 40.0, 40.0)
+            .feathered(3.0, DOC)
+            .expect("a soft box");
+
+        assert_eq!(hard.union(&soft).expect("a union").feather(), 3.0);
+        assert_eq!(soft.union(&hard).expect("a union").feather(), 3.0);
+        assert_eq!(hard.difference(&soft).expect("a cut").feather(), 3.0);
+        assert_eq!(hard.intersection(&soft).expect("an overlap").feather(), 3.0);
+    }
+
+    #[test]
+    fn a_gesture_carries_the_feather_it_began_with() {
+        // Snapshotted at the start, exactly as the operation is: a polygon
+        // spans several clicks, and a rail dragged between two of them must not
+        // change what the gesture already under way turns out to have meant.
+        let mut draft =
+            SelectionDraft::new(SelectionMode::Rectangle, vec2(10.0, 10.0)).feathered(4.0);
+        assert_eq!(draft.feather(), 4.0);
+        draft.moved(vec2(30.0, 30.0));
+        let s = draft.finish(DOC).expect("a soft box");
+        assert_eq!(s.feather(), 4.0);
+        assert!(s.coverage_at(9, 20) > 0, "the edge softened outwards");
+
+        assert_eq!(
+            SelectionDraft::new(SelectionMode::Lasso, vec2(0.0, 0.0)).feather(),
+            0.0,
+            "a gesture nobody softened is hard"
+        );
+    }
+
+    #[test]
+    fn a_feather_is_bounded_however_it_is_asked_for() {
+        // The radius reaches this module from a control somebody can type into,
+        // and it decides how far the bounding rectangle grows — so an absurd
+        // one is clamped here rather than trusted to the interface.
+        let big = UVec2::splat(1024);
+        let s =
+            Selection::rectangle(vec2(200.0, 200.0), vec2(800.0, 800.0), big).expect("a rectangle");
+        let wild = s
+            .feathered(Selection::MAX_FEATHER * 10.0, big)
+            .expect("still a selection");
+        assert_eq!(wild.feather(), Selection::MAX_FEATHER);
+        let b = wild.bounds();
+        assert!(
+            b.x + b.width <= big.x && b.y + b.height <= big.y,
+            "the grown rectangle left the canvas: {b:?}"
+        );
+    }
+
+    #[test]
+    fn a_feather_wide_enough_to_dissolve_a_shape_selects_nothing() {
+        // The tent normalises, so a radius far larger than the shape spreads
+        // its coverage below a byte everywhere — and a mask of nothing is
+        // nothing selected, the same answer as a lasso that enclosed no pixel
+        // and as a subtraction that took everything. The alternative would be a
+        // `Selection` with an all-zero mask, which is an outline standing over
+        // a region that clips every stroke to nothing.
+        let s = rect(20.0, 20.0, 24.0, 24.0);
+        assert!(s.feathered(Selection::MAX_FEATHER, DOC).is_none());
     }
 
     /// The marquee has to travel with a flipped canvas, or it goes on clipping

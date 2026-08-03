@@ -246,8 +246,9 @@ Next, roughly in order:
   toolchain, and working on the aarch64 cross-builds and inside the Flatpak
   sandbox — rather than anything about the pixels, which `umber_core::clipboard`
   already holds in the straight-alpha sRGB form an interchange format wants.
-- **Adding to and subtracting from a selection**, and a feather. Both live in
-  `umber_core::selection`, which today builds one mask from one gesture.
+- **Selecting by colour**, and growing or shrinking a selection by a distance.
+  `umber_core::selection` has the four boolean modes and a feather; what it has
+  no answer for is a selection derived from the picture rather than drawn.
 - Scatter that reacts to pen speed
 - Per-brush blend modes
 - **rubberduck's stamps in the shipped library.** Three packs' stamps ship now;

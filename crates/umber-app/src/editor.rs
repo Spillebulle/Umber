@@ -113,6 +113,19 @@ pub struct UiState {
     /// Which outline the selection tool draws. One tool with a mode rather
     /// than three tools: see `umber_core::selection`.
     pub selection_mode: SelectionMode,
+    /// What a gesture does to the selection already standing, when no modifier
+    /// says otherwise.
+    ///
+    /// A setting as well as a pair of modifiers because a held key is not
+    /// discoverable and cannot be listed — see `App::selection_op`, which is
+    /// where the two meet.
+    pub selection_op: SelectionOp,
+    /// How far a new selection's edge is softened, in document pixels.
+    ///
+    /// Interface state and not the document's: it describes what the *next*
+    /// gesture will draw, exactly as the mode above does, and the radius a
+    /// selection actually carries lives on the `Selection` itself.
+    pub selection_feather: f32,
     pub picker: PickerMode,
     pub wheel_shape: WheelShape,
     /// Whether the wheel's triangle turns to follow the hue. Meaningless for the
@@ -188,6 +201,8 @@ impl Default for UiState {
             pressure_open: true,
             tool: Tool::Brush,
             selection_mode: SelectionMode::Rectangle,
+            selection_op: SelectionOp::Replace,
+            selection_feather: 0.0,
             picker: PickerMode::Wheel,
             wheel_shape: WheelShape::Triangle,
             // What the picker has always done, and what the design draws.
@@ -871,10 +886,12 @@ impl Editor {
     /// that had to agree with the first about every antialiased edge.
     pub fn flip_canvas(&mut self, axis: umber_core::FlipAxis) {
         let doc = self.doc.size;
-        // A selection that mirrors to nothing cannot arise — a mirror preserves
-        // area — but `flipped` is an `Option` because `from_rings` is, and
-        // dropping it is the right answer if it ever does: an outline covering
-        // nothing is no selection.
+        // A selection that mirrors to nothing cannot arise from one that had
+        // area — a mirror preserves it, and `Selection::flipped` keeps the hard
+        // mirror rather than let a wide feather dissolve the mirrored shape.
+        // `flipped` is an `Option` because `from_rings` is, and dropping it is
+        // the right answer if it ever does: an outline covering nothing is no
+        // selection.
         self.selection = self
             .selection
             .as_deref()
@@ -1100,7 +1117,10 @@ impl Editor {
     /// `op` is therefore read from the press that *starts* the gesture and
     /// ignored on every one after it — a polygon spans several clicks and must
     /// not change its mind between two of them. See
-    /// [`SelectionDraft::combining`].
+    /// [`SelectionDraft::combining`]. The feather is snapshotted there too, and
+    /// is taken from the interface here rather than passed in because — unlike
+    /// the operation — no modifier can change it and there is nothing to
+    /// reconcile.
     pub fn selection_press(&mut self, doc: Vec2, op: SelectionOp) {
         // A screen distance, divided by the zoom. A fixed *document* distance
         // would be impossible to hit at 10% and impossible to avoid at 800%.
@@ -1112,8 +1132,11 @@ impl Editor {
                 }
             }
             None => {
-                self.selection_draft =
-                    Some(SelectionDraft::new(self.ui.selection_mode, doc).combining(op));
+                self.selection_draft = Some(
+                    SelectionDraft::new(self.ui.selection_mode, doc)
+                        .combining(op)
+                        .feathered(self.ui.selection_feather),
+                );
                 self.interaction = Interaction::Selecting;
             }
         }
@@ -1272,8 +1295,21 @@ impl Editor {
     /// longer holds anything — an outline that lies about what it covers.
     ///
     /// The rings are geometry, so this is the forward transform applied to
-    /// them and a re-rasterisation. Nothing in `selection.rs` needed changing
-    /// for it.
+    /// them and a re-rasterisation.
+    ///
+    /// **The feather is re-applied**, for the reason `Selection::flipped` does
+    /// it: the rebuilt mask is the *sharp* rasterisation of the moved rings, so
+    /// dragging a softly selected region across the canvas would otherwise put
+    /// it down with a hard edge. The radius is left as it was rather than
+    /// scaled by the transform — a feather is a distance in document pixels,
+    /// the same thing the control on the strip says, and a non-uniform scale
+    /// has no single number to scale it by anyway.
+    ///
+    /// And it falls back to the hard mirror where the radius dissolves the
+    /// moved shape, exactly as `Selection::flipped` does and for the reason
+    /// stated there: scaling a small feathered region down is a way to reach
+    /// that, and losing the marquee because a transform was committed is worse
+    /// than carrying it hard.
     pub fn carry_selection(&mut self, xf: &Transform) {
         let Some(selection) = self.selection.as_ref() else {
             return;
@@ -1284,7 +1320,11 @@ impl Editor {
             .iter()
             .map(|ring| ring.iter().map(|p| m.apply(*p)).collect())
             .collect();
-        self.selection = Selection::from_rings(rings, self.doc.size).map(Arc::new);
+        let feather = selection.feather();
+        let doc = self.doc.size;
+        self.selection = Selection::from_rings(rings, doc)
+            .map(|sharp| sharp.clone().feathered(feather, doc).unwrap_or(sharp))
+            .map(Arc::new);
     }
 
     /// Flatten the layer stack into what the composite pass consumes.

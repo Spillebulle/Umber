@@ -549,6 +549,65 @@ mod tests {
         );
     }
 
+    /// The complement rule again, through a **feathered** selection.
+    ///
+    /// A separate test rather than a second fixture inside the one above,
+    /// because what it exercises is different in kind: an antialiased edge is a
+    /// one-pixel band of partial coverage round an interior of 255, where a
+    /// feather is almost nothing *but* partial coverage — so `min(alpha,
+    /// coverage)` and the subtraction that gives the other half are being asked
+    /// for every share rather than for the two ends and a sliver. If a feather
+    /// could break `taken + left == before` it would break it here.
+    #[test]
+    fn a_cut_through_a_feathered_selection_still_takes_what_it_leaves() {
+        const N: u32 = 24;
+        let doc = UVec2::splat(N);
+        let selection = Selection::from_rings(
+            vec![vec![vec2(6.0, 6.0), vec2(18.0, 8.0), vec2(9.0, 18.0)]],
+            doc,
+        )
+        .expect("a selection")
+        .feathered(3.0, doc)
+        .expect("a soft selection");
+
+        let layer: Vec<u8> = (0..N * N)
+            .flat_map(|i| {
+                let a = (i * 255 / (N * N - 1)) as u8;
+                srgb::encode_pixel([200, 90, 30, a])
+            })
+            .collect();
+        let r = rect(0, 0, N, N);
+        let cut = Clip::cut_from_layer(r, &layer, Some(&selection)).expect("a cut");
+
+        let mut partials = 0;
+        for i in (0..layer.len()).step_by(4) {
+            let before = u32::from(layer[i + 3]);
+            let taken = u32::from(cut.clip.pixels()[i + 3]);
+            let left = u32::from(cut.remainder[i + 3]);
+            assert_eq!(
+                taken + left,
+                before,
+                "pixel {} lost or gained coverage",
+                i / 4
+            );
+            if taken > 0 && left > 0 {
+                partials += 1;
+            }
+        }
+        // A feather has to produce *many* of these, not the handful an
+        // antialiased edge does — otherwise this is the same test again.
+        assert!(
+            partials > 40,
+            "only {partials} pixels were partly cut, so the feather is not \
+             being exercised"
+        );
+
+        // And a copy takes the identical share, which is the guarantee that
+        // makes `cut_from_layer` and `from_layer` one function.
+        let copied = Clip::from_layer(r, &layer, Some(&selection)).expect("a clip");
+        assert_eq!(cut.clip, copied);
+    }
+
     /// An odd-sized clip must not creep. Truncating rather than rounding moves
     /// it half a pixel every time it is pasted, which is visible after three.
     #[test]

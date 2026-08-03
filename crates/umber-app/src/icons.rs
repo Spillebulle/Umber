@@ -113,6 +113,26 @@ pub enum Icon {
     /// [`Icon::ChevronDown`], which already exists and already points the way a
     /// disclosure open should.
     ChevronRight,
+    // What a new selection does to the one already standing. At the end for
+    // the reason the folder marks above are: this enum is shared, and
+    // renumbering it would be a merge that compiles and draws the wrong marks.
+    //
+    // The four are the universal spelling of this control — Photoshop, GIMP,
+    // Krita and Affinity all draw a pair of overlapping squares with the
+    // *result* of the operation filled in — and being one motif they can only
+    // be told apart by that fill, which is why the outlines stay visible
+    // through it rather than the filled part being drawn alone.
+    /// One square, filled: the new shape becomes the selection. Deliberately a
+    /// single square where its three neighbours are a pair, because replacing
+    /// is the one of the four that does not involve what was already there.
+    SelectReplace,
+    /// Two overlapping squares, both filled: the union.
+    SelectAdd,
+    /// Two overlapping squares with the first filled only where the second does
+    /// not reach: the difference.
+    SelectSubtract,
+    /// Two overlapping squares with only the overlap filled: the intersection.
+    SelectIntersect,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -284,6 +304,59 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
         Icon::ChevronDown => path(vec![at(6.0, 9.0), at(12.0, 15.0), at(18.0, 9.0)]),
 
         Icon::ChevronRight => path(vec![at(9.0, 6.0), at(15.0, 12.0), at(9.0, 18.0)]),
+
+        Icon::SelectReplace | Icon::SelectAdd | Icon::SelectSubtract | Icon::SelectIntersect => {
+            // One motif, four fills. The squares are the same two in every
+            // case — the selection already standing and the shape being drawn —
+            // and what tells the four apart is which part of them is filled, so
+            // the fill is drawn *under* the outlines and at a fraction of the
+            // ink. A solid fill would swallow the outlines and leave Add and
+            // Replace the same silhouette.
+            let tint = colour.gamma_multiply(0.4);
+            let fill = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                painter.rect_filled(Rect::from_min_max(at(x0, y0), at(x1, y1)), 0.0, tint);
+            };
+            let outline = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                path(vec![
+                    at(x0, y0),
+                    at(x1, y0),
+                    at(x1, y1),
+                    at(x0, y1),
+                    at(x0, y0),
+                ]);
+            };
+
+            if icon == Icon::SelectReplace {
+                // One square, not a pair: replacing is the one of the four that
+                // does not involve what was already selected, and a mark that
+                // showed two shapes would say it did.
+                fill(5.0, 5.0, 19.0, 19.0);
+                outline(5.0, 5.0, 19.0, 19.0);
+            } else {
+                match icon {
+                    // The union, as **three disjoint rectangles**. Filling both
+                    // squares whole is the obvious spelling and is wrong: the
+                    // tint is a fraction of the ink, so two fills composite in
+                    // the lens where they cross and Add draws a darker overlap
+                    // — which is exactly Intersect's mark, on the one control
+                    // whose four members can only be told apart by their fill.
+                    Icon::SelectAdd => {
+                        fill(4.0, 4.0, 15.0, 15.0);
+                        fill(15.0, 9.0, 20.0, 20.0);
+                        fill(9.0, 15.0, 15.0, 20.0);
+                    }
+                    // The first square with the second taken out of it: an L,
+                    // which is two rectangles because both are axis-aligned.
+                    Icon::SelectSubtract => {
+                        fill(4.0, 4.0, 15.0, 9.0);
+                        fill(4.0, 9.0, 9.0, 15.0);
+                    }
+                    _ => fill(9.0, 9.0, 15.0, 15.0),
+                }
+                outline(4.0, 4.0, 15.0, 15.0);
+                outline(9.0, 9.0, 20.0, 20.0);
+            }
+        }
 
         Icon::Folder => {
             // The tab first, so the body's top edge draws over its base and the
