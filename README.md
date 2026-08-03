@@ -143,12 +143,22 @@ Umber remembers each shape's angle separately.
 |---|---|---|---|
 | ![](docs/images/picker-wheel.png) | ![](docs/images/picker-wheel-square.png) | ![](docs/images/picker-square.png) | ![](docs/images/picker-sliders.png) |
 
+A fifth mode, **Harmony**, marks the complement, triad, tetrad, analogues or
+split-complement of the hue you are on and lets you take one with a click.
+
+The **Palette** module keeps the colours you want to come back to: click a slot
+to store what is in hand, and save a whole set into a library. Palettes are
+plain GIMP `.gpl` files in a folder of their own, so anything that reads them
+can read yours, and Umber imports and exports the same format it stores.
+
 ## Selections and moving things
 
 **Select** marks out where edits may land — rectangle, freehand lasso, or
 polygon point-to-point. Everything the brush and eraser do is clipped to it,
 antialiased edges included, so a diagonal is a diagonal rather than a staircase.
-Hold `Shift` to add to a selection, `Ctrl` to take away.
+Hold `Shift` to add to a selection, `Ctrl` to take away, and both to keep only
+where the two overlap. A **feather** softens the edge by as many pixels as you
+ask for.
 
 Three buttons sit just above the marquee — **deselect**, **copy** and **cut** —
 and they stay on screen even when the selection is scrolled half out of view.
@@ -167,7 +177,9 @@ putting it down:
 
 Nothing touches the layer until you put it down, so abandoning costs nothing and
 undoing restores both where the pixels went **and** the hole they came from, in
-one step. Copy, cut and paste work across tabs.
+one step. Copy, cut and paste work across tabs, and to and from other
+applications — a screenshot pastes straight in, and a region copied out of Umber
+can be pasted anywhere else.
 
 ## Documents
 
@@ -224,6 +236,10 @@ open when a pen feels wrong.
   Umber's own. Those copies expire after a month, adjustable or off. **Nothing
   Umber deletes is ever a file you chose the place for.**
 - Closing with unsaved work asks first, and **names** every document at risk.
+- If Umber stops without closing properly, the next start **offers its copies
+  back** — naming each document and when it was last written. Opening one puts
+  the painting in front of you and writes nothing over the file it came from
+  until you save it there yourself. Saying no keeps every copy where it is.
 - If Umber does stop, a window opens saying so and — more to the point — whether
   your work was written down and where, with the technical details folded out
   and written to a file you can attach to a bug report. Nothing is sent
@@ -237,7 +253,7 @@ open when a pen feels wrong.
 | `B` / `E` / `S` / `T` / `H` / `Z` | Brush / eraser / select / transform / pan / zoom |
 | `Ctrl` + `D` | Deselect |
 | `Ctrl` + `C` / `X` / `V` | Copy / cut / paste |
-| `Shift` / `Ctrl` + drag with Select | Add to the selection / take away |
+| `Shift` / `Ctrl` / both + drag with Select | Add to the selection / take away / keep the overlap |
 | `Enter` / `Esc` while selecting | Close / abandon the outline |
 | `Enter` / `Esc` while transforming | Put the picture down / throw the move away |
 | `X` | Swap foreground and background colours |
@@ -263,14 +279,9 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 
 ## What is not there yet
 
-- **Text and shapes.** Six tools where the design draws sixteen. Selections have
-  no intersect and no feather.
-- **The system clipboard.** Copy and paste work inside Umber and between its
-  tabs, not to and from other applications.
+- **Text and shapes.** Six tools where the design draws sixteen.
 - **Mobile.** Android and iOS are prepared for architecturally but have never
   been built or run. Do not believe anyone who says otherwise.
-- **Automatic crash recovery.** Autosave keeps copies and Settings will open the
-  folder, but nothing offers one back to you next time Umber starts.
 - **Structural undo.** Undo covers painting, transforms and canvas flips; adding,
   deleting or reordering a layer is not recorded, and deleting a layer clears the
   history.
@@ -279,10 +290,11 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 - **A folder's own opacity and blend mode.** Folders hold layers and their eye
   and lock reach inside, but a group opacity needs group compositing.
   [`docs/layer-folders.md`](docs/layer-folders.md) has the design and its cost.
-- **Layer masks from other applications.** Umber reads and writes its own; a
-  `.kra` or `.psd` mask is reported as lost rather than converted.
+- **Photoshop's layer masks.** Krita's transparency masks come across; a `.psd`
+  mask is reported as lost rather than converted, and Krita's filter, transform,
+  selection and colorize masks are named rather than approximated.
 - **Pen pressure on macOS and Linux**, as above. Windows works.
-- Navigator, palette and harmony colour modes, and stylus tilt.
+- A navigator, and stylus tilt.
 
 ## Building from source
 

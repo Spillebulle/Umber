@@ -228,6 +228,75 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
   which is the thing the whole module exists to prevent. Same division
   `ScrollSpan` and `Clip::place` keep: the rule is testable without a window,
   and `ui.rs` only paints it.
+- **A selection has four boolean modes, and the boolean happens on the
+  coverage.** `max` for Add, `min(a, 255 − b)` for Subtract, `min(a, b)` for
+  Intersect — `max`, `min` and the complement, so intersect is difference's twin
+  rather than a fourth idea. Polygon boolean geometry is the alternative and is
+  a large, bug-prone algorithm for a result the mask already has exactly.
+  **The bounding rectangle moves differently for each and getting it wrong is
+  silent**: Add unions, Intersect takes the *overlap* — not either operand's own
+  rectangle, because `blit_into` only visits the overlap and a mask sized to the
+  larger one leaves this selection's coverage standing everywhere the other does
+  not reach, which is a union wearing intersect's name — Subtract keeps this
+  one's, and every result is trimmed to what it actually covers. **Intersecting
+  with no selection is the shape**, where subtracting from it is nothing: no
+  selection means the whole document.
+- **A feather is a blur of the mask with the rings left exactly where they
+  were**, which is the opposite of the decision a boolean forces and right for
+  the same reason. The kernel is symmetric, so the 50% contour of the softened
+  mask *is* the sharp edge it was blurred from — the marquee and `contains` keep
+  reading the exact geometry rather than a staircase traced back out of pixels.
+  **The radius is a field on `Selection`**, because rings cannot describe a soft
+  edge and Umber rasterises them again twice — `Selection::flipped` and
+  `Editor::carry_selection` — so both re-apply it or a canvas flip quietly
+  hardens every soft edge in the picture. A boolean records the **larger** of
+  the two radii, the only answer that cannot harden an edge that was soft. **And
+  both re-raster sites keep the hard mirror where the radius dissolves the
+  rebuilt shape**: a boolean's traced rings can be small while its recorded
+  radius is wide, and deleting somebody's selection because they flipped the
+  canvas is unrecoverable, since undoing a flip is another flip.
+- **The feather kernel is a tent, two box passes per axis, and "per axis" is the
+  whole of it** — a tent is the box convolved with itself and convolution is per
+  axis. Running sums make it linear in the area whatever the radius; every
+  partial sum is an exact integer, so the only rounding is one store per pass
+  and a rectangle comes out exactly mirrored about its own centre; and being
+  separable over a mask that is itself separable, an axis-aligned rectangle
+  keeps the exactness the fill rule gives it. **A radius of zero is the exact
+  identity** — same bounds, same bytes, no allocation. Outside the canvas counts
+  as unselected, so a selection against the document edge fades at it, as
+  Photoshop's and GIMP's do.
+- **A feather makes the lift's third case the ordinary one.**
+  `transform.wgsl`'s `min(a, m) / a` takes content softer than the mask *whole*;
+  against an antialiased edge that is one pixel, against a feather it is a band
+  `2 × radius` wide, so a soft wash lifted through a wide feather comes out
+  unfeathered wherever it is fainter than the ramp. Nothing changed it and
+  `a_lift_still_splits_paint_the_selection_did_not_make` refuses the tempting
+  over-correction — but it is now the common case rather than a curiosity.
+  `a_lift_through_a_feathered_selection_splits_the_alpha_it_finds` fills the
+  layer flat rather than painting through the selection it lifts through: paint
+  made through the mask has `a == m`, so the share is identically one and the
+  test would pass under any rule.
+- **The four operations are on the tool options strip as well as on the
+  modifiers**, and `App::combined_selection_op` is the one place the two meet —
+  Shift adds, Ctrl (Cmd) subtracts, both intersect, nothing held takes the
+  strip's setting, so a modifier overrides one gesture rather than changing what
+  the strip says. A free function for the reason `gesture::press` is one, and in
+  `app.rs` rather than `umber-core` because *which* modifier means which has to
+  be reconciled with what Alt already does on this canvas. **Their fills must
+  not overlap** — the tint is a fraction of the ink so two `rect_filled`s
+  composite where they cross, and Add drew Intersect's darker lens until the
+  union became three disjoint rectangles.
+- **The feather rail is `widgets::inline_slider` and applies to the next
+  gesture.** `number_row` is the *typable* rail and is two stacked rows tall,
+  which does not fit `metrics::OPTIONS_STRIP`'s 36 points; this figure cannot be
+  typed, so it is the strip's own control and not a second "type it or drag it".
+  That it sets what the next shape will be rather than softening the one
+  standing is every application's spelling of a tool-options feather — and
+  re-applying it live is not merely expensive but lossy, since the sharp mask is
+  gone after a boolean. **A budget on that strip must be measured where it is
+  spent**: the combine line reads `available_width()` afresh, *after* the mode
+  hint, because that hint is drawn unconditionally and
+  `SelectionMode::Polygon`'s is eighty-four characters.
 
 ### Transforms and the clipboard
 
@@ -390,6 +459,89 @@ put on and take off.
   have accumulated one from, so with nothing selected a bare Ctrl+X on a 10000²
   canvas is 400 MB and the budget holds exactly one. Same rule as a stroke
   across such a canvas, and said out loud for the reason the Undo section gives.
+
+#### The desktop's clipboard
+
+`umber-app::sysclip`. In `umber-app` for the reason `update` is: `umber-core`
+and `umber-render` may not learn about the platform, which is the boundary that
+keeps them testable without one. `umber-core::clipboard` was **not changed at
+all** — the straight-alpha sRGB RGBA8 it already held is exactly
+`arboard::ImageData`, which is what that choice was made against.
+
+- **`sysclip::decide` is the whole rule and is a pure function of three
+  readings** — what the desktop holds, what `Editor::clipboard` holds, and what
+  the desktop should hand back for Umber's own clip — for the reason
+  `install::detect` is a pure function of a `Probe`. **No test may touch the
+  real clipboard**: a CI runner may have no display server at all, and a test
+  that grabs the desktop's clipboard on somebody's machine is hostile.
+- **A picture on the desktop wins, unless it is the one Umber put there or
+  Umber's copy never got there; with no picture on the desktop, Umber's own clip
+  lands.** Every clause was needed. The first makes a paste respect the machine
+  it runs on. The second keeps the copy-and-paste-back exactness true once a
+  copy leaves the process. The third was a **silent bug**: a write can fail — a
+  Windows global allocation refusing a large picture — leaving the desktop
+  holding what it held *before* the copy, and believing that put down a picture
+  the artist never copied. There is no ordering to appeal to; Umber can know
+  whether its own copy arrived, never when the desktop's did.
+- **The third reading is a picture, not a flag, and `TRANSPORT_IS_EXACT` decides
+  whether one is taken.** A platform whose clipboard does not hand back the
+  bytes it was given holds something that is not Umber's clip and is nonetheless
+  Umber's copy; comparing against the clip would believe the desktop and paste
+  mangled bytes. So a write on such a platform keeps the **echo** — what came
+  back — and compares against that. Windows and Linux pay nothing: no read, no
+  second copy. An echo that comes back *equal* is dropped rather than held
+  beside an identical picture, which is memory and **not** a promotion: the next
+  copy still echoes, because a premultiply is the identity on anything opaque
+  and one agreeing picture says nothing about the next. It is a `const` and not
+  a `cfg` so the echo compiles everywhere, which is the only check on it anybody
+  here can perform. **Nobody working on Umber has a Mac and no part of that path
+  has ever been run**; `examples/measure-clipboard.rs` settles it in one run,
+  and its exactness sweep covers every alpha deliberately, because a premultiply
+  would hide in a sweep of solid colours.
+- **A mismatch is `warn` only where no echo was taken.** Where one was, a
+  mismatch just means somebody copied something else — it happens on every
+  foreign paste. Where one was not, a same-sized picture that is not ours is the
+  one reading that says the constant is wrong for this machine, and it is the
+  *only* detector for that, so it must not be quiet. Losing this was a real bug
+  in the first draft of the echo.
+- **A picture off the desktop is an ordinary `Clip` and there is no second
+  placer.** `Clip::place` decides where it goes exactly as for Umber's own,
+  which matters more here: a screenshot is usually larger than the canvas, and
+  that is the case the crop notice already covers. It is adopted into
+  `Editor::clipboard` **only once `begin_float` has accepted it** — adopting up
+  front threw away the region the artist had copied whenever the paste was
+  refused for a lock or a folder.
+- **Nothing is threaded, and the paste is what decides it.** The copy's argument
+  is the export's; the paste's is stronger — a write still in flight when the
+  next Ctrl+V reads the desktop would leave `decide` looking at the previous
+  picture.
+- **Numbers here are `examples/measure-clipboard.rs`'s, and re-running it is not
+  optional.** The first figures written into these docs were three times too
+  slow because the machine was building six other things at the time. About
+  2.5 ms/MB to write and 2.1 to read; Ctrl+C with nothing selected on a 10000²
+  canvas is roughly a second, doubled where an echo is taken, on top of the
+  readback it already paid for. **Nothing on screen says so**, and that was
+  decided rather than skipped — a progress bar over a blocking call that reports
+  none is the lying control `Stage::progress`'s `Option` already refuses.
+- **Text is egui-winit's**, which is why its `clipboard` feature is on. It
+  already maps Ctrl+C/X/V and Shift+Insert — including the non-Latin-layout
+  fallback — to egui's own events; restating any of that would be a second copy
+  of egui's rule in a codebase that refuses to reimplement a caret. `links`
+  stays off, so `about::link_row` still paints its own hyperlink.
+- **What Umber copies belongs to Umber while it runs.** On X11 and Wayland the
+  contents are served by the process that put them there, so closing Umber
+  empties the clipboard unless a manager took the handover arboard offers on the
+  way out — which is why every exit must stay an `event_loop.exit()` and never a
+  `process::exit`. `SetExtLinux::wait` is **refused**: it serves requests until
+  somebody else copies, which for an application that stays open means blocking
+  the thread that draws.
+- **The Linux packages gained no shared library, and that was checked rather
+  than assumed.** `x11rb` speaks the protocol over the socket and links no
+  libxcb; `wl-clipboard-rs` and `smithay-clipboard` reach only
+  `libwayland-client.so.0`, which winit already opens. `tree_magic_mini` would
+  want `shared-mime-info` at runtime and is deliberately not declared, because
+  it is reachable only from `MimeType::Autodetect` and arboard names an explicit
+  type on every call — **an arboard bump has to re-check that.**
 
 ### Layers
 
@@ -797,9 +949,19 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   declares 1 and still opens in every older Umber. A version number is a
   statement about what a file *contains*, not about what wrote it.
 - **A mask goes outside the ORA layer stack**, under `umber/masks/`, pointed at
-  by `umber-mask`. Krita's `svg:dst-in` nested-stack convention would be read by
-  GIMP and MyPaint as a layer that erases the one below — a file that opens
-  *wrong* elsewhere, which is worse than one that opens plain.
+  by `umber-mask`. The nested-`<stack>`-plus-`svg:dst-in` convention is the
+  obvious alternative and is not baseline ORA: GIMP and MyPaint would read it as
+  a layer that erases the one below — a file that opens *wrong* elsewhere, which
+  is worse than one that opens plain. **It is not what Krita does either**, and
+  this file said so for a while: Krita's ORA export writes each layer's
+  `projection()`, with masks already baked into the pixels, and emits no mask
+  element at all. The `svg:dst-in` Krita does write is an ordinary *layer* blend
+  mode. So nothing Umber reads was ever written that way, and the argument for
+  going outside the stack rests on GIMP and MyPaint alone — which is enough.
+- **A folder's `<stack>` carries `isolation="auto"`**, because ORA's default is
+  `isolate` and every folder in this build is pass-through. See `folder_xml`:
+  saying nothing made the file claim the opposite of what the screen showed, and
+  the two agree only for as long as every child composites `svg:src-over`.
 - **The undo history is written too**, under `umber/`, pointed at by
   `umber-history`. `docformat::history` has the argument; the rules it lives by:
   - **A slot is never written down.** `PixelPatch::slot` is a texture slice and
@@ -966,6 +1128,85 @@ when nobody asked for it.
   frame so one saved while it is up stops being named. `Editor::quit_requested`
   is a flag because `ui::draw` has no `ActiveEventLoop`.
 
+#### Offering a copy back
+
+`autosave.rs` decides what may be offered and `recoverdlg.rs` paints it — the
+division `dock.rs` keeps against `panels.rs`.
+
+- **A session marker is what says the last run stopped rather than ended.** One
+  small file per run under `autosave/sessions`, held open and **exclusively
+  locked** for the whole run. The lock is the operating system's, so it is
+  released identically by a panic, a hard kill, an out-of-memory and a power
+  cut — which is exactly why a crash report cannot be the signal: a panic hook
+  writes one and nothing writes anything when the process is killed outright. A
+  **second Umber** sees the first's marker locked and leaves it alone. A lock
+  that can be neither taken nor refused is read as *still running*: not offering
+  costs an offer the autosave folder still holds, where over-offering would put
+  two processes on one painting.
+- **It is removed from one place, `lib.rs::run` after `run_app` returns**, and
+  deliberately not from a `Drop` or from beside each `event_loop.exit()`. A
+  `Drop` runs while a panic unwinds, so it would remove the evidence in the one
+  case the marker exists for; four call sites is the invariant that will be
+  forgotten at the fifth. After the `?`, because a loop that ended by *failing*
+  is not a shutdown.
+- **`SessionMark::open` must not truncate**, and the record is read back
+  **through the handle the lock is held on**. The file has to be opened before
+  it can be locked, so truncating on open would empty a marker somebody else is
+  holding before discovering that they hold it; and Windows' `LockFileEx` locks
+  the file's *bytes*, so a second handle reading a marker this process has just
+  claimed is refused — which made every offer come back empty.
+- **A dead marker is held until the offer is answered.** Reading it and letting
+  the lock go leaves it unlocked for the minutes somebody spends reading the
+  dialog, which is a window for a second Umber to offer the same documents.
+- **The marker follows the session, on `crash::note_documents`'s terms.**
+  `Autosave::note_documents` runs every frame, reduces the tab strip and the
+  copies chosen for it to one number, and rewrites only when that number moves.
+  `revision` is deliberately *not* in the reduction, so a stroke costs nothing.
+  Without it a document closed or saved after its copy was written would be
+  offered back — work somebody deliberately let go of.
+- **The offer may not claim a copy is complete, and says so.** A crash box
+  compares the copy's revision against the document's because a panic hook reads
+  a session still in memory; nothing at the next start can, so every row says
+  when the copy was written and that anything painted afterwards is not in it.
+  `no_row_claims_a_copy_is_complete` fails the build on "everything",
+  "complete", "all of" or "safe" appearing in one. What *is* checkable is
+  compared: a copy the painter's own file is already at least as new as is not
+  offered, within two seconds' slack for FAT's mtime granularity.
+- **`at_risk` alone raises nothing.** Naming a document with no copy exists so a
+  dialog offering two back does not read as a promise about the third; with
+  nothing offered there is no such promise, and what is left is a box saying
+  work was lost with nothing to click. It would also be the *common* case: an
+  operating system restart force-kills applications and Umber refuses to close
+  while a document holds unsaved work, so an ordinary reboot leaves a marker
+  every time.
+- **A recovered document's own file is withheld from the timer.** Its tab points
+  at the painter's path so Save writes where they expect — and `next_due` only
+  picks *modified* documents, so a recovered one would be the one kind the
+  autosave writes back: five minutes after clicking Open to see what was in a
+  copy, unasked, with no history in the copy to step back through.
+  `Tab::recovered` and `Candidate::write_own_file` hold it until an explicit
+  Save. **The tab never points at the copy**, or a Save would write into Umber's
+  own autosave folder.
+- **A row says "Recovered" only once its copy opened.** Marking it as the
+  request is taken puts that word beside a truncated archive that produced no
+  document, with the button that would let somebody try again gone.
+- **Nothing on this path deletes a document.** `Reaper` is untouched; markers
+  get their own much smaller deleter, `Marks`, with the same structural
+  containment, rather than `Reaper` being widened by one name — which is exactly
+  the loosening its own rule refuses. **The copy a marker names is checked, not
+  trusted**: `ours` requires a name an autosave writes, directly inside the
+  copies directory, which stops a marker naming the painter's own document from
+  having it opened and offered back as a copy of itself.
+- **A marker that names nothing is forgotten; one that cannot be *read* is
+  kept.** The two look alike and are not: a rewrite a power cut caught half done
+  may still name copies sitting in the folder. `MARK_FORMAT` is compared, unlike
+  `crash::Report`'s, because a marker genuinely is read across builds.
+- **Dismissing forgets the marker and keeps every copy**, and the dialog says
+  both — including "This offer is only made once".
+- **There are no previews.** `mergedimage.png` is in every copy and could be
+  lifted out, but decoding one per copy on the start-up path is not a directory
+  listing.
+
 ### Crash reporting
 
 `umber-app/src/crash/`. A panic hook that writes a report and a **second
@@ -1027,17 +1268,28 @@ reporter's own window.
   destructor that produced the second panic, `run_app` is not `UnwindSafe`, and
   on Windows the loop unwinds through a Win32 message callback where catching is
   not dependable.
-- **There is no "Copy details" button, and that is not an oversight.**
-  `egui-winit` is built `default-features = false`, so its `clipboard` feature
-  is not compiled in and `Context::copy_text` is a no-op — the same reason
-  `about::link_row` paints its own hyperlink. A button that looks like it copies
-  and does nothing is the control that lies; turning the feature on means
-  `arboard`, a new linked dependency `packaging/linux/build-packages.sh` and the
-  `PKGBUILD` would have to declare by hand. The report is already a *file*, so
-  the box names its path and opens its folder, and the details are a read-only
-  `TextEdit` — genuinely selectable, bounded by a `ScrollArea` rather than
-  sizing the window, which is `TextWrapMode::Extend` and the brush browser
-  again with worse text.
+- **The "Copy details" button copies `Report::details`, the same string the
+  block beside it draws, and it sits *above* that block** — a backtrace is
+  unbounded, so a control after it is one somebody scrolls a page of frame
+  addresses to reach, which is the failure the brush editor's Edit mark is in
+  the header to avoid. There used to be no such button and the reason was sound:
+  `egui-winit` was built `default-features = false`, its `clipboard` feature was
+  not compiled in, and `Context::copy_text` fell through to a `String` held in
+  the process — a control that would have looked like it copied a backtrace into
+  an issue and copied it nowhere. **The premise changed, not the standard**: the
+  canvas clipboard needed the same crate, so `arboard` and the packaging
+  declarations that were not worth paying for one button had to be paid for
+  anyway. What did not change is the rest of the route out — the report is still
+  a *file*, the box still names its path and opens its folder, and the details
+  are still a selectable read-only `TextEdit`, bounded by a `ScrollArea` rather
+  than sizing the window — because on X11 what is copied dies with the process
+  unless a clipboard manager takes it, so the one control for getting a report
+  out must not be the only one. The confirmation is a **latched line, not a
+  timer** ("Copied — paste it before closing this window"): the rule `repaint_at`
+  exists for is *perpetual* repainting, and one deferred frame is not that, but a
+  line that simply stays costs the frame the click already caused.
+  `about::link_row` still paints its own hyperlink: that is the `links` feature,
+  which is a different one and is still off.
 - **Reports are never deleted.** Each is a few kilobytes and is the only record
   of what happened. `autosave::Reaper` is deliberately the only thing in Umber
   that deletes a file on the user's behalf, and its containment is careful for a
@@ -1073,6 +1325,60 @@ reporter's own window.
 - **`psd` 0.3.5's `Layer::visible()` returns its own opposite.** Adobe's flag is
   *hidden*; the crate reads it as *visible*. `photoshop.rs` inverts it, and a
   test pins that. Do not "fix" the inversion.
+
+- **A mask arrives from a `.kra`'s transparency masks and from nowhere else but
+  Umber's own ORA.** A mask slice holds **sRGB-encoded coverage**, because
+  `composite.wgsl` reads its red channel through the layer array's
+  `Rgba8UnormSrgb` view — while every source format states a mask as a *linear*
+  multiplier on alpha. So 128 there is 188 here, and
+  `docimport::srgb::encode_coverage` is the one place the two meet; copying the
+  byte across is wrong by a full gamma curve and hides four fifths of a layer
+  somebody hid by half. Krita's other four mask kinds — filter, transform,
+  selection, colorize — are named, not approximated, and a transparency mask
+  built from a vector selection arrives unmasked with a warning rather than a
+  vector renderer being put inside an importer. The pixels are **not** beside
+  the layer's tiles: Krita writes the selection's own paint device to
+  `layers/<filename>.pixelselection` with the byte outside the stored tiles in a
+  `.defaultpixel` neighbour, one byte per pixel.
+- **`.psd` masks are not read at all, and that is `psd` 0.3.5's limit rather
+  than a decision.** It reads the length of the layer-mask block and *skips* it —
+  and that block holds the mask's own rectangle, which is where a mask's pixels
+  live rather than the layer's — keeps the bytes behind a private accessor, and
+  **panics on an RLE mask channel**, which is why such a file is refused
+  outright. 0.3.5 is the newest published version. Reading one means a second
+  parser walking the same bytes beside the crate's, which is the fork this
+  module declines.
+- **A Clip Studio dynamic is a curve *and* a floor, and the floor is half of
+  what it says.** Clip Studio states each mapping's minimum as a percentage of
+  the setting's own value, which is exactly what `Brush::min_size_ratio` means
+  for size. Opacity has no such field and wants none — coverage genuinely
+  reaches zero — so the floor is folded into the response curve, where
+  `f + (1 − f) × curve(p)` is exact in a fixed row of samples. Reading the curve
+  alone is a brush whose author had it painting from six tenths arriving
+  painting from nothing: every stroke a fraction of the strength it was set to,
+  reaching the colour asked for only once it has been laid down several times,
+  which is indistinguishable from an opacity control that does not work. Per-dab
+  coverage is Opacity **times** Brush density, under pressure as well as under
+  speed.
+- **Clip Studio leaves a setting's value in the file when the setting is
+  switched off, and every read has to name the field that says so** —
+  `BrushUseIn` rather than `BrushInLength`, the rotation effector rather than
+  `BrushRotationRandomScale`, `BrushAutoIntervalType` rather than
+  `BrushInterval`, and the texture reference **naming a material** rather than
+  the column merely holding a blob. The paper is the worst of the four, because
+  grain multiplies coverage: a brush that was never textured paints through
+  paper it does not have — mottled, weaker than its opacity says, and darker
+  each time the stroke is laid down again, since the pits are anchored to the
+  document and a second pass composites over the first.
+- **Pressure and randomness driving a setting Umber has no field for are lost
+  and deliberately not named**, unlike tilt, the unnamed fifth source and stray
+  velocity. Naming them was tried: the sweep runs over a 187-to-214-column
+  schema and cannot tell a live effector from one whose bits were left behind,
+  and the random bit is the *only* bit ever set on the hue, saturation and
+  brightness effectors in both sample files. The result was a sentence on nearly
+  every import, frequently about a mapping the brush does not have. **A list
+  that cries wolf costs the losses that matter.** Silence beats a false apology
+  until the enable flag beside each effector can be read.
 
 ### The brush library
 
@@ -1508,7 +1814,7 @@ page — go by it.
 
 Most of the design is built: layout edit mode, the brush editor and library, the
 settings dialog, document tabs and the splash. What is not — the navigator, the
-brush editor's Wet edges section, Palette and Harmony picker modes,
+brush editor's Wet edges section,
 ten of the sixteen tools, drag-to-reorder in the rail, saved workspaces — is
 listed in the README's "What is not there yet", with the reasoning in
 `docs/architecture.md`'s roadmap and, for the brush settings, `docs/brushes.md`. **Do not add UI for features that do not work** — a
@@ -1704,6 +2010,53 @@ design shows a whole row of them.
   means the editor's handles move only vertically — so the curve can never be
   dragged into mapping one pressure to two values. Do not "improve" it into a
   `Vec` of points without solving all three.
+
+- **The Palette module's library is a directory of `.gpl` files, and that is a
+  different argument from the brush library's.** `UserLibrary` is a directory
+  because a bitmap tip does not go in a text file; a palette holds no bitmaps,
+  so the question had to be asked again. It is still a directory because **the
+  interchange format is the storage format** — one decoder and one encoder, the
+  rule `docformat` states as "there must never be a second ORA reader" applied
+  where the format Umber reads and the one it writes are the same. An edit
+  rewrites one small file rather than an index holding every palette, and the
+  files are ordinary files somebody can hand to GIMP. Anything Umber-specific
+  goes in a `#` comment, which every other reader ignores exactly as they ignore
+  the `umber-` attributes.
+- **A swatch is eight-bit sRGB, not a `Color`.** A palette is stored and shared
+  rather than painted with, so holding it in the form it is written in makes the
+  round trip exact by construction; a linear `Color` would be quantised out and
+  dequantised in, and the colour you clicked would not be the colour you got.
+  The same argument the clipboard makes, through the same
+  `Color::from_srgb_u8`/`to_srgb_u8` pair — never a second `powf`.
+- **A stem is free only if no *file* holds it, not if no palette loaded.**
+  `PaletteLibrary::occupied` keeps the stems of every `.gpl` seen and not read.
+  Without it, a file the library has just warned it could not read is a name
+  `free_id` hands straight out, and the next write renames over it — the artist
+  is told their palette is unreadable and then it is destroyed, in the same
+  session. `a_file_that_would_not_read_is_never_written_over` guards it.
+  **`read_gpl` does not refuse an empty palette**, because `create` writes one
+  out empty so that naming a palette is enough to keep it; a reader that refused
+  its own output made every new palette vanish on the next launch.
+- **A harmony is a function of hue alone**, which is why `umber_core::harmony`
+  has no drawing in it and why the picker must read `Editor::hsv` rather than
+  the colour — hue is undefined for greys, so a mode reading the hue off the
+  colour would offer a red harmony for every grey. Saturation and value are
+  carried across every member unchanged. That makes a harmony of a grey a row of
+  identical greys, which is correct, and is why the swatch in hand is marked by
+  a **bar under it rather than a border round it** — an accent border is
+  invisible whenever the colour is near the accent, and a warm ochre is exactly
+  what somebody reaches a harmony wheel for.
+- **`color::wrap_hue` is the one door a hue comes through.** A bare `rem_euclid`
+  gets two cases wrong and both end in `sin_cos` and then in vertex positions,
+  where one NaN is a mesh egui discards whole — a picker that has silently
+  stopped drawing. `NaN.rem_euclid` is NaN, and a tiny negative rounds up to
+  exactly `360.0`, which `to_color` reads as the sixth sextant and paints
+  magenta.
+- **Nothing is shipped, and the rule a shipped half would have to follow is
+  written down anyway.** A shipped palette is `include_str!`'d and replaced
+  wholesale by every update, so anything the user decides about one cannot live
+  where the palette is. Recorded before rather than after, because the failure
+  is silent and months late — the argument `Library::collections` already makes.
 
 ### The dockable modules
 
@@ -1914,6 +2267,47 @@ Three things follow, and all three were bugs:
   `gesture::press` call gave and lands it only on a sample that is itself a
   press, since `note` records the left button and touches and nothing else.
   Same rule as `note_resolved`, and observation only.
+
+**Umber hides the arrow itself under a pen, because winit will not.** `ui.rs`'s
+`pen_cursor` asks egui for `CursorIcon::None`, and that request is dropped:
+winit's `refresh_os_cursor` hides only when `CursorFlags::IN_WINDOW` is set and
+in the `else` branch actively *un*-hides, and `IN_WINDOW` is set true only
+inside `WM_MOUSEMOVE` — which a pen never produces, since `WM_POINTER*` ends at
+`ProcResult::Value(0)` after `SkipPointerFrameMessages` and never reaches
+`DefWindowProc`. `egui-winit` then dedupes on the last icon it set, so the lost
+request is never retried. `syscursor` therefore calls Windows' `SetCursor`
+directly. Three rules come with it:
+
+- **It is a per-frame call, never a latch.** That is what preserves the property
+  `CursorIcon::None` was chosen for over `set_cursor_visible(false)`: egui
+  re-derives the cursor every frame, so the arrow comes back on its own when the
+  pen goes away, where a latch's failure mode is a window with no pointer in it
+  and no way to say so.
+- **Focus belongs in the *request*, not beside the platform call.** Putting it
+  at the platform call meant nothing ever un-hid: Alt-Tab away with a pen
+  hovering and `pen_dot` was still `Some`, egui's icon was unchanged, its dedupe
+  skipped `set_cursor`, and the NULL cursor stayed in force **across the whole
+  desktop**. Folded into `Editor::pen_dot` via `Surroundings`, an unfocused
+  window asks for a real `CursorIcon`, the dedupe passes and winit restores the
+  arrow on the spot — one condition rather than two that can disagree. The
+  reading is `ctx.input(|i| i.focused)` and **not** `i.viewport().focused`,
+  which looks more direct and is always `None` because it is filled in by
+  `update_viewport_info`, which `render` does not call.
+- **`Memory::layer_id_at` is not a hit test while a modal is open** — it returns
+  the modal's own layer for *every* point in the window, open canvas included.
+  So anything reading `over_egui_area` gets `true` everywhere whenever a dialog
+  is up. That is correct for `pen_dot` and for `ui_owns_pointer`, which both
+  mean "refuse", and it silently killed the Settings readout, which meant
+  "observe": the row could only ever say the ordinary pointer, and its tooltip
+  then blamed the pen's position. The pane skips obscured frames and carries a
+  **count** of frames that asked to hide, because `egui::Popup::menu` is an
+  ordinary `Area` rather than a `Modal` — so walking to the pane through the
+  menu records the pen over the menu and clobbers the one reading somebody
+  opened it to see.
+- **No test can fail if `syscursor` is deleted.** The CPU tests cover which
+  cursor Umber *decides* to ask for; the platform call that is the actual fix is
+  not testable here, and `pen_dot`'s "checkable without a window" must not be
+  read as covering it.
 
 The pressure resolution is 1024 levels, which is what the `WM_POINTER` API
 carries however many the tablet itself distinguishes. `PressureSource::Device`

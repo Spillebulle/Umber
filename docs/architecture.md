@@ -240,12 +240,6 @@ Next, roughly in order:
 - **`lock_alpha`** — painting only where the layer already has coverage. Nothing
   in the shipped library needs it; it is worth building as a painting feature in
   its own right.
-- **The system clipboard.** Copy and paste move pixels inside Umber and between
-  its tabs today; nothing goes to or comes from another application. What stands
-  in the way is a dependency that has to hold to the standard `ureq` does — no C
-  toolchain, and working on the aarch64 cross-builds and inside the Flatpak
-  sandbox — rather than anything about the pixels, which `umber_core::clipboard`
-  already holds in the straight-alpha sRGB form an interchange format wants.
 - **Selecting by colour**, and growing or shrinking a selection by a distance.
   `umber_core::selection` has the four boolean modes and a feather; what it has
   no answer for is a selection derived from the picture rather than drawn.

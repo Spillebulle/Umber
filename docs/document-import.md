@@ -24,8 +24,12 @@ groups, another application's masks, blend modes Umber lacks — it is imported
 and the loss is reported in `ImportedDocument::warnings`, which the UI shows.
 Clipping is no longer in that list: Umber's own flag means what Photoshop's
 does, so a clipped `.psd` layer arrives clipped. Umber's own masks arrive too,
-out of its own `.ora`; a `.kra` or `.psd` mask is still reported as lost,
-because reading one is a second decoder in each of those formats.
+out of its own `.ora`, and a Krita **transparency** mask arrives too. Krita's
+other four mask kinds — filter, transform, selection, colorize — are reported as
+lost, because Umber has no equivalent for any of them. A `.psd` mask is reported
+as lost for a different reason: the pinned `psd` crate skips the block holding
+the mask's own rectangle, keeps the bytes behind a private accessor, and panics
+on an RLE mask channel, so reading one means a second parser beside the crate's.
 
 ## Verdicts
 
@@ -33,7 +37,7 @@ because reading one is a second decoder in each of those formats.
 |---|---|---|
 | `.ora` OpenRaster | **Landed, exact** | Open specification; layers, offsets, opacity, visibility and blend modes all arrive. Also what Umber *writes* — see `document-format.md`. |
 | `.kra` Krita | **Landed, layer-aware** | 8-bit RGBA documents read tile by tile. Anything else falls back to the embedded composite, with a warning. |
-| `.psd` Photoshop | **Landed, lossy** | 8-bit RGB only. Groups flatten, masks and clipping are dropped, and every loss is reported. |
+| `.psd` Photoshop | **Landed, lossy** | 8-bit RGB only. Groups flatten and masks are dropped; clipping arrives. A file with an RLE-compressed mask channel is refused outright, because the `psd` crate panics on one. Every loss is reported. |
 | `.png` | **Landed, exact** | A single layer. Also the decoder ORA uses. |
 | `.psb` Photoshop large | Declined | Header version 2; the `psd` crate reads version 1 only. |
 | `.clip` Clip Studio | Declined | Undocumented proprietary schema inside SQLite. Research project, not a feature. |
@@ -388,6 +392,11 @@ the adapter's real `max_texture_dimension_2d` before uploading.
   the tree available and can stop flattening.
 - Krita's `.krz` (the same container with different compression) is untested and
   not claimed.
-- Photoshop layer masks are detected and reported but not applied. Applying one
-  is straightforward — multiply it into alpha — but the mask's own rectangle,
-  density and feather all have to be right first.
+- Photoshop layer masks are detected and reported but not applied, and with the
+  pinned `psd` crate they *cannot* be: `read_layer_record` reads the length of
+  the layer-mask block and skips it, so the mask's own rectangle — which is
+  where its pixels live, not the layer's — never leaves the parser, the channel
+  bytes sit behind a private accessor, and an RLE mask channel panics. Applying
+  a mask would be a multiply into alpha; getting one to multiply is a second
+  parser walking the same bytes, which is the fork this module declines.
+  Density and feather would still have to be right afterwards.
