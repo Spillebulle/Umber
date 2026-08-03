@@ -17,7 +17,7 @@
 //! outlived it: both were worse versions of "put the panels where you want
 //! them".
 
-use crate::editor::{BrushTab, Editor, Tool};
+use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
 use crate::shortcuts::{self, Action};
@@ -995,23 +995,36 @@ fn brush_size_preview(ui: &egui::Ui, p: &Palette, ed: &Editor) {
 /// it back. `set_cursor_visible(false)` is the opposite, a latch whose failure
 /// mode is a window with no pointer in it and no way to say so.
 ///
+/// That request is still the whole of what this function makes. On Windows it
+/// is not the whole of what *happens*: winit's `set_cursor_visible` — which is
+/// what egui-winit turns `CursorIcon::None` into — cannot reach a pen, and
+/// `syscursor` is the one line that finishes the job, from the same per-frame
+/// answer rather than from a state of its own. Its module docs have the
+/// argument.
+///
+/// Where the dot goes is [`Editor::pen_dot`]'s, in a pure function, because it
+/// is the half of this that can be tested on a machine with no tablet.
+///
 /// The dot is in points, which is egui's unit and already scaled — so it is
 /// the same size on the screen whatever the display's density, exactly as the
 /// panels and the type are.
 fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
-    // Over a panel, a menu or a scrollbar the ordinary cursor is the right
-    // one: those are things to point at, and a workspace whose pointer
-    // vanished at the edge of the canvas would be unusable.
-    if !ed.pen_pointer || !ed.pointer_over_canvas(ed.cursor) {
+    // Over a panel, a menu, a modal or a scrollbar the ordinary cursor is the
+    // right one: those are things to point at, and a workspace whose pointer
+    // vanished at the edge of the canvas — or the moment a dialog opened —
+    // would be unusable. The `Area` half has to be asked of egui, so it is
+    // read here and handed to the rule rather than fetched inside it.
+    let over_area = editor::over_egui_area(ed, ui.ctx(), ed.cursor);
+    let Some(at) = ed.pen_dot(over_area) else {
         return;
-    }
+    };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
     // `text_dim` is the palette's recessive ink, and it is the one token that
     // is a mid-grey in *both* themes — the surfaces invert between Graphite and
     // Paper and most of the ink with them, so anything stronger would be black
     // on one and white on the other, over artwork that is neither.
     ui.painter()
-        .circle_filled(ed.to_points(ed.cursor), metrics::PEN_DOT, p.text_dim);
+        .circle_filled(ed.to_points(at), metrics::PEN_DOT, p.text_dim);
 }
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {

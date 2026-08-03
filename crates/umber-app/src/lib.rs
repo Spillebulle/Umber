@@ -42,6 +42,7 @@ mod settings;
 mod shortcuts;
 mod splash;
 mod sysclip;
+mod syscursor;
 mod tabs;
 mod taskbar;
 mod theme;

@@ -252,6 +252,22 @@ pub struct InputLog {
     /// How many touch events carried a force reading at all. A tablet whose
     /// touches all arrive with none is a driver problem, not a Umber one.
     pub with_force: u32,
+    /// What the last painted frame asked the window system for: `Some(true)`
+    /// where the interface wanted no cursor at all, `Some(false)` where it
+    /// wanted an ordinary one, `None` before any frame has been painted.
+    ///
+    /// The reason this is worth a row of its own: "the arrow is still there
+    /// under my pen" has two completely different causes, and the other columns
+    /// on this page distinguish neither. Either Umber never asked — the pen was
+    /// not recognised, or `Editor::cursor` was somewhere else and the canvas
+    /// decided the pointer was over a panel — or Umber asked and the platform
+    /// did not carry it out, which is a real thing that happens here and is
+    /// what `syscursor` exists for. This says which.
+    ///
+    /// An `Option` because "no frame has been painted yet" is not the same
+    /// answer as "an ordinary cursor", the same rule [`Sample::reported`] lives
+    /// by. Recorded, never recomputed: it is the very bool the frame acted on.
+    pub cursor_hidden: Option<bool>,
     /// Touch id currently in contact, for [`Motion::of`]. One rather than a set
     /// because it only has to tell a contact from a hover, and a second finger
     /// is a pinch the stroke path already refuses.
@@ -279,6 +295,7 @@ impl Default for InputLog {
             mouse_events: 0,
             touch_events: 0,
             with_force: 0,
+            cursor_hidden: None,
             contact: None,
             pos: Vec2::ZERO,
             probe: PressureModel::default(),
@@ -399,6 +416,18 @@ impl InputLog {
         }
     }
 
+    /// Record which cursor the frame just painted asked the window system for.
+    ///
+    /// Takes the answer the frame acted on rather than asking `Editor::pen_dot`
+    /// again, for the reason [`Self::note_resolved`] and [`Self::note_gesture`]
+    /// do: the page has to show what actually ran. Frame-driven rather than
+    /// event-driven, and deliberately — it is a statement about a *frame*, and
+    /// the frames between two pointer events are exactly where an arrow that
+    /// should not be there is sitting.
+    pub fn note_cursor(&mut self, hidden: bool) {
+        self.cursor_hidden = Some(hidden);
+    }
+
     /// The most recent press that resolved to a gesture, for the pane's readout.
     ///
     /// Walks the ring backwards, which is fine: only the Input & pen page calls
@@ -449,6 +478,12 @@ impl InputLog {
         self.mouse_events = 0;
         self.touch_events = 0;
         self.with_force = 0;
+        // `cursor_hidden` is deliberately *not* cleared. Everything else here
+        // is a tally of the session and Clear empties it; this is a reading of
+        // the last painted frame, and the next frame — the one that draws the
+        // cleared page — overwrites it before anybody sees it. Setting it to
+        // `None` would make "nothing yet" a state that is written and never
+        // drawn, which is a control lying about being resettable.
         self.probe_started = f64::MAX;
     }
 }
