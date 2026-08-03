@@ -571,22 +571,39 @@ are the contiguous run immediately below it whose `depth` is greater.
   in front of you does. `App::delete_picked_layers` is written in terms of
   `delete_layer` so the lock gate, the float being put down and the history
   being cleared are each stated once.
-- **The ticked-layers strip is drawn only when something is ticked**, and the
-  tick box is drawn on every row whether or not anything is. A strip that was
-  always there costs the list a row of height on every three-layer document; a
-  box that appeared only after you had found the first one is a feature nobody
-  finds.
-- **"All" is a box at the head of the tick column, not words on the strip.**
-  There used to be a "3 ticked" label and an All/None pair sharing that line
-  with six icon buttons: they fit in the abstract and were drawn over each other
-  at `metrics::PANEL`'s real 264 px. One box in the column it acts on says which
-  control it is by *where it sits*, so it needs no label to be overdrawn, and it
-  is drawn always — like the row boxes and unlike the strip — because it is the
-  way in to ticking rather than something you find after ticking. It ticks
-  everything, or unticks it once everything already is, which is the pair in one
-  control. Its geometry is `widgets`' `PICK_AT`/`PICK_HIT`/`PICK_MARK`, shared
-  with `layer_row`, or the header drifts out of the column the first time a row
-  is restyled. **It has three states and a folder's box has two**, and that is
+- **The ticked-layers strip is drawn only when something is ticked, and it
+  shares the "All" box's line rather than having one of its own.** The tick box
+  on each row is drawn whether or not anything is ticked, and so is the "All"
+  box above them; the six buttons are the only part that comes and goes. A
+  strip with a row to itself would still be right about *what* it draws and was
+  wrong about what that costs: the box below it is always there, so appearing
+  **inserted a line**, and ticking the first layer shunted the whole stack down
+  under the pointer that had just ticked it — reported from a running window.
+  Only the buttons appearing changes nothing's position.
+  **The line's height is `metrics::LAYER_TICK_ROW` and is not taken from its
+  contents**, because the chain is a 20 px `icon_toggle` and the box is
+  `PICK_HIT`'s 18: a line sized by what is on it would be two pixels shorter
+  with nothing ticked, which is the same jump made small enough to be
+  mystifying. `ticking_a_layer_does_not_move_the_layer_list` is the guard and
+  needs no GPU — it measures the body in all three states —
+  and `layers_panel_preview` is what says it looks right.
+- **"All" is a box at the head of the tick column, not words beside the
+  buttons.** There used to be a "3 ticked" label and an All/None pair sharing
+  that line with the six: they fit in the abstract and were drawn over each
+  other at `metrics::PANEL`'s real 264 px. One box in the column it acts on says
+  which control it is by *where it sits*, so it needs no label to be overdrawn,
+  and it is drawn always — like the row boxes and unlike the buttons — because
+  it is the way in to ticking rather than something you find after ticking. It
+  ticks everything, or unticks it once everything already is, which is the pair
+  in one control. Its geometry is `widgets`' `PICK_AT`/`PICK_HIT`/`PICK_MARK`,
+  shared with `layer_row`, or the header drifts out of the column the first time
+  a row is restyled — and `pick_all_box` therefore allocates **its own width and
+  not the line's**, because the buttons right-align into what is left of that
+  line. Its click is collected like the buttons' `Bulk` and applied after the
+  line, so the ticks have one writer per frame: the buttons are drawn from
+  `picked_count` and `targets` read *before* the line, and a `pick_all` landing
+  half way through would leave the two disagreeing about what "the ticked
+  layers" were. **It has three states and a folder's box has two**, and that is
   not an inconsistency: ticking a folder cascades, so "ticked, contents not" is
   unreachable there, while "some of the stack" is the ordinary case here and an
   empty box would say none was ticked.

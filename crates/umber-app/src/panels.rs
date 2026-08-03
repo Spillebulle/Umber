@@ -1250,29 +1250,105 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
 
     ui.add_space(7.0);
 
-    // What ticking rows is *for*, drawn only once something is ticked.
+    // What is being carried, if anything. Kept in egui's temporary store rather
+    // than on `Editor`, which is where `history_body`'s scroll memo lives and
+    // for the same reason: this belongs to the list, not to the document, and a
+    // tab switch has nothing to say about it.
+    let mut drag: Option<layerdrag::Drag> = ui.ctx().data(|d| d.get_temp(layer_drag_id()));
+
+    // The row a drop would land on, as `Drag::aim` left it at the end of the
+    // *last* frame. One frame behind the pointer, which nobody can see in a
+    // drag, and what it buys is that the mark can be handed to the row as its
+    // own highlight rather than painted over the top of it — `layer_row` draws
+    // its own name and blend, and a fill laid on afterwards would cover both.
+    let aimed = drag.as_ref().and_then(layerdrag::Drag::destination);
+
+    // Where the rows land, for the drag model. Collected only while a button is
+    // down or something is already being carried: the list is redrawn every
+    // frame and this would otherwise be a `Vec` built sixty times a second to
+    // answer a question nobody is asking.
+    let (pointer, origin, down, released, deciding) = ui.input(|i| {
+        (
+            i.pointer.interact_pos(),
+            i.pointer.press_origin(),
+            i.pointer.primary_down(),
+            i.pointer.any_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+    let watching = drag.is_some() || down;
+    let mut rows: Vec<layerdrag::Row> = Vec::new();
+
+    // The head of the tick column, and — once something is ticked — what
+    // ticking is *for*, on one line.
     //
-    // A strip that was always there would cost the list a row of height on
-    // every document, most of which have three layers and no use for it; and a
-    // row of controls that do nothing is the thing CLAUDE.md refuses
-    // everywhere else. How many are ticked is not stated here: the boxes
-    // themselves say it, and a count sharing this line with six icon buttons is
-    // what the buttons overdrew at the panel's real width.
-    if ed.layers.picked_count() > 0 {
-        let picked = ed.layers.picked_count();
-        // Through `effective_locked`, so a folder's lock protects what is
-        // inside it — the same question `delete_layer`'s gate asks.
-        let any_locked = ed
-            .layers
-            .targets()
-            .iter()
-            .any(|i| ed.layers.effective_locked(*i));
-        let can_delete = ed.layers.can_remove(&ed.layers.targets());
-        let mut act: Option<Bulk> = None;
-        ui.horizontal(|ui| {
-            // Still wrapped, for the reason every dialog's footer is: a bare
-            // right-to-left layout takes the whole remaining *height* of the ui
-            // it is in, because the align is the cross axis.
+    // One line rather than two, and that is the whole of the arrangement. The
+    // box is drawn always, so a strip with a row of its own meant that ticking
+    // the first layer *inserted* that row and pushed the entire list down under
+    // the pointer that had just ticked it; sharing the box's line, only the
+    // buttons come and go and nothing moves. The height is
+    // `metrics::LAYER_TICK_ROW` for the same reason — see its doc comment,
+    // which is where the two-pixel version of the same jump is written down.
+    //
+    // The box itself is drawn always, like the row boxes and unlike the
+    // buttons: it is how somebody finds ticking at all, so hiding it until
+    // something is ticked would hide the way in behind itself. It is counted
+    // over the whole stack rather than over `targets`, which falls back to the
+    // selected layer when nothing is ticked — this box says what the *boxes*
+    // hold, and with none ticked that is none.
+    let picked = ed.layers.picked_count();
+    let state = match picked {
+        0 => widgets::PickAll::None,
+        n if n == count => widgets::PickAll::All,
+        _ => widgets::PickAll::Some,
+    };
+    let mut act: Option<Bulk> = None;
+    // Collected like `act` rather than written inside the closure, so the ticks
+    // have exactly one writer per frame: the buttons are drawn from `picked`
+    // and from `targets`, both read before the line, and a `pick_all` landing
+    // half way through would leave the two disagreeing about what "the ticked
+    // layers" were.
+    let mut mark_all = None;
+    // A fixed-size allocation rather than `ui.horizontal`, which takes its
+    // height from whatever happens to be on it — which here is a 20 px chain on
+    // the frames something is ticked and an 18 px box on the frames nothing is.
+    // It is also what wraps the right-to-left layout below, for the reason every
+    // dialog's footer is wrapped: a bare one takes the whole remaining *height*
+    // of the ui it is in, because the align is the cross axis. Left-to-right
+    // with a centre cross-align, so the box and the taller buttons sit on one
+    // baseline rather than one of them riding at the top of the line.
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), metrics::LAYER_TICK_ROW),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            if widgets::pick_all_box(ui, p, state) {
+                // Everything, or nothing once it is already everything — which
+                // is the All and None pair this replaced, in the one place
+                // where "all of them" is the thing being looked at.
+                mark_all = Some(state != widgets::PickAll::All);
+            }
+            // The buttons appear only once something is ticked. A row of
+            // controls that do nothing is the thing CLAUDE.md refuses
+            // everywhere else, and how many are ticked is not stated here: the
+            // boxes themselves say it, and a count sharing this line with six
+            // icon buttons is what the buttons overdrew at the panel's real
+            // width.
+            if picked == 0 {
+                return;
+            }
+            // Inside the branch, because `targets` builds a list and this runs
+            // every frame the panel is open: with nothing ticked there are no
+            // buttons to answer for and nothing to ask.
+            //
+            // `any_locked` goes through `effective_locked`, so a folder's lock
+            // protects what is inside it — the same question `delete_layer`'s
+            // gate asks.
+            let any_locked = ed
+                .layers
+                .targets()
+                .iter()
+                .any(|i| ed.layers.effective_locked(*i));
+            let can_delete = ed.layers.can_remove(&ed.layers.targets());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icon_button(
                     ui,
@@ -1324,92 +1400,45 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     act = Some(Bulk::Visible(true));
                 }
             });
-        });
-        match act {
-            // Straight onto the flags: nothing here touches the GPU or the
-            // history, so there is no reason to send it round through
-            // `UiActions` and back. Deleting is the one that does.
-            Some(Bulk::Visible(on)) => {
-                for index in ed.layers.targets() {
-                    if let Some(layer) = ed.layers.get_mut(index) {
-                        layer.visible = on;
-                    }
-                }
-                changed = true;
-            }
-            Some(Bulk::Lock(on)) => {
-                for index in ed.layers.targets() {
-                    if let Some(layer) = ed.layers.get_mut(index) {
-                        layer.locked = on;
-                    }
-                }
-                changed = true;
-            }
-            Some(Bulk::Link) => {
-                ed.layers.link(&ed.layers.targets());
-                changed = true;
-            }
-            Some(Bulk::Unlink) => {
-                ed.layers.unlink(&ed.layers.targets());
-                changed = true;
-            }
-            // Slots go back on the free list, so this clears the undo history
-            // and has to happen where the GPU is. `UiActions` is `Copy` and
-            // cannot carry the list; the caller reads the ticks off the editor
-            // in the frame the flag was set, exactly as `new_tip` does.
-            Some(Bulk::Delete) => actions.delete_picked = true,
-            None => {}
-        }
-        ui.add_space(6.0);
+        },
+    );
+    if let Some(all) = mark_all {
+        ed.layers.pick_all(all);
     }
-
-    // What is being carried, if anything. Kept in egui's temporary store rather
-    // than on `Editor`, which is where `history_body`'s scroll memo lives and
-    // for the same reason: this belongs to the list, not to the document, and a
-    // tab switch has nothing to say about it.
-    let mut drag: Option<layerdrag::Drag> = ui.ctx().data(|d| d.get_temp(layer_drag_id()));
-
-    // The row a drop would land on, as `Drag::aim` left it at the end of the
-    // *last* frame. One frame behind the pointer, which nobody can see in a
-    // drag, and what it buys is that the mark can be handed to the row as its
-    // own highlight rather than painted over the top of it — `layer_row` draws
-    // its own name and blend, and a fill laid on afterwards would cover both.
-    let aimed = drag.as_ref().and_then(layerdrag::Drag::destination);
-
-    // Where the rows land, for the drag model. Collected only while a button is
-    // down or something is already being carried: the list is redrawn every
-    // frame and this would otherwise be a `Vec` built sixty times a second to
-    // answer a question nobody is asking.
-    let (pointer, origin, down, released, deciding) = ui.input(|i| {
-        (
-            i.pointer.interact_pos(),
-            i.pointer.press_origin(),
-            i.pointer.primary_down(),
-            i.pointer.any_released(),
-            i.pointer.is_decidedly_dragging(),
-        )
-    });
-    let watching = drag.is_some() || down;
-    let mut rows: Vec<layerdrag::Row> = Vec::new();
-
-    // The head of the tick column. Drawn always, like the row boxes and unlike
-    // the strip above: it is how somebody finds ticking at all, so hiding it
-    // until something is ticked would hide the way in behind itself.
-    //
-    // Counted over the whole stack rather than over `targets`, which falls back
-    // to the selected layer when nothing is ticked — this box says what the
-    // *boxes* hold, and with none ticked that is none.
-    let picked = ed.layers.picked_count();
-    let state = match picked {
-        0 => widgets::PickAll::None,
-        n if n == count => widgets::PickAll::All,
-        _ => widgets::PickAll::Some,
-    };
-    if widgets::pick_all_box(ui, p, state) {
-        // Everything, or nothing once it is already everything — which is the
-        // All and None pair this replaced, in the one place where "all of them"
-        // is the thing being looked at.
-        ed.layers.pick_all(state != widgets::PickAll::All);
+    match act {
+        // Straight onto the flags: nothing here touches the GPU or the history,
+        // so there is no reason to send it round through `UiActions` and back.
+        // Deleting is the one that does.
+        Some(Bulk::Visible(on)) => {
+            for index in ed.layers.targets() {
+                if let Some(layer) = ed.layers.get_mut(index) {
+                    layer.visible = on;
+                }
+            }
+            changed = true;
+        }
+        Some(Bulk::Lock(on)) => {
+            for index in ed.layers.targets() {
+                if let Some(layer) = ed.layers.get_mut(index) {
+                    layer.locked = on;
+                }
+            }
+            changed = true;
+        }
+        Some(Bulk::Link) => {
+            ed.layers.link(&ed.layers.targets());
+            changed = true;
+        }
+        Some(Bulk::Unlink) => {
+            ed.layers.unlink(&ed.layers.targets());
+            changed = true;
+        }
+        // Slots go back on the free list, so this clears the undo history and
+        // has to happen where the GPU is. `UiActions` is `Copy` and cannot
+        // carry the list; the caller reads the ticks off the editor in the
+        // frame the flag was set, exactly as `new_tip` does.
+        Some(Bulk::Delete) => actions.delete_picked = true,
+        None => {}
     }
 
     // Stored bottom-first; shown top-first, the way it is drawn.
@@ -2344,6 +2373,70 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
 
 #[cfg(test)]
 mod tests {
+    /// Ticking a layer must not move the layer list.
+    ///
+    /// The six bulk buttons used to be a line of their own *above* the tick
+    /// column's header, drawn only once something was ticked — so ticking the
+    /// first layer inserted a line and shunted the whole stack down under the
+    /// pointer that had just ticked it, and unticking the last one pulled it
+    /// back up. They share the header's line now, and that line's height is
+    /// fixed at [`metrics::LAYER_TICK_ROW`] rather than taken from whatever is
+    /// on it, so the body is exactly as tall in all three of the header's
+    /// states.
+    ///
+    /// A CPU test because this is geometry and needs no device — the shot below
+    /// is what says whether the result *looks* right, and this is what fails
+    /// the build if it stops being true.
+    #[test]
+    fn ticking_a_layer_does_not_move_the_layer_list() {
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Rect, pos2, vec2};
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(metrics::PANEL, 600.0),
+            )),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        let height = |ticks: &[usize]| {
+            let mut ed = Editor::default();
+            for _ in 0..3 {
+                ed.layers.add();
+            }
+            for index in ticks {
+                ed.layers.pick(*index, true);
+            }
+            // Twice, and the second is the one read: the first pass through a
+            // fresh context builds the font atlas, and text laid out against a
+            // half-built one is not the height it will settle at.
+            let mut measured = 0.0;
+            for _ in 0..2 {
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    let mut actions = crate::ui::UiActions::default();
+                    super::layers_body(ui, &palette, &mut ed, &mut actions);
+                    measured = ui.min_rect().height();
+                });
+            }
+            measured
+        };
+
+        let none = height(&[]);
+        assert_eq!(
+            height(&[1]),
+            none,
+            "ticking one layer changed the height of the Layers body"
+        );
+        assert_eq!(
+            height(&[0, 1, 2, 3]),
+            none,
+            "ticking every layer changed the height of the Layers body"
+        );
+    }
+
     /// The Layers module at the panel's real width, in each of the three states
     /// the tick column's header can be in.
     ///
