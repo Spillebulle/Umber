@@ -38,7 +38,7 @@
 //! again on every start for ever. That is bookkeeping, not a document — see
 //! [`crate::autosave::Marks`].
 
-use egui::{Sense, vec2};
+use egui::{Sense, Vec2, vec2};
 
 use crate::autosave::{Offer, Recoverable};
 use crate::editor::Editor;
@@ -80,6 +80,15 @@ pub struct Recovery {
     /// [`UiActions::delete_picked`] keeps and for the same reason: `UiActions`
     /// is `Copy` and this is a list.
     wanted: Vec<usize>,
+    /// An offer has arrived and has not been drawn yet.
+    ///
+    /// It is raised *after* the frame has been presented — the autosave
+    /// collects there — so nothing on screen has it yet, and under
+    /// `ControlFlow::Wait` a value appearing in a field is not an event. The
+    /// same gap `Autosave::set_waker` and `app::Wake` exist for, one frame
+    /// wide: without this the offer would sit unseen until the painter happened
+    /// to move the mouse.
+    arrived: bool,
 }
 
 impl Recovery {
@@ -92,10 +101,12 @@ impl Recovery {
         }
         self.opened = vec![false; offer.found.len()];
         self.offer = Some(offer);
+        self.arrived = true;
     }
 
-    pub fn is_open(&self) -> bool {
-        self.offer.is_some()
+    /// Whether a frame has to be asked for so the offer is seen.
+    pub fn take_arrived(&mut self) -> bool {
+        std::mem::take(&mut self.arrived)
     }
 
     /// The copies the artist asked for this frame, with the row each came from.
@@ -233,8 +244,8 @@ fn body(
     // discovered after it.
     ui.label(
         egui::RichText::new(
-            "Nothing here is deleted either way. Umber keeps its copies in the \
-             autosave folder until they expire.",
+            "Nothing here is deleted either way — Umber keeps its copies in the \
+             autosave folder until they expire. This offer is only made once.",
         )
         .size(text::TINY)
         .color(p.text_dim),
@@ -261,9 +272,9 @@ fn body(
                     ui,
                     p,
                     if remaining == 1 {
-                        "Open it"
+                        "Recover it"
                     } else {
-                        "Open them all"
+                        "Recover them all"
                     },
                     true,
                 )
@@ -276,7 +287,9 @@ fn body(
                         .map(|(i, _)| i),
                 );
             }
-            if tabs::button(ui, p, "Show the folder", false) {
+            // The words Settings uses for the same control. Two spellings of
+            // one command is how the two come to be read as two things.
+            if tabs::button(ui, p, "Open the folder", false) {
                 out.reveal = true;
             }
         });
@@ -345,11 +358,11 @@ fn row(
                 // a control that is drawn and refuses is one that lies about
                 // being available.
                 ui.label(
-                    egui::RichText::new("Opened")
+                    egui::RichText::new("Recovered")
                         .size(text::SMALL)
                         .color(p.text_dim),
                 );
-            } else if tabs::button(ui, p, "Open", false) {
+            } else if tabs::button(ui, p, "Recover", false) {
                 wanted.push(index);
             }
         });
@@ -376,9 +389,10 @@ fn missing(ui: &mut egui::Ui, p: &Palette, titles: &[String]) {
     );
     for title in titles {
         ui.horizontal(|ui| {
-            // The quit prompt's own dot column, so two lists of documents in
-            // one application line up rather than each finding its own indent.
-            let (dot, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+            // The quit prompt's own dot column, taken from where it is stated
+            // rather than re-typed, so two lists of documents in one
+            // application line up and go on lining up.
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(tabs::MARK), Sense::hover());
             ui.painter().circle_filled(dot.center(), 3.0, p.warning);
             ui.label(
                 egui::RichText::new(title)
@@ -461,11 +475,11 @@ mod tests {
         );
         let saved = entry("hands.ora", Some("/work/hands.ora"), 60).destination();
         assert!(saved.contains("hands.ora"), "{saved}");
-        assert!(saved.contains("writes back"), "{saved}");
-        // The autosave has to be named too: a recovered document is an
-        // ordinary open one, so the timer writes to that file within minutes
-        // whether or not anybody presses Save.
-        assert!(saved.contains("autosave"), "{saved}");
+        assert!(saved.contains("Save writes back"), "{saved}");
+        // And the half that decides whether somebody dares click: opening a
+        // copy to look at it must not be what replaces the file they have.
+        // `Candidate::write_own_file` is what makes this true.
+        assert!(saved.contains("until you do"), "{saved}");
     }
 
     /// A row says "Opened" only once its copy actually opened.
@@ -509,7 +523,12 @@ mod tests {
     fn dismissing_forgets_the_marker_and_names_no_document() {
         let mut recovery = Recovery::default();
         recovery.offer(offer_of(vec![entry("a.ora", None, 10)]));
-        assert!(recovery.is_open());
+        assert!(recovery.offer.is_some());
+        assert!(
+            recovery.take_arrived(),
+            "an offer nothing asks a frame for is one nobody sees",
+        );
+        assert!(!recovery.take_arrived(), "asked for twice");
 
         let marks = recovery.dismiss();
         assert_eq!(marks.len(), 1);
@@ -519,7 +538,7 @@ mod tests {
                 .all(|p| p.extension().is_some_and(|e| e == "json")),
             "dismissing named something that is not a marker: {marks:?}",
         );
-        assert!(!recovery.is_open());
+        assert!(recovery.offer.is_none());
         assert!(recovery.dismiss().is_empty(), "answered twice");
     }
 

@@ -2210,6 +2210,14 @@ impl UmberApp {
             self.editor.notice = Some(notice);
         }
 
+        // An offer raised by the collect above arrived *after* this frame was
+        // presented, so nothing on screen holds it — and under
+        // `ControlFlow::Wait` a value appearing in a field is not an event.
+        // The same wake-up the update check and the autosave's writer need.
+        if self.editor.recovery.take_arrived() {
+            gfx.window.request_redraw();
+        }
+
         // Keep the frames coming while a stroke is live; otherwise the app
         // goes back to sleep until the next input event. A capture in flight
         // needs the same: under `ControlFlow::Wait` a document being read back
@@ -2773,6 +2781,11 @@ impl UmberApp {
         // what made this tab the active one.
         if modified {
             self.editor.mark_modified();
+            // And that the file this tab names is one nobody has saved to. The
+            // autosave writes the internal copy either way and leaves the
+            // painter's own file alone until they choose it — see
+            // `session::Tab::recovered`.
+            self.editor.session.mark_recovered();
         }
         self.request_redraw();
         true
@@ -2793,7 +2806,13 @@ impl UmberApp {
             // notice of its own, and the button that would let somebody try
             // again has to still be under it rather than replaced by the word
             // "Opened" beside a document that is not there.
-            if self.open_import(&entry.copy, entry.title.clone(), entry.original, true) {
+            if self.open_import(&entry.copy, entry.title, entry.original, true) {
+                // The document it came out of *is* its copy. Without this the
+                // marker would describe it as having none until its first
+                // autosave, and a never-saved one would then be written to a
+                // second file beside the one it was recovered from.
+                let id = self.editor.session.active_id();
+                self.editor.autosave.adopt_copy(id, entry.copy);
                 self.editor.recovery.note_opened(row);
             }
         }

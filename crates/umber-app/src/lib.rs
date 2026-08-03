@@ -98,6 +98,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // or by an update handing over. A panic unwinds straight past this, a hard
     // kill never reaches it, and both are exactly the cases the next start has
     // to be able to tell apart. See `autosave::SessionMark`.
+    //
+    // After the `?` deliberately: a loop that ended by *failing* is not a
+    // shutdown, and leaving the marker behind is the honest reading of it.
     app.ended_cleanly();
     Ok(())
 }

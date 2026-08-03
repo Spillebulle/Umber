@@ -290,9 +290,13 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
 
     // What a session that stopped left behind. Drawn from here rather than from
     // a panel body, for the reason the brush library's modals and the canvas
-    // dialogs are — and *before* the notice below, so that a warning raised by
-    // recovering a document lands on top of the offer it came from rather than
-    // underneath it.
+    // dialogs are, and placed here rather than anywhere else in this run of
+    // dialogs for two reasons of its own. *After* the quit prompt, because that
+    // one is the answer to "the window is closing" and supersedes everything —
+    // though the two cannot in practice be on screen together, since this is
+    // only ever raised on the first frame. *Before* the notice below, because
+    // recovering a document can raise one, and a warning about what an import
+    // dropped has to land on top of the offer that produced it.
     crate::recoverdlg::show(root, &p, ed, &mut actions);
 
     tabs::notice(root, &p, ed);
