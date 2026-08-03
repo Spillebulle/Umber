@@ -163,7 +163,7 @@
 //! ### And nothing on screen says so, which was checked rather than assumed
 //!
 //! This project's rule is that a control which lies is worse than one that is
-//! not drawn, and a three-second freeze with nothing on screen reads as a hang.
+//! not drawn, and a second of freeze with nothing on screen reads as a hang.
 //! Three ways to say something were looked at and all three were refused, so
 //! the conclusion is written down rather than left to be re-derived:
 //!
