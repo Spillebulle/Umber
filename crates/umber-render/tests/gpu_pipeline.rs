@@ -3695,6 +3695,89 @@ fn a_lift_leaves_no_ghost_of_the_selection_it_was_painted_through() {
     }
 }
 
+/// The same property under a **feather**, which is the case the `min(a, m) / a`
+/// rule was built for and never actually met.
+///
+/// An antialiased outline is one pixel of partial coverage against a whole
+/// interior of 255; a feathered one is *nothing but* partial coverage, tens of
+/// pixels deep and reaching down to a coverage of one. So this is the same
+/// arithmetic over the range where it is hardest: the share is a share of an
+/// alpha that is itself small, and the two halves — what the float takes and
+/// what the hole leaves — have to go on summing to what was there.
+///
+/// The two are one number in `transform.wgsl` by construction, which is why
+/// this can be stated as a complement rather than as a falloff anybody worked
+/// out by hand: the source has to come back to bare, and the destination has to
+/// hold what the source gave up.
+#[test]
+fn a_lift_through_a_feathered_selection_leaves_no_ghost_either() {
+    let mut h = harness_or_skip!();
+
+    let sel = Selection::polygon(
+        &[
+            Vec2::new(12.0, 10.0),
+            Vec2::new(28.0, 14.0),
+            Vec2::new(16.0, 26.0),
+        ],
+        UVec2::splat(DOC),
+    )
+    .expect("a selection")
+    .feathered(4.0, UVec2::splat(DOC))
+    .expect("a soft selection");
+    let source = sel.bounds();
+    let empty = read_rect(&h, 0, source);
+    assert!(
+        empty.iter().all(|b| *b == 0),
+        "the layer did not start bare"
+    );
+
+    h.set_selection(Some(sel.clone()));
+    h.stamp(&[dab(19.0, 17.0, 34.0, 1.0)]);
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let painted = alphas(&read_rect(&h, 0, source));
+    // The point of the feather: a mask that is almost all partial coverage. An
+    // ordinary antialiased edge would fail this — its interior is 255 and only
+    // a one-pixel band is in between.
+    let soft = painted.iter().filter(|a| **a > 0 && **a < 250).count();
+    assert!(
+        soft * 2 > painted.iter().filter(|a| **a > 0).count(),
+        "most of a feathered selection's paint should be partly covered, and \
+         only {soft} of {} pixels are",
+        painted.len()
+    );
+
+    let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 30.0));
+
+    assert_eq!(
+        read_rect(&h, 0, source),
+        empty,
+        "a ghost of the feather was left where the paint was lifted from"
+    );
+    // Alpha, within the level the store can round by, for the reason the
+    // antialiased test above gives at length — and colour deliberately not
+    // compared at all, which matters far more here: most of this rectangle is
+    // at an alpha where one level moves the encoded byte by several.
+    let carried = alphas(&read_rect(&h, 0, dest));
+    assert_eq!(
+        carried.len(),
+        painted.len(),
+        "the rectangles differ in size"
+    );
+    let worst = carried
+        .iter()
+        .zip(&painted)
+        .enumerate()
+        .max_by_key(|(_, (c, g))| c.abs_diff(**g))
+        .map(|(i, (c, g))| (i, *c, *g));
+    if let Some((at, carried, gave_up)) = worst {
+        assert!(
+            carried.abs_diff(gave_up) <= 1,
+            "the float did not carry every pixel the layer gave up: at pixel \
+             {at} the layer gave up {gave_up} and the float carries {carried}",
+        );
+    }
+}
+
 /// The cheap case, and the one that should be exact on both axes: an integer
 /// rectangle, whose coverage is only ever 0 or 255. Here the lift takes the
 /// selected pixels whole and leaves the rest of the layer untouched — the

@@ -26,8 +26,8 @@ use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use umber_core::{
-    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, SelectionMode,
-    input::PressureSource,
+    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, Selection,
+    SelectionMode, SelectionOp, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -1347,22 +1347,29 @@ mod strip_budget {
     pub const OPACITY: f32 = 185.0;
     pub const STABILISER: f32 = 110.0;
     /// The line naming the modifiers that add to and subtract from a selection.
-    pub const COMBINE: f32 = 175.0;
+    pub const COMBINE: f32 = 230.0;
+    /// The four marks that say what a new shape does to the selection.
+    pub const SELECT_OP: f32 = 105.0;
+    /// The feather rail, its label and its readout.
+    pub const FEATHER: f32 = 165.0;
 }
 
-/// How to add to and subtract from a selection, named for this platform.
+/// How to add to, subtract from and intersect a selection, named for this
+/// platform.
 ///
 /// A held modifier is part of a gesture rather than a command, so it is
 /// deliberately not in the rebindable table — which leaves the options strip as
-/// the only place the user can find out. `const` rather than `format!` with
+/// the only place the user can find out. It is a *second* way in rather than
+/// the only one now: the four marks beside it are the same four operations, for
+/// the reason `App::selection_op` gives. `const` rather than `format!` with
 /// `shortcuts::primary_modifier_name`, because the strip is painted every frame
 /// and a string built per frame for a line that never changes is exactly what
 /// the rest of this interface avoids.
 const fn combine_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Hold Shift to add, Cmd to subtract."
+        "Hold Shift to add, Cmd to subtract, both to intersect."
     } else {
-        "Hold Shift to add, Ctrl to subtract."
+        "Hold Shift to add, Ctrl to subtract, both to intersect."
     }
 }
 
@@ -1455,6 +1462,31 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             );
         } else if ed.ui.tool == Tool::Select {
             selection_mode_switch(ui, p, ed);
+            // One reading of the room and cumulative budgets, exactly as the
+            // brush's three groups above do it, in reverse order of how badly
+            // somebody is stuck without them. The controls come before the
+            // prose because a control that is not drawn cannot be reached at
+            // all, where a sentence has usually already been read — and the
+            // feather goes before the marks because the four operations have a
+            // second way in (the modifiers, which the line at the end names)
+            // and the feather has none.
+            let room = ui.available_width();
+            if room >= strip_budget::SELECT_OP {
+                divider(ui, p);
+                selection_op_switch(ui, p, ed);
+            }
+            if room >= strip_budget::SELECT_OP + strip_budget::FEATHER {
+                divider(ui, p);
+                widgets::inline_slider(
+                    ui,
+                    p,
+                    "Feather",
+                    &mut ed.ui.selection_feather,
+                    0.0..=Selection::MAX_FEATHER,
+                    false,
+                    |v| format!("{v:.0}"),
+                );
+            }
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(ed.ui.selection_mode.hint())
@@ -1464,7 +1496,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // Dropped first when the window is narrow: the gesture the mode
             // needs is the line somebody is stuck without, and this one is
             // about a gesture they have not reached for yet.
-            if ui.available_width() >= strip_budget::COMBINE {
+            if room >= strip_budget::SELECT_OP + strip_budget::FEATHER + strip_budget::COMBINE {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(combine_hint())
@@ -1523,6 +1555,41 @@ fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }
         }
     });
+}
+
+/// What a new shape does to the selection already standing: four marks, of
+/// which exactly one is on.
+///
+/// **Four [`widgets::icon_toggle`]s rather than a [`widgets::segmented`] or a
+/// fifth [`widgets::dropdown`].** The segmented picker takes the whole of the
+/// width it is given, which on a single unwrapped row is everything left, and
+/// it is a stacked control that belongs in a panel. A dropdown would be a
+/// second one on this strip, beside the mode's, with nothing but its own word
+/// to say which question it answers. Four marks laid out side by side, one lit,
+/// is what Photoshop, GIMP, Krita and Affinity all draw for exactly this — and
+/// it is the one spelling that fits a 36-point row and says the whole set at a
+/// glance rather than one member of it.
+///
+/// The toggles are read-only about each other: clicking the one already on
+/// leaves it on, because these are four answers to one question and there is no
+/// state with none of them chosen. That is the difference between this and the
+/// layer flags, which are the same widget and are genuinely independent.
+fn selection_op_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    for op in SelectionOp::ALL {
+        let mark = match op {
+            SelectionOp::Replace => Icon::SelectReplace,
+            SelectionOp::Add => Icon::SelectAdd,
+            SelectionOp::Subtract => Icon::SelectSubtract,
+            SelectionOp::Intersect => Icon::SelectIntersect,
+        };
+        // The tooltip carries the name as well as what it does: the mark is a
+        // picture of the *result*, which is legible once you know the four and
+        // guessable at best before that.
+        let tip = format!("{} — {}", op.label(), op.hint());
+        if widgets::icon_toggle(ui, p, mark, ed.ui.selection_op == op, true, &tip) {
+            ed.ui.selection_op = op;
+        }
+    }
 }
 
 fn divider(ui: &mut egui::Ui, p: &Palette) {

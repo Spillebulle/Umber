@@ -1455,36 +1455,42 @@ impl UmberApp {
     }
 
     /// What a press with the selection tool means: replace what is selected,
-    /// add to it, or take the new shape out of it.
+    /// add to it, take the new shape out of it, or keep only what both cover.
     ///
-    /// **Shift adds and Ctrl — Command on macOS — subtracts.** Shift-to-add is
-    /// universal and needs no defending. Subtract is the interesting half:
-    /// Photoshop's and Krita's spelling of it is Alt, and Alt is not available
-    /// here. It is already the eyedropper when a button goes down and the brush
-    /// resize when one does not (see `set_brush_resize`), and the eyedropper is
-    /// tested *before* the tool is consulted — so an Alt-drag with the selection
-    /// tool in hand picks a colour today, and making it subtract instead would
-    /// take a gesture away from every tool to give it to one. Ctrl is GIMP's
-    /// binding for the same operation, so this is a convention somebody already
-    /// has rather than one invented here, and Ctrl is otherwise unspoken for on
-    /// a canvas press — it is the wheel's zoom modifier and nothing else.
+    /// **Shift adds, Ctrl — Command on macOS — subtracts, and the two together
+    /// intersect.** Shift-to-add is universal and needs no defending. Subtract
+    /// is the interesting half: Photoshop's and Krita's spelling of it is Alt,
+    /// and Alt is not available here. It is already the eyedropper when a
+    /// button goes down and the brush resize when one does not (see
+    /// `set_brush_resize`), and the eyedropper is tested *before* the tool is
+    /// consulted — so an Alt-drag with the selection tool in hand picks a
+    /// colour today, and making it subtract instead would take a gesture away
+    /// from every tool to give it to one. Ctrl is GIMP's binding for the same
+    /// operation, so this is a convention somebody already has rather than one
+    /// invented here, and Ctrl is otherwise unspoken for on a canvas press — it
+    /// is the wheel's zoom modifier and nothing else. Intersect then follows
+    /// for free: it is add-and-subtract together everywhere this is spelled,
+    /// with Ctrl standing in for the Alt Umber cannot offer.
     ///
-    /// Not in [`shortcuts`]'s rebindable table, deliberately: a held modifier
-    /// is part of a *gesture*, not a command that could be listed, enumerated
-    /// or fired from the keyboard. The tool options strip is where it is
-    /// written down instead.
+    /// **With no modifier held it is the tool options strip's setting**, which
+    /// is what makes the operation reachable at all: a held key is not
+    /// discoverable, cannot be listed and cannot be enumerated, so a modifier
+    /// alone would leave three quarters of this feature to be guessed. It is
+    /// still not in [`shortcuts`]'s rebindable table, deliberately — a held
+    /// modifier is part of a *gesture*, not a command that could be fired from
+    /// the keyboard — and the strip is where it is written down instead. A
+    /// modifier overrides the setting for the one gesture rather than changing
+    /// it, which is what every application spelling both does.
     ///
     /// Command is accepted alongside Control for the same reason
     /// `shortcuts::resolve` folds the two: winit reports it as Super, and a Mac
     /// keyboard has no Ctrl a hand reaches for.
     fn selection_op(&self) -> SelectionOp {
-        if self.modifiers.shift_key() {
-            SelectionOp::Add
-        } else if self.modifiers.control_key() || self.modifiers.super_key() {
-            SelectionOp::Subtract
-        } else {
-            SelectionOp::Replace
-        }
+        combined_selection_op(
+            self.modifiers.shift_key(),
+            self.modifiers.control_key() || self.modifiers.super_key(),
+            self.editor.ui.selection_op,
+        )
     }
 
     /// Take the colour under the cursor as the painting colour.
@@ -3665,9 +3671,52 @@ fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> Pix
     PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
 }
 
+/// The rule [`App::selection_op`] applies, as a pure function of what was held
+/// and what the strip is set to.
+///
+/// A free function for the reason `gesture::press` is one: the interesting part
+/// is a small matrix, and the matrix is only checkable if it can be stated
+/// without a window and without a `winit::Modifiers`. It stays here rather than
+/// in `umber_core::selection` because *which* modifier means which is the
+/// interface's decision — it has to be reconciled with what Alt already does on
+/// this canvas — and that is what `SelectionOp`'s own docs say.
+fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> SelectionOp {
+    match (add, subtract) {
+        (true, true) => SelectionOp::Intersect,
+        (true, false) => SelectionOp::Add,
+        (false, true) => SelectionOp::Subtract,
+        (false, false) => setting,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_modifier_overrides_the_strips_setting_for_one_gesture_and_no_longer() {
+        // Every cell, against every setting. The two things this is here to
+        // pin: nothing held is the setting *whatever* it is — a modifier
+        // changes what one gesture does and never what the strip says — and
+        // the pair together is Intersect rather than whichever of the two won
+        // an `if`/`else if`, which is what the old two-armed version would have
+        // done had Intersect been bolted onto it.
+        for setting in SelectionOp::ALL {
+            assert_eq!(combined_selection_op(false, false, setting), setting);
+            assert_eq!(
+                combined_selection_op(true, false, setting),
+                SelectionOp::Add
+            );
+            assert_eq!(
+                combined_selection_op(false, true, setting),
+                SelectionOp::Subtract
+            );
+            assert_eq!(
+                combined_selection_op(true, true, setting),
+                SelectionOp::Intersect
+            );
+        }
+    }
 
     #[test]
     fn a_saved_file_always_ends_up_openable() {
