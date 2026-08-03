@@ -98,6 +98,15 @@ fn stroke_rgb(uv: vec2<f32>) -> vec3<f32> {
 //
 // Byte for byte what `composite.wgsl` builds as `s`: the same coverage sample
 // times the same once-applied stroke opacity, times the same `stroke_rgb`.
+//
+// The claim is about `s` and not about the whole blend. The *destination*
+// differs: the preview samples the layer bilinearly at screen resolution while
+// this reads one texel, so under magnification the two are blending against
+// slightly different backdrops. Filtering does not commute with a non-linear
+// blend, which makes that difference marginally larger for Multiply than for
+// Normal. It is sub-visual, it predates blend modes, and closing it would mean
+// resampling the layer to match — which is why what is promised here is the
+// source rather than the result.
 fn stroke_src(uv: vec2<f32>) -> vec4<f32> {
     let cov = textureSampleLevel(stroke_tex, samp, uv, 0.0).r * u.color.a;
     return vec4<f32>(stroke_rgb(uv) * cov, cov);

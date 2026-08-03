@@ -55,7 +55,9 @@ Umber uses a wet-layer scheme instead:
 2. **Composite pass** (`composite.wgsl`) — layer + scratch drawn to the surface
    under the camera transform, one fullscreen triangle.
 3. **Commit** (`commit.wgsl`) — at pointer-up the scratch bakes into the layer
-   once, over the stroke's damaged rect only, then the scratch is cleared.
+   once, over the stroke's damaged rect only, then the scratch is cleared. That
+   is the Normal path, which is every stroke there has ever been; a brush
+   carrying a blend mode takes a different route, below.
 
 Invariants that are easy to break:
 
@@ -92,6 +94,50 @@ Invariants that are easy to break:
   (per-dab colour, build-up), built by one loop over one descriptor rather than
   four copies of it. `DabStyle` carries both and must be the same for every
   frame of a stroke.
+- **A brush carries its own blend mode, and the blend maths lives in one file
+  both passes compile.** `shaders/blend.wgsl` is `concat!`ed in front of
+  `composite.wgsl` and `commit.wgsl`, so the rule that those two must implement
+  identical blending maths is *structural* rather than a discipline — two
+  hand-written copies of Multiply is exactly the drift that makes a stroke jump
+  at pointer-up. One consequence to know before reading a shader error: naga
+  counts lines from the start of the concatenated text, so a line number it
+  reports against either file is shifted by the length of `blend.wgsl`.
+  `docs/brushes.md` has the whole argument; the rules:
+  - **Normal is untouched and must stay the fast path.** One pass, the
+    fixed-function blender, no copy and no allocation. The preview writes
+    `s + lay * (1 - s.a)` directly rather than routing through the general
+    form, because the two agree exactly where the general form would differ in
+    the last bit of floating point. That line is not a duplicate of Multiply.
+  - **A blended commit needs a *copy* of the layer, and Multiply is why.** No
+    combination of fixed-function blend factors produces `B(Cb, Cs)`, so
+    `fs_blend` computes the whole thing and is drawn with `blend: None`,
+    reading the destination out of a copy — a colour attachment may not also be
+    sampled. Same constraint `flip.wgsl` works around.
+  - **The copy is per damaged piece, never per stroke rectangle.** A backdrop
+    spanning the bounding box is canvas-sized for a *thin diagonal*, which is
+    the 381 MB the tiled undo patch exists to avoid put back on the GPU. A
+    piece is a contiguous run of cells within one row of the damage grid — so a
+    row may hold several — which bounds the backdrop at `canvas width × 64`.
+    The cost is a render pass per piece, because a copy cannot be recorded
+    inside a pass. That is fine on the desktop and is the thing to revisit on a
+    tile-based renderer; `commit_blended`'s docs name the atlas that would fix
+    it and why it is not worth building yet.
+  - **An eraser and a stroke on a mask both ignore the mode**, and both are
+    refused the blended path at the *same* gate. An eraser deposits no colour;
+    a mask slice holds coverage read on one channel where `fs_blend` writes
+    four. Guarding one and not the other is the asymmetry that gets forgotten —
+    `a_stroke_on_a_mask_ignores_the_blend_mode_it_is_carrying` and
+    `an_erasing_brush_ignores_the_blend_mode_it_is_carrying` are the pair, and
+    the first paints grey on grey deliberately, because a mask is read on `.r`
+    and black on white is the one pair Multiply cannot be told from Normal by.
+  - **The brush row's preview does not show the mode**, and that is decided
+    rather than overlooked — a row has no picture underneath it to blend with,
+    and faking one would be a fourth CPU copy of the maths. It is the one
+    setting `preview_dabs` does not distinguish; see `widgets.rs`.
+  - **It did not move `umber-version`.** A `Brush` never enters an ORA file —
+    `docformat` writes `composite-op` and `umber-blend` by hand from the
+    *layer* — so this changes no document byte. `brushes.ron` carries it behind
+    the `#[serde(default)]` already on `Brush`.
 - **Grain multiplies coverage and is anchored to the *document*.**
   `mix(1.0, tile, strength)`, so a strength of zero is the exact identity — a
   brush with no paper pays one multiply by one and no branch. Document-anchored

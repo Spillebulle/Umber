@@ -87,6 +87,12 @@ const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 ///
 /// `concat!` rather than a runtime `format!`: this is a `&'static str` compiled
 /// into the binary exactly as a lone `include_str!` was.
+///
+/// **A shader error's line number is not the file's.** naga sees one text, so
+/// it counts from the first line of `blend.wgsl` and everything it reports
+/// against `composite.wgsl` or `commit.wgsl` is shifted by that file's length.
+/// Subtract it before going to look, or the line named will be plausible and
+/// wrong — which is worse than one that is obviously out of range.
 const BLEND_PRELUDE_COMPOSITE: &str = concat!(
     include_str!("../shaders/blend.wgsl"),
     include_str!("../shaders/composite.wgsl"),
@@ -2695,10 +2701,12 @@ impl CanvasRenderer {
     /// for a stroke drawn across the picture, and — much worse — it would be
     /// canvas-sized for a *thin diagonal* too, since that stroke's bounding box
     /// is the whole document. That is the 381 MB the tiled undo patch exists to
-    /// avoid, put back on the GPU. A `TileMask` piece is one row of the
-    /// 64-pixel damage grid, so the copy is bounded by `canvas width × 64`
-    /// however long the stroke is, and the texture is sized to the largest
-    /// single piece.
+    /// avoid, put back on the GPU. A `TileMask` piece is a contiguous *run* of
+    /// cells within one row of the 64-pixel damage grid — `push_run` emits one
+    /// per run, so a row may hold several — and each is therefore never taller
+    /// than a cell nor wider than the stroke's own rectangle. That is what
+    /// bounds the copy at `canvas width × 64` however long the stroke is; the
+    /// texture is sized to the largest single piece.
     ///
     /// A caller that hands over the bounding rectangle as one piece gets a
     /// backdrop the size of it, and that is the honest bound rather than a
@@ -2707,10 +2715,25 @@ impl CanvasRenderer {
     /// already paying for on the CPU.
     ///
     /// The cost is a render pass per piece rather than one pass with a scissor
-    /// per piece, because a copy cannot be recorded inside a pass. That is a
-    /// hundred and fifty passes for the worst stroke on the largest canvas,
-    /// once, at pointer-up, on a path that already does a blocking readback for
-    /// the undo patch — and only for a brush that asked for a blend mode.
+    /// per piece, because a copy cannot be recorded inside a pass. Since a piece
+    /// is a run rather than a row, that count follows how much the stroke
+    /// zig-zags and not only how long it is — a hundred and fifty passes for a
+    /// thin diagonal across the largest canvas, and several times that for a
+    /// stroke that crosses its own row repeatedly. Once, at pointer-up, on a
+    /// path that already does a blocking readback for the undo patch, and only
+    /// for a brush that asked for a blend mode.
+    ///
+    /// That argument forbids *interleaving* copies and passes; it does not
+    /// forbid recording every copy first and then drawing one pass. Copying the
+    /// pieces into a single atlas and drawing them under the scissor and dynamic
+    /// offset that already exist would be one pass, and is the change to make if
+    /// this ever needs to be cheaper — batched to a byte budget, because the
+    /// total piece area is 6.8 MB for that diagonal and 381 MB for a wash that
+    /// covers the canvas. It is not worth it on the desktop, where the scissor
+    /// makes an extra pass nearly free. It would matter on a tile-based
+    /// renderer, where wgpu's render area is the whole attachment and each pass
+    /// loads and stores every tile of the slice — which is Android and iOS, and
+    /// neither has ever been built.
     ///
     /// Everything allocated here is dropped when the commit returns. A stroke
     /// is not often enough to be worth caching, and caching would mean holding

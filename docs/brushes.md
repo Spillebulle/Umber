@@ -1029,11 +1029,26 @@ by the same function.
   works around, for the same reason.
 - **The copy is per damaged piece.** A backdrop spanning the stroke's bounding
   rectangle would be canvas-sized for a thin diagonal — the 381 MB the tiled
-  undo patch exists to avoid, put back on the GPU. A piece is one row of the
-  64-pixel damage grid, so the copy is bounded by `canvas width × 64` however
-  long the stroke is. The cost is a render pass per piece, since a copy cannot
-  be recorded inside one; that is once, at pointer-up, on a path that already
-  blocks on a readback for the undo patch.
+  undo patch exists to avoid, put back on the GPU. A piece is a contiguous *run*
+  of cells within one row of the 64-pixel damage grid, so a row may hold several
+  and the count follows how much the stroke zig-zags rather than only how long
+  it is; what is bounded is the backdrop, at `canvas width × 64`, because a
+  piece is never taller than a cell nor wider than the stroke's own rectangle.
+  The cost is a render pass per piece, since a copy cannot be recorded inside
+  one; that is once, at pointer-up, on a path that already blocks on a readback
+  for the undo patch.
+- **A pass per piece is the part to revisit first if this ever needs to be
+  cheaper**, and the argument that produced it only forbids *interleaving*
+  copies and passes — not recording every copy first and then drawing one pass.
+  Copying the pieces into a single atlas and drawing them under the per-piece
+  scissor and dynamic offset that already exist would be one pass, at the cost
+  of holding the total piece area at once (6.8 MB for the thin diagonal above,
+  but 381 MB for a wash that genuinely covers the canvas — so it would have to
+  batch to a byte budget rather than assume one atlas fits). Nothing on the
+  desktop needs it: the scissor makes an extra pass nearly free on an immediate
+  mode GPU. A tile-based renderer is where it would bite, because wgpu's render
+  area is the whole attachment and each pass would load and store every tile of
+  the slice — which is Android and iOS, and neither has ever been built.
 - **Normal is untouched.** One pass, the fixed-function blender, no copy and no
   allocation — and the preview writes `s + lay * (1 - s.a)` directly rather than
   routing through the general form, because those two agree exactly where the
