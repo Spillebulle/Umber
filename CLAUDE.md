@@ -530,6 +530,22 @@ are the contiguous run immediately below it whose `depth` is greater.
   pointer's horizontal position picks the nesting, one level per
   `metrics::LAYER_INDENT`, capped by what the target row can hold. A refused
   drop lights nothing up rather than falling back to a depth nobody asked for.
+- **Past either end of the list is the top level, whatever `x` says.** A level
+  is twelve pixels, so "beside the folder rather than in it" was a twelve-pixel
+  target in the middle of a gesture — and in a stack whose every row is inside a
+  folder it is the *only* way back out, which makes it the only way to a second
+  top-level folder. Past the ends there is nothing to be inside of, so the
+  answer is unambiguous and the target is the whole panel. Only *past* an end,
+  never the end row itself, or a folder that happened to be topmost could not be
+  dropped into. The model already permitted every one of these moves —
+  `a_stack_entirely_inside_one_folder_can_still_reach_the_top_level` — so this
+  was reachability alone, which is exactly the kind of bug the mark below hides.
+- **The drop mark is a dashed outline stepped in to the depth it would land
+  at**, not the selected row's own fill. Borrowing that fill made "the layer
+  lands here" and "this row is selected" the same mark, and it could not say the
+  one thing a drop with folders in the stack has to say — inside, or beside. It
+  is `panels::drop_slot`, dashed in the accent, which is how this interface
+  already spells "a place something is going" on the dock.
 - **A folder's row draws a folder mark, not a thumbnail.** The honest thumbnail
   is the composite of its contents and is a third mode for `thumbnail.wgsl`; one
   arbitrary child would be a picture that lies about what the group holds.

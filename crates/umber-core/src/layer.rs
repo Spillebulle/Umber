@@ -2610,4 +2610,61 @@ mod tests {
         );
         assert_eq!(s.subtree(3), 0..4, "all three are inside now");
     }
+
+    /// A stack whose every entry is inside one folder can still be got back out
+    /// at either end, and a second top-level folder made out of what came out.
+    ///
+    /// This is the model half of `layerdrag`'s "past either end of the list is
+    /// the top level". The gesture was unreachable in practice — a step of
+    /// nesting is twelve pixels — but the moves themselves have to be legal, or
+    /// the drag would light nothing up and the way out would still not exist.
+    #[test]
+    fn a_stack_entirely_inside_one_folder_can_still_reach_the_top_level() {
+        let mut s = grouped();
+        assert!(s.reorder_to(0, 0, 1), "everything into the one group");
+        assert_eq!(s.subtree(3), 0..4);
+
+        // Out at the bottom: the position it already holds, at the top level.
+        assert!(s.reorder_to(0, 0, 0));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 2".into(), 1, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+            ],
+            "the bottom layer is beside the group, not in it"
+        );
+
+        // And out at the top: the folder's own row, at the top level, which
+        // puts it above the folder rather than inside it.
+        assert!(s.reorder_to(1, 3, 0));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 0, false),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+                ("Layer 2".into(), 0, false),
+            ]
+        );
+
+        // Two top-level layers now, and grouping one of them is the second
+        // top-level folder the whole gesture exists to make possible.
+        assert_eq!(s.group(&[0]), Some(1));
+        assert_eq!(
+            shape_of(&s),
+            vec![
+                ("Layer 1".into(), 1, false),
+                ("Group 2".into(), 0, true),
+                ("Layer 3".into(), 1, false),
+                ("Group 1".into(), 0, true),
+                ("Layer 2".into(), 0, false),
+            ],
+            "two folders, neither inside the other"
+        );
+        assert_eq!(s.subtree(1), 0..2);
+        assert_eq!(s.subtree(3), 2..4);
+    }
 }

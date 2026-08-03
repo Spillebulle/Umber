@@ -1435,7 +1435,6 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         {
             continue;
         }
-        let target = aimed.map(|a| a.index) == Some(index);
         // Through a scope, purely to learn where the row landed: `layer_row`
         // reports what was clicked and not what it occupied, and a rect guessed
         // from the row height would be a second statement of a number
@@ -1454,11 +1453,11 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     folder: layer.is_folder(),
                     collapsed: layer.collapsed,
                     hidden_by_folder: layer.visible && !ed.layers.effective_visible(index),
-                    // The drop target borrows the selected row's own fill, so
-                    // the mark is part of the row. The outline below is what
-                    // keeps "the layer lands here" from reading as "this row is
-                    // selected".
-                    active: index == active || target,
+                    // Only the selected row. The drop target used to borrow this
+                    // fill as well, which made "the layer lands here" and "this
+                    // row is selected" the same mark and had no way at all of
+                    // saying *at what nesting* it lands — see `drop_slot`.
+                    active: index == active,
                     blend: layer.blend.label(),
                     has_mask: layer.has_mask(),
                     // The edit target is per document, so only the selected row
@@ -1473,13 +1472,8 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             )
         });
         let (row, rect) = (placed.inner, placed.response.rect);
-        if target {
-            ui.painter().rect_stroke(
-                rect,
-                metrics::RADIUS,
-                Stroke::new(1.0, p.accent),
-                StrokeKind::Inside,
-            );
+        if let Some(aim) = aimed.filter(|a| a.index == index) {
+            drop_slot(ui.painter(), p, rect, aim.depth);
         }
         if watching {
             rows.push(layerdrag::Row {
@@ -1625,6 +1619,27 @@ fn layer_drag_id() -> Id {
 /// the destination — the list says where the layer lands by lighting the row up
 /// under the pointer, where the collection rail is a list of names the pointer
 /// may be nowhere near.
+/// Where a dragged layer would land: a dashed outline over the row it would
+/// take, stepped in to the *nesting* it would take.
+///
+/// The step is the whole point. A drop says two things once folders exist —
+/// where in the order, and inside what — and the second is the pointer's
+/// horizontal position, one level per `LAYER_INDENT`. That is twelve pixels,
+/// invisible, and it decides whether a layer lands in a group or beside it; the
+/// mark that stood here before was the selected row's own fill, which could not
+/// say either. An outline that starts where the row will start says it without
+/// a word, and it is the same dashed accent the dock's "dock here" indicator
+/// uses, for the same reason: dashed is how this interface spells "not a real
+/// piece of chrome, a place something is going".
+fn drop_slot(painter: &egui::Painter, p: &Palette, row: Rect, depth: u8) {
+    let slot = Rect::from_min_max(
+        row.left_top() + vec2(depth as f32 * metrics::LAYER_INDENT, 0.0),
+        row.right_bottom(),
+    );
+    painter.rect_filled(slot, metrics::RADIUS, p.accent.gamma_multiply(0.09));
+    dashed_rect(painter, slot, metrics::RADIUS, Stroke::new(2.0, p.accent));
+}
+
 fn drag_ghost(ctx: &egui::Context, p: &Palette, drag: &layerdrag::Drag) {
     let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) else {
         return;
@@ -2395,5 +2410,79 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 3 shots to {}", dir.display());
+    }
+
+    /// The mark a drag puts on the list, at each nesting it can land at.
+    ///
+    /// The same reason the shot above is written rather than asserted, and one
+    /// more of its own: what a drop *means* is a twelve-pixel horizontal
+    /// difference, so the only question worth asking about the mark is whether
+    /// somebody can see which of the two it is.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app layer_drop_mark_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn layer_drop_mark_preview() {
+        use crate::dock::{Layout, PanelKind};
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::layerdrag::{Aim, Drag};
+        use crate::theme::{Palette, metrics};
+        use egui::{Pos2, Rect, vec2};
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/layers-panel");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // Three layers with the top two grouped, so the list has a folder, its
+        // contents, and a layer outside it to be dragged about.
+        //
+        //   3  Group 1    depth 0   folder
+        //   2    Layer 3  depth 1
+        //   1    Layer 2  depth 1
+        //   0  Layer 1    depth 0
+        for (name, aim) in [
+            ("4-drop-inside", Aim { index: 3, depth: 1 }),
+            ("5-drop-beside", Aim { index: 3, depth: 0 }),
+            ("6-drop-bottom", Aim { index: 0, depth: 0 }),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = Layout::default();
+            ed.layers.add();
+            ed.layers.add();
+            ed.layers.group(&[1, 2]);
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(metrics::PANEL, 300.0);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                // Re-seeded every frame: the list discards a drag that no
+                // pointer is holding, which is exactly right in the application
+                // and leaves nothing to photograph here.
+                root.ctx().data_mut(|d| {
+                    d.insert_temp(
+                        super::layer_drag_id(),
+                        Drag::aiming_for_test(0, "Layer 1", aim),
+                    );
+                });
+                let mut actions = crate::ui::UiActions::default();
+                super::panel(
+                    root,
+                    &palette,
+                    &mut ed,
+                    &mut actions,
+                    PanelKind::Layers,
+                    rect,
+                );
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 3 drop marks to {}", dir.display());
     }
 }

@@ -37,6 +37,12 @@
 //!   This does not fight the rule above it. Sideways-out is decided by
 //!   containment first, and the rows span the panel — so the leftmost step of
 //!   the list means "top level" and leaving the list entirely still means "no".
+//! - **Past either end of the list is the top level**, whatever the horizontal
+//!   position says. A step of nesting is twelve pixels, so "beside the folder"
+//!   is otherwise a twelve-pixel target, and in a stack whose every row is
+//!   inside a folder it is the *only* way back out — which is how a second
+//!   top-level folder is made. Past the ends there is nothing to be inside of,
+//!   so the answer is unambiguous and the gesture is a large one.
 //!
 //! Whether a drop is *legal* is not decided here. `LayerStack` owns that — a
 //! drop that would nest too deep, or put a folder inside itself, is refused by
@@ -138,6 +144,23 @@ impl Drag {
     pub fn destination(&self) -> Option<Aim> {
         self.to
     }
+
+    /// A drag already aiming somewhere, for a test that has to draw one.
+    ///
+    /// The panel's preview shots need a drag in flight without a pointer to
+    /// make one, and [`Drag::aim`] wants the rows — which only exist once the
+    /// list has been drawn. Deliberately not a general constructor: outside a
+    /// test the only thing that may set a destination is `aim`, or the mark on
+    /// the list could name somewhere the model was never asked about. Same rule
+    /// as `Session::for_test`. Never compiled into the application.
+    #[cfg(test)]
+    pub fn aiming_for_test(from: usize, name: impl Into<String>, to: Aim) -> Self {
+        Self {
+            from,
+            name: name.into(),
+            to: Some(to),
+        }
+    }
 }
 
 /// The row under `pointer` and the nesting its horizontal position asks for.
@@ -147,6 +170,25 @@ impl Drag {
 pub fn aim_at(rows: &[Row], pointer: Pos2, indent: f32) -> Option<Aim> {
     let index = row_at(rows, pointer)?;
     let row = rows.iter().find(|r| r.index == index)?;
+    // **Past either end of the list is the top level, whatever `x` says.**
+    //
+    // Inside the list the horizontal position is the nesting, and one level is
+    // `LAYER_INDENT` — twelve pixels. That makes "beside the folder rather than
+    // in it" a twelve-pixel target somewhere in the middle of a gesture, which
+    // is a rule nobody can be expected to hit and, where every row of the list
+    // is inside a folder, the only way of getting anything back out to the top
+    // level at all. There has to be one gesture that means "out here, beside
+    // everything", and past the ends of the list is where there is nothing to
+    // be inside of and plenty of panel to let go over. It is also how a second
+    // top-level folder gets made: drag one past the end and it is a sibling.
+    //
+    // Only *past* an end, never the end row itself, so dropping onto the top
+    // row still nests exactly as dropping onto any other row does.
+    if let Some(span) = span_of(rows)
+        && (pointer.y < span.top() || pointer.y > span.bottom())
+    {
+        return Some(Aim { index, depth: 0 });
+    }
     // One level per step of the indent, from the left edge of the list — the
     // same measurement the rows were drawn by.
     let steps = ((pointer.x - row.rect.left()) / indent.max(1.0)).floor();
@@ -191,10 +233,7 @@ pub fn row_at(rows: &[Row], pointer: Pos2) -> Option<usize> {
     if let Some(index) = row_pressed(rows, pointer) {
         return Some(index);
     }
-    let span = rows.iter().fold(None::<Rect>, |acc, row| match acc {
-        Some(rect) => Some(rect.union(row.rect)),
-        None => Some(row.rect),
-    })?;
+    let span = span_of(rows)?;
     if pointer.x < span.left() || pointer.x > span.right() {
         return None;
     }
@@ -205,6 +244,17 @@ pub fn row_at(rows: &[Row], pointer: Pos2) -> Option<usize> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|row| row.index)
+}
+
+/// The rectangle every row together occupies, or `None` for an empty list.
+///
+/// Shared by the sideways-out test and the past-the-ends one so the two cannot
+/// disagree about where the list stops.
+fn span_of(rows: &[Row]) -> Option<Rect> {
+    rows.iter().fold(None::<Rect>, |acc, row| match acc {
+        Some(rect) => Some(rect.union(row.rect)),
+        None => Some(row.rect),
+    })
 }
 
 /// How far `y` is outside a row's own vertical extent. Zero inside it.
@@ -463,6 +513,34 @@ mod tests {
             at(2, 0),
             "over a nested row but hard left: beside the folder, not in it"
         );
+    }
+
+    /// The way out of a folder, and the way to a second top-level folder: drag
+    /// past either end of the list and the nesting is nothing, however far
+    /// right the pointer happens to be.
+    #[test]
+    fn past_either_end_of_the_list_is_the_top_level() {
+        let rows = nested();
+        // Well past the right-hand edge of the indent steps, which inside the
+        // list would be as deep as the row could take.
+        assert_eq!(
+            aim_at(&rows, pos2(240.0, 20.0), INDENT),
+            at(3, 0),
+            "above the list, over a folder that would otherwise have taken it in"
+        );
+        assert_eq!(
+            aim_at(&rows, pos2(240.0, 600.0), INDENT),
+            at(0, 0),
+            "below the list"
+        );
+    }
+
+    /// And only *past* an end. The top row is still an ordinary target, or
+    /// dropping into a folder that happens to be topmost would be impossible.
+    #[test]
+    fn the_end_rows_themselves_still_nest() {
+        let rows = nested();
+        assert_eq!(aim_at(&rows, pos2(240.0, 115.0), INDENT), at(3, 1));
     }
 
     /// The predicate is the model's answer, and a refusal has to clear the
