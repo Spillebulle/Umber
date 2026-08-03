@@ -2606,11 +2606,18 @@ impl CanvasRenderer {
             return;
         };
 
-        // An eraser has no colour, so it has nothing to blend; `blend` is
-        // ignored rather than refused, which is the same reading
-        // `umber_core::Brush::blend_applies` gives and the reason the editor
-        // never sends one here in the first place.
-        if style.mode == BrushMode::Paint && style.blend != BlendMode::Normal {
+        // Two strokes carry no blend, and both are *ignored* rather than
+        // refused — the same reading `umber_core::Brush::blend_applies` gives,
+        // and the editor never sends one here in either case.
+        //
+        // An eraser has no colour, so it has nothing to blend with what is
+        // under it. A stroke on a mask has no colour either: the slice holds
+        // coverage on one channel, and `fs_blend` writes four, so a blended
+        // commit onto one would put colour into a mask. Guarding only the
+        // eraser is the asymmetry that gets forgotten — a caller reaching
+        // `commit_stroke` directly is all that stands between the two.
+        let blends = style.mode == BrushMode::Paint && !style.on_mask;
+        if blends && style.blend != BlendMode::Normal {
             self.commit_blended(device, encoder, slot, pieces, style);
             self.clear_stroke(encoder);
             self.touch_slot(slot);
@@ -2752,8 +2759,14 @@ impl CanvasRenderer {
         // One uniform block per piece, because the vertex shader spans the
         // piece rather than the whole rectangle: the backdrop copy sits at the
         // texture's origin, so `rect_min` is what maps a fragment into it.
-        let stride = (device.limits().min_uniform_buffer_offset_alignment as usize)
-            .max(std::mem::size_of::<CommitUniforms>());
+        // Rounded *up to* the alignment rather than `max`ed with it: a dynamic
+        // offset must itself be a multiple of the alignment, and a `max` only
+        // happens to give one while the block is smaller than 256 bytes. Grow
+        // `CommitUniforms` past that and every piece after the first would take
+        // an unaligned offset — a validation error on a canvas with two damaged
+        // pieces and on no other, which is not the first thing anybody tests.
+        let stride = std::mem::size_of::<CommitUniforms>()
+            .next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as usize);
         let color = style.color;
         let mut blocks = vec![0u8; stride * live.len()];
         for (i, piece) in live.iter().enumerate() {

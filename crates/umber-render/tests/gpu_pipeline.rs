@@ -1023,6 +1023,123 @@ fn a_blended_stroke_previews_exactly_as_it_commits() {
     }
 }
 
+/// The same, for a *smudging* stroke — the one that reads its colour per dab.
+///
+/// The maths is shared, so this is not in doubt; the wiring is, and this is the
+/// half of it the test above cannot reach. `per_dab_color` picks a different
+/// dab pipeline writing a second attachment, and it picks a different *branch*
+/// in both `composite.wgsl` and `commit.wgsl` for where the stroke's colour
+/// comes from. A blended commit that read the flat palette colour where the
+/// preview read the scratch would agree on every test above and disagree here,
+/// and the artist would see a smear jump to the palette colour at pointer-up.
+#[test]
+fn a_blended_smudging_stroke_previews_exactly_as_it_commits() {
+    let mut h = harness_or_skip!();
+
+    let under = [70u8, 160, 110, 255];
+    // Deliberately not the palette colour below, so a commit reading the wrong
+    // one of the two is a visible difference rather than a coincidence.
+    let picked = [0.85f32, 0.25, 0.55];
+    let palette = Color::from_srgb_u8(20, 20, 240, 255);
+
+    for blend in BRUSH_BLENDS {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.stamp_colored(&[coloured_dab(32.0, 32.0, 16.0, 1.0, picked)], true);
+
+        let stack = [layer(0, 1.0, BlendMode::Normal)];
+        let style = StrokeStyle {
+            color: palette,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            blend,
+            per_dab_color: true,
+            on_mask: false,
+        };
+        let previewed = h.composite_pixel_with(&stack, style, 32, 32);
+        h.commit_blended_to(0, palette, 1.0, BrushMode::Paint, blend);
+        let committed = h.composite_pixel(&stack, 32, 32);
+
+        assert_near(
+            committed,
+            [previewed[0], previewed[1], previewed[2]],
+            2,
+            &format!("{blend:?} jumped at pointer-up on a smudging stroke"),
+        );
+    }
+}
+
+/// A stroke on a mask ignores the blend mode it is carrying, exactly as an
+/// eraser does.
+///
+/// A mask slice holds coverage on one channel and `fs_blend` writes four, so a
+/// blended commit onto a mask would put colour into it. `commit_stroke` refuses
+/// the blended path for `on_mask` for that reason — the editor never sends one,
+/// but this is the renderer's own guard rather than a promise about its caller,
+/// and defending the eraser and not this was the asymmetry that would be
+/// forgotten first.
+#[test]
+fn a_stroke_on_a_mask_ignores_the_blend_mode_it_is_carrying() {
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 4);
+
+    // Grey on grey, deliberately, and this is the whole of what makes the test
+    // able to fail. A mask is read on `.r`, so black paint on a white mask is
+    // the one pair Multiply cannot tell from Normal — `0 × 1` and `0` are the
+    // same number, and the assertion would hold with the guard taken out. Half
+    // way up the channel it does not: `0.216 × 0.216` is nowhere near `0.216`.
+    let ink = Color::from_srgb_u8(128, 128, 128, 255);
+    let ground = [128u8, 128, 128, 255];
+
+    let rect = whole(&h);
+    let style = |blend, on_mask| StrokeStyle {
+        color: ink,
+        opacity: 1.0,
+        mode: BrushMode::Paint,
+        blend,
+        per_dab_color: false,
+        on_mask,
+    };
+
+    let commit = |h: &mut Harness, slot: u32, blend, on_mask| {
+        fill_slot(h, slot, ground);
+        h.stamp(&[dab(32.0, 32.0, 14.0, 1.0)]);
+        let mut enc = h.encoder();
+        h.canvas.commit_stroke(
+            &h.gpu.device,
+            &h.gpu.queue,
+            &mut enc,
+            slot,
+            rect,
+            &[rect],
+            style(blend, on_mask),
+        );
+        h.gpu.queue.submit(Some(enc.finish()));
+    };
+
+    // The two masks differ only in the blend mode the style carries.
+    commit(&mut h, 1, BlendMode::Normal, true);
+    commit(&mut h, 3, BlendMode::Multiply, true);
+    // And the same pair on an ordinary layer, which is what says these colours
+    // genuinely distinguish the two modes. Without this the assertion above
+    // would be satisfied by a Multiply that did nothing.
+    commit(&mut h, 0, BlendMode::Normal, false);
+    commit(&mut h, 2, BlendMode::Multiply, false);
+
+    assert_ne!(
+        h.pixel_in(0, 32, 32),
+        h.pixel_in(2, 32, 32),
+        "these colours cannot tell Multiply from Normal, so the mask assertion \
+         below proves nothing — pick different ones"
+    );
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        h.pixel_in(3, 32, 32),
+        "a blend mode changed what a stroke on a mask did"
+    );
+}
+
 /// The same, for a stroke that is only half opaque.
 ///
 /// Stroke opacity is applied exactly once, at commit — the invariant the wet
