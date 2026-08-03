@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::curve::ResponseCurve;
 use crate::dynamics::{DabInput, DabTarget, Modulations};
+use crate::layer::BlendMode;
 
 /// What a stroke does to the layer underneath it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,27 @@ pub struct Brush {
     /// Input smoothing, `0.0` (raw) to just under `1.0` (very heavy).
     pub stabilization: f32,
     pub mode: BrushMode,
+    /// How the finished stroke combines with the layer it lands on.
+    ///
+    /// The same [`BlendMode`] a layer carries, deliberately: it is evaluated by
+    /// the same shared WGSL function, so a brush set to Multiply and a layer set
+    /// to Multiply are the same arithmetic on the same linear premultiplied
+    /// numbers. Two enums, or a second implementation of the maths, would
+    /// eventually disagree about one of the five.
+    ///
+    /// It applies at the **composite and commit step**, not in the dab pass.
+    /// The scratch still holds nothing but coverage in `0..1`, so the `max`
+    /// still saturates, opacity is still applied exactly once, and a selection
+    /// still clips by the one multiply it always did — none of the dab pass's
+    /// invariants can be reached from here. What changes is only how the
+    /// finished coverage is combined with what is underneath it, which is a
+    /// question the dab pass cannot answer anyway because it never sees the
+    /// layer.
+    ///
+    /// Meaningless while [`Brush::mode`] is [`BrushMode::Erase`] — an eraser
+    /// removes coverage and deposits no colour for a mode to combine — and
+    /// [`Brush::blend_applies`] is the one place that is decided.
+    pub blend: BlendMode,
     /// How much of each dab's colour is picked up off the canvas rather than
     /// taken from the palette. `0.0` is an ordinary brush; `1.0` deposits only
     /// what it found, which is a pure blender.
@@ -264,6 +286,7 @@ impl Default for Brush {
             min_hardness_ratio: 0.5,
             stabilization: 0.35,
             mode: BrushMode::Paint,
+            blend: BlendMode::Normal,
             smudge: 0.0,
             smudge_length: 0.5,
             smudge_radius: 1.0,
@@ -432,6 +455,36 @@ impl Brush {
             || self.modulations.drives(DabTarget::Scatter)
     }
 
+    /// Whether [`Brush::blend`] means anything for this brush.
+    ///
+    /// It does not for an eraser, and that is not a gap to be filled later. A
+    /// blend mode is a rule for combining a *colour* with what is underneath
+    /// it, and an eraser deposits none: it is a different blend state rather
+    /// than a different shader output — `src_factor: Zero`, so the layer's
+    /// alpha is scaled down — and there is nothing in that for Multiply to be a
+    /// mode of. So the control is not drawn for one, in the same spirit as
+    /// [`Brush::dab_has_angle`] and for the same reason: a live control that
+    /// does nothing is worse than one that is visibly absent.
+    ///
+    /// Read at the editor's one gate as well as by the control, so a brush
+    /// carrying a mode from before it was switched to erasing cannot smuggle
+    /// one into a stroke.
+    pub fn blend_applies(&self) -> bool {
+        self.mode == BrushMode::Paint
+    }
+
+    /// The blend mode this brush would actually paint with.
+    ///
+    /// [`BlendMode::Normal`] wherever [`Brush::blend_applies`] is false, so
+    /// nothing downstream ever has to hold the pair of them in mind at once.
+    pub fn effective_blend(&self) -> BlendMode {
+        if self.blend_applies() {
+            self.blend
+        } else {
+            BlendMode::Normal
+        }
+    }
+
     /// Whether the dab's angle is worth showing the user.
     ///
     /// A circle has no angle, so an Angle slider on a round brush is a control
@@ -563,6 +616,49 @@ mod tests {
             Brush::size_after_drag(1.5, vec2(-5000.0, 5000.0)),
             Brush::MIN_SIZE
         );
+    }
+
+    /// An eraser has no colour to combine with anything, so whatever mode the
+    /// brush is carrying must not reach the stroke. Decided once, here, rather
+    /// than at each of the places that read the field.
+    #[test]
+    fn an_eraser_has_no_blend_mode() {
+        let mut b = Brush {
+            blend: BlendMode::Multiply,
+            ..Default::default()
+        };
+        assert!(b.blend_applies());
+        assert_eq!(b.effective_blend(), BlendMode::Multiply);
+
+        b.mode = BrushMode::Erase;
+        assert!(!b.blend_applies());
+        assert_eq!(b.effective_blend(), BlendMode::Normal);
+        assert_eq!(
+            b.blend,
+            BlendMode::Multiply,
+            "the field is not cleared — switching back to painting restores it"
+        );
+    }
+
+    /// A library written before brushes had a blend mode still loads, and the
+    /// brush it names paints exactly as it did: `#[serde(default)]` on the
+    /// container is what carries that, and this is what stops a later field
+    /// being added without it.
+    #[test]
+    fn a_preset_written_before_blend_modes_still_loads_as_normal() {
+        let b: Brush = ron::from_str("(size: 40.0, hardness: 0.9)").unwrap();
+        assert_eq!(b.size, 40.0);
+        assert_eq!(b.blend, BlendMode::Normal);
+
+        let round: Brush = ron::from_str(
+            &ron::ser::to_string(&Brush {
+                blend: BlendMode::Screen,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round.blend, BlendMode::Screen);
     }
 
     #[test]

@@ -1000,6 +1000,79 @@ grain, or a pressure-opacity ramp. For an ordinary brush per-dab coverage is
 exactly 1.0 and the two rules agree — which is why nothing in the MyPaint pack
 uses it.
 
+## Per-brush blend modes
+
+A layer could multiply, screen, overlay or add onto what was beneath it and a
+brush could not: every stroke was source-over. `Brush::blend` is the same
+`BlendMode` a layer carries — not a second enum beside it — and it is evaluated
+by the same function.
+
+- **The maths lives once, in `shaders/blend.wgsl`.** That file is a prelude
+  concatenated in front of both `composite.wgsl` and `commit.wgsl`, so the
+  preview and the thing that replaces it at pointer-up compile from one
+  statement of what Multiply is. CLAUDE.md's rule that those two must implement
+  identical blending maths used to be a rule two files were disciplined into
+  keeping; now it is a function they both call. Linear light, premultiplied
+  colour, so a brush set to Multiply and a layer set to Multiply mean the same
+  thing.
+- **It belongs to the composite and commit step, not the dab pass.** The dab
+  pass never sees the layer, so it could not evaluate a mode that is a function
+  of what is underneath — and anything put there would touch the scratch, which
+  holds coverage in 0..1 and must go on doing so. The `max` still saturates,
+  `Brush::opacity` is still applied exactly once at commit, and a selection
+  still clips by the one multiply it always did.
+- **The commit needs a copy of the layer, and Multiply is why.** No combination
+  of fixed-function blend factors produces `B(Cb, Cs)`, so a blended commit
+  cannot hand its result to the blender: `fs_blend` computes the whole thing and
+  is drawn with `blend: None`, reading the destination out of a copy because a
+  colour attachment may not also be sampled. The same constraint `flip.wgsl`
+  works around, for the same reason.
+- **The copy is per damaged piece.** A backdrop spanning the stroke's bounding
+  rectangle would be canvas-sized for a thin diagonal — the 381 MB the tiled
+  undo patch exists to avoid, put back on the GPU. A piece is a contiguous *run*
+  of cells within one row of the 64-pixel damage grid, so a row may hold several
+  and the count follows how much the stroke zig-zags rather than only how long
+  it is; what is bounded is the backdrop, at `canvas width × 64`, because a
+  piece is never taller than a cell nor wider than the stroke's own rectangle.
+  The cost is a render pass per piece, since a copy cannot be recorded inside
+  one; that is once, at pointer-up, on a path that already blocks on a readback
+  for the undo patch.
+- **A pass per piece is the part to revisit first if this ever needs to be
+  cheaper**, and the argument that produced it only forbids *interleaving*
+  copies and passes — not recording every copy first and then drawing one pass.
+  Copying the pieces into a single atlas and drawing them under the per-piece
+  scissor and dynamic offset that already exist would be one pass, at the cost
+  of holding the total piece area at once (6.8 MB for the thin diagonal above,
+  but 381 MB for a wash that genuinely covers the canvas — so it would have to
+  batch to a byte budget rather than assume one atlas fits). Nothing on the
+  desktop needs it: the scissor makes an extra pass nearly free on an immediate
+  mode GPU. A tile-based renderer is where it would bite, because wgpu's render
+  area is the whole attachment and each pass would load and store every tile of
+  the slice — which is Android and iOS, and neither has ever been built.
+- **Normal is untouched.** One pass, the fixed-function blender, no copy and no
+  allocation — and the preview writes `s + lay * (1 - s.a)` directly rather than
+  routing through the general form, because those two agree exactly where the
+  general form would differ in the last bit of floating point.
+- **An eraser has none, and the control is not drawn for one.** A blend mode
+  combines a colour with what is under it and an eraser deposits none: it is a
+  different blend state, `src_factor: Zero`, and there is nothing there for
+  Multiply to be a mode of. A stroke on a *mask* has none either — a mask holds
+  coverage on one channel and its preview is a one-channel blend written to
+  match the commit. Both are coerced at `Editor::begin_stroke`, the one gate
+  where the mode and the colour already are.
+- **A brush row does not preview it.** A row is a swatch on a panel with no
+  picture underneath it, so there is nothing for a mode to combine with, and
+  drawing one would be a fourth CPU copy of the blend maths beside the shared
+  WGSL function.
+- **`.myb` has none of this** — MyPaint's `Eraser` setting is the paint/erase
+  switch and nothing else — so the importer invents nothing and reports nothing
+  dropped. Every existing `brushes.ron` still loads: `Brush` carries
+  `#[serde(default)]` on the container, so an omitted field is Normal.
+
+`a_blended_stroke_previews_exactly_as_it_commits` and its partial-opacity twin
+are the guards that matter: they stamp, read the preview, commit, and read
+again, for every mode.
+
 ## Non-square tips
 
 A non-square mask used to be **padded into a square**, because the dab stretched
@@ -1153,13 +1226,6 @@ per pack. See `docs/brush-sources.md`.
   of them to a live value, so nothing in the library is waiting on them; they
   are worth building as painting features in their own right, `lock_alpha`
   especially, rather than as import fidelity.
-- **Per-brush blend modes.** `Brush::mode` is `Paint | Erase`. Widening it to
-  the layer stack's `BlendMode` would mean the commit pass choosing among eight
-  blend states rather than two, the same eight added to the preview half of
-  `composite.wgsl`, and a control in the brush editor — perhaps two days, most
-  of it in keeping the two shaders in step. Nothing in the shipped library needs
-  it, so it is worth doing when a *user* asks rather than to close an import
-  gap.
 - **`custom_input`**, and with it the last third of MyPaint's own mappings. See
   "What a MyPaint `.myb` conversion loses".
 - **Krita's other paint engines** — `spraybrush`, `hairybrush`, `deformbrush`,
@@ -1186,7 +1252,7 @@ a name for the thing:
 | Inputs | the modulation table — target, input, both ends of its range and its curve — plus the stroke ramp and hold |
 | Scatter | scatter, size jitter, angle jitter, speed lead, pressure → scatter |
 | Texture | build-up, paper strength, which paper, tile size |
-| Blending | colour pickup, smear length, pickup radius |
+| Blending | blend mode, colour pickup, smear length, pickup radius |
 
 That is every field of `Brush` except `mode`, which is the tool choice (Brush
 or Eraser) rather than a brush setting, and is on the tool rail.
@@ -1202,8 +1268,9 @@ rather than drawn empty; it has no engine behind it. **Stabiliser** is one
 slider and rides on Tip. Two of the six names are our own, and both were needed
 because the design has no word for the thing:
 
-- **Blending**, for colour pickup. Filing it under "Wet edges" would have
-  borrowed a term that means something else in every application that has it.
+- **Blending**, for colour pickup and the brush's blend mode. Filing it under
+  "Wet edges" would have borrowed a term that means something else in every
+  application that has it.
 - **Inputs**, for the modulation table. It could not go on Dynamics: that
   section is three curves that all answer "what does pressing harder do", and
   this is a *list* of arbitrary length whose rows each pick their own target and

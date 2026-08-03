@@ -86,6 +86,8 @@
 //! statement that the argument is expected to hold and not a check that runs
 //! in a release build.
 
+use serde::{Deserialize, Serialize};
+
 use crate::color::Color;
 
 /// What a stroke on the active layer lands in.
@@ -106,8 +108,15 @@ pub enum EditTarget {
 ///
 /// The numeric values are consumed directly by `composite.wgsl`; keep them in
 /// step with the `switch` in `blend_rgb`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Serialised because a *brush* carries one too — see [`crate::Brush::blend`] —
+/// and a brush is what a preset file holds. Deliberately the same enum rather
+/// than a second one beside it: the arithmetic is one shared WGSL function, so
+/// a layer set to Multiply and a brush set to Multiply mean the same thing, and
+/// two enums would eventually stop agreeing about which modes exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlendMode {
+    #[default]
     Normal = 0,
     Multiply = 1,
     Screen = 2,

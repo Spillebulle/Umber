@@ -142,6 +142,22 @@ impl Harness {
     }
 
     fn commit_to(&mut self, slot: u32, color: Color, opacity: f32, mode: BrushMode) {
+        self.commit_blended_to(slot, color, opacity, mode, BlendMode::Normal);
+    }
+
+    /// The same commit with the brush carrying a blend mode.
+    ///
+    /// Separate from [`Harness::commit_to`] rather than an argument on it,
+    /// because Normal is the path every other test in this file exercises and
+    /// it must stay the one that is exercised by default.
+    fn commit_blended_to(
+        &mut self,
+        slot: u32,
+        color: Color,
+        opacity: f32,
+        mode: BrushMode,
+        blend: BlendMode,
+    ) {
         // The canvas's own size rather than `DOC`, so a test that has resized
         // still commits the whole scratch rather than its top-left corner.
         let size = self.canvas.doc_size();
@@ -153,6 +169,7 @@ impl Harness {
         };
         let mut enc = self.encoder();
         self.canvas.commit_stroke(
+            &self.gpu.device,
             &self.gpu.queue,
             &mut enc,
             slot,
@@ -162,6 +179,7 @@ impl Harness {
                 color,
                 opacity,
                 mode,
+                blend,
                 per_dab_color: self.per_dab_color,
                 on_mask: false,
             },
@@ -922,6 +940,411 @@ fn a_dark_colour_survives_the_round_trip_to_the_layer() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-brush blend modes
+// ---------------------------------------------------------------------------
+
+/// Every mode a brush can carry that is not the plain source-over every stroke
+/// used to be. Normal is deliberately not here: it stays on the fixed-function
+/// path and is what the rest of this file exercises.
+const BRUSH_BLENDS: [BlendMode; 4] = [
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Overlay,
+    BlendMode::Add,
+];
+
+/// The whole document as a rectangle.
+fn whole(h: &Harness) -> PixelRect {
+    let size = h.canvas.doc_size();
+    PixelRect {
+        x: 0,
+        y: 0,
+        width: size.x,
+        height: size.y,
+    }
+}
+
+/// Back to an empty canvas and an empty scratch, between one mode and the next.
+fn reset(h: &mut Harness) {
+    let mut enc = h.encoder();
+    h.canvas.clear_all_layers(&mut enc);
+    h.canvas.clear_stroke(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+}
+
+/// **The test this whole feature hangs on.**
+///
+/// `composite.wgsl` draws the stroke as a live preview and `commit.wgsl`
+/// replaces it at pointer-up. CLAUDE.md's rule is that the two must implement
+/// identical blending maths, because any difference between them is a mark that
+/// visibly jumps under the artist's hand at the moment they lift the pen. They
+/// now share one `composite_over` out of `blend.wgsl`, which makes the *maths*
+/// structurally the same; this is what says the wiring around it — the uniform,
+/// the backdrop copy, which entry point is drawn — agrees as well.
+///
+/// Compared at the middle of a solid dab over an opaque layer, so coverage is
+/// exactly 1 and the colour is not a nearly transparent pixel's. The tolerance
+/// is what eight bits of sRGB storage can round by: the preview never leaves
+/// float, the commit goes through the layer.
+#[test]
+fn a_blended_stroke_previews_exactly_as_it_commits() {
+    let mut h = harness_or_skip!();
+
+    // Something with colour underneath, or Multiply and Screen would be reading
+    // bare canvas and every mode would agree by accident.
+    let under = [90u8, 140, 200, 255];
+    let ink = Color::from_srgb_u8(230, 120, 40, 255);
+
+    for blend in BRUSH_BLENDS {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.stamp(&[dab(32.0, 32.0, 16.0, 1.0)]);
+
+        let stack = [layer(0, 1.0, BlendMode::Normal)];
+        let style = StrokeStyle {
+            color: ink,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            blend,
+            per_dab_color: false,
+            on_mask: false,
+        };
+        let previewed = h.composite_pixel_with(&stack, style, 32, 32);
+        h.commit_blended_to(0, ink, 1.0, BrushMode::Paint, blend);
+        let committed = h.composite_pixel(&stack, 32, 32);
+
+        assert_near(
+            committed,
+            [previewed[0], previewed[1], previewed[2]],
+            2,
+            &format!("{blend:?} jumped at pointer-up"),
+        );
+    }
+}
+
+/// The same, for a *smudging* stroke — the one that reads its colour per dab.
+///
+/// The maths is shared, so this is not in doubt; the wiring is, and this is the
+/// half of it the test above cannot reach. `per_dab_color` picks a different
+/// dab pipeline writing a second attachment, and it picks a different *branch*
+/// in both `composite.wgsl` and `commit.wgsl` for where the stroke's colour
+/// comes from. A blended commit that read the flat palette colour where the
+/// preview read the scratch would agree on every test above and disagree here,
+/// and the artist would see a smear jump to the palette colour at pointer-up.
+#[test]
+fn a_blended_smudging_stroke_previews_exactly_as_it_commits() {
+    let mut h = harness_or_skip!();
+
+    let under = [70u8, 160, 110, 255];
+    // Deliberately not the palette colour below, so a commit reading the wrong
+    // one of the two is a visible difference rather than a coincidence.
+    let picked = [0.85f32, 0.25, 0.55];
+    let palette = Color::from_srgb_u8(20, 20, 240, 255);
+
+    for blend in BRUSH_BLENDS {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.stamp_colored(&[coloured_dab(32.0, 32.0, 16.0, 1.0, picked)], true);
+
+        let stack = [layer(0, 1.0, BlendMode::Normal)];
+        let style = StrokeStyle {
+            color: palette,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            blend,
+            per_dab_color: true,
+            on_mask: false,
+        };
+        let previewed = h.composite_pixel_with(&stack, style, 32, 32);
+        h.commit_blended_to(0, palette, 1.0, BrushMode::Paint, blend);
+        let committed = h.composite_pixel(&stack, 32, 32);
+
+        assert_near(
+            committed,
+            [previewed[0], previewed[1], previewed[2]],
+            2,
+            &format!("{blend:?} jumped at pointer-up on a smudging stroke"),
+        );
+    }
+}
+
+/// A stroke on a mask ignores the blend mode it is carrying, exactly as an
+/// eraser does.
+///
+/// A mask slice holds coverage on one channel and `fs_blend` writes four, so a
+/// blended commit onto a mask would put colour into it. `commit_stroke` refuses
+/// the blended path for `on_mask` for that reason — the editor never sends one,
+/// but this is the renderer's own guard rather than a promise about its caller,
+/// and defending the eraser and not this was the asymmetry that would be
+/// forgotten first.
+#[test]
+fn a_stroke_on_a_mask_ignores_the_blend_mode_it_is_carrying() {
+    let mut h = harness_or_skip!();
+    h.canvas.ensure_slots(&h.gpu.device, &h.gpu.queue, 4);
+
+    // Grey on grey, deliberately, and this is the whole of what makes the test
+    // able to fail. A mask is read on `.r`, so black paint on a white mask is
+    // the one pair Multiply cannot tell from Normal — `0 × 1` and `0` are the
+    // same number, and the assertion would hold with the guard taken out. Half
+    // way up the channel it does not: `0.216 × 0.216` is nowhere near `0.216`.
+    let ink = Color::from_srgb_u8(128, 128, 128, 255);
+    let ground = [128u8, 128, 128, 255];
+
+    let rect = whole(&h);
+    let style = |blend, on_mask| StrokeStyle {
+        color: ink,
+        opacity: 1.0,
+        mode: BrushMode::Paint,
+        blend,
+        per_dab_color: false,
+        on_mask,
+    };
+
+    let commit = |h: &mut Harness, slot: u32, blend, on_mask| {
+        fill_slot(h, slot, ground);
+        h.stamp(&[dab(32.0, 32.0, 14.0, 1.0)]);
+        let mut enc = h.encoder();
+        h.canvas.commit_stroke(
+            &h.gpu.device,
+            &h.gpu.queue,
+            &mut enc,
+            slot,
+            rect,
+            &[rect],
+            style(blend, on_mask),
+        );
+        h.gpu.queue.submit(Some(enc.finish()));
+    };
+
+    // The two masks differ only in the blend mode the style carries.
+    commit(&mut h, 1, BlendMode::Normal, true);
+    commit(&mut h, 3, BlendMode::Multiply, true);
+    // And the same pair on an ordinary layer, which is what says these colours
+    // genuinely distinguish the two modes. Without this the assertion above
+    // would be satisfied by a Multiply that did nothing.
+    commit(&mut h, 0, BlendMode::Normal, false);
+    commit(&mut h, 2, BlendMode::Multiply, false);
+
+    assert_ne!(
+        h.pixel_in(0, 32, 32),
+        h.pixel_in(2, 32, 32),
+        "these colours cannot tell Multiply from Normal, so the mask assertion \
+         below proves nothing — pick different ones"
+    );
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        h.pixel_in(3, 32, 32),
+        "a blend mode changed what a stroke on a mask did"
+    );
+}
+
+/// The same, for a stroke that is only half opaque.
+///
+/// Stroke opacity is applied exactly once, at commit — the invariant the wet
+/// layer exists for — and a blend mode must not become the place it is applied
+/// twice. A partial alpha is also where the two halves of the W3C formula
+/// (`(1 - ab)*Sc` and `as*ab*B`) both carry weight, so a preview that dropped
+/// one of them would show here and nowhere else.
+#[test]
+fn a_blended_stroke_at_partial_opacity_previews_as_it_commits() {
+    let mut h = harness_or_skip!();
+
+    let under = [200u8, 60, 60, 255];
+    let ink = Color::from_srgb_u8(40, 90, 220, 255);
+
+    for blend in BRUSH_BLENDS {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.stamp(&[dab(32.0, 32.0, 16.0, 1.0)]);
+
+        let stack = [layer(0, 1.0, BlendMode::Normal)];
+        let style = StrokeStyle {
+            color: ink,
+            opacity: 0.5,
+            mode: BrushMode::Paint,
+            blend,
+            per_dab_color: false,
+            on_mask: false,
+        };
+        let previewed = h.composite_pixel_with(&stack, style, 32, 32);
+        h.commit_blended_to(0, ink, 0.5, BrushMode::Paint, blend);
+        let committed = h.composite_pixel(&stack, 32, 32);
+
+        assert_near(
+            committed,
+            [previewed[0], previewed[1], previewed[2]],
+            2,
+            &format!("{blend:?} at half opacity jumped at pointer-up"),
+        );
+    }
+}
+
+/// Blend identities rather than hand-computed values, for the reason CLAUDE.md
+/// gives: they are exact and they survive rounding on either adapter.
+///
+/// Multiplying white onto a picture leaves it alone, and screening black onto
+/// it does too. Both are the *brush* doing it, so they also say the brush's
+/// mode is reaching the commit at all — a mode quietly ignored would pass a
+/// test that only checked the mark had changed.
+#[test]
+fn a_blended_brush_keeps_the_identities_its_mode_promises() {
+    let mut h = harness_or_skip!();
+    let under = [70u8, 160, 110, 255];
+
+    for (blend, ink, what) in [
+        (BlendMode::Multiply, Color::WHITE, "multiplying by white"),
+        (BlendMode::Screen, Color::BLACK, "screening with black"),
+    ] {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.stamp(&[dab(32.0, 32.0, 16.0, 1.0)]);
+        h.commit_blended_to(0, ink, 1.0, BrushMode::Paint, blend);
+
+        let px = h.pixel(32, 32);
+        assert_near(
+            px,
+            [under[0], under[1], under[2]],
+            1,
+            &format!("{what} is the identity"),
+        );
+        assert_eq!(px[3], 255, "{what} left the alpha alone");
+    }
+}
+
+/// A blend mode reads what is *underneath*, and on bare canvas there is
+/// nothing: W3C's formula collapses to the source, so a multiplying brush on an
+/// empty layer lays down its own colour rather than nothing at all.
+///
+/// The obvious wrong implementation — multiplying by a backdrop read as opaque
+/// black — paints an invisible stroke, and that is the shape this catches.
+#[test]
+fn a_multiplying_brush_on_bare_canvas_lays_down_its_own_colour() {
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 16.0, 1.0)]);
+    h.commit_blended_to(
+        0,
+        Color::from_srgb_u8(220, 90, 30, 255),
+        1.0,
+        BrushMode::Paint,
+        BlendMode::Multiply,
+    );
+
+    let px = h.pixel(32, 32);
+    assert_eq!(px[3], 255, "the stroke should be there at all");
+    assert_near(
+        px,
+        [220, 90, 30],
+        2,
+        "a multiply over nothing is the source",
+    );
+}
+
+/// An eraser carrying a blend mode erases exactly as one that is not.
+///
+/// A blend mode is a rule for combining a colour with what is under it, and an
+/// eraser deposits none — it is a different *blend state*, `src_factor: Zero`,
+/// which is the invariant `erasing_removes_coverage` guards. So the mode is
+/// ignored rather than approximated, the editor never sends one down here, and
+/// this is what says the renderer would not honour one if it did.
+#[test]
+fn an_erasing_brush_ignores_the_blend_mode_it_is_carrying() {
+    let mut h = harness_or_skip!();
+
+    h.stamp(&[dab(32.0, 32.0, 14.0, 1.0)]);
+    h.commit_to(0, Color::WHITE, 1.0, BrushMode::Paint);
+    h.stamp(&[dab(32.0, 32.0, 14.0, 1.0)]);
+    h.commit_to(1, Color::WHITE, 1.0, BrushMode::Paint);
+    assert_eq!(h.pixel_in(0, 32, 32), h.pixel_in(1, 32, 32));
+
+    h.stamp(&[dab(32.0, 32.0, 10.0, 0.5)]);
+    h.commit_to(0, Color::WHITE, 1.0, BrushMode::Erase);
+    h.stamp(&[dab(32.0, 32.0, 10.0, 0.5)]);
+    h.commit_blended_to(1, Color::WHITE, 1.0, BrushMode::Erase, BlendMode::Multiply);
+
+    assert_eq!(
+        h.pixel_in(0, 32, 32),
+        h.pixel_in(1, 32, 32),
+        "a blend mode changed what an eraser did"
+    );
+}
+
+/// The blended commit is scissored to the same pieces the undo patch was
+/// captured from, exactly as the plain one is.
+///
+/// It gets there differently — a pass per piece with its own backdrop copy,
+/// rather than one pass with a scissor per piece — so the guarantee has to be
+/// re-stated for it. Two pieces with a gap between them also drive the
+/// per-piece uniform, which is the one thing in this path a single-piece commit
+/// would never exercise: if the dynamic offset were wrong, the second piece
+/// would sample the first's backdrop and the assertions below would disagree.
+#[test]
+fn a_blended_commit_writes_only_the_pieces_it_was_given() {
+    let mut h = harness_or_skip!();
+
+    let rect = whole(&h);
+    h.write_block(0, rect, [200, 200, 200, 255]);
+    // A dab wide enough to cover both pieces and the gap between them, so what
+    // decides where paint lands is the piece list and nothing else.
+    h.stamp(&[dab(32.0, 32.0, 40.0, 1.0)]);
+
+    let pieces = [
+        PixelRect {
+            x: 8,
+            y: 24,
+            width: 12,
+            height: 16,
+        },
+        PixelRect {
+            x: 44,
+            y: 24,
+            width: 12,
+            height: 16,
+        },
+    ];
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        &pieces,
+        StrokeStyle {
+            color: Color::BLACK,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            blend: BlendMode::Multiply,
+            per_dab_color: false,
+            on_mask: false,
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Multiplying black is black, in both pieces.
+    for x in [12u32, 48] {
+        assert_near(
+            h.pixel(x, 32),
+            [0, 0, 0],
+            2,
+            "a piece the commit was given was not painted",
+        );
+    }
+    // The gap between them, and a row above both, are untouched.
+    for (x, y) in [(32u32, 32u32), (12, 8), (48, 8)] {
+        assert_eq!(
+            h.pixel(x, y),
+            [200, 200, 200, 255],
+            "a pixel outside every piece was written at ({x}, {y})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bitmap tips
 // ---------------------------------------------------------------------------
 
@@ -1027,6 +1450,7 @@ fn a_stamp_gets_the_same_shape_dynamics_a_round_dab_does() {
     let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
     let mut enc = h.encoder();
     h.canvas.commit_stroke(
+        &h.gpu.device,
         &h.gpu.queue,
         &mut enc,
         0,
@@ -1311,6 +1735,7 @@ fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
     let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
     let mut enc = h.encoder();
     h.canvas.commit_stroke(
+        &h.gpu.device,
         &h.gpu.queue,
         &mut enc,
         0,
@@ -2265,6 +2690,7 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
         color: Color::BLACK,
         opacity: 0.75,
         mode: BrushMode::Paint,
+        blend: BlendMode::Normal,
         per_dab_color: false,
         on_mask: true,
     };
@@ -2289,8 +2715,15 @@ fn a_stroke_on_a_mask_previews_exactly_as_it_commits() {
     let mut enc = h.encoder();
     // Into the mask's slice, which is the whole of what "painting the mask"
     // means to the renderer — `commit_stroke` has no variant for it.
-    h.canvas
-        .commit_stroke(&h.gpu.queue, &mut enc, 1, rect, &[rect], style);
+    h.canvas.commit_stroke(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &mut enc,
+        1,
+        rect,
+        &[rect],
+        style,
+    );
     h.gpu.queue.submit(Some(enc.finish()));
 
     let committed = h.composite_pixel(&[masked], 32, 32);
@@ -2806,6 +3239,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
         height: DOC,
     };
     canvas.commit_stroke(
+        &gpu.device,
         &gpu.queue,
         &mut enc,
         0,
@@ -2815,6 +3249,7 @@ fn offscreen_passes_work_when_the_surface_is_bgra() {
             color: Color::from_srgb_u8(200, 20, 20, 255),
             opacity: 1.0,
             mode: BrushMode::Paint,
+            blend: BlendMode::Normal,
             per_dab_color: false,
             on_mask: false,
         },
@@ -4142,6 +4577,7 @@ fn an_undo_restores_every_pixel_a_tiled_stroke_changed() {
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     canvas.commit_stroke(
+        &gpu.device,
         &gpu.queue,
         &mut enc,
         0,
@@ -4151,6 +4587,7 @@ fn an_undo_restores_every_pixel_a_tiled_stroke_changed() {
             color: Color::from_srgb_u8(200, 20, 20, 255),
             opacity: 1.0,
             mode: BrushMode::Paint,
+            blend: BlendMode::Normal,
             per_dab_color: false,
             on_mask: false,
         },

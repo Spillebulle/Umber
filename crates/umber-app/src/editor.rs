@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use umber_core::{
-    Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, EditTarget, Handle, History, Hsv,
-    InputPoint, LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp, StrokeBuilder,
-    TipMask, Transform,
+    BlendMode, Brush, BrushMode, BrushPreset, Camera, Clip, Color, Document, EditTarget, Handle,
+    History, Hsv, InputPoint, LayerStack, Selection, SelectionDraft, SelectionMode, SelectionOp,
+    StrokeBuilder, TipMask, Transform,
     input::{PressureModel, PressureSource},
 };
 use umber_render::{LayerDraw, StrokeStyle};
@@ -1073,6 +1073,22 @@ impl Editor {
             color,
             opacity: self.brush.opacity,
             mode,
+            // Snapshotted like everything else here, and coerced at this one
+            // gate rather than at the preview and the commit separately.
+            //
+            // Two things take it back to Normal. `effective_blend` refuses one
+            // for an eraser, because a blend mode is a rule for combining a
+            // colour and an eraser deposits none. And a stroke on a *mask* has
+            // none either: a mask holds coverage on one channel, its preview is
+            // a one-channel blend written to match what the commit puts in the
+            // slice, and a second mode running through that pair would be a
+            // second place for those two to disagree — for a control whose
+            // meaning on a coverage channel nobody has defined.
+            blend: if on_mask {
+                BlendMode::Normal
+            } else {
+                self.brush.effective_blend()
+            },
             // Decided once, here, from the brush this stroke started with. It
             // must not change mid-stroke: dabs already stamped without a colour
             // recorded would commit as the flat palette colour while the rest
@@ -1576,6 +1592,51 @@ mod tests {
         assert_eq!(Some(ed.stroke_slot), ed.layers.active_slot());
         assert_eq!(ed.stroke_style.color, ed.color);
         assert_eq!(ed.stroke_style.mode, BrushMode::Erase);
+    }
+
+    /// A brush's blend mode is snapshotted with the rest of the stroke, and
+    /// taken back to Normal at this one gate in the two cases where it means
+    /// nothing — an eraser, which deposits no colour for a mode to combine, and
+    /// a stroke on a mask, whose preview blends one coverage channel against a
+    /// commit written to match it.
+    ///
+    /// Coerced here rather than in `composite.wgsl` and `commit.wgsl`
+    /// separately: those two must be handed the *same* style, and the way that
+    /// is guaranteed is that there is only one place it is decided.
+    #[test]
+    fn a_stroke_carries_its_brushs_blend_mode_except_where_it_means_nothing() {
+        let mut ed = Editor::default();
+        ed.brush.blend = BlendMode::Multiply;
+
+        assert!(ed.begin_stroke(point()));
+        assert_eq!(ed.stroke_style.blend, BlendMode::Multiply);
+
+        ed.interaction = Interaction::Idle;
+        ed.brush.mode = BrushMode::Erase;
+        assert!(ed.begin_stroke(point()));
+        assert_eq!(
+            ed.stroke_style.blend,
+            BlendMode::Normal,
+            "an eraser has no colour to blend"
+        );
+
+        ed.interaction = Interaction::Idle;
+        ed.brush.mode = BrushMode::Paint;
+        ed.layers.add_mask(0);
+        ed.edit_target = EditTarget::Mask;
+        assert!(ed.begin_stroke(point()));
+        assert!(ed.stroke_style.on_mask);
+        assert_eq!(
+            ed.stroke_style.blend,
+            BlendMode::Normal,
+            "a mask holds coverage, not colour"
+        );
+
+        assert_eq!(
+            ed.brush.blend,
+            BlendMode::Multiply,
+            "the brush itself is untouched — the coercion is the stroke's"
+        );
     }
 
     // --- folders ------------------------------------------------------------
