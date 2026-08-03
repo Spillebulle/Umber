@@ -348,11 +348,20 @@ impl<'a> Database<'a> {
             if kind == 0x0d {
                 out.push(self.leaf_cell(page_bytes, cell)?);
             } else {
-                let child = u32::from_be_bytes(
-                    page_bytes[cell..cell + 4]
-                        .try_into()
-                        .expect("four bytes were just bounds-checked"),
-                );
+                // `.get`, not an index. The check above bounds `cell` by the
+                // usable area, which says nothing about the four bytes *after*
+                // it — a pointer two bytes short of the end of the page would
+                // slice past it and panic, and a panic here takes the whole
+                // application down because somebody opened the wrong file.
+                let child = page_bytes
+                    .get(cell..cell + 4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_be_bytes)
+                    .ok_or_else(|| {
+                        SqliteError::new(format!(
+                            "a child pointer on page {page} runs off the end of it"
+                        ))
+                    })?;
                 self.walk(child, seen, out)?;
             }
         }
@@ -389,11 +398,15 @@ impl<'a> Database<'a> {
 
         let mut payload = page[body..body + local].to_vec();
         if local < payload_len {
-            let next = u32::from_be_bytes(
-                page[body + local..body + local + 4]
-                    .try_into()
-                    .map_err(|_| SqliteError::new("a record ends before its overflow pointer"))?,
-            );
+            // `.get` for the reason the child pointer above takes one: the
+            // check is that the *record* fits inside the usable area, and the
+            // overflow pointer sits four bytes past its end. A record ending
+            // exactly at the page boundary would slice past it and panic.
+            let next = page
+                .get(body + local..body + local + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_be_bytes)
+                .ok_or_else(|| SqliteError::new("a record ends before its overflow pointer"))?;
             self.gather_overflow(next, payload_len - local, &mut payload)?;
         }
 
@@ -1213,6 +1226,66 @@ mod tests {
         let db = Database::open(&bytes).expect("open");
         let table = db.table("A").expect("look up").expect("present");
         assert!(db.rows(&table).unwrap_err().to_string().contains("9999"));
+    }
+
+    /// A cell pointer is bounds-checked against the *usable area*, which says
+    /// nothing about the bytes that follow it — so a pointer two bytes short of
+    /// the end of the page used to slice past it and panic. These are files a
+    /// stranger wrote and a panic takes the whole application down, with every
+    /// unsaved document in it, because somebody opened the wrong one.
+    #[test]
+    fn a_cell_pointer_at_the_very_end_of_a_page_is_refused_rather_than_read_past() {
+        let mut bytes = database(&[TableSpec::new("A", &["x"]).row(vec![Value::Integer(1)])]);
+        let root = {
+            let db = Database::open(&bytes).expect("open");
+            db.table("A").expect("look up").expect("present").root
+        };
+        let at = (root as usize - 1) * 4096;
+        // One interior cell whose four-byte child pointer would end two bytes
+        // past the page.
+        bytes[at] = 0x05;
+        bytes[at + 3..at + 5].copy_from_slice(&1u16.to_be_bytes());
+        bytes[at + 12..at + 14].copy_from_slice(&4094u16.to_be_bytes());
+
+        let db = Database::open(&bytes).expect("open");
+        let table = db.table("A").expect("look up").expect("present");
+        let err = db.rows(&table).unwrap_err();
+        assert!(err.to_string().contains("child pointer"), "{err}");
+    }
+
+    /// The other half of the same hole, and the one a real `.sut` would reach
+    /// first: a record that spills into an overflow chain keeps the pointer to
+    /// it in the four bytes *after* its local payload, which the "does the
+    /// record fit in the usable area" check does not cover.
+    #[test]
+    fn an_overflow_pointer_past_the_end_of_a_page_is_refused_rather_than_read_past() {
+        let mut bytes = database(&[TableSpec::new("A", &["x"]).row(vec![Value::Integer(1)])]);
+        let root = {
+            let db = Database::open(&bytes).expect("open");
+            db.table("A").expect("look up").expect("present").root
+        };
+        let at = (root as usize - 1) * 4096;
+
+        // Hand-built, because a page SQLite itself laid out cannot show this:
+        // it packs the last cell flush to the end, which puts the pointer
+        // exactly on the boundary. A record declaring 4062 bytes keeps
+        // `min_local` of them here — 489 on a 4096-byte page — so a cell placed
+        // at 3601 ends its payload at 4093 and its overflow pointer one byte
+        // past the page, while still satisfying the "the record fits in the
+        // usable area" check that is the only bound on this read.
+        let page = &mut bytes[at..at + 4096];
+        page.fill(0);
+        page[0] = 0x0d;
+        page[3..5].copy_from_slice(&1u16.to_be_bytes());
+        page[5..7].copy_from_slice(&3601u16.to_be_bytes());
+        page[8..10].copy_from_slice(&3601u16.to_be_bytes());
+        // varint(4062), then varint(rowid 1).
+        page[3601..3604].copy_from_slice(&[0x9f, 0x5e, 0x01]);
+
+        let db = Database::open(&bytes).expect("open");
+        let table = db.table("A").expect("look up").expect("present");
+        let err = db.rows(&table).unwrap_err();
+        assert!(err.to_string().contains("overflow pointer"), "{err}");
     }
 
     /// An index b-tree holds the same rows in a different order, so following

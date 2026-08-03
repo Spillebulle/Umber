@@ -69,13 +69,32 @@
 //!   is not because the bit cannot be identified — it can, see [`TILT`] — but
 //!   because no platform Umber runs on reports tilt at all, so the modulation
 //!   would sit at a value the pen never produces.
+//! - **Pressure and the random draw driving a setting Umber has no field for
+//!   are lost and deliberately not named.** They are as lost as a tilt mapping
+//!   is, and reporting them was tried: the sweep cannot tell a live effector
+//!   from one whose bits Clip Studio left behind when the setting was switched
+//!   off, and those two bits are set on far more columns than tilt or velocity
+//!   ever are — so the sentence appeared on nearly every import and was often
+//!   about a mapping the brush does not have. [`unreachable_inputs`] has the
+//!   whole argument. Silence beats a false apology until the enable flag beside
+//!   each effector can be read.
+//! - **A floor is part of a mapping and is carried with it.** Clip Studio
+//!   states each dynamic's minimum as a percentage of the setting's own value,
+//!   and for size that is [`Brush::min_size_ratio`] exactly. Opacity has no
+//!   such field, so the floor is folded into the response curve, where it is
+//!   exact — see [`floored`]. Dropping it is a brush that paints from nothing
+//!   where its author had it painting from six tenths, which looks like an
+//!   opacity setting that does not work.
 //! - **The taper arrives at the start of a stroke and not at its end.** "In"
 //!   is a size ramp over the first stretch of the mark, which is precisely what
 //!   [`DabInput::Stroke`] is. "Out" is measured back from an end the engine
 //!   does not know until the stroke is over.
 //! - **The paper texture becomes one of Umber's three.** Umber's grain is a
 //!   closed set (see [`GrainPattern`]), so the strength and the tile size carry
-//!   across and the picture does not.
+//!   across and the picture does not. It is read only where the reference
+//!   actually names a material: grain multiplies coverage, so a stale
+//!   reference left behind by a texture that was switched off would be a brush
+//!   painting through paper it does not have.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
 //!   have no engine behind them at all** and are named.
 //! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
@@ -113,6 +132,12 @@ pub mod dropped {
     /// Stroke speed reaches size and per-dab opacity; on anything else there is
     /// no Umber setting for it to drive.
     pub const SPEED_ELSEWHERE: &str = "stroke speed driving a setting Umber has no equivalent for";
+    /// The brush names a paper and this reader could not read the reference.
+    /// The strength and the tile size are still in the file; applying them to
+    /// one of Umber's papers would be a grain invented out of a reference
+    /// nobody could resolve, so it is named instead — the same answer
+    /// [`UNUSABLE_TIP`] gives for the analogous tip.
+    pub const UNREADABLE_TEXTURE: &str = "a paper texture this reader could not resolve";
     pub const MIXING: &str = "the detail of Clip Studio's underlying-colour mixing";
     pub const DUAL_BRUSH: &str = "dual brushes";
     pub const WATER_EDGE: &str = "watercolour edges";
@@ -571,6 +596,28 @@ fn at(points: &[(f64, f64)], x: f64) -> f64 {
 /// still a setting whose behaviour will not arrive. `driven` names the columns
 /// whose velocity mapping *was* imported, so speed is only reported where it
 /// really had nowhere to go.
+///
+/// **Only tilt, the unnamed fifth source and stray velocity are reported, and
+/// pressure and the random draw deliberately are not** — even though a mapping
+/// of either onto a setting Umber has no field for is just as lost. Reporting
+/// them was tried and is wrong here for two compounding reasons. The sweep is
+/// over a schema of 187 to 214 columns and cannot tell an effector whose bits
+/// are live from one whose bits are *stale*, and Clip Studio leaves a setting's
+/// value in the file when the setting is switched off — the trap the taper, the
+/// angle jitter, the spacing and the paper each read a separate field to avoid.
+/// Pressure and randomness are set on far more of those columns than tilt or
+/// velocity ever are, so the result was a sentence appearing on nearly every
+/// import, frequently about a mapping the brush does not have. `docs/brushes.md`
+/// records that the random bit is the *only* bit ever set on the hue,
+/// saturation and brightness effectors in either sample file — so a brush with
+/// colour jitter switched off would have apologised for it, and one with it
+/// switched on would have said the same loss twice, once vaguely.
+///
+/// A list that cries wolf is one a reader learns to skip, which costs the
+/// losses that do matter — the same argument the skipped fill tool and the
+/// automatic dab interval already make. Naming these properly needs the enable
+/// flag beside each effector, which means knowing what those columns are
+/// called; until then silence beats a false apology.
 fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str> {
     let mut out = Vec::new();
     let mut note = |sources: u32, column: &str| {
@@ -915,11 +962,58 @@ fn convert(
         brush.radius_jitter = spread_from_floor(effector.minimum(RANDOM));
     }
 
-    if let Some(effector) = settings.effector("BrushOpacityEffector") {
-        brush.pressure_opacity = effector.drives(PRESSURE);
-        if brush.pressure_opacity {
-            brush.opacity_curve = effector.curve_for(PRESSURE);
-        }
+    // Hardness follows pressure in Clip Studio exactly as size does, and Umber
+    // has the whole shape of it — the flag, the floor and the curve. Reading it
+    // is what makes a soft pencil feathery at a light touch instead of drawing
+    // one edge for every pressure the hand can produce.
+    //
+    // The floor is taken **as the file states it**, including zero, where
+    // `Brush::min_hardness_ratio`'s own default of 0.5 exists to keep the soft
+    // end "a brush rather than a cloud". That default is Umber's taste for a
+    // hand-written preset; this is somebody's brush, and a Clip Studio dynamic
+    // whose minimum is zero really does go fully diffuse at a feather touch.
+    // Same rule `min_size_ratio` is already read by, one line up.
+    if let Some(effector) = settings
+        .effector("BrushHardnessEffector")
+        .filter(|e| e.drives(PRESSURE))
+    {
+        brush.pressure_hardness = true;
+        brush.min_hardness_ratio = effector.minimum(PRESSURE);
+        brush.hardness_curve = effector.curve_for(PRESSURE);
+    }
+
+    // ---- per-dab coverage ----------------------------------------------
+    // Clip Studio reaches per-dab coverage through two settings that
+    // **multiply**: Opacity, which is the whole stroke's, and Brush density,
+    // which is one dab's. `SPEED_TARGETS` already composes them that way for
+    // velocity; pressure has to be composed the same, or the two halves of one
+    // brush disagree about what it does. `BrushFlowEffector`'s pressure mapping
+    // used to be read for velocity alone and dropped here, so a brush whose
+    // density followed the pen arrived painting at full density throughout.
+    //
+    // Each carries a **floor**, exactly as size does. Clip Studio states it as
+    // a percentage of the setting's own value, so a floor of 60 is a brush that
+    // never paints below 60% of its opacity however lightly it is touched.
+    // Umber has no `min_opacity_ratio` field and does not need one: a floor is
+    // exactly representable in the curve as `f + (1 - f) * curve(p)`, which is
+    // the arithmetic `radius_at` does around `min_size_ratio`. Reading the
+    // curve alone dropped it — and that is a brush whose every stroke comes out
+    // at a fraction of the strength its author set, and has to be laid down
+    // several times to reach the colour that was asked for.
+    let mut coverage: Option<ResponseCurve> = None;
+    for column in ["BrushOpacityEffector", "BrushFlowEffector"] {
+        let Some(effector) = settings.effector(column).filter(|e| e.drives(PRESSURE)) else {
+            continue;
+        };
+        let one = floored(effector.curve_for(PRESSURE), effector.minimum(PRESSURE));
+        coverage = Some(match coverage {
+            None => one,
+            Some(first) => multiplied(first, one),
+        });
+    }
+    brush.pressure_opacity = coverage.is_some();
+    if let Some(curve) = coverage {
+        brush.opacity_curve = curve;
     }
 
     // ---- stroke speed --------------------------------------------------
@@ -994,7 +1088,38 @@ fn convert(
     }
 
     // ---- grain ---------------------------------------------------------
-    if settings.blob("TextureImage").is_some() {
+    // Gated on the reference actually **naming a material**, not on the column
+    // holding a blob at all. Clip Studio leaves a setting's value in the file
+    // when the setting itself is switched off — which is why the taper reads
+    // `BrushUseIn` rather than `BrushInLength`, why the angle jitter reads its
+    // effector rather than `BrushRotationRandomScale`, and why the spacing
+    // reads `BrushAutoIntervalType`. A texture reference is the same trap and
+    // the failure is worse than any of those, because grain **multiplies
+    // coverage**: a brush that was never textured arrives painting through a
+    // paper it does not have — mottled, weaker than its opacity says, and
+    // darker each time the stroke is laid down again, since the pits are
+    // anchored to the document and a second pass composites over the first.
+    //
+    // Deliberately not gated on the material being *present*: Clip Studio
+    // leaves an installed one out of the file and expects to find it locally,
+    // exactly as it does for a tip, and the strength and the tile size are
+    // still the author's numbers. What is checked is that the reference names
+    // one at all.
+    //
+    // The two failures are told apart rather than both reading as "no paper",
+    // because they are not the same thing. A reference holding no materials is
+    // a texture that was never set, and there is nothing to report. One that
+    // holds a material this reader could not resolve is a paper the brush
+    // genuinely has, and going quiet about it would be a brush that paints
+    // smoother than its author's with nothing saying why — which is the answer
+    // `UNUSABLE_TIP` already gives for the analogous tip.
+    let texture = settings
+        .blob("TextureImage")
+        .filter(|r| reference_count(r) > 0);
+    if texture.is_some_and(|r| reference_path(r).is_none()) {
+        push_once(&mut dropped, dropped::UNREADABLE_TEXTURE);
+    }
+    if texture.is_some_and(|r| reference_path(r).is_some()) {
         brush.grain = settings
             .percent("TextureDensity")
             .unwrap_or(0.0)
@@ -1102,6 +1227,45 @@ fn convert(
     (brush, tip, dropped)
 }
 
+/// A response with a floor under it: the curve rescaled into `floor..=1`.
+///
+/// Clip Studio states a dynamic's minimum as a percentage of the setting's own
+/// value, which is precisely what [`Brush::min_size_ratio`] means for size —
+/// and `radius_at` composes it as `min + (1 - min) * curve(p)`. Opacity has no
+/// such field, deliberately (`CLAUDE.md`: coverage genuinely reaches zero), so
+/// the floor is folded into the curve instead, where it is exact. A floor of
+/// zero is the identity and a floor of one is a flat response, which is what a
+/// setting pressure cannot move actually does.
+fn floored(curve: ResponseCurve, floor: f32) -> ResponseCurve {
+    if floor <= 0.0 {
+        return curve;
+    }
+    let mut out = curve;
+    for i in 0..ResponseCurve::N {
+        out.set(i, floor + (1.0 - floor) * curve.points[i]);
+    }
+    out
+}
+
+/// Two responses multiplied sample by sample, which is what lets one Umber
+/// curve carry two Clip Studio settings that multiply.
+///
+/// **Exact at the five knots and an approximation between them**, and the
+/// difference is worth stating because [`floored`] beside it genuinely is
+/// exact everywhere. The product of two piecewise-linear curves is
+/// *quadratic*; this re-linearises it over each quarter of the range, which
+/// bows by at most `Δa·Δb/4` — four levels of eight-bit coverage in the worst
+/// case, two `LINEAR` curves. That is the resolution [`ResponseCurve`] has at
+/// all, and the same bound [`Effector::curve_for`] already accepts when it
+/// resamples Clip Studio's own control points onto those five knots.
+fn multiplied(a: ResponseCurve, b: ResponseCurve) -> ResponseCurve {
+    let mut out = a;
+    for i in 0..ResponseCurve::N {
+        out.set(i, a.points[i] * b.points[i]);
+    }
+    out
+}
+
 /// A jitter spread, given the floor a random draw is allowed to fall to.
 ///
 /// Umber's radius jitter is a standard deviation in log space, so a floor of
@@ -1135,7 +1299,7 @@ mod tests {
     /// The columns of `Variant` this importer actually reads, in an order that
     /// is deliberately *not* the order the code reads them in — the point of
     /// the schema being name-addressed is that neither one matters.
-    const VARIANT_COLUMNS: [&str; 40] = [
+    const VARIANT_COLUMNS: [&str; 41] = [
         "TextureDensityEffector",
         "VariantID",
         "BrushRotation",
@@ -1144,6 +1308,7 @@ mod tests {
         "BrushSize",
         "BrushSizeEffector",
         "BrushHardness",
+        "BrushHardnessEffector",
         "BrushInterval",
         "BrushAutoIntervalType",
         "BrushFlowEffector",
@@ -1803,6 +1968,199 @@ mod tests {
         assert!((m.low - 0.3f32.ln()).abs() < 1e-5);
         // The tilt half is still a loss and still says so.
         assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
+    }
+
+    /// A dynamic's **floor** is half of what it says, and opacity's used to be
+    /// thrown away.
+    ///
+    /// Clip Studio states the minimum as a percentage of the setting's own
+    /// value, so a floor of 60 is a brush that never paints below six tenths of
+    /// its opacity however lightly it is touched. Reading the curve alone
+    /// imported that as a brush painting from nothing — every stroke a fraction
+    /// of the strength its author set, and only reaching the colour asked for
+    /// once it had been laid down several times. Which is exactly what an
+    /// opacity control that does not work looks like.
+    #[test]
+    fn a_pressure_opacity_mapping_keeps_the_floor_under_it() {
+        let bytes = sut(
+            &[(
+                "Ink",
+                Variant::plain(1).set(
+                    "BrushOpacityEffector",
+                    effector(PRESSURE, [60, 0, 0, 0], &[(0.0, 0.0), (1.0, 1.0)], &[]),
+                ),
+            )],
+            &[],
+        );
+        let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+
+        assert!(brush.pressure_opacity);
+        // A feather touch is six tenths, not nothing; a full press is full.
+        assert!(
+            (brush.coverage_at(0.0) - 0.6).abs() < 1e-5,
+            "{}",
+            brush.coverage_at(0.0)
+        );
+        assert!((brush.coverage_at(1.0) - 1.0).abs() < 1e-5);
+        // And the shape between the two is still the file's, rescaled rather
+        // than replaced: a linear curve stays linear over the new range.
+        assert!((brush.coverage_at(0.5) - 0.8).abs() < 1e-5);
+    }
+
+    /// Clip Studio reaches per-dab coverage through Opacity *and* Brush
+    /// density, and they multiply — which `SPEED_TARGETS` already said for
+    /// velocity while pressure ignored the density half entirely. A brush whose
+    /// density followed the pen therefore arrived painting at full density
+    /// throughout, which is the same bug pointing the other way.
+    #[test]
+    fn opacity_and_dab_density_both_follow_pressure_and_multiply() {
+        let ramp = [(0.0, 0.0), (1.0, 1.0)];
+        let bytes = sut(
+            &[(
+                "Wash",
+                Variant::plain(1)
+                    .set(
+                        "BrushOpacityEffector",
+                        effector(PRESSURE, [50, 0, 0, 0], &ramp, &[]),
+                    )
+                    .set(
+                        "BrushFlowEffector",
+                        effector(PRESSURE, [50, 0, 0, 0], &ramp, &[]),
+                    ),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        // Both mappings landed, so there is nothing to apologise for.
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        let brush = tool.brush;
+        assert!(brush.pressure_opacity);
+        // Half times half at no pressure, one times one at full.
+        assert!((brush.coverage_at(0.0) - 0.25).abs() < 1e-5);
+        assert!((brush.coverage_at(1.0) - 1.0).abs() < 1e-5);
+        // And density alone still switches the flag on, which it did not
+        // before: only the opacity effector was consulted.
+        let bytes = sut(
+            &[(
+                "Density only",
+                Variant::plain(2).set(
+                    "BrushFlowEffector",
+                    effector(PRESSURE, [0, 0, 0, 0], &ramp, &[]),
+                ),
+            )],
+            &[],
+        );
+        let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+        assert!(brush.pressure_opacity);
+        assert_eq!(brush.coverage_at(0.0), 0.0);
+    }
+
+    /// Hardness follows pressure in Clip Studio exactly as size does, and Umber
+    /// has the whole shape of it. Leaving it unread gave a soft pencil one edge
+    /// for every pressure the hand can make.
+    #[test]
+    fn pressure_drives_hardness_through_its_floor_and_its_curve() {
+        assert!(
+            !Brush::default().pressure_hardness,
+            "the default has moved, and an unread column would now inherit it"
+        );
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1).int("BrushHardness", 100).set(
+                    "BrushHardnessEffector",
+                    effector(PRESSURE, [30, 0, 0, 0], &[(0.0, 0.0), (1.0, 1.0)], &[]),
+                ),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        let brush = tool.brush;
+        assert!(brush.pressure_hardness);
+        assert!((brush.min_hardness_ratio - 0.3).abs() < 1e-6);
+        assert!((brush.hardness_at(0.0) - 0.3).abs() < 1e-5);
+        assert!((brush.hardness_at(1.0) - 1.0).abs() < 1e-5);
+
+        // A brush that does not map it must not pick up Umber's own answer.
+        let bytes = sut(&[("Nib", Variant::plain(1))], &[]);
+        let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+        assert!(!brush.pressure_hardness);
+    }
+
+    /// Pressure and the random draw driving a setting Umber has no field for
+    /// are as lost as a tilt mapping, and are deliberately **not** reported —
+    /// see [`unreachable_inputs`] for the argument. This is what pins that the
+    /// silence is a decision rather than an oversight: a list that apologises
+    /// on nearly every import is one a reader learns to skip, taking the losses
+    /// that matter with it.
+    #[test]
+    fn pressure_and_randomness_with_nowhere_to_land_stay_quiet() {
+        let bytes = sut(
+            &[
+                (
+                    "Textured",
+                    Variant::plain(1).set(
+                        "TextureDensityEffector",
+                        effector(PRESSURE | RANDOM, [0, 0, 0, 40], &[], &[]),
+                    ),
+                ),
+                // Tilt on the same column still speaks, so the sweep is
+                // demonstrably still running over it.
+                (
+                    "Tilted",
+                    Variant::plain(2).set(
+                        "TextureDensityEffector",
+                        effector(PRESSURE | TILT, [0; 4], &[], &[]),
+                    ),
+                ),
+            ],
+            &[],
+        );
+        let tools = from_sut(&bytes).expect("read").tools;
+        assert!(tools[0].dropped.is_empty(), "{:?}", tools[0].dropped);
+        assert_eq!(tools[1].dropped, [dropped::TILT_INPUT]);
+    }
+
+    /// Clip Studio leaves a setting's value in the file when the setting is
+    /// switched off — the trap the taper, the angle jitter and the spacing are
+    /// each guarded against by name. The texture reference is the same trap and
+    /// the worst of them: grain **multiplies coverage**, so a brush that was
+    /// never textured painted through a paper it does not have — mottled,
+    /// weaker than its opacity claimed, and darker every time the stroke was
+    /// laid down again.
+    #[test]
+    fn a_texture_reference_that_names_no_material_leaves_the_brush_ungrained() {
+        let textured = |stale: Value| {
+            sut(
+                &[(
+                    "Untextured",
+                    Variant::plain(1)
+                        .set("TextureImage", stale)
+                        .int("TextureDensity", 80)
+                        .real("TextureScale2", 100.0),
+                )],
+                &[],
+            )
+        };
+
+        // A reference holding no materials at all: a texture that was never
+        // set, so there is nothing to grain and nothing to report.
+        let bytes = textured(reference(".:paper:data:material_0.layer", 0));
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.brush.grain, 0.0);
+        assert!(!tool.brush.has_grain());
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        // One that holds a material this reader cannot resolve is a paper the
+        // brush genuinely has. Still no invented grain — but it says so, which
+        // is the answer the analogous tip already gives.
+        let bytes = textured(reference("", 1));
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.brush.grain, 0.0);
+        assert_eq!(tool.dropped, [dropped::UNREADABLE_TEXTURE]);
     }
 
     /// Speed on Clip Studio's per-dab density is Umber's per-dab opacity, and
