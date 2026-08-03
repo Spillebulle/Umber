@@ -971,6 +971,33 @@ mod tests {
         assert_eq!(prefs.wheel_shape, WheelShape::Triangle);
     }
 
+    /// Every relation, for the reason `harmony_id`'s own comment gives: the ids
+    /// are a `match` so that adding a relation is a missing arm, and this is
+    /// what says the arm somebody adds actually round-trips.
+    #[test]
+    fn every_harmony_relation_survives_a_restart() {
+        for harmony in Harmony::ALL {
+            let prefs = Prefs {
+                harmony,
+                ..Prefs::default()
+            };
+            let back = from_text(&to_text(&prefs));
+            assert_eq!(back.harmony, harmony, "{}", harmony.label());
+        }
+        // The ids are the file's own words and are deliberately not the labels
+        // lower-cased, so a label reworded tomorrow cannot silently change what
+        // a file written today means.
+        assert_eq!(
+            from_text("harmony = split-complementary\n").harmony,
+            Harmony::SplitComplementary
+        );
+        assert_eq!(
+            from_text("harmony = Split complementary\n").harmony,
+            Harmony::default(),
+            "a bad id keeps the default"
+        );
+    }
+
     /// The angle is set on the Colour panel, like the rotation above it, and has
     /// to reach the picker rather than only the `Prefs` struct — and each shape
     /// has to arrive with its own number, since that is the whole point of

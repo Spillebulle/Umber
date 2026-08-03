@@ -132,14 +132,15 @@ impl WheelAngles {
 /// Anything not finite comes back as zero rather than being carried: this ends
 /// up in `sin_cos` and then in vertex positions, and one NaN there is a mesh
 /// egui discards — a picker that silently stops drawing.
+///
+/// The arithmetic is [`umber_core::color::wrap_hue`]'s, because it is the same
+/// arithmetic and the same two traps. This name is kept because the *thing*
+/// differs: a hue is a position on the colour circle and this is how far a
+/// shape has been turned from its neutral pose, which is why the range is
+/// documented per shape above and why the Angle control reads it in degrees of
+/// rotation.
 pub fn normalise_angle(degrees: f32) -> f32 {
-    if !degrees.is_finite() {
-        return 0.0;
-    }
-    let wrapped = degrees.rem_euclid(360.0);
-    // `rem_euclid` of a tiny negative rounds up to exactly 360 in f32, which is
-    // the one value outside the range this promises.
-    if wrapped >= 360.0 { 0.0 } else { wrapped }
+    umber_core::color::wrap_hue(degrees)
 }
 
 const RING_SEGMENTS: usize = 96;
@@ -309,8 +310,7 @@ fn wheel(
 
     // --- hue ring ---
     if on_ring && let Some(pos) = at {
-        let d = pos - centre;
-        hsv.h = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
+        hsv.h = ring_hue(centre, pos);
         changed = true;
     }
 
@@ -443,6 +443,19 @@ const MARKER_STROKE: Stroke = Stroke {
 fn ring_point(centre: Pos2, inner: f32, outer: f32, hue: f32) -> Pos2 {
     let a = hue.to_radians();
     centre + vec2(a.cos(), a.sin()) * (inner + outer) * 0.5
+}
+
+/// The hue a point on the ring stands for — [`ring_point`]'s inverse, and the
+/// only thing in this file that writes a hue from a gesture.
+///
+/// Through [`umber_core::color::wrap_hue`] rather than a bare `rem_euclid`,
+/// which is what both call sites used to do. `atan2` answers in `-π..=π`, and
+/// `(-1e-7f32).to_degrees().rem_euclid(360.0)` is exactly `360.0` — a hue one
+/// step anticlockwise of red, held in the one value the type says it never
+/// holds, and `to_color` reads it as the sixth sextant and paints magenta.
+fn ring_hue(centre: Pos2, at: Pos2) -> f32 {
+    let d = at - centre;
+    umber_core::color::wrap_hue(d.y.atan2(d.x).to_degrees())
 }
 
 /// The hue ring itself, drawn between two radii about `centre`.
@@ -923,8 +936,7 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
         .is_some_and(|from| (from - centre).length() > inner * RING_GRIP);
 
     if on_ring && let Some(pos) = at {
-        let d = pos - centre;
-        hsv.h = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
+        hsv.h = ring_hue(centre, pos);
         changed = true;
     }
 
@@ -1037,10 +1049,19 @@ fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bo
         let cell = swatch_cell(row, index, hues.len());
         let colour = Hsv::new(*hue, hsv.s, hsv.v).to_color(1.0);
         let [r, g, b, _] = colour.to_srgb_u8();
+        // The one in hand senses hover and not clicks. It is already the colour
+        // you have, so there is nothing for a click to do — and a target that
+        // looks live and quietly drops what it is given is the control this
+        // project refuses everywhere else. The hover stays, because the tooltip
+        // saying which swatch this *is* is the whole reason to draw it.
         let response = ui.interact(
             cell,
             ui.id().with(("harmony-swatch", index)),
-            Sense::click(),
+            if index == 0 {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
         );
         ui.painter()
             .rect_filled(cell, metrics::RADIUS, Color32::from_rgb(r, g, b));
@@ -1063,7 +1084,6 @@ fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bo
         if response
             .on_hover_text(format!("{hint} — #{r:02X}{g:02X}{b:02X}"))
             .clicked()
-            && index > 0
         {
             taken = Some(*hue);
         }
@@ -1304,6 +1324,30 @@ mod tests {
             45.0,
             "nor the triangle back"
         );
+    }
+
+    /// The ring's own inverse, and the trap it exists for: a point a hair
+    /// anticlockwise of red is `-1e-7` radians, whose degrees `rem_euclid`
+    /// rounds up to exactly 360 — outside the range `Hsv` promises, and read by
+    /// `to_color` as the sixth sextant, which is magenta.
+    #[test]
+    fn the_ring_reads_back_the_hue_its_marker_was_drawn_at() {
+        for hue in [0.0_f32, 1.0, 90.0, 179.9, 270.0, 359.9] {
+            let at = ring_point(CENTRE, 40.0, 60.0, hue);
+            let back = ring_hue(CENTRE, at);
+            let apart = (back - hue).abs().min(360.0 - (back - hue).abs());
+            assert!(apart < 1e-2, "{hue} -> {back}");
+        }
+        // Every answer is a hue, including the one just short of a whole turn.
+        let just_under = ring_hue(CENTRE, CENTRE + vec2(1.0, -1e-7));
+        assert!((0.0..360.0).contains(&just_under), "{just_under}");
+        assert_eq!(
+            Hsv::new(just_under, 1.0, 1.0).to_color(1.0).to_srgb_u8(),
+            [255, 0, 0, 255],
+            "a hair off red must not be magenta"
+        );
+        // And the centre itself, where there is no direction at all.
+        assert!(ring_hue(CENTRE, CENTRE).is_finite());
     }
 
     #[test]

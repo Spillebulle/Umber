@@ -30,11 +30,13 @@
 //! A swatch takes its colour, through [`Editor::set_color`] — which is the same
 //! door the eyedropper and the colour wells use, so the picker's hue survives a
 //! grey being taken. The remove mark inside a swatch's corner is *allocated*
-//! every frame and *painted* only while the pointer is inside the swatch, which
-//! is the rule a revealed control has to follow here: egui stops its hover
-//! search at the topmost interactive widget, so a mark that only existed while
-//! its parent reported hovered would flicker once a frame. Testing the
-//! swatch's own rectangle is geometry, and geometry does not oscillate.
+//! every frame and *painted* only while `Response::contains_pointer` is true of
+//! the swatch, which is the rule a revealed control has to follow here: egui
+//! stops its hover search at the topmost interactive widget, so a mark that
+//! only existed while its parent reported `hovered` would blink out the moment
+//! the pointer reached it and back in the frame after. `contains_pointer` is
+//! geometry — layer-aware and clip-aware, unlike the raw pointer position —
+//! and geometry does not oscillate.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -416,30 +418,26 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     let [r, g, b, _] = ed.color.to_srgb_u8();
     let in_hand = [r, g, b];
 
-    // What is actually on screen. A palette may hold `MAX_SWATCHES` of them,
-    // and this loop does an `interact` and two shapes per colour — four
-    // thousand of each, every frame, for a panel showing forty. The brush list
-    // skips rows scrolled out of view for exactly this reason; a swatch wholly
-    // outside the clip is neither drawn nor a target, so leaving it out changes
-    // nothing anybody can point at.
-    let visible = ui.clip_rect();
-
     let mut act = None;
     for (index, swatch) in palette.swatches.iter().enumerate() {
         let cell = swatch_rect(area.min, index, columns);
-        if !visible.intersects(cell) {
+        // A palette may hold `MAX_SWATCHES`, and this loop does two `interact`s
+        // and two shapes per colour — four thousand of each, every frame, for a
+        // panel showing forty. The brush list skips rows scrolled out of view
+        // for exactly this reason. A swatch wholly outside the clip is neither
+        // drawn nor a target, so leaving it out changes nothing anybody can
+        // point at.
+        if !ui.is_rect_visible(cell) {
             continue;
         }
         let response = ui.interact(cell, ui.id().with(("swatch", index)), Sense::click());
-        // Geometry, not `response.hovered()`. The remove mark below is an
-        // interactive widget on top of this one, and egui stops its hover search
-        // at the topmost — so a mark drawn only while the swatch reported
-        // hovered would blink out the moment the pointer reached it, and back in
-        // the frame after. See the module docs.
-        let pointer_inside = ui
-            .ctx()
-            .pointer_hover_pos()
-            .is_some_and(|at| cell.contains(at));
+        // `contains_pointer`, which is geometry and is layer- and clip-aware —
+        // not `response.hovered()`. The remove mark below is an interactive
+        // widget on top of this one and egui stops its hover search at the
+        // topmost, so a mark drawn only while the swatch reported *hovered*
+        // would blink out the moment the pointer reached it and back in the
+        // frame after. See the module docs.
+        let pointer_inside = response.contains_pointer();
 
         let fill = Color32::from_rgb(swatch.rgb[0], swatch.rgb[1], swatch.rgb[2]);
         ui.painter().rect_filled(cell, metrics::RADIUS, fill);
@@ -471,14 +469,23 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
             );
         }
 
-        let name = if swatch.name.trim().is_empty() {
-            swatch.hex()
-        } else {
-            format!("{} — {}", swatch.name, swatch.hex())
-        };
-        if pointer_inside && remove.on_hover_text("Remove this colour").clicked() {
-            act = Some(Act::Remove(index));
-        } else if response.on_hover_text(name).clicked() {
+        if pointer_inside {
+            // The label is built here and not above the hover test: `hex` is a
+            // `format!`, and one allocation per swatch per frame is the thing
+            // the cull above exists to avoid, done a second way.
+            let name = if swatch.name.trim().is_empty() {
+                swatch.hex()
+            } else {
+                format!("{} — {}", swatch.name, swatch.hex())
+            };
+            if remove.on_hover_text("Remove this colour").clicked() {
+                act = Some(Act::Remove(index));
+            } else if response.on_hover_text(name).clicked() {
+                act = Some(Act::Take(index));
+            }
+        } else if response.clicked() {
+            // Reachable without the pointer: a click delivered by the keyboard,
+            // or one whose press landed here and whose release did not.
             act = Some(Act::Take(index));
         }
     }
@@ -618,7 +625,10 @@ fn export(state: &mut State, ed: &mut Editor, id: &str) {
     let Some(path) = rfd::FileDialog::new()
         .set_title("Export palette")
         .add_filter("GIMP palette", &[GPL_EXTENSION])
-        .set_file_name(format!("{}.{GPL_EXTENSION}", palette.name))
+        // The *id*, not the display name: an id is already a filename — see
+        // `PaletteLibrary`'s `slug` — and a name may hold a separator or a
+        // colon, which is a file dialog opened on a path nobody meant.
+        .set_file_name(format!("{}.{GPL_EXTENSION}", palette.id))
         .save_file()
     else {
         return;
@@ -646,11 +656,34 @@ fn file_label(path: &Path) -> String {
 /// The palette library. Drawn from [`crate::panels::sidebars`], not from the
 /// panel body — see the module docs.
 pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
+    // Nothing at all until the module is in the layout or the state already
+    // exists. `sidebars` calls this every frame whether or not the Palette
+    // panel is anywhere, and `load` reads the whole directory — up to
+    // `MAX_PALETTES` files, synchronously, inside a frame — and can raise a
+    // notice about a file that would not parse. Doing either at launch for
+    // somebody who has never opened the panel is a dialog about a feature they
+    // have not asked for. Once the state is in memory this costs a lookup, so
+    // closing the module mid-session does not throw the library away.
+    if !ed.layout.is_open(crate::dock::PanelKind::Palette)
+        && !root
+            .ctx()
+            .data(|d| d.get_temp::<State>(state_id()).is_some())
+    {
+        return;
+    }
     let mut state = load(root.ctx(), ed);
     if !state.library_open {
         store(root.ctx(), state);
         return;
     }
+
+    // Clamped to the window, for the reason `brushlib::browser` clamps: a modal
+    // wider than the screen has no way back out of its own corners, and the
+    // Close mark is in one of them.
+    let available = root.ctx().content_rect().size();
+    let [full_width, full_height] = metrics::PALETTE_LIBRARY;
+    let w = full_width.min(available.x - 48.0).max(280.0);
+    let h = full_height.min(available.y - 220.0).max(120.0);
 
     let response = egui::Modal::new(Id::new("palette-library-modal"))
         .frame(
@@ -661,7 +694,6 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 .inner_margin(egui::Margin::same(18)),
         )
         .show(root.ctx(), |ui| {
-            let [w, h] = metrics::PALETTE_LIBRARY;
             ui.set_width(w);
             ui.horizontal(|ui| {
                 ui.label(
@@ -687,14 +719,40 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
-                let writable = state.writable();
-                if controls::text_button(ui, p, "New palette", true, writable)
-                    .on_hover_text(if writable { "" } else { state.why_not() })
+                // Room is what stops a palette being written that the next
+                // launch would not read back — see `PaletteLibrary::save`. The
+                // control is disabled and says which of the two it is rather
+                // than being live and refusing.
+                let room = state.library().is_some_and(|library| library.has_room());
+                let can_make = state.writable() && room;
+                if controls::text_button(ui, p, "New palette", true, can_make)
+                    .on_hover_text(if can_make {
+                        "Make an empty palette to save colours into".to_owned()
+                    } else if !state.writable() {
+                        state.why_not().to_owned()
+                    } else {
+                        format!(
+                            "Your library already holds {} palettes",
+                            palette::MAX_PALETTES
+                        )
+                    })
                     .clicked()
                 {
                     new_palette(&mut state, ed);
                 }
-                if controls::text_button(ui, p, "Import…", false, writable).clicked() {
+                if controls::text_button(ui, p, "Import…", false, can_make)
+                    .on_hover_text(if can_make {
+                        "Bring a .gpl palette into your library".to_owned()
+                    } else if !state.writable() {
+                        state.why_not().to_owned()
+                    } else {
+                        format!(
+                            "Your library already holds {} palettes",
+                            palette::MAX_PALETTES
+                        )
+                    })
+                    .clicked()
+                {
                     import(&mut state, ed);
                 }
                 if let Some(dir) = state.library().map(|library| library.dir().to_path_buf()) {
@@ -704,6 +762,14 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 }
             });
             ui.add_space(8.0);
+
+            // With no library there is nothing to list and two dead buttons
+            // above, so the modal has to say what is wrong rather than being a
+            // note about .gpl and a rectangle of nothing. The panel body says
+            // the same sentence for the same reason.
+            if !state.writable() {
+                controls::note(ui, p, state.why_not());
+            }
 
             egui::ScrollArea::vertical()
                 .id_salt("palette-library-list")
@@ -761,12 +827,35 @@ fn library_list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     // Collected and applied below the loop, because every arm needs the state
     // mutably in a way the loop cannot — a delete resolves against a library
     // the rows are still being drawn from.
+    //
+    // **Two slots, not one.** A field losing focus and a button being pressed
+    // are one frame's worth of *different* events: clicking Rename on a row
+    // below one whose field is open fires both, and a single "last one wins"
+    // slot threw the typed name away with nothing to show for it. The rename
+    // lands first below, so the name is saved and the button still does what it
+    // was pressed for.
     let mut request = None;
+    let mut renamed = None;
     for palette in library.palettes() {
-        if let Some(asked) = library_row(ui, p, state, palette) {
-            request = Some((palette.id.clone(), asked));
+        match library_row(ui, p, state, palette) {
+            Some(Request::Rename(name)) => renamed = Some((palette.id.clone(), name)),
+            Some(Request::CancelRename) => renamed = Some((palette.id.clone(), String::new())),
+            Some(asked) => request = Some((palette.id.clone(), asked)),
+            None => {}
         }
         ui.add_space(6.0);
+    }
+
+    if let Some((id, name)) = renamed {
+        state.renaming = None;
+        // An empty name is how the loop above spells Escape: the model would
+        // substitute "Untitled palette" for one, so it cannot be a real name
+        // arriving here and there is nothing to disambiguate.
+        if !name.is_empty() {
+            write(state, ed, "Could not rename the palette", |library| {
+                library.rename(&id, &name)
+            });
+        }
     }
 
     match request {
@@ -779,22 +868,16 @@ fn library_list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                 focus: true,
             });
         }
-        Some((id, Request::Rename(name))) => {
-            state.renaming = None;
-            write(state, ed, "Could not rename the palette", |library| {
-                library.rename(&id, &name)
-            });
-        }
-        Some((_, Request::CancelRename)) => state.renaming = None,
-        Some((id, Request::Export)) => export(state, ed, &id),
         Some((id, Request::Confirm)) => state.confirming = Some(id),
+        Some((_, Request::Keep)) => state.confirming = None,
+        Some((id, Request::Export)) => export(state, ed, &id),
         Some((id, Request::Delete)) => {
             state.confirming = None;
             write(state, ed, "Could not delete the palette", |library| {
                 library.remove(&id)
             });
         }
-        None => {}
+        Some((_, Request::Rename(_) | Request::CancelRename)) | None => {}
     }
 }
 
@@ -806,6 +889,11 @@ enum Request {
     Export,
     /// The first press of Delete: arm it and say so.
     Confirm,
+    /// Put an armed Delete back. `brushlib::confirm_overlay` spells this
+    /// **Keep**, so this does too — the alternative was a Delete that read
+    /// "Really?" with no way back except closing the modal, which leaves a row
+    /// armed and forgotten and deletes it on one click minutes later.
+    Keep,
     Delete,
 }
 
@@ -847,14 +935,21 @@ fn library_row(ui: &mut Ui, p: &Palette, state: &mut State, palette: &Swatches) 
                         }
                         if field.lost_focus() {
                             // Escape abandons; anything else — Enter, or a click
-                            // elsewhere — keeps what was typed. `rename` is
-                            // refused an empty name by the model, so a field
-                            // cleared and blurred is not a nameless palette.
-                            request = Some(if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                Request::CancelRename
-                            } else {
-                                Request::Rename(rename.text.clone())
-                            });
+                            // elsewhere — keeps what was typed. A field cleared
+                            // and blurred is not a nameless palette: the model
+                            // *substitutes* "Untitled palette" for an empty
+                            // name rather than refusing it, so the worst case is
+                            // a palette called that.
+                            let typed = rename.text.trim().to_owned();
+                            request = Some(
+                                if typed.is_empty()
+                                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                {
+                                    Request::CancelRename
+                                } else {
+                                    Request::Rename(typed)
+                                },
+                            );
                         }
                     }
                     None => {
@@ -882,33 +977,49 @@ fn library_row(ui: &mut Ui, p: &Palette, state: &mut State, palette: &Swatches) 
                 );
 
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if confirming { "Really?" } else { "Delete" };
-                    if controls::text_button(ui, p, label, confirming, true)
-                        .on_hover_text(if confirming {
-                            "This cannot be undone — the history covers painting only"
-                        } else {
-                            "Delete this palette"
-                        })
-                        .clicked()
-                    {
-                        request = Some(if confirming {
-                            Request::Delete
-                        } else {
-                            Request::Confirm
-                        });
-                    }
-                    if controls::text_button(ui, p, "Export…", false, !palette.is_empty())
-                        .on_hover_text(if palette.is_empty() {
-                            "Nothing to export yet"
-                        } else {
-                            "Write this palette out as a .gpl"
-                        })
-                        .clicked()
-                    {
-                        request = Some(Request::Export);
-                    }
-                    if controls::text_button(ui, p, "Rename", false, true).clicked() {
-                        request = Some(Request::StartRename);
+                    // An armed Delete shows a **Delete/Keep** pair, the way
+                    // `brushlib::confirm_overlay` asks. A single button that
+                    // changed its own label to "Really?" had no way back: a row
+                    // armed and forgotten deletes on one click minutes later,
+                    // and the only escape was closing the modal.
+                    if confirming {
+                        if controls::text_button(ui, p, "Delete", true, true)
+                            .on_hover_text(
+                                "This cannot be undone — the history covers painting only",
+                            )
+                            .clicked()
+                        {
+                            request = Some(Request::Delete);
+                        }
+                        if controls::text_button(ui, p, "Keep", false, true)
+                            .on_hover_text("Leave this palette where it is")
+                            .clicked()
+                        {
+                            request = Some(Request::Keep);
+                        }
+                    } else {
+                        if controls::text_button(ui, p, "Delete", false, true)
+                            .on_hover_text("Delete this palette")
+                            .clicked()
+                        {
+                            request = Some(Request::Confirm);
+                        }
+                        if controls::text_button(ui, p, "Export…", false, !palette.is_empty())
+                            .on_hover_text(if palette.is_empty() {
+                                "Nothing to export yet"
+                            } else {
+                                "Write this palette out as a .gpl"
+                            })
+                            .clicked()
+                        {
+                            request = Some(Request::Export);
+                        }
+                        if controls::text_button(ui, p, "Rename", false, true)
+                            .on_hover_text("Give this palette another name")
+                            .clicked()
+                        {
+                            request = Some(Request::StartRename);
+                        }
                     }
                 });
             });
@@ -923,6 +1034,13 @@ fn library_row(ui: &mut Ui, p: &Palette, state: &mut State, palette: &Swatches) 
 fn colour_strip(ui: &mut Ui, p: &Palette, palette: &Swatches) {
     let width = ui.available_width().max(1.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, STRIP_HEIGHT), Sense::hover());
+    // The room is claimed either way, so the list does not change height as it
+    // scrolls; only the forty-odd shapes are skipped. A library may hold
+    // `MAX_PALETTES` rows, which is the same omission the swatch grid just had
+    // fixed, one modal away.
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
     let shown = palette.len().min(STRIP_TILES);
     let each = rect.width() / shown.max(1) as f32;
     for (index, swatch) in palette.swatches.iter().take(shown).enumerate() {
@@ -948,6 +1066,58 @@ fn colour_strip(ui: &mut Ui, p: &Palette, palette: &Swatches) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The module's headline rule, in the model: the palette in front is held
+    /// by **id**, so a delete cannot silently leave the panel showing a
+    /// different palette. It is pure state and needs no window.
+    #[test]
+    fn the_palette_in_front_is_a_name_and_never_a_position() {
+        let dir = std::env::temp_dir().join("umber-palette-settle");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = PaletteLibrary::load_from(&dir);
+        // Named so the sorted order is a, b, c.
+        let a = library.create("Alpha").expect("made");
+        let b = library.create("Beta").expect("made");
+        let c = library.create("Gamma").expect("made");
+
+        let mut state = State {
+            store: Store::Ready(Arc::new(library.clone())),
+            selected: None,
+            library_open: false,
+            renaming: None,
+            confirming: None,
+        };
+        // Nothing selected takes the first, so a library with palettes in it
+        // never draws a panel that looks broken.
+        state.settle_selection();
+        assert_eq!(state.selected.as_deref(), Some(a.as_str()));
+
+        // A selection that still names something is left exactly alone, whatever
+        // position it is in — this is the case an index would get wrong.
+        state.selected = Some(c.clone());
+        library.remove(&a).expect("deleted");
+        state.store = Store::Ready(Arc::new(library.clone()));
+        state.settle_selection();
+        assert_eq!(
+            state.selected.as_deref(),
+            Some(c.as_str()),
+            "deleting the palette above it moved the selection"
+        );
+
+        // And one whose palette has gone falls back rather than pointing at
+        // nothing.
+        library.remove(&c).expect("deleted");
+        state.store = Store::Ready(Arc::new(library));
+        state.settle_selection();
+        assert_eq!(state.selected.as_deref(), Some(b.as_str()));
+
+        // With no library at all there is nothing to point at, and a stale id
+        // would outlive the thing it named.
+        state.store = Store::Broken("no data directory".into());
+        state.settle_selection();
+        assert_eq!(state.selected, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A library in a directory of its own, with two palettes in it, for the
     /// preview shots below to draw.

@@ -33,9 +33,11 @@
 //! and for a stronger reason: **the interchange format is the storage format**.
 //!
 //! GIMP's `.gpl` is the universal palette format. It is a dozen lines of plain
-//! text, and GIMP, Krita, Inkscape and Aseprite all read and write it — the
-//! four named because those four are checkable, not because the list ends
-//! there. Storing the library as one `.gpl` per palette means:
+//! text, and GIMP, Krita, Inkscape and Aseprite all read it — the four named
+//! because those four are checkable, not because the list ends there, and
+//! *read* rather than "read and write" because Inkscape's palettes **are**
+//! `.gpl` files and it has no export for them. Storing the library as one
+//! `.gpl` per palette means:
 //!
 //! - **There is one decoder and one encoder.** Import is reading a file into
 //!   the directory and export is copying one out; neither is a second parser to
@@ -120,6 +122,10 @@ pub enum PaletteError {
         found: usize,
         max: usize,
     },
+    /// The library already holds as many palettes as it will read back.
+    Full {
+        max: usize,
+    },
     /// No id in this library matches.
     Unknown(String),
     NoDataDirectory,
@@ -141,6 +147,10 @@ impl fmt::Display for PaletteError {
                 f,
                 "{} holds {found} colours, and Umber reads at most {max} in one palette",
                 path.display()
+            ),
+            Self::Full { max } => write!(
+                f,
+                "the library already holds {max} palettes, which is as many as Umber reads back"
             ),
             Self::Unknown(id) => write!(f, "there is no palette called “{id}” in the library"),
             Self::NoDataDirectory => {
@@ -443,6 +453,17 @@ pub struct PaletteLibrary {
     dir: PathBuf,
     /// Sorted by name — see [`Self::sort`].
     palettes: Vec<Palette>,
+    /// Stems of `.gpl` files in the directory that are **not** in `palettes`:
+    /// ones that would not parse, and ones past [`MAX_PALETTES`].
+    ///
+    /// Kept because a filename is an id here, and an id has to be free of every
+    /// file in the directory rather than of every palette that happened to
+    /// load. Without this, a file the library has just warned the user it could
+    /// not read is a name [`Self::free_id`] hands straight out — and
+    /// `write_atomically` renames over it. The artist is told their palette
+    /// could not be read and then it is destroyed, silently, in the same
+    /// session.
+    occupied: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -477,6 +498,7 @@ impl PaletteLibrary {
         let mut library = Self {
             dir,
             palettes: Vec::new(),
+            occupied: Vec::new(),
             warnings: Vec::new(),
         };
         let Ok(entries) = fs::read_dir(&library.dir) else {
@@ -494,17 +516,32 @@ impl PaletteLibrary {
         // library that reads back differently on two machines is one whose
         // "first palette" is a different palette on each.
         paths.sort();
+        let mut over = false;
         for path in paths {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if library.palettes.len() >= MAX_PALETTES {
-                library.warnings.push(format!(
-                    "{} holds more than {MAX_PALETTES} palettes; the rest were not read",
-                    library.dir.display()
-                ));
-                break;
+                // Every remaining file still owns its name, so the loop carries
+                // on collecting stems rather than breaking. One warning, not one
+                // per file.
+                if !over {
+                    over = true;
+                    library.warnings.push(format!(
+                        "{} holds more than {MAX_PALETTES} palettes; the rest were not read",
+                        library.dir.display()
+                    ));
+                }
+                library.occupied.push(stem);
+                continue;
             }
             match Self::read_file(&path) {
                 Ok(palette) => library.palettes.push(palette),
-                Err(e) => library.warnings.push(e.to_string()),
+                Err(e) => {
+                    library.warnings.push(e.to_string());
+                    library.occupied.push(stem);
+                }
             }
         }
         library.sort();
@@ -569,6 +606,12 @@ impl PaletteLibrary {
     ///
     /// Returns the id, which the caller needs when the palette was built by
     /// [`Palette::new`] and has none yet.
+    /// Whether another palette will fit. The New control reads this and is
+    /// *disabled* when it is false, rather than being live and refusing.
+    pub fn has_room(&self) -> bool {
+        self.palettes.len() < MAX_PALETTES
+    }
+
     pub fn save(&mut self, mut palette: Palette) -> Result<String, PaletteError> {
         if palette.name.trim().is_empty() {
             palette.name = self.free_name(UNTITLED);
@@ -576,7 +619,16 @@ impl PaletteLibrary {
         if palette.id.is_empty() {
             palette.id = self.free_id(&palette.name);
         }
+        // Refused rather than written, and only for a palette that is *new*:
+        // `load_from` stops reading at `MAX_PALETTES`, so one written past it
+        // would be in the list this session and gone the next, with a warning
+        // about a directory the artist did not know was full. Saving an edit to
+        // a palette already here is always allowed — it writes no new file.
         let id = palette.id.clone();
+        let known = self.palettes.iter().any(|p| p.id == id);
+        if !known && !self.has_room() {
+            return Err(PaletteError::Full { max: MAX_PALETTES });
+        }
         self.write(&palette)?;
         match self.palettes.iter_mut().find(|p| p.id == id) {
             Some(existing) => *existing = palette,
@@ -670,8 +722,17 @@ impl PaletteLibrary {
         write_atomically(path, &palette.to_gpl())
     }
 
+    /// The file one id names.
+    ///
+    /// `slug` is applied here and not only where an id is *minted*, because
+    /// [`Palette::id`] is a public field and this is the one place it becomes a
+    /// path. "The callers only pass ids this module made" is not good enough —
+    /// it is the standard [`crate::docformat`]'s reaper is held to, and the
+    /// failure it prevents is a name with a separator in it writing outside the
+    /// library. An id that is already a slug is unchanged by this, which is
+    /// every id the library itself produced.
     fn path_of(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.{GPL_EXTENSION}"))
+        self.dir.join(format!("{}.{GPL_EXTENSION}", slug(id)))
     }
 
     fn write(&self, palette: &Palette) -> Result<(), PaletteError> {
@@ -693,14 +754,25 @@ impl PaletteLibrary {
         )
     }
 
-    /// A filename stem no palette here already occupies.
+    /// A filename stem no file in the directory already occupies.
     ///
     /// Derived from the name so the directory is legible from a file manager,
     /// and reduced to what every filesystem accepts, so a palette called
     /// "Ochres / greys" cannot produce a path with a directory separator in it.
+    ///
+    /// Judged against **every `.gpl` that was seen**, not against the palettes
+    /// that loaded — see [`Self::occupied`]. A file that would not parse still
+    /// owns its name, and handing that name out means the next write renames
+    /// over it: the artist is told their palette could not be read, and then it
+    /// is destroyed.
     fn free_id(&self, name: &str) -> String {
         let base = slug(name);
-        let taken: Vec<&str> = self.palettes.iter().map(|p| p.id.as_str()).collect();
+        let taken: Vec<&str> = self
+            .palettes
+            .iter()
+            .map(|p| p.id.as_str())
+            .chain(self.occupied.iter().map(String::as_str))
+            .collect();
         if !taken.contains(&base.as_str()) {
             return base;
         }
@@ -1017,6 +1089,57 @@ mod tests {
         assert!(library.remove(&id).expect("deleted"));
         assert!(!library.remove(&id).expect("already gone is not an error"));
         assert!(PaletteLibrary::load_from(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file the library could not read still owns its name. Handing that name
+    /// out means the next write renames over it — so the artist is told their
+    /// palette could not be read, and then it is destroyed, in the same session
+    /// and with no second warning.
+    #[test]
+    fn a_file_that_would_not_read_is_never_written_over() {
+        let dir = temp_dir("occupied");
+        fs::create_dir_all(&dir).expect("a directory");
+        // A file whose stem is exactly what `create("Bad")` would mint.
+        fs::write(dir.join("bad.gpl"), "this is not a palette").unwrap();
+        let before = fs::read_to_string(dir.join("bad.gpl")).unwrap();
+
+        let mut library = PaletteLibrary::load_from(&dir);
+        assert_eq!(library.warnings().len(), 1, "it said it could not read it");
+        let id = library.create("Bad").expect("made");
+        assert_ne!(id, "bad", "the stem was already taken");
+        assert_eq!(
+            fs::read_to_string(dir.join("bad.gpl")).unwrap(),
+            before,
+            "the file the library warned about was overwritten"
+        );
+        assert!(dir.join(format!("{id}.gpl")).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A palette written past what `load_from` will read back would be in the
+    /// list this session and gone the next, with a warning about a directory
+    /// nobody was told was full. It is refused instead, and the control that
+    /// offers it reads `has_room`.
+    #[test]
+    fn the_library_refuses_a_palette_it_could_not_read_back() {
+        let dir = temp_dir("full");
+        let mut library = PaletteLibrary::load_from(&dir);
+        for n in 0..MAX_PALETTES {
+            library.create(&format!("P{n}")).expect("room");
+        }
+        assert!(!library.has_room());
+        assert!(matches!(
+            library.create("One too many"),
+            Err(PaletteError::Full { .. })
+        ));
+        // An edit to a palette already here is always allowed: it writes no new
+        // file, so nothing is lost on the next launch.
+        let id = library.palettes()[0].id.clone();
+        let mut palette = library.get(&id).expect("there").clone();
+        palette.add(Swatch::new([1, 2, 3]));
+        library.save(palette).expect("an edit still saves");
+        assert_eq!(library.get(&id).expect("there").len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
