@@ -202,12 +202,18 @@ All four are written into the `.ora` and read back out of it.
 contents are stepped in beneath it. Drag a layer sideways as well as up and
 down: how far right the pointer is decides what it lands inside, one step of the
 indent per level, and dragging to the far left of the list takes it back out.
-Eight levels of nesting, and a folder travels with everything in it.
+A dashed outline shows where it would land and at what nesting before you let
+go, and **dragging past either end of the list means the top level** — which is
+how something comes out of a group when every row is inside one, and how a
+second top-level folder gets made. Eight levels of nesting, and a folder travels
+with everything in it.
 
 A folder's **eye and lock reach what is inside it** — hide the group and every
 layer in it goes, without their own eyes changing, so opening it again brings
-them all back. Ticking a folder ticks its contents, which is how "show
-everything in this group" is said. Deleting one deletes what it holds.
+them all back, and a layer a folder has locked shows a faint padlock of its own
+so the refusal is never a surprise. Ticking a folder ticks its contents, which
+is how "show everything in this group" is said. Deleting one deletes what it
+holds.
 
 What a folder does not have is an **opacity or a blend mode of its own**; see
 [what is not there yet](#what-is-not-there-yet). Everything a folder *is* today
