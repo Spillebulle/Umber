@@ -9,7 +9,13 @@
 #   2. checks Cargo.toml's version matches the one asked for
 #   3. checks CHANGELOG.md has a section for it, and prints the notes
 #   4. runs fmt, clippy and the tests — the same gates CI runs
-#   5. pushes the branch, writes an annotated tag, pushes the tag
+#   5. pushes the branch and waits for CI to pass on that very commit
+#   6. writes an annotated tag and pushes it
+#
+# Step 5 is why this needs the GitHub CLI. The gates in step 4 run on one
+# machine, and every release that has gone wrong went wrong on a platform that
+# machine is not — so a green run here is not evidence, and the tag waits for
+# one that is. `-SkipCi` opts out; nothing else about the order is optional.
 #
 # Pushing the tag is the whole of "make a release": the Release workflow builds
 # the binaries, packages them and publishes the notes. Nothing here uploads
@@ -29,7 +35,12 @@ param(
 
     # Skip the test run. For when they have just been run and the tree has not
     # moved; not for when they are failing.
-    [switch]$SkipTests
+    [switch]$SkipTests,
+
+    # Tag without waiting for CI to pass on the pushed commit. The escape hatch
+    # for a machine with no `gh`; see the comment at the wait itself for why it
+    # is not the default.
+    [switch]$SkipCi
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +150,69 @@ if ($DryRun) {
 Step "pushing $branch"
 git push origin $branch
 if ($LASTEXITCODE -ne 0) { Fail 'pushing the branch failed' }
+
+# --- 5a. wait for CI on the commit being tagged ------------------------------
+#
+# **The gates above run on one machine, and that is the whole problem.** Every
+# release that has failed so far failed on a platform this machine is not:
+# 0.0.2 on a timing assertion on macOS, 0.0.4 on code that only compiled on
+# Windows, 0.0.5 on a GPU test that only rounds that way on hardware. Each was
+# green locally, each was tagged, and each was found out afterwards — which is
+# exactly the thing the header of this script says must not happen, because a
+# tag spent on a broken workflow is one somebody may already have fetched.
+#
+# So the branch is pushed, CI is *watched* on that very commit, and the tag is
+# written only once it is green. Nothing is spent if it is not: the commit is on
+# main either way, and the fix is another commit and another run of this script.
+#
+# It costs the wall-clock time of a CI run, which is the correct price and is
+# paid once per release.
+
+if ($SkipCi) {
+    Write-Host 'not waiting for CI as asked — the tag may land on a red commit' -ForegroundColor Yellow
+} else {
+    $sha = (git rev-parse HEAD).Trim()
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Fail @"
+the GitHub CLI (gh) is not installed, so CI cannot be checked before tagging.
+Install it, or pass -SkipCi to tag without waiting — knowing that every release
+that has gone wrong so far went wrong on a platform this machine is not.
+"@
+    }
+
+    Step "waiting for CI on $($sha.Substring(0, 8))"
+    $deadline = (Get-Date).AddMinutes(45)
+    $run = $null
+    while ($true) {
+        if ((Get-Date) -gt $deadline) {
+            Fail 'CI has not finished within 45 minutes. Nothing has been tagged; look at the run and try again.'
+        }
+        # `--json` keeps this off the human-readable format, which changes.
+        $runs = gh run list --workflow=ci.yml --limit 20 --json headSha,databaseId,status,conclusion,url |
+            ConvertFrom-Json
+        $run = $runs | Where-Object { $_.headSha -eq $sha } | Select-Object -First 1
+        if ($null -eq $run) {
+            # GitHub has not created the run yet; that is ordinary for the first
+            # few seconds after a push.
+            Write-Host '    waiting for the run to appear...' -ForegroundColor DarkGray
+        } elseif ($run.status -ne 'completed') {
+            Write-Host "    $($run.status)..." -ForegroundColor DarkGray
+        } else {
+            break
+        }
+        Start-Sleep -Seconds 20
+    }
+
+    if ($run.conclusion -ne 'success') {
+        Fail @"
+CI on this commit concluded '$($run.conclusion)'. Nothing has been tagged.
+  $($run.url)
+Fix it, commit, and run this again — the version and the notes are already in
+place, so there is nothing to redo but the fix.
+"@
+    }
+    Write-Host '    CI is green' -ForegroundColor Green
+}
 
 Step "tagging $tag"
 git tag -a $tag -m "Umber $Version"

@@ -1733,6 +1733,31 @@ device with no surface, stamps dabs, commits, and reads pixels back. These tests
 catch shader and blend-state bugs that no CPU test can. They **skip** rather
 than fail when no adapter exists, so they stay meaningful on CI runners.
 
+- **`UMBER_TEST_SOFTWARE=1` runs the whole suite on the software rasteriser,
+  and it is how a CI failure is reproduced before it is pushed.** GitHub's
+  runners have no graphics card, so every one of these tests runs there on WARP
+  or lavapipe while this machine runs them on hardware. The two agree about what
+  the shaders *do* and disagree in the last bit of floating point — so an
+  assertion comparing exact bytes can pass here and fail there, which is how
+  v0.0.5 was tagged broken. It reaches the adapter through `Gpu::with_adapter`
+  and `gpu::Choice`, so the limits and the device description stay stated once;
+  `Gpu::new` is unchanged and everything shipped still asks for the best adapter
+  there is.
+- **An assertion about pixels that have been through a shader may not promise a
+  byte.** Where coverage is only ever 0 or 1 the arithmetic has nothing to round
+  and exactness is real — `a_hard_edged_rectangular_lift_is_exact` is the
+  pattern, and it holds on both adapters. Where an edge is antialiased, compare
+  the **alpha** (linear 8-bit even in an sRGB format, hence `alphas`) and allow
+  the one level the store can round by. Do not compare colour at a nearly
+  transparent pixel at all: at an alpha of two, one level of it moves the
+  encoded byte by six, which says nothing about the code.
+- **Nothing here may assert wall-clock time on CI.** A runner is a machine
+  nobody chose under a load nobody controls. `a_capture_of_a_large_document_
+  never_costs_a_frame` states the machine-independent half — that the capture is
+  *spread* across frames — and gates the millisecond figure on not being CI and
+  not being a software adapter. v0.0.2 was tagged broken by the version that
+  did not.
+
 `export_rgba`, `pick_colour` and the autosave's capture all reuse the *screen*
 composite pass with an export flag rather than having their own shader. A second
 copy of the blend maths would be a second thing to keep in step, and an export
@@ -2008,9 +2033,29 @@ pwsh tools/release.ps1 0.0.2           # for real
 
 **Cutting a release is pushing a tag.** Everything else follows from that, which
 is what stops a release being a sequence somebody has to remember. The script
-checks the tree, the version and the notes, runs the same gates CI runs, then
-pushes `main` and an annotated `v<version>` tag. It uploads nothing, so it
-cannot half-publish; `.github/workflows/release.yml` does the rest.
+checks the tree, the version and the notes, runs the same gates CI runs, pushes
+`main`, **waits for CI to pass on that very commit**, and only then writes and
+pushes an annotated `v<version>` tag. It uploads nothing, so it cannot
+half-publish; `.github/workflows/release.yml` does the rest.
+
+- **The tag waits for CI, and this is the rule the other three were learned
+  from.** The gates in the script run on one machine, and every release that has
+  gone wrong went wrong on a platform that machine is not: 0.0.2 on a timing
+  assertion on macOS, 0.0.4 on code that only compiled on Windows, 0.0.5 on a
+  GPU test that only rounds that way on hardware. All three were green locally,
+  all three were tagged, and all three were found out afterwards. A local pass
+  is therefore not evidence, and the tag waits for one that is. Nothing is spent
+  on a red run: the commit is on `main` either way and the fix is another commit
+  and another run of the script. It needs the GitHub CLI for this and says so;
+  `-SkipCi` / `--skip-ci` opts out, and is for a machine without `gh` rather
+  than for a hurry.
+- **The two scripts have to stay in step**, `release.ps1` and `release.sh`, the
+  same arrangement `tools/fetch-brushes.*` keeps.
+- **`release.ps1` wants PowerShell 7.** Under Windows PowerShell 5.1 a native
+  command's stderr becomes an error record, so `$ErrorActionPreference = 'Stop'`
+  aborts the script on cargo's ordinary progress output. Do not "fix" that by
+  redirecting or by loosening the preference — the preference is what makes a
+  failing gate stop the release.
 
 - **`CHANGELOG.md` is the release notes**, published verbatim. There is no
   second place to write them and therefore no way for GitHub and the repository
