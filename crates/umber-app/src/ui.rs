@@ -38,8 +38,8 @@ pub struct UiActions {
     /// for a cut — off the layer. The caller's, because both block on a
     /// readback *and* on the encode that puts the picture on the machine's
     /// clipboard, and a cut records an undo entry. On a very large region that
-    /// is seconds, which `sysclip`'s module docs measure and this button
-    /// therefore shares. Raised by the selection's overlay strip, which is the only
+    /// is about a second, which `examples/measure-clipboard.rs` measures and
+    /// this button therefore shares. Raised by the selection's overlay strip, which is the only
     /// control for either; the keyboard reaches the same two methods directly
     /// rather than through here.
     pub copy_selection: bool,

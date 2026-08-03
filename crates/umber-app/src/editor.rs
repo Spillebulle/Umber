@@ -406,6 +406,17 @@ pub struct Editor {
     /// desktop is still holding its own copy; all it would buy is a re-read on
     /// the next paste, at the cost of two lifetimes for one clipboard. A cap on
     /// the size is a separate question and is not answered here.
+    ///
+    /// **A second picture can be live beside this one**, and only one:
+    /// `sysclip::OnDesktop::Echo`, on a platform whose clipboard does not hand
+    /// back what it was given. `put_image` clears it before every write and
+    /// `note_adopted` replaces it, so there is never more than one — and
+    /// Windows and Linux keep none at all, because an echo equal to the clip is
+    /// dropped. Where one is kept the worst case is worth naming: a bare Ctrl+X
+    /// on the 10000² canvas the Undo section uses as its bound holds the
+    /// 400 MB undo patch, 400 MB here, 400 MB of echo, and whatever the
+    /// platform's own pasteboard keeps, with the decode buffer transiently on
+    /// top of that.
     pub clipboard: Option<Clip>,
     /// The selection outline being drawn, if one is. Transient like
     /// [`Editor::stroke`], and abandoned rather than carried across a tab
