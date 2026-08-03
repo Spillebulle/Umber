@@ -866,32 +866,57 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         );
     });
 
-    // Which cursor the last painted frame asked for. "The arrow is still under
-    // my pen" has two causes that look identical from the outside — Umber never
-    // asked, or Umber asked and the window system did not carry it out — and
-    // this is the only reading that separates them. What it reports is the
-    // request, not the screen, and the tooltip says so: nothing in this process
-    // can see what Windows actually drew.
+    // Which cursor Umber asked for. "The arrow is still under my pen" has two
+    // causes that look identical from the outside — Umber never asked, or Umber
+    // asked and the window system did not carry it out — and this is the only
+    // reading that separates them. What it reports is the request, not the
+    // screen, and the wording says so: nothing in this process can see what
+    // Windows actually drew.
+    //
+    // The count is doing the real work and the reading beside it is context.
+    // This pane lives in a modal, and while one is open egui answers the
+    // modal's own layer for every point in the window — so `pen_dot` declines
+    // everywhere and every frame you can *read* this on says "the ordinary
+    // pointer". `InputLog` therefore skips those frames, and the count is
+    // clobber-proof besides: opening the menu to get here is an ordinary
+    // `Area`, so those frames do count, and they record the pen over the menu.
     let cursor = ed.input.cursor_hidden;
+    let asked = ed.input.hidden_frames;
+    // A figure inside the sentence rather than a second row, so "it has asked
+    // before" and "it is not asking now" are one reading instead of two that
+    // have to be held side by side.
+    let words = match (cursor, asked) {
+        (_, 0) => "Never asked to hide it".to_string(),
+        (Some(true), _) => "None, so the canvas can draw its own dot".to_string(),
+        (_, n) => format!("The ordinary pointer now; hidden on {n} earlier frames"),
+    };
     controls::row(ui, p, "Cursor asked for", |ui| {
         ui.label(
-            egui::RichText::new(match cursor {
-                Some(true) => "None, so the canvas can draw its own dot",
-                Some(false) => "The ordinary pointer",
-                None => "nothing yet",
-            })
-            .size(text::SMALL)
-            .color(if cursor.is_some() { p.text } else { p.text_dim }),
+            egui::RichText::new(&words)
+                .size(text::SMALL)
+                .color(if asked == 0 { p.text_dim } else { p.text }),
         )
-        .on_hover_text(
-            "What the last painted frame asked the window system for, which is \
-             not the same as what ended up on screen. If this says None while a \
-             pen is over the canvas and an arrow is still showing, the request \
-             is being dropped below Umber. If it says the ordinary pointer, \
-             Umber decided the pen was not over the canvas at all.",
-        );
+        .on_hover_text(CURSOR_HELP);
     });
 }
+
+/// Why the row above is worth reading, what to do to make it say something,
+/// and what it cannot tell you.
+///
+/// Long, and its own constant so that it can be — this is the one control in
+/// Umber whose whole purpose is to be read by somebody diagnosing hardware
+/// nobody here has. The *previous* version was three lines and asserted that
+/// "the ordinary pointer" meant Umber had decided the pen was not over the
+/// canvas; that was false whenever this dialog was open, which is whenever
+/// anybody could read it.
+const CURSOR_HELP: &str = "What Umber asked the window system for, which is not \
+     the same as what ended up on screen — nothing in this process can see what \
+     was actually drawn. Frames with a dialog over the canvas are left out, \
+     because Umber correctly asks for an ordinary pointer on those and this one \
+     is a dialog. So: hover a pen over the canvas, then come back. If the count \
+     is rising and an arrow is still showing under the pen, the request is being \
+     dropped below Umber. If it stays at zero, Umber never asked — look at the \
+     route and gesture rows above for why.";
 
 /// Where pressure comes from: the one setting on this page, and the two knobs
 /// that hang off one of its answers.

@@ -2022,11 +2022,14 @@ impl UmberApp {
         // *what the interface asked for this frame* — `ui::pen_cursor` is the
         // only thing that ever asks for `None` — so the state runs the same way
         // it does for every other cursor: derived per frame, never remembered.
-        // The focus half is `syscursor`'s rule and its docs have the argument:
-        // the cursor shape is shared, so a repaint while somebody is working in
-        // another application must not blank *their* pointer.
-        let hide_cursor =
-            platform_output.cursor_icon == egui::CursorIcon::None && gfx.window.has_focus();
+        //
+        // Focus is deliberately *not* re-tested here. It is folded into the
+        // request, in `Editor::pen_dot`, and testing it a second time on this
+        // side is what let the two disagree: the request said "none" while the
+        // platform call was skipped, so nothing ever put the arrow back. One
+        // condition, and the platform call happens exactly when the frame asked
+        // for no cursor.
+        let hide_cursor = platform_output.cursor_icon == egui::CursorIcon::None;
         gfx.egui_state
             .handle_platform_output(&gfx.window, platform_output);
         // …and after, because egui-winit's own attempt goes first and, on
@@ -2043,7 +2046,15 @@ impl UmberApp {
         // pen lives by. It is the one place "Umber never asked" and "Umber
         // asked and the platform ignored it" can be told apart, on a machine
         // that actually has a tablet.
-        self.editor.input.note_cursor(hide_cursor);
+        //
+        // `obscured` is what makes the row worth reading at all. egui's
+        // `layer_id_at` answers the *modal's* layer for every point in the
+        // window while one is open — not a hit test, see `over_egui_area` — so
+        // `pen_dot` correctly declines everywhere, and every frame the user can
+        // actually see this pane on is a frame that says nothing about the pen.
+        // Recording those would pin the row to one answer for ever.
+        let obscured = gfx.egui_ctx.memory(|m| m.top_modal_layer().is_some());
+        self.editor.input.note_cursor(hide_cursor, obscured);
 
         // What egui itself wants next, which is the *only* thing that should
         // schedule a frame with no input behind it.
@@ -3794,6 +3805,17 @@ impl ApplicationHandler<Wake> for UmberApp {
                         // frame is asked for only where something that moved is
                         // actually drawn — over a panel or a menu this would be
                         // repainting an identical picture.
+                        //
+                        // This is a *narrowing* of what already happens rather
+                        // than the thing that makes the hover paint: egui-winit
+                        // has already asked for a repaint on the same event, so
+                        // taking this out would cost frames and lose nothing.
+                        // Do not go the other way and stop the pass-through as
+                        // well. Under a pen the cursor is re-derived per frame
+                        // and hidden by `syscursor` per frame, so a hover that
+                        // stopped producing frames over a *panel* would leave
+                        // whatever the last canvas frame asked for standing —
+                        // which is no cursor at all, over the controls.
                         if wants_frame || self.editor.pointer_over_canvas(pos) {
                             self.request_redraw();
                         }

@@ -1,6 +1,6 @@
 //! Taking the arrow off the screen when the canvas is drawing its own pointer.
 //!
-//! [`ui::pen_cursor`](crate::ui) asks egui for `CursorIcon::None`, and that is
+//! `ui::pen_cursor` asks egui for `CursorIcon::None`, and that is
 //! still the request — this module is only what carries it out on the one
 //! platform where winit cannot. The layering is unchanged: egui re-derives the
 //! cursor from what the interface asked for on every frame, `app::render` reads
@@ -63,25 +63,47 @@
 //! `set_cursor` calls `SetCursor` on the spot rather than waiting for a
 //! `WM_SETCURSOR` that, by the argument above, a pen never provokes.
 //!
-//! **Only while the window has focus.** The cursor shape is a shared, global
-//! thing, not this thread's — MSDN's rule is that a window sets it only over
-//! its own client area, which is why winit does this from a `WM_SETCURSOR`
-//! handler gated on `HTCLIENT`. Umber has no such handler to sit in, and it
-//! repaints for reasons of its own (an autosave notice, an update answer, an
-//! egui animation). Without the guard, a pen left hovering over the canvas
-//! while the user works in another application blanks the cursor wherever it
-//! now is on the desktop, once per repaint. Focus is not the same test as
-//! `HTCLIENT` and is deliberately the cheaper one: `pen_dot` has already said
-//! the pointer is over the canvas, so focus is the only part left.
+//! **Only while the window has focus — and that guard is not here.** The cursor
+//! shape is a shared, global thing rather than this thread's; MSDN's rule is
+//! that a window sets it only over its own client area, which is why winit does
+//! this from a `WM_SETCURSOR` handler gated on `HTCLIENT`. Umber has no such
+//! handler to sit in and repaints for reasons of its own — an autosave notice,
+//! an update answer, an egui animation — so a pen left hovering over the canvas
+//! while the user works elsewhere would blank the cursor wherever it now is,
+//! once per repaint.
+//!
+//! The guard was tried *here*, beside the call, and that was wrong in a way
+//! worth writing down: the **request** then still said "none", so egui-winit
+//! deduped it against `current_cursor_icon`, never called `set_cursor`, and the
+//! blank shape this module had already installed stayed in force across the
+//! whole desktop — with no later frame able to take it back, because nothing
+//! had changed as far as egui was concerned. Alt-Tab away by keyboard with the
+//! pen hovering and that is the state. It is exactly "a window with no pointer
+//! in it and no way to say so", which is what `pen_cursor` rejects
+//! `set_cursor_visible` for, arrived at from the other side.
+//!
+//! So focus lives in [`Editor::pen_dot`](crate::Editor::pen_dot), in what the
+//! interface asks for. Unfocused, egui asks for a real `CursorIcon`, the dedupe
+//! passes, winit's `set_cursor` restores the arrow on the spot, and this
+//! function is not called at all because `cursor_icon` is no longer `None`. One
+//! condition, and the two halves cannot disagree.
 //!
 //! Nothing is needed on macOS or Linux: `set_cursor_visible` there is not gated
 //! on anything a pen fails to produce. Neither platform has a pen path at all
 //! yet, so this would be untested code on top of untestable code.
+//!
+//! **Nothing in the test suite covers this file.** Delete it and every test
+//! still passes: what they pin is that Umber *asks* for no cursor in the right
+//! circumstances, which is `Editor::pen_dot` and is a rule. Whether the ask
+//! reaches the screen is a property of Windows, of a driver and of a tablet
+//! nobody working on Umber has — so the evidence for it is the reading in
+//! Settings → Input & pen, and that is why the reading exists.
 
 /// Draw no cursor at all, for as long as the caller keeps asking.
 ///
 /// Called once per frame in which the interface asked for
-/// `egui::CursorIcon::None` *and* the window had focus, and never otherwise.
+/// `egui::CursorIcon::None`, and never otherwise. Focus is already folded into
+/// that request — see the module docs — so there is nothing to re-test here.
 #[cfg(windows)]
 pub fn hide_now() {
     use windows_sys::Win32::UI::WindowsAndMessaging::SetCursor;
@@ -90,7 +112,7 @@ pub fn hide_now() {
     // documented request for no cursor; there is no pointer to dereference and
     // no failure to check. It must be called from the thread that owns the
     // window, which this is — `app::render` runs on the winit event loop — and
-    // only while the cursor belongs to us, which is the caller's focus guard.
+    // only while the cursor is ours to set, which `pen_dot`'s focus test is.
     unsafe {
         SetCursor(std::ptr::null_mut());
     }

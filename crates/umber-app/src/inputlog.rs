@@ -252,9 +252,9 @@ pub struct InputLog {
     /// How many touch events carried a force reading at all. A tablet whose
     /// touches all arrive with none is a driver problem, not a Umber one.
     pub with_force: u32,
-    /// What the last painted frame asked the window system for: `Some(true)`
-    /// where the interface wanted no cursor at all, `Some(false)` where it
-    /// wanted an ordinary one, `None` before any frame has been painted.
+    /// What the last **unobscured** painted frame asked the window system for:
+    /// `Some(true)` where the interface wanted no cursor at all, `Some(false)`
+    /// where it wanted an ordinary one, `None` before any such frame.
     ///
     /// The reason this is worth a row of its own: "the arrow is still there
     /// under my pen" has two completely different causes, and the other columns
@@ -264,10 +264,30 @@ pub struct InputLog {
     /// did not carry it out, which is a real thing that happens here and is
     /// what `syscursor` exists for. This says which.
     ///
+    /// **Frames with a modal up are skipped, and that is what makes the row
+    /// answerable rather than constant.** `Context::layer_id_at` returns the
+    /// modal's own layer for *every* point in the window while one is open, so
+    /// `Editor::pen_dot` declines everywhere and the frame's answer is always
+    /// "an ordinary cursor" — correctly, and saying nothing about the pen. Since
+    /// this pane is itself inside a modal, recording those frames would pin the
+    /// row to that one answer on every frame the user can read it, and the
+    /// interesting arm would be unreachable. So the reading held here is the
+    /// last frame on which the question meant something.
+    ///
     /// An `Option` because "no frame has been painted yet" is not the same
     /// answer as "an ordinary cursor", the same rule [`Sample::reported`] lives
     /// by. Recorded, never recomputed: it is the very bool the frame acted on.
     pub cursor_hidden: Option<bool>,
+    /// How many painted frames have asked for no cursor at all.
+    ///
+    /// The clobber-proof half of the row above, and it is needed because
+    /// getting *to* this pane moves the pointer: opening a menu is an `Area`
+    /// rather than a modal, so those frames are recorded, and they record the
+    /// pen sitting over the menu — which would overwrite the one reading the
+    /// user opened the pane to see. A count only rises, so "Umber has asked at
+    /// least once" survives the journey. Same idiom as [`Self::with_force`],
+    /// and it is what lets the row tell "never asked" from "not asking now".
+    pub hidden_frames: u32,
     /// Touch id currently in contact, for [`Motion::of`]. One rather than a set
     /// because it only has to tell a contact from a hover, and a second finger
     /// is a pinch the stroke path already refuses.
@@ -296,6 +316,7 @@ impl Default for InputLog {
             touch_events: 0,
             with_force: 0,
             cursor_hidden: None,
+            hidden_frames: 0,
             contact: None,
             pos: Vec2::ZERO,
             probe: PressureModel::default(),
@@ -424,8 +445,18 @@ impl InputLog {
     /// event-driven, and deliberately — it is a statement about a *frame*, and
     /// the frames between two pointer events are exactly where an arrow that
     /// should not be there is sitting.
-    pub fn note_cursor(&mut self, hidden: bool) {
-        self.cursor_hidden = Some(hidden);
+    ///
+    /// `obscured` says a modal was up, which makes the frame's answer
+    /// uninformative rather than wrong — see [`Self::cursor_hidden`]. The count
+    /// is still taken from every frame, because a hide *did* happen on it and
+    /// the whole point of the count is that nothing can take it back.
+    pub fn note_cursor(&mut self, hidden: bool, obscured: bool) {
+        if hidden {
+            self.hidden_frames = self.hidden_frames.saturating_add(1);
+        }
+        if !obscured {
+            self.cursor_hidden = Some(hidden);
+        }
     }
 
     /// The most recent press that resolved to a gesture, for the pane's readout.
@@ -478,12 +509,14 @@ impl InputLog {
         self.mouse_events = 0;
         self.touch_events = 0;
         self.with_force = 0;
-        // `cursor_hidden` is deliberately *not* cleared. Everything else here
-        // is a tally of the session and Clear empties it; this is a reading of
-        // the last painted frame, and the next frame — the one that draws the
-        // cleared page — overwrites it before anybody sees it. Setting it to
-        // `None` would make "nothing yet" a state that is written and never
-        // drawn, which is a control lying about being resettable.
+        // The count is a tally like the three above it, so Clear empties it —
+        // and that is the whole workflow this row is used through: Clear, close
+        // the dialog, hover the pen over the canvas, reopen. `cursor_hidden` is
+        // deliberately *not* cleared: it is a reading of a frame rather than a
+        // tally, and every frame from here until the dialog shuts has a modal
+        // over it, so clearing it would put the row back to "nothing yet" and
+        // leave it there with no way to refill it from inside the dialog.
+        self.hidden_frames = 0;
         self.probe_started = f64::MAX;
     }
 }
@@ -491,6 +524,73 @@ impl InputLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The cursor row must survive being read**, and this is the whole of why
+    /// `note_cursor` takes a second argument.
+    ///
+    /// The pane that draws it is inside a modal, and while a modal is open
+    /// egui's `layer_id_at` answers that modal's layer for *every* point in the
+    /// window rather than hit-testing. So `Editor::pen_dot` declines
+    /// everywhere — correctly — and every frame the user can actually read this
+    /// row on reports "an ordinary cursor". Recorded, that pins the row to one
+    /// answer for ever and the interesting arm is unreachable: the row would be
+    /// a control that cannot say the thing it exists to say.
+    ///
+    /// So the reading skips obscured frames and the count does not, and the two
+    /// together are what the pane draws.
+    #[test]
+    fn a_dialog_over_the_canvas_cannot_erase_what_the_cursor_row_says() {
+        let mut log = InputLog::default();
+        assert_eq!(log.cursor_hidden, None, "nothing painted yet");
+        assert_eq!(log.hidden_frames, 0);
+
+        // A pen hovering over open canvas: the frames that mean something.
+        for _ in 0..3 {
+            log.note_cursor(true, false);
+        }
+        assert_eq!(log.cursor_hidden, Some(true));
+        assert_eq!(log.hidden_frames, 3);
+
+        // Settings opens. Every frame from here reports "ordinary", because a
+        // modal covers the whole window as far as `layer_id_at` is concerned.
+        for _ in 0..50 {
+            log.note_cursor(false, true);
+        }
+        assert_eq!(
+            log.cursor_hidden,
+            Some(true),
+            "the dialog being open must not overwrite the reading it is opened to see"
+        );
+        assert_eq!(
+            log.hidden_frames, 3,
+            "and must not inflate the count either"
+        );
+
+        // A genuinely unobscured frame still speaks, so the row is not frozen.
+        log.note_cursor(false, false);
+        assert_eq!(log.cursor_hidden, Some(false));
+    }
+
+    /// The count is what makes "never asked" distinguishable, and it has to be
+    /// clobber-proof: reaching this pane means opening a menu, which is an
+    /// ordinary `Area` rather than a modal, so those frames *are* recorded and
+    /// they record the pen sitting over the menu.
+    #[test]
+    fn walking_to_the_settings_dialog_cannot_hide_that_umber_ever_asked() {
+        let mut log = InputLog::default();
+        log.note_cursor(true, false);
+        // The menu is not a modal, so this frame counts and it says "ordinary".
+        log.note_cursor(false, false);
+        assert_eq!(
+            log.cursor_hidden,
+            Some(false),
+            "the last clear frame really was the pen over the menu"
+        );
+        assert_eq!(
+            log.hidden_frames, 1,
+            "but the count still says Umber asked, which is the question"
+        );
+    }
 
     fn sample(at: f64) -> Sample {
         Sample {
