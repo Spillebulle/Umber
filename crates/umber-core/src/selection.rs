@@ -134,8 +134,11 @@
 //! The drift it admits is small and real: subtracting a feathered shape from a
 //! hard selection and then flipping the canvas softens the whole outline.
 //!
-//! The kernel is a **tent**, two box passes of half-width `radius / 2` run
-//! separably. Three properties earn it: the running sums make it linear in the
+//! The kernel is a **tent**, two box passes of half-width `radius / 2` **per
+//! axis** — four passes, not two, because a tent is the box convolved with
+//! itself and convolution is per axis; one pass along each is a two-dimensional
+//! box, which reaches half as far as the radius asked for and has a corner in
+//! its profile. Three properties earn it: the running sums make it linear in the
 //! area whatever the radius; every partial sum is an exact integer, so the only
 //! rounding is the one store per pass and the result is exactly symmetric; and
 //! being separable over a mask that is itself separable, an axis-aligned
