@@ -15,17 +15,46 @@ pub struct Gpu {
     pub queue: Arc<wgpu::Queue>,
 }
 
+/// Which adapter to ask the instance for.
+///
+/// Umber itself always wants [`Choice::Best`]. [`Choice::Fallback`] exists for
+/// the GPU tests and is the answer to a real problem: CI runners have no
+/// graphics card, so `gpu_pipeline.rs` runs there on the driver's software
+/// rasteriser — WARP on Windows, lavapipe on Linux — while a developer's
+/// machine runs it on hardware. The two do not round identically, so a test
+/// asserting an exact byte passes here and fails there, and the failure is
+/// found *after* a tag has been pushed. Being able to ask for the same
+/// rasteriser CI will use is what turns that into something reproducible
+/// before it is pushed. See `shared_gpu` in the tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Choice {
+    /// Whatever the machine has, preferring a discrete card.
+    #[default]
+    Best,
+    /// The software rasteriser, even where there is a card.
+    Fallback,
+}
+
 impl Gpu {
     /// Create a device suitable for the given surface.
     pub async fn new(
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'static>>,
     ) -> Result<Self, String> {
+        Self::with_adapter(instance, compatible_surface, Choice::Best).await
+    }
+
+    /// As [`Gpu::new`], choosing the adapter. See [`Choice`] for why.
+    pub async fn with_adapter(
+        instance: wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'static>>,
+        choice: Choice,
+    ) -> Result<Self, String> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface,
-                force_fallback_adapter: false,
+                force_fallback_adapter: choice == Choice::Fallback,
             })
             .await
             .map_err(|e| format!("no suitable GPU adapter: {e}"))?;

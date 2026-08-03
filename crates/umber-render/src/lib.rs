@@ -24,4 +24,4 @@ pub use canvas::{
     CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource,
     LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
 };
-pub use gpu::Gpu;
+pub use gpu::{Choice, Gpu};

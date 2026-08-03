@@ -14,8 +14,8 @@ use umber_core::{
     TileMask, TipMask, Transform,
 };
 use umber_render::{
-    CanvasRenderer, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource, Gpu,
-    LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
+    CanvasRenderer, Choice, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource,
+    Gpu, LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -35,9 +35,33 @@ fn shared_gpu() -> Option<&'static Gpu> {
     static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
     GPU.get_or_init(|| {
         let instance = Gpu::create_instance();
-        pollster::block_on(Gpu::new(instance, None)).ok()
+        pollster::block_on(Gpu::with_adapter(instance, None, adapter_choice())).ok()
     })
     .as_ref()
+}
+
+/// `UMBER_TEST_SOFTWARE=1` runs the whole suite on the software rasteriser.
+///
+/// **This is how a failure on CI is reproduced before it is pushed.** GitHub's
+/// runners have no graphics card, so every one of these tests runs there on
+/// WARP or lavapipe, while the machine they were written on has a real one.
+/// The two agree about what the shaders *do* and disagree in the last bit of
+/// floating point, so a test asserting an exact byte can pass here and fail
+/// there — which it did, on a tag that had already been pushed. Running
+///
+/// ```sh
+/// UMBER_TEST_SOFTWARE=1 cargo test -p umber-render --test gpu_pipeline
+/// ```
+///
+/// is the check that says whether an assertion is about this code or about the
+/// hardware it happened to be written on. It is an environment variable rather
+/// than a second test binary because the whole suite has to run under it, and
+/// deliberately not the default: the hardware path is the one people paint on.
+fn adapter_choice() -> Choice {
+    match std::env::var_os("UMBER_TEST_SOFTWARE") {
+        Some(v) if v != "0" => Choice::Fallback,
+        _ => Choice::Best,
+    }
 }
 
 struct Harness {
@@ -3626,11 +3650,49 @@ fn a_lift_leaves_no_ghost_of_the_selection_it_was_painted_through() {
         empty,
         "a ghost of the selection was left where the paint was lifted from"
     );
+    // **The alpha, within a level, and not the bytes.**
+    //
+    // What this test is for is conservation: the float has to carry the paint
+    // the layer gave up, or the ghost is back in the other direction. That
+    // property lives in the alpha — see `alphas`, which is linear eight bits
+    // even in an sRGB format — and it is computed by a shader in floating point
+    // and stored twice through eight bits, so it is exact only to the level the
+    // store has. It used to be `assert_eq!` on the raw bytes, which is a
+    // promise about *rounding on one particular device*: it held on the
+    // hardware it was written on and failed on the software rasteriser CI runs,
+    // by one level of alpha at the antialiased edge, on a tag that had already
+    // been pushed. `UMBER_TEST_SOFTWARE=1` is how that is now found first.
+    //
+    // The exact claim has not been given up, it is made where it can be kept:
+    // `a_hard_edged_rectangular_lift_is_exact` asserts the whole rectangle byte
+    // for byte, colour included, over a mask whose coverage is only ever 0 or
+    // 1 — where the arithmetic has nothing to round. Here the colour is
+    // deliberately not compared at all: at an alpha of two the stored colour is
+    // a steep function of that alpha, so a single level of it moves the encoded
+    // byte by six, which says nothing about the lift and everything about
+    // dividing by a small number.
+    let carried = alphas(&read_rect(&h, 0, dest));
+    let gave_up = alphas(&painted);
     assert_eq!(
-        read_rect(&h, 0, dest),
-        painted,
-        "the float did not carry every pixel the layer gave up"
+        carried.len(),
+        gave_up.len(),
+        "the rectangles differ in size"
     );
+    let worst = carried
+        .iter()
+        .zip(&gave_up)
+        .enumerate()
+        .max_by_key(|(_, (c, g))| c.abs_diff(**g))
+        .map(|(i, (c, g))| (i, *c, *g));
+    if let Some((at, carried, gave_up)) = worst {
+        assert!(
+            carried.abs_diff(gave_up) <= 1,
+            "the float did not carry every pixel the layer gave up: at pixel \
+             {at} the layer gave up {gave_up} and the float carries {carried}, \
+             which is {} levels and not the one the store can round by",
+            carried.abs_diff(gave_up),
+        );
+    }
 }
 
 /// The cheap case, and the one that should be exact on both axes: an integer
