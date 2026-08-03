@@ -1330,6 +1330,17 @@ impl MarkBox {
 /// it here would also be a fourth copy of the blend maths on the CPU, beside
 /// the one shared WGSL function `composite.wgsl` and `commit.wgsl` both call,
 /// which is exactly the drift `shaders/blend.wgsl` exists to end.
+///
+/// That leaves the list unable to tell two brushes apart that paint
+/// differently, which is a real cost and worth being explicit about: the
+/// obvious repair is a *label* rather than a mark — a badge on the row saying
+/// "Multiply" — which invents no pixels and restates no maths. It is not drawn
+/// because no shipped preset writes the field at all, so the badge would be
+/// absent from every shipped row and appear only on brushes the user made,
+/// where the editor they made it in already says so. Add it the day a shipped
+/// preset carries one, and
+/// put it on the row rather than in the sample: the argument above is about the
+/// *stroke*, not about the row.
 fn preview_dabs(brush: &Brush, at: &MarkBox) -> Vec<Dab> {
     let scale = at.scale(brush);
     // The path in **document** pixels: the box the preview will occupy, taken
