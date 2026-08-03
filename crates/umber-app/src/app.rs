@@ -9,6 +9,7 @@ use crate::logo;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
+use crate::sysclip::{self, Paste};
 use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
@@ -203,6 +204,15 @@ pub struct UmberApp {
     /// physical pixels, and the same distinction the editor draws between a
     /// gesture and a document. Nothing about it survives the release.
     put_down_at: Option<Vec2>,
+    /// Umber's hold on the desktop's clipboard, for pictures.
+    ///
+    /// On the application rather than in `Editor` for the reason `gfx` is: it
+    /// is a resource the process holds, not something a document has, and a tab
+    /// switch has nothing to do with it. `Editor::clipboard` — the `Clip`
+    /// itself — stays where it is, above the `--- documents ---` line, because
+    /// copying out of one document and into another is most of what a clipboard
+    /// is for.
+    sysclip: sysclip::Board,
 }
 
 /// How far the pointer may travel from a press outside the transform box before
@@ -288,6 +298,7 @@ impl UmberApp {
             bindings: shortcuts::defaults(),
             repaint_at: None,
             put_down_at: None,
+            sysclip: sysclip::Board::default(),
         }
     }
 
@@ -937,11 +948,19 @@ impl UmberApp {
     }
 
     /// Take the selection — or the whole layer where there is none — onto
-    /// Umber's clipboard.
+    /// Umber's clipboard, and offer it to the rest of the machine.
     ///
     /// `read_layer_rect` blocks, which is acceptable here for the same reason
     /// it is acceptable in a save: this is an explicit action and is nowhere
-    /// near the drawing loop.
+    /// near the drawing loop. So does the write to the desktop's clipboard,
+    /// which encodes a PNG, and it is not threaded — see `sysclip`'s module
+    /// docs, where the ordering against the next paste is the deciding
+    /// argument.
+    ///
+    /// **Both clipboards are written, and Umber's own is the one that must not
+    /// fail.** The desktop's is best effort: a machine with no clipboard, or a
+    /// compositor without the protocol, costs the artist nothing they can see
+    /// because copy and paste inside Umber are unaffected.
     fn copy_selection(&mut self) {
         // `take_region` puts any float down and answers for whichever state the
         // copy was asked in — that is what lets a copy mid-transform read the
@@ -961,6 +980,7 @@ impl UmberApp {
         match umber_core::Clip::from_layer(rect, &bytes, mask.as_deref()) {
             Some(clip) => {
                 log::info!("copied {} × {}", clip.size().x, clip.size().y);
+                self.sysclip.put_image(&clip);
                 self.editor.clipboard = Some(clip);
             }
             // Nothing under the selection. The previous clipboard is left
@@ -1038,6 +1058,10 @@ impl UmberApp {
             EditKind::Erase,
             PixelPatch::new(rect, slot, bytes),
         ));
+        // The desktop gets exactly what the copy would have given it: a cut is
+        // a copy plus the removal, and `Clip::cut_from_layer` is what makes the
+        // two halves the same take.
+        self.sysclip.put_image(&cut.clip);
         self.editor.clipboard = Some(cut.clip);
         self.editor.mark_modified();
         self.request_redraw();
@@ -1047,10 +1071,38 @@ impl UmberApp {
     ///
     /// It arrives floating rather than committed, which is the whole reason the
     /// two features are one: a paste that had already been baked into the layer
-    /// would have to be undone to be repositioned.
+    /// would have to be undone to be repositioned. That is as true of a
+    /// screenshot off the desktop as it is of Umber's own copy — it arrives
+    /// where it can be dragged, turned and scaled before it is anywhere.
+    ///
+    /// **Which of the two clipboards it comes off is `sysclip::decide`'s**, a
+    /// pure function of what each is holding, so the rule is testable without a
+    /// display server — which is the only way it is tested at all, because no
+    /// test here may touch the real clipboard. Where a picture *goes* is
+    /// `Clip::place`'s, in `umber-core`, and a foreign picture is an ordinary
+    /// clip: there is deliberately no second placer for one.
+    ///
+    /// The read blocks, which is what an explicit Ctrl+V may do and the drawing
+    /// loop may not. It is not threaded, and the reason is in `sysclip`.
     fn paste(&mut self) {
-        let Some(clip) = self.editor.clipboard.clone() else {
-            return;
+        // The desktop is asked *first*, so a picture copied in another
+        // application half a second ago is the one that lands.
+        let clip = match sysclip::decide(self.sysclip.take_image(), self.editor.clipboard.as_ref())
+        {
+            Paste::Nothing => return,
+            Paste::Mine(clip) => clip,
+            // Adopted, so a second Ctrl+V puts down the same picture once the
+            // desktop's clipboard has moved on — the same rule that keeps
+            // Umber's own copy alive when somebody copies a line of text.
+            Paste::Theirs(clip) => {
+                log::info!(
+                    "pasting {} × {} off the desktop's clipboard",
+                    clip.size().x,
+                    clip.size().y
+                );
+                self.editor.clipboard = Some(clip.clone());
+                clip
+            }
         };
         self.finish_transform();
         self.finish_stroke();

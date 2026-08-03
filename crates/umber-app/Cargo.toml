@@ -86,6 +86,25 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
 ] }
 
+# The desktop's clipboard (`sysclip.rs`), for pictures. Text goes out through
+# egui-winit's own `clipboard` feature, which brings this same crate — arboard
+# keeps one process-global X11 connection behind a `static`, so the two handles
+# are one owner rather than two things to fight over a selection.
+#
+# Gated exactly as egui-winit gates its own: arboard has no Android backend at
+# all, so the dependency must not be built there. `image-data` is what makes it
+# carry pictures rather than only text, and `wayland-data-control` is the
+# Wayland backend — without it a Wayland session would fall through to X11,
+# which under a native Wayland window is not there. Neither adds a *system*
+# library: arboard's X11 path is `x11rb` speaking the protocol over the socket,
+# and `wl-clipboard-rs` reaches `libwayland-client.so.0`, which winit already
+# opens and every Linux package here already declares.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { version = "3.6", default-features = false, features = [
+    "image-data",
+    "wayland-data-control",
+] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { workspace = true, features = ["android-native-activity"] }
 android_logger = "0.15"

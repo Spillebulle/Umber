@@ -14,21 +14,29 @@
 //! report already holds — so the crash box cannot be stopped by the same thing
 //! that stopped Umber.
 //!
-//! ### Why there is no "Copy details" button
+//! ### The "Copy details" button
 //!
-//! `egui-winit` is built with `default-features = false` (see the crate's
-//! `Cargo.toml`, and `about::link_row` for the same problem with hyperlinks),
-//! so its `clipboard` feature is not compiled in and `Context::copy_text` is a
-//! no-op. A button that looks like it copies and does nothing is the control
-//! that lies, which this codebase refuses everywhere else; turning the feature
-//! on means `arboard`, which on Linux is a new linked dependency that
-//! `packaging/linux/build-packages.sh` and the `PKGBUILD` would have to declare
-//! by hand — a real packaging change for one button.
+//! There used to be no such button, and the reason was real: `egui-winit` was
+//! built with `default-features = false` and its `clipboard` feature was
+//! therefore not compiled in, so `Context::copy_text` fell through to a
+//! `String` held in the process — a button that would have copied the backtrace
+//! into nothing an issue tracker could see. A control that lies is worse than
+//! one that is not drawn.
 //!
-//! So the report gets out of the window a better way: it is already a file.
-//! The box names the path and offers to open the folder, and the details
-//! themselves are a read-only `TextEdit`, which is genuinely selectable. The
-//! whole report can be sent; nobody has to retype a backtrace.
+//! The feature is on now, because Umber's canvas clipboard needed the same
+//! crate (`sysclip`), so `arboard` and the packaging declarations it was worth
+//! avoiding for one button had to be paid for anyway. `Context::copy_text`
+//! reaches the desktop, and this is exactly the window where somebody needs it:
+//! the whole point of the report is that it goes into a bug report.
+//!
+//! What did not change is the rest of the route out. The report is still a
+//! file, the box still names its path and offers to open the folder, and the
+//! details are still a read-only `TextEdit` that can be selected by hand —
+//! because this window runs after a crash, and the one control it offers for
+//! getting the report out must not be the only one.
+//!
+//! `about::link_row` still paints its own hyperlink: that is the `links`
+//! feature, which is a different one and is still off.
 
 use crate::icons::{self, Icon};
 use crate::logo;
@@ -608,8 +616,7 @@ fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool)
     //
     // Read-only, and therefore genuinely selectable: `&str` is a `TextBuffer`
     // that reports itself immutable, so egui draws a real text field that
-    // cannot be edited. See the module docs for why there is no Copy button
-    // beside it.
+    // cannot be edited.
     let mut text = details;
     ui.add(
         egui::TextEdit::multiline(&mut text)
@@ -617,6 +624,26 @@ fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool)
             .desired_width(f32::INFINITY)
             .text_color(p.text_muted),
     );
+
+    // The one control most likely to be wanted here, and it copies exactly what
+    // is drawn above it — `Report::details`, called once and handed to both, so
+    // what is pasted into an issue cannot differ from what the box showed.
+    //
+    // It is drawn only with the details open, because a Copy beside a closed
+    // section would be a button whose subject is out of sight. There is no
+    // "Copied" confirmation: that needs a timer, and this window sits under
+    // `ControlFlow::Wait` precisely so that a box being read costs nothing.
+    // Same as "Show the report" below, which also acts and says nothing.
+    //
+    // On X11 and Wayland what is copied belongs to *this* process, so closing
+    // the box before pasting can empty the clipboard again unless a clipboard
+    // manager took it on the way out. That is every X11 application's story and
+    // not something a button can fix — it is the other half of why the path to
+    // the file is printed above and why the details stay selectable.
+    ui.add_space(6.0);
+    if tabs::button(ui, p, "Copy details", false) {
+        ui.ctx().copy_text(details.to_string());
+    }
 }
 
 /// Where the file is, and the one control that gets it out of this window.

@@ -53,6 +53,24 @@ fi
 # recorded in the ELF, so `dpkg-shlibdeps` and rpm's own scanner cannot see any
 # of them. A package that omitted them would install cleanly and then fail to
 # open a window, which is the worst shape a packaging bug can take.
+#
+# **The clipboard added nothing to either list, and that was checked rather
+# than assumed** — it is exactly the kind of change that usually does. Umber
+# reaches the desktop's clipboard through `arboard` (pictures, `sysclip.rs`)
+# and through egui-winit's own `clipboard` feature (text in the interface's
+# fields). On X11 that is `x11rb`, which speaks the protocol over the socket
+# itself and links no libxcb; on Wayland it is `wl-clipboard-rs` and
+# `smithay-clipboard`, both of which reach `libwayland-client.so.0` and nothing
+# else — and winit already opens that, so it is already below. `wayland-cursor`
+# came along with `smithay-clipboard` and is pure Rust unless its
+# `use_system_lib` feature is on, which it is not.
+#
+# One near miss, recorded so nobody has to work it out twice: `wl-clipboard-rs`
+# carries `tree_magic_mini`, which without its (GPL-2.0-data) `with-gpl-data`
+# feature reads `/usr/share/mime/magic` at runtime — a `shared-mime-info`
+# dependency. It is **not** declared because that path is unreachable from
+# here: it is used only for `MimeType::Autodetect`, and arboard names an
+# explicit MIME type on every call in both directions.
 DEB_DEPENDS="libc6, libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon0, libwayland-client0, libvulkan1"
 
 # RPM requirements are stated as **sonames**, not as package names.
