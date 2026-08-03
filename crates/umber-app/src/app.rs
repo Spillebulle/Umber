@@ -1938,6 +1938,12 @@ impl UmberApp {
         if hide_cursor {
             syscursor::hide_now();
         }
+        // Observation only, and the answer this frame acted on rather than a
+        // second reading of it — the rule every column of Settings → Input &
+        // pen lives by. It is the one place "Umber never asked" and "Umber
+        // asked and the platform ignored it" can be told apart, on a machine
+        // that actually has a tablet.
+        self.editor.input.note_cursor(hide_cursor);
 
         // What egui itself wants next, which is the *only* thing that should
         // schedule a frame with no input behind it.

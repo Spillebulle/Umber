@@ -865,6 +865,32 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }),
         );
     });
+
+    // Which cursor the last painted frame asked for. "The arrow is still under
+    // my pen" has two causes that look identical from the outside — Umber never
+    // asked, or Umber asked and the window system did not carry it out — and
+    // this is the only reading that separates them. What it reports is the
+    // request, not the screen, and the tooltip says so: nothing in this process
+    // can see what Windows actually drew.
+    let cursor = ed.input.cursor_hidden;
+    controls::row(ui, p, "Cursor asked for", |ui| {
+        ui.label(
+            egui::RichText::new(match cursor {
+                Some(true) => "None, so the canvas can draw its own dot",
+                Some(false) => "The ordinary pointer",
+                None => "nothing yet",
+            })
+            .size(text::SMALL)
+            .color(if cursor.is_some() { p.text } else { p.text_dim }),
+        )
+        .on_hover_text(
+            "What the last painted frame asked the window system for, which is \
+             not the same as what ended up on screen. If this says None while a \
+             pen is over the canvas and an arrow is still showing, the request \
+             is being dropped below Umber. If it says the ordinary pointer, \
+             Umber decided the pen was not over the canvas at all.",
+        );
+    });
 }
 
 /// Where pressure comes from: the one setting on this page, and the two knobs
