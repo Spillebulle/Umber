@@ -494,10 +494,18 @@ fn load_layer(
 /// on the layer's alpha, which is not what a mask slice holds; see
 /// [`srgb::encode_coverage`].
 ///
-/// `None` where nothing could be read, and the caller says so. An empty
-/// transparency mask writes no `.pixelselection` at all, and a default of zero
-/// would mean a layer hidden completely — inventing that from an absent entry
-/// is exactly the silent damage this module refuses.
+/// `None` where nothing could be read, and the caller says so — a default of
+/// zero would mean a layer hidden completely, and inventing that from an absent
+/// entry is exactly the silent damage this module refuses. Two ordinary files
+/// reach it, so it is not the damaged-archive branch it looks like:
+///
+/// - A mask whose selection is **empty**. Krita writes no `.pixelselection` for
+///   one, and its own loader then leaves the selection at its default.
+/// - A mask made from a **vector** selection, which is a common enough way to
+///   make one. Krita stores that as SVG under `<filename>.shapeselection/` and
+///   writes no raster data beside it — its loader reads one or the other and
+///   never both. Rasterising the path here would be a vector renderer inside an
+///   importer, so the layer arrives unmasked and says so.
 fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) -> Option<Vec<u8>> {
     if spec.filename.is_empty() {
         return None;
