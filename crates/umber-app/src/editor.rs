@@ -364,6 +364,13 @@ pub struct Editor {
     /// Genuinely session-wide rather than per-document — copying out of one tab
     /// and into another is most of what a clipboard is for — so it belongs
     /// above the `--- documents ---` line and stays there across a switch.
+    ///
+    /// This is *Umber's* clipboard, and the desktop has one too. Which of the
+    /// two a paste takes its picture off is `sysclip::decide`'s, and a picture
+    /// off the desktop is adopted here on the way past — so a second Ctrl+V
+    /// puts down the same picture once the desktop's clipboard has moved on.
+    /// The board itself lives on `UmberApp`, not here: it is a resource the
+    /// process holds rather than anything a session is.
     pub clipboard: Option<Clip>,
     /// The selection outline being drawn, if one is. Transient like
     /// [`Editor::stroke`], and abandoned rather than carried across a tab

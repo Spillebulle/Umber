@@ -14,21 +14,29 @@
 //! report already holds — so the crash box cannot be stopped by the same thing
 //! that stopped Umber.
 //!
-//! ### Why there is no "Copy details" button
+//! ### The "Copy details" button
 //!
-//! `egui-winit` is built with `default-features = false` (see the crate's
-//! `Cargo.toml`, and `about::link_row` for the same problem with hyperlinks),
-//! so its `clipboard` feature is not compiled in and `Context::copy_text` is a
-//! no-op. A button that looks like it copies and does nothing is the control
-//! that lies, which this codebase refuses everywhere else; turning the feature
-//! on means `arboard`, which on Linux is a new linked dependency that
-//! `packaging/linux/build-packages.sh` and the `PKGBUILD` would have to declare
-//! by hand — a real packaging change for one button.
+//! There used to be no such button, and the reason was real: `egui-winit` was
+//! built with `default-features = false` and its `clipboard` feature was
+//! therefore not compiled in, so `Context::copy_text` fell through to a
+//! `String` held in the process — a button that would have copied the backtrace
+//! into nothing an issue tracker could see. A control that lies is worse than
+//! one that is not drawn.
 //!
-//! So the report gets out of the window a better way: it is already a file.
-//! The box names the path and offers to open the folder, and the details
-//! themselves are a read-only `TextEdit`, which is genuinely selectable. The
-//! whole report can be sent; nobody has to retype a backtrace.
+//! The feature is on now, because Umber's canvas clipboard needed the same
+//! crate (`sysclip`), so `arboard` and the packaging declarations it was worth
+//! avoiding for one button had to be paid for anyway. `Context::copy_text`
+//! reaches the desktop, and this is exactly the window where somebody needs it:
+//! the whole point of the report is that it goes into a bug report.
+//!
+//! What did not change is the rest of the route out. The report is still a
+//! file, the box still names its path and offers to open the folder, and the
+//! details are still a read-only `TextEdit` that can be selected by hand —
+//! because this window runs after a crash, and the one control it offers for
+//! getting the report out must not be the only one.
+//!
+//! `about::link_row` still paints its own hyperlink: that is the `links`
+//! feature, which is a different one and is still off.
 
 use crate::icons::{self, Icon};
 use crate::logo;
@@ -109,6 +117,13 @@ struct Reporter<'a> {
     /// "Technical details", closed to begin with. A crash box that opens on a
     /// page of frame addresses buries the sentence about somebody's work.
     expanded: bool,
+    /// Whether "Copy details" has been used, which is the whole of the
+    /// confirmation. Latched rather than timed: a message that fades needs a
+    /// repaint scheduled for a moment nothing else would ask for, and this
+    /// window sits under `ControlFlow::Wait` so that a box being read costs
+    /// nothing. A line that simply stays says the same thing and costs one
+    /// frame — the one the click already caused.
+    copied: bool,
     restart: bool,
     /// Why the window could not be opened, if it could not. The caller prints
     /// the report to stderr rather than leaving somebody with nothing.
@@ -129,6 +144,7 @@ impl<'a> Reporter<'a> {
             palette: Palette::with_accent(prefs.theme, prefs.accent),
             gfx: None,
             expanded: false,
+            copied: false,
             restart: false,
             failure: None,
         }
@@ -277,6 +293,7 @@ impl Reporter<'_> {
         let details = &self.details;
         let report_path = &self.report_path;
         let expanded = &mut self.expanded;
+        let copied = &mut self.copied;
         let restart = &mut self.restart;
         let mut close = false;
 
@@ -292,6 +309,7 @@ impl Reporter<'_> {
                 report_path,
                 Actions {
                     expanded,
+                    copied,
                     restart: &mut *restart,
                     close: &mut close,
                 },
@@ -403,6 +421,7 @@ fn clear_colour(p: &Palette) -> wgpu::Color {
 /// because a run of bare booleans in a signature is how the wrong one gets set.
 struct Actions<'a> {
     expanded: &'a mut bool,
+    copied: &'a mut bool,
     restart: &'a mut bool,
     close: &'a mut bool,
 }
@@ -459,7 +478,7 @@ fn body(
                     work(ui, p, report);
 
                     ui.add_space(14.0);
-                    technical(ui, p, details, actions.expanded);
+                    technical(ui, p, details, actions.expanded, actions.copied);
 
                     ui.add_space(12.0);
                     where_the_report_is(ui, p, report_path);
@@ -559,7 +578,13 @@ fn work(ui: &mut egui::Ui, p: &Palette, report: &Report) {
 /// the rule "a widget revealed on hover must not be what decides the hover"
 /// exists for — although here it is a plain click target, so the only thing at
 /// stake is a chevron that does not flicker.
-fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool) {
+fn technical(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    details: &str,
+    expanded: &mut bool,
+    copied: &mut bool,
+) {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), metrics::DROPDOWN),
         Sense::click(),
@@ -599,6 +624,36 @@ fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool)
     }
 
     ui.add_space(6.0);
+    // **Above the text, not below it.** The block underneath is a backtrace and
+    // its length is bounded only by `report::BACKTRACE_LIMIT`, so a control
+    // after it is one somebody has to scroll a page of frame addresses to
+    // reach — the failure the brush editor's Edit mark is in the *header* to
+    // avoid, and the one the footer twelve lines further down is outside the
+    // scroll area to avoid. It copies exactly what is drawn below it:
+    // `Report::details`, called once in `Reporter::new` and handed to both, so
+    // what is pasted into an issue cannot differ from what the box showed.
+    ui.horizontal(|ui| {
+        if tabs::button(ui, p, "Copy details", false) {
+            ui.ctx().copy_text(details.to_string());
+            *copied = true;
+        }
+        if *copied {
+            ui.add_space(8.0);
+            // Says what is true rather than "Copied": on X11 and Wayland what
+            // is copied is served by *this* process, so closing the box before
+            // pasting can empty the clipboard again unless a clipboard manager
+            // took it on the way out. That is every X11 application's story and
+            // not something a button can fix — it is the other half of why the
+            // path to the file is printed below and why the text stays
+            // selectable.
+            ui.label(
+                egui::RichText::new("Copied — paste it before closing this window.")
+                    .size(text::SMALL)
+                    .color(p.text_dim),
+            );
+        }
+    });
+    ui.add_space(6.0);
     // Deliberately **no scroll area of its own**. This sits inside the body's
     // one `ScrollArea`, and a second one nested in it would make the wheel mean
     // two things depending on where the pointer happened to be — the rule the
@@ -608,8 +663,7 @@ fn technical(ui: &mut egui::Ui, p: &Palette, details: &str, expanded: &mut bool)
     //
     // Read-only, and therefore genuinely selectable: `&str` is a `TextBuffer`
     // that reports itself immutable, so egui draws a real text field that
-    // cannot be edited. See the module docs for why there is no Copy button
-    // beside it.
+    // cannot be edited.
     let mut text = details;
     ui.add(
         egui::TextEdit::multiline(&mut text)

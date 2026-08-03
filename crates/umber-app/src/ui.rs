@@ -34,9 +34,12 @@ use umber_core::{
 #[derive(Default, Clone, Copy)]
 pub struct UiActions {
     pub clear: bool,
-    /// Take the selection onto Umber's clipboard, and — for a cut — off the
-    /// layer. The caller's, because both block on a readback and a cut records
-    /// an undo entry. Raised by the selection's overlay strip, which is the only
+    /// Take the selection onto Umber's clipboard and on to the desktop's, and —
+    /// for a cut — off the layer. The caller's, because both block on a
+    /// readback *and* on the encode that puts the picture on the machine's
+    /// clipboard, and a cut records an undo entry. On a very large region that
+    /// is seconds, which `sysclip`'s module docs measure and this button
+    /// therefore shares. Raised by the selection's overlay strip, which is the only
     /// control for either; the keyboard reaches the same two methods directly
     /// rather than through here.
     pub copy_selection: bool,

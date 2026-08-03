@@ -25,6 +25,14 @@ options=('!strip' '!debug')
 
 # Opened at runtime by winit and wgpu rather than recorded in the ELF, so
 # namcap's automatic scan will not find them.
+#
+# The desktop clipboard added nothing here, and that was checked rather than
+# assumed: arboard's X11 path is `x11rb` speaking the protocol over the socket
+# and links no libxcb, and its Wayland path (`wl-clipboard-rs`, and
+# `smithay-clipboard` for the interface's text fields) reaches only
+# `libwayland-client`, which `wayland` below already covers. See the longer
+# note in `build-packages.sh`, including the one dependency deliberately not
+# declared.
 depends=('libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxkbcommon'
          'wayland' 'vulkan-icd-loader' 'gcc-libs')
 

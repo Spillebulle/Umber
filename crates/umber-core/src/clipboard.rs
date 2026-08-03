@@ -5,9 +5,15 @@
 //! **Straight-alpha sRGB RGBA8** — the form every interchange format stores and
 //! the form `docimport::srgb` already converts to and from. Not the layer
 //! texture's own bytes, and deliberately so: a clipboard is the boundary where
-//! a picture stops belonging to one layer, and the day this grows a system
-//! clipboard the bytes it has to hand over are these. Keeping the conversion at
-//! copy and paste rather than at that boundary would mean discovering it twice.
+//! a picture stops belonging to one layer, and the bytes it has to hand the
+//! desktop are these. Keeping the conversion at copy and paste rather than at
+//! that boundary would mean discovering it twice.
+//!
+//! That was written before there was a system clipboard to hand anything to,
+//! and it held: `arboard::ImageData` is straight-alpha sRGB RGBA8, row-major,
+//! four bytes a pixel — so [`Clip::pixels`] goes out untouched and
+//! [`Clip::from_rgba`] takes what comes back. Nothing in this module was
+//! changed to reach the desktop.
 //!
 //! Both directions go through `srgb::encode_pixel` and `srgb::decode_pixel`,
 //! which are exact inverses over every reachable (colour, alpha) pair — the
@@ -38,9 +44,15 @@
 //!
 //! # What is not here
 //!
-//! No system clipboard, no formats, no history of what was copied before. Each
-//! is a real feature; the first has to answer for a dependency on every
-//! platform Umber ships to and does not have one yet.
+//! No formats and no history of what was copied before. Both are real features.
+//!
+//! Nor is the *system* clipboard, which is `umber_app::sysclip` — it needs a
+//! dependency on every platform Umber ships to, and this crate may not learn
+//! about the platform any more than it may about wgpu. What lives here is the
+//! picture and the rules; which of the two clipboards a paste takes its picture
+//! off is decided there, and [`Clip::place`] then answers the same question
+//! about where it goes whichever it came from. There is deliberately no second
+//! placer for a foreign picture.
 
 use crate::docimport::srgb;
 use crate::geom::PixelRect;

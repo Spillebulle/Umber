@@ -9,6 +9,7 @@ use crate::logo;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
+use crate::sysclip::{self, Paste};
 use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
@@ -203,6 +204,15 @@ pub struct UmberApp {
     /// physical pixels, and the same distinction the editor draws between a
     /// gesture and a document. Nothing about it survives the release.
     put_down_at: Option<Vec2>,
+    /// Umber's hold on the desktop's clipboard, for pictures.
+    ///
+    /// On the application rather than in `Editor` for the reason `gfx` is: it
+    /// is a resource the process holds, not something a document has, and a tab
+    /// switch has nothing to do with it. `Editor::clipboard` — the `Clip`
+    /// itself — stays where it is, above the `--- documents ---` line, because
+    /// copying out of one document and into another is most of what a clipboard
+    /// is for.
+    sysclip: sysclip::Board,
 }
 
 /// How far the pointer may travel from a press outside the transform box before
@@ -288,6 +298,7 @@ impl UmberApp {
             bindings: shortcuts::defaults(),
             repaint_at: None,
             put_down_at: None,
+            sysclip: sysclip::Board::default(),
         }
     }
 
@@ -937,11 +948,22 @@ impl UmberApp {
     }
 
     /// Take the selection — or the whole layer where there is none — onto
-    /// Umber's clipboard.
+    /// Umber's clipboard, and offer it to the rest of the machine.
     ///
     /// `read_layer_rect` blocks, which is acceptable here for the same reason
     /// it is acceptable in a save: this is an explicit action and is nowhere
-    /// near the drawing loop.
+    /// near the drawing loop. So does the write to the desktop's clipboard,
+    /// which encodes a PNG, and it is not threaded — see `sysclip`'s module
+    /// docs, where the ordering against the next paste is the deciding
+    /// argument.
+    ///
+    /// **Both clipboards are written, and Umber's own is the one that must not
+    /// fail.** The desktop's is best effort — a machine with no clipboard, or
+    /// an allocation it refuses — but the outcome is *remembered* rather than
+    /// only logged, because a refusal leaves the desktop holding an older
+    /// picture and `sysclip::decide` would otherwise believe that one over the
+    /// region just copied. Copy and paste inside Umber are unaffected either
+    /// way, which is what makes the failure survivable rather than invisible.
     fn copy_selection(&mut self) {
         // `take_region` puts any float down and answers for whichever state the
         // copy was asked in — that is what lets a copy mid-transform read the
@@ -961,6 +983,7 @@ impl UmberApp {
         match umber_core::Clip::from_layer(rect, &bytes, mask.as_deref()) {
             Some(clip) => {
                 log::info!("copied {} × {}", clip.size().x, clip.size().y);
+                self.sysclip.put_image(&clip);
                 self.editor.clipboard = Some(clip);
             }
             // Nothing under the selection. The previous clipboard is left
@@ -1038,6 +1061,10 @@ impl UmberApp {
             EditKind::Erase,
             PixelPatch::new(rect, slot, bytes),
         ));
+        // The desktop gets exactly what the copy would have given it: a cut is
+        // a copy plus the removal, and `Clip::cut_from_layer` is what makes the
+        // two halves the same take.
+        self.sysclip.put_image(&cut.clip);
         self.editor.clipboard = Some(cut.clip);
         self.editor.mark_modified();
         self.request_redraw();
@@ -1047,11 +1074,48 @@ impl UmberApp {
     ///
     /// It arrives floating rather than committed, which is the whole reason the
     /// two features are one: a paste that had already been baked into the layer
-    /// would have to be undone to be repositioned.
+    /// would have to be undone to be repositioned. That is as true of a
+    /// screenshot off the desktop as it is of Umber's own copy — it arrives
+    /// where it can be dragged, turned and scaled before it is anywhere.
+    ///
+    /// **Which of the two clipboards it comes off is `sysclip::decide`'s**, a
+    /// pure function of what each is holding, so the rule is testable without a
+    /// display server — which is the only way it is tested at all, because no
+    /// test here may touch the real clipboard. Where a picture *goes* is
+    /// `Clip::place`'s, in `umber-core`, and a foreign picture is an ordinary
+    /// clip: there is deliberately no second placer for one.
+    ///
+    /// **A picture off the desktop is adopted only once it has actually been
+    /// put down.** Adopting it up front is the obvious place and is wrong: a
+    /// Ctrl+V on a locked layer or with a folder selected is refused by
+    /// `begin_float`, and having already overwritten `Editor::clipboard` it
+    /// would have thrown away the region the artist copied in Umber — to paste
+    /// nothing. The desktop is unaffected by the refusal, so the next Ctrl+V
+    /// finds the same picture again.
+    ///
+    /// The read blocks, which is what an explicit Ctrl+V may do and the drawing
+    /// loop may not. It is not threaded, and the reason is in `sysclip`.
     fn paste(&mut self) {
-        let Some(clip) = self.editor.clipboard.clone() else {
-            return;
-        };
+        // The desktop is asked *first*, so a picture copied in another
+        // application half a second ago is the one that lands. `published` says
+        // whether Umber's own clip is known to have got there, without which a
+        // copy the desktop refused would be overruled by whatever it held
+        // before — see `sysclip`.
+        let taken = self.sysclip.take_image();
+        let published = self.sysclip.published();
+        let (clip, foreign) =
+            match sysclip::decide(taken, self.editor.clipboard.as_ref(), published) {
+                Paste::Nothing => return,
+                Paste::Mine(clip) => (clip, false),
+                Paste::Theirs(clip) => {
+                    log::info!(
+                        "pasting {} × {} off the desktop's clipboard",
+                        clip.size().x,
+                        clip.size().y
+                    );
+                    (clip, true)
+                }
+            };
         self.finish_transform();
         self.finish_stroke();
 
@@ -1095,12 +1159,29 @@ impl UmberApp {
                 )],
             });
         }
-        if self.begin_float(placed.rect, Some(&placed.pixels)) {
-            // The box has handles, and they are the transform tool's. Landing
-            // in another tool would leave a preview nothing could act on.
-            self.editor.set_tool(Tool::Transform);
-            self.request_redraw();
+        if !self.begin_float(placed.rect, Some(&placed.pixels)) {
+            // Refused — a locked layer, or a folder, which `begin_float` has
+            // already said so about. Nothing has been pasted, so nothing is
+            // adopted: Umber's own clipboard has to survive a paste that did
+            // not happen, or Ctrl+V on the wrong layer would throw away the
+            // region the artist copied. The desktop still holds its picture,
+            // so the next Ctrl+V finds it again.
+            return;
         }
+        // Adopted only now, and only for a picture that came off the desktop:
+        // a second Ctrl+V then puts down the same picture once the desktop's
+        // clipboard has moved on, which is the rule that keeps Umber's own copy
+        // alive when somebody copies a line of text. `note_adopted` is what
+        // stops `decide` reading the adopted clip as one the desktop never
+        // received.
+        if foreign {
+            self.editor.clipboard = Some(clip);
+            self.sysclip.note_adopted();
+        }
+        // The box has handles, and they are the transform tool's. Landing in
+        // another tool would leave a preview nothing could act on.
+        self.editor.set_tool(Tool::Transform);
+        self.request_redraw();
     }
 
     /// Move the document to `position` in the history — the number of recorded
