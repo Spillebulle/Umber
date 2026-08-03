@@ -409,6 +409,7 @@ pub struct Board {
 /// every platform**, which — since nobody here can run macOS — is the only
 /// check on it anybody working on Umber can actually perform. The branch is a
 /// constant, so the platforms that do not need it pay nothing at run time.
+///
 /// The second arm is arboard's own `cfg` for its X11/Wayland module, plus iOS —
 /// which arboard does *not* exclude, and which is why [`Board`] gates it out
 /// itself. Spelled as the set the evidence is about rather than as "not macOS",
