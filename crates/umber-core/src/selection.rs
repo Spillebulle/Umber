@@ -157,6 +157,28 @@
 //! no allocation and no pass, so a selection nobody feathered costs exactly
 //! what it did before feathering existed.
 //!
+//! # What a feather does to a lift, which is not new but is now the ordinary
+//! case
+//!
+//! `transform.wgsl`'s `fs_mask` takes the share of a pixel that leaves as
+//! `min(a, m) / a` rather than `a × m`, because painting is *already* clipped
+//! by this same mask in the dab pass and multiplying applies it twice. The
+//! third of the three cases that rule enumerates — `a < m`, content softer than
+//! the mask — reads "the float takes it whole, with that falloff intact rather
+//! than multiplied by the mask's". Against an antialiased edge that is a
+//! one-pixel band. Against a feather it is a band `2 × radius` wide, so
+//! **lifting a soft wash through a wide feather takes it whole wherever it is
+//! fainter than the ramp**, and the feather shows only where the content is
+//! more opaque than the mask.
+//!
+//! That is the documented rule behaving as documented and nothing here changed
+//! it, but it is worth saying out loud in the place a feather is defined,
+//! because a feather is exactly what somebody reaches for when they want a soft
+//! edge on a lift. `a_lift_still_splits_paint_the_selection_did_not_make`
+//! refuses the tempting over-correction — taking everything the mask touches —
+//! and the argument for `min` is in `transform.wgsl`'s own comments; changing
+//! it is a decision about the transform, not about this module.
+//!
 //! # What is not here
 //!
 //! No "select by colour", no growing or shrinking a selection by a distance,
@@ -411,6 +433,16 @@ impl Selection {
     ///
     /// `None` where a shape is so thin that softening it rounds every pixel to
     /// nothing — the same answer as no selection everywhere else in this file.
+    ///
+    /// **A mask that survives but never reaches [`INSIDE`] is kept**, where
+    /// [`Selection::from_mask`] refuses one. The two look like the same
+    /// condition and are answers to different questions: there the *outline* is
+    /// what could not be found, and a selection with no outline is one nobody
+    /// can see; here the outline is the exact geometry of the shape somebody
+    /// drew and is unchanged, and a very soft selection whose peak coverage is
+    /// low is precisely what a feather wider than the shape means. Refusing it
+    /// would make the rail stop working part way along for no reason the artist
+    /// could see.
     #[must_use]
     pub fn feathered(self, radius: f32, doc: UVec2) -> Option<Self> {
         let radius = radius.clamp(0.0, Self::MAX_FEATHER);
@@ -445,9 +477,19 @@ impl Selection {
     /// a mirror is an isometry, so it needs no transforming — see "Feather" in
     /// the module docs.
     ///
-    /// `None` cannot arise from a selection that had any coverage, since a
-    /// mirror preserves area; it is an `Option` because `from_rings` is, and
-    /// the answer for "nothing selected" is `None` everywhere in this file.
+    /// **A feather that dissolves the mirror keeps the hard one instead**, and
+    /// this is not a hypothetical. A boolean traces its rings at the 50%
+    /// contour and records the *larger* of the two radii, so a small region
+    /// carrying a wide feather is reachable — intersect two heavily feathered
+    /// shapes that barely overlap — and re-rasterising those rings sharp and
+    /// softening them by that radius can round every pixel to nothing.
+    /// Deleting somebody's selection because they flipped the canvas is far
+    /// worse than mirroring it hard, and it would not even be undoable: undoing
+    /// a flip *is* another flip, so there is nothing to bring it back.
+    ///
+    /// `None` therefore still means only what it means everywhere else in this
+    /// file: the mirrored rings enclosed no pixel at all, which a mirror of
+    /// something with area cannot produce.
     pub fn flipped(&self, axis: FlipAxis, doc: UVec2) -> Option<Self> {
         let size = Vec2::new(doc.x as f32, doc.y as f32);
         let rings = self
@@ -455,7 +497,8 @@ impl Selection {
             .iter()
             .map(|ring| ring.iter().map(|p| axis.mirror(*p, size)).collect())
             .collect();
-        Self::from_rings(rings, doc)?.feathered(self.feather, doc)
+        let sharp = Self::from_rings(rings, doc)?;
+        Some(sharp.clone().feathered(self.feather, doc).unwrap_or(sharp))
     }
 
     /// Build a selection from a coverage mask, trimming it to what is actually
@@ -803,6 +846,18 @@ fn add_span(acc: &mut [f32], origin: f32, x0: f32, x1: f32, weight: f32) {
 ///
 /// **Everything outside the mask is zero**, including everything outside the
 /// canvas, which is what makes a selection fade at the edge of the document.
+///
+/// **What it costs, said the way [`trace_rings`] says it.** Linear in the area
+/// whatever the radius, but with a real constant: two byte buffers the size of
+/// the grown rectangle, so a full-canvas feathered selection on a 2048²
+/// document is about 8 MB of scratch and on a 10000² one about 200 MB, given
+/// straight back. The vertical pass walks columns, which is a cache line per
+/// access on a wide rectangle. Unlike `trace_rings` this runs on *every*
+/// feathered gesture rather than only after a boolean — but still only at
+/// pointer-up, on a flip, and at a transform commit. **Nothing on the drawing
+/// path may reach it**, and nothing does: [`Selection::feathered`] is called
+/// from `SelectionDraft::finish`, [`Selection::flipped`] and
+/// `Editor::carry_selection`, and from nowhere else.
 fn soften(
     bounds: PixelRect,
     coverage: &[u8],
@@ -1959,6 +2014,44 @@ mod tests {
             .expect("a mirror back");
         assert_eq!(back.bounds(), s.bounds());
         assert_eq!(back.coverage(), s.coverage());
+    }
+
+    #[test]
+    fn a_flip_never_deletes_a_selection_it_cannot_soften() {
+        // A small region carrying a wide feather is reachable, because a
+        // boolean traces its rings at the 50% contour and records the *larger*
+        // of the two radii. Re-rasterising those rings sharp and softening them
+        // by that radius can round every pixel to nothing — and a flip that
+        // silently threw the selection away would not even be undoable, since
+        // undoing a flip is another flip.
+        let small = rect(28.0, 28.0, 32.0, 32.0);
+        // Softening it outright *is* nothing, which is the state the flip has
+        // to survive rather than pass on.
+        assert!(
+            small
+                .clone()
+                .feathered(Selection::MAX_FEATHER, DOC)
+                .is_none()
+        );
+
+        // The state a boolean can leave: these rings, that radius. Built by
+        // hand because reaching it through two feathered lassos would be a
+        // fixture nobody could check by eye, and the shape of the state is the
+        // whole point.
+        let awkward = Selection {
+            feather: Selection::MAX_FEATHER,
+            ..small
+        };
+        let flipped = awkward
+            .flipped(FlipAxis::Horizontal, DOC)
+            .expect("the selection must survive a flip");
+        assert!(
+            flipped.coverage().iter().any(|c| *c > 0),
+            "the flip left a selection with no coverage"
+        );
+        // And it is the hard mirror, in the mirrored place — 64 - 32 .. 64 - 28.
+        assert_eq!(flipped.bounds().x, 32);
+        assert_eq!(flipped.coverage_at(32, 30), 255);
     }
 
     #[test]

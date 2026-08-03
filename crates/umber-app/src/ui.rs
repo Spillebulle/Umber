@@ -1346,8 +1346,9 @@ mod strip_budget {
     pub const SIZE: f32 = 160.0;
     pub const OPACITY: f32 = 185.0;
     pub const STABILISER: f32 = 110.0;
-    /// The line naming the modifiers that add to and subtract from a selection.
-    pub const COMBINE: f32 = 230.0;
+    /// The line naming the modifiers that add to, subtract from and intersect a
+    /// selection, and say what the feather applies to.
+    pub const COMBINE: f32 = 320.0;
     /// The four marks that say what a new shape does to the selection.
     pub const SELECT_OP: f32 = 105.0;
     /// The feather rail, its label and its readout.
@@ -1355,21 +1356,32 @@ mod strip_budget {
 }
 
 /// How to add to, subtract from and intersect a selection, named for this
-/// platform.
+/// platform — and **what the feather applies to**.
 ///
 /// A held modifier is part of a gesture rather than a command, so it is
 /// deliberately not in the rebindable table — which leaves the options strip as
 /// the only place the user can find out. It is a *second* way in rather than
 /// the only one now: the four marks beside it are the same four operations, for
-/// the reason `App::selection_op` gives. `const` rather than `format!` with
-/// `shortcuts::primary_modifier_name`, because the strip is painted every frame
-/// and a string built per frame for a line that never changes is exactly what
-/// the rest of this interface avoids.
+/// the reason `App::selection_op` gives.
+///
+/// The feather's half is here because [`widgets::inline_slider`] has no
+/// tooltip — it is the strip's rail and every other user of it sets something
+/// that takes effect at once — and a rail that reads `0…250` while a selection
+/// is standing and changes nothing about it is a control that lies unless the
+/// strip says which selection it means. Saying it in the label ("Feather next")
+/// was the alternative and reads as a typo; this is where the other thing the
+/// strip has to explain about a *gesture* already lives.
+///
+/// `const` rather than `format!` with `shortcuts::primary_modifier_name`,
+/// because the strip is painted every frame and a string built per frame for a
+/// line that never changes is exactly what the rest of this interface avoids.
 const fn combine_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Hold Shift to add, Cmd to subtract, both to intersect."
+        "Hold Shift to add, Cmd to subtract, both to intersect. Feather softens \
+         the next shape you draw."
     } else {
-        "Hold Shift to add, Ctrl to subtract, both to intersect."
+        "Hold Shift to add, Ctrl to subtract, both to intersect. Feather softens \
+         the next shape you draw."
     }
 }
 
@@ -1496,7 +1508,16 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // Dropped first when the window is narrow: the gesture the mode
             // needs is the line somebody is stuck without, and this one is
             // about a gesture they have not reached for yet.
-            if room >= strip_budget::SELECT_OP + strip_budget::FEATHER + strip_budget::COMBINE {
+            //
+            // **Measured afresh, not against `room`.** The mode hint above it is
+            // drawn unconditionally and is in no budget — `SelectionMode::
+            // Polygon`'s is eighty-four characters — so a budget taken before it
+            // would put this sentence hundreds of points past the right edge of
+            // a strip that does not reflow. Reading what is actually left is
+            // what the line has always done, and it accounts for the hint by
+            // construction rather than by a number that would have to be kept
+            // in step with three sentences.
+            if ui.available_width() >= strip_budget::COMBINE {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(combine_hint())

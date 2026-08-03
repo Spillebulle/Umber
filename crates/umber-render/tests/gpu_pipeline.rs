@@ -3695,22 +3695,25 @@ fn a_lift_leaves_no_ghost_of_the_selection_it_was_painted_through() {
     }
 }
 
-/// The same property under a **feather**, which is the case the `min(a, m) / a`
-/// rule was built for and never actually met.
+/// A lift through a **feather**, over content the selection did not make.
 ///
-/// An antialiased outline is one pixel of partial coverage against a whole
-/// interior of 255; a feathered one is *nothing but* partial coverage, tens of
-/// pixels deep and reaching down to a coverage of one. So this is the same
-/// arithmetic over the range where it is hardest: the share is a share of an
-/// alpha that is itself small, and the two halves — what the float takes and
-/// what the hole leaves — have to go on summing to what was there.
+/// The test above paints *through* the selection it then lifts through, so
+/// `a == m` everywhere and the share `min(a, m) / a` is identically one: the
+/// float takes all of it and the hole is zero by construction. That is the
+/// right shape for the ghost it exists to catch, and it is deliberately not a
+/// test of the arithmetic — it would pass under any rule that reduces to one
+/// when `a <= m`.
 ///
-/// The two are one number in `transform.wgsl` by construction, which is why
-/// this can be stated as a complement rather than as a falloff anybody worked
-/// out by hand: the source has to come back to bare, and the destination has to
-/// hold what the source gave up.
+/// Here the layer is filled to a flat alpha the selection knows nothing about,
+/// so `a` and `m` are independent and the share runs over its whole range: one
+/// where the feather's ramp is above the alpha, `m / a` where it is below.
+/// What is asserted is therefore **conservation** rather than "the float
+/// carries all of it" — what leaves plus what stays is what was there — which
+/// is the one number `transform.wgsl` drives both passes from, and it is the
+/// same claim `a_cut_takes_exactly_what_it_leaves_behind` makes on the CPU
+/// side.
 #[test]
-fn a_lift_through_a_feathered_selection_leaves_no_ghost_either() {
+fn a_lift_through_a_feathered_selection_splits_the_alpha_it_finds() {
     let mut h = harness_or_skip!();
 
     let sel = Selection::polygon(
@@ -3725,57 +3728,43 @@ fn a_lift_through_a_feathered_selection_leaves_no_ghost_either() {
     .feathered(4.0, UVec2::splat(DOC))
     .expect("a soft selection");
     let source = sel.bounds();
-    let empty = read_rect(&h, 0, source);
-    assert!(
-        empty.iter().all(|b| *b == 0),
-        "the layer did not start bare"
-    );
 
-    h.set_selection(Some(sel.clone()));
-    h.stamp(&[dab(19.0, 17.0, 34.0, 1.0)]);
-    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
-    let painted = alphas(&read_rect(&h, 0, source));
-    // The point of the feather: a mask that is almost all partial coverage. An
-    // ordinary antialiased edge would fail this — its interior is 255 and only
-    // a one-pixel band is in between.
-    let soft = painted.iter().filter(|a| **a > 0 && **a < 250).count();
-    assert!(
-        soft * 2 > painted.iter().filter(|a| **a > 0).count(),
-        "most of a feathered selection's paint should be partly covered, and \
-         only {soft} of {} pixels are",
-        painted.len()
-    );
+    // A flat half-transparent block, written straight into the layer rather
+    // than painted through anything — which is the whole of what makes `a`
+    // independent of the mask here. Premultiplied, as a layer holds it.
+    let before = 128u8;
+    h.write_block(0, source, [64, 30, 12, before]);
 
     let dest = lift_and_move(&mut h, &sel, Vec2::new(0.0, 30.0));
 
-    assert_eq!(
-        read_rect(&h, 0, source),
-        empty,
-        "a ghost of the feather was left where the paint was lifted from"
-    );
-    // Alpha, within the level the store can round by, for the reason the
-    // antialiased test above gives at length — and colour deliberately not
-    // compared at all, which matters far more here: most of this rectangle is
-    // at an alpha where one level moves the encoded byte by several.
-    let carried = alphas(&read_rect(&h, 0, dest));
-    assert_eq!(
-        carried.len(),
-        painted.len(),
-        "the rectangles differ in size"
-    );
-    let worst = carried
-        .iter()
-        .zip(&painted)
-        .enumerate()
-        .max_by_key(|(_, (c, g))| c.abs_diff(**g))
-        .map(|(i, (c, g))| (i, *c, *g));
-    if let Some((at, carried, gave_up)) = worst {
+    let left = alphas(&read_rect(&h, 0, source));
+    let taken = alphas(&read_rect(&h, 0, dest));
+    assert_eq!(left.len(), taken.len(), "the rectangles differ in size");
+
+    let mut split = 0;
+    for (i, (l, t)) in left.iter().zip(&taken).enumerate() {
+        let sum = u16::from(*l) + u16::from(*t);
+        // Two levels rather than one: this is two stores of two numbers a
+        // shader worked out from one, where the antialiased test compares a
+        // single stored value against a single stored value.
         assert!(
-            carried.abs_diff(gave_up) <= 1,
-            "the float did not carry every pixel the layer gave up: at pixel \
-             {at} the layer gave up {gave_up} and the float carries {carried}",
+            sum.abs_diff(u16::from(before)) <= 2,
+            "at pixel {i} the layer kept {l} and the float took {t}, which is \
+             {sum} of the {before} that was there",
         );
+        if *l > 0 && *t > 0 {
+            split += 1;
+        }
     }
+    // And the feather is what is being tested: a hard mask splits no pixel at
+    // all and an antialiased edge splits a one-pixel band, so a ramp crossing
+    // the block's own alpha has to split a great many or this is the test above
+    // wearing a different name.
+    assert!(
+        split > 40,
+        "only {split} pixels were partly lifted, so the feather is not being \
+         exercised"
+    );
 }
 
 /// The cheap case, and the one that should be exact on both axes: an integer

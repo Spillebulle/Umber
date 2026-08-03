@@ -879,10 +879,12 @@ impl Editor {
     /// that had to agree with the first about every antialiased edge.
     pub fn flip_canvas(&mut self, axis: umber_core::FlipAxis) {
         let doc = self.doc.size;
-        // A selection that mirrors to nothing cannot arise — a mirror preserves
-        // area — but `flipped` is an `Option` because `from_rings` is, and
-        // dropping it is the right answer if it ever does: an outline covering
-        // nothing is no selection.
+        // A selection that mirrors to nothing cannot arise from one that had
+        // area — a mirror preserves it, and `Selection::flipped` keeps the hard
+        // mirror rather than let a wide feather dissolve the mirrored shape.
+        // `flipped` is an `Option` because `from_rings` is, and dropping it is
+        // the right answer if it ever does: an outline covering nothing is no
+        // selection.
         self.selection = self
             .selection
             .as_deref()
@@ -1295,6 +1297,12 @@ impl Editor {
     /// scaled by the transform — a feather is a distance in document pixels,
     /// the same thing the control on the strip says, and a non-uniform scale
     /// has no single number to scale it by anyway.
+    ///
+    /// And it falls back to the hard mirror where the radius dissolves the
+    /// moved shape, exactly as `Selection::flipped` does and for the reason
+    /// stated there: scaling a small feathered region down is a way to reach
+    /// that, and losing the marquee because a transform was committed is worse
+    /// than carrying it hard.
     pub fn carry_selection(&mut self, xf: &Transform) {
         let Some(selection) = self.selection.as_ref() else {
             return;
@@ -1306,8 +1314,9 @@ impl Editor {
             .map(|ring| ring.iter().map(|p| m.apply(*p)).collect())
             .collect();
         let feather = selection.feather();
-        self.selection = Selection::from_rings(rings, self.doc.size)
-            .and_then(|s| s.feathered(feather, self.doc.size))
+        let doc = self.doc.size;
+        self.selection = Selection::from_rings(rings, doc)
+            .map(|sharp| sharp.clone().feathered(feather, doc).unwrap_or(sharp))
             .map(Arc::new);
     }
 

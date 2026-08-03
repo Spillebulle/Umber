@@ -334,9 +334,16 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 outline(5.0, 5.0, 19.0, 19.0);
             } else {
                 match icon {
+                    // The union, as **three disjoint rectangles**. Filling both
+                    // squares whole is the obvious spelling and is wrong: the
+                    // tint is a fraction of the ink, so two fills composite in
+                    // the lens where they cross and Add draws a darker overlap
+                    // — which is exactly Intersect's mark, on the one control
+                    // whose four members can only be told apart by their fill.
                     Icon::SelectAdd => {
                         fill(4.0, 4.0, 15.0, 15.0);
-                        fill(9.0, 9.0, 20.0, 20.0);
+                        fill(15.0, 9.0, 20.0, 20.0);
+                        fill(9.0, 15.0, 15.0, 20.0);
                     }
                     // The first square with the second taken out of it: an L,
                     // which is two rectangles because both are axis-aligned.
