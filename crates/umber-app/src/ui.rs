@@ -34,7 +34,8 @@ use umber_core::{
 #[derive(Default, Clone, Copy)]
 pub struct UiActions {
     pub clear: bool,
-    /// Take the selection onto Umber's clipboard, and — for a cut — off the
+    /// Take the selection onto Umber's clipboard and on to the desktop's, and —
+    /// for a cut — off the
     /// layer. The caller's, because both block on a readback and a cut records
     /// an undo entry. Raised by the selection's overlay strip, which is the only
     /// control for either; the keyboard reaches the same two methods directly
