@@ -930,23 +930,6 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
 
     hue_ring(ui, centre, inner, outer);
 
-    // The members, marked on the ring. The base wears the same ring the Wheel
-    // mode's hue marker does — it is the same thing — and the others are filled
-    // discs of their own colour, so which one is in hand is a difference of
-    // *mark* rather than of colour. That matters: at zero saturation every
-    // member is the same grey.
-    let hues = harmony.hues(hsv.h);
-    let painter = ui.painter();
-    for (index, hue) in hues.as_slice().iter().enumerate() {
-        let at = ring_point(centre, inner, outer, *hue);
-        if index == 0 {
-            painter.circle_stroke(at, 6.0, MARKER_STROKE);
-        } else {
-            painter.circle_filled(at, 5.0, hsv_colour(*hue, hsv.s, hsv.v));
-            painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
-        }
-    }
-
     // The saturation and value field, level and inscribed in the ring.
     let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
     let drag = if on_ring { None } else { at };
@@ -974,8 +957,33 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     );
     *harmony = picked;
 
+    // Only now: the hue, the saturation, the value and the relation are all
+    // settled for this frame. Asking earlier — which is the obvious place,
+    // beside the ring the markers sit on — makes the row show the *previous*
+    // relation for a frame after the dropdown is used, which is one frame of a
+    // control lying about what it just did.
     ui.add_space(8.0);
-    changed |= harmony_swatches(ui, p, hues.as_slice(), hsv);
+    changed |= harmony_swatches(ui, p, harmony.hues(hsv.h).as_slice(), hsv);
+
+    // The markers, last of all, so a colour taken from the row above moves them
+    // on the frame it was taken rather than the frame after. Painting order is
+    // insertion order within a layer, so these land on top of the ring however
+    // far down the layout they are written.
+    //
+    // The base wears the same ring the Wheel mode's hue marker does — it is the
+    // same thing — and the others are filled discs of their own colour, so which
+    // one is in hand is a difference of *mark* rather than of colour. That
+    // matters: at zero saturation every member is the same grey.
+    let painter = ui.painter();
+    for (index, hue) in harmony.hues(hsv.h).as_slice().iter().enumerate() {
+        let at = ring_point(centre, inner, outer, *hue);
+        if index == 0 {
+            painter.circle_stroke(at, 6.0, MARKER_STROKE);
+        } else {
+            painter.circle_filled(at, 5.0, hsv_colour(*hue, hsv.s, hsv.v));
+            painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+        }
+    }
 
     changed
 }
