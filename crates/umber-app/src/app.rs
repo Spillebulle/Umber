@@ -9,6 +9,7 @@ use crate::logo;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
+use crate::syscursor;
 use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
@@ -1921,8 +1922,22 @@ impl UmberApp {
             pixels_per_point,
             viewport_output,
         } = full_output;
+        // Read before the output is handed over, because it is moved. This is
+        // *what the interface asked for this frame* — `ui::pen_cursor` is the
+        // only thing that ever asks for `None` — so the state runs the same way
+        // it does for every other cursor: derived per frame, never remembered.
+        let hide_cursor = platform_output.cursor_icon == egui::CursorIcon::None;
         gfx.egui_state
             .handle_platform_output(&gfx.window, platform_output);
+        // …and after, because egui-winit's own attempt goes first and, on
+        // Windows under a pen, quietly does nothing. See `syscursor`: winit
+        // hides the cursor only while a flag that legacy mouse messages alone
+        // ever set is on, and a pen produces none of those. Called every frame
+        // the answer is still "none" rather than on the change, so there is
+        // nothing here to get stuck.
+        if hide_cursor {
+            syscursor::hide_now();
+        }
 
         // What egui itself wants next, which is the *only* thing that should
         // schedule a frame with no input behind it.

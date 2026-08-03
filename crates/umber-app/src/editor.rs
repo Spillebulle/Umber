@@ -616,6 +616,34 @@ impl Editor {
         inside && !self.layout_owns_pointer(screen) && !self.canvas_overlay_owns_pointer(screen)
     }
 
+    /// Where the canvas should draw its own pointer this frame, in physical
+    /// window pixels — and `None` where the cursor the rest of the desktop gave
+    /// us is the right one.
+    ///
+    /// The whole of the rule, in one place and as a pure function of state, so
+    /// that it can be checked without a window. That matters more here than
+    /// almost anywhere else in this crate: nobody working on Umber has a pen,
+    /// so the only evidence this decision is right is a test that puts an
+    /// [`Editor`] into the state a hovering pen leaves it in and asks.
+    ///
+    /// Two halves, and each was somewhere a pen could have been lost:
+    ///
+    /// - [`Editor::pen_pointer`] — *what kind* of device is driving the
+    ///   pointer, latched from the last pointer event rather than preferred.
+    ///   A finger counts, and deliberately: an arrow under a fingertip says as
+    ///   little about where the mark will start as an arrow under a nib does.
+    /// - [`Editor::pointer_over_canvas`] of [`Editor::cursor`] — over a panel,
+    ///   a menu or one of the canvas's own overlay controls the ordinary cursor
+    ///   is the right one, because those are things to point *at*. `cursor` is
+    ///   only trustworthy here because a pen's hover writes it: winit gives a
+    ///   pen no `CursorMoved`, so a build in which the hover branch merely
+    ///   recorded the position and returned would be testing wherever the mouse
+    ///   was last left — `(0, 0)` on a fresh launch, which is the menu bar, and
+    ///   therefore *never* the canvas.
+    pub fn pen_dot(&self) -> Option<Vec2> {
+        (self.pen_pointer && self.pointer_over_canvas(self.cursor)).then_some(self.cursor)
+    }
+
     /// Select a tool, keeping the brush's paint/erase mode in step.
     pub fn set_tool(&mut self, tool: Tool) {
         self.ui.tool = tool;
@@ -1443,6 +1471,90 @@ mod tests {
                 "{name} claimed canvas it does not cover"
             );
         }
+    }
+
+    /// An editor whose canvas region fills a 1000 x 800 window, points and
+    /// pixels alike, and which **no pointer event has touched** — so `cursor`
+    /// is still where a fresh launch leaves it.
+    ///
+    /// A struct literal rather than `Editor::default()` followed by three
+    /// assignments, which says the same thing and is what clippy's
+    /// `field_reassign_with_default` refuses.
+    fn windowed() -> Editor {
+        Editor {
+            pixels_per_point: 1.0,
+            canvas_pivot: Vec2::new(500.0, 400.0),
+            canvas_size: Vec2::new(1000.0, 800.0),
+            ..Editor::default()
+        }
+    }
+
+    /// **A hovering pen must reach the dot with no mouse event behind it**,
+    /// which is the case a machine with a tablet is in and the machine this was
+    /// written on can never be.
+    ///
+    /// The trap is `Editor::cursor`. It is written by `CursorMoved`, and a pen
+    /// on Windows Ink produces none — so if the hover branch of `window_event`
+    /// ever goes back to recording the position and returning, `cursor` here
+    /// holds wherever the mouse was last left. On a fresh launch that is
+    /// `(0, 0)`, the corner of the menu bar, which is never over the canvas:
+    /// `pen_dot` would answer `None` for the whole time the pen is hovering,
+    /// which is exactly when the arrow is on screen and complained about. So
+    /// this starts from an editor no pointer event has touched and writes
+    /// *only* what a hover writes.
+    ///
+    /// It is also the guard on the second half of that bug: the dot is drawn at
+    /// the position this answers with, so a stale `cursor` put the dot in the
+    /// wrong place as well as suppressing it.
+    #[test]
+    fn a_hovering_pen_asks_for_its_own_cursor_with_no_mouse_event_behind_it() {
+        let mut ed = windowed();
+        assert_eq!(
+            ed.cursor,
+            Vec2::ZERO,
+            "the point of this test is that no mouse event has moved it"
+        );
+        assert_eq!(ed.pen_dot(), None, "a mouse keeps the desktop's own arrow");
+
+        // What the `Contact::Hover` branch leaves behind: the kind of device,
+        // and the position out of the touch's own event.
+        let at = Vec2::new(620.0, 310.0);
+        ed.pen_pointer = true;
+        ed.cursor = at;
+        assert_eq!(
+            ed.pen_dot(),
+            Some(at),
+            "a pen hovering over the canvas has to get the dot, at the nib"
+        );
+    }
+
+    /// Over a panel the ordinary cursor is the right one — those are things to
+    /// point at — and over a canvas overlay too, for the same reason a press
+    /// there is not a dab. Both halves through `pointer_over_canvas`, so this
+    /// cannot start disagreeing with where a press goes.
+    #[test]
+    fn a_pen_over_something_to_point_at_keeps_the_ordinary_cursor() {
+        let mut ed = windowed();
+        ed.pen_pointer = true;
+
+        ed.cursor = Vec2::new(500.0, 400.0);
+        assert!(ed.pen_dot().is_some(), "open canvas is the dot's");
+
+        // Off the canvas region altogether: a docked panel.
+        ed.cursor = Vec2::new(1400.0, 400.0);
+        assert_eq!(ed.pen_dot(), None, "a pen over a panel keeps the arrow");
+
+        // Inside the region, over one of the canvas's own controls.
+        ed.cursor = Vec2::new(500.0, 400.0);
+        ed.selection_buttons[0] = Some(egui::Rect::from_min_size(
+            egui::pos2(480.0, 380.0),
+            egui::vec2(40.0, 40.0),
+        ));
+        assert_eq!(
+            ed.pen_dot(),
+            None,
+            "a pen over a canvas overlay keeps the arrow"
+        );
     }
 
     fn point() -> InputPoint {

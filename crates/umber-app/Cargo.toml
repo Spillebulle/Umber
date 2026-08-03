@@ -84,6 +84,10 @@ windows-sys = { version = "0.61", features = [
     # `SetCurrentProcessExplicitAppUserModelID`, which is what gives the taskbar
     # button an identity of its own. See `taskbar::claim_identity`.
     "Win32_UI_Shell",
+    # `SetCursor`, which is the only way to take the arrow off the screen for a
+    # pen: winit's own `set_cursor_visible` is gated on a flag that legacy mouse
+    # messages alone ever set. See `src/syscursor.rs`.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]

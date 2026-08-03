@@ -41,6 +41,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod splash;
+mod syscursor;
 mod tabs;
 mod taskbar;
 mod theme;
