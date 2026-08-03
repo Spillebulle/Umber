@@ -905,6 +905,35 @@ blobs, reads the four the same way. A fifth bit, `0x100`, is declared as
 supported by brush size and its neighbours and is never switched on in either
 sample file; it is named as unrecognised rather than guessed at.
 
+**A source is carried only where the setting it drives has an Umber field, and
+everything else is named.** `IMPORTED_INPUTS` is the one statement of which
+sources land on which column — pressure on size, hardness and the two coverage
+settings; velocity on size and the two coverage settings; randomness on size and
+the dab angle — and `unreachable_inputs` reports the complement. Pressure and
+the random draw used to be passed over on the grounds that Umber produces them
+both, which reads the rule backwards: what is lost is the *mapping*, not the
+input, and a brush whose hardness or spray followed the pen arrived looking like
+an import with nothing to apologise for.
+
+**A dynamic's floor is half of what it says, and it is carried with the curve.**
+Clip Studio states the minimum as a percentage of the setting's own value, which
+is exactly what `Brush::min_size_ratio` means for size. Opacity has no such
+field — coverage genuinely reaches zero, so Umber does not want one — so the
+floor is folded into the response curve instead, where a fixed row of evenly
+spaced samples represents `f + (1 − f) × curve(p)` exactly. Reading the curve
+alone dropped it, and a brush whose author had it painting from six tenths
+arrived painting from nothing: every stroke a fraction of the strength it was
+set to, reaching the colour asked for only after being laid down several times,
+which is indistinguishable from an opacity control that does not work.
+
+**Per-dab coverage is Opacity times Brush density, under pressure as well as
+under speed.** Clip Studio's Opacity is the whole stroke's and its Brush density
+is one dab's, and they multiply; `SPEED_TARGETS` already composed them that way
+for velocity while the pressure half read `BrushOpacityEffector` alone, so a
+brush whose density followed the pen imported painting at full density
+throughout. Two curves multiply sample by sample, which is the whole reason one
+`ResponseCurve` can carry both.
+
 **Velocity is Umber's `Speed` input, and it reaches size and per-dab opacity.**
 The shape is the same in both engines: full at a standstill, falling towards the
 input's floor as the pen moves. So the modulation's `low` is that floor and its
