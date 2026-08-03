@@ -480,8 +480,8 @@ fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
         ui,
         p,
         "No palettes yet. Make one and it fills with the colours you save into \
-         it, or bring one in — Umber reads and writes GIMP's .gpl, which is \
-         what every other painting application uses.",
+         it, or bring one in — Umber reads and writes GIMP's .gpl, which GIMP, \
+         Krita, Inkscape and Aseprite all read.",
     );
     ui.add_space(8.0);
     ui.horizontal(|ui| {
