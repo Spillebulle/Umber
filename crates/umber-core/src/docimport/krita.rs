@@ -196,6 +196,43 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
         Skipped,
     }
 
+    /// One open `<layer>` element.
+    struct Open {
+        /// Whether this element pushed onto `groups`, so its close pops.
+        pushed_group: bool,
+        name: String,
+        holder: Holder,
+        /// It has a `<masks>` element.
+        saw_masks: bool,
+        /// ...and at least one `<mask>` inside it was recognised — imported,
+        /// or named in a warning.
+        ///
+        /// The pair exists so a wrong guess about the *shape* of a mask
+        /// element cannot become a **silent** loss. Everything below rests on
+        /// `<masks>` holding `<mask>` children whose kind is in `nodetype`,
+        /// read out of Krita's `kis_kra_savexml_visitor.cpp` — but the
+        /// fixtures here are written from that same reading, so no test in
+        /// this repository can say it is wrong. If it ever is, the layer still
+        /// reports a mask that did not come across, which is exactly what this
+        /// reader did before it could read one at all. A guess that degrades
+        /// to a named loss is worth making; one that degrades to a layer
+        /// quietly covering more than it should is the thing this whole module
+        /// exists to refuse.
+        handled_a_mask: bool,
+    }
+
+    impl Open {
+        fn new(pushed_group: bool, name: String, holder: Holder) -> Self {
+            Self {
+                pushed_group,
+                name,
+                holder,
+                saw_masks: false,
+                handled_a_mask: false,
+            }
+        }
+    }
+
     let mut name = String::new();
     let mut size = None;
     let mut colourspace = String::new();
@@ -204,7 +241,7 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
     let mut specs: Vec<LayerSpec> = Vec::new();
     // One entry per open `<layer>` element: its name, whether it pushed a
     // group, and what it became.
-    let mut open_layers: Vec<(bool, String, Holder)> = Vec::new();
+    let mut open_layers: Vec<Open> = Vec::new();
     let mut groups: Vec<Group> = Vec::new();
 
     let mut buf = Vec::new();
@@ -295,10 +332,19 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                             }
                         };
                         if !is_empty {
-                            open_layers.push((pushed_group, open_name, holder));
+                            open_layers.push(Open::new(pushed_group, open_name, holder));
                         } else if pushed_group {
                             // `<layer nodetype="grouplayer"/>` with no children.
                             groups.pop();
+                        }
+                    }
+                    // Noted, not acted on — what is inside decides everything.
+                    // Recorded so that a `<masks>` yielding no `<mask>` this
+                    // reader recognises is still reported; see
+                    // `Open::handled_a_mask`.
+                    b"masks" => {
+                        if let Some(open) = open_layers.last_mut() {
+                            open.saw_masks = true;
                         }
                     }
                     // A `<mask>` inside the `<masks>` of whichever layer is
@@ -307,10 +353,17 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                     // is: `<masks>` carries no name of its own.
                     b"mask" => {
                         let attrs = Attrs::read(e).map_err(malformed)?;
-                        // `last_mut` is `None` for a `<mask>` outside every
-                        // layer, which is malformed and has nothing to attach
-                        // to.
-                        if let Some((_, layer, holder)) = open_layers.last_mut() {
+                        // `last_mut` is `None` for a `<mask>` sitting at the
+                        // root of `<layers>` rather than inside a layer, which
+                        // is how Krita serialises a **global selection
+                        // mask** — a selection belonging to the image itself.
+                        // Umber imports no selection out of any format, so
+                        // there is nothing here for this one file to report
+                        // that every other one does not.
+                        if let Some(open) = open_layers.last_mut() {
+                            open.handled_a_mask = true;
+                            let layer = &open.name;
+                            let holder = &mut open.holder;
                             let kind = attrs.get("nodetype").unwrap_or_default();
                             let unsupported = if kind != TRANSPARENCY_MASK {
                                 Some(mask_label(kind))
@@ -350,16 +403,17 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                                     let what = match (unsupported, spec.mask.is_some()) {
                                         (Some(what), _) => Some(what),
                                         // Krita allows several and Umber holds
-                                        // one. The uppermost is kept —
-                                        // `<masks>` is written topmost first,
-                                        // as the layer list is — and the rest
-                                        // are named rather than combined,
-                                        // which would be a second
-                                        // implementation of Krita's mask
-                                        // stack living in an importer.
+                                        // one. The first that is switched *on*
+                                        // is kept — `<masks>` is written
+                                        // topmost first, as the layer list is,
+                                        // so that is the uppermost live one —
+                                        // and the rest are named rather than
+                                        // combined, which would be a second
+                                        // implementation of Krita's mask stack
+                                        // living in an importer.
                                         (None, true) => Some(
-                                            "a second transparency mask, where Umber holds one \
-                                             per layer"
+                                            "a second transparency mask (Umber holds one per \
+                                             layer)"
                                                 .to_string(),
                                         ),
                                         (None, false) => {
@@ -389,9 +443,19 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
             Event::End(ref e) if e.local_name().as_ref() == b"layer" => {
                 // Every closing tag pops, whether or not it opened a group:
                 // the two stacks have to stay in step.
-                let closed_a_group = open_layers.pop().is_some_and(|(group, _, _)| group);
-                if closed_a_group {
-                    groups.pop();
+                if let Some(open) = open_layers.pop() {
+                    // It had masks and not one of them was anything this
+                    // reader recognised. Reported rather than passed over —
+                    // see `Open::handled_a_mask`.
+                    if open.saw_masks
+                        && !open.handled_a_mask
+                        && !matches!(open.holder, Holder::Skipped)
+                    {
+                        warnings.push(ImportWarning::MaskIgnored { layer: open.name });
+                    }
+                    if open.pushed_group {
+                        groups.pop();
+                    }
                 }
             }
             _ => {}
@@ -494,18 +558,24 @@ fn load_layer(
 /// on the layer's alpha, which is not what a mask slice holds; see
 /// [`srgb::encode_coverage`].
 ///
-/// `None` where nothing could be read, and the caller says so — a default of
-/// zero would mean a layer hidden completely, and inventing that from an absent
-/// entry is exactly the silent damage this module refuses. Two ordinary files
-/// reach it, so it is not the damaged-archive branch it looks like:
+/// `None` where nothing could be read, and the caller raises `MaskIgnored`.
+/// Two ordinary files reach it, so it is not the damaged-archive branch it
+/// looks like — and in **both** the layer really does come back covering more
+/// than it did, which is what that warning says:
 ///
-/// - A mask whose selection is **empty**. Krita writes no `.pixelselection` for
-///   one, and its own loader then leaves the selection at its default.
 /// - A mask made from a **vector** selection, which is a common enough way to
 ///   make one. Krita stores that as SVG under `<filename>.shapeselection/` and
 ///   writes no raster data beside it — its loader reads one or the other and
-///   never both. Rasterising the path here would be a vector renderer inside an
-///   importer, so the layer arrives unmasked and says so.
+///   never both. Rasterising the path here would be a vector renderer inside
+///   an importer.
+/// - A mask whose selection is **empty**. Krita writes no `.pixelselection` at
+///   all for one, and its loader defaults a pixel selection to transparent, so
+///   in Krita that mask hides the layer *entirely*. This is therefore the case
+///   where the warning is understated rather than wrong — and it is exactly
+///   why the absent entry may not be read as "no mask": taking the default of
+///   zero on faith would hide a layer completely on the strength of a file
+///   that said nothing, which is the silent damage this module refuses in the
+///   other direction.
 fn load_mask(zip: &mut Zip<'_>, document: &str, spec: &MaskSpec, canvas: UVec2) -> Option<Vec<u8>> {
     if spec.filename.is_empty() {
         return None;
@@ -1015,6 +1085,69 @@ mod tests {
         );
         let doc = read(&kra).unwrap();
         assert_eq!(mask_at(&doc.layers[0], 0, 0, 64), 255);
+
+        // A default that is not one of the two fixed points, so it also pins
+        // that the default goes through the same encode the tiles do. 0 and
+        // 255 alone would pass whether it did or not.
+        let kra = fixtures::kra(
+            64,
+            64,
+            &[KraLayer::new("Lines").pixel(0, 0, [9, 9, 9, 255]).mask(
+                KraMask::transparency("Mask")
+                    .coverage(0, 0, 0)
+                    .default_coverage(128)
+                    .at(64, 0),
+            )],
+        );
+        let doc = read(&kra).unwrap();
+        let stored = mask_at(&doc.layers[0], 0, 0, 64);
+        assert!(
+            (stored as i32 - 188).abs() <= 1,
+            "the default pixel was stored as {stored}, not encoded like the tiles"
+        );
+    }
+
+    #[test]
+    fn a_mask_kind_this_build_has_never_heard_of_is_named_by_its_own_word() {
+        // The two arms of `mask_label` that carry no translation. A kind a
+        // later Krita adds is one where the raw word is the only true thing
+        // that can be said, and "a mask" would send somebody looking through
+        // the wrong part of their document.
+        assert_eq!(mask_label("weathermask"), "a Krita weathermask");
+        assert_eq!(mask_label(""), "a Krita mask of no stated kind");
+
+        let kra = fixtures::kra(
+            64,
+            64,
+            &[KraLayer::new("Lines")
+                .pixel(0, 0, [9, 9, 9, 255])
+                .mask(KraMask::transparency("Mask").kind("weathermask"))],
+        );
+        let doc = read(&kra).unwrap();
+        assert!(doc.layers[0].mask.is_none());
+        assert!(doc.warnings.iter().any(|w| matches!(
+            w,
+            ImportWarning::MaskUnsupported { what, .. } if what == "a Krita weathermask"
+        )));
+    }
+
+    #[test]
+    fn a_mask_that_names_no_pixel_data_is_reported_like_one_whose_data_is_gone() {
+        // A `<mask>` with no `filename` at all, which is the malformed cousin
+        // of the missing-entry case and must not be read as "no mask".
+        let kra = fixtures::kra(
+            64,
+            64,
+            &[KraLayer::new("Lines")
+                .pixel(0, 0, [9, 9, 9, 255])
+                .mask(KraMask::transparency("Mask").unnamed())],
+        );
+        let doc = read(&kra).unwrap();
+        assert!(doc.layers[0].mask.is_none());
+        assert!(doc.warnings.iter().any(|w| matches!(
+            w,
+            ImportWarning::MaskIgnored { layer } if layer == "Lines"
+        )));
     }
 
     #[test]
@@ -1153,6 +1286,52 @@ mod tests {
             "{:?}",
             doc.warnings
         );
+    }
+
+    /// A `<masks>` element holding nothing this reader recognises is still
+    /// reported, and that is what keeps a wrong reading of the format from
+    /// being a *silent* loss.
+    ///
+    /// Every fixture here is written from the same reading of Krita's source
+    /// the reader is, so no test in this repository can tell us that reading is
+    /// wrong. What *can* be tested is the failure mode if it ever is — and the
+    /// answer has to be that the layer still says it had a mask that did not
+    /// come across, which is exactly what this reader did before it could read
+    /// one at all. A guess that degrades to a named loss is worth making; one
+    /// that degrades to a layer quietly covering more than it should is the
+    /// thing this module exists to refuse.
+    #[test]
+    fn a_masks_element_this_reader_cannot_make_sense_of_is_still_reported() {
+        // The element itself is unknown, so neither the `<mask>` arm nor the
+        // `<layer>` arm fires and only `<masks>` was ever seen.
+        let doc = read(&fixtures::kra_with_unreadable_mask_element()).unwrap();
+        assert_eq!(doc.layers.len(), 1);
+        assert!(doc.layers[0].mask.is_none());
+        assert!(
+            doc.warnings.iter().any(|w| matches!(
+                w,
+                ImportWarning::MaskIgnored { layer } if layer == "Lines"
+            )),
+            "an unrecognised mask must not vanish quietly: {:?}",
+            doc.warnings
+        );
+
+        // And the narrower miss — the element is right, its kind attribute is
+        // not — lands on the kind that says so rather than on nothing. `type=`
+        // is how an older note had it; Krita writes `nodetype=`.
+        let kra = fixtures::kra(
+            64,
+            64,
+            &[KraLayer::new("Lines")
+                .pixel(0, 0, [9, 9, 9, 255])
+                .mask(KraMask::transparency("Mask").kind(""))],
+        );
+        let doc = read(&kra).unwrap();
+        assert!(doc.layers[0].mask.is_none());
+        assert!(doc.warnings.iter().any(|w| matches!(
+            w,
+            ImportWarning::MaskUnsupported { what, .. } if what == "a Krita mask of no stated kind"
+        )));
     }
 
     #[test]

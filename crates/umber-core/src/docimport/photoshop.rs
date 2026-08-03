@@ -52,10 +52,16 @@
 //!   why [`has_mask`] is written the way it is: asking for the compression of
 //!   a channel that is not there is an error, and that is enough to *know* a
 //!   mask was dropped without being able to read it.
-//! - **RLE mask data would decode to rubbish even so.** `read_layer_channels`
-//!   skips the per-scanline length table using the **layer's** height for
-//!   every channel, so a mask whose rectangle is a different height than the
-//!   layer's — the ordinary case — starts decoding at the wrong offset.
+//! - **An RLE mask channel takes the whole file down, and this is the one that
+//!   costs a user something today.** `read_layer_channels` skips the
+//!   per-scanline length table with `&channel_data[2 * scanlines..]`, using the
+//!   **layer's** height for every channel. A mask shorter than the layer — the
+//!   ordinary case, since a mask is stored in its own rectangle — makes that a
+//!   slice past the end, which panics. `catch` turns it into a refusal, so the
+//!   document does not open **at all**: a real Photoshop file with a
+//!   compressed mask is not a lossy import here, it is a declined one.
+//!   `an_rle_mask_channel_refuses_the_file_rather_than_taking_the_process_with_
+//!   it` pins the refusal, which is the part that must not regress.
 //! - **There is no newer version to move to.** 0.3.5 is the latest published
 //!   (January 2024).
 //!
@@ -614,6 +620,27 @@ mod tests {
         assert!(has_mask(layer));
         // And the layer this crate *can* build is the layer without it.
         assert_eq!(&layer.rgba()[0..4], &[0, 0, 0, 255]);
+    }
+
+    /// An RLE-compressed mask channel — what Photoshop ordinarily writes —
+    /// refuses the file rather than taking the process with it.
+    ///
+    /// `psd` 0.3.5 skips the per-scanline length table using the *layer's*
+    /// height for every channel, so a mask stored in a shorter rectangle makes
+    /// that a slice past the end of the channel. `catch` is the whole of why
+    /// that is a message instead of a crash, and this is the case that proves
+    /// the module docs' claim rather than restating it: a real Photoshop file
+    /// with a compressed mask is a *declined* import here, not a lossy one.
+    #[test]
+    fn an_rle_mask_channel_refuses_the_file_rather_than_taking_the_process_with_it() {
+        let psd = fixtures::psd(
+            4,
+            8,
+            &[PsdLayerSpec::new("Ink", [0, 0, 0, 255])
+                .mask(PsdMask::new((0, 0, 2, 4), 200).compressed())],
+        );
+        let err = read(&psd).unwrap_err();
+        assert!(matches!(err, ImportError::Malformed { .. }), "{err:?}");
     }
 
     #[test]

@@ -154,12 +154,12 @@ pub struct ImportedLayer {
     /// goes straight to `write_texture` like everything else here.
     ///
     /// Only the **red** channel is ever read, and it holds sRGB-encoded
-    /// coverage rather than a linear multiplier; [`srgb::encode_coverage`] is
+    /// coverage rather than a linear multiplier; `srgb::encode_coverage` is
     /// the one place another application's mask byte becomes one of these.
     ///
     /// Filled by ORA and by `.kra`'s transparency masks. A `.psd` mask is
     /// still reported as lost, and that is the `psd` crate's limit rather than
-    /// a decision: see [`photoshop`]'s module docs.
+    /// a decision: see `photoshop`'s module docs.
     pub mask: Option<Vec<u8>>,
     /// Bounded by the alpha of the nearest unclipped layer below.
     pub clipped: bool,
@@ -695,6 +695,19 @@ impl std::error::Error for ImportError {
 /// Called by each reader as soon as it knows the header, which is the point of
 /// it: decoding sixty 8000² layers and *then* refusing would allocate several
 /// gigabytes to reach the same answer.
+///
+/// **Masks are deliberately not counted, and the bound is therefore what a
+/// stack of layers costs rather than what a document costs.** A mask is another
+/// canvas-sized slice, so a document whose every layer carries one reaches
+/// roughly twice [`ImportedDocument::MAX_TOTAL_BYTES`]. Counting them looks
+/// like the obvious tightening and is wrong in the one direction that matters:
+/// this is the check an *Umber* document goes through on the way back in, so a
+/// bound that counted masks would refuse to reopen large masked documents Umber
+/// itself had written — the reader would be stricter than the writer, and the
+/// artist's own file would be the casualty. The figure is a sanity bound
+/// against a malformed header rather than a memory budget; the real limits are
+/// the caller's `max_texture_dimension_2d` check and `LayerStack::MAX_SLOTS`,
+/// which does account for a mask on every layer.
 fn check_bounds(
     format: SourceFormat,
     width: u32,

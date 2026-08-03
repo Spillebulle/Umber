@@ -226,6 +226,8 @@ pub struct KraMask {
     /// Whether the `.pixelselection` entry is written at all. Krita omits it
     /// for a mask whose selection is empty.
     data: bool,
+    /// Whether the element carries a `filename` attribute.
+    named: bool,
 }
 
 impl KraMask {
@@ -241,6 +243,7 @@ impl KraMask {
             pixels: Vec::new(),
             default: 0,
             data: true,
+            named: true,
         }
     }
 
@@ -276,9 +279,21 @@ impl KraMask {
         self
     }
 
+    /// A mask carrying no `filename` attribute, so it names no pixel data.
+    pub fn unnamed(mut self) -> Self {
+        self.named = false;
+        self.data = false;
+        self
+    }
+
     fn xml(&self, filename: &str) -> String {
+        let filename = if self.named {
+            format!(" filename=\"{filename}\"")
+        } else {
+            String::new()
+        };
         format!(
-            "<mask name=\"{}\" filename=\"{filename}\" nodetype=\"{}\" visible=\"{}\" \
+            "<mask name=\"{}\"{filename} nodetype=\"{}\" visible=\"{}\" \
              locked=\"0\" x=\"{}\" y=\"{}\"/>",
             self.name,
             self.node_type,
@@ -621,6 +636,34 @@ pub fn kra_with_masked_group() -> Vec<u8> {
     archive.finish()
 }
 
+/// A `<masks>` element holding a child this reader has no arm for at all.
+///
+/// Stands in for the reading of the format being wrong about the *element*
+/// rather than about an attribute: if Krita named its mask elements anything
+/// but `<mask>`, this is the shape the reader would meet, and nothing here
+/// would fire. The layer must still report that it had a mask.
+pub fn kra_with_unreadable_mask_element() -> Vec<u8> {
+    let layer = KraLayer::new("Lines").pixel(0, 0, [1, 1, 1, 255]);
+    let mut archive = Archive::new("application/x-krita");
+    archive.add("Fixture/layers/layer0", &layer.tile_file());
+
+    let body = "<layer name=\"Lines\" filename=\"layer0\" nodetype=\"paintlayer\" x=\"0\" y=\"0\" \
+                opacity=\"255\" visible=\"1\" compositeop=\"normal\" colorspacename=\"RGBA\">\
+                <masks><transparencymask name=\"Mask\" filename=\"mask1\"/></masks></layer>";
+    let xml = format!(
+        "<DOC xmlns=\"http://www.calligra.org/DTD/krita\" syntaxVersion=\"2\">\
+         <IMAGE name=\"Fixture\" mime=\"application/x-kra\" width=\"64\" height=\"64\" \
+         colorspacename=\"RGBA\" profile=\"sRGB-elle-V2-srgbtrc.icc\">\
+         <layers>{body}</layers></IMAGE></DOC>"
+    );
+    archive.add("maindoc.xml", xml.as_bytes());
+    archive.add(
+        "mergedimage.png",
+        &png_rgba(64, 64, &solid(64, 64, &[7, 7, 7, 255])),
+    );
+    archive.finish()
+}
+
 pub fn kra_with_vector_layer() -> Vec<u8> {
     kra(
         64,
@@ -657,6 +700,8 @@ pub struct PsdMask {
     flags: u8,
     /// A flat coverage for the whole rectangle.
     value: u8,
+    /// Store the channel PackBits-compressed rather than raw.
+    rle: bool,
 }
 
 impl PsdMask {
@@ -666,6 +711,7 @@ impl PsdMask {
             default: 0,
             flags: 0,
             value,
+            rle: false,
         }
     }
 
@@ -675,9 +721,51 @@ impl PsdMask {
         self
     }
 
-    fn pixels(&self) -> usize {
-        let (top, left, bottom, right) = self.rect;
-        ((bottom - top) as usize) * ((right - left) as usize)
+    /// Store the mask channel RLE-compressed, as Photoshop ordinarily does.
+    ///
+    /// The bytes written are a per-scanline length table over the **mask's**
+    /// rows followed by one PackBits run each — the real layout, which is the
+    /// point: it is shorter than the table `psd` 0.3.5 skips, and that is what
+    /// makes the file undecodable there. See [`super::photoshop`]'s docs.
+    pub fn compressed(mut self) -> Self {
+        self.rle = true;
+        self
+    }
+
+    fn rows(&self) -> usize {
+        let (top, _, bottom, _) = self.rect;
+        (bottom - top) as usize
+    }
+
+    fn columns(&self) -> usize {
+        let (_, left, _, right) = self.rect;
+        (right - left) as usize
+    }
+
+    /// The channel plane, in whichever form [`Self::rle`] asks for.
+    ///
+    /// PackBits: a two-byte length per scanline, then the runs. A row of one
+    /// repeated byte is `(1 - columns) as i8` followed by that byte, which is
+    /// two bytes a row — comfortably shorter than the `2 * layer_height` table
+    /// `psd` 0.3.5 skips past.
+    fn plane(&self) -> Vec<u8> {
+        if !self.rle {
+            return std::iter::repeat_n(self.value, self.rows() * self.columns()).collect();
+        }
+        let run = [(1i32 - self.columns() as i32) as i8 as u8, self.value];
+        let mut out = Vec::new();
+        for _ in 0..self.rows() {
+            out.extend_from_slice(&(run.len() as u16).to_be_bytes());
+        }
+        for _ in 0..self.rows() {
+            out.extend_from_slice(&run);
+        }
+        out
+    }
+
+    /// The compression marker that goes in front of the plane.
+    fn compression(&self) -> u16 {
+        u16::from(self.rle)
     }
 }
 
@@ -765,7 +853,7 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
         for id in channels {
             records.extend_from_slice(&id.to_be_bytes());
             let plane = match (*id, &layer.mask) {
-                (-2, Some(mask)) => mask.pixels(),
+                (-2, Some(mask)) => mask.plane().len(),
                 _ => pixels,
             };
             // Two bytes of compression marker plus the plane itself.
@@ -808,8 +896,8 @@ pub fn psd(width: u32, height: u32, layers: &[PsdLayerSpec]) -> Vec<u8> {
             channel_data.extend(std::iter::repeat_n(layer.pixel[component], pixels));
         }
         if let Some(mask) = &layer.mask {
-            channel_data.extend_from_slice(&0u16.to_be_bytes()); // raw
-            channel_data.extend(std::iter::repeat_n(mask.value, mask.pixels()));
+            channel_data.extend_from_slice(&mask.compression().to_be_bytes());
+            channel_data.extend_from_slice(&mask.plane());
         }
     }
 
