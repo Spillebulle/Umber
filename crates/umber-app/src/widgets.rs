@@ -1321,6 +1321,15 @@ impl MarkBox {
 /// travelling in. None of that is restated here, which is the whole point: a
 /// second dab loop beside it would be a second thing to keep in step, and the
 /// row would slowly stop showing what the brush does.
+///
+/// [`Brush::blend`] is the one setting a row deliberately does **not** show,
+/// and it is not an omission to be filled in. A blend mode is a rule for
+/// combining the mark with the picture underneath it, and a row has no picture
+/// underneath it — it is a swatch on a panel, so there is nothing for Multiply
+/// to be a mode of and any mark drawn for one would be invented. Implementing
+/// it here would also be a fourth copy of the blend maths on the CPU, beside
+/// the one shared WGSL function `composite.wgsl` and `commit.wgsl` both call,
+/// which is exactly the drift `shaders/blend.wgsl` exists to end.
 fn preview_dabs(brush: &Brush, at: &MarkBox) -> Vec<Dab> {
     let scale = at.scale(brush);
     // The path in **document** pixels: the box the preview will occupy, taken
