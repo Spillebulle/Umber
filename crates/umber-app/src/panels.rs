@@ -954,13 +954,16 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         // not a second heading style; it is inline rather than a call to it
         // because that helper is a block with its own spacing and this shares
         // the icon row.
-        ui.label(
-            egui::RichText::new("Layer settings")
-                .size(text::SMALL)
-                .color(p.text_dim)
-                .strong(),
-        )
-        .on_hover_text("Blend mode and opacity apply to the selected layer");
+        //
+        // **The buttons are laid out first and the heading takes what is
+        // left.** A label in a horizontal layout defaults to
+        // `TextWrapMode::Extend`, so putting it first let it claim the whole
+        // line on a narrow panel; the right-to-left group after it was then
+        // handed a rect starting off the end of the panel and drew its buttons
+        // back over the words. Same failure the brush browser's notice bar had,
+        // and the panel can be dragged narrow enough to reach it in a way a
+        // dialog cannot. Truncated rather than wrapped, because a heading that
+        // became two lines would move the whole list down as the panel narrows.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(
                 ui,
@@ -1058,6 +1061,30 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             ) {
                 actions.group_layers = true;
             }
+            // Whose settings these are. The blend picker and the opacity slider
+            // below edit the *selected* layer — `Layer::blend` and
+            // `Layer::opacity` have always been per-layer — and with nothing
+            // saying so the pair read as a document-wide setting, which is the
+            // one thing they are not. Typography is `controls::section`'s, so
+            // the panel gains a heading and not a second heading style; it is
+            // inline rather than a call to it because that helper is a block
+            // with its own spacing and this shares the icon row.
+            //
+            // Turned back left-to-right inside the right-to-left group, so the
+            // heading reads from the left edge of whatever room the buttons
+            // left it rather than being pushed up against them.
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Layer settings")
+                            .size(text::SMALL)
+                            .color(p.text_dim)
+                            .strong(),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text("Blend mode and opacity apply to the selected layer");
+            });
         });
     });
 
@@ -1465,6 +1492,11 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     editing_mask: index == active && editing_mask,
                     clipped: layer.clipped,
                     locked: layer.locked,
+                    // Asked of the model rather than derived here: a lock
+                    // reaches a whole subtree and `effective_locked` is the one
+                    // place that is decided, the same rule the gates on
+                    // painting and deleting are read through.
+                    locked_by_folder: !layer.locked && ed.layers.effective_locked(index),
                     link: layer.link,
                     thumb: layer.slot().and_then(|s| ed.thumbs.picture(s)),
                     picked: layer.picked,
@@ -2484,5 +2516,72 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 3 drop marks to {}", dir.display());
+    }
+
+    /// The panel dragged narrow, and a locked folder.
+    ///
+    /// Two things a running window found and no assertion would: the heading
+    /// and the icon row shared a line and the buttons were drawn over the words
+    /// once the panel was narrow enough, and a folder's lock reached its
+    /// contents without any of them saying so.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app layers_panel_edges_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn layers_panel_edges_preview() {
+        use crate::dock::{Layout, PanelKind, limits};
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, metrics};
+        use egui::{Pos2, Rect, vec2};
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/layers-panel");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The narrowest a column may be dragged, which is where the heading has
+        // least room, and the design's width for comparison.
+        for (name, width, lock) in [
+            ("7-narrow", limits::SIDEBAR_MIN_WIDTH, false),
+            ("8-wide", metrics::PANEL, false),
+            ("9-locked-folder", metrics::PANEL, true),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = Layout::default();
+            ed.layers.add();
+            ed.layers.add();
+            ed.layers.group(&[1, 2]);
+            if lock {
+                // The folder alone. Its two layers are locked by it and hold no
+                // flag of their own, which is precisely the case that showed
+                // nothing.
+                if let Some(folder) = ed.layers.get_mut(3) {
+                    folder.locked = true;
+                }
+            }
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(width, 300.0);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                let mut actions = crate::ui::UiActions::default();
+                super::panel(
+                    root,
+                    &palette,
+                    &mut ed,
+                    &mut actions,
+                    PanelKind::Layers,
+                    rect,
+                );
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 3 edge cases to {}", dir.display());
     }
 }

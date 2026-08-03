@@ -1805,6 +1805,15 @@ pub struct LayerRow<'a> {
     pub editing_mask: bool,
     pub clipped: bool,
     pub locked: bool,
+    /// Locked by a folder it is inside rather than by its own flag.
+    ///
+    /// The mark is drawn either way, because an entry that refuses strokes,
+    /// transforms and deletion has to say so — a stack where the lock is real
+    /// and invisible is one where every one of those refusals arrives as a
+    /// surprise. Fainter, and its own flag is still off: the row is reporting
+    /// something that belongs to the folder, exactly as the eye does through
+    /// [`LayerRow::hidden_by_folder`], and for the same reason.
+    pub locked_by_folder: bool,
     /// Which link group the layer is in, if any. The chain mark is drawn in
     /// that group's colour, which is the whole of how a row says *which* set
     /// of layers it travels with rather than only that it travels with some.
@@ -2101,7 +2110,19 @@ pub fn layer_row(ui: &mut Ui, p: &Palette, row: LayerRow<'_>) -> LayerRowRespons
     marks_left -= blend_width;
     for (on, icon, tint) in [
         (row.clipped, Icon::Clip, p.text_dim),
-        (row.locked, Icon::Lock, p.text_dim),
+        // A lock inherited from a folder is drawn fainter than one the entry
+        // set itself. Not a different mark: it is the same lock and it refuses
+        // the same things, and a second padlock glyph would be a distinction
+        // nothing downstream makes.
+        (
+            row.locked || row.locked_by_folder,
+            Icon::Lock,
+            if row.locked {
+                p.text_dim
+            } else {
+                p.text_dim.gamma_multiply(0.55)
+            },
+        ),
         // The one mark here drawn in anything but the dim text colour, because
         // it is the one that has to be told apart from the identical mark on
         // another row. Never hard-coded: `Palette::link_colour` is the table.
