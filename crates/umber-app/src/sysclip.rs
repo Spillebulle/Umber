@@ -259,6 +259,42 @@ pub enum OnDesktop {
     Echo(Clip),
 }
 
+/// What a successful write leaves behind: the other half of the model, and a
+/// pure function for the same reason [`decide`] is.
+///
+/// `exact` is [`TRANSPORT_IS_EXACT`], `echo` is what reading the clipboard
+/// straight back answered — `None` covering both "there is no clipboard" and
+/// "it would not read back". `clip` is what was just written.
+///
+/// Being a function rather than three arms inside [`Board::put_image`] is what
+/// lets the **not-exact** path be driven on a machine where the constant is
+/// true. Since nobody working on Umber has a Mac, a test passing `false` here
+/// is the only exercise the macOS branch will ever get before somebody with the
+/// hardware runs it.
+pub fn recorded(exact: bool, echo: Option<Clip>, clip: &Clip) -> OnDesktop {
+    if exact {
+        return OnDesktop::TheClipItself;
+    }
+    match echo {
+        // The echo agrees, so holding it would be a second copy of a picture
+        // already in `Editor::clipboard` — on a full-canvas copy, hundreds of
+        // megabytes to say what `TheClipItself` says in a word, and the same
+        // comparison either way because the two pictures are equal.
+        //
+        // **This is not the platform being promoted to exact.** The next copy
+        // takes its echo exactly as this one did, and it must: the transport
+        // suspected on macOS is a premultiply, which is the identity on
+        // anything fully opaque, so one agreeing picture is no evidence at all
+        // about the next.
+        Some(echo) if echo == *clip => OnDesktop::TheClipItself,
+        Some(echo) => OnDesktop::Echo(echo),
+        // Written but unreadable. The same state a refused write leaves, and
+        // for the same reason: not knowing what is there must fall towards
+        // pasting Umber's own copy, never towards pasting something else's.
+        None => OnDesktop::Nothing,
+    }
+}
+
 /// Choose between the desktop's picture and Umber's own.
 ///
 /// See the module docs for the argument. `system` is what the desktop is
@@ -431,41 +467,26 @@ impl Board {
             );
             return;
         }
-        self.on_desktop = if TRANSPORT_IS_EXACT {
-            OnDesktop::TheClipItself
+        // The echo, on a platform whose clipboard is not known to hand back
+        // what it was given. `recorded` is the rule and is testable without
+        // one; this is only the read.
+        let echo = if TRANSPORT_IS_EXACT {
+            None
         } else {
-            match self.read_image() {
-                // The echo agrees, so holding it would be a second copy of a
-                // picture already in `Editor::clipboard` — on a full-canvas
-                // copy, hundreds of megabytes to say what `TheClipItself`
-                // says in a word. The two are the same comparison, because
-                // the two pictures are equal.
-                //
-                // **This is not the platform being promoted to exact.** The
-                // next copy takes its echo exactly as this one did, and it
-                // must: the transport suspected here is a premultiply, which
-                // is the identity on anything fully opaque, so one agreeing
-                // picture is no evidence at all about the next.
-                Some(echo) if echo == *clip => {
-                    log::debug!("the clipboard echoed this picture unchanged");
-                    OnDesktop::TheClipItself
-                }
-                Some(echo) => {
-                    log::info!(
-                        "this platform's clipboard did not hand back the picture it was \
-                         given, so the copy is recognised by its echo instead"
-                    );
-                    OnDesktop::Echo(echo)
-                }
-                None => {
-                    log::warn!(
-                        "the picture was put on the desktop's clipboard but could not be read \
-                         back, so a later paste will prefer Umber's own copy"
-                    );
-                    OnDesktop::Nothing
-                }
-            }
+            self.read_image()
         };
+        self.on_desktop = recorded(TRANSPORT_IS_EXACT, echo, clip);
+        match &self.on_desktop {
+            OnDesktop::Echo(_) => log::info!(
+                "this platform's clipboard did not hand back the picture it was given, so \
+                 the copy is recognised by its echo instead"
+            ),
+            OnDesktop::Nothing => log::warn!(
+                "the picture was put on the desktop's clipboard but could not be read back, \
+                 so a later paste will prefer Umber's own copy"
+            ),
+            OnDesktop::TheClipItself => {}
+        }
     }
 
     /// Note that the editor's clip came *off* the desktop.
@@ -690,6 +711,52 @@ mod tests {
             decide(Some(theirs.clone()), Some(&mine), &PUT_THERE),
             Paste::Theirs(theirs)
         );
+    }
+
+    /// What a copy leaves behind on a platform that returns what it was given:
+    /// no read is taken and no second copy of the picture is held.
+    #[test]
+    fn an_exact_platform_records_the_clip_and_keeps_no_echo() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(recorded(true, None, &clip), OnDesktop::TheClipItself);
+    }
+
+    /// **The macOS branch, driven on a machine that is not a Mac.** This is the
+    /// whole reason `recorded` is a function rather than three arms inside
+    /// `put_image`: nobody working on Umber has the hardware, so a test passing
+    /// `false` is the only exercise the not-exact path gets.
+    #[test]
+    fn a_platform_that_changes_the_picture_is_recorded_by_its_echo() {
+        let clip = clip(4, 4, [200, 100, 50, 128]);
+        let mut mangled = clip.pixels().to_vec();
+        mangled[3] = mangled[3].wrapping_sub(7);
+        let echo = Clip::from_rgba(4, 4, mangled).expect("an echo");
+        assert_eq!(
+            recorded(false, Some(echo.clone()), &clip),
+            OnDesktop::Echo(echo)
+        );
+    }
+
+    /// And where such a platform hands the picture back unchanged, the echo is
+    /// dropped rather than held beside an identical copy of it. Same
+    /// comparison, hundreds of megabytes lighter on a full-canvas copy — and
+    /// not a judgement about the platform, which goes on being asked.
+    #[test]
+    fn an_echo_equal_to_its_picture_is_not_kept() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(
+            recorded(false, Some(clip.clone()), &clip),
+            OnDesktop::TheClipItself
+        );
+    }
+
+    /// Written, but the clipboard would not read back. Umber does not know what
+    /// is there, and not knowing has to fall towards pasting its own copy —
+    /// the same state a refused write leaves, for the same reason.
+    #[test]
+    fn a_picture_that_cannot_be_read_back_is_treated_as_not_there() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(recorded(false, None, &clip), OnDesktop::Nothing);
     }
 
     /// **The echo, and the reason it exists.** On a platform whose clipboard
