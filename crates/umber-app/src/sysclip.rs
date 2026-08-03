@@ -736,18 +736,31 @@ mod tests {
         );
     }
 
-    /// A picture adopted *off* the desktop is recorded as the clip itself on
-    /// every platform, exact transport or not, because it was obtained by
-    /// reading the desktop — so a second Ctrl+V has to recognise it there
-    /// without an echo having been taken.
+    /// A picture adopted *off* the desktop is recorded as being there, on every
+    /// platform and with no echo taken, because it was obtained by reading the
+    /// desktop — so the bytes it hands back for it are the bytes in hand.
+    ///
+    /// **What that is worth is not the paste straight afterwards**, which lands
+    /// the same picture whatever the state says, so asserting it would be a
+    /// test that passes against the bug. It is the *next* copy somebody makes
+    /// in another application: leaving the adoption unrecorded fires the
+    /// refused-write clause where no write was refused, and Ctrl+V then puts
+    /// down the picture from last time instead of the one just copied.
     #[test]
-    fn a_picture_adopted_from_the_desktop_is_recognised_next_time() {
-        let theirs = clip(3, 3, [10, 20, 30, 255]);
-        // What `paste` does: adopts it, and `note_adopted` records it as there.
-        let mine = theirs.clone();
+    fn adopting_a_picture_does_not_make_the_next_foreign_copy_lose() {
+        let adopted = clip(3, 3, [10, 20, 30, 255]);
+        let newer = clip(5, 1, [1, 2, 3, 255]);
         assert_eq!(
-            decide(Some(theirs), Some(&mine), &PUT_THERE),
-            Paste::Mine(mine)
+            decide(Some(newer.clone()), Some(&adopted), &PUT_THERE),
+            Paste::Theirs(newer.clone()),
+            "the picture adopted last time was preferred over the one just copied"
+        );
+        // And this is the failure `note_adopted` exists to prevent, stated so
+        // the assertion above cannot be read as testing nothing.
+        assert_eq!(
+            decide(Some(newer), Some(&adopted), &NOT_THERE),
+            Paste::Mine(adopted),
+            "the refused-write clause has stopped preferring Umber's own copy"
         );
     }
 }
