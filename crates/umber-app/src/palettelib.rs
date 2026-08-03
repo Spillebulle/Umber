@@ -43,7 +43,9 @@ use std::sync::Arc;
 
 use egui::{Color32, Frame, Id, Layout, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
-use umber_core::palette::{self, GPL_EXTENSION, Palette as Swatches, PaletteError, PaletteLibrary};
+use umber_core::palette::{
+    self, GPL_EXTENSION, Palette as ColourPalette, PaletteError, PaletteLibrary,
+};
 
 use crate::controls;
 use crate::editor::Editor;
@@ -113,7 +115,7 @@ impl State {
     }
 
     /// The palette in front, if the id still names one.
-    fn current(&self) -> Option<&Swatches> {
+    fn current(&self) -> Option<&ColourPalette> {
         let library = self.library()?;
         library.get(self.selected.as_deref()?)
     }
@@ -222,7 +224,7 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 
     // Right-to-left: added first lands furthest right, next to the close mark,
     // which is where the Brushes panel draws its own save.
-    let room = state.current().is_some_and(Swatches::has_room);
+    let room = state.current().is_some_and(ColourPalette::has_room);
     let can_add = state.writable() && room;
     let tip = if can_add {
         "Add the colour in hand to this palette".to_owned()
@@ -525,7 +527,7 @@ fn edit_current(
     state: &mut State,
     ed: &mut Editor,
     what: &str,
-    change: impl FnOnce(&mut Swatches),
+    change: impl FnOnce(&mut ColourPalette),
 ) {
     let Some(mut palette) = state.current().cloned() else {
         return;
@@ -906,7 +908,12 @@ enum Request {
 const STRIP_TILES: usize = 40;
 const STRIP_HEIGHT: f32 = 14.0;
 
-fn library_row(ui: &mut Ui, p: &Palette, state: &mut State, palette: &Swatches) -> Option<Request> {
+fn library_row(
+    ui: &mut Ui,
+    p: &Palette,
+    state: &mut State,
+    palette: &ColourPalette,
+) -> Option<Request> {
     let selected = state.selected.as_deref() == Some(palette.id.as_str());
     let renaming = state.renaming.as_ref().is_some_and(|r| r.id == palette.id);
     let confirming = state.confirming.as_deref() == Some(palette.id.as_str());
@@ -1031,7 +1038,7 @@ fn library_row(ui: &mut Ui, p: &Palette, state: &mut State, palette: &Swatches) 
 
 /// A palette's colours as a single band, so a row can be told from its
 /// neighbours at a glance.
-fn colour_strip(ui: &mut Ui, p: &Palette, palette: &Swatches) {
+fn colour_strip(ui: &mut Ui, p: &Palette, palette: &ColourPalette) {
     let width = ui.available_width().max(1.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, STRIP_HEIGHT), Sense::hover());
     // The room is claimed either way, so the list does not change height as it
