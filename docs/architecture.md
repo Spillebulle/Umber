@@ -249,7 +249,6 @@ Next, roughly in order:
 - **Adding to and subtracting from a selection**, and a feather. Both live in
   `umber_core::selection`, which today builds one mask from one gesture.
 - Scatter that reacts to pen speed
-- Per-brush blend modes
 - **rubberduck's stamps in the shipped library.** Three packs' stamps ship now;
   this one's do not, because its CC0 is declared on the OpenGameArt page rather
   than inside the download, and shipping a mask is redistributing artwork rather

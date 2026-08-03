@@ -68,7 +68,9 @@ come from CC0 and CC-BY Krita packs, 19 of those stamping a **bitmap tip**
 rather than an ellipse. Six are Umber's own. Each keeps its author and licence.
 
 Blenders work: a smudging brush picks colour up off the canvas and carries it,
-and scrubbing back and forth blends its own wet paint.
+and scrubbing back and forth blends its own wet paint. **A brush can carry its
+own blend mode** — a marker that multiplies into the paper, a highlighter that
+screens — without putting the layer it paints on into that mode.
 
 <br clear="right">
 
@@ -280,8 +282,7 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 - **Layer masks from other applications.** Umber reads and writes its own; a
   `.kra` or `.psd` mask is reported as lost rather than converted.
 - **Pen pressure on macOS and Linux**, as above. Windows works.
-- Navigator, palette and harmony colour modes, per-brush blend modes, and stylus
-  tilt.
+- Navigator, palette and harmony colour modes, and stylus tilt.
 
 ## Building from source
 
