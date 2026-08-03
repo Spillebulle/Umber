@@ -17,7 +17,7 @@
 //! outlived it: both were worse versions of "put the panels where you want
 //! them".
 
-use crate::editor::{BrushTab, Editor, Tool};
+use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::panels;
 use crate::shortcuts::{self, Action};
@@ -1006,10 +1006,13 @@ fn brush_size_preview(ui: &egui::Ui, p: &Palette, ed: &Editor) {
 /// the same size on the screen whatever the display's density, exactly as the
 /// panels and the type are.
 fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
-    // Over a panel, a menu or a scrollbar the ordinary cursor is the right
-    // one: those are things to point at, and a workspace whose pointer
-    // vanished at the edge of the canvas would be unusable.
-    let Some(at) = ed.pen_dot() else {
+    // Over a panel, a menu, a modal or a scrollbar the ordinary cursor is the
+    // right one: those are things to point at, and a workspace whose pointer
+    // vanished at the edge of the canvas — or the moment a dialog opened —
+    // would be unusable. The `Area` half has to be asked of egui, so it is
+    // read here and handed to the rule rather than fetched inside it.
+    let over_area = editor::over_egui_area(ed, ui.ctx(), ed.cursor);
+    let Some(at) = ed.pen_dot(over_area) else {
         return;
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);

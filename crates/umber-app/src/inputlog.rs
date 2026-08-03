@@ -478,10 +478,12 @@ impl InputLog {
         self.mouse_events = 0;
         self.touch_events = 0;
         self.with_force = 0;
-        // Back to "nothing yet" like everything else here. The next painted
-        // frame writes it again immediately, which is right: it describes that
-        // frame rather than the session.
-        self.cursor_hidden = None;
+        // `cursor_hidden` is deliberately *not* cleared. Everything else here
+        // is a tally of the session and Clear empties it; this is a reading of
+        // the last painted frame, and the next frame — the one that draws the
+        // cleared page — overwrites it before anybody sees it. Setting it to
+        // `None` would make "nothing yet" a state that is written and never
+        // drawn, which is a control lying about being resettable.
         self.probe_started = f64::MAX;
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::canvasdlg;
 use crate::crash;
-use crate::editor::{Editor, Floating, Interaction, Tool};
+use crate::editor::{self, Editor, Floating, Interaction, Tool};
 use crate::gesture;
 use crate::keylayout;
 use crate::logo;
@@ -93,10 +93,9 @@ const WHEEL_PIXELS_PER_NOTCH: f32 = 60.0;
 ///   layout and the scrollbars have claimed, computed from the same rect the
 ///   composite pass is given.
 fn ui_owns_pointer(editor: &Editor, ctx: &egui::Context, screen: Vec2) -> bool {
-    let over_area = ctx
-        .layer_id_at(editor.to_points(screen))
-        .is_some_and(|layer| layer.order != egui::Order::Background);
-    ctx.egui_is_using_pointer() || over_area || !editor.pointer_over_canvas(screen)
+    ctx.egui_is_using_pointer()
+        || editor::over_egui_area(editor, ctx, screen)
+        || !editor.pointer_over_canvas(screen)
 }
 
 /// Everything tied to a live window and GPU surface.
@@ -1926,7 +1925,11 @@ impl UmberApp {
         // *what the interface asked for this frame* — `ui::pen_cursor` is the
         // only thing that ever asks for `None` — so the state runs the same way
         // it does for every other cursor: derived per frame, never remembered.
-        let hide_cursor = platform_output.cursor_icon == egui::CursorIcon::None;
+        // The focus half is `syscursor`'s rule and its docs have the argument:
+        // the cursor shape is shared, so a repaint while somebody is working in
+        // another application must not blank *their* pointer.
+        let hide_cursor =
+            platform_output.cursor_icon == egui::CursorIcon::None && gfx.window.has_focus();
         gfx.egui_state
             .handle_platform_output(&gfx.window, platform_output);
         // …and after, because egui-winit's own attempt goes first and, on
