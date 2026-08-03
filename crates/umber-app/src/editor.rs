@@ -396,6 +396,16 @@ pub struct Editor {
     /// puts down the same picture once the desktop's clipboard has moved on.
     /// The board itself lives on `UmberApp`, not here: it is a resource the
     /// process holds rather than anything a session is.
+    ///
+    /// **It is never released, including a picture adopted off the desktop, and
+    /// that was considered rather than overlooked.** There is no moment to hang
+    /// a release on: [`Session::successor_of`] refuses to close the last tab —
+    /// which is why the last document's tab draws no close mark — so "the last
+    /// document went" is not a state Umber has. And a *foreign* clip is
+    /// precisely the one whose memory releasing would not reclaim, because the
+    /// desktop is still holding its own copy; all it would buy is a re-read on
+    /// the next paste, at the cost of two lifetimes for one clipboard. A cap on
+    /// the size is a separate question and is not answered here.
     pub clipboard: Option<Clip>,
     /// The selection outline being drawn, if one is. Transient like
     /// [`Editor::stroke`], and abandoned rather than carried across a tab
