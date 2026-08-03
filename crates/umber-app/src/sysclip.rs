@@ -23,9 +23,9 @@
 //! the real clipboard. A CI runner may have no display server at all, and a
 //! test that grabs the desktop's clipboard on somebody's machine is hostile.
 //!
-//! The rule: **the desktop wins when it is holding a picture, and Umber's own
-//! clip wins otherwise or when the desktop is holding exactly what Umber's own
-//! copy put there.**
+//! The rule: **a picture on the desktop wins, unless it is the one Umber's own
+//! copy put there; and where the desktop is holding no picture at all, Umber's
+//! own clip is what gets pasted.**
 //!
 //! Both halves are load-bearing.
 //!
@@ -47,13 +47,13 @@
 //!   Windows rather than only read off arboard's source: a 16×16 square
 //!   carrying every alpha from 0 to 255 came back byte for byte, which also
 //!   rules out the DIB path having been taken in preference to the PNG one.
-//!   macOS goes
-//!   out through an `NSImage` and back through its TIFF representation, which
-//!   nobody working on Umber can run; if that moves a byte, the comparison
-//!   fails, the divergence is logged, and **what the desktop actually holds is
-//!   what gets pasted**. A picture that merely resembles the one Umber copied
-//!   is not evidence that it is that picture, and pasting the wrong picture is
-//!   the one failure here worth avoiding at any cost.
+//!   macOS goes out through an `NSImage` and back through its TIFF
+//!   representation, which nobody working on Umber can run; if that moves a
+//!   byte the comparison fails, the divergence is logged, and **what the
+//!   desktop actually holds is what gets pasted**. A picture that merely
+//!   resembles the one Umber copied is not evidence that it is that picture,
+//!   and pasting the wrong picture is the one failure here worth avoiding at
+//!   any cost.
 //!
 //! Where a pasted picture *goes* is not decided here. That is `Clip::place`'s,
 //! in `umber-core`, and a picture off the desktop is an ordinary clip: it is
