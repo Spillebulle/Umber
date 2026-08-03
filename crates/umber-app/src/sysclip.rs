@@ -17,17 +17,18 @@
 //!
 //! # Which picture a paste puts down
 //!
-//! [`decide`], which is a pure function of two readings — what the desktop
-//! holds and what Umber holds — for the reason `install::detect` is a pure
-//! function of a `Probe`: it is the whole of the rule, and no test may touch
-//! the real clipboard. A CI runner may have no display server at all, and a
-//! test that grabs the desktop's clipboard on somebody's machine is hostile.
+//! [`decide`], which is a pure function of three readings — what the desktop
+//! holds, what Umber holds, and whether Umber's own copy is known to have
+//! reached the desktop — for the reason `install::detect` is a pure function of
+//! a `Probe`: it is the whole of the rule, and no test may touch the real
+//! clipboard. A CI runner may have no display server at all, and a test that
+//! grabs the desktop's clipboard on somebody's machine is hostile.
 //!
 //! The rule: **a picture on the desktop wins, unless it is the one Umber's own
-//! copy put there; and where the desktop is holding no picture at all, Umber's
-//! own clip is what gets pasted.**
+//! copy put there, or Umber's own copy never got there; and where the desktop
+//! is holding no picture at all, Umber's own clip is what gets pasted.**
 //!
-//! Both halves are load-bearing.
+//! Every clause is load-bearing.
 //!
 //! * *The desktop wins.* Copying a photograph in a browser and pasting it into
 //!   Umber has to put down the photograph. Preferring the internal clip
@@ -38,6 +39,21 @@
 //!   of text somewhere else does not throw away the region an artist copied ten
 //!   seconds ago; every painting application behaves this way, and there is no
 //!   text tool for a string to be pasted into.
+//! * *And where the copy never reached the desktop.* **This clause exists
+//!   because leaving it out was a bug**, and a silent one. A write can fail —
+//!   a Windows global allocation refused a 400 MB picture is the realistic
+//!   case — and when it does the desktop goes on holding whatever it held
+//!   *before* the copy. Without this clause the next Ctrl+V compares that older
+//!   picture against Umber's new clip, finds them different, believes the
+//!   desktop and **puts down something the artist did not copy**. There is no
+//!   ordering to appeal to: Umber cannot know when the desktop's picture was
+//!   put there, only whether its own reached it. So where it did not, the copy
+//!   Umber knows about is the most recent thing Umber knows about, and it wins.
+//!   The cost is stated rather than hidden — in a session where the write keeps
+//!   failing, a picture copied in *another* application will not paste in —
+//!   and it is the far smaller of the two, because that case is visible (the
+//!   wrong picture arrives as a float, and Escape throws it away) where the
+//!   other is a copy and a paste that quietly disagree.
 //! * *And where the desktop holds Umber's own bytes.* This is what keeps
 //!   `a_copy_and_a_paste_are_exact_inverses` — the sibling of
 //!   `saving_and_reopening_does_not_move_a_pixel` — true through a copy that
@@ -47,13 +63,26 @@
 //!   Windows rather than only read off arboard's source: a 16×16 square
 //!   carrying every alpha from 0 to 255 came back byte for byte, which also
 //!   rules out the DIB path having been taken in preference to the PNG one.
-//!   macOS goes out through an `NSImage` and back through its TIFF
-//!   representation, which nobody working on Umber can run; if that moves a
-//!   byte the comparison fails, the divergence is logged, and **what the
-//!   desktop actually holds is what gets pasted**. A picture that merely
-//!   resembles the one Umber copied is not evidence that it is that picture,
-//!   and pasting the wrong picture is the one failure here worth avoiding at
-//!   any cost.
+//!   A picture that merely resembles the one Umber copied is not evidence that
+//!   it is that picture, and pasting the wrong picture is the one failure here
+//!   worth avoiding at any cost — so where the bytes differ, the desktop is
+//!   believed and the divergence is logged at `warn`, loudly enough to be seen
+//!   without setting `RUST_LOG`.
+//!
+//! **macOS is the platform this has not been run on, and it is named rather
+//! than assumed sound.** arboard writes an `NSImage` built from a `CGImage`
+//! with straight alpha and reads back that image's TIFF representation, and
+//! Cocoa's bitmap representations conventionally carry *premultiplied* alpha
+//! while `image`'s TIFF decoder does not undo it. If that is what happens, the
+//! comparison above fails on every copy of anything with a soft edge, the
+//! desktop is believed, and a paste straight back comes out darker at that
+//! edge. Nobody working on Umber has a Mac; the `warn` is what would report it,
+//! and the fix if it is ever confirmed is **not** a size heuristic — a picture
+//! of the same shape is not the same picture — but an *echo*: read the desktop
+//! back once immediately after a successful write and compare against that
+//! instead of against the clip. It is correct on a lossy transport and has no
+//! false positive, and it is not done today because it costs a second decode on
+//! every copy, which on the canvases the paragraph below is about is seconds.
 //!
 //! Where a pasted picture *goes* is not decided here. That is `Clip::place`'s,
 //! in `umber-core`, and a picture off the desktop is an ordinary clip: it is
@@ -78,21 +107,34 @@
 //! picture there, not recognise it, and put it down — the wrong picture, from
 //! the one branch that exists to make that impossible.
 //!
-//! One bound is worth writing down because it is not Umber's to set: on X11 a
-//! read waits on the *owning* process, and arboard gives that four seconds
-//! before giving up. A Ctrl+V while some other application is wedged is
-//! therefore a stall of up to four seconds — bounded, on an explicit keystroke,
-//! and nowhere near the drawing loop, which is the same ground the blocking
-//! readbacks stand on.
+//! **The cost was measured, because guessing it from `measure-history.rs`'s
+//! 1.6 ms/MB would have been wrong by five times.** That figure is PNG at
+//! `Compression::Fast`; arboard encodes at `image`'s default level, and on
+//! Windows it writes a *second* copy as an uncompressed `CF_DIBV5` beside the
+//! PNG because some applications only read one of the two. Timed on this
+//! machine over 4, 16 and 64 MB pictures, in release: **about 8 ms per megabyte
+//! each way**, both `set_image` and `get_image`. So an ordinary selection is
+//! imperceptible, a 2048² region is about a sixth of a second, and Ctrl+C with
+//! nothing selected on the 10000² document the Undo section uses as its bound
+//! is **roughly three seconds** — on top of the 400 MB readback that copy
+//! already paid for. That is a freeze an artist would feel, and it is stated
+//! here rather than hidden. It is not gated on a size, because any threshold
+//! would be a number nobody measured and the effect of crossing it would be a
+//! copy that silently did not leave Umber.
 //!
-//! The cost is real and is stated rather than hidden: with nothing selected, a
-//! copy takes the whole canvas, so on the 10000² document the Undo section uses
-//! as its bound Ctrl+C hands 400 MB to a PNG encoder. That is on top of the
-//! 400 MB readback the copy already paid for, and it is the same shape of cost
-//! the undo budget's own note describes. A failure — an allocation refused, a
-//! desktop with no clipboard at all — is logged once and carried on from, and
-//! Umber's own clip is unaffected, so copy and paste inside Umber go on
-//! working.
+//! Two more bounds are not Umber's to set. On X11 a read waits on the *owning*
+//! process and arboard gives that four seconds, so a Ctrl+V while another
+//! application is wedged stalls for that long. And a paste makes **two** such
+//! round trips, not one: egui-winit sees the keystroke first and reads the
+//! desktop's *text* for its own `Event::Paste` whether or not a text field has
+//! the keyboard, and then [`Board::take_image`] reads the picture. All of it is
+//! bounded, on an explicit keystroke, and nowhere near the drawing loop, which
+//! is the same ground the blocking readbacks stand on.
+//!
+//! A failure — an allocation refused, a desktop with no clipboard at all — is
+//! logged and carried on from, and Umber's own clip is unaffected, so copy and
+//! paste inside Umber go on working. It is also *remembered*; see the third
+//! clause of the rule above for why that is not optional.
 //!
 //! # What the desktop cannot promise
 //!
@@ -137,12 +179,14 @@ pub enum Paste {
 /// Choose between the desktop's picture and Umber's own.
 ///
 /// See the module docs for the argument. `system` is what the desktop is
-/// holding, already read; `mine` is `Editor::clipboard`.
+/// holding, already read; `mine` is `Editor::clipboard`; `published` is
+/// [`Board::published`] — whether the clip in `mine` is known to have reached
+/// the desktop.
 ///
-/// The answer is a pure function of the two readings. The one log line is
+/// The answer is a pure function of the three readings. The one log line is
 /// observation and nothing reads it — it is the only way anybody would ever
 /// find out that a platform's clipboard had started moving a byte.
-pub fn decide(system: Option<Clip>, mine: Option<&Clip>) -> Paste {
+pub fn decide(system: Option<Clip>, mine: Option<&Clip>, published: bool) -> Paste {
     match (system, mine) {
         // The desktop is still holding what Umber's own copy put there, so
         // **Umber's own bytes** are what go back on to the layer, not the ones
@@ -151,14 +195,23 @@ pub fn decide(system: Option<Clip>, mine: Option<&Clip>) -> Paste {
         // is "our copy wins", and it should not quietly become "the transport's
         // copy wins" if `Clip`'s equality is ever loosened.
         (Some(theirs), Some(mine)) if theirs == *mine => Paste::Mine(mine.clone()),
+        // Umber's copy never reached the desktop, so what is sitting there
+        // predates it as far as Umber can tell — and believing it would put
+        // down a picture the artist did not copy. See the module docs: leaving
+        // this case out was a bug and a silent one.
+        (Some(_), Some(mine)) if !published => Paste::Mine(mine.clone()),
         (Some(theirs), Some(mine)) => {
-            // Either somebody copied something else — the ordinary case — or a
-            // platform's clipboard moved a byte of Umber's own picture. The two
-            // are indistinguishable from here, and only one of the two possible
-            // mistakes is survivable, so the desktop is believed.
+            // Umber's copy did reach the desktop and something different is
+            // there now, so the desktop moved on after Umber wrote it — the
+            // ordinary case — or a platform's clipboard gave back something
+            // other than what it was handed. The two are indistinguishable from
+            // here and only one of the two possible mistakes is survivable, so
+            // the desktop is believed and the divergence is said out loud.
             if theirs.size() == mine.size() {
-                log::debug!(
-                    "the desktop holds a {} × {} picture that is not the one Umber copied",
+                log::warn!(
+                    "the desktop is holding a {} × {} picture that is not the one Umber put \
+                     there; pasting the desktop's. If this happens on every copy, this \
+                     platform's clipboard is not returning what it was given",
                     theirs.size().x,
                     theirs.size().y,
                 );
@@ -188,26 +241,42 @@ pub fn decide(system: Option<Clip>, mine: Option<&Clip>) -> Paste {
 /// behind a `static`, so both handles are the same owner; on Windows the
 /// clipboard is opened and closed around each operation; on macOS both are
 /// handles on the one `NSPasteboard`.
+/// **The gate is Android *and* iOS**, which is what egui-winit's own *code*
+/// gates on even though its manifest names only Android. arboard has no iOS
+/// backend either: its `cfg` for the X11/Wayland one is `all(unix, not(any(
+/// macos, android, emscripten)))`, so iOS falls into it and an iOS build would
+/// go looking for an X server. Matching the manifest rather than the code is
+/// how "architecturally prepared" quietly stops being true.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Default)]
 pub struct Board {
     /// `None` before the first use and after a failure to open one; `tried`
     /// tells the two apart.
-    #[cfg(not(target_os = "android"))]
     board: Option<arboard::Clipboard>,
-    #[cfg(not(target_os = "android"))]
     tried: bool,
+    /// Whether the clip the editor is holding is known to be on the desktop.
+    ///
+    /// Written by the two things that can make it true and by nothing else, so
+    /// it cannot drift out of step with `Editor::clipboard` the way a flag
+    /// beside that field at three call sites would. Read by [`Board::published`]
+    /// and fed to [`decide`] — see the module docs for the bug its absence was.
+    published: bool,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Board {
-    /// Offer `clip` to the rest of the machine.
+    /// Offer `clip` to the rest of the machine, and answer whether it got
+    /// there.
     ///
-    /// Best effort by construction: Umber's own clipboard is written by the
-    /// caller either way, so a desktop that will not take it costs the artist
-    /// nothing they can see. Reported once, at the level a failed autosave is —
-    /// a paint application must not raise a dialog on Ctrl+C.
-    #[cfg(not(target_os = "android"))]
+    /// The answer is not decoration. Umber's own clipboard is written by the
+    /// caller either way, so a refusal costs the artist nothing they can *see* —
+    /// but it leaves the desktop holding an older picture, and [`decide`] would
+    /// then believe that picture over the one just copied. So the outcome is
+    /// remembered rather than only logged. Logged as well, at the level a failed
+    /// autosave is: a paint application must not raise a dialog on Ctrl+C.
     pub fn put_image(&mut self, clip: &Clip) {
         let size = clip.size();
+        self.published = false;
         let Some(board) = self.board() else { return };
         let image = arboard::ImageData {
             width: size.x as usize,
@@ -215,9 +284,28 @@ impl Board {
             // Straight-alpha sRGB RGBA8 on both sides. See the module docs.
             bytes: std::borrow::Cow::Borrowed(clip.pixels()),
         };
-        if let Err(e) = board.set_image(image) {
-            log::warn!("the desktop's clipboard would not take the picture: {e}");
+        match board.set_image(image) {
+            Ok(()) => self.published = true,
+            Err(e) => log::warn!(
+                "the desktop's clipboard would not take the picture, so it stays inside \
+                 Umber: {e}"
+            ),
         }
+    }
+
+    /// Note that the editor's clip came *off* the desktop, so it is there by
+    /// construction.
+    ///
+    /// Called where a foreign picture is adopted, and only once that paste has
+    /// actually happened — the same place `Editor::clipboard` is written, so
+    /// the two cannot disagree.
+    pub fn note_adopted(&mut self) {
+        self.published = true;
+    }
+
+    /// Whether the clip the editor holds is known to have reached the desktop.
+    pub fn published(&self) -> bool {
+        self.published
     }
 
     /// What the desktop is holding, if it is holding a picture.
@@ -226,7 +314,6 @@ impl Board {
     /// clipboard, nothing on it, a format arboard cannot read — because the
     /// caller does the same thing with all of them: falls back to Umber's own
     /// clip. Only a failure that is not "there is no picture" is logged.
-    #[cfg(not(target_os = "android"))]
     pub fn take_image(&mut self) -> Option<Clip> {
         let board = self.board()?;
         let image = match board.get_image() {
@@ -245,7 +332,6 @@ impl Board {
         Clip::from_rgba(width, height, image.bytes.into_owned())
     }
 
-    #[cfg(not(target_os = "android"))]
     fn board(&mut self) -> Option<&mut arboard::Clipboard> {
         if !self.tried {
             self.tried = true;
@@ -256,15 +342,27 @@ impl Board {
         }
         self.board.as_mut()
     }
+}
 
-    /// Android has no arboard backend, so the dependency is not built there —
-    /// the same gate egui-winit puts on its own. Umber's internal clipboard is
-    /// untouched by this, so copy and paste inside the application work exactly
-    /// as they did before any of this existed.
-    #[cfg(target_os = "android")]
+/// Where arboard is not built there is no desktop clipboard to reach, and
+/// `published` is therefore always false — which is exactly right: [`decide`]
+/// then never prefers a picture Umber did not put there, and since
+/// [`Board::take_image`] answers `None` as well, copy and paste inside Umber
+/// work exactly as they did before any of this existed.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[derive(Default)]
+pub struct Board;
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+impl Board {
     pub fn put_image(&mut self, _clip: &Clip) {}
 
-    #[cfg(target_os = "android")]
+    pub fn note_adopted(&mut self) {}
+
+    pub fn published(&self) -> bool {
+        false
+    }
+
     pub fn take_image(&mut self) -> Option<Clip> {
         None
     }
@@ -273,6 +371,10 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named so the third argument of every `decide` below says what it means
+    /// at the call site: a bare `true` there is the reading nobody can check.
+    const PUBLISHED: bool = true;
 
     fn clip(w: u32, h: u32, px: [u8; 4]) -> Clip {
         let pixels = px
@@ -293,8 +395,26 @@ mod tests {
         let theirs = clip(4, 4, [10, 20, 30, 255]);
         let mine = clip(4, 4, [200, 100, 50, 255]);
         assert_eq!(
-            decide(Some(theirs.clone()), Some(&mine)),
+            decide(Some(theirs.clone()), Some(&mine), PUBLISHED),
             Paste::Theirs(theirs)
+        );
+    }
+
+    /// **The bug the third reading exists for.** The desktop was holding
+    /// something, Umber copied a region, and the write to the desktop failed —
+    /// a Windows global allocation refusing a large picture is the realistic
+    /// way. The desktop is therefore still holding the *older* picture, and
+    /// believing it means a copy and the paste straight after it put down
+    /// different pictures with nothing said. Umber's own copy is the most
+    /// recent thing Umber knows happened, so it is what lands.
+    #[test]
+    fn a_copy_the_desktop_refused_is_still_what_a_paste_puts_down() {
+        let stale = clip(4, 4, [10, 20, 30, 255]);
+        let mine = clip(6, 2, [200, 100, 50, 255]);
+        assert_eq!(
+            decide(Some(stale), Some(&mine), !PUBLISHED),
+            Paste::Mine(mine),
+            "a copy the desktop would not take was overruled by what was there before it"
         );
     }
 
@@ -327,7 +447,7 @@ mod tests {
         let desktop = Clip::from_rgba(mine.size().x, mine.size().y, mine.pixels().to_vec())
             .expect("what a lossless desktop hands back");
 
-        let Paste::Mine(chosen) = decide(Some(desktop), Some(&mine)) else {
+        let Paste::Mine(chosen) = decide(Some(desktop), Some(&mine), PUBLISHED) else {
             panic!("Umber's own copy was not recognised on the desktop's clipboard");
         };
         let placed = chosen
@@ -346,7 +466,7 @@ mod tests {
     #[test]
     fn text_on_the_desktop_leaves_umbers_own_picture_alone() {
         let mine = clip(2, 2, [1, 2, 3, 4]);
-        assert_eq!(decide(None, Some(&mine)), Paste::Mine(mine));
+        assert_eq!(decide(None, Some(&mine), PUBLISHED), Paste::Mine(mine));
     }
 
     /// Nothing anywhere. A paste has to do nothing at all rather than put down
@@ -354,7 +474,7 @@ mod tests {
     /// `copying_nothing_leaves_the_clipboard_alone` states for the other end.
     #[test]
     fn nothing_on_either_clipboard_pastes_nothing() {
-        assert_eq!(decide(None, None), Paste::Nothing);
+        assert_eq!(decide(None, None, !PUBLISHED), Paste::Nothing);
     }
 
     /// A picture off the desktop with nothing on Umber's own clipboard — the
@@ -362,7 +482,10 @@ mod tests {
     #[test]
     fn a_first_paste_of_the_session_takes_what_the_desktop_holds() {
         let theirs = clip(8, 2, [0, 255, 0, 255]);
-        assert_eq!(decide(Some(theirs.clone()), None), Paste::Theirs(theirs));
+        assert_eq!(
+            decide(Some(theirs.clone()), None, !PUBLISHED),
+            Paste::Theirs(theirs)
+        );
     }
 
     /// Same size, different pixels. Indistinguishable from Umber's own copy
@@ -374,7 +497,7 @@ mod tests {
         let mine = clip(4, 4, [200, 100, 50, 255]);
         let theirs = clip(4, 4, [200, 100, 51, 255]);
         assert_eq!(
-            decide(Some(theirs.clone()), Some(&mine)),
+            decide(Some(theirs.clone()), Some(&mine), PUBLISHED),
             Paste::Theirs(theirs)
         );
     }
