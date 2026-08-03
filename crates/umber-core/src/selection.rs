@@ -399,18 +399,24 @@ impl Selection {
     /// promise the tent cannot keep — two tents are not one wider tent.
     ///
     /// A radius at or below zero is the exact identity: the same bounds, the
-    /// same bytes, no allocation. `None` where a shape so thin that softening
-    /// it rounds every pixel to nothing — the same answer as no selection
-    /// everywhere else in this file.
+    /// same bytes, **no allocation and no copy** — which is why this takes
+    /// `self` by value rather than borrowing it. Every caller owns the
+    /// selection it is softening (a gesture's own shape, or the rebuild a flip
+    /// or a transform commit just made), so the common case is a move, and
+    /// consuming the sharp mask is also what stops the non-idempotence above
+    /// being reached by accident.
+    ///
+    /// `None` where a shape is so thin that softening it rounds every pixel to
+    /// nothing — the same answer as no selection everywhere else in this file.
     #[must_use]
-    pub fn feathered(&self, radius: f32, doc: UVec2) -> Option<Self> {
+    pub fn feathered(self, radius: f32, doc: UVec2) -> Option<Self> {
         let radius = radius.clamp(0.0, Self::MAX_FEATHER);
         if radius <= 0.0 {
-            return Some(self.clone());
+            return Some(self);
         }
         let (bounds, coverage) = soften(self.bounds, &self.coverage, radius, doc)?;
         Some(Self {
-            rings: self.rings.clone(),
+            rings: self.rings,
             bounds,
             coverage,
             feather: radius,
@@ -1817,7 +1823,7 @@ mod tests {
         // reallocate.
         let s = rect(10.0, 10.0, 20.0, 20.0);
         for radius in [0.0, -1.0] {
-            let same = s.feathered(radius, DOC).expect("itself");
+            let same = s.clone().feathered(radius, DOC).expect("itself");
             assert_eq!(same.bounds(), s.bounds());
             assert_eq!(same.coverage(), s.coverage());
             assert_eq!(same.feather(), 0.0);
@@ -1906,7 +1912,7 @@ mod tests {
         let sharp =
             Selection::polygon(&[vec2(10.0, 10.0), vec2(40.0, 14.0), vec2(16.0, 44.0)], DOC)
                 .expect("a triangle");
-        let soft = sharp.feathered(6.0, DOC).expect("a soft triangle");
+        let soft = sharp.clone().feathered(6.0, DOC).expect("a soft triangle");
         assert_eq!(soft.rings(), sharp.rings());
         assert!(soft.contains(vec2(20.0, 20.0)));
         assert!(!soft.contains(vec2(38.0, 40.0)));
