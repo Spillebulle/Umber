@@ -664,7 +664,13 @@ impl Editor {
     /// `install::detect` takes a `Probe` and `keylayout::name_for` takes a
     /// reading — an `egui::Context` is exactly the thing a test has not got.
     ///
-    /// Three halves, and each was somewhere a pen could have been lost:
+    /// It is **not** a test of the platform half. `syscursor` could be deleted
+    /// and every test in this file would still pass — what they pin is that
+    /// Umber *asks*, which is the half that can be reasoned about here. Whether
+    /// the ask is carried out is a property of Windows and is settled from
+    /// Settings → Input & pen on a machine with a tablet.
+    ///
+    /// Four things, and each was somewhere a pen could have been lost:
     ///
     /// - [`Editor::pen_pointer`] — *what kind* of device is driving the
     ///   pointer, latched from the last pointer event rather than preferred.
@@ -677,23 +683,38 @@ impl Editor {
     ///   `CursorMoved`, so a build in which the hover branch merely recorded
     ///   the position and returned would be testing wherever the mouse was last
     ///   left — `(0, 0)` on a fresh launch, which is the menu bar.
-    /// - `over_area` — anything egui is drawing *over* the canvas rather than
-    ///   beside it. This one is not optional and was found by review rather
-    ///   than by use, because until the platform half of the hide worked there
-    ///   was nothing to see: a modal, a menu or a dropdown sits inside the
-    ///   central panel's rect, so `pointer_over_canvas` says yes, and
-    ///   `pen_cursor` runs *last* in `ui::draw` where `set_cursor_icon` is
-    ///   last-write-wins. A pen in Settings or the brush library would
-    ///   therefore have overwritten that dialog's own cursor with "none" and
-    ///   painted the dot into the background layer *underneath* it — no
-    ///   pointer at all, which is the exact failure this function's use of
-    ///   `CursorIcon::None` over `set_cursor_visible` was chosen to avoid.
+    /// - [`Surroundings::over_area`] — anything egui is drawing *over* the
+    ///   canvas rather than beside it. A modal, a menu or a dropdown sits
+    ///   inside the central panel's rect, so `pointer_over_canvas` says yes,
+    ///   and `set_cursor_icon` is last-write-wins within a frame. `pen_cursor`
+    ///   is drawn inside the `CentralPanel`, which every dialog and every menu
+    ///   is drawn *before* — so without this a pen in Settings or the brush
+    ///   library overwrote that dialog's own cursor with "none" and painted the
+    ///   dot into the background layer *underneath* it. No pointer at all,
+    ///   which is the exact failure this function's use of `CursorIcon::None`
+    ///   over `set_cursor_visible` was chosen to avoid. (Three `panels::` calls
+    ///   do run after it and two of them set `Grabbing`; they are live only
+    ///   during a panel drag, which is not a moment a dot is wanted either.)
     ///   [`over_egui_area`] is the one statement of the reading, shared with
     ///   `app::ui_owns_pointer`, so what suppresses the dot and what refuses a
     ///   press cannot drift apart.
-    pub fn pen_dot(&self, over_area: bool) -> Option<Vec2> {
-        (self.pen_pointer && !over_area && self.pointer_over_canvas(self.cursor))
-            .then_some(self.cursor)
+    /// - [`Surroundings::focused`] — and this one has to be *here*, in what the
+    ///   interface asks for, rather than at the platform call. It was at the
+    ///   call, and that reintroduced the very failure `CursorIcon::None` was
+    ///   chosen over `set_cursor_visible` to avoid: Alt-Tab away by keyboard
+    ///   with the pen hovering and the request was still "none", so egui-winit
+    ///   deduped it against `current_cursor_icon`, never called `set_cursor`,
+    ///   and the blank shape stayed in force across the whole desktop. Declined
+    ///   here, egui asks for a real `CursorIcon` instead, the dedupe passes and
+    ///   winit puts the arrow back on the spot. It also stops an unfocused
+    ///   window drawing a dot on its canvas, which the platform-side guard did
+    ///   not.
+    pub fn pen_dot(&self, around: Surroundings) -> Option<Vec2> {
+        (self.pen_pointer
+            && around.focused
+            && !around.over_area
+            && self.pointer_over_canvas(self.cursor))
+        .then_some(self.cursor)
     }
 
     /// Select a tool, keeping the brush's paint/erase mode in step.
@@ -1505,6 +1526,24 @@ impl Editor {
     }
 }
 
+/// What [`Editor::pen_dot`] needs to know about the window this frame and
+/// cannot find out for itself.
+///
+/// A struct of injected readings rather than two loose `bool` arguments, for
+/// the reason `install::detect` takes a `Probe`: the call site says which is
+/// which, and a test can state the case it means without counting positions.
+/// Both come from egui — one from the layer under the pointer, one from
+/// `InputState::focused` — and neither is anything an `Editor` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Surroundings {
+    /// Is egui drawing a menu, a dropdown, a modal or a floating panel over
+    /// the canvas at the pointer? See [`over_egui_area`].
+    pub over_area: bool,
+    /// Does this window have the keyboard focus? A cursor belongs to whoever
+    /// the user is working in, so an unfocused Umber asks for nothing.
+    pub focused: bool,
+}
+
 /// Is egui drawing something of its own *over* the canvas at `screen`?
 ///
 /// A menu, a popup, a modal or a floating panel — all of them `Area`s, all of
@@ -1627,6 +1666,14 @@ mod tests {
     /// It is also the guard on the second half of that bug: the dot is drawn at
     /// the position this answers with, so a stale `cursor` put the dot in the
     /// wrong place as well as suppressing it.
+    /// The ordinary case: focused, with nothing of egui's over the pointer.
+    fn clear() -> Surroundings {
+        Surroundings {
+            over_area: false,
+            focused: true,
+        }
+    }
+
     #[test]
     fn a_hovering_pen_asks_for_its_own_cursor_with_no_mouse_event_behind_it() {
         let mut ed = windowed();
@@ -1636,7 +1683,7 @@ mod tests {
             "the point of this test is that no mouse event has moved it"
         );
         assert_eq!(
-            ed.pen_dot(false),
+            ed.pen_dot(clear()),
             None,
             "a mouse keeps the desktop's own arrow"
         );
@@ -1651,7 +1698,7 @@ mod tests {
             "the fixture has to put the origin off the canvas or it proves nothing"
         );
         assert_eq!(
-            ed.pen_dot(false),
+            ed.pen_dot(clear()),
             None,
             "a stale cursor must not be read as a pen over the canvas"
         );
@@ -1661,7 +1708,7 @@ mod tests {
         let at = Vec2::new(620.0, 310.0);
         ed.cursor = at;
         assert_eq!(
-            ed.pen_dot(false),
+            ed.pen_dot(clear()),
             Some(at),
             "a pen hovering over the canvas has to get the dot, at the nib"
         );
@@ -1669,15 +1716,23 @@ mod tests {
 
     /// **A pen over a modal, a menu or a dropdown keeps the ordinary cursor.**
     ///
-    /// `pen_cursor` is the last thing `ui::draw` paints and
-    /// `Context::set_cursor_icon` is last-write-wins, so without this the dot
-    /// would win over a dialog's own cursor — and be painted into the
-    /// background layer *underneath* that dialog. No pointer at all, which is
-    /// the failure `CursorIcon::None` was chosen over `set_cursor_visible` to
-    /// prevent. It cannot be caught by `pointer_over_canvas`: an egui `Area`
-    /// claims no space, so the canvas rect is the same whether one is up or
-    /// not — which is a rule this codebase relies on elsewhere and is exactly
-    /// what makes this case invisible.
+    /// Every dialog and every menu is drawn *before* the `CentralPanel` that
+    /// `pen_cursor` sits in, and `Context::set_cursor_icon` is last-write-wins
+    /// within a frame — so without this the dot won over the dialog's own
+    /// cursor and was painted into the background layer *underneath* it. No
+    /// pointer at all, which is the failure `CursorIcon::None` was chosen over
+    /// `set_cursor_visible` to prevent. It cannot be caught by
+    /// `pointer_over_canvas`: an egui `Area` claims no space, so the canvas
+    /// rect is the same whether one is up or not — a rule this codebase relies
+    /// on elsewhere and exactly what makes this case invisible.
+    ///
+    /// What this pins is the **rule**, with the reading passed in. Whether
+    /// `pen_cursor` supplies the right reading is `over_egui_area`'s and cannot
+    /// be checked without an `egui::Context` — worth knowing, because that
+    /// function's answer under a modal is not the plain hit test it looks like:
+    /// egui returns the modal's own layer for *every* point in the window. That
+    /// is right for this rule and it is why `InputLog::note_cursor` has to skip
+    /// those frames.
     #[test]
     fn a_pen_over_a_dialog_keeps_the_ordinary_cursor() {
         let mut ed = windowed();
@@ -1685,13 +1740,42 @@ mod tests {
         ed.cursor = Vec2::new(500.0, 415.0);
 
         assert!(
-            ed.pen_dot(false).is_some(),
+            ed.pen_dot(clear()).is_some(),
             "the same point with nothing over it is the dot's"
         );
         assert_eq!(
-            ed.pen_dot(true),
+            ed.pen_dot(Surroundings {
+                over_area: true,
+                ..clear()
+            }),
             None,
             "a pen over a modal must keep a pointer it can aim with"
+        );
+    }
+
+    /// **An unfocused window asks for nothing**, and the reason this is a rule
+    /// of the *request* rather than of the platform call is a bug it caused.
+    ///
+    /// Alt-Tab away by keyboard with a pen hovering over the canvas: no pointer
+    /// event follows, so with focus tested only beside `SetCursor` the request
+    /// stayed "none", egui-winit deduped it against `current_cursor_icon` and
+    /// never called `set_cursor`, and the blank shape stayed in force over the
+    /// whole desktop until the mouse crossed a window that set its own. That is
+    /// precisely "a window with no pointer in it and no way to say so", which
+    /// `pen_cursor`'s choice of `CursorIcon::None` exists to avoid.
+    #[test]
+    fn an_unfocused_window_puts_the_cursor_back() {
+        let mut ed = windowed();
+        ed.pen_pointer = true;
+        ed.cursor = Vec2::new(500.0, 415.0);
+        assert!(ed.pen_dot(clear()).is_some(), "focused, the dot is right");
+        assert_eq!(
+            ed.pen_dot(Surroundings {
+                focused: false,
+                ..clear()
+            }),
+            None,
+            "an unfocused window must ask for a real cursor, not for none"
         );
     }
 
@@ -1705,14 +1789,29 @@ mod tests {
         ed.pen_pointer = true;
 
         ed.cursor = Vec2::new(500.0, 400.0);
-        assert!(ed.pen_dot(false).is_some(), "open canvas is the dot's");
+        assert!(ed.pen_dot(clear()).is_some(), "open canvas is the dot's");
 
-        // Off the canvas region altogether: a docked panel.
+        // Outside the canvas region on the x axis. The fixture's canvas spans
+        // the full width, so this is off the *window* rather than over a docked
+        // panel — which is the same arithmetic `pointer_over_canvas` does for a
+        // panel and is all this line claims.
         ed.cursor = Vec2::new(1400.0, 400.0);
         assert_eq!(
-            ed.pen_dot(false),
+            ed.pen_dot(clear()),
             None,
-            "a pen over a panel keeps the arrow"
+            "a pen outside the canvas region keeps the arrow"
+        );
+
+        // A docked panel proper: inside the window, claimed by the layout.
+        let mut docked = windowed();
+        docked.pen_pointer = true;
+        docked.canvas_size = Vec2::new(736.0, 770.0);
+        docked.canvas_pivot = Vec2::new(368.0, 415.0);
+        docked.cursor = Vec2::new(900.0, 400.0);
+        assert_eq!(
+            docked.pen_dot(clear()),
+            None,
+            "a pen over a docked panel keeps the arrow"
         );
 
         // Inside the region, over one of the canvas's own controls.
@@ -1722,7 +1821,7 @@ mod tests {
             egui::vec2(40.0, 40.0),
         ));
         assert_eq!(
-            ed.pen_dot(false),
+            ed.pen_dot(clear()),
             None,
             "a pen over a canvas overlay keeps the arrow"
         );

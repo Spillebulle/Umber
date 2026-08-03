@@ -1035,10 +1035,25 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
     // Over a panel, a menu, a modal or a scrollbar the ordinary cursor is the
     // right one: those are things to point at, and a workspace whose pointer
     // vanished at the edge of the canvas — or the moment a dialog opened —
-    // would be unusable. The `Area` half has to be asked of egui, so it is
-    // read here and handed to the rule rather than fetched inside it.
-    let over_area = editor::over_egui_area(ed, ui.ctx(), ed.cursor);
-    let Some(at) = ed.pen_dot(over_area) else {
+    // would be unusable. Both readings have to be asked of egui, so they are
+    // taken here and handed to the rule rather than fetched inside it.
+    //
+    // Focus belongs in the *request*, not beside the platform call that
+    // carries it out: asking for "none" while another application has the
+    // keyboard leaves egui-winit's dedupe holding a blank cursor it will never
+    // be prompted to replace. `Editor::pen_dot`'s docs have that in full.
+    //
+    // `input.focused` and deliberately not `input.viewport().focused`, which
+    // looks like the more direct reading of the same thing and here is always
+    // `None`: egui-winit fills that in from `update_viewport_info`, which the
+    // caller has to invoke and `app::render` does not. `focused` is written
+    // from the `WindowEvent::Focused` egui-winit sees in `on_window_event`,
+    // which every window event goes through.
+    let around = editor::Surroundings {
+        over_area: editor::over_egui_area(ed, ui.ctx(), ed.cursor),
+        focused: ui.ctx().input(|i| i.focused),
+    };
+    let Some(at) = ed.pen_dot(around) else {
         return;
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
