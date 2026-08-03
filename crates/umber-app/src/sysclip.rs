@@ -43,7 +43,11 @@
 //!   `saving_and_reopening_does_not_move_a_pixel` — true through a copy that
 //!   also went to the desktop. It is a **check rather than a trust**: arboard
 //!   round trips RGBA8 through PNG on Windows and on both Linux backends, so
-//!   the bytes come back identical and the comparison is satisfied. macOS goes
+//!   the bytes come back identical and the comparison is satisfied. Measured on
+//!   Windows rather than only read off arboard's source: a 16×16 square
+//!   carrying every alpha from 0 to 255 came back byte for byte, which also
+//!   rules out the DIB path having been taken in preference to the PNG one.
+//!   macOS goes
 //!   out through an `NSImage` and back through its TIFF representation, which
 //!   nobody working on Umber can run; if that moves a byte, the comparison
 //!   fails, the divergence is logged, and **what the desktop actually holds is
