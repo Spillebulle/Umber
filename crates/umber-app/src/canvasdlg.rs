@@ -16,7 +16,7 @@
 use egui::{Rect, Sense, Stroke, StrokeKind, Ui, Vec2, vec2};
 use umber_core::{Anchor, Background, Color, Document, Hsv, Unit, document};
 
-use crate::colorpicker::{self, PickerMode, WheelAngles, WheelShape};
+use crate::colorpicker;
 use crate::editor::Editor;
 use crate::tabs;
 use crate::theme::{Palette, metrics, text};
@@ -407,21 +407,9 @@ fn background_fields(ui: &mut Ui, p: &Palette, form: &mut CanvasForm) {
     if form.choice == Choice::Custom {
         ui.add_space(8.0);
         // The Colour panel's own slider mode, so the two mix a colour the same
-        // way. `shape`, `rotate` and the angles belong to the wheel, which this
-        // mode does not draw, so they are throwaways rather than the editor's —
-        // a dialog must not be able to turn the picker in the panel behind it.
-        let mut shape = WheelShape::Triangle;
-        let mut rotate = false;
-        let mut angles = WheelAngles::default();
-        colorpicker::show(
-            ui,
-            p,
-            PickerMode::Sliders,
-            &mut shape,
-            &mut rotate,
-            &mut angles,
-            &mut form.hsv,
-        );
+        // way — and nothing of the wheel's, which this mode does not draw and
+        // which belongs to the panel behind this dialog.
+        colorpicker::show_sliders(ui, p, &mut form.hsv);
     }
 }
 

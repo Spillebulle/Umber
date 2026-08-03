@@ -18,6 +18,7 @@ use crate::dock::{ColumnGeometry, DropTarget, Floating, Geometry, PanelKind, Sid
 use crate::editor::{Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::layerdrag;
+use crate::palettelib;
 use crate::shortcuts::{self, Action};
 use crate::theme::{Palette, metrics, text};
 use crate::ui::{UiActions, icon_button};
@@ -98,6 +99,8 @@ pub fn sidebars(
     // the Brushes panel, which the layout is free to hide — a modal that goes
     // with its panel cannot be shut and cannot be reopened.
     brushlib::dialogs(root, p, ed);
+    // The palette library, for exactly the reason above.
+    palettelib::dialogs(root, p, ed);
     // The module library, for the same reason and one more: it is how a module
     // that has been removed from the layout comes back, so tying it to a panel
     // would tie the way back to the thing that has gone.
@@ -459,6 +462,9 @@ pub(crate) fn panel(
             if kind == PanelKind::Brushes {
                 brushlib::header_controls(ui, p, ed);
             }
+            if kind == PanelKind::Palette {
+                palettelib::header_controls(ui, p, ed);
+            }
         },
     );
 
@@ -484,6 +490,7 @@ pub(crate) fn panel(
                 .show(ui, |ui| match kind {
                     PanelKind::Tools => tools_body(ui, p, ed),
                     PanelKind::Colour => colour_body(ui, p, ed),
+                    PanelKind::Palette => palettelib::panel(ui, p, ed),
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
                     PanelKind::History => history_body(ui, p, ed, actions),
@@ -874,6 +881,7 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut shape = ed.ui.wheel_shape;
     let mut rotates = ed.ui.wheel_rotates;
     let mut angles = ed.ui.wheel_angles;
+    let mut harmony = ed.ui.harmony;
     let changed = colorpicker::show(
         ui,
         p,
@@ -881,20 +889,25 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         &mut shape,
         &mut rotates,
         &mut angles,
+        &mut harmony,
         &mut ed.hsv,
     );
-    // All three are kept between runs, though their controls are here rather
+    // All four are kept between runs, though their controls are here rather
     // than in the settings dialog — they are choices about the workspace, and
     // where one is set does not decide whether it should still be true tomorrow.
     //
     // Compared before and after rather than asked of the controls, because
     // `show` reports a change of *colour*: keying off its return would queue a
     // preferences write for every frame of a drag around the hue ring.
-    if shape != ed.ui.wheel_shape || rotates != ed.ui.wheel_rotates || angles != ed.ui.wheel_angles
+    if shape != ed.ui.wheel_shape
+        || rotates != ed.ui.wheel_rotates
+        || angles != ed.ui.wheel_angles
+        || harmony != ed.ui.harmony
     {
         ed.ui.wheel_shape = shape;
         ed.ui.wheel_rotates = rotates;
         ed.ui.wheel_angles = angles;
+        ed.ui.harmony = harmony;
         crate::prefs::mark_dirty();
     }
     if changed {
@@ -2250,6 +2263,34 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
                     ink,
                 );
             }
+        }
+        // A grid of colours, with one of them in hand.
+        //
+        // Deliberately unlike the Colour module's ring: the two sit beside each
+        // other in the library and in the dock, and the eye is matching shapes.
+        // A picker is round and continuous; a palette is square and countable,
+        // which is exactly the difference between mixing a colour and keeping
+        // one.
+        PanelKind::Palette => {
+            for k in 0..8 {
+                let cell = Rect::from_min_size(
+                    pos2(
+                        body.left() + (k % 4) as f32 * 9.0,
+                        body.top() + 3.0 + (k / 4) as f32 * 9.0,
+                    ),
+                    vec2(7.0, 7.0),
+                );
+                painter.rect_filled(cell, 1.5, ink);
+                if k == 1 {
+                    painter.rect_stroke(
+                        cell.expand(1.0),
+                        2.0,
+                        Stroke::new(1.0, p.accent),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+            bar(body.bottom() - 2.0, 0.0, 26.0, ink);
         }
         // A short list of brushes, each a stroke sample beside a name.
         PanelKind::Brushes => {

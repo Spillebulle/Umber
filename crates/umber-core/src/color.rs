@@ -80,10 +80,28 @@ pub struct Hsv {
     pub v: f32,
 }
 
+/// Degrees brought into `0.0..360.0`, the range a hue is defined over.
+///
+/// Two cases a bare `rem_euclid` gets wrong, and both end up in `sin_cos` and
+/// then in a picker's vertex positions — where one NaN is a mesh egui discards
+/// whole, which reads as a picker that has silently stopped drawing:
+///
+/// * **Not a number.** `NaN.rem_euclid(360.0)` is `NaN`, and a hue is a plain
+///   public field that anything may write.
+/// * **A tiny negative.** `(-1e-7).rem_euclid(360.0)` rounds up to exactly
+///   `360.0` in f32, which is the one value outside the range this promises.
+pub fn wrap_hue(degrees: f32) -> f32 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let wrapped = degrees.rem_euclid(360.0);
+    if wrapped >= 360.0 { 0.0 } else { wrapped }
+}
+
 impl Hsv {
     pub fn new(h: f32, s: f32, v: f32) -> Self {
         Self {
-            h: h.rem_euclid(360.0),
+            h: wrap_hue(h),
             s: s.clamp(0.0, 1.0),
             v: v.clamp(0.0, 1.0),
         }
@@ -91,7 +109,7 @@ impl Hsv {
 
     /// Convert to a linear-space colour.
     pub fn to_color(self, alpha: f32) -> Color {
-        let h = self.h.rem_euclid(360.0) / 60.0;
+        let h = wrap_hue(self.h) / 60.0;
         let c = self.v * self.s;
         let x = c * (1.0 - (h % 2.0 - 1.0).abs());
         let m = self.v - c;
@@ -138,7 +156,7 @@ impl Color {
         };
 
         Hsv {
-            h: h.rem_euclid(360.0),
+            h: wrap_hue(h),
             s: if max <= f32::EPSILON { 0.0 } else { d / max },
             v: max,
         }
@@ -218,6 +236,36 @@ mod tests {
     fn greys_have_zero_saturation() {
         let hsv = Color::from_srgb_u8(90, 90, 90, 255).to_hsv();
         assert!(hsv.s < 1e-4, "got {}", hsv.s);
+    }
+
+    /// A hue is a point on a circle, and every way of naming one has to land
+    /// inside a single turn. The two failures are a tiny negative, which
+    /// `rem_euclid` rounds up to exactly 360, and anything not a number — both
+    /// of which reach `sin_cos` and then a picker's vertex positions, where one
+    /// NaN is a mesh egui throws away.
+    #[test]
+    fn a_hue_is_always_inside_a_single_turn() {
+        for degrees in [0.0, 359.9, 360.0, 720.0, -90.0, -1e-7, -0.0] {
+            let h = wrap_hue(degrees);
+            assert!((0.0..360.0).contains(&h), "{degrees} -> {h}");
+            assert_eq!(Hsv::new(degrees, 1.0, 1.0).h, h);
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(wrap_hue(bad), 0.0);
+            assert_eq!(Hsv::new(bad, 1.0, 1.0).h, 0.0);
+        }
+        // A whole turn is red, not the magenta that indexing the sixth sextant
+        // would give.
+        assert_eq!(
+            Hsv {
+                h: 360.0,
+                s: 1.0,
+                v: 1.0
+            }
+            .to_color(1.0)
+            .to_srgb_u8(),
+            [255, 0, 0, 255]
+        );
     }
 
     #[test]

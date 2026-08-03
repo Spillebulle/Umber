@@ -113,15 +113,17 @@ pub mod limits {
 pub enum PanelKind {
     Tools,
     Colour,
+    Palette,
     Brushes,
     Layers,
     History,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 5] = [
+    pub const ALL: [PanelKind; 6] = [
         Self::Tools,
         Self::Colour,
+        Self::Palette,
         Self::Brushes,
         Self::Layers,
         Self::History,
@@ -130,15 +132,15 @@ impl PanelKind {
     /// The arrangement Umber ships with, a column per side: the tool rail alone
     /// at the left, the design's three modules stacked at the right.
     ///
-    /// History is deliberately *not* among them, and that is the same answer a
-    /// layout file written before History existed gets — an absent panel is a
-    /// closed one, so an old config opens with it closed too. Putting it in the
-    /// default instead would have made a fresh install and an upgraded one
-    /// disagree about what the workspace contains, which is exactly the silent
-    /// divergence the config's version header exists to prevent; and the
-    /// alternative to that, bumping the version, would throw away every
-    /// arrangement anybody has made to add one module they can reach from the
-    /// Window menu in two clicks.
+    /// History and Palette are deliberately *not* among them, and that is the
+    /// same answer a layout file written before either existed gets — an absent
+    /// panel is a closed one, so an old config opens with them closed too.
+    /// Putting one in the default instead would have made a fresh install and
+    /// an upgraded one disagree about what the workspace contains, which is
+    /// exactly the silent divergence the config's version header exists to
+    /// prevent; and the alternative to that, bumping the version, would throw
+    /// away every arrangement anybody has made to add one module they can reach
+    /// from the Window menu in two clicks.
     ///
     /// Tools *is* among them, and is the exception the module comment argues
     /// for: an old file records the rail's edge, so it opens with the rail
@@ -150,6 +152,7 @@ impl PanelKind {
         match self {
             Self::Tools => "Tools",
             Self::Colour => "Colour",
+            Self::Palette => "Palette",
             Self::Brushes => "Brushes",
             Self::Layers => "Layers",
             Self::History => "History",
@@ -170,8 +173,12 @@ impl PanelKind {
                  swap between them."
             }
             Self::Colour => {
-                "Choose the painting colour — a hue ring, a saturation square \
-                 or RGB sliders."
+                "Choose the painting colour — a hue ring, a saturation square, \
+                 RGB sliders or a harmony wheel."
+            }
+            Self::Palette => {
+                "The colours you are working with, and the library of palettes \
+                 you keep them in."
             }
             Self::Brushes => {
                 "The brushes in reach, and the way in to the whole library and \
@@ -191,6 +198,7 @@ impl PanelKind {
         match self {
             Self::Tools => "tools",
             Self::Colour => "colour",
+            Self::Palette => "palette",
             Self::Brushes => "brushes",
             Self::Layers => "layers",
             Self::History => "history",
@@ -207,6 +215,9 @@ impl PanelKind {
         match self {
             Self::Tools => 1.0,
             Self::Colour => 3.0,
+            // A grid of swatches, so it wants less than a picker and about what
+            // a shortlist of brushes wants.
+            Self::Palette => 1.3,
             Self::Brushes => 1.3,
             Self::Layers => 2.2,
             Self::History => 2.0,
