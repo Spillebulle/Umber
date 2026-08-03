@@ -280,7 +280,79 @@ fn interface(stage: &mut Stage, dir: &Path) -> Result<Vec<(PathBuf, u64, u32, u3
         out.push(picker_shot(stage, dir, picker, shape, name)?);
     }
 
+    // The Brushes module, which is the one panel that shows real work being
+    // done without a document: every row's sample is a stroke stamped by the
+    // dab generator on the CPU, so a picture of the list is a picture of two
+    // hundred brushes actually painting.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Brushes,
+        vec2(theme::metrics::PANEL, 460.0),
+        |_| {},
+        "brushes.png",
+    )?);
+
+    // The Layers module, holding a folder, a link group and a couple of ticks.
+    //
+    // The thumbnails come out as bare checker, and that is honest rather than a
+    // shortcoming of the shot: they are read back off a canvas, this document
+    // has none, and "nothing on this layer" is exactly the checker a real empty
+    // layer draws. A picture of the *structure* is what this is for.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Layers,
+        vec2(theme::metrics::PANEL, 320.0),
+        |ed| {
+            for _ in 0..3 {
+                ed.layers.add();
+            }
+            for (n, index) in (0..4).enumerate() {
+                if let Some(layer) = ed.layers.get_mut(index) {
+                    layer.name = ["Background", "Flats", "Line", "Shading"][n].to_string();
+                }
+            }
+            // A group holding the top two, so the row that folds and the rows
+            // stepped in beneath it are both in the picture.
+            ed.layers.group(&[2, 3]);
+            if let Some(folder) = ed.layers.get_mut(4) {
+                folder.name = "Ink".to_string();
+            }
+            // And a link between the two that are not in it, which is what puts
+            // a coloured chain on a row.
+            ed.layers.link(&[0, 1]);
+            ed.layers.set_active(2);
+        },
+        "layers.png",
+    )?);
+
     Ok(out)
+}
+
+/// One docked module, at the width the design gives a panel.
+///
+/// `setup` is handed the editor before it is drawn, for the panels whose
+/// picture is of a document rather than of the controls themselves.
+fn panel_shot(
+    stage: &mut Stage,
+    dir: &Path,
+    kind: PanelKind,
+    field: Vec2,
+    setup: impl FnOnce(&mut Editor),
+    name: &str,
+) -> Result<(PathBuf, u64, u32, u32), String> {
+    let mut ed = editor();
+    setup(&mut ed);
+    let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+    let rect = Rect::from_min_size(Pos2::ZERO, field);
+    let image = stage
+        .shoot(field, PANEL_SCALE, &palette, palette.dock, |root| {
+            let mut actions = ui::UiActions::default();
+            panels::panel(root, &palette, &mut ed, &mut actions, kind, rect);
+        })
+        .trim(palette.dock, (TRIM_MARGIN * PANEL_SCALE) as u32);
+    write_png(&dir.join(name), &image)
 }
 
 /// The settings dialog, open on one pane.
