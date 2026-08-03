@@ -29,6 +29,24 @@
 //! stores. The two must remain exact inverses on the bytes a layer texture can
 //! actually hold, or a document would drift a little every time it was saved and
 //! reopened; `saving_and_reopening_does_not_move_a_pixel` pins that down.
+//!
+//! # A mask is the same question with a different answer
+//!
+//! A mask is another slice of the *same* layer array, and `composite.wgsl`
+//! reads its **red** channel — through the array's `Rgba8UnormSrgb` view, so
+//! the sampler decodes it on the way out. The number the shader multiplies the
+//! layer by is therefore `srgb_decode(red / 255)` and not `red / 255`: a mask
+//! slice holds **sRGB-encoded coverage** exactly as a layer slice holds
+//! sRGB-encoded colour, and `a_mask_hides_what_it_covers` in `gpu_pipeline.rs`
+//! reads the stored 188 as a half.
+//!
+//! Every other application stores a mask as a **linear** multiplier on alpha —
+//! Krita's transparency mask is a byte of its ALPHA colour space and
+//! Photoshop's is a greyscale channel, and both mean "times `byte / 255`". So
+//! a source byte of 128 means a half, and a half is stored here as 188.
+//! Copying the byte across unchanged is the tempting one-liner and is wrong by
+//! a full gamma curve: a layer the artist hid by half would arrive hidden by
+//! four fifths. [`encode_coverage`] is the one place that conversion happens.
 
 use std::sync::OnceLock;
 
@@ -80,6 +98,49 @@ pub fn encode_buffer(buf: &mut [u8]) {
     for px in buf.chunks_exact_mut(4) {
         px.copy_from_slice(&encode_pixel([px[0], px[1], px[2], px[3]]));
     }
+}
+
+/// `linear coverage -> the byte a mask slice holds`. 256 entries, built once.
+///
+/// Small enough to compute per call and deliberately not: a canvas-sized mask
+/// on a 4096² import is 16 million `powf` pairs, which is the cost [`TABLE`]
+/// exists to avoid on the colour path.
+static COVERAGE: OnceLock<[u8; 256]> = OnceLock::new();
+
+fn coverage_table() -> &'static [u8; 256] {
+    COVERAGE.get_or_init(|| {
+        let mut t = [0u8; 256];
+        for (v, out) in t.iter_mut().enumerate() {
+            *out = (linear_to_srgb(v as f32 / 255.0) * 255.0 + 0.5) as u8;
+        }
+        t
+    })
+}
+
+/// Turn one byte of another application's mask into the four a mask slice
+/// holds.
+///
+/// The input is coverage as every source format states it — a linear multiplier
+/// on the layer's alpha, `0` hiding and `255` revealing. The output is
+/// `(g, g, g, 255)` with `g` sRGB-encoded, which is what
+/// [`crate::docformat`]'s greyscale mask PNG round-trips and what the composite
+/// samples. See the module docs for why the encode is not a no-op.
+///
+/// Opaque in the fourth byte because a mask slice is read on one channel and
+/// nothing looks at the others; writing the coverage there as well would make
+/// a half-hidden layer's mask *itself* half transparent the day something does.
+pub fn encode_coverage(coverage: u8) -> [u8; 4] {
+    let g = coverage_table()[coverage as usize];
+    [g, g, g, 255]
+}
+
+/// Widen a canvas of coverage bytes into a mask slice.
+pub fn encode_coverage_buffer(coverage: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(coverage.len() * 4);
+    for &c in coverage {
+        out.extend_from_slice(&encode_coverage(c));
+    }
+    out
 }
 
 /// `[alpha][stored] -> straight byte`. The inverse of [`TABLE`].
@@ -213,6 +274,59 @@ mod tests {
         // decode that divided in sRGB would give ~215 instead.
         let out = decode_pixel([188, 188, 188, 128]);
         assert!((out[0] as i32 - 255).abs() <= 1, "got {}", out[0]);
+    }
+
+    #[test]
+    fn a_mask_that_hides_nothing_and_one_that_hides_everything_are_exact() {
+        // The two ends have to be exact or every unmasked pixel of an imported
+        // mask moves: 255 must reveal completely and 0 must hide completely.
+        assert_eq!(encode_coverage(255), [255, 255, 255, 255]);
+        assert_eq!(encode_coverage(0), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn half_coverage_is_stored_as_the_byte_the_composite_reads_as_a_half() {
+        // The whole point, and the mask's version of
+        // `half_alpha_white_is_linear_not_srgb_half`. Krita and Photoshop both
+        // mean "half the alpha" by a mask byte of 128; the composite samples
+        // the slice through an sRGB view, so a half is stored as ~188. Copying
+        // 128 straight across would hide four fifths of the layer.
+        let out = encode_coverage(128);
+        assert!(
+            (out[0] as i32 - 188).abs() <= 1,
+            "expected ~188, got {out:?}"
+        );
+
+        // Said the other way round, which is the way the shader says it: the
+        // stored byte, decoded the way the sampler decodes it, is the source's
+        // own multiplier back again.
+        let decoded = srgb_to_linear(out[0] as f32 / 255.0);
+        assert!(
+            (decoded - 128.0 / 255.0).abs() < 0.005,
+            "the composite would read {decoded}, not {}",
+            128.0 / 255.0
+        );
+    }
+
+    #[test]
+    fn coverage_encoding_is_monotone_and_never_inverts() {
+        // A mask that got darker where the source got lighter is the worst
+        // shape this bug takes, because it looks deliberate.
+        let mut last = 0;
+        for c in 0..=255u8 {
+            let g = encode_coverage(c)[0];
+            assert!(g >= last, "coverage {c} encoded to {g} after {last}");
+            last = g;
+        }
+    }
+
+    #[test]
+    fn the_coverage_buffer_and_the_single_byte_agree() {
+        let out = encode_coverage_buffer(&[0, 40, 128, 255]);
+        assert_eq!(out.len(), 16);
+        for (i, c) in [0u8, 40, 128, 255].into_iter().enumerate() {
+            assert_eq!(&out[i * 4..i * 4 + 4], encode_coverage(c));
+        }
     }
 
     #[test]

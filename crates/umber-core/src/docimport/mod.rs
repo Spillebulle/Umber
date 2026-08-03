@@ -20,12 +20,17 @@
 //! the artist to export a PNG or an ORA, whereas a wrong import wastes an
 //! afternoon before they notice the colours moved.
 //!
-//! The same rule shapes what happens *inside* a supported format. Umber has no
-//! layer groups and five blend modes, and reads a mask out of its own files
-//! only, so a real Photoshop file cannot arrive intact. Every such loss appends
-//! an [`ImportWarning`], and the UI is expected to show them. Clipping is no
-//! longer among the losses — Umber's own flag means what Photoshop's does, so a
-//! clipped PSD layer arrives clipped.
+//! The same rule shapes what happens *inside* a supported format. Umber has
+//! five blend modes and one mask per layer, so a real Photoshop file cannot
+//! arrive intact. Every such loss appends an [`ImportWarning`], and the UI is
+//! expected to show them. Clipping is no longer among the losses — Umber's own
+//! flag means what Photoshop's does, so a clipped PSD layer arrives clipped.
+//!
+//! Masks are read out of ORA and out of a `.kra`'s **transparency masks**,
+//! which are the one kind of Krita mask that means what Umber's does. Krita's
+//! other four — filter, transform, selection and colorize — and Photoshop's
+//! masks are all still reported as lost, the last of those because `psd` 0.3.5
+//! does not carry them out of the file at all. See [`krita`] and [`photoshop`].
 //!
 //! # Pixel convention
 //!
@@ -148,9 +153,13 @@ pub struct ImportedLayer {
     /// The layer's mask, canvas-sized and in the same form as `pixels` — so it
     /// goes straight to `write_texture` like everything else here.
     ///
-    /// `None` for every format but Umber's own so far. A `.kra` and a `.psd`
-    /// both carry masks and both still report them as lost; reading them is a
-    /// second decoder each and is not what this change is.
+    /// Only the **red** channel is ever read, and it holds sRGB-encoded
+    /// coverage rather than a linear multiplier; [`srgb::encode_coverage`] is
+    /// the one place another application's mask byte becomes one of these.
+    ///
+    /// Filled by ORA and by `.kra`'s transparency masks. A `.psd` mask is
+    /// still reported as lost, and that is the `psd` crate's limit rather than
+    /// a decision: see [`photoshop`]'s module docs.
     pub mask: Option<Vec<u8>>,
     /// Bounded by the alpha of the nearest unclipped layer below.
     pub clipped: bool,
@@ -497,6 +506,17 @@ pub enum ImportWarning {
     GroupOpacityFolded { group: String },
     /// A layer mask was ignored, so the layer covers more than it should.
     MaskIgnored { layer: String },
+    /// Something hanging off a layer that Umber has no place for at all — a
+    /// Krita filter or selection mask, a mask that was switched off, a second
+    /// mask on a layer that can hold one.
+    ///
+    /// Deliberately *not* [`MaskIgnored`](Self::MaskIgnored): that one says the
+    /// layer now covers more than it did, which is true of a transparency mask
+    /// Umber could not read and false of every case here — a disabled mask
+    /// changed no pixel in the source either, and a filter mask never bounded
+    /// the layer's alpha in the first place. Two losses that read identically
+    /// to the artist would be one warning; these do not.
+    MaskUnsupported { layer: String, what: String },
     /// A layer could not be brought across at all.
     LayerSkipped { layer: String, reason: String },
     /// Layer structure was lost and the flattened image was used instead.
@@ -543,6 +563,9 @@ impl fmt::Display for ImportWarning {
                 f,
                 "Layer “{layer}” has a mask, which was ignored — the layer covers more than it did."
             ),
+            Self::MaskUnsupported { layer, what } => {
+                write!(f, "Layer “{layer}”: {what} was not imported.")
+            }
             Self::LayerSkipped { layer, reason } => {
                 write!(f, "Layer “{layer}” could not be imported: {reason}.")
             }

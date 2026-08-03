@@ -206,6 +206,98 @@ pub fn ora_with_empty_group() -> Vec<u8> {
 
 // ---------------------------------------------------------------- KRA
 
+/// One mask of a Krita fixture, hanging off a [`KraLayer`].
+///
+/// Written from Krita's own `kis_kra_savexml_visitor.cpp` and
+/// `kis_kra_save_visitor.cpp`: the element is `<mask>` inside `<masks>`, the
+/// kind is in `nodetype` (**not** `type`), and the binary data of a
+/// transparency mask is its *selection*, under `<filename>.pixelselection`
+/// with the byte outside the tiles in `<filename>.pixelselection.defaultpixel`.
+pub struct KraMask {
+    name: String,
+    node_type: &'static str,
+    visible: bool,
+    x: i64,
+    y: i64,
+    /// Coverage bytes to store, as `(x, y, value)`; everywhere else takes
+    /// `default`.
+    pixels: Vec<(usize, usize, u8)>,
+    default: u8,
+    /// Whether the `.pixelselection` entry is written at all. Krita omits it
+    /// for a mask whose selection is empty.
+    data: bool,
+}
+
+impl KraMask {
+    /// A visible transparency mask that reveals nothing but the pixels it is
+    /// given — Krita's own default for a pixel selection.
+    pub fn transparency(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            node_type: "transparencymask",
+            visible: true,
+            x: 0,
+            y: 0,
+            pixels: Vec::new(),
+            default: 0,
+            data: true,
+        }
+    }
+
+    pub fn kind(mut self, node_type: &'static str) -> Self {
+        self.node_type = node_type;
+        self
+    }
+
+    pub fn hidden(mut self) -> Self {
+        self.visible = false;
+        self
+    }
+
+    pub fn at(mut self, x: i64, y: i64) -> Self {
+        self.x = x;
+        self.y = y;
+        self
+    }
+
+    pub fn coverage(mut self, x: usize, y: usize, value: u8) -> Self {
+        self.pixels.push((x, y, value));
+        self
+    }
+
+    pub fn default_coverage(mut self, value: u8) -> Self {
+        self.default = value;
+        self
+    }
+
+    /// A mask whose `.pixelselection` entry is not in the archive.
+    pub fn without_data(mut self) -> Self {
+        self.data = false;
+        self
+    }
+
+    fn xml(&self, filename: &str) -> String {
+        format!(
+            "<mask name=\"{}\" filename=\"{filename}\" nodetype=\"{}\" visible=\"{}\" \
+             locked=\"0\" x=\"{}\" y=\"{}\"/>",
+            self.name,
+            self.node_type,
+            if self.visible { 1 } else { 0 },
+            self.x,
+            self.y,
+        )
+    }
+
+    /// One 64×64 tile at the origin, a single plane of coverage.
+    fn tile_file(&self) -> Vec<u8> {
+        let mut plane = vec![0u8; 64 * 64];
+        for (x, y, value) in &self.pixels {
+            plane[y * 64 + x] = *value;
+        }
+        tile_file(1, &plane, false)
+    }
+}
+
 /// One layer of a Krita fixture. Uppermost first, as `maindoc.xml` orders them.
 pub struct KraLayer {
     name: String,
@@ -217,7 +309,7 @@ pub struct KraLayer {
     y: i64,
     pixels: Vec<(usize, usize, [u8; 4])>,
     compress: bool,
-    masked: bool,
+    masks: Vec<KraMask>,
 }
 
 impl KraLayer {
@@ -232,7 +324,7 @@ impl KraLayer {
             y: 0,
             pixels: Vec::new(),
             compress: false,
-            masked: false,
+            masks: Vec::new(),
         }
     }
 
@@ -272,9 +364,15 @@ impl KraLayer {
         self
     }
 
-    pub fn masked(mut self) -> Self {
-        self.masked = true;
+    /// Attach a mask, uppermost first — the order Krita writes them in.
+    pub fn mask(mut self, mask: KraMask) -> Self {
+        self.masks.push(mask);
         self
+    }
+
+    /// An ordinary visible transparency mask revealing one pixel.
+    pub fn masked(self) -> Self {
+        self.mask(KraMask::transparency("Mask").coverage(0, 0, 255))
     }
 
     fn group(name: &str) -> Self {
@@ -294,20 +392,7 @@ impl KraLayer {
             planes[2 * N + i] = rgba[0];
             planes[3 * N + i] = rgba[3];
         }
-
-        let body = if self.compress {
-            lzf_compress(&planes)
-        } else {
-            planes
-        };
-        let flag: u8 = if self.compress { 1 } else { 0 };
-
-        let mut out = b"VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE 4\nDATA 1\n".to_vec();
-        // The declared size counts the flag byte as well as the payload.
-        out.extend_from_slice(format!("0,0,LZF,{}\n", body.len() + 1).as_bytes());
-        out.push(flag);
-        out.extend_from_slice(&body);
-        out
+        tile_file(4, &planes, self.compress)
     }
 
     fn xml(&self, filename: &str, children: &str) -> String {
@@ -322,8 +407,12 @@ impl KraLayer {
             self.op,
         );
         let mut inner = String::new();
-        if self.masked {
-            inner += "<masks><mask name=\"Mask\" type=\"transparencymask\"/></masks>";
+        if !self.masks.is_empty() {
+            inner += "<masks>";
+            for (i, mask) in self.masks.iter().enumerate() {
+                inner += &mask.xml(&mask_filename(filename, i));
+            }
+            inner += "</masks>";
         }
         inner += children;
         if inner.is_empty() {
@@ -332,6 +421,54 @@ impl KraLayer {
             format!("{open}>{inner}</layer>")
         }
     }
+
+    /// Write every mask's binary data under the layer directory.
+    fn add_masks(&self, archive: &mut Archive, document: &str, filename: &str) {
+        for (i, mask) in self.masks.iter().enumerate() {
+            if !mask.data {
+                continue;
+            }
+            let path = format!(
+                "{document}/layers/{}.pixelselection",
+                mask_filename(filename, i)
+            );
+            archive.add(&path, &mask.tile_file());
+            archive.add(&format!("{path}.defaultpixel"), &[mask.default]);
+        }
+    }
+}
+
+/// Krita numbers every node in one sequence; the fixtures only need the names
+/// to be unique and to differ from the layers'.
+fn mask_filename(layer: &str, index: usize) -> String {
+    format!("{layer}mask{index}")
+}
+
+/// A bare Krita tile file, for a test that drives the tile reader directly.
+pub fn kra_tile_file(pixel_size: u32, planes: &[u8]) -> Vec<u8> {
+    tile_file(pixel_size, planes, false)
+}
+
+/// A Krita tile file: the five-line header, then one tile at the origin.
+///
+/// `pixel_size` is what the header declares and what the reader is required to
+/// agree with — 4 for a layer's BGRA planes, 1 for a mask's selection.
+fn tile_file(pixel_size: u32, planes: &[u8], compress: bool) -> Vec<u8> {
+    let body = if compress {
+        lzf_compress(planes)
+    } else {
+        planes.to_vec()
+    };
+    let flag: u8 = if compress { 1 } else { 0 };
+
+    let mut out =
+        format!("VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE {pixel_size}\nDATA 1\n")
+            .into_bytes();
+    // The declared size counts the flag byte as well as the payload.
+    out.extend_from_slice(format!("0,0,LZF,{}\n", body.len() + 1).as_bytes());
+    out.push(flag);
+    out.extend_from_slice(&body);
+    out
 }
 
 /// A valid LZF stream, using back-references for runs.
@@ -395,6 +532,7 @@ fn kra_archive(width: u32, height: u32, colourspace: &str, layers: &[KraLayer]) 
         if layer.node_type == "paintlayer" {
             archive.add(&format!("Fixture/layers/{filename}"), &layer.tile_file());
         }
+        layer.add_masks(&mut archive, "Fixture", &filename);
     }
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -438,6 +576,7 @@ pub fn kra_with_group() -> Vec<u8> {
         let filename = format!("inner{i}");
         children += &layer.xml(&filename, "");
         archive.add(&format!("Fixture/layers/{filename}"), &layer.tile_file());
+        layer.add_masks(&mut archive, "Fixture", &filename);
     }
     let mut body = group.xml("group0", &format!("<layers>{children}</layers>"));
     body += &outside.xml("outer0", "");
@@ -445,6 +584,34 @@ pub fn kra_with_group() -> Vec<u8> {
 
     let xml = format!(
         "<DOC xmlns=\"http://www.calligra.org/DTD/krita\" syntaxVersion=\"2\">         <IMAGE name=\"Fixture\" mime=\"application/x-kra\" width=\"64\" height=\"64\"          colorspacename=\"RGBA\" profile=\"sRGB-elle-V2-srgbtrc.icc\">         <layers>{body}</layers></IMAGE></DOC>"
+    );
+    archive.add("maindoc.xml", xml.as_bytes());
+    archive.add(
+        "mergedimage.png",
+        &png_rgba(64, 64, &solid(64, 64, &[7, 7, 7, 255])),
+    );
+    archive.finish()
+}
+
+/// A transparency mask on the **group** rather than on a layer.
+///
+/// Groups are flattened away by this reader, so a mask on one has nowhere to
+/// go — and unlike the layer case that is a real change to the picture.
+pub fn kra_with_masked_group() -> Vec<u8> {
+    let group = KraLayer::group("Ink").mask(KraMask::transparency("Group mask"));
+    let inside = KraLayer::new("Lines").pixel(0, 0, [1, 1, 1, 255]);
+
+    let mut archive = Archive::new("application/x-krita");
+    let children = inside.xml("inner0", "");
+    archive.add("Fixture/layers/inner0", &inside.tile_file());
+    let body = group.xml("group0", &format!("<layers>{children}</layers>"));
+    group.add_masks(&mut archive, "Fixture", "group0");
+
+    let xml = format!(
+        "<DOC xmlns=\"http://www.calligra.org/DTD/krita\" syntaxVersion=\"2\">\
+         <IMAGE name=\"Fixture\" mime=\"application/x-kra\" width=\"64\" height=\"64\" \
+         colorspacename=\"RGBA\" profile=\"sRGB-elle-V2-srgbtrc.icc\">\
+         <layers>{body}</layers></IMAGE></DOC>"
     );
     archive.add("maindoc.xml", xml.as_bytes());
     archive.add(
