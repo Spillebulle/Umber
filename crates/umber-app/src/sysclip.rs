@@ -166,9 +166,10 @@ use umber_core::Clip;
 /// What a paste should put down.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Paste {
-    /// Umber's own clip. Either the desktop is holding no picture, or it is
-    /// holding byte for byte the one Umber's copy put there — so the exact
-    /// bytes that came off the layer are the ones that go back on to it.
+    /// Umber's own clip: the desktop is holding no picture, or it is holding
+    /// byte for byte the one Umber's copy put there, or Umber's copy never
+    /// reached it. In all three the exact bytes that came off the layer are the
+    /// ones that go back on to it.
     Mine(Clip),
     /// A picture Umber did not put on the desktop's clipboard.
     Theirs(Clip),
