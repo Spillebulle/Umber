@@ -2059,6 +2059,17 @@ half-publish; `.github/workflows/release.yml` does the rest.
   and another run of the script. It needs the GitHub CLI for this and says so;
   `-SkipCi` / `--skip-ci` opts out, and is for a machine without `gh` rather
   than for a hurry.
+- **The README links to every file of the current release, and two tests keep
+  it true.** GitHub's permanent `releases/latest/download/<name>` form needs a
+  filename that never changes, and Umber's carry the version — which is worth
+  keeping, because months later it is what says which build is in somebody's
+  downloads folder. So the links name a version, and
+  `the_readme_links_to_every_file_of_this_release` and its `..._no_download_
+  link_that_is_not_...` twin fail the build when they name the previous one.
+  Both directions are needed: the first catches a row that was not updated, the
+  second a row left behind for a package that is no longer built. `ASSETS` in
+  that file is the **third** statement of the asset names, after `release.yml`
+  and `update::release::wanted_asset`; changing a name means changing all three.
 - **`ci.yml`'s matrix must cover every runner `release.yml` builds on**, or the
   wait above is a gate with a hole in it. v0.0.5 was tagged on a green CI and
   then failed on `windows-11-arm`, which CI did not run at all. Adding a target
