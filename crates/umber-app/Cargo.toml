@@ -94,8 +94,9 @@ windows-sys = { version = "0.61", features = [
 # Gated exactly as egui-winit gates its own: arboard has no Android backend at
 # all, so the dependency must not be built there. `image-data` is what makes it
 # carry pictures rather than only text, and `wayland-data-control` is the
-# Wayland backend — without it a Wayland session would fall through to X11,
-# which under a native Wayland window is not there. Neither adds a *system*
+# Wayland backend — without it a Wayland session would reach the clipboard only
+# through whatever XWayland happens to be bridging, which is a session Umber
+# does not get to require. Neither adds a *system*
 # library: arboard's X11 path is `x11rb` speaking the protocol over the socket,
 # and `wl-clipboard-rs` reaches `libwayland-client.so.0`, which winit already
 # opens and every Linux package here already declares.
