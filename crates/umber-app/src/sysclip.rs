@@ -18,11 +18,12 @@
 //! # Which picture a paste puts down
 //!
 //! [`decide`], which is a pure function of three readings — what the desktop
-//! holds, what Umber holds, and whether Umber's own copy is known to have
-//! reached the desktop — for the reason `install::detect` is a pure function of
-//! a `Probe`: it is the whole of the rule, and no test may touch the real
-//! clipboard. A CI runner may have no display server at all, and a test that
-//! grabs the desktop's clipboard on somebody's machine is hostile.
+//! holds, what Umber holds, and [`OnDesktop`]: what the desktop *should* be
+//! handing back for Umber's own clip. That is `install::detect`'s shape and it
+//! is for `install::detect`'s reason: it is the whole of the rule, and **no
+//! test may touch the real clipboard.** A CI runner may have no display server
+//! at all, and a test that grabs the desktop's clipboard on somebody's machine
+//! is hostile.
 //!
 //! The rule: **a picture on the desktop wins, unless it is the one Umber's own
 //! copy put there, or Umber's own copy never got there; and where the desktop
@@ -54,35 +55,66 @@
 //!   and it is the far smaller of the two, because that case is visible (the
 //!   wrong picture arrives as a float, and Escape throws it away) where the
 //!   other is a copy and a paste that quietly disagree.
-//! * *And where the desktop holds Umber's own bytes.* This is what keeps
+//! * *And where the desktop holds Umber's own copy.* This is what keeps
 //!   `a_copy_and_a_paste_are_exact_inverses` — the sibling of
 //!   `saving_and_reopening_does_not_move_a_pixel` — true through a copy that
-//!   also went to the desktop. It is a **check rather than a trust**: arboard
-//!   round trips RGBA8 through PNG on Windows and on both Linux backends, so
-//!   the bytes come back identical and the comparison is satisfied. Measured on
-//!   Windows rather than only read off arboard's source: a 16×16 square
-//!   carrying every alpha from 0 to 255 came back byte for byte, which also
-//!   rules out the DIB path having been taken in preference to the PNG one.
-//!   A picture that merely resembles the one Umber copied is not evidence that
-//!   it is that picture, and pasting the wrong picture is the one failure here
-//!   worth avoiding at any cost — so where the bytes differ, the desktop is
-//!   believed and the divergence is logged at `warn`, loudly enough to be seen
-//!   without setting `RUST_LOG`.
+//!   also went to the desktop. The bytes that go back on to the layer are the
+//!   ones that came off it, never the ones that came back through the machine.
 //!
-//! **macOS is the platform this has not been run on, and it is named rather
-//! than assumed sound.** arboard writes an `NSImage` built from a `CGImage`
-//! with straight alpha and reads back that image's TIFF representation, and
-//! Cocoa's bitmap representations conventionally carry *premultiplied* alpha
-//! while `image`'s TIFF decoder does not undo it. If that is what happens, the
-//! comparison above fails on every copy of anything with a soft edge, the
-//! desktop is believed, and a paste straight back comes out darker at that
-//! edge. Nobody working on Umber has a Mac; the `warn` is what would report it,
-//! and the fix if it is ever confirmed is **not** a size heuristic — a picture
-//! of the same shape is not the same picture — but an *echo*: read the desktop
-//! back once immediately after a successful write and compare against that
-//! instead of against the clip. It is correct on a lossy transport and has no
-//! false positive, and it is not done today because it costs a second decode on
-//! every copy, which on the canvases the paragraph below is about is seconds.
+//! # Recognising Umber's own copy, on a clipboard that changes it
+//!
+//! The third reading is a **picture, not a flag**, and that is the whole of
+//! this section. "Is the desktop still holding what Umber put there" cannot be
+//! answered by comparing against `Editor::clipboard`, because a platform whose
+//! clipboard does not hand back the bytes it was given is holding something
+//! that is *not* that clip and is nonetheless Umber's copy. Comparing against
+//! the clip would fail to recognise it, believe the desktop, and paste the
+//! mangled bytes — a copy and a paste straight back coming out different, which
+//! is wrong pixels, silently, and a **regression** on any platform it happens
+//! on, since an internal clipboard was exact before there was a desktop one.
+//!
+//! So [`Board::put_image`] keeps the **echo**: the picture read straight back
+//! after a successful write, which is what the desktop will hand back next time
+//! *if reading it twice answers twice the same*. That is an assumption and not
+//! a construction — it needs the platform's read to be deterministic, which is
+//! very likely and is not proved here. A transport that is lossy **and**
+//! non-deterministic is the one case the echo does not fix, and it would show
+//! up as `decide` believing the desktop on every paste.
+//!
+//! [`decide`] compares against the echo. It is correct on a lossy transport
+//! and, unlike a size or a shape test, it has no false positive — a picture of
+//! the same shape is not the same picture. The strong guard is
+//! `a_lossy_clipboard_still_pastes_the_bytes_that_came_off_the_layer`, which
+//! fails against the comparison that preceded the echo;
+//! `an_echo_does_not_make_another_applications_picture_lose` is a weaker
+//! companion and says so in its own docs rather than claiming to be the pair.
+//!
+//! **The echo is only taken where the transport is not known to be exact**, and
+//! [`TRANSPORT_IS_EXACT`] is where that is decided and evidenced. Windows was
+//! measured — every alpha from 0 to 255, byte for byte — and arboard's X11 and
+//! Wayland backends encode and decode `image/png` from and to RGBA8, which is
+//! lossless by construction. Those two pay nothing at all: no second read, and
+//! no second copy of the picture in memory, because the bytes to compare
+//! against are the clip's own ([`OnDesktop::TheClipItself`]). Everything else
+//! pays one extra decode per copy to be correct rather than fast, which is the
+//! direction this project takes that trade everywhere. The second *copy* of
+//! the picture is only kept where the echo actually came back different: an
+//! echo equal to the clip records [`OnDesktop::TheClipItself`], which is the
+//! same comparison and hundreds of megabytes lighter on a full-canvas copy.
+//!
+//! **Nobody working on Umber has a Mac, and no part of the macOS clipboard path
+//! has ever been run** — the same statement the pen and the mobile targets are
+//! held to, and it is why the gate is a `const` and not a `cfg`: the echo
+//! compiles on every platform, which is the only check on it anybody here can
+//! perform. What is *suspected* there is that arboard writes an `NSImage` built
+//! from a `CGImage` with straight alpha and reads back that image's TIFF
+//! representation, and that Cocoa's bitmap representations carry premultiplied
+//! alpha where `image`'s TIFF decoder does not undo it. If that is right the
+//! echo is what makes it harmless; if it is wrong, macOS pays one read per copy
+//! for nothing, which is the cheap way to be wrong. Note that a premultiply is
+//! the exact identity on anything fully opaque, so an echo that agrees on one
+//! picture says nothing about the next — which is why a first agreeing echo
+//! does **not** promote the platform to exact.
 //!
 //! Where a pasted picture *goes* is not decided here. That is `Clip::place`'s,
 //! in `umber-core`, and a picture off the desktop is an ordinary clip: it is
@@ -107,20 +139,53 @@
 //! picture there, not recognise it, and put it down — the wrong picture, from
 //! the one branch that exists to make that impossible.
 //!
-//! **The cost was measured, because guessing it from `measure-history.rs`'s
-//! 1.6 ms/MB would have been wrong by five times.** That figure is PNG at
-//! `Compression::Fast`; arboard encodes at `image`'s default level, and on
-//! Windows it writes a *second* copy as an uncompressed `CF_DIBV5` beside the
-//! PNG because some applications only read one of the two. Timed on this
-//! machine over 4, 16 and 64 MB pictures, in release: **about 8 ms per megabyte
-//! each way**, both `set_image` and `get_image`. So an ordinary selection is
-//! imperceptible, a 2048² region is about a sixth of a second, and Ctrl+C with
-//! nothing selected on the 10000² document the Undo section uses as its bound
-//! is **roughly three seconds** — on top of the 400 MB readback that copy
-//! already paid for. That is a freeze an artist would feel, and it is stated
-//! here rather than hidden. It is not gated on a size, because any threshold
-//! would be a number nobody measured and the effect of crossing it would be a
-//! copy that silently did not leave Umber.
+//! **The cost is measured, by `examples/measure-clipboard.rs`, and it is quoted
+//! here only because that exists to re-derive it.** `measure-history.rs`'s
+//! 1.6 ms/MB is the wrong figure to reason from — that is PNG at
+//! `Compression::Fast`, where arboard encodes at `image`'s default level and on
+//! Windows writes a *second* uncompressed `CF_DIBV5` beside the PNG.
+//!
+//! On this machine, in release, over 4, 16 and 64 MB pictures: **about
+//! 2.5 ms/MB to write and 2.1 ms/MB to read**, flat across all three. So an
+//! ordinary selection is imperceptible, a 2048² region is about a twentieth of
+//! a second, and Ctrl+C with nothing selected on the 10000² document the Undo
+//! section uses as its bound is **roughly a second** — on top of the 400 MB
+//! readback that copy already paid for, and doubled again where the echo is
+//! taken. Re-run the example before quoting any of it: the first measurement
+//! taken for these docs said 8 ms/MB, on the same machine, because it was
+//! running six other builds at the time.
+//!
+//! That is still a freeze an artist would feel, and it is stated here rather
+//! than hidden. It is not gated on a size, because any threshold would be a
+//! number nobody measured and the effect of crossing it would be a copy that
+//! silently did not leave Umber.
+//!
+//! ### And nothing on screen says so, which was checked rather than assumed
+//!
+//! This project's rule is that a control which lies is worse than one that is
+//! not drawn, and a second of freeze with nothing on screen reads as a hang.
+//! Three ways to say something were looked at and all three were refused, so
+//! the conclusion is written down rather than left to be re-derived:
+//!
+//! * **A progress bar is impossible and would be the lying control.** The whole
+//!   copy is one blocking call sequence — `read_layer_rect`, then arboard's
+//!   encode — and neither reports progress, so the bar could only animate over
+//!   something it does not know. `Stage::progress` returning `Option` and
+//!   drawing an empty track is the same refusal in the update dialog.
+//! * **A wait cursor cannot be relied on.** Setting it before the block means
+//!   the OS re-asserting it through a message pump that, by definition, is not
+//!   running — so whether it appears is a platform question nobody here can
+//!   answer, and a cursor that changes on one platform and not another is worse
+//!   than one that never does.
+//! * **A notice *before* the work is the one that would actually work**, and it
+//!   is a real change rather than a line: the copy would have to become two
+//!   phases — a frame that draws and submits "Copying…", then the blocking work
+//!   on the next — which is a pending-copy state on `UmberApp`, a banner to
+//!   clear afterwards, and a decision about when the word appears. Showing it
+//!   on *every* copy is a flicker on the ordinary small ones; showing it only
+//!   on large ones is the size threshold refused above, though in a much weaker
+//!   form, since being wrong about it costs a word rather than a copy. It is
+//!   the thing to build if this is ever worth building; it is not a comment.
 //!
 //! Two more bounds are not Umber's to set. On X11 a read waits on the *owning*
 //! process and arboard gives that four seconds, so a Ctrl+V while another
@@ -177,42 +242,162 @@ pub enum Paste {
     Nothing,
 }
 
+/// What the desktop should be handing back for Umber's own clip, if it is
+/// still holding it.
+///
+/// This is the third reading [`decide`] takes, and it is a `Clip` rather than a
+/// boolean because **the bytes a lossy transport gives back for our own picture
+/// are not our own picture**. Comparing what the desktop holds against
+/// `Editor::clipboard` only recognises our copy where the round trip is exact;
+/// comparing it against what the transport actually *echoed* recognises it
+/// everywhere, and still pastes the exact bytes off the layer.
+///
+/// On Android and iOS only [`OnDesktop::Nothing`] is ever reached, because
+/// there is no clipboard to put anything on; the other two are still matched by
+/// [`decide`], which is one rule for every platform.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum OnDesktop {
+    /// Umber has nothing on the desktop's clipboard, or cannot tell that it
+    /// has. **Three producers**: no copy has been made; the write was refused;
+    /// or the write succeeded and the echo could not be read back. The third is
+    /// not the same situation as the other two — see [`recorded`] — and is
+    /// filed here because it decides identically, not because it is the same.
+    #[default]
+    Nothing,
+    /// The desktop is holding Umber's clip and hands back exactly those bytes,
+    /// so the picture to compare against is `Editor::clipboard`'s own and no
+    /// second copy of it is held. **Three producers**: a platform that returns
+    /// what it was given; an echo that came back equal to the clip; and a
+    /// picture adopted off the desktop, which is those bytes because they were
+    /// read from there.
+    TheClipItself,
+    /// Umber's clip is there, and this is what the desktop hands back for it.
+    ///
+    /// Only reached where [`TRANSPORT_IS_EXACT`] is false **and the echo
+    /// actually differed** — an echo equal to the clip is recorded as
+    /// [`OnDesktop::TheClipItself`], because it is the same comparison without
+    /// a second copy of the picture. That is a memory saving and not a
+    /// judgement about the platform: the next copy takes its echo just the
+    /// same.
+    Echo(Clip),
+}
+
+/// What reading the clipboard straight back after a write answered.
+///
+/// Three cases and not an `Option`, because "not read" and "read and failed"
+/// are opposite instructions and an `Option` would have carried them in the
+/// same `None`, told apart only by a second argument the caller also had to get
+/// right. This way [`TRANSPORT_IS_EXACT`] is consulted in exactly one place.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub enum Echo {
+    /// No read was taken: this platform hands back what it was given.
+    NotTaken,
+    /// Read, and this came back.
+    Is(Clip),
+    /// Read, and the clipboard would not answer.
+    Failed,
+}
+
+/// What a successful write leaves behind: the other half of the model, and a
+/// pure function for the same reason [`decide`] is.
+///
+/// Being a function rather than three arms inside [`Board::put_image`] is what
+/// lets the not-taken and the **taken** paths both be driven on one machine.
+/// Since nobody working on Umber has a Mac, a test passing [`Echo::Is`] is the
+/// only exercise the macOS branch will ever get before somebody with the
+/// hardware runs it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn recorded(echo: Echo, clip: &Clip) -> OnDesktop {
+    match echo {
+        Echo::NotTaken => OnDesktop::TheClipItself,
+        // The echo agrees, so holding it would be a second copy of a picture
+        // already in `Editor::clipboard` — on a full-canvas copy, hundreds of
+        // megabytes to say what `TheClipItself` says in a word, and the same
+        // comparison either way because the two pictures are equal.
+        //
+        // **This is not the platform being promoted to exact.** The next copy
+        // takes its echo exactly as this one did, and it must: the transport
+        // suspected on macOS is a premultiply, which is the identity on
+        // anything fully opaque, so one agreeing picture is no evidence at all
+        // about the next.
+        Echo::Is(echo) if echo == *clip => OnDesktop::TheClipItself,
+        Echo::Is(echo) => OnDesktop::Echo(echo),
+        // Written, and Umber cannot tell what is there. It falls to the same
+        // answer a refused write gives but **not for the same reason**, and the
+        // difference is worth having straight: after a refusal the desktop
+        // holds something *older* than Umber's clip, so preferring the clip is
+        // simply right; here it holds Umber's own picture, so preferring the
+        // clip is right only until somebody else copies, after which a paste
+        // puts down the Umber region rather than what they copied. It is the
+        // safe side of the module's rule rather than the correct answer, and it
+        // is not a fourth variant because it decides identically — the rule
+        // that keeps a paste out of `EditKind`.
+        Echo::Failed => OnDesktop::Nothing,
+    }
+}
+
 /// Choose between the desktop's picture and Umber's own.
 ///
 /// See the module docs for the argument. `system` is what the desktop is
-/// holding, already read; `mine` is `Editor::clipboard`; `published` is
-/// [`Board::published`] — whether the clip in `mine` is known to have reached
-/// the desktop.
+/// holding, already read; `mine` is `Editor::clipboard`; `on_desktop` is
+/// [`Board::on_desktop`].
 ///
-/// The answer is a pure function of the three readings. The one log line is
-/// observation and nothing reads it — it is the only way anybody would ever
-/// find out that a platform's clipboard had started moving a byte.
-pub fn decide(system: Option<Clip>, mine: Option<&Clip>, published: bool) -> Paste {
+/// The answer is a pure function of the three readings — no clipboard, no
+/// display server, no platform. The one log line is observation and nothing
+/// reads it.
+pub fn decide(system: Option<Clip>, mine: Option<&Clip>, on_desktop: &OnDesktop) -> Paste {
+    // What the desktop would be handing back if it were still holding Umber's
+    // copy. `None` means it is not — never written, or the write was refused.
+    let expected = match on_desktop {
+        OnDesktop::Nothing => None,
+        OnDesktop::TheClipItself => mine,
+        OnDesktop::Echo(echo) => Some(echo),
+    };
     match (system, mine) {
         // The desktop is still holding what Umber's own copy put there, so
         // **Umber's own bytes** are what go back on to the layer, not the ones
-        // that came back through the transport. Indistinguishable today — the
-        // guard is equality — and written this way round deliberately: the rule
-        // is "our copy wins", and it should not quietly become "the transport's
-        // copy wins" if `Clip`'s equality is ever loosened.
-        (Some(theirs), Some(mine)) if theirs == *mine => Paste::Mine(mine.clone()),
+        // that came back through the transport. On an exact platform those are
+        // the same bytes; on one that moves a byte they are not, and that
+        // difference is the whole reason `expected` is a picture rather than a
+        // flag.
+        (Some(theirs), Some(mine)) if expected == Some(&theirs) => Paste::Mine(mine.clone()),
         // Umber's copy never reached the desktop, so what is sitting there
         // predates it as far as Umber can tell — and believing it would put
         // down a picture the artist did not copy. See the module docs: leaving
         // this case out was a bug and a silent one.
-        (Some(_), Some(mine)) if !published => Paste::Mine(mine.clone()),
+        (Some(_), Some(mine)) if expected.is_none() => Paste::Mine(mine.clone()),
         (Some(theirs), Some(mine)) => {
-            // Umber's copy did reach the desktop and something different is
-            // there now, so the desktop moved on after Umber wrote it — the
-            // ordinary case — or a platform's clipboard gave back something
-            // other than what it was handed. The two are indistinguishable from
-            // here and only one of the two possible mistakes is survivable, so
-            // the desktop is believed and the divergence is said out loud.
-            if theirs.size() == mine.size() {
+            // Umber's copy did reach the desktop and something else is there
+            // now. Ordinarily that means somebody copied something else, which
+            // is `debug` — it happens every time a paste comes from another
+            // application.
+            //
+            // **Unless no echo was taken**, and then it is the one reading that
+            // says [`TRANSPORT_IS_EXACT`] is wrong for this machine. Where an
+            // echo was taken, a mismatch cannot mean that: the echo *is* what
+            // the transport hands back, so it would have matched. Where it was
+            // not — because the platform is trusted to return what it was
+            // given — a same-sized picture that is not ours is either a
+            // coincidence or that trust being misplaced, and the second is the
+            // macOS bug on a platform declaring itself immune. An X11 clipboard
+            // manager that takes ownership and re-serves a re-encoded image is
+            // the realistic agent. Nothing here can tell the two apart, so the
+            // desktop is still believed — but it is said out loud, because
+            // otherwise the only symptom is an artist's own copy coming back
+            // changed with nothing anywhere to explain it.
+            if matches!(on_desktop, OnDesktop::TheClipItself) && theirs.size() == mine.size() {
                 log::warn!(
                     "the desktop is holding a {} × {} picture that is not the one Umber put \
                      there; pasting the desktop's. If this happens on every copy, this \
-                     platform's clipboard is not returning what it was given",
+                     platform's clipboard is not returning what it was given and \
+                     TRANSPORT_IS_EXACT is wrong for it",
+                    theirs.size().x,
+                    theirs.size().y,
+                );
+            } else {
+                log::debug!(
+                    "the desktop holds a {} × {} picture that is not the one Umber put there",
                     theirs.size().x,
                     theirs.size().y,
                 );
@@ -255,31 +440,96 @@ pub struct Board {
     /// tells the two apart.
     board: Option<arboard::Clipboard>,
     tried: bool,
-    /// Whether the clip the editor is holding is known to be on the desktop.
+    /// What the desktop should hand back for the clip the editor is holding.
     ///
-    /// Written by the two things that can make it true and by nothing else, so
-    /// it cannot drift out of step with `Editor::clipboard` the way a flag
-    /// beside that field at three call sites would. Read by [`Board::published`]
-    /// and fed to [`decide`] — see the module docs for the bug its absence was.
-    published: bool,
+    /// Written by the two things that can put a picture there and by nothing
+    /// else, so it cannot drift out of step with `Editor::clipboard` the way a
+    /// flag beside that field at three call sites would. Read by
+    /// [`Board::on_desktop`] and fed to [`decide`].
+    on_desktop: OnDesktop,
 }
+
+/// Whether this platform's clipboard is known to hand back exactly the bytes it
+/// was given.
+///
+/// Where it is false, [`Board::put_image`] reads the picture straight back and
+/// keeps that **echo** to compare against later — one extra decode per copy,
+/// paid to be right rather than fast. Where it is true nothing extra happens at
+/// all.
+///
+/// * **Windows: measured**, by `examples/measure-clipboard.rs`, which is what
+///   to re-run rather than trusting this line. A 16×16 square carrying every
+///   alpha from 0 to 255 through `set_image` and `get_image` came back byte for
+///   byte. arboard writes a PNG *and* a `CF_DIBV5` and reads the PNG back
+///   first, so it also rules out the DIB path having been preferred — and every
+///   alpha is in the sweep deliberately, because a premultiply is the identity
+///   on anything opaque and would hide in a sweep of solid colours.
+/// * **X11 and Wayland: read off arboard's source, which is airtight here** —
+///   both backends encode `image/png` from RGBA8 and decode it back to RGBA8,
+///   and PNG is lossless. Nobody working on Umber has run Linux either, so this
+///   is the weaker of the two claims; it is included because the argument does
+///   not depend on anything a platform could vary.
+/// * **Everything else, macOS included: not known.** See the module docs for
+///   what is suspected there and why guessing in the other direction would be
+///   wrong pixels rather than a slow copy.
+///
+/// A `const` rather than a `cfg` deliberately: the echo then **compiles on
+/// every platform**, which — since nobody here can run macOS — is the only
+/// check on it anybody working on Umber can actually perform. The branch is a
+/// constant, so the platforms that do not need it pay nothing at run time.
+///
+/// The second arm is arboard's own `cfg` for its X11/Wayland module, plus iOS —
+/// which arboard does *not* exclude, and which is why [`Board`] gates it out
+/// itself. Spelled as the set the evidence is about rather than as "not macOS",
+/// so a platform arboard grows a new backend for lands in the unknown group
+/// and pays for the echo until somebody checks it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const TRANSPORT_IS_EXACT: bool = cfg!(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(any(
+            target_os = "macos",
+            target_os = "android",
+            target_os = "ios",
+            target_os = "emscripten"
+        ))
+    ),
+));
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Board {
-    /// Offer `clip` to the rest of the machine, remembering whether it got
-    /// there.
+    /// Offer `clip` to the rest of the machine, remembering what the desktop
+    /// should hand back for it.
     ///
     /// Remembered rather than returned, so the caller cannot forget to carry
-    /// the answer: it is read back through [`Board::published`] at the one
+    /// the answer: it is read back through [`Board::on_desktop`] at the one
     /// place that needs it. And it is not decoration. Umber's own clipboard is
     /// written by the caller either way, so a refusal costs the artist nothing
     /// they can *see* — but it leaves the desktop holding an older picture, and
     /// [`decide`] would otherwise believe that picture over the one just
     /// copied. Logged as well, at the level a failed autosave is: a paint
     /// application must not raise a dialog on Ctrl+C.
+    ///
+    /// **The echo.** Where [`TRANSPORT_IS_EXACT`] is false the picture is read
+    /// straight back, because on a platform whose clipboard does not return
+    /// what it was given, what it returns for our own picture is the only thing
+    /// a later paste can recognise it by. What is *kept* is [`recorded`]'s
+    /// answer: the echo only where it differs from the clip, and
+    /// [`OnDesktop::Nothing`] where it could not be read at all. See there for
+    /// why the last of those is the safe answer rather than the right one.
+    ///
+    /// There is a window here the old boolean did not have. Between the write
+    /// landing and the read completing — about 130 ms for a 64 MB picture, on
+    /// this module's own measured figures — another application copying
+    /// something makes *their* picture the echo, recorded as Umber's. The next
+    /// paste then answers `Mine` and puts down Umber's region while the desktop
+    /// holds theirs. It lands on the safe side of the module's rule, which is
+    /// why it is a note and not a defect, and it is named because the window is
+    /// long enough to be reached.
     pub fn put_image(&mut self, clip: &Clip) {
         let size = clip.size();
-        self.published = false;
+        self.on_desktop = OnDesktop::Nothing;
         let Some(board) = self.board() else { return };
         let image = arboard::ImageData {
             width: size.x as usize,
@@ -287,28 +537,53 @@ impl Board {
             // Straight-alpha sRGB RGBA8 on both sides. See the module docs.
             bytes: std::borrow::Cow::Borrowed(clip.pixels()),
         };
-        match board.set_image(image) {
-            Ok(()) => self.published = true,
-            Err(e) => log::warn!(
+        if let Err(e) = board.set_image(image) {
+            log::warn!(
                 "the desktop's clipboard would not take the picture, so it stays inside \
                  Umber: {e}"
+            );
+            return;
+        }
+        // The echo, on a platform whose clipboard is not known to hand back
+        // what it was given. This is the **one** place `TRANSPORT_IS_EXACT` is
+        // read; `recorded` is the rule and is testable without a clipboard.
+        let echo = if TRANSPORT_IS_EXACT {
+            Echo::NotTaken
+        } else {
+            self.read_image().map_or(Echo::Failed, Echo::Is)
+        };
+        self.on_desktop = recorded(echo, clip);
+        match &self.on_desktop {
+            OnDesktop::Echo(_) => log::info!(
+                "this platform's clipboard did not hand back the picture it was given, so \
+                 the copy is recognised by its echo instead"
             ),
+            OnDesktop::Nothing => log::warn!(
+                "the picture was put on the desktop's clipboard but could not be read back, \
+                 so a later paste will prefer Umber's own copy"
+            ),
+            OnDesktop::TheClipItself => {}
         }
     }
 
-    /// Note that the editor's clip came *off* the desktop, so it is there by
-    /// construction.
+    /// Note that the editor's clip came *off* the desktop.
+    ///
+    /// It is [`OnDesktop::TheClipItself`] on **every** platform, exact
+    /// transport or not, and that is not an oversight: the clip was obtained by
+    /// reading the desktop, so the bytes it hands back for it are the bytes in
+    /// hand — on the same assumption the echo rests on, that reading twice
+    /// answers twice the same. There is nothing to echo.
     ///
     /// Called where a foreign picture is adopted, and only once that paste has
     /// actually happened — the same place `Editor::clipboard` is written, so
     /// the two cannot disagree.
     pub fn note_adopted(&mut self) {
-        self.published = true;
+        self.on_desktop = OnDesktop::TheClipItself;
     }
 
-    /// Whether the clip the editor holds is known to have reached the desktop.
-    pub fn published(&self) -> bool {
-        self.published
+    /// What the desktop should hand back for the clip the editor holds.
+    pub fn on_desktop(&self) -> &OnDesktop {
+        &self.on_desktop
     }
 
     /// What the desktop is holding, if it is holding a picture.
@@ -318,6 +593,13 @@ impl Board {
     /// caller does the same thing with all of them: falls back to Umber's own
     /// clip. Only a failure that is not "there is no picture" is logged.
     pub fn take_image(&mut self) -> Option<Clip> {
+        self.read_image()
+    }
+
+    /// The one read. [`Board::take_image`] is a paste asking; the echo in
+    /// [`Board::put_image`] is a copy asking, and neither may have its own
+    /// notion of what a picture off the clipboard is.
+    fn read_image(&mut self) -> Option<Clip> {
         let board = self.board()?;
         let image = match board.get_image() {
             Ok(image) => image,
@@ -347,14 +629,16 @@ impl Board {
     }
 }
 
-/// Where arboard is not built there is no desktop clipboard to reach, and
-/// `published` is therefore always false — which is exactly right: [`decide`]
-/// then never prefers a picture Umber did not put there, and since
+/// Where arboard is not built there is no desktop clipboard to reach, so
+/// nothing of Umber's is ever on one — which is exactly right: [`decide`] then
+/// never prefers a picture Umber did not put there, and since
 /// [`Board::take_image`] answers `None` as well, copy and paste inside Umber
 /// work exactly as they did before any of this existed.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 #[derive(Default)]
-pub struct Board;
+pub struct Board {
+    nothing: OnDesktop,
+}
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 impl Board {
@@ -362,8 +646,8 @@ impl Board {
 
     pub fn note_adopted(&mut self) {}
 
-    pub fn published(&self) -> bool {
-        false
+    pub fn on_desktop(&self) -> &OnDesktop {
+        &self.nothing
     }
 
     pub fn take_image(&mut self) -> Option<Clip> {
@@ -375,9 +659,11 @@ impl Board {
 mod tests {
     use super::*;
 
-    /// Named so the third argument of every `decide` below says what it means
-    /// at the call site: a bare `true` there is the reading nobody can check.
-    const PUBLISHED: bool = true;
+    /// What a copy on an exact platform leaves behind, named so the third
+    /// argument of a `decide` below says what it means at the call site.
+    const PUT_THERE: OnDesktop = OnDesktop::TheClipItself;
+    /// And what a copy that never reached the desktop leaves behind.
+    const NOT_THERE: OnDesktop = OnDesktop::Nothing;
 
     fn clip(w: u32, h: u32, px: [u8; 4]) -> Clip {
         let pixels = px
@@ -398,7 +684,7 @@ mod tests {
         let theirs = clip(4, 4, [10, 20, 30, 255]);
         let mine = clip(4, 4, [200, 100, 50, 255]);
         assert_eq!(
-            decide(Some(theirs.clone()), Some(&mine), PUBLISHED),
+            decide(Some(theirs.clone()), Some(&mine), &PUT_THERE),
             Paste::Theirs(theirs)
         );
     }
@@ -415,7 +701,7 @@ mod tests {
         let stale = clip(4, 4, [10, 20, 30, 255]);
         let mine = clip(6, 2, [200, 100, 50, 255]);
         assert_eq!(
-            decide(Some(stale), Some(&mine), !PUBLISHED),
+            decide(Some(stale), Some(&mine), &NOT_THERE),
             Paste::Mine(mine),
             "a copy the desktop would not take was overruled by what was there before it"
         );
@@ -450,7 +736,7 @@ mod tests {
         let desktop = Clip::from_rgba(mine.size().x, mine.size().y, mine.pixels().to_vec())
             .expect("what a lossless desktop hands back");
 
-        let Paste::Mine(chosen) = decide(Some(desktop), Some(&mine), PUBLISHED) else {
+        let Paste::Mine(chosen) = decide(Some(desktop), Some(&mine), &PUT_THERE) else {
             panic!("Umber's own copy was not recognised on the desktop's clipboard");
         };
         let placed = chosen
@@ -469,7 +755,7 @@ mod tests {
     #[test]
     fn text_on_the_desktop_leaves_umbers_own_picture_alone() {
         let mine = clip(2, 2, [1, 2, 3, 4]);
-        assert_eq!(decide(None, Some(&mine), PUBLISHED), Paste::Mine(mine));
+        assert_eq!(decide(None, Some(&mine), &PUT_THERE), Paste::Mine(mine));
     }
 
     /// Nothing anywhere. A paste has to do nothing at all rather than put down
@@ -477,7 +763,7 @@ mod tests {
     /// `copying_nothing_leaves_the_clipboard_alone` states for the other end.
     #[test]
     fn nothing_on_either_clipboard_pastes_nothing() {
-        assert_eq!(decide(None, None, !PUBLISHED), Paste::Nothing);
+        assert_eq!(decide(None, None, &NOT_THERE), Paste::Nothing);
     }
 
     /// A picture off the desktop with nothing on Umber's own clipboard — the
@@ -486,22 +772,173 @@ mod tests {
     fn a_first_paste_of_the_session_takes_what_the_desktop_holds() {
         let theirs = clip(8, 2, [0, 255, 0, 255]);
         assert_eq!(
-            decide(Some(theirs.clone()), None, !PUBLISHED),
+            decide(Some(theirs.clone()), None, &NOT_THERE),
             Paste::Theirs(theirs)
         );
     }
 
-    /// Same size, different pixels. Indistinguishable from Umber's own copy
-    /// having been moved a byte by the platform, and the desktop is believed
-    /// anyway: of the two possible mistakes only one — putting down a picture
-    /// nobody copied — is unsurvivable.
+    /// Same size, different pixels, on a platform whose transport returns what
+    /// it was given. Somebody copied something else, and the desktop is
+    /// believed — a picture of the same shape is not the same picture, which is
+    /// exactly why the echo below is a `Clip` and not a size.
     #[test]
     fn a_same_sized_picture_that_is_not_umbers_is_still_theirs() {
         let mine = clip(4, 4, [200, 100, 50, 255]);
         let theirs = clip(4, 4, [200, 100, 51, 255]);
         assert_eq!(
-            decide(Some(theirs.clone()), Some(&mine), PUBLISHED),
+            decide(Some(theirs.clone()), Some(&mine), &PUT_THERE),
             Paste::Theirs(theirs)
+        );
+    }
+
+    /// What a copy leaves behind on a platform that returns what it was given:
+    /// no read is taken and no second copy of the picture is held.
+    #[test]
+    fn an_exact_platform_records_the_clip_and_keeps_no_echo() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(recorded(Echo::NotTaken, &clip), OnDesktop::TheClipItself);
+    }
+
+    /// **The macOS branch, driven on a machine that is not a Mac.** This is the
+    /// whole reason `recorded` is a function rather than three arms inside
+    /// `put_image`: nobody working on Umber has the hardware, so a test passing
+    /// `false` is the only exercise the not-exact path gets.
+    #[test]
+    fn a_platform_that_changes_the_picture_is_recorded_by_its_echo() {
+        let clip = clip(4, 4, [200, 100, 50, 128]);
+        let mut mangled = clip.pixels().to_vec();
+        mangled[3] = mangled[3].wrapping_sub(7);
+        let echo = Clip::from_rgba(4, 4, mangled).expect("an echo");
+        assert_eq!(
+            recorded(Echo::Is(echo.clone()), &clip),
+            OnDesktop::Echo(echo)
+        );
+    }
+
+    /// And where such a platform hands the picture back unchanged, the echo is
+    /// dropped rather than held beside an identical copy of it. Same
+    /// comparison, hundreds of megabytes lighter on a full-canvas copy — and
+    /// not a judgement about the platform, which goes on being asked.
+    #[test]
+    fn an_echo_equal_to_its_picture_is_not_kept() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(
+            recorded(Echo::Is(clip.clone()), &clip),
+            OnDesktop::TheClipItself
+        );
+    }
+
+    /// Written, but the clipboard would not read back. Umber does not know what
+    /// is there, and not knowing has to fall towards pasting its own copy —
+    /// the same state a refused write leaves, for the same reason.
+    #[test]
+    fn a_picture_that_cannot_be_read_back_is_treated_as_not_there() {
+        let clip = clip(4, 4, [200, 100, 50, 255]);
+        assert_eq!(recorded(Echo::Failed, &clip), OnDesktop::Nothing);
+    }
+
+    /// **The echo, and the reason it exists.** On a platform whose clipboard
+    /// does not hand back the bytes it was given — macOS is suspected of
+    /// exactly this, through `NSImage` and a TIFF representation that
+    /// premultiplies — the desktop is holding something that is *not* Umber's
+    /// clip and is nonetheless Umber's copy. Comparing against the clip would
+    /// fail to recognise it, believe the desktop, and paste the transport's
+    /// mangled bytes: a copy and a paste straight back that comes out darker at
+    /// every soft edge, silently, on a whole supported platform.
+    ///
+    /// Comparing against the echo recognises it, and what lands is still the
+    /// exact bytes off the layer. Driven end to end — through `Clip::from_layer`
+    /// and `Clip::place` — because the promise is about pixels reaching a layer
+    /// rather than about which enum variant came back.
+    #[test]
+    fn a_lossy_clipboard_still_pastes_the_bytes_that_came_off_the_layer() {
+        // Layer-texture form: premultiplied, so no component may exceed alpha.
+        let layer: Vec<u8> = vec![
+            200, 100, 50, 255, // opaque
+            0, 0, 0, 0, // clear
+            90, 40, 20, 128, // a soft edge, which is where the loss would be
+            33, 33, 33, 200,
+        ];
+        let rect = umber_core::PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let mine = Clip::from_layer(rect, &layer, None).expect("a clip");
+
+        // What a transport that moved a byte hands back for it. Nothing here
+        // models Cocoa; all that matters is that it is not `mine`.
+        let mut mangled = mine.pixels().to_vec();
+        mangled[6] = mangled[6].wrapping_add(3);
+        let echo = Clip::from_rgba(mine.size().x, mine.size().y, mangled).expect("an echo");
+        assert_ne!(echo, mine, "the fixture is not modelling a lossy transport");
+
+        let Paste::Mine(chosen) = decide(Some(echo.clone()), Some(&mine), &OnDesktop::Echo(echo))
+        else {
+            panic!("the copy was not recognised by its echo, so the transport's bytes would land");
+        };
+        let placed = chosen
+            .place(glam::UVec2::splat(64), glam::vec2(32.0, 32.0))
+            .expect("somewhere to go");
+        assert_eq!(
+            placed.pixels, layer,
+            "a paste on a lossy platform did not restore the bytes the copy took"
+        );
+    }
+
+    /// And an echo in hand must not swallow a genuine foreign picture — a
+    /// platform that needs one is still a platform somebody copies a photograph
+    /// on.
+    ///
+    /// **A weak guard, said so plainly.** It rules out an `Echo(_)` arm that
+    /// always answered `Mine`, and nothing finer: it passes against the
+    /// comparison this module used *before* the echo existed, because that one
+    /// also answered `Theirs` here. The strong guard for the echo is
+    /// `a_lossy_clipboard_still_pastes_the_bytes_that_came_off_the_layer`,
+    /// which fails against it.
+    #[test]
+    fn an_echo_does_not_make_another_applications_picture_lose() {
+        let mine = clip(4, 4, [200, 100, 50, 255]);
+        let echo = clip(4, 4, [200, 100, 50, 254]);
+        let theirs = clip(4, 4, [10, 20, 30, 255]);
+        assert_eq!(
+            decide(Some(theirs.clone()), Some(&mine), &OnDesktop::Echo(echo)),
+            Paste::Theirs(theirs)
+        );
+    }
+
+    /// `note_adopted` records a picture taken *off* the desktop as being there.
+    ///
+    /// This drives the real [`Board`], which the earlier version of this test
+    /// did not — it only called `decide` with a hand-written state, so deleting
+    /// `note_adopted`'s call site left it passing. **It touches no clipboard**:
+    /// `Board::default` opens nothing, and `note_adopted` and `on_desktop` are
+    /// the two methods that never reach `board()`.
+    ///
+    /// What it is worth is the *next* copy somebody makes in another
+    /// application. Leaving the adoption unrecorded leaves `Nothing`, which
+    /// fires the refused-write clause where no write was refused, and Ctrl+V
+    /// then puts down the picture from last time instead of the one just
+    /// copied — the second assertion.
+    #[test]
+    fn adopting_a_picture_records_it_as_being_on_the_desktop() {
+        let mut board = Board::default();
+        assert_eq!(board.on_desktop(), &OnDesktop::Nothing, "a fresh board");
+        board.note_adopted();
+        assert_eq!(board.on_desktop(), &OnDesktop::TheClipItself);
+
+        let adopted = clip(3, 3, [10, 20, 30, 255]);
+        let newer = clip(5, 1, [1, 2, 3, 255]);
+        assert_eq!(
+            decide(Some(newer.clone()), Some(&adopted), board.on_desktop()),
+            Paste::Theirs(newer.clone()),
+            "the picture adopted last time was preferred over the one just copied"
+        );
+        assert_eq!(
+            decide(Some(newer), Some(&adopted), &NOT_THERE),
+            Paste::Mine(adopted),
+            "and this is what leaving the adoption unrecorded would have done"
         );
     }
 }
