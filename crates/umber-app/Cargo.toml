@@ -95,8 +95,13 @@ windows-sys = { version = "0.61", features = [
 # keeps one process-global X11 connection behind a `static`, so the two handles
 # are one owner rather than two things to fight over a selection.
 #
-# Gated exactly as egui-winit gates its own: arboard has no Android backend at
-# all, so the dependency must not be built there. `image-data` is what makes it
+# Gated on Android **and iOS**, which is what egui-winit's own *code* gates on
+# even though its manifest names only Android — and the code is right. arboard's
+# X11/Wayland module is `all(unix, not(any(macos, android, emscripten)))`, so
+# iOS falls into it and an iOS build would compile a clipboard that goes looking
+# for an X server. `sysclip`'s `Board` excludes both for that reason; the
+# manifest has to agree, or the dependency is still built there. `image-data` is
+# what makes it
 # carry pictures rather than only text, and `wayland-data-control` is the
 # Wayland backend — without it a Wayland session would reach the clipboard only
 # through whatever XWayland happens to be bridging, which is a session Umber
@@ -104,7 +109,7 @@ windows-sys = { version = "0.61", features = [
 # library: arboard's X11 path is `x11rb` speaking the protocol over the socket,
 # and `wl-clipboard-rs` reaches `libwayland-client.so.0`, which winit already
 # opens and every Linux package here already declares.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard = { version = "3.6", default-features = false, features = [
     "image-data",
     "wayland-data-control",
