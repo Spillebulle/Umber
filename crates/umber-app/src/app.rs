@@ -2322,6 +2322,14 @@ impl UmberApp {
             self.editor.notice = Some(notice);
         }
 
+        // An offer raised by the collect above arrived *after* this frame was
+        // presented, so nothing on screen holds it — and under
+        // `ControlFlow::Wait` a value appearing in a field is not an event.
+        // The same wake-up the update check and the autosave's writer need.
+        if self.editor.recovery.take_arrived() {
+            gfx.window.request_redraw();
+        }
+
         // Keep the frames coming while a stroke is live; otherwise the app
         // goes back to sleep until the next input event. A capture in flight
         // needs the same: under `ControlFlow::Wait` a document being read back
@@ -2481,6 +2489,14 @@ impl UmberApp {
             // beside the button, so somebody whose desktop has no file manager
             // still has what they need.
             log::warn!("could not open {}: {e}", dir.display());
+        }
+        // Before the dismissal, so a frame in which both were somehow set still
+        // opens what was asked for before the offer is put away.
+        if actions.recover {
+            self.recover_documents();
+        }
+        if actions.dismiss_recovery {
+            self.dismiss_recovery();
         }
         if actions.save_all_and_quit {
             self.editor.ui.quit_prompt = false;
@@ -2735,27 +2751,52 @@ impl UmberApp {
     }
 
     fn open_path(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.open_import(path, name, Some(path.to_path_buf()), false);
+    }
+
+    /// Open `source` as a document, presenting it as `title` and remembering
+    /// `record_path` as the file it belongs to.
+    ///
+    /// Those two are the same file for everything but a **recovered autosave
+    /// copy**, and there they must not be: the pixels come out of the internal
+    /// copy while the tab has to point at the file the painter chose, or Save
+    /// would write into Umber's own autosave folder — somewhere they would
+    /// never think to look for their painting, and somewhere the expiry sweep
+    /// is the only thing that reads.
+    ///
+    /// `modified` puts the dot on the tab, which a recovery needs and an
+    /// ordinary open does not: the pixels on screen are not what is at
+    /// `record_path`, so closing without saving would lose the difference.
+    ///
+    /// Returns whether a document was actually opened.
+    fn open_import(
+        &mut self,
+        source: &Path,
+        name: String,
+        record_path: Option<PathBuf>,
+        modified: bool,
+    ) -> bool {
         // The document in front is about to be parked, and a float belongs to
         // it — its preview lives in *that* document's renderer, which would go
         // on standing in front of a layer when the tab came back.
         self.finish_transform();
         self.finish_stroke();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
 
-        let imported = match umber_core::docimport::import(path) {
+        let imported = match umber_core::docimport::import(source) {
             Ok(doc) => doc,
             Err(error) => {
                 // `ImportError` displays as a finished sentence written for the
                 // user; showing it verbatim beats inventing a second wording.
-                log::warn!("could not open {}: {error}", path.display());
+                log::warn!("could not open {}: {error}", source.display());
                 self.editor.notice = Some(Notice {
                     title: format!("Could not open “{name}”"),
                     lines: vec![error.to_string()],
                 });
-                return;
+                return false;
             }
         };
 
@@ -2773,7 +2814,7 @@ impl UmberApp {
                         imported.size.x, imported.size.y,
                     )],
                 });
-                return;
+                return false;
             }
         }
 
@@ -2807,7 +2848,7 @@ impl UmberApp {
                 edit_target: umber_core::EditTarget::Layer,
             },
             name.clone(),
-            Some(path.to_path_buf()),
+            record_path,
             notes.clone(),
         );
 
@@ -2832,7 +2873,7 @@ impl UmberApp {
 
         log::info!(
             "opened {} as {format}, {} × {}, {} layer(s)",
-            path.display(),
+            source.display(),
             size.x,
             size.y,
             uploads.len(),
@@ -2846,7 +2887,57 @@ impl UmberApp {
                 lines: notes,
             });
         }
+        // A recovered copy is not what is at the path the tab now names, so the
+        // dot goes on and closing the tab asks — the same reading of `modified`
+        // every other path here takes. After `open_document`, because that is
+        // what made this tab the active one.
+        if modified {
+            self.editor.mark_modified();
+            // And that the file this tab names is one nobody has saved to. The
+            // autosave writes the internal copy either way and leaves the
+            // painter's own file alone until they choose it — see
+            // `session::Tab::recovered`.
+            self.editor.session.mark_recovered();
+        }
         self.request_redraw();
+        true
+    }
+
+    /// Open the autosave copies the recovery offer was asked for.
+    ///
+    /// Each becomes an ordinary document wearing the identity it had before the
+    /// crash — its own title, and its own file if it had one — so a Save writes
+    /// where the painter would expect and never into Umber's autosave folder.
+    /// **The copy itself is left exactly where it is.** Recovering is a read;
+    /// only `autosave::Reaper` ever removes one, on its own schedule.
+    fn recover_documents(&mut self) {
+        for (row, entry) in self.editor.recovery.take_wanted() {
+            log::info!("recovering “{}” from {}", entry.title, entry.copy.display());
+            // The row is marked only on success. A copy that will not open —
+            // a truncated archive, a canvas this GPU cannot hold — raises a
+            // notice of its own, and the button that would let somebody try
+            // again has to still be under it rather than replaced by the word
+            // "Opened" beside a document that is not there.
+            if self.open_import(&entry.copy, entry.title, entry.original, true) {
+                // The document it came out of *is* its copy. Without this the
+                // marker would describe it as having none until its first
+                // autosave, and a never-saved one would then be written to a
+                // second file beside the one it was recovered from.
+                let id = self.editor.session.active_id();
+                self.editor.autosave.adopt_copy(id, entry.copy);
+                self.editor.recovery.note_opened(row);
+            }
+        }
+    }
+
+    /// The recovery offer has been answered, one way or the other.
+    ///
+    /// Forgets the markers it came from so the same offer is not made on every
+    /// start for ever. Nothing else is removed: the copies are documents, and
+    /// the one thing in Umber that may delete one of those is `Reaper`.
+    fn dismiss_recovery(&mut self) {
+        let marks = self.editor.recovery.dismiss();
+        self.editor.autosave.forget_marks(&marks);
     }
 
     // --- the pointer, whichever kind it is ---
@@ -3039,6 +3130,22 @@ impl UmberApp {
         if let Some(gfx) = self.gfx.as_ref() {
             gfx.window.request_redraw();
         }
+    }
+
+    /// The event loop finished on purpose.
+    ///
+    /// Takes this run's autosave marker down, which is the whole of how the
+    /// *next* start tells a shutdown from a stop. Called from [`crate::run`]
+    /// and nowhere else: `run_app` returns only when the loop was told to exit,
+    /// so there is one place where that is known rather than one beside each of
+    /// the four `event_loop.exit()` calls — an invariant enforced at four call
+    /// sites is one that will be forgotten at the fifth.
+    ///
+    /// Deliberately not a `Drop`. A panic unwinds through destructors, so a
+    /// `Drop` would remove the marker in exactly the case it exists to leave
+    /// behind.
+    pub fn ended_cleanly(&mut self) {
+        self.editor.autosave.end_run();
     }
 }
 

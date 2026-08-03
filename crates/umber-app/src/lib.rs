@@ -37,6 +37,7 @@ mod localtime;
 mod logo;
 mod panels;
 mod prefs;
+mod recoverdlg;
 mod session;
 mod settings;
 mod shortcuts;
@@ -93,6 +94,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = UmberApp::new(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
+    // The one place a shutdown is known to have been orderly, and therefore the
+    // one place this is said. `run_app` returns only when the loop was told to
+    // exit — by the quit prompt, once every unsaved document was accounted for,
+    // or by an update handing over. A panic unwinds straight past this, a hard
+    // kill never reaches it, and both are exactly the cases the next start has
+    // to be able to tell apart. See `autosave::SessionMark`.
+    //
+    // After the `?` deliberately: a loop that ended by *failing* is not a
+    // shutdown, and leaving the marker behind is the honest reading of it.
+    app.ended_cleanly();
     Ok(())
 }
 
@@ -114,4 +125,5 @@ pub extern "C" fn android_main(android_app: winit::platform::android::activity::
 
     let mut app = UmberApp::new(event_loop.create_proxy());
     let _ = event_loop.run_app(&mut app);
+    app.ended_cleanly();
 }

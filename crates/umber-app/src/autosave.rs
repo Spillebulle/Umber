@@ -50,6 +50,37 @@
 //! **[`Reaper`] is the only thing in Umber that deletes a document, and it can
 //! only reach inside one directory.** See its own documentation — that
 //! containment is structural, not a matter of the callers being careful.
+//!
+//! # Offering a copy back
+//!
+//! Writing copies is only half of a recovery. The other half is that the next
+//! start of Umber *offers* them, and that needs one fact the copies themselves
+//! cannot carry: did the last session end on purpose, or did it stop?
+//!
+//! [`SessionMark`] is the answer. One small file per run, under
+//! [`SESSIONS_DIR`], **held open and exclusively locked for the whole run**:
+//!
+//! * A **clean exit** removes it — [`Autosave::end_run`], from the one place
+//!   the event loop is known to have finished.
+//! * A **crash, a hard kill, an out-of-memory or a power cut** leaves it. That
+//!   is the whole point: a crash report is written by a panic hook and proves a
+//!   panic, but nothing is written when the process is killed outright, so a
+//!   report on disk cannot be the only signal.
+//! * **A second copy of Umber running** holds its own marker, locked, and the
+//!   first one's marker is locked too — so neither mistakes the other for a
+//!   session that died. The lock is the operating system's, which is exactly
+//!   why it survives every way a process can stop without warning; a recorded
+//!   process id would not, because ids are reused.
+//! * A lock that can be neither taken nor refused — a file system that does not
+//!   support locking — is read as **still running**. Not offering costs an
+//!   offer, which the autosave folder still holds; over-offering would put two
+//!   processes on one painting.
+//!
+//! The marker also carries what the session had open, refreshed by
+//! [`Autosave::note_documents`] on the same terms
+//! [`crate::crash::note_documents`] keeps: called every frame, reduced to one
+//! number first, and rebuilt only when that number moves. That is what lets a
+//! document closed or saved after its copy was written stop being offered.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,6 +89,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use glam::UVec2;
+use serde::{Deserialize, Serialize};
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::{Background, BlendMode};
 use umber_render::{CanvasRenderer, DocumentCapture, Gpu};
@@ -68,6 +100,14 @@ use crate::tabs::Notice;
 
 /// Directory under the platform data directory that holds the internal copies.
 pub const DIR_NAME: &str = "autosave";
+
+/// Directory under [`DIR_NAME`] that holds one [`SessionMark`] per run.
+///
+/// A subdirectory rather than a name beside the copies, so [`Reaper`] — which
+/// does not recurse and only ever considers a `.ora` — cannot see a marker at
+/// all, and so the folder somebody opens from Settings holds their documents
+/// and one folder of Umber's bookkeeping rather than the two mixed together.
+pub const SESSIONS_DIR: &str = "sessions";
 
 /// How often an autosave runs out of the box.
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 5;
@@ -107,6 +147,12 @@ pub fn internal_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Umber").map(|d| d.data_dir().join(DIR_NAME))
 }
 
+/// Where one run's [`SessionMark`] goes. Inside [`internal_dir`], so there is
+/// still only one statement of where Umber keeps its own copies.
+pub fn sessions_dir() -> Option<PathBuf> {
+    internal_dir().map(|d| d.join(SESSIONS_DIR))
+}
+
 /// The path as the settings dialog shows it, or a plain explanation when there
 /// is none. Never a silent blank.
 pub fn internal_dir_label() -> String {
@@ -142,7 +188,15 @@ pub fn reveal(path: &Path) -> std::io::Result<()> {
 // Expiry
 // ---------------------------------------------------------------------------
 
-/// Why the reaper would not delete something.
+/// Why a deleter would not delete something.
+///
+/// One vocabulary shared by the two — [`Reaper`] and [`Marks`] — rather than
+/// one each, and each of them can only produce a subset of it: a reaper never
+/// answers [`Refused::NotASessionMark`] and a marks deleter never answers
+/// [`Refused::NotAnAutosave`]. That is the point rather than an untidiness.
+/// Both refusals mean the same thing — *this is not the kind of file I delete*
+/// — and the two are kept apart precisely so each can only say it about its
+/// own kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
     /// It does not resolve to a file directly inside the reaper's root.
@@ -151,6 +205,10 @@ pub enum Refused {
     NotAPlainFile,
     /// Not a name an autosave writes.
     NotAnAutosave,
+    /// Not a name [`SessionMark`] writes. Only [`Marks`] can answer this, and
+    /// only [`Marks`] can act on it — see its own documentation for why the two
+    /// deleters are kept apart.
+    NotASessionMark,
     /// The file system said no.
     Io(String),
 }
@@ -161,6 +219,7 @@ impl std::fmt::Display for Refused {
             Self::Outside => write!(f, "it is not inside the autosave folder"),
             Self::NotAPlainFile => write!(f, "it is not a plain file"),
             Self::NotAnAutosave => write!(f, "it is not an autosave"),
+            Self::NotASessionMark => write!(f, "it is not a session marker"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -350,6 +409,562 @@ fn internal_name(stem: &str, key: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Did the last session end cleanly?
+// ---------------------------------------------------------------------------
+
+/// The shape of a marker file. Bumped only if a field's *meaning* changes;
+/// adding one does not need it, because every field is `#[serde(default)]`.
+///
+/// A marker this build cannot read is **discarded**, not refused: it names
+/// copies that are still on disk either way, and the folder is one click away
+/// in Settings. Same rule the undo history's manifest lives by.
+const MARK_FORMAT: u32 = 1;
+
+/// How much newer the painter's own file has to be before it counts as newer
+/// than the internal copy.
+///
+/// Two seconds because an autosave writes the internal copy and then the
+/// document's own file, a moment apart, and because FAT records a modification
+/// time to the nearest two seconds. Without the slack the two halves of one
+/// autosave read as "the copy is behind" on a memory stick.
+const SAME_MOMENT: Duration = Duration::from_secs(2);
+
+/// How much of a document's title the marker keeps.
+///
+/// Far beyond any real title — a file name is bounded by the file system long
+/// before this — and here for the reason [`crate::crash::Report`] bounds every
+/// field it writes: an unbounded write from a path that runs unattended is the
+/// shape of failure both of these exist to avoid.
+const TITLE_LIMIT: usize = 200;
+
+/// One document, as the running session last described it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkedDocument {
+    #[serde(default)]
+    pub title: String,
+    /// The file the painter chose, if the document had one. A `String` rather
+    /// than a `PathBuf` for the reason [`crate::crash::Report`]'s is: this goes
+    /// through JSON, and a path that is not UTF-8 must not fail the write — a
+    /// marker that refused to be written is a recovery nobody is offered.
+    ///
+    /// The trade is that such a path comes back with replacement characters in
+    /// it. The ceiling on that is low and worth stating: a mangled name cannot
+    /// collide with a real one, so a Save through it creates an oddly named
+    /// file rather than overwriting the wrong painting.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The internal copy chosen for this document, if one has been.
+    ///
+    /// Chosen when a capture *begins*, so the file it names may not exist —
+    /// [`offer_from`] reads the file system rather than trusting this, and
+    /// [`ours`] refuses anything that is not a copy of Umber's own.
+    ///
+    /// Lossy for the same reason [`MarkedDocument::path`] is, and the failure
+    /// is the safe direction: a mangled name does not exist, so the document is
+    /// listed as one there is no copy of rather than opened from the wrong
+    /// file.
+    #[serde(default)]
+    pub copy: Option<String>,
+    /// Whether closing this document would have lost something, as of the last
+    /// time the marker was written. Exactly [`crate::session::Tab::modified`].
+    #[serde(default)]
+    pub modified: bool,
+}
+
+/// What one run of Umber leaves behind while it is running.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    #[serde(default)]
+    pub format: u32,
+    /// The Umber that was running.
+    ///
+    /// Written, and read by nothing — deliberately, and unlike
+    /// [`SessionRecord::format`], which is compared. What it is for is the
+    /// person looking at the file: a marker that outlives its build is one
+    /// somebody is debugging, and "which Umber left this" is the first thing
+    /// they will want. [`MARK_FORMAT`] is what decides whether the file may be
+    /// acted on.
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub documents: Vec<MarkedDocument>,
+}
+
+/// This run's marker: a file that exists for exactly as long as Umber is
+/// running, and is **locked** for exactly as long as this process holds it.
+///
+/// The lock is what makes the whole scheme work, and it is not a detail:
+///
+/// * It is released by the operating system when the process ends, **however**
+///   it ends. A hard kill, an out-of-memory, a power cut and an ordinary panic
+///   all leave the file behind with nobody holding it, which is precisely the
+///   reading "this session did not end cleanly".
+/// * It cannot go stale. A recorded process id can — ids are reused, and a
+///   marker naming one would eventually point at somebody's web browser.
+/// * A second Umber sees the first's marker *locked* and leaves it alone, so
+///   starting a second window does not offer to recover the documents open in
+///   the first.
+///
+/// The record is rewritten in place through the same handle, so the lock is
+/// never let go of in the middle of a run.
+#[derive(Debug)]
+pub struct SessionMark {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl SessionMark {
+    /// Create this run's marker in `dir` and take its lock.
+    ///
+    /// The name is the run's own token, so two Umbers started in the same
+    /// millisecond still get a file each — and if they somehow did not, the
+    /// lock refuses the second rather than letting it overwrite the first.
+    pub fn open(dir: &Path, token: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(mark_name(token));
+        // **Not** `truncate`, and that is the one subtle thing here: the file is
+        // opened before it is locked, so truncating on open would empty a
+        // marker somebody else is holding *before* finding out they hold it —
+        // wiping a running session's record on the way to failing. The record
+        // is truncated by `write` instead, which only ever runs once the lock
+        // is ours, and until then nothing may read the file because we hold it.
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        // Write access on both platforms: Windows' `LockFileEx` wants a handle
+        // that can be written to, and this handle is the one the record is
+        // rewritten through anyway.
+        file.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::Error(e) => e,
+            std::fs::TryLockError::WouldBlock => {
+                std::io::Error::other("another Umber already holds this marker")
+            }
+        })?;
+        Ok(Self { path, file })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Replace what the marker says. Truncate-and-write through the handle that
+    /// holds the lock, so nothing has to be closed and reopened.
+    pub fn write(&mut self, record: &SessionRecord) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        self.file.set_len(0)?;
+        self.file.rewind()?;
+        self.file.write_all(&bytes)?;
+        self.file.flush()
+    }
+}
+
+/// The one thing that deletes a **session marker** — and it is deliberately not
+/// [`Reaper`].
+///
+/// The temptation is to widen `Reaper` by one name. That is exactly the
+/// loosening its own documentation refuses: it is the only thing in Umber that
+/// may delete a *document*, and the narrowness of "a `.ora` directly inside one
+/// canonicalised root" is what makes that safe to reason about. A second, much
+/// smaller deleter that can only ever reach a sixteen-hex-digit `.json` inside
+/// the `sessions` directory takes nothing away from that guarantee, where a
+/// `Reaper` that had learnt about a second extension would.
+///
+/// The containment is the same shape, and for the same reasons: one
+/// canonicalised root, every candidate canonicalised independently, the
+/// candidate's *parent* required to equal the root so it cannot descend,
+/// `symlink_metadata` first so a link is refused before it is resolved, no
+/// recursion, and only names this module writes.
+/// `a_marks_deleter_refuses_a_document` is the guard, and it is the one that
+/// matters: recovering a copy — or declining to — must never remove it.
+#[derive(Clone, Debug)]
+pub struct Marks {
+    root: PathBuf,
+}
+
+impl Marks {
+    /// Build a deleter for `root`, resolving it once and for all.
+    ///
+    /// Fails when the directory does not exist, which is the ordinary state
+    /// before the first run that ever wrote a marker.
+    pub fn new(root: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            root: std::fs::canonicalize(root)?,
+        })
+    }
+
+    /// Every marker directly inside the root.
+    pub fn list(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_mark_name(p))
+            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+            .collect();
+        // A stable order so two runs of the recovery scan list the same
+        // documents in the same order.
+        out.sort();
+        out
+    }
+
+    /// Delete one marker, refusing anything that is not one of this directory's.
+    pub fn remove(&self, candidate: &Path) -> Result<(), Refused> {
+        let meta = std::fs::symlink_metadata(candidate).map_err(|e| Refused::Io(e.to_string()))?;
+        if !meta.is_file() {
+            return Err(Refused::NotAPlainFile);
+        }
+        if !is_mark_name(candidate) {
+            return Err(Refused::NotASessionMark);
+        }
+        let resolved = std::fs::canonicalize(candidate).map_err(|e| Refused::Io(e.to_string()))?;
+        if resolved.parent() != Some(self.root.as_path()) {
+            return Err(Refused::Outside);
+        }
+        std::fs::remove_file(&resolved).map_err(|e| Refused::Io(e.to_string()))
+    }
+}
+
+/// The name one run's marker takes: its token, in hex, and nothing else.
+fn mark_name(token: u64) -> String {
+    format!("{token:016x}.json")
+}
+
+/// True only for a name [`mark_name`] could have produced.
+///
+/// Deliberately strict about the stem as well as the extension. A `.json`
+/// somebody dropped in the directory is not ours to delete, and this is the
+/// whole of what stops [`Marks`] from being a general JSON deleter.
+fn is_mark_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    stem.len() == 16 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Take a stopped session's marker, or answer `None` if it is not ours to
+/// take.
+///
+/// Answered by the lock: if it can be taken, nobody holds it, and the only
+/// thing that ever holds it is a running Umber. A refusal means one is still
+/// running. **An error means neither**, and is read as "still running" — see
+/// the module docs.
+///
+/// The handle is **returned rather than dropped**, and that is the point of the
+/// name. A marker read as abandoned and then let go of is unlocked for as long
+/// as the offer sits on screen — minutes — so a second Umber started in that
+/// window would find it, read it as abandoned too, and offer the same documents
+/// again. Two windows on one painting is exactly what the lock exists to
+/// prevent; holding it until the offer is answered is what makes the guarantee
+/// cover the whole gesture rather than the instant it was tested in.
+fn claim_if_abandoned(path: &Path) -> Option<std::fs::File> {
+    let file = match std::fs::File::options().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            log::warn!("could not read {}: {e}", path.display());
+            return None;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(e)) => {
+            log::warn!(
+                "could not tell whether {} belongs to a running Umber: {e}",
+                path.display(),
+            );
+            None
+        }
+    }
+}
+
+/// One document a session that stopped left a copy of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recoverable {
+    /// What the tab was called, so a never-saved document comes back as
+    /// "Untitled 3" rather than as the hashed name of its copy.
+    pub title: String,
+    /// The file the painter chose for it, if it had one. **This** is what a
+    /// recovered document's tab points at — never the copy, or a Save would
+    /// write into the autosave folder.
+    pub original: Option<PathBuf>,
+    /// The copy to open.
+    pub copy: PathBuf,
+    /// How long before the scan the copy was written, from the file's own
+    /// modification time — which is exactly what "when was this last
+    /// autosaved" means, and is the same reading [`Reaper::expire`] ages a copy
+    /// by. Taken once, like [`crate::crash::Report`]'s, rather than recomputed
+    /// as the dialog sits on screen.
+    pub seconds_ago: u64,
+}
+
+impl Recoverable {
+    /// The sentence under the title.
+    ///
+    /// **It says what cannot be known.** A crash box can compare the copy's
+    /// revision against the document's, because the panic hook reads a snapshot
+    /// of a session that is still in memory. Nothing here can: the session that
+    /// wrote this copy is gone, and whatever was painted after it was written
+    /// left no record anywhere. Claiming the copy holds everything would be the
+    /// one thing this feature must not do, so it says the opposite plainly.
+    pub fn note(&self) -> String {
+        format!(
+            "Autosaved {}. Anything painted after that is not in it.",
+            crate::crash::age_phrase(self.seconds_ago),
+        )
+    }
+
+    /// What opening this one does to the file it belongs to, said before the
+    /// click.
+    ///
+    /// **"Not until you save it" is the load-bearing half.** Somebody clicking
+    /// Open is very often deciding *whether* they want this copy, and the
+    /// answer to "does opening it replace what I already have?" has to be there
+    /// before the click rather than discovered five minutes afterwards. It is
+    /// true because [`Candidate::write_own_file`] makes it true — the autosave
+    /// writes its own copy and leaves that file alone — rather than because a
+    /// dialog says so.
+    pub fn destination(&self) -> String {
+        match &self.original {
+            Some(path) => format!(
+                "Save writes back to {}. Nothing is written there until you do.",
+                path.display(),
+            ),
+            None => {
+                "This document had never been saved, so Save will ask where to put it.".to_string()
+            }
+        }
+    }
+}
+
+/// Everything one start-up has to offer, and which markers it came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Offer {
+    /// The markers this was read out of, to be forgotten once it is answered.
+    pub marks: Vec<PathBuf>,
+    pub found: Vec<Recoverable>,
+    /// Documents that held unsaved work and have no copy anywhere.
+    ///
+    /// Named rather than passed over, exactly as [`crate::crash::Report`]'s own
+    /// `at_risk` is: a box that lists two recoverable documents and says nothing
+    /// about the third reads as a promise about the third.
+    pub at_risk: Vec<String>,
+}
+
+impl Offer {
+    /// Whether there is anything to *do* about this, which is the only reason
+    /// to put a modal in front of somebody at start-up.
+    ///
+    /// **`at_risk` alone does not count**, and that is deliberate rather than
+    /// an oversight of the rule it answers to. Naming a document with no copy
+    /// exists so that a dialog offering two back does not read as a promise
+    /// about the third; with nothing offered there is no such promise to
+    /// correct, and what is left is a box that says work was lost and gives
+    /// nobody anything to click. That box would also be the *common* case: an
+    /// operating system restart force-kills applications, and Umber refuses to
+    /// close while a document holds unsaved work, so an ordinary reboot leaves
+    /// a marker every time.
+    pub fn is_empty(&self) -> bool {
+        self.found.is_empty()
+    }
+}
+
+/// Is `candidate` a file an autosave could have written into `copies`?
+///
+/// The marker is the one thing in this module that hands over a path Umber did
+/// not construct in the same breath, and [`Reaper`] already says why "the
+/// callers only ever pass internal paths" is not good enough: a later change,
+/// or a hand-edited file, makes it false in silence. So the copy an offer opens
+/// has to be a name an autosave writes, directly inside the directory autosaves
+/// go in — which is also what stops a marker naming the *painter's own*
+/// document from having it opened, marked modified and offered back as a copy
+/// of itself.
+///
+/// Compared without canonicalising, unlike `Reaper`'s, and the difference is
+/// the stakes: this decides what is *read*, in a directory the user already
+/// owns, where `Reaper` decides what is deleted.
+fn ours(candidate: &Path, copies: &Path) -> bool {
+    is_autosave_name(candidate) && candidate.parent() == Some(copies)
+}
+
+/// The rule that turns one dead session's record into what the dialog offers.
+///
+/// **A pure function of injected readings**, the shape
+/// [`crate::update::install::detect`] keeps and for the same reason: it is the
+/// only way the interesting cases — a copy that is missing, a copy older than
+/// the painter's own file, a clock that has run backwards — are tested at all,
+/// and none of them is a state a test can conveniently arrange on a real disk.
+///
+/// `read` answers "when was this file last written", or `None` where there is
+/// no such file. `copies` is the directory an internal copy may be in, and
+/// nothing outside it is a candidate — see [`ours`].
+pub fn offer_from(
+    record: &SessionRecord,
+    now: SystemTime,
+    copies: &Path,
+    read: &dyn Fn(&Path) -> Option<SystemTime>,
+) -> (Vec<Recoverable>, Vec<String>) {
+    let mut found = Vec::new();
+    let mut at_risk = Vec::new();
+    for doc in &record.documents {
+        let copy = doc
+            .copy
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| ours(p, copies));
+        let written = copy.as_deref().and_then(read);
+        let (Some(copy), Some(written)) = (copy, written) else {
+            // No copy, or one whose write never landed. Worth naming only if
+            // there was something in it to lose.
+            if doc.modified {
+                at_risk.push(doc.title.clone());
+            }
+            continue;
+        };
+        let original = doc.path.as_deref().map(PathBuf::from);
+        // The painter's own file already holds everything this copy does, so
+        // there is nothing to offer. Not silence about lost work: whatever was
+        // painted after both were written is in neither, and no copy exists
+        // that would bring it back.
+        let superseded = original
+            .as_deref()
+            .and_then(read)
+            .is_some_and(|own| own + SAME_MOMENT >= written);
+        if superseded {
+            continue;
+        }
+        found.push(Recoverable {
+            title: doc.title.clone(),
+            original,
+            copy,
+            // A copy dated in the future — a clock put back, a file restored
+            // from a backup — reads as "moments ago" rather than as an error.
+            seconds_ago: now
+                .duration_since(written)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        });
+    }
+    (found, at_risk)
+}
+
+/// Read a marker, or `None` if it cannot be read as one.
+///
+/// A revision this build does not know is one of the `None`s, and the
+/// comparison is the whole of what [`MARK_FORMAT`] is for. Unlike
+/// [`crate::crash::Report`]'s — where the reader is always the same executable
+/// that wrote the file — a marker genuinely is read across builds: a downgrade,
+/// or a portable copy started beside an installed one. A future revision that
+/// changed what a field *meant* would otherwise be read straight through.
+/// **Read through the handle the lock is held on**, never by opening the path
+/// again. Windows' `LockFileEx` locks the file's *bytes*, so a second handle
+/// reading a marker this process has just claimed is refused outright — which
+/// is a real bug and not a hypothetical: it made every offer come back empty.
+/// It is also the property that stops anything reading a marker a *running*
+/// Umber is in the middle of rewriting.
+fn read_record(file: &mut std::fs::File, path: &Path) -> Option<SessionRecord> {
+    use std::io::{Read, Seek};
+    let mut text = String::new();
+    file.rewind().ok()?;
+    file.read_to_string(&mut text).ok()?;
+    let record: SessionRecord = serde_json::from_str(&text).ok()?;
+    if record.format > MARK_FORMAT {
+        log::info!(
+            "{} was written by a newer Umber (revision {}); leaving it alone",
+            path.display(),
+            record.format,
+        );
+        return None;
+    }
+    Some(record)
+}
+
+/// What every session that did not end cleanly left behind, from `dir`.
+///
+/// Markers belonging to a *running* Umber are left strictly alone, and the ones
+/// that are not are **held** for as long as the offer they produced is on
+/// screen — see [`claim_if_abandoned`].
+///
+/// A dead marker that turns out to offer nothing — because its copies have
+/// expired, because its documents were all saved, or because it never got as
+/// far as writing one — is forgotten on the spot: it names nothing, so there is
+/// nothing to lose, and leaving it would mean the directory filled with markers
+/// no dialog would ever answer for. One that could not be **read** is a
+/// different case and is kept: it may name copies that are still there, and
+/// deleting the only record of them because a power cut caught a rewrite
+/// half-done is the one outcome worth a few hundred stale bytes.
+fn collect_offer(dir: &Path, now: SystemTime) -> (Offer, Vec<std::fs::File>) {
+    let Ok(marks) = Marks::new(dir) else {
+        return (Offer::default(), Vec::new());
+    };
+    let mut offer = Offer::default();
+    let mut held = Vec::new();
+    // The copies sit in the directory the markers' own is nested in — see
+    // [`SESSIONS_DIR`] — so there is still one statement of where they live.
+    let copies = dir.parent().unwrap_or(dir);
+    let read = |path: &Path| -> Option<SystemTime> {
+        std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    };
+    for path in marks.list() {
+        let Some(mut lock) = claim_if_abandoned(&path) else {
+            continue;
+        };
+        let Some(record) = read_record(&mut lock, &path) else {
+            log::warn!(
+                "{} could not be read; leaving it rather than losing what it names",
+                path.display(),
+            );
+            continue;
+        };
+        let (found, at_risk) = offer_from(&record, now, copies, &read);
+        if found.is_empty() && at_risk.is_empty() {
+            // Before the removal, and not merely tidiness: Windows keeps a name
+            // that still has a handle open on it, so removing first would leave
+            // the marker on disk and this would find it again on every start.
+            drop(lock);
+            if let Err(why) = marks.remove(&path) {
+                log::info!("left {} alone: {why}", path.display());
+            }
+            continue;
+        }
+        offer.marks.push(path);
+        offer.found.extend(found);
+        offer.at_risk.extend(at_risk);
+        held.push(lock);
+    }
+    // Two sessions that both died with the same document open name the same
+    // copy — the internal name is keyed on the document's own path. Grouped by
+    // copy so the duplicates are adjacent, and freshest first within a group so
+    // the one `dedup_by` keeps is the newer reading rather than an older
+    // session's memory of the same file.
+    offer.found.sort_by(|a, b| {
+        a.copy
+            .cmp(&b.copy)
+            .then_with(|| a.seconds_ago.cmp(&b.seconds_ago))
+    });
+    offer.found.dedup_by(|a, b| a.copy == b.copy);
+    // Then into the order a person would want to read them in: what was being
+    // painted last, first. Sorting by the copy's *name* would order the list by
+    // a hash, which is no order at all.
+    offer.found.sort_by(|a, b| {
+        a.seconds_ago
+            .cmp(&b.seconds_ago)
+            .then(a.title.cmp(&b.title))
+    });
+    offer.at_risk.sort();
+    offer.at_risk.dedup();
+    (offer, held)
+}
+
+// ---------------------------------------------------------------------------
 // The scheduler
 // ---------------------------------------------------------------------------
 
@@ -406,6 +1021,19 @@ pub struct Candidate {
     pub title: String,
     /// The file the painter chose, if the document has one.
     pub path: Option<PathBuf>,
+    /// Whether [`Candidate::path`] may be **written**, as against merely named.
+    ///
+    /// False for exactly one case, and it is the one that would hurt: a
+    /// document recovered out of an autosave copy. Its path came from a marker
+    /// rather than from the painter opening or saving that file, and what it
+    /// holds is by definition not what is at that path — so writing it back on
+    /// a timer would replace an artist's picture with a version they had not
+    /// asked for, five minutes after clicking Open to see what was in the copy,
+    /// and with no history to step back through. The internal copy is still
+    /// written, so nothing is lost either way. See [`crate::session::Tab`]'s
+    /// `recovered`, which is what clears it: an explicit Save is the painter
+    /// choosing that file for this document.
+    pub write_own_file: bool,
     pub size: UVec2,
     pub background: Background,
     pub dpi: f32,
@@ -561,6 +1189,25 @@ pub struct Autosave {
     complained: bool,
     /// The start-up expiry sweep has run. See [`Autosave::sweep_once`].
     swept: bool,
+    /// Where this run's marker goes, and where a previous run's is looked for.
+    ///
+    /// A field rather than a call to [`sessions_dir`] at the point of use, so a
+    /// test can point the whole mechanism at a scratch directory. A test that
+    /// wrote a marker into somebody's real data folder would then be found by
+    /// their next start of Umber.
+    pub marks_dir: Option<PathBuf>,
+    /// This run's marker, held open and locked. `None` before
+    /// [`Autosave::begin_run`], and on a system with no data directory.
+    mark: Option<SessionMark>,
+    /// Locks taken over the markers a session that stopped left, held for as
+    /// long as the offer they produced is unanswered. See
+    /// [`claim_if_abandoned`].
+    claimed: Vec<std::fs::File>,
+    /// [`Autosave::begin_run`] has run.
+    begun: bool,
+    /// The reduction of the tab strip the marker was last written from. See
+    /// [`Autosave::note_documents`].
+    noted: u64,
     /// When the last document was written, for the settings dialog.
     pub last_written: Option<Instant>,
 
@@ -598,6 +1245,13 @@ impl Default for Autosave {
             seq: 0,
             complained: false,
             swept: false,
+            marks_dir: sessions_dir(),
+            mark: None,
+            claimed: Vec::new(),
+            begun: false,
+            // Nothing has been written down yet, so the first reading of the
+            // tab strip has to count as a change whatever it comes to.
+            noted: u64::MAX,
             last_written: None,
             tx: None,
             rx: None,
@@ -730,6 +1384,165 @@ impl Autosave {
                 }
             }
             None => log::error!("no autosave writer; nothing was written"),
+        }
+    }
+
+    /// Claim this run's marker, and collect what a session that did not end
+    /// cleanly left behind. Once per run.
+    ///
+    /// The scan comes **before** the marker is created, which is what keeps
+    /// this run's own file out of its own answer without having to name it.
+    pub fn begin_run(&mut self, now: SystemTime) -> Offer {
+        if std::mem::replace(&mut self.begun, true) {
+            return Offer::default();
+        }
+        let Some(dir) = self.marks_dir.clone() else {
+            return Offer::default();
+        };
+        let (offer, held) = collect_offer(&dir, now);
+        // Held for as long as the offer is on screen, so a second Umber started
+        // while somebody is reading it cannot read the same markers as
+        // abandoned and offer the same documents again.
+        self.claimed = held;
+        match SessionMark::open(&dir, self.token) {
+            Ok(mark) => self.mark = Some(mark),
+            // Umber carries on without one. What is lost is the *next* start's
+            // offer, not anything this session is doing — the copies are
+            // written either way, and the folder is one click away in Settings.
+            Err(e) => log::warn!("could not mark this session as running: {e}"),
+        }
+        offer
+    }
+
+    /// Take this run's marker down, because the loop finished on purpose.
+    ///
+    /// Called from exactly one place — see [`crate::UmberApp::ended_cleanly`] —
+    /// and deliberately not from a `Drop`: a panic unwinds through destructors,
+    /// so a `Drop` here would remove the very evidence that the session did not
+    /// end cleanly, in precisely the case this exists for.
+    pub fn end_run(&mut self) {
+        let Some(mark) = self.mark.take() else {
+            return;
+        };
+        let path = mark.path().to_path_buf();
+        // The lock goes with the handle, before the file is removed.
+        drop(mark);
+        self.forget_marks(std::slice::from_ref(&path));
+    }
+
+    /// Forget markers that have been answered, or that this run has taken down.
+    ///
+    /// Every removal goes through [`Marks`], which cannot reach a document.
+    pub fn forget_marks(&mut self, paths: &[PathBuf]) {
+        // The offer is answered, so the locks taken over its markers go — and
+        // they go *first*, because a handle still open on a file being removed
+        // is the one part of this that is not the same on every platform.
+        self.claimed.clear();
+        let Some(dir) = self.marks_dir.as_deref() else {
+            return;
+        };
+        let Ok(marks) = Marks::new(dir) else {
+            return;
+        };
+        for path in paths {
+            if let Err(why) = marks.remove(path) {
+                log::info!("left {} alone: {why}", path.display());
+            }
+        }
+    }
+
+    /// Note that this document came out of `copy`, so that is the copy it goes
+    /// back to.
+    ///
+    /// Two things it buys, and both were wrong without it. The marker would
+    /// describe a freshly recovered document as having **no copy** until its
+    /// first autosave, so a crash in between would put it in the next start's
+    /// "Umber had no copy of this one" — while the copy it was recovered from
+    /// sat in the folder. And a never-saved document, whose copy is keyed on
+    /// this run rather than on a path, would otherwise be autosaved to a second
+    /// file beside the one it came out of.
+    pub fn adopt_copy(&mut self, id: DocId, copy: PathBuf) {
+        self.docs
+            .entry(id)
+            .or_insert_with(|| Record {
+                internal: None,
+                last: Instant::now(),
+            })
+            .internal = Some(copy);
+    }
+
+    /// Keep the marker's description of the open documents up to date.
+    ///
+    /// Called **every frame** and does nothing on almost all of them: the tab
+    /// strip and the copies chosen for it are reduced to one number first, and
+    /// only a change to it rewrites the file. That is the same bargain
+    /// [`crate::crash::note_documents`] makes, and it is what lets this sit on
+    /// the drawing path — the reduction allocates nothing, and the rewrite
+    /// happens on the handful of frames where a document was opened, closed,
+    /// saved, first painted on, or given a copy.
+    ///
+    /// Keeping it current is not bookkeeping for its own sake: a document
+    /// closed or saved after its copy was written must stop being offered, and
+    /// this is the only thing that says so.
+    pub fn note_documents(&mut self, session: &Session) {
+        if self.mark.is_none() {
+            return;
+        }
+        let mark = self.fingerprint(session);
+        if self.noted == mark {
+            return;
+        }
+        let record = self.record(session);
+        let Some(file) = self.mark.as_mut() else {
+            return;
+        };
+        match file.write(&record) {
+            // Only once the write has actually landed, so a failure is retried
+            // on the next frame rather than remembered as done.
+            Ok(()) => self.noted = mark,
+            Err(e) => log::warn!("could not update the session marker: {e}"),
+        }
+    }
+
+    /// A cheap reading of what the marker would say. Allocates nothing.
+    fn fingerprint(&self, session: &Session) -> u64 {
+        let mut hash = digest(&(session.len() as u64).to_le_bytes());
+        for tab in session.tabs() {
+            let mix = |hash: u64, part: u64| hash.rotate_left(7).wrapping_add(part);
+            hash = mix(hash, digest(tab.title.as_bytes()));
+            hash = mix(
+                hash,
+                tab.path
+                    .as_ref()
+                    .map_or(0, |p| digest(p.as_os_str().as_encoded_bytes())),
+            );
+            hash = mix(hash, u64::from(tab.modified));
+            hash = mix(
+                hash,
+                self.internal_copy(tab.id)
+                    .map_or(0, |p| digest(p.as_os_str().as_encoded_bytes())),
+            );
+        }
+        hash
+    }
+
+    fn record(&self, session: &Session) -> SessionRecord {
+        SessionRecord {
+            format: MARK_FORMAT,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            documents: session
+                .tabs()
+                .iter()
+                .map(|tab| MarkedDocument {
+                    // Bounded, for the reason every field of a crash report is:
+                    // this is written from a frame loop and a tab title is a
+                    // file name, which has no ceiling of its own.
+                    title: tab.title.chars().take(TITLE_LIMIT).collect(),
+                    path: tab.path.as_ref().map(|p| p.display().to_string()),
+                    copy: self.internal_copy(tab.id).map(|p| p.display().to_string()),
+                    modified: tab.modified,
+                })
+                .collect(),
         }
     }
 
@@ -909,6 +1722,29 @@ pub fn collect(
     // preferences file on the first frame, and this is after it.
     editor.autosave.sweep_once();
 
+    // The other half of "once, on the first frame": claim this run's marker,
+    // and find out whether the last run put one down. Before the sweep would be
+    // wrong — expiry can take the very copies an offer is about, and a dialog
+    // listing a file that has just been deleted is worse than one listing
+    // nothing. The sweep runs on a thread, so this is *ordering*, not a
+    // guarantee; `offer_from` reads the file system rather than trusting the
+    // marker, so a copy that goes in between is simply not offered.
+    let offer = editor.autosave.begin_run(SystemTime::now());
+    if !offer.is_empty() {
+        log::info!(
+            "the last session did not end cleanly: {} copy/copies to offer back, \
+             {} document(s) with no copy",
+            offer.found.len(),
+            offer.at_risk.len(),
+        );
+        editor.recovery.offer(offer);
+    }
+
+    // Every frame, and free on almost all of them. What it costs on the ones
+    // where it is not is one small write; what it buys is that a document
+    // closed or saved since its copy was written stops being offered back.
+    editor.autosave.note_documents(&editor.session);
+
     if let Some(id) = editor.autosave.capturing_id()
         && let Some(canvas) = canvases.get_mut(&id)
     {
@@ -988,6 +1824,7 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
         revision: tab.revision,
         title: tab.title.clone(),
         path: tab.path.clone(),
+        write_own_file: !tab.recovered,
         size: doc.size,
         background: doc.background,
         dpi: doc.dpi,
@@ -1119,7 +1956,14 @@ fn run_task(task: Task) -> Vec<Report> {
 
     // Then the document's own file, which this **overwrites without asking**.
     // That is what an autosave is; the alternative is a dialog on a timer.
-    if let Some(path) = &doc.path {
+    //
+    // Gated, and on exactly one thing: a document recovered out of a copy has a
+    // path nobody has saved to. Overwriting *without asking* is right where the
+    // painter put the document at that path themselves and is not where Umber
+    // did. See `Candidate::write_own_file`.
+    if let Some(path) = &doc.path
+        && doc.write_own_file
+    {
         match docformat::write_encoded(path, &encoded) {
             Ok(()) => {
                 wrote_user_file = true;
@@ -1369,12 +2213,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&internal);
     }
 
+    /// A marker read the way a start-up reads one: through a handle of its
+    /// own, no lock involved, because in a test nothing is holding it.
+    fn record_at(path: &Path) -> Option<SessionRecord> {
+        let mut file = std::fs::File::options().read(true).open(path).ok()?;
+        read_record(&mut file, path)
+    }
+
     fn candidate(id: DocId, title: &str) -> Candidate {
         Candidate {
             id,
             revision: 0,
             title: title.to_string(),
             path: None,
+            write_own_file: true,
             size: UVec2::splat(8),
             background: Background::Transparent,
             dpi: 72.0,
@@ -1704,6 +2556,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&documents);
     }
 
+    /// **The one that would cost somebody a painting.** A document recovered
+    /// out of a copy carries the file the painter chose, so that Save writes
+    /// where they expect — and the timer must not, because they may have opened
+    /// the copy only to look at it. Five minutes later, unasked, with no undo
+    /// history in the copy to step back through, is the worst shape this could
+    /// take.
+    #[test]
+    fn a_recovered_document_is_not_written_back_to_the_file_it_names() {
+        let internal = scratch("recovered-internal");
+        let documents = scratch("recovered-documents");
+        let theirs = documents.join("hands.ora");
+        std::fs::write(&theirs, b"what the painter has").expect("write");
+
+        let mut doc = candidate(Session::default().active_id(), "hands.ora");
+        doc.path = Some(theirs.clone());
+        doc.write_own_file = false;
+        doc.size = UVec2::ONE;
+        let ours = internal.join("hands-5555555555555555.ora");
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours.clone()),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}",
+        );
+        assert!(
+            matches!(
+                reports.last(),
+                Some(Report::Written {
+                    wrote_user_file: false,
+                    ..
+                })
+            ),
+            "{reports:?}",
+        );
+        assert_eq!(
+            std::fs::read(&theirs).expect("read"),
+            b"what the painter has",
+            "an autosave replaced a file nobody had saved this document to",
+        );
+        // And the copy is still written, so nothing is lost by holding back.
+        assert!(umber_core::docimport::import(&ours).is_ok());
+
+        let _ = std::fs::remove_dir_all(&internal);
+        let _ = std::fs::remove_dir_all(&documents);
+    }
+
     #[test]
     fn a_capture_of_the_wrong_size_is_refused_rather_than_written_sheared() {
         // Cannot happen — a resize cancels the capture on both sides — and a
@@ -1776,6 +2680,10 @@ mod tests {
         // the real one — a test must not write into somebody's data folder.
         editor.autosave.interval = Duration::ZERO;
         editor.autosave.expiry = None;
+        // Same rule for the session marker, and it matters more: a marker left
+        // in the real directory would be found by this machine's next start of
+        // Umber and offered to somebody as a document to recover.
+        editor.autosave.marks_dir = Some(scratch("loop-sessions"));
         editor
             .autosave
             .next_due(Instant::now(), true, &editor.session);
@@ -2000,6 +2908,590 @@ mod tests {
                 "the snapshot and the model disagree about entry {i}"
             );
         }
+    }
+
+    // --- offering a copy back -----------------------------------------------
+
+    /// The moment every `seconds_ago` in these tests is measured against.
+    fn noon() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    fn marked(
+        title: &str,
+        path: Option<&str>,
+        copy: Option<&str>,
+        modified: bool,
+    ) -> MarkedDocument {
+        MarkedDocument {
+            title: title.to_string(),
+            path: path.map(str::to_string),
+            copy: copy.map(str::to_string),
+            modified,
+        }
+    }
+
+    fn record_of(documents: Vec<MarkedDocument>) -> SessionRecord {
+        SessionRecord {
+            format: MARK_FORMAT,
+            version: "0.0.5".to_string(),
+            documents,
+        }
+    }
+
+    /// The directory a made-up file system keeps its internal copies in.
+    /// Every `copy` in these fixtures is a name an autosave writes, inside it —
+    /// which is what [`ours`] demands and `a_copy_outside_the_autosave_folder_
+    /// is_not_one_of_ours` is about.
+    const COPIES: &str = "/data/autosave";
+
+    /// A reading of a made-up file system: a path, and when it was last
+    /// written. Anything not in the list does not exist.
+    fn readings(entries: &[(&str, SystemTime)]) -> impl Fn(&Path) -> Option<SystemTime> + use<> {
+        let owned: Vec<(PathBuf, SystemTime)> = entries
+            .iter()
+            .map(|(p, t)| (PathBuf::from(p), *t))
+            .collect();
+        move |path: &Path| owned.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
+    }
+
+    /// The document with nowhere else to go. A never-saved painting's copy is
+    /// the only record of it that exists, so it is always worth offering.
+    #[test]
+    fn a_never_saved_documents_copy_is_always_offered() {
+        let record = record_of(vec![marked(
+            "Untitled 3",
+            None,
+            Some("/data/autosave/u-1111111111111111.ora"),
+            true,
+        )]);
+        let read = readings(&[(
+            "/data/autosave/u-1111111111111111.ora",
+            noon() - Duration::from_secs(240),
+        )]);
+        let (found, at_risk) = offer_from(&record, noon(), Path::new(COPIES), &read);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].title, "Untitled 3");
+        assert_eq!(found[0].original, None, "there is no file to save back to");
+        assert_eq!(found[0].seconds_ago, 240);
+        assert!(at_risk.is_empty());
+    }
+
+    /// The case the whole comparison exists for: the painter's own file is at
+    /// least as new as the copy, so the copy holds nothing they do not already
+    /// have. Offering it would be asking somebody to choose between two
+    /// identical documents.
+    #[test]
+    fn a_copy_the_painters_own_file_already_holds_is_not_offered() {
+        let record = record_of(vec![marked(
+            "hands.ora",
+            Some("/work/hands.ora"),
+            Some("/data/autosave/hands-2222222222222222.ora"),
+            false,
+        )]);
+        // The internal copy is written first and the painter's file a moment
+        // later, which is the ordinary case and must not read as "behind".
+        let copy_at = noon() - Duration::from_secs(300);
+        let read = readings(&[
+            ("/data/autosave/hands-2222222222222222.ora", copy_at),
+            ("/work/hands.ora", copy_at + Duration::from_millis(400)),
+        ]);
+        let (found, at_risk) = offer_from(&record, noon(), Path::new(COPIES), &read);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(at_risk.is_empty());
+    }
+
+    /// And its opposite: a copy written after the last Save is the only thing
+    /// that holds what came in between.
+    #[test]
+    fn a_copy_newer_than_the_painters_own_file_is_offered_against_it() {
+        let record = record_of(vec![marked(
+            "hands.ora",
+            Some("/work/hands.ora"),
+            Some("/data/autosave/hands-2222222222222222.ora"),
+            true,
+        )]);
+        let read = readings(&[
+            (
+                "/data/autosave/hands-2222222222222222.ora",
+                noon() - Duration::from_secs(60),
+            ),
+            ("/work/hands.ora", noon() - Duration::from_secs(3600)),
+        ]);
+        let (found, _) = offer_from(&record, noon(), Path::new(COPIES), &read);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].original.as_deref(),
+            Some(Path::new("/work/hands.ora")),
+            "a recovered document has to point at the painter's own file, or a \
+             Save writes into the autosave folder",
+        );
+    }
+
+    /// A document that held work and has no copy is **named**, not passed over.
+    /// A dialog that offers two documents back and is silent about the third
+    /// reads as a promise about the third — the rule `Report::at_risk` keeps.
+    #[test]
+    fn a_document_with_no_copy_is_named_rather_than_passed_over() {
+        let record = record_of(vec![
+            marked("Untitled 4", None, None, true),
+            // The copy was chosen but the write never landed, which looks
+            // exactly the same from here and must be read the same way.
+            marked(
+                "Untitled 5",
+                None,
+                Some("/data/autosave/gone-3333333333333333.ora"),
+                true,
+            ),
+            // Nothing to lose, so nothing to say about it at all.
+            marked("reference.ora", Some("/work/reference.ora"), None, false),
+        ]);
+        let read = readings(&[]);
+        let (found, at_risk) = offer_from(&record, noon(), Path::new(COPIES), &read);
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(at_risk, ["Untitled 4", "Untitled 5"]);
+    }
+
+    /// The marker is the one path in this module Umber did not build itself,
+    /// and `Reaper` already says why "the callers only pass internal paths" is
+    /// not good enough. A `copy` naming somewhere else is refused — which is
+    /// also what stops a marker naming the painter's *own* document from having
+    /// it opened, marked modified and offered back as a copy of itself.
+    #[test]
+    fn a_copy_outside_the_autosave_folder_is_not_one_of_ours() {
+        let now = noon();
+        let recent = now - Duration::from_secs(60);
+        for (case, copy) in [
+            ("the painter's own document", "/work/hands.ora"),
+            ("a subdirectory of the copies", "/data/autosave/deep/x.ora"),
+            ("a name no autosave writes", "/data/autosave/notes.txt"),
+            ("a walk back out", "/data/autosave/../../etc/passwd"),
+        ] {
+            let record = record_of(vec![marked("hands.ora", None, Some(copy), true)]);
+            let read = readings(&[(copy, recent)]);
+            let (found, at_risk) = offer_from(&record, now, Path::new(COPIES), &read);
+            assert!(found.is_empty(), "{case} was offered: {found:?}");
+            // Not silently dropped either: the document held work and Umber has
+            // nothing it can hand back, which is what `at_risk` is for.
+            assert_eq!(at_risk, ["hands.ora"], "{case}");
+        }
+    }
+
+    /// A clock put back, or a copy restored from a backup. "In the future" is
+    /// not a duration, and printing a wrapped one would be worse than the
+    /// coarsest possible truth.
+    #[test]
+    fn a_copy_dated_in_the_future_reads_as_moments_ago() {
+        let record = record_of(vec![marked(
+            "a",
+            None,
+            Some("/data/autosave/a-4444444444444444.ora"),
+            true,
+        )]);
+        let read = readings(&[(
+            "/data/autosave/a-4444444444444444.ora",
+            noon() + Duration::from_secs(3600),
+        )]);
+        let (found, _) = offer_from(&record, noon(), Path::new(COPIES), &read);
+        assert_eq!(found[0].seconds_ago, 0);
+        assert!(
+            found[0].note().contains("moments ago"),
+            "{}",
+            found[0].note()
+        );
+    }
+
+    // --- the marker ---------------------------------------------------------
+
+    /// The rule the whole feature rests on, and the reason [`Marks`] is a
+    /// second, much smaller deleter rather than a widened [`Reaper`]: nothing
+    /// on the recovery path may reach a document. Recovering a copy is a read,
+    /// and declining one leaves it where it is.
+    #[test]
+    fn a_marks_deleter_refuses_a_document() {
+        let root = scratch("marks-root");
+        let elsewhere = scratch("marks-elsewhere");
+
+        // An autosave copy sitting in the sessions directory — which cannot
+        // happen, and is exactly the thing that must be refused if it does.
+        let copy = root.join("hands-0123456789abcdef.ora");
+        std::fs::write(&copy, b"an afternoon").expect("write");
+        // A foreign `.json`, which is not ours to delete either.
+        let foreign = root.join("settings.json");
+        std::fs::write(&foreign, b"{}").expect("write");
+        // A real marker, outside the root.
+        let outside = elsewhere.join("00000000deadbeef.json");
+        std::fs::write(&outside, b"{}").expect("write");
+
+        let marks = Marks::new(&root).expect("marks");
+        assert_eq!(marks.remove(&copy), Err(Refused::NotASessionMark));
+        assert!(
+            copy.exists(),
+            "a document was deleted by the marker deleter"
+        );
+        assert_eq!(marks.remove(&foreign), Err(Refused::NotASessionMark));
+        assert!(foreign.exists());
+        assert_eq!(marks.remove(&outside), Err(Refused::Outside));
+        assert!(outside.exists());
+
+        // It does not descend, and a directory is not a candidate.
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let inner = nested.join("00000000deadbeef.json");
+        std::fs::write(&inner, b"{}").expect("write");
+        assert_eq!(marks.remove(&inner), Err(Refused::Outside));
+        assert!(inner.exists());
+
+        let dressed = root.join("00000000cafebabe.json");
+        std::fs::create_dir_all(&dressed).expect("directory");
+        assert_eq!(marks.remove(&dressed), Err(Refused::NotAPlainFile));
+        assert!(dressed.exists());
+
+        // And the listing only ever sees markers, so nothing else can be
+        // handed to `remove` in the first place.
+        assert!(
+            marks.list().iter().all(|p| is_mark_name(p)),
+            "{:?}",
+            marks.list()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn only_a_name_this_module_writes_is_a_marker() {
+        assert!(is_mark_name(Path::new("0123456789abcdef.json")));
+        assert!(is_mark_name(Path::new("/a/b/00000000DEADBEEF.json")));
+        assert!(
+            !is_mark_name(Path::new("0123456789abcde.json")),
+            "15 digits"
+        );
+        assert!(
+            !is_mark_name(Path::new("0123456789abcdefg.json")),
+            "not hex"
+        );
+        assert!(!is_mark_name(Path::new("session.json")));
+        assert!(!is_mark_name(Path::new("0123456789abcdef.ora")));
+    }
+
+    /// A running Umber's marker is locked, and a second copy of Umber must read
+    /// that as "still running" rather than offering its documents back. Two
+    /// windows open on one machine is an ordinary thing to do, and recovering
+    /// the other one's painting into this one would put two processes on one
+    /// file.
+    #[test]
+    fn a_marker_a_running_umber_holds_is_left_alone() {
+        let dir = scratch("marker-live");
+        let mut mark = SessionMark::open(&dir, 0x00c0_ffee_0000_0001).expect("marker");
+        mark.write(&record_of(vec![marked("hands.ora", None, None, true)]))
+            .expect("write");
+        assert!(
+            claim_if_abandoned(mark.path()).is_none(),
+            "a live session's marker was read as abandoned",
+        );
+
+        // A second claim on the same name is refused, and — the part that is
+        // easy to get wrong — refused *without* having emptied the first one on
+        // the way. `open` deliberately does not truncate, because the file has
+        // to be opened before it can be locked.
+        assert!(
+            SessionMark::open(&dir, 0x00c0_ffee_0000_0001).is_err(),
+            "two sessions took the same marker",
+        );
+        assert_eq!(
+            std::fs::metadata(mark.path()).map(|m| m.len() > 0).ok(),
+            Some(true),
+            "a refused claim emptied the record of the session that holds it",
+        );
+
+        // The same file once its holder has gone, however it went — the lock is
+        // the operating system's and it is released with the handle.
+        let path = mark.path().to_path_buf();
+        drop(mark);
+        assert!(
+            claim_if_abandoned(&path).is_some(),
+            "a marker whose session has gone was read as live",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole signal, end to end. A run that ends on purpose takes its
+    /// marker down; one that stops leaves it, and what it left is what the next
+    /// start offers.
+    #[test]
+    fn a_session_that_stopped_offers_its_copies_and_one_that_ended_does_not() {
+        // The sessions directory is nested *inside* the one the copies are in,
+        // as it is in a real installation — which is also what makes a copy in
+        // it one of ours. See `ours`.
+        let copies = scratch("marker-copies");
+        let dir = copies.join(SESSIONS_DIR);
+        let copy = copies.join("hands-0123456789abcdef.ora");
+        touch(&copy, Duration::from_secs(120));
+
+        // A session that stopped: a marker with a document in it, and nobody
+        // holding it.
+        let mut stopped = SessionMark::open(&dir, 0x0000_0000_0000_0011).expect("marker");
+        stopped
+            .write(&record_of(vec![marked(
+                "hands.ora",
+                None,
+                Some(&copy.display().to_string()),
+                true,
+            )]))
+            .expect("write");
+        let stopped_path = stopped.path().to_path_buf();
+        drop(stopped);
+
+        let (offer, held) = collect_offer(&dir, SystemTime::now());
+        assert_eq!(offer.found.len(), 1, "{offer:?}");
+        assert_eq!(offer.found[0].title, "hands.ora");
+        // Compared by name: `Marks` canonicalises, which on Windows puts a
+        // verbatim prefix in front of everything it hands back.
+        assert_eq!(
+            offer
+                .marks
+                .iter()
+                .map(|p| p.file_name())
+                .collect::<Vec<_>>(),
+            vec![stopped_path.file_name()],
+        );
+        assert!(
+            stopped_path.exists(),
+            "a marker that had something to offer was thrown away before the \
+             offer could be answered",
+        );
+        assert!(copy.exists(), "reading an offer must not touch the copies");
+
+        // And it is **held** while the offer stands, so a second Umber started
+        // in the minutes somebody spends reading the dialog cannot read the
+        // same marker as abandoned and offer the same painting again.
+        assert_eq!(held.len(), 1);
+        assert!(
+            claim_if_abandoned(&stopped_path).is_none(),
+            "the marker behind a live offer was there for the taking",
+        );
+
+        // Answered: the marker goes and the copy stays. That is the whole of
+        // why "not now" is a safe answer.
+        let mut autosave = Autosave {
+            marks_dir: Some(dir.clone()),
+            claimed: held,
+            ..Autosave::default()
+        };
+        autosave.forget_marks(&offer.marks);
+        assert!(!stopped_path.exists());
+        assert!(copy.exists(), "declining an offer deleted a document");
+        assert!(collect_offer(&dir, SystemTime::now()).0.is_empty());
+
+        let _ = std::fs::remove_dir_all(&copies);
+    }
+
+    /// A marker whose copies have all expired, or that never got as far as
+    /// writing one, names nothing. Forgotten on the spot rather than left for a
+    /// dialog that would have no rows in it — otherwise the directory fills
+    /// with markers nothing will ever answer for.
+    #[test]
+    fn a_marker_with_nothing_to_offer_is_forgotten_rather_than_kept() {
+        let dir = scratch("marker-empty");
+        let mut empty = SessionMark::open(&dir, 0x0000_0000_0000_0022).expect("marker");
+        empty
+            .write(&record_of(vec![marked(
+                "saved.ora",
+                Some("/work/x.ora"),
+                None,
+                false,
+            )]))
+            .expect("write");
+        let path = empty.path().to_path_buf();
+        drop(empty);
+
+        let (offer, held) = collect_offer(&dir, SystemTime::now());
+        assert!(offer.is_empty(), "{offer:?}");
+        assert!(
+            held.is_empty(),
+            "a marker that offered nothing was held on to"
+        );
+        assert!(!path.exists(), "a marker naming nothing was kept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker that cannot be read is **kept**, where one that names nothing
+    /// is forgotten. The two look alike from here and are not: a marker whose
+    /// rewrite a power cut caught half done may still name copies that are
+    /// sitting in the folder, and deleting the only record of them to save a
+    /// few hundred bytes is the wrong way round.
+    #[test]
+    fn a_marker_that_cannot_be_read_is_kept_rather_than_thrown_away() {
+        let dir = scratch("marker-unreadable");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let torn = dir.join("00000000000000aa.json");
+        std::fs::write(&torn, br#"{"format":1,"docum"#).expect("write");
+        // And one from a build that knows a revision this one does not.
+        let newer = dir.join("00000000000000bb.json");
+        std::fs::write(&newer, br#"{"format":99,"documents":[]}"#).expect("write");
+
+        let (offer, held) = collect_offer(&dir, SystemTime::now());
+        assert!(offer.is_empty(), "{offer:?}");
+        assert!(held.is_empty());
+        assert!(torn.exists(), "a half-written marker was thrown away");
+        assert!(newer.exists(), "a newer build's marker was thrown away");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session that lost work it had no copy of has **nothing to offer**, so
+    /// no dialog is raised — and that is the case, not the exception. An
+    /// operating system restart force-kills applications and Umber refuses to
+    /// close while a document holds unsaved work, so an ordinary reboot leaves
+    /// a marker every time. A modal saying "your work is gone" with nothing to
+    /// click, after every reboot, is not honesty.
+    #[test]
+    fn nothing_is_offered_for_work_there_is_no_copy_of() {
+        let offer = Offer {
+            marks: vec![PathBuf::from(
+                "/data/autosave/sessions/00000000deadbeef.json",
+            )],
+            found: Vec::new(),
+            at_risk: vec!["Untitled 4".to_string()],
+        };
+        assert!(offer.is_empty());
+        // Beside something that *can* be offered it is drawn, which is the rule
+        // `Report::at_risk` keeps: a list of two must not read as a promise
+        // about the third.
+        let offer = Offer {
+            found: vec![Recoverable {
+                title: "hands.ora".into(),
+                original: None,
+                copy: PathBuf::from("/data/autosave/hands-0123456789abcdef.ora"),
+                seconds_ago: 60,
+            }],
+            ..offer
+        };
+        assert!(!offer.is_empty());
+        assert_eq!(offer.at_risk, ["Untitled 4"]);
+    }
+
+    /// `begin_run` scans before it writes, so a fresh start never offers its
+    /// own marker back to itself — and `end_run` takes it down again.
+    #[test]
+    fn a_run_does_not_offer_itself_and_cleans_up_after_itself() {
+        let dir = scratch("marker-self");
+        let mut autosave = Autosave {
+            marks_dir: Some(dir.clone()),
+            ..Autosave::default()
+        };
+        assert!(autosave.begin_run(SystemTime::now()).is_empty());
+        assert!(
+            autosave.mark.is_some(),
+            "the run did not mark itself as running",
+        );
+        assert_eq!(Marks::new(&dir).expect("marks").list().len(), 1);
+
+        // Once per run: a second call must not mint a second marker.
+        assert!(autosave.begin_run(SystemTime::now()).is_empty());
+        assert_eq!(Marks::new(&dir).expect("marks").list().len(), 1);
+
+        autosave.end_run();
+        assert!(Marks::new(&dir).expect("marks").list().is_empty());
+        // And again, which is what happens if the loop is left twice.
+        autosave.end_run();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The marker has to follow the session, or a document closed or saved
+    /// after its copy was written would be offered back — work somebody
+    /// deliberately let go of.
+    #[test]
+    fn the_marker_follows_the_documents_and_costs_nothing_while_they_stand_still() {
+        let dir = scratch("marker-follow");
+        let mut autosave = Autosave {
+            marks_dir: Some(dir.clone()),
+            ..Autosave::default()
+        };
+        autosave.begin_run(SystemTime::now());
+        let mut session = session_of(2);
+
+        autosave.note_documents(&session);
+        let path = autosave
+            .mark
+            .as_ref()
+            .expect("a marker")
+            .path()
+            .to_path_buf();
+        let titles = |record: &SessionRecord| -> Vec<String> {
+            record.documents.iter().map(|d| d.title.clone()).collect()
+        };
+        assert_eq!(
+            titles(&autosave.record(&session)),
+            ["Untitled 1", "Untitled 2"],
+        );
+
+        // Nothing has moved, so nothing is written.
+        let noted = autosave.noted;
+        autosave.note_documents(&session);
+        assert_eq!(
+            autosave.noted, noted,
+            "the marker was rewritten for nothing"
+        );
+
+        // A document closed drops out of the record, so the next start does not
+        // offer back a painting somebody put down on purpose.
+        session.remove(0);
+        autosave.note_documents(&session);
+        assert_ne!(autosave.noted, noted);
+
+        // And what is on disk is what the record said. Read only once the
+        // marker's handle has gone, because the lock covers the file's bytes:
+        // a running session's marker cannot be read by anything else, which is
+        // the same fact `is_abandoned` rests on.
+        drop(autosave.mark.take());
+        assert_eq!(
+            record_at(&path).as_ref().map(titles),
+            Some(vec!["Untitled 2".to_string()]),
+        );
+
+        autosave.end_run();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record has to survive the file, and a record from a build that knew
+    /// fewer fields has to load rather than throwing away the one thing that
+    /// says where somebody's work is.
+    #[test]
+    fn a_record_survives_being_written_and_read_back() {
+        let dir = scratch("marker-round-trip");
+        let record = record_of(vec![marked(
+            "hands.ora",
+            Some("/work/hands.ora"),
+            Some("/data/autosave/hands-2222222222222222.ora"),
+            true,
+        )]);
+        let mut mark = SessionMark::open(&dir, 0x0000_0000_0000_0033).expect("marker");
+        mark.write(&record).expect("write");
+        // Rewritten shorter: the file must not keep the tail of what it said
+        // before, which is what `set_len` is for.
+        mark.write(&record_of(Vec::new())).expect("write");
+        mark.write(&record).expect("write");
+        let path = mark.path().to_path_buf();
+        drop(mark);
+
+        assert_eq!(record_at(&path), Some(record));
+
+        std::fs::write(&path, r#"{"format":1,"documents":[{"title":"a"}]}"#).expect("write");
+        let older = record_at(&path).expect("an older record loads");
+        assert_eq!(older.documents.len(), 1);
+        assert!(older.documents[0].copy.is_none());
+        assert!(older.version.is_empty());
+
+        std::fs::write(&path, b"not json at all").expect("write");
+        assert_eq!(record_at(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

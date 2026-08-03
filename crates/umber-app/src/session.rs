@@ -122,6 +122,20 @@ pub struct Tab {
     /// the capture began; never reset, so it cannot wrap round to a stale
     /// match.
     pub revision: u64,
+    /// This document's [`Tab::path`] was inherited from a session that stopped,
+    /// and nobody has saved to it since.
+    ///
+    /// **The autosave must not write a recovered document to that file.** Every
+    /// other document with a path got it by being opened from it or saved to
+    /// it, which is the painter putting the document there; a recovered one got
+    /// it from a marker, and the copy it holds is by definition *not* what is at
+    /// that path. Autosaving it back would replace an artist's file with a
+    /// version they had not asked for and could not undo — the internal copy
+    /// carries no history — five minutes after they clicked Open to see what was
+    /// in it. So the path is remembered for Save and withheld from the timer;
+    /// [`Session::mark_saved`] is what clears the flag, because that is the
+    /// moment the painter chose the file. See `autosave::Candidate::write_own_file`.
+    pub recovered: bool,
     /// What the import could not represent, already phrased for the user by
     /// `umber_core::docimport`. Kept on the tab so the notice can be reopened
     /// after it has been dismissed.
@@ -184,6 +198,7 @@ impl Default for Session {
             path: None,
             modified: false,
             revision: 0,
+            recovered: false,
             notes: Vec::new(),
             tip_for: None,
             parked: None,
@@ -288,6 +303,15 @@ impl Session {
         }
         tab.path = Some(path);
         tab.modified = false;
+        // The painter has now chosen this file for this document, so the
+        // autosave may write it. See [`Tab::recovered`].
+        tab.recovered = false;
+    }
+
+    /// Note that the live document came out of an autosave copy, and that the
+    /// file it names is one nobody has written to since.
+    pub fn mark_recovered(&mut self) {
+        self.active_tab_mut().recovered = true;
     }
 
     /// Add a tab for a document whose state the caller is about to make live.
@@ -304,6 +328,7 @@ impl Session {
             path,
             modified: false,
             revision: 0,
+            recovered: false,
             notes: Vec::new(),
             tip_for: None,
             parked: None,

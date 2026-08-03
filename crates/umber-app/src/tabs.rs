@@ -19,7 +19,11 @@ use crate::icons::{self, Icon};
 use crate::theme::{Palette, metrics, text};
 
 /// Diameter of the modified dot, which the close mark replaces on hover.
-const MARK: f32 = 14.0;
+///
+/// Shared with [`crate::recoverdlg`], which draws the same dot column beside a
+/// list of documents — two lists of documents in one application have to line
+/// up, and re-typing 14.0 is what `theme::metrics` exists to stop.
+pub(crate) const MARK: f32 = 14.0;
 
 /// Padding either side of a tab's label.
 const TAB_PAD: f32 = 12.0;

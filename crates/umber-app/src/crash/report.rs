@@ -300,13 +300,21 @@ pub fn payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// worth going back to", which "four minutes ago" answers and "4 m 12 s" does
 /// not. Written here rather than with `umber_core::time` because that module
 /// spells *moments*, and this is an interval whose exact seconds nobody wants.
+///
+/// The days arm exists for the recovery offer rather than for a crash box: a
+/// crash names a copy written minutes ago, but a machine that went down on
+/// Friday is started again on Monday, and "78 hours ago" is a number somebody
+/// has to do arithmetic on to understand.
 pub fn age_phrase(seconds: u64) -> String {
+    /// Two days, where hours stop being the useful unit.
+    const DAYS: u64 = 2 * 24 * 3600;
     match seconds {
         0..=29 => "moments ago".to_string(),
         30..=89 => "a minute ago".to_string(),
         90..=3599 => format!("{} minutes ago", (seconds + 30) / 60),
         3600..=5399 => "an hour ago".to_string(),
-        _ => format!("{} hours ago", (seconds + 1800) / 3600),
+        5400..DAYS => format!("{} hours ago", (seconds + 1800) / 3600),
+        _ => format!("{} days ago", (seconds + 43_200) / 86_400),
     }
 }
 
@@ -515,6 +523,11 @@ mod tests {
         assert_eq!(age_phrase(240), "4 minutes ago");
         assert_eq!(age_phrase(3600), "an hour ago");
         assert_eq!(age_phrase(7200), "2 hours ago");
+        // A machine that went down on Friday, started again on Monday. Hours
+        // here would be a number somebody has to divide in their head.
+        assert_eq!(age_phrase(47 * 3600), "47 hours ago");
+        assert_eq!(age_phrase(2 * 24 * 3600), "2 days ago");
+        assert_eq!(age_phrase(9 * 24 * 3600), "9 days ago");
     }
 
     // -- the details block -------------------------------------------------
