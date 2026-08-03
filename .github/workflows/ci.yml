@@ -61,13 +61,30 @@ jobs:
       - name: Metadata consistency
         run: sh packaging/check.sh
 
+  # **Every runner the release builds on.** `release.ps1` will not push a tag
+  # until this workflow is green on that commit, which only means anything if
+  # the two cover the same machines. They did not: the release also builds on
+  # `ubuntu-22.04-arm` and `windows-11-arm`, and v0.0.5 was tagged on a green CI
+  # and then failed on the ARM Windows job — the one platform nothing had run
+  # on. The rule is that adding a target to `release.yml`'s matrix means adding
+  # its runner here, or the gate has a hole in exactly the shape of the new
+  # target.
+  #
+  # `ubuntu-22.04` rather than `ubuntu-latest`, matching the release: a binary
+  # built against an old glibc runs on newer distributions and not the other way
+  # round, so that is the machine whose answer matters.
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-latest
 
     steps:
       - uses: actions/checkout@v5

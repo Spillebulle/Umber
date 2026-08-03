@@ -1775,6 +1775,16 @@ seventeen concurrent Vulkan devices each blocking on `poll` for its own
 submission, which starved them into a hang — the run never finished rather than
 failing. Sharing one device is also ~10× faster.
 
+**That rule is per test *binary*, and `umber-app` is a second one.**
+`umber_app::gputest` is its copy, and it exists because the rule was not applied
+there: `autosave`'s frame-loop test was the only thing in the crate that wanted
+a device until `thumbs`' arrived beside it, and two tests each building and
+tearing down their own — concurrently, which is what the harness does — killed
+the binary with `STATUS_ACCESS_VIOLATION` at process exit on the ARM64 Windows
+runner. Every test passed and the run failed on the way out, which is the worst
+shape of this bug, and it is invisible on a desktop driver. Anything here that
+wants a device takes `gputest::lock()` and holds the guard for the whole test.
+
 `composite_pixel` runs the real composite pass into an offscreen target, which
 is the only way to test layer opacity and blend modes. Two things to copy when
 adding to it:
@@ -2049,6 +2059,10 @@ half-publish; `.github/workflows/release.yml` does the rest.
   and another run of the script. It needs the GitHub CLI for this and says so;
   `-SkipCi` / `--skip-ci` opts out, and is for a machine without `gh` rather
   than for a hurry.
+- **`ci.yml`'s matrix must cover every runner `release.yml` builds on**, or the
+  wait above is a gate with a hole in it. v0.0.5 was tagged on a green CI and
+  then failed on `windows-11-arm`, which CI did not run at all. Adding a target
+  to the release matrix means adding its runner to CI in the same commit.
 - **The two scripts have to stay in step**, `release.ps1` and `release.sh`, the
   same arrangement `tools/fetch-brushes.*` keeps.
 - **`release.ps1` wants PowerShell 7.** Under Windows PowerShell 5.1 a native

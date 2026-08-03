@@ -25,6 +25,10 @@ pub mod docshot;
 mod editor;
 mod exportdlg;
 mod gesture;
+/// One device for every test in this crate that wants one. See its own docs:
+/// the rule is per test *binary*, and this crate is a second one.
+#[cfg(test)]
+mod gputest;
 mod icons;
 mod inputlog;
 mod keylayout;

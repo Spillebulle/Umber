@@ -1739,8 +1739,10 @@ mod tests {
     /// Skips rather than fails with no adapter, like the GPU tests.
     #[test]
     fn a_frame_loop_writes_the_document_out_by_itself() {
-        let instance = Gpu::create_instance();
-        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+        // Shared with every other test here that wants a device, and held for
+        // the length of this one. Two of them each building their own crashed
+        // the binary on the way out on ARM64 Windows — see `crate::gputest`.
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
             eprintln!("no GPU adapter available; skipping");
             return;
         };
@@ -1790,7 +1792,7 @@ mod tests {
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        drive(&mut editor, &gpu, &mut canvases, &mut enc, false);
+        drive(&mut editor, gpu, &mut canvases, &mut enc, false);
         gpu.queue.submit(Some(enc.finish()));
         assert!(
             !editor.autosave.capturing(),
@@ -1801,9 +1803,9 @@ mod tests {
             let mut enc = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            drive(&mut editor, &gpu, &mut canvases, &mut enc, true);
+            drive(&mut editor, gpu, &mut canvases, &mut enc, true);
             gpu.queue.submit(Some(enc.finish()));
-            let notice = collect(&mut editor, &gpu, &mut canvases);
+            let notice = collect(&mut editor, gpu, &mut canvases);
             assert!(notice.is_none(), "{:?}", notice.map(|n| n.lines));
             // Wait for the dot as well as for the files. The writing happens on
             // a thread and the dot comes off when its report is *collected*,

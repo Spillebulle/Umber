@@ -282,10 +282,13 @@ mod tests {
     #[test]
     fn a_frame_loop_fills_the_layer_list_in_and_keeps_it_true() {
         use umber_core::PixelRect;
-        use umber_render::{CanvasRenderer, Gpu};
+        use umber_render::CanvasRenderer;
 
-        let instance = Gpu::create_instance();
-        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+        // Shared with every other test here that wants a device, and held for
+        // the length of this one. This test arriving beside `autosave`'s — two
+        // devices, built and torn down concurrently — is what crashed the
+        // binary on the way out on ARM64 Windows. See `crate::gputest`.
+        let Some((gpu, _serial)) = crate::gputest::lock() else {
             eprintln!("no GPU adapter available; skipping");
             return;
         };
