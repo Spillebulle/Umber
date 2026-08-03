@@ -74,6 +74,13 @@
 //! picture there, not recognise it, and put it down — the wrong picture, from
 //! the one branch that exists to make that impossible.
 //!
+//! One bound is worth writing down because it is not Umber's to set: on X11 a
+//! read waits on the *owning* process, and arboard gives that four seconds
+//! before giving up. A Ctrl+V while some other application is wedged is
+//! therefore a stall of up to four seconds — bounded, on an explicit keystroke,
+//! and nowhere near the drawing loop, which is the same ground the blocking
+//! readbacks stand on.
+//!
 //! The cost is real and is stated rather than hidden: with nothing selected, a
 //! copy takes the whole canvas, so on the 10000² document the Undo section uses
 //! as its bound Ctrl+C hands 400 MB to a PNG encoder. That is on top of the
