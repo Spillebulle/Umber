@@ -298,19 +298,44 @@ mod tests {
         );
     }
 
-    /// **The exactness promise.** The desktop is holding what Umber's own copy
-    /// put there, so the bytes that came off the layer are the ones that go
-    /// back on to it — not the bytes that came back through the platform's
-    /// clipboard. `a_copy_and_a_paste_are_exact_inverses` is the test in
-    /// `umber-core` this keeps true once a copy also leaves the process.
+    /// **The exactness promise, end to end.** A region taken off a layer,
+    /// handed to a desktop that gives it back unchanged, and pasted: the bytes
+    /// that reach the layer have to be the bytes that came off it. That is
+    /// `a_copy_and_a_paste_are_exact_inverses` in `umber-core` with the machine
+    /// in the middle of it — which is exactly what this module put there, and
+    /// the only reason the "it is already ours" branch exists at all.
+    ///
+    /// The transport is modelled as what arboard measurably does: `put_image`
+    /// hands over `Clip::pixels` and `take_image` is `Clip::from_rgba` over
+    /// what came back, so a lossless one returns the same bytes.
     #[test]
-    fn umbers_own_copy_comes_back_out_of_umbers_own_clip() {
-        let mine = clip(3, 5, [200, 100, 50, 128]);
-        // What a lossless transport hands back: the same bytes.
-        let round_tripped = mine.clone();
+    fn a_copy_out_to_the_desktop_and_a_paste_back_move_no_pixel() {
+        // Layer-texture form: premultiplied, so no component may exceed alpha.
+        let layer: Vec<u8> = vec![
+            200, 100, 50, 255, // opaque
+            0, 0, 0, 0, // clear
+            90, 40, 20, 128, // half covered
+            33, 33, 33, 200,
+        ];
+        let rect = umber_core::PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let mine = Clip::from_layer(rect, &layer, None).expect("a clip");
+        let desktop = Clip::from_rgba(mine.size().x, mine.size().y, mine.pixels().to_vec())
+            .expect("what a lossless desktop hands back");
+
+        let Paste::Mine(chosen) = decide(Some(desktop), Some(&mine)) else {
+            panic!("Umber's own copy was not recognised on the desktop's clipboard");
+        };
+        let placed = chosen
+            .place(glam::UVec2::splat(64), glam::vec2(32.0, 32.0))
+            .expect("somewhere to go");
         assert_eq!(
-            decide(Some(round_tripped), Some(&mine)),
-            Paste::Mine(mine.clone()),
+            placed.pixels, layer,
+            "a copy out to the machine and a paste back moved a pixel"
         );
     }
 
