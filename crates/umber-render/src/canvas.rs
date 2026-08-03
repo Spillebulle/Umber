@@ -2688,9 +2688,16 @@ impl CanvasRenderer {
     /// for a stroke drawn across the picture, and — much worse — it would be
     /// canvas-sized for a *thin diagonal* too, since that stroke's bounding box
     /// is the whole document. That is the 381 MB the tiled undo patch exists to
-    /// avoid, put back on the GPU. A piece is one row of the 64-pixel damage
-    /// grid, so the copy is bounded by `canvas width × 64` however long the
-    /// stroke is, and the texture is sized to the largest single piece.
+    /// avoid, put back on the GPU. A `TileMask` piece is one row of the
+    /// 64-pixel damage grid, so the copy is bounded by `canvas width × 64`
+    /// however long the stroke is, and the texture is sized to the largest
+    /// single piece.
+    ///
+    /// A caller that hands over the bounding rectangle as one piece gets a
+    /// backdrop the size of it, and that is the honest bound rather than a
+    /// hole in the one above: the undo patch for that same commit is the whole
+    /// rectangle too, so the backdrop is never larger than what the caller was
+    /// already paying for on the CPU.
     ///
     /// The cost is a render pass per piece rather than one pass with a scissor
     /// per piece, because a copy cannot be recorded inside a pass. That is a
