@@ -445,6 +445,23 @@ pub mod metrics {
     /// A progress bar — the update dialog's, and the same weight the splash
     /// draws its own at.
     pub const PROGRESS_BAR: f32 = 4.0;
+    /// One colour in the Palette module's grid, and the gap between two.
+    ///
+    /// Big enough that a colour can be judged against its neighbours and that
+    /// the remove mark inside its corner is a real target, and small enough
+    /// that a 264 px panel fits eight across — which is what makes a palette of
+    /// the usual sixteen two tidy rows.
+    pub const PALETTE_SWATCH: f32 = 26.0;
+    pub const PALETTE_SWATCH_GAP: f32 = 4.0;
+    /// The palette library: how wide the modal is, and how tall its list is.
+    ///
+    /// Fixed, for the reason [`BRUSH_LIBRARY`] is: the rows carry names
+    /// somebody else chose and the modal carries notices naming a file that
+    /// would not read, and one that grew to fit either ends up wider than the
+    /// screen. The second figure is the *list*, not the modal — the header and
+    /// the two buttons above it claim their own room first, and a scroll area
+    /// given the whole height would push them off the bottom on a short window.
+    pub const PALETTE_LIBRARY: [f32; 2] = [560.0, 380.0];
     /// The tallest a dropdown's menu grows before it scrolls.
     ///
     /// Some of the lists are long — thirteen dab inputs, ten blend modes, a

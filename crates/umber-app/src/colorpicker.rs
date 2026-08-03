@@ -857,8 +857,29 @@ fn sv_field(
 }
 
 /// How tall a harmony swatch is, and how far apart two of them sit.
-const HARMONY_SWATCH: f32 = 30.0;
+const HARMONY_SWATCH: f32 = 28.0;
 const HARMONY_GAP: f32 = 4.0;
+
+/// The bar under the swatch that is the colour in hand, and the gap above it.
+///
+/// **Under** the swatch rather than round it, and this is not a preference. An
+/// accent border on a swatch is invisible whenever the colour is near the
+/// accent — which for Umber's own accent is any warm ochre, and a warm ochre is
+/// exactly what somebody reaches a harmony wheel for. A ring in white or black
+/// picked by luminance would always contrast and would be a mark that changes
+/// shape as the colour moves; a bar on the panel's own background always reads,
+/// says the same thing every time, and is in the accent this interface already
+/// spells "this is the one" in.
+const HARMONY_MARK: f32 = 3.0;
+const HARMONY_MARK_GAP: f32 = 3.0;
+
+/// The whole height one member of the row takes: the colour, and room for the
+/// mark under it whether or not this one wears it.
+///
+/// Reserved for every member rather than added to the one that has it, or the
+/// row would be three pixels taller the moment the base moved and every swatch
+/// would step down under the pointer.
+const HARMONY_ROW: f32 = HARMONY_SWATCH + HARMONY_MARK_GAP + HARMONY_MARK;
 
 /// The hue ring with the chosen relation's other hues marked on it, a
 /// saturation/value square in the middle, and a row of the resulting colours
@@ -974,7 +995,18 @@ fn swatch_cell(row: Rect, index: usize, count: usize) -> Rect {
     let each = ((row.width() - HARMONY_GAP * (count - 1) as f32) / count as f32).max(1.0);
     Rect::from_min_size(
         pos2(row.left() + index as f32 * (each + HARMONY_GAP), row.top()),
-        vec2(each, row.height()),
+        vec2(
+            each,
+            (row.height() - HARMONY_MARK_GAP - HARMONY_MARK).max(1.0),
+        ),
+    )
+}
+
+/// The bar under one swatch, drawn only for the colour in hand.
+fn swatch_mark(cell: Rect) -> Rect {
+    Rect::from_min_size(
+        pos2(cell.left(), cell.bottom() + HARMONY_MARK_GAP),
+        vec2(cell.width(), HARMONY_MARK),
     )
 }
 
@@ -990,7 +1022,7 @@ fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bo
         return false;
     }
     let width = ui.available_width().max(MIN_PICKER);
-    let (row, _) = ui.allocate_exact_size(vec2(width, HARMONY_SWATCH), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(width, HARMONY_ROW), Sense::hover());
 
     let mut taken = None;
     for (index, hue) in hues.iter().enumerate() {
@@ -1004,16 +1036,22 @@ fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bo
         );
         ui.painter()
             .rect_filled(cell, metrics::RADIUS, Color32::from_rgb(r, g, b));
-        // The one in hand is outlined in the accent — the mark this interface
-        // already uses for "this is the one" — and the rest carry the ordinary
-        // border so a swatch the same colour as the panel still has an edge.
-        let (stroke, hint) = if index == 0 {
-            (Stroke::new(2.0, p.accent), "The colour in hand")
+        // An edge on every swatch, or one the colour of the panel has none.
+        ui.painter().rect_stroke(
+            cell,
+            metrics::RADIUS,
+            Stroke::new(1.0, p.border),
+            StrokeKind::Inside,
+        );
+        // And the bar under the one in hand. See `HARMONY_MARK` for why it is
+        // under rather than round.
+        let hint = if index == 0 {
+            ui.painter()
+                .rect_filled(swatch_mark(cell), metrics::RADIUS, p.accent);
+            "The colour in hand"
         } else {
-            (Stroke::new(1.0, p.border), "Take this colour")
+            "Take this colour"
         };
-        ui.painter()
-            .rect_stroke(cell, metrics::RADIUS, stroke, StrokeKind::Inside);
         if response
             .on_hover_text(format!("{hint} — #{r:02X}{g:02X}{b:02X}"))
             .clicked()
@@ -1462,13 +1500,22 @@ mod tests {
     #[test]
     fn the_harmony_swatches_tile_their_row_without_overlapping() {
         for width in [264.0_f32, 190.0, 48.0, 1.0, 0.0] {
-            let row = Rect::from_min_size(pos2(10.0, 20.0), vec2(width, HARMONY_SWATCH));
+            let row = Rect::from_min_size(pos2(10.0, 20.0), vec2(width, HARMONY_ROW));
             for count in 1..=umber_core::harmony::MAX_HUES {
                 let cells: Vec<Rect> = (0..count).map(|i| swatch_cell(row, i, count)).collect();
                 for cell in &cells {
                     assert!(cell.width() > 0.0 && cell.height() > 0.0, "{cell:?}");
                     assert_eq!(cell.top(), row.top());
-                    assert_eq!(cell.height(), row.height());
+                    // The mark's room is reserved on every swatch, so the row
+                    // does not change height as the base moves along it.
+                    assert_eq!(cell.height(), HARMONY_SWATCH);
+                    let mark = swatch_mark(*cell);
+                    assert!(mark.top() >= cell.bottom(), "the mark overlaps the colour");
+                    assert!(
+                        mark.bottom() <= row.bottom() + 1e-3,
+                        "the mark runs off the row"
+                    );
+                    assert_eq!(mark.width(), cell.width());
                 }
                 for pair in cells.windows(2) {
                     assert!(
@@ -1486,6 +1533,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The Harmony mode at the panel's real width, at each relation.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is:
+    /// what can go wrong in a ring, a square, a dropdown and a row that divides
+    /// itself four ways is a *layout*, and no assertion about widgets catches
+    /// controls drawn over each other. It also answers the one question the
+    /// maths cannot: whether four markers on a ring can be told apart.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app harmony_picker_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn harmony_picker_preview() {
+        use crate::docshot;
+        use crate::theme::{Palette, metrics};
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/harmony");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        let palette = Palette::of(crate::theme::ThemeKind::Graphite);
+        for (index, relation) in Harmony::ALL.into_iter().enumerate() {
+            let mut harmony = relation;
+            let mut hsv = Hsv::new(28.0, 0.72, 0.86);
+            let field = vec2(metrics::PANEL - 2.0 * metrics::PANEL_PAD as f32, 300.0);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                harmony_wheel(root, &palette, &mut harmony, &mut hsv);
+            });
+            let name = format!("{}-{}", index + 1, relation.label().replace(' ', "-"));
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote {} shots to {}", Harmony::ALL.len(), dir.display());
     }
 
     /// A triangle squashed to nothing has no outward direction, and one NaN
