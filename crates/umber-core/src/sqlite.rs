@@ -1253,6 +1253,41 @@ mod tests {
         assert!(err.to_string().contains("child pointer"), "{err}");
     }
 
+    /// The other half of the same hole, and the one a real `.sut` would reach
+    /// first: a record that spills into an overflow chain keeps the pointer to
+    /// it in the four bytes *after* its local payload, which the "does the
+    /// record fit in the usable area" check does not cover.
+    #[test]
+    fn an_overflow_pointer_past_the_end_of_a_page_is_refused_rather_than_read_past() {
+        let mut bytes = database(&[TableSpec::new("A", &["x"]).row(vec![Value::Integer(1)])]);
+        let root = {
+            let db = Database::open(&bytes).expect("open");
+            db.table("A").expect("look up").expect("present").root
+        };
+        let at = (root as usize - 1) * 4096;
+
+        // Hand-built, because a page SQLite itself laid out cannot show this:
+        // it packs the last cell flush to the end, which puts the pointer
+        // exactly on the boundary. A record declaring 4062 bytes keeps
+        // `min_local` of them here — 489 on a 4096-byte page — so a cell placed
+        // at 3601 ends its payload at 4093 and its overflow pointer one byte
+        // past the page, while still satisfying the "the record fits in the
+        // usable area" check that is the only bound on this read.
+        let page = &mut bytes[at..at + 4096];
+        page.fill(0);
+        page[0] = 0x0d;
+        page[3..5].copy_from_slice(&1u16.to_be_bytes());
+        page[5..7].copy_from_slice(&3601u16.to_be_bytes());
+        page[8..10].copy_from_slice(&3601u16.to_be_bytes());
+        // varint(4062), then varint(rowid 1).
+        page[3601..3604].copy_from_slice(&[0x9f, 0x5e, 0x01]);
+
+        let db = Database::open(&bytes).expect("open");
+        let table = db.table("A").expect("look up").expect("present");
+        let err = db.rows(&table).unwrap_err();
+        assert!(err.to_string().contains("overflow pointer"), "{err}");
+    }
+
     /// An index b-tree holds the same rows in a different order, so following
     /// one would produce duplicates rather than more data. Refusing says which
     /// page, which is what makes a surprising file diagnosable.

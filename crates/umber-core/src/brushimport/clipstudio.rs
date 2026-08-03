@@ -69,11 +69,15 @@
 //!   is not because the bit cannot be identified — it can, see [`TILT`] — but
 //!   because no platform Umber runs on reports tilt at all, so the modulation
 //!   would sit at a value the pen never produces.
-//! - **A source is only carried where the *setting* it drives has an Umber
-//!   field**, which is what [`IMPORTED_INPUTS`] states, and everything else is
-//!   named — pressure and randomness included. Those two used to be dropped in
-//!   silence on the grounds that Umber produces them, which reads the rule the
-//!   wrong way round: what is lost is the *mapping*, not the input.
+//! - **Pressure and the random draw driving a setting Umber has no field for
+//!   are lost and deliberately not named.** They are as lost as a tilt mapping
+//!   is, and reporting them was tried: the sweep cannot tell a live effector
+//!   from one whose bits Clip Studio left behind when the setting was switched
+//!   off, and those two bits are set on far more columns than tilt or velocity
+//!   ever are — so the sentence appeared on nearly every import and was often
+//!   about a mapping the brush does not have. [`unreachable_inputs`] has the
+//!   whole argument. Silence beats a false apology until the enable flag beside
+//!   each effector can be read.
 //! - **A floor is part of a mapping and is carried with it.** Clip Studio
 //!   states each dynamic's minimum as a percentage of the setting's own value,
 //!   and for size that is [`Brush::min_size_ratio`] exactly. Opacity has no
@@ -128,15 +132,12 @@ pub mod dropped {
     /// Stroke speed reaches size and per-dab opacity; on anything else there is
     /// no Umber setting for it to drive.
     pub const SPEED_ELSEWHERE: &str = "stroke speed driving a setting Umber has no equivalent for";
-    /// Pressure reaches size, hardness and per-dab opacity. Anything else it
-    /// drives in Clip Studio has nowhere to land, and used to be dropped in
-    /// silence — which is the one thing an interactive import may not do.
-    pub const PRESSURE_ELSEWHERE: &str =
-        "pen pressure driving a setting Umber has no equivalent for";
-    /// The per-dab random draw reaches the dab's radius and its angle. Same
-    /// rule, and it was silent for the same reason.
-    pub const RANDOM_ELSEWHERE: &str =
-        "per-dab randomness driving a setting Umber has no equivalent for";
+    /// The brush names a paper and this reader could not read the reference.
+    /// The strength and the tile size are still in the file; applying them to
+    /// one of Umber's papers would be a grain invented out of a reference
+    /// nobody could resolve, so it is named instead — the same answer
+    /// [`UNUSABLE_TIP`] gives for the analogous tip.
+    pub const UNREADABLE_TEXTURE: &str = "a paper texture this reader could not resolve";
     pub const MIXING: &str = "the detail of Clip Studio's underlying-colour mixing";
     pub const DUAL_BRUSH: &str = "dual brushes";
     pub const WATER_EDGE: &str = "watercolour edges";
@@ -587,60 +588,47 @@ fn at(points: &[(f64, f64)], x: f64) -> f64 {
     points.last().expect("at least two points").1
 }
 
-/// Which effect sources [`convert`] actually lands somewhere, per column.
-///
-/// One table rather than a rule beside each conversion, because
-/// [`unreachable_inputs`] has to name exactly what was *not* taken — two lists
-/// would drift into a brush that both imports a mapping and apologises for it.
-/// A column absent from the table has none of its sources imported, which is
-/// the right default: a setting this reader has never heard of is one whose
-/// behaviour certainly will not arrive.
-///
-/// [`SPEED_TARGETS`] is the velocity half stated again with the target beside
-/// it, and `every_speed_target_is_declared_as_imported` is what keeps the two
-/// from disagreeing.
-const IMPORTED_INPUTS: [(&str, u32); 5] = [
-    ("BrushSizeEffector", PRESSURE | VELOCITY | RANDOM),
-    ("BrushOpacityEffector", PRESSURE | VELOCITY),
-    ("BrushFlowEffector", PRESSURE | VELOCITY),
-    ("BrushHardnessEffector", PRESSURE),
-    ("BrushRotationEffector", RANDOM),
-];
-
 /// The effect sources on this brush that Umber will not reproduce.
 ///
 /// Every `*Effector` column is swept rather than the handful this importer
 /// reads, because the question is what the *brush* does and not what this
 /// function happens to look at — a setting Umber has no field for at all is
-/// still a setting whose behaviour will not arrive.
+/// still a setting whose behaviour will not arrive. `driven` names the columns
+/// whose velocity mapping *was* imported, so speed is only reported where it
+/// really had nowhere to go.
 ///
-/// All four sources are reported, not only the two Umber cannot produce at all.
-/// Pressure and the random draw *are* produced, and land on a handful of
-/// settings; on any other setting they are as lost as tilt is, and they used to
-/// go unnamed — a brush whose hardness or spray followed the pen arrived
-/// looking like an import that had nothing to apologise for.
-fn unreachable_inputs(settings: &Settings) -> Vec<&'static str> {
+/// **Only tilt, the unnamed fifth source and stray velocity are reported, and
+/// pressure and the random draw deliberately are not** — even though a mapping
+/// of either onto a setting Umber has no field for is just as lost. Reporting
+/// them was tried and is wrong here for two compounding reasons. The sweep is
+/// over a schema of 187 to 214 columns and cannot tell an effector whose bits
+/// are live from one whose bits are *stale*, and Clip Studio leaves a setting's
+/// value in the file when the setting is switched off — the trap the taper, the
+/// angle jitter, the spacing and the paper each read a separate field to avoid.
+/// Pressure and randomness are set on far more of those columns than tilt or
+/// velocity ever are, so the result was a sentence appearing on nearly every
+/// import, frequently about a mapping the brush does not have. `docs/brushes.md`
+/// records that the random bit is the *only* bit ever set on the hue,
+/// saturation and brightness effectors in either sample file — so a brush with
+/// colour jitter switched off would have apologised for it, and one with it
+/// switched on would have said the same loss twice, once vaguely.
+///
+/// A list that cries wolf is one a reader learns to skip, which costs the
+/// losses that do matter — the same argument the skipped fill tool and the
+/// automatic dab interval already make. Naming these properly needs the enable
+/// flag beside each effector, which means knowing what those columns are
+/// called; until then silence beats a false apology.
+fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str> {
     let mut out = Vec::new();
     let mut note = |sources: u32, column: &str| {
-        let taken = IMPORTED_INPUTS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(column))
-            .map_or(0, |(_, inputs)| *inputs);
-        let lost = sources & !taken;
-        if lost & TILT != 0 {
+        if sources & TILT != 0 {
             push_once(&mut out, dropped::TILT_INPUT);
         }
-        if lost & UNKNOWN != 0 {
+        if sources & UNKNOWN != 0 {
             push_once(&mut out, dropped::UNKNOWN_INPUT);
         }
-        if lost & VELOCITY != 0 {
+        if sources & VELOCITY != 0 && !driven.contains(&column) {
             push_once(&mut out, dropped::SPEED_ELSEWHERE);
-        }
-        if lost & PRESSURE != 0 {
-            push_once(&mut out, dropped::PRESSURE_ELSEWHERE);
-        }
-        if lost & RANDOM != 0 {
-            push_once(&mut out, dropped::RANDOM_ELSEWHERE);
         }
     };
 
@@ -978,6 +966,13 @@ fn convert(
     // has the whole shape of it — the flag, the floor and the curve. Reading it
     // is what makes a soft pencil feathery at a light touch instead of drawing
     // one edge for every pressure the hand can produce.
+    //
+    // The floor is taken **as the file states it**, including zero, where
+    // `Brush::min_hardness_ratio`'s own default of 0.5 exists to keep the soft
+    // end "a brush rather than a cloud". That default is Umber's taste for a
+    // hand-written preset; this is somebody's brush, and a Clip Studio dynamic
+    // whose minimum is zero really does go fully diffuse at a feather touch.
+    // Same rule `min_size_ratio` is already read by, one line up.
     if let Some(effector) = settings
         .effector("BrushHardnessEffector")
         .filter(|e| e.drives(PRESSURE))
@@ -1110,10 +1105,21 @@ fn convert(
     // exactly as it does for a tip, and the strength and the tile size are
     // still the author's numbers. What is checked is that the reference names
     // one at all.
-    if settings
+    //
+    // The two failures are told apart rather than both reading as "no paper",
+    // because they are not the same thing. A reference holding no materials is
+    // a texture that was never set, and there is nothing to report. One that
+    // holds a material this reader could not resolve is a paper the brush
+    // genuinely has, and going quiet about it would be a brush that paints
+    // smoother than its author's with nothing saying why — which is the answer
+    // `UNUSABLE_TIP` already gives for the analogous tip.
+    let texture = settings
         .blob("TextureImage")
-        .is_some_and(|r| reference_count(r) > 0 && reference_path(r).is_some())
-    {
+        .filter(|r| reference_count(r) > 0);
+    if texture.is_some_and(|r| reference_path(r).is_none()) {
+        push_once(&mut dropped, dropped::UNREADABLE_TEXTURE);
+    }
+    if texture.is_some_and(|r| reference_path(r).is_some()) {
         brush.grain = settings
             .percent("TextureDensity")
             .unwrap_or(0.0)
@@ -1192,7 +1198,7 @@ fn convert(
     if settings.flag("BrushContinuousPlot") {
         brush.dabs_per_second = HELD_SPRAY_RATE;
     }
-    for loss in unreachable_inputs(settings) {
+    for loss in unreachable_inputs(settings, &SPEED_TARGETS.map(|(column, _)| column)) {
         push_once(&mut dropped, loss);
     }
     if settings.flag("UseDualBrush") {
@@ -1241,19 +1247,17 @@ fn floored(curve: ResponseCurve, floor: f32) -> ResponseCurve {
     out
 }
 
-/// Two responses multiplied sample by sample.
+/// Two responses multiplied sample by sample, which is what lets one Umber
+/// curve carry two Clip Studio settings that multiply.
 ///
-/// [`ResponseCurve`] is a fixed row of evenly spaced samples, so the product of
-/// two of them is the product of their samples and there is nothing to resample
-/// — which is the whole reason two Clip Studio settings that multiply can be
-/// carried by one Umber curve.
-///
-/// Exact at every knot and at both ends, and an approximation between them: the
-/// product of two piecewise-linear curves is quadratic, and this re-linearises
-/// it over each quarter of the range. That is the resolution [`ResponseCurve`]
-/// has at all — the same bound [`Effector::curve_for`] already accepts when it
-/// resamples Clip Studio's own control points onto five knots — so the error is
-/// below what could be recorded either way.
+/// **Exact at the five knots and an approximation between them**, and the
+/// difference is worth stating because [`floored`] beside it genuinely is
+/// exact everywhere. The product of two piecewise-linear curves is
+/// *quadratic*; this re-linearises it over each quarter of the range, which
+/// bows by at most `Δa·Δb/4` — four levels of eight-bit coverage in the worst
+/// case, two `LINEAR` curves. That is the resolution [`ResponseCurve`] has at
+/// all, and the same bound [`Effector::curve_for`] already accepts when it
+/// resamples Clip Studio's own control points onto those five knots.
 fn multiplied(a: ResponseCurve, b: ResponseCurve) -> ResponseCurve {
     let mut out = a;
     for i in 0..ResponseCurve::N {
@@ -2086,64 +2090,38 @@ mod tests {
         assert!(!brush.pressure_hardness);
     }
 
-    /// Pressure and the per-dab random draw *are* inputs Umber produces, which
-    /// is why they used to be passed over here — and that reads the rule the
-    /// wrong way round. What is lost is the mapping, not the input, and a
-    /// mapping onto a setting Umber has no field for is exactly as lost as a
-    /// tilt one.
+    /// Pressure and the random draw driving a setting Umber has no field for
+    /// are as lost as a tilt mapping, and are deliberately **not** reported —
+    /// see [`unreachable_inputs`] for the argument. This is what pins that the
+    /// silence is a decision rather than an oversight: a list that apologises
+    /// on nearly every import is one a reader learns to skip, taking the losses
+    /// that matter with it.
     #[test]
-    fn pressure_and_randomness_with_nowhere_to_land_are_named() {
+    fn pressure_and_randomness_with_nowhere_to_land_stay_quiet() {
         let bytes = sut(
             &[
                 (
                     "Textured",
                     Variant::plain(1).set(
                         "TextureDensityEffector",
-                        effector(PRESSURE, [0; 4], &[], &[]),
+                        effector(PRESSURE | RANDOM, [0, 0, 0, 40], &[], &[]),
                     ),
                 ),
+                // Tilt on the same column still speaks, so the sweep is
+                // demonstrably still running over it.
                 (
-                    "Speckled",
+                    "Tilted",
                     Variant::plain(2).set(
                         "TextureDensityEffector",
-                        effector(RANDOM, [0, 0, 0, 40], &[], &[]),
-                    ),
-                ),
-                // Both of these do land, and must stay quiet.
-                (
-                    "Ordinary",
-                    Variant::plain(3).set(
-                        "BrushSizeEffector",
-                        effector(PRESSURE | RANDOM, [0, 0, 0, 50], &[], &[]),
+                        effector(PRESSURE | TILT, [0; 4], &[], &[]),
                     ),
                 ),
             ],
             &[],
         );
         let tools = from_sut(&bytes).expect("read").tools;
-        assert_eq!(tools[0].dropped, [dropped::PRESSURE_ELSEWHERE]);
-        assert_eq!(tools[1].dropped, [dropped::RANDOM_ELSEWHERE]);
-        assert!(tools[2].dropped.is_empty(), "{:?}", tools[2].dropped);
-    }
-
-    /// The velocity half of [`IMPORTED_INPUTS`] is stated twice — there, and in
-    /// [`SPEED_TARGETS`] with the Umber target beside it. Two statements of one
-    /// fact drift into a brush that both imports a mapping and apologises for
-    /// it, so this is what keeps them together.
-    #[test]
-    fn every_speed_target_is_declared_as_imported() {
-        for (column, _) in SPEED_TARGETS {
-            let declared = IMPORTED_INPUTS
-                .iter()
-                .find(|(name, _)| *name == column)
-                .unwrap_or_else(|| {
-                    panic!("{column} routes velocity but is not in IMPORTED_INPUTS")
-                });
-            assert!(
-                declared.1 & VELOCITY != 0,
-                "{column} routes velocity and would still be reported as lost"
-            );
-        }
+        assert!(tools[0].dropped.is_empty(), "{:?}", tools[0].dropped);
+        assert_eq!(tools[1].dropped, [dropped::TILT_INPUT]);
     }
 
     /// Clip Studio leaves a setting's value in the file when the setting is
@@ -2155,14 +2133,8 @@ mod tests {
     /// laid down again.
     #[test]
     fn a_texture_reference_that_names_no_material_leaves_the_brush_ungrained() {
-        for stale in [
-            // A reference holding no materials at all.
-            reference(".:paper:data:material_0.layer", 0),
-            // And one whose text is not a member path, which is what a stub
-            // left over from an unset texture looks like.
-            reference("", 1),
-        ] {
-            let bytes = sut(
+        let textured = |stale: Value| {
+            sut(
                 &[(
                     "Untextured",
                     Variant::plain(1)
@@ -2171,13 +2143,24 @@ mod tests {
                         .real("TextureScale2", 100.0),
                 )],
                 &[],
-            );
-            let tool = from_sut(&bytes).expect("read").tools.remove(0);
-            assert_eq!(tool.brush.grain, 0.0);
-            assert!(!tool.brush.has_grain());
-            // And nothing is claimed to have been lost, because nothing was.
-            assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
-        }
+            )
+        };
+
+        // A reference holding no materials at all: a texture that was never
+        // set, so there is nothing to grain and nothing to report.
+        let bytes = textured(reference(".:paper:data:material_0.layer", 0));
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.brush.grain, 0.0);
+        assert!(!tool.brush.has_grain());
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        // One that holds a material this reader cannot resolve is a paper the
+        // brush genuinely has. Still no invented grain — but it says so, which
+        // is the answer the analogous tip already gives.
+        let bytes = textured(reference("", 1));
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.brush.grain, 0.0);
+        assert_eq!(tool.dropped, [dropped::UNREADABLE_TEXTURE]);
     }
 
     /// Speed on Clip Studio's per-dab density is Umber's per-dab opacity, and

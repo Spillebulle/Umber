@@ -905,15 +905,22 @@ blobs, reads the four the same way. A fifth bit, `0x100`, is declared as
 supported by brush size and its neighbours and is never switched on in either
 sample file; it is named as unrecognised rather than guessed at.
 
-**A source is carried only where the setting it drives has an Umber field, and
-everything else is named.** `IMPORTED_INPUTS` is the one statement of which
-sources land on which column — pressure on size, hardness and the two coverage
-settings; velocity on size and the two coverage settings; randomness on size and
-the dab angle — and `unreachable_inputs` reports the complement. Pressure and
-the random draw used to be passed over on the grounds that Umber produces them
-both, which reads the rule backwards: what is lost is the *mapping*, not the
-input, and a brush whose hardness or spray followed the pen arrived looking like
-an import with nothing to apologise for.
+**Pressure and randomness driving a setting Umber has no field for are lost and
+deliberately not named.** They are as lost as a tilt mapping, so reporting them
+was tried — and it is wrong here for two compounding reasons. The sweep runs
+over a schema of 187 to 214 columns and cannot tell a live effector from one
+whose bits Clip Studio left behind when the setting was switched off, which is
+the trap `BrushUseIn`, `BrushRotationEffector`, `BrushAutoIntervalType` and the
+texture reference each read a separate field to avoid. And those two bits are set
+on far more columns than tilt or velocity ever are: the random bit is the *only*
+bit ever set on the hue, saturation and brightness effectors in either sample
+file, so a brush with colour jitter switched off would have apologised for a
+mapping it does not have, and one with it switched on would have said the same
+loss twice, once vaguely. A list that cries wolf is one a reader learns to skip,
+which costs the losses that do matter — the argument the skipped fill tool and
+the automatic dab interval already make. Naming these properly needs the enable
+flag beside each effector, and that means learning what those columns are
+called.
 
 **A dynamic's floor is half of what it says, and it is carried with the curve.**
 Clip Studio states the minimum as a percentage of the setting's own value, which
@@ -932,7 +939,11 @@ is one dab's, and they multiply; `SPEED_TARGETS` already composed them that way
 for velocity while the pressure half read `BrushOpacityEffector` alone, so a
 brush whose density followed the pen imported painting at full density
 throughout. Two curves multiply sample by sample, which is the whole reason one
-`ResponseCurve` can carry both.
+`ResponseCurve` can carry both — exact at the five knots and bowing by at most
+`Δa·Δb/4` between them, since the product of two piecewise-linear curves is
+quadratic. That is the resolution `ResponseCurve` has at all, and the bound
+`curve_for` already accepts when it resamples Clip Studio's control points onto
+those knots.
 
 **Velocity is Umber's `Speed` input, and it reaches size and per-dab opacity.**
 The shape is the same in both engines: full at a standstill, falling towards the
@@ -985,7 +996,11 @@ opacity claims, and darker each time the stroke is laid down again, since the
 pits are anchored to the document and a second pass composites over the first.
 Deliberately not gated on the material being *present*, only on it being named:
 Clip Studio leaves an installed one out of the file and expects to find it
-locally, exactly as it does for a tip.
+locally, exactly as it does for a tip. The two failures are told apart — a
+reference holding no materials is a texture that was never set and there is
+nothing to report, while one naming a material this reader cannot resolve is a
+paper the brush genuinely has, and it is named rather than passed over, which is
+the answer `UNUSABLE_TIP` already gives for the analogous tip.
 
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
