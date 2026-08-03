@@ -6,8 +6,8 @@ use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{
-    Affine, Anchor, Background, BrushMode, Camera, CanvasCopy, Color, Dab, FlipAxis, PixelRect,
-    Selection, TipMask, transform,
+    Affine, Anchor, Background, BlendMode, BrushMode, Camera, CanvasCopy, Color, Dab, FlipAxis,
+    PixelRect, Selection, TipMask, transform,
 };
 use wgpu::util::DeviceExt;
 
@@ -90,6 +90,15 @@ const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 const BLEND_PRELUDE_COMPOSITE: &str = concat!(
     include_str!("../shaders/blend.wgsl"),
     include_str!("../shaders/composite.wgsl"),
+);
+
+/// The commit pass, with the same blend modes in front of it.
+///
+/// The other half of [`BLEND_PRELUDE_COMPOSITE`]: the preview and the thing
+/// that replaces it are compiled from one copy of `blend.wgsl`.
+const BLEND_PRELUDE_COMMIT: &str = concat!(
+    include_str!("../shaders/blend.wgsl"),
+    include_str!("../shaders/commit.wgsl"),
 );
 
 /// Per-dab colour, for a smudging stroke only.
@@ -634,6 +643,24 @@ pub struct StrokeStyle {
     /// Applied once, on commit — never folded into per-dab coverage.
     pub opacity: f32,
     pub mode: BrushMode,
+    /// How the finished stroke combines with the layer it lands on:
+    /// `umber_core::Brush::blend`, snapshotted with everything else here.
+    ///
+    /// It lives in this struct for the reason everything else in it does. The
+    /// preview computes it in `composite.wgsl` and the commit computes it in
+    /// `commit.wgsl`, out of one shared `composite_over` — so the two cannot
+    /// disagree about what Multiply is, but they still have to be told the same
+    /// mode, and being handed one `StrokeStyle` is what guarantees that.
+    ///
+    /// [`BlendMode::Normal`] is the path every stroke took before brushes had
+    /// one, and it stays exactly as it was: the fixed-function blender does it,
+    /// with no backdrop copy and no extra pass.
+    ///
+    /// Ignored when [`StrokeStyle::mode`] is [`BrushMode::Erase`] — an eraser
+    /// deposits no colour for a mode to combine — and
+    /// `umber_core::Brush::blend_applies` is where that is decided, so nothing
+    /// here has to hold both in mind.
+    pub blend: BlendMode,
     /// The stroke deposits a colour per dab — it smudges — so `color` is only
     /// the fallback and the real colour comes from the stroke's colour scratch.
     ///
@@ -660,6 +687,7 @@ impl Default for StrokeStyle {
             color: Color::BLACK,
             opacity: 1.0,
             mode: BrushMode::Paint,
+            blend: BlendMode::Normal,
             per_dab_color: false,
             on_mask: false,
         }
@@ -882,7 +910,10 @@ struct ViewUniforms {
     per_dab_color: u32,
     /// The stroke in flight is going into the active layer's mask.
     stroke_on_mask: u32,
-    _pad: u32,
+    /// The brush's blend mode, in [`BlendMode::index`]'s numbering. Took the
+    /// place of the padding word that was here, so the block is the size it
+    /// always was — see the WGSL struct.
+    stroke_blend: u32,
     /// (opacity, blend, slot, visible) per stack position.
     layers: [[f32; 4]; MAX_LAYERS],
     /// (mask slot, has mask, clipped, unused) per stack position. See the WGSL
@@ -911,6 +942,7 @@ struct TransformUniforms {
     _pad2: f32,
 }
 
+/// Mirrors `Commit` in `commit.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CommitUniforms {
@@ -921,7 +953,11 @@ struct CommitUniforms {
     color: [f32; 4],
     mode: u32,
     per_dab_color: u32,
-    _pad2: [f32; 2],
+    /// [`BlendMode::index`]. Took one of the two padding words already here, so
+    /// the block is the size it always was. Scalars rather than a `vec3`: see
+    /// the uniform-layout note in CLAUDE.md.
+    blend: u32,
+    _pad2: u32,
 }
 
 /// Mirrors `Flip` in `flip.wgsl`.
@@ -1070,6 +1106,14 @@ struct Shared {
     commit_layout: wgpu::BindGroupLayout,
     commit_pipeline: wgpu::RenderPipeline,
     commit_erase_pipeline: wgpu::RenderPipeline,
+    /// A commit for a brush whose blend mode is not Normal.
+    ///
+    /// Its own layout because it needs a fifth binding — a copy of the layer
+    /// under the piece, which the pass cannot sample out of its own attachment
+    /// — and because its uniform is bound with a dynamic offset, one block per
+    /// piece. See [`CanvasRenderer::commit_blended`].
+    commit_blend_layout: wgpu::BindGroupLayout,
+    commit_blend_pipeline: wgpu::RenderPipeline,
 
     /// Mirrors one layer slice. See `flip.wgsl` for why it is its own pass
     /// rather than a copy or a use of the transform resampler.
@@ -1358,9 +1402,13 @@ impl Shared {
             make_composite("composite-offscreen-pipeline", OFFSCREEN_FORMAT);
 
         // ---- commit pass ----------------------------------------------------
+        //
+        // `blend.wgsl` in front of this one too — see `BLEND_PRELUDE_COMMIT`.
+        // The preview and the commit call one `composite_over` rather than each
+        // carrying a copy of it.
         let commit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("commit"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/commit.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(BLEND_PRELUDE_COMMIT.into()),
         });
         let commit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("commit-bgl"),
@@ -1432,6 +1480,74 @@ impl Shared {
                 alpha: erase_blend,
             },
         );
+
+        // The blended commit: everything the fixed-function blender cannot do.
+        //
+        // Multiply needs the pixel underneath, and no combination of blend
+        // factors produces `B(Cb, Cs)`, so `fs_blend` computes the whole result
+        // and the target's blend is `None`. The destination it needs is bound
+        // at 4 as a copy, because a colour attachment may not also be sampled
+        // — the same constraint `flip.wgsl` works around.
+        //
+        // The uniform carries a **dynamic offset**: one block per damaged
+        // piece, because each piece is drawn against its own backdrop copy and
+        // the vertex shader spans the piece rather than the whole rectangle.
+        // One buffer and one bind group either way; the alternative was a bind
+        // group per piece, which is allocation churn on pointer-up for nothing.
+        let commit_blend_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("commit-blend-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    texture_entry(1),
+                    sampler_entry(2),
+                    texture_entry(3),
+                    texture_entry(4),
+                ],
+            });
+        let commit_blend_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("commit-blend-pl"),
+            bind_group_layouts: &[Some(&commit_blend_layout)],
+            immediate_size: 0,
+        });
+        let commit_blend_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("commit-blend"),
+                layout: Some(&commit_blend_pl),
+                vertex: wgpu::VertexState {
+                    module: &commit_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &commit_shader,
+                    entry_point: Some("fs_blend"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: LAYER_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         // ---- flip pass ------------------------------------------------------
         //
@@ -1616,6 +1732,8 @@ impl Shared {
             commit_layout,
             commit_pipeline,
             commit_erase_pipeline,
+            commit_blend_layout,
+            commit_blend_pipeline,
             flip_layout,
             flip_pipeline,
             transform_layout,
@@ -2406,7 +2524,12 @@ impl CanvasRenderer {
                 is_export: if params.export { 1 } else { 0 },
                 per_dab_color: u32::from(params.stroke.per_dab_color),
                 stroke_on_mask: u32::from(params.stroke.on_mask),
-                _pad: 0,
+                // The brush's mode, and it reaches the shader for the paint
+                // path alone — an eraser's branch never reads it. Not clamped
+                // or coerced here: `Brush::blend_applies` is the one place that
+                // decision is made, and restating it would be a second place
+                // for the preview and the commit to disagree.
+                stroke_blend: params.stroke.blend.index(),
                 layers: packed,
                 extra,
             }),
@@ -2455,8 +2578,22 @@ impl CanvasRenderer {
     ///
     /// It is also less work. A thin diagonal across a large canvas commits a
     /// hundred and fifty narrow strips instead of the whole document.
+    ///
+    /// A brush carrying a blend mode other than [`BlendMode::Normal`] goes down
+    /// [`Self::commit_blended`] instead. Normal — every stroke there has ever
+    /// been — is untouched: the same one pass, the same fixed-function blender,
+    /// no copy and no allocation.
+    ///
+    /// The device is here because the blended path allocates — a backdrop
+    /// texture, a uniform block per piece and a bind group, all dropped when it
+    /// returns. Bundling the arguments to please the lint would hide which of
+    /// them the two paths share; `rect` and `pieces` are separately meaningful
+    /// (the first is what the quad spans, the second what survives the scissor)
+    /// and the style is already the one struct preview and commit share.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_stroke(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         slot: u32,
@@ -2468,6 +2605,17 @@ impl CanvasRenderer {
             log::error!("commit to slot {slot} beyond capacity");
             return;
         };
+
+        // An eraser has no colour, so it has nothing to blend; `blend` is
+        // ignored rather than refused, which is the same reading
+        // `umber_core::Brush::blend_applies` gives and the reason the editor
+        // never sends one here in the first place.
+        if style.mode == BrushMode::Paint && style.blend != BlendMode::Normal {
+            self.commit_blended(device, encoder, slot, pieces, style);
+            self.clear_stroke(encoder);
+            self.touch_slot(slot);
+            return;
+        }
 
         let color = style.color;
         queue.write_buffer(
@@ -2481,7 +2629,8 @@ impl CanvasRenderer {
                 color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
                 mode: mode_index(style.mode),
                 per_dab_color: u32::from(style.per_dab_color),
-                _pad2: [0.0; 2],
+                blend: BlendMode::Normal.index(),
+                _pad2: 0,
             }),
         );
 
@@ -2519,6 +2668,199 @@ impl CanvasRenderer {
 
         self.clear_stroke(encoder);
         self.touch_slot(slot);
+    }
+
+    /// The commit for a brush whose blend mode is not Normal.
+    ///
+    /// # Why this needs a copy at all
+    ///
+    /// Multiply is a function of the pixel underneath, and no combination of
+    /// fixed-function blend factors can produce one — `B(Cb, Cs)` is not linear
+    /// in the destination for Overlay, and even Multiply's premultiplied form
+    /// needs the source twice. So the destination has to arrive as a *sampled*
+    /// input, and a colour attachment may not also be bound for sampling. The
+    /// pass therefore reads a copy, which is the arrangement `flip.wgsl` uses
+    /// for the same reason.
+    ///
+    /// # Why the copy is per piece
+    ///
+    /// A backdrop covering the whole damaged rectangle would be canvas-sized
+    /// for a stroke drawn across the picture, and — much worse — it would be
+    /// canvas-sized for a *thin diagonal* too, since that stroke's bounding box
+    /// is the whole document. That is the 381 MB the tiled undo patch exists to
+    /// avoid, put back on the GPU. A piece is one row of the 64-pixel damage
+    /// grid, so the copy is bounded by `canvas width × 64` however long the
+    /// stroke is, and the texture is sized to the largest single piece.
+    ///
+    /// The cost is a render pass per piece rather than one pass with a scissor
+    /// per piece, because a copy cannot be recorded inside a pass. That is a
+    /// hundred and fifty passes for the worst stroke on the largest canvas,
+    /// once, at pointer-up, on a path that already does a blocking readback for
+    /// the undo patch — and only for a brush that asked for a blend mode.
+    ///
+    /// Everything allocated here is dropped when the commit returns. A stroke
+    /// is not often enough to be worth caching, and caching would mean holding
+    /// a canvas-wide texture for a session because one stroke wanted it.
+    fn commit_blended(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+        pieces: &[PixelRect],
+        style: StrokeStyle,
+    ) {
+        let Some(view) = self.layers.slot_views.get(slot as usize) else {
+            return;
+        };
+        // A zero-sized piece would be an illegal copy extent and draws nothing
+        // anyway. `pieces` never holds one today; skipping is cheaper than
+        // depending on that.
+        let live: Vec<PixelRect> = pieces
+            .iter()
+            .copied()
+            .filter(|p| p.width > 0 && p.height > 0)
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+
+        let widest = live.iter().map(|p| p.width).max().unwrap_or(1);
+        let tallest = live.iter().map(|p| p.height).max().unwrap_or(1);
+        let backdrop = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("umber-commit-backdrop"),
+            size: wgpu::Extent3d {
+                width: widest,
+                height: tallest,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LAYER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // One uniform block per piece, because the vertex shader spans the
+        // piece rather than the whole rectangle: the backdrop copy sits at the
+        // texture's origin, so `rect_min` is what maps a fragment into it.
+        let stride = (device.limits().min_uniform_buffer_offset_alignment as usize)
+            .max(std::mem::size_of::<CommitUniforms>());
+        let color = style.color;
+        let mut blocks = vec![0u8; stride * live.len()];
+        for (i, piece) in live.iter().enumerate() {
+            let block = CommitUniforms {
+                rect_min: [piece.x as f32, piece.y as f32],
+                rect_max: [
+                    (piece.x + piece.width) as f32,
+                    (piece.y + piece.height) as f32,
+                ],
+                doc_size: [self.doc_size.x as f32, self.doc_size.y as f32],
+                _pad0: [0.0; 2],
+                color: [color.r, color.g, color.b, style.opacity.clamp(0.0, 1.0)],
+                mode: mode_index(style.mode),
+                per_dab_color: u32::from(style.per_dab_color),
+                blend: style.blend.index(),
+                _pad2: 0,
+            };
+            let at = i * stride;
+            blocks[at..at + std::mem::size_of::<CommitUniforms>()]
+                .copy_from_slice(bytemuck::bytes_of(&block));
+        }
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("umber-commit-blend-uniforms"),
+            contents: &blocks,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("commit-blend-bg"),
+            layout: &self.shared.commit_blend_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniforms,
+                        offset: 0,
+                        // One block, not the whole buffer: with a dynamic
+                        // offset the bound range is `offset .. offset + size`,
+                        // and binding the lot would run off the end.
+                        size: wgpu::BufferSize::new(std::mem::size_of::<CommitUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.stroke_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.shared.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.stroke_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&backdrop_view),
+                },
+            ],
+        });
+
+        for (i, piece) in live.iter().enumerate() {
+            // The copy has to precede the pass that reads it, and a copy cannot
+            // be recorded inside one. Pieces never overlap, so piece *i* reads
+            // pixels no earlier piece wrote.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.layers.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: piece.x,
+                        y: piece.y,
+                        z: slot,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: piece.width,
+                    height: piece.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("commit-blend-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.shared.commit_blend_pipeline);
+            pass.set_bind_group(0, &bind_group, &[(i * stride) as u32]);
+            // The quad already covers exactly this piece, so the scissor is
+            // belt and braces — and it is what keeps "no pixel outside the
+            // pieces the undo patch was captured from is written" a property of
+            // the pass rather than of the rasteriser's rounding.
+            pass.set_scissor_rect(piece.x, piece.y, piece.width, piece.height);
+            pass.draw(0..4, 0..1);
+        }
     }
 
     /// Wipe the scratch surface.

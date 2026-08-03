@@ -373,6 +373,7 @@ impl UmberApp {
         ));
 
         canvas.commit_stroke(
+            &gfx.gpu.device,
             &gfx.gpu.queue,
             &mut enc,
             slot,

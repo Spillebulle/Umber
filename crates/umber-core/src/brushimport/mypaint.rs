@@ -124,6 +124,7 @@ use serde::Deserialize;
 use crate::brush::{Brush, BrushMode};
 use crate::curve::ResponseCurve;
 use crate::dynamics::{DabInput, DabTarget, Modulation, Modulations};
+use crate::layer::BlendMode;
 use crate::preset::PresetError;
 
 /// `.myb` versions this understands. Version 3 is what MyPaint 1.2 onwards
@@ -558,6 +559,14 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         min_hardness_ratio,
         stabilization,
         mode,
+        // A `.myb` has no per-brush blend mode of this kind — MyPaint's own
+        // `Eraser` setting is the paint/erase switch above and nothing else.
+        // So there is nothing to read and nothing is invented: an import that
+        // *gains* a behaviour nobody asked for is worse than one that loses
+        // something, because a loss is at least reported. This is not a
+        // `dropped_features` entry either, for the same reason: nothing was
+        // dropped.
+        blend: BlendMode::Normal,
         smudge,
         smudge_length,
         smudge_radius,

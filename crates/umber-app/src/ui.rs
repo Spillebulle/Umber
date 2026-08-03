@@ -26,8 +26,8 @@ use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
 use umber_core::{
-    Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan, SelectionMode,
-    input::PressureSource,
+    BlendMode, Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan,
+    SelectionMode, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -2534,6 +2534,44 @@ fn paper_preview(ui: &mut egui::Ui, p: &Palette, pattern: GrainPattern) {
 /// Colour pickup — a brush that carries what it finds on the canvas.
 fn brush_editor_blending(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     ui.spacing_mut().item_spacing.y = 12.0;
+
+    // How the stroke combines with the layer it lands on.
+    //
+    // **Not drawn for an eraser**, rather than drawn and disabled. A blend mode
+    // combines a colour with what is under it and an eraser deposits none, so
+    // there is no setting here that is merely switched off — there is nothing
+    // for the control to be about. That is `Brush::blend_applies`, and it is
+    // the same reading the Tip section's Angle slider takes of a round dab.
+    //
+    // `widgets::dropdown`, and the same `BlendMode::ALL` the layer picker
+    // walks: one gesture, one list, and the same arithmetic behind both.
+    if ed.brush.blend_applies() {
+        ui.label(
+            egui::RichText::new("Blend mode")
+                .size(text::SMALL)
+                .color(p.text_dim),
+        );
+        // Alone on its line, so it fills it — `DropdownWidth`'s own rule.
+        let label = ed.brush.blend.label();
+        widgets::dropdown(
+            ui,
+            p,
+            widgets::Dropdown::new(label).width(widgets::DropdownWidth::Fill),
+            |ui| {
+                for mode in BlendMode::ALL {
+                    ui.selectable_value(&mut ed.brush.blend, mode, mode.label());
+                }
+            },
+        );
+        caption(
+            ui,
+            p,
+            "How the finished stroke combines with the layer under it — the \
+             same five modes a layer has, and the same maths. Applied once, \
+             when the stroke is put down, so a mark that crosses itself \
+             multiplies with the paint beneath it rather than with itself.",
+        );
+    }
 
     widgets::slider_row(
         ui,
