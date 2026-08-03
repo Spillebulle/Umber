@@ -29,6 +29,31 @@
 //! picture. Here it is turned back into a document property, and its PNG is
 //! never decoded — the attribute already holds the colour, so skipping it saves
 //! a canvas-sized decode on every open.
+//!
+//! # Somebody else's masks are not in here, and that is the file's doing
+//!
+//! `umber-mask` is Umber's own, so a mask arrives out of an ORA only where
+//! Umber wrote it. It is worth saying what the other writers do, because the
+//! obvious worry — that a mask arrives disguised as a layer and quietly erases
+//! the one below it — is not one this reader can walk into:
+//!
+//! - **Krita bakes them in.** Its ORA export writes each layer's
+//!   *projection* — the layer with its masks already applied — and emits no
+//!   mask element of any kind. So a masked Krita layer arrives here looking
+//!   exactly as it looked in Krita, and the loss is that the mask is no longer
+//!   separable, which changes no pixel. Krita does write `svg:dst-in`, but
+//!   only where a *layer* carries Destination In as its blend mode, which is
+//!   an ordinary blend mode there and not a mask convention.
+//! - **A `dst-in` layer is therefore an ordinary unsupported blend mode**, and
+//!   goes through `blend::nearest` like every other: Normal, and a
+//!   [`ImportWarning::BlendDropped`] naming it. That is the right answer and
+//!   the important half is that it is *named* — a layer meant to erase the one
+//!   below arriving as flat paint over it is a large change to the picture,
+//!   and one nobody was told about would be the silent loss this module
+//!   exists to refuse. `a_layer_that_would_erase_the_one_below_is_named`
+//!   pins it.
+//! - **GIMP and MyPaint have nothing to write.** Neither carries a layer mask
+//!   into an ORA either.
 
 use glam::UVec2;
 use quick_xml::events::Event;
@@ -758,6 +783,41 @@ mod tests {
         let opened = doc.open();
         assert_eq!(opened.stack.subtree(1), 1..2, "the group is empty");
         assert_eq!(opened.stack.pixel_count(), 1);
+    }
+
+    /// A layer whose blend mode would erase the one below it is reported, not
+    /// composited over it in silence.
+    ///
+    /// `svg:dst-in` is the mode a mask written as a layer would carry, and it
+    /// is also just a blend mode Krita offers on ordinary layers. Umber has
+    /// neither, so the layer arrives Normal — which over the layer below is a
+    /// large change to the picture, and exactly the kind that has to be named.
+    /// The same holds for a nested `<stack>` that carries it, since a folder
+    /// here is pass-through and can hold no mode at all.
+    #[test]
+    fn a_layer_that_would_erase_the_one_below_is_named() {
+        let ora = fixtures::ora(
+            1,
+            1,
+            &[
+                OraLayer::new("Cutout", 1, 1, &[0, 0, 0, 128]).op("svg:dst-in"),
+                OraLayer::new("Paint", 1, 1, &[255, 0, 0, 255]),
+            ],
+        );
+        let doc = read(&ora).unwrap();
+        assert_eq!(doc.layers[1].name, "Cutout");
+        assert_eq!(doc.layers[1].blend, BlendMode::Normal);
+        assert!(
+            doc.layers[1].mask.is_none(),
+            "a dst-in layer is a layer, never somebody's mask guessed at"
+        );
+        assert_eq!(
+            doc.warnings,
+            vec![ImportWarning::BlendDropped {
+                layer: "Cutout".into(),
+                source: "dst-in".into()
+            }]
+        );
     }
 
     #[test]
