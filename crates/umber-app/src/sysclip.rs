@@ -265,15 +265,17 @@ pub struct Board {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Board {
-    /// Offer `clip` to the rest of the machine, and answer whether it got
+    /// Offer `clip` to the rest of the machine, remembering whether it got
     /// there.
     ///
-    /// The answer is not decoration. Umber's own clipboard is written by the
-    /// caller either way, so a refusal costs the artist nothing they can *see* —
-    /// but it leaves the desktop holding an older picture, and [`decide`] would
-    /// then believe that picture over the one just copied. So the outcome is
-    /// remembered rather than only logged. Logged as well, at the level a failed
-    /// autosave is: a paint application must not raise a dialog on Ctrl+C.
+    /// Remembered rather than returned, so the caller cannot forget to carry
+    /// the answer: it is read back through [`Board::published`] at the one
+    /// place that needs it. And it is not decoration. Umber's own clipboard is
+    /// written by the caller either way, so a refusal costs the artist nothing
+    /// they can *see* — but it leaves the desktop holding an older picture, and
+    /// [`decide`] would otherwise believe that picture over the one just
+    /// copied. Logged as well, at the level a failed autosave is: a paint
+    /// application must not raise a dialog on Ctrl+C.
     pub fn put_image(&mut self, clip: &Clip) {
         let size = clip.size();
         self.published = false;
