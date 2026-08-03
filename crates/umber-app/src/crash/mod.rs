@@ -82,6 +82,14 @@ mod report;
 mod window;
 
 pub use report::Report;
+/// How long ago, in words.
+///
+/// Re-exported because the recovery offer asks the same question of the same
+/// kind of file — "is that copy worth going back to" — and a second spelling of
+/// "4 minutes ago" beside this one is how the two would come to disagree about
+/// where a minute becomes minutes. It lives in `report.rs` because that is
+/// where every other sentence about an autosave copy is decided and tested.
+pub use report::age_phrase;
 use report::{AutosaveCopy, BACKTRACE_LIMIT, DocumentNote, FIELD_LIMIT, FORMAT, tidy};
 
 use crate::session::{DocId, Session};

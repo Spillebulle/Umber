@@ -109,6 +109,17 @@ pub struct UiActions {
     pub save_all_and_quit: bool,
     /// Open the internal autosave location in the system file manager.
     pub reveal_autosaves: bool,
+    /// Open the autosave copies the recovery offer was asked for.
+    ///
+    /// A `bool` rather than the list, because [`UiActions`] is `Copy` — the
+    /// caller reads them off `Editor::recovery` in the frame the flag was set,
+    /// which is the frame the request was made in. Same arrangement, and the
+    /// same reason, as [`UiActions::delete_picked`].
+    pub recover: bool,
+    /// The recovery offer has been answered. Takes the dialog down and forgets
+    /// the marker it came from; it deletes no copy, which is the whole of why
+    /// saying "not now" is safe. See [`crate::recoverdlg`].
+    pub dismiss_recovery: bool,
     /// Open a canvas to draw a bitmap tip for the brush currently in hand.
     ///
     /// A `bool` rather than the brush it is for, because `UiActions` is `Copy`
@@ -276,6 +287,14 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
         Some(tabs::CloseChoice::UseAsTip) => actions.use_tip_and_close = ed.ui.close_prompt.take(),
         Some(tabs::CloseChoice::Cancel) | None => {}
     }
+
+    // What a session that stopped left behind. Drawn from here rather than from
+    // a panel body, for the reason the brush library's modals and the canvas
+    // dialogs are — and *before* the notice below, so that a warning raised by
+    // recovering a document lands on top of the offer it came from rather than
+    // underneath it.
+    crate::recoverdlg::show(root, &p, ed, &mut actions);
+
     tabs::notice(root, &p, ed);
 
     // Whatever is left is the document's. The canvas is drawn by the GPU

@@ -299,6 +299,11 @@ pub struct Editor {
     /// writes. Out of [`UiState`] for the same reason `updates` is — it holds
     /// channels and a map of every open document.
     pub autosave: crate::autosave::Autosave,
+    /// What a session that did not end cleanly left behind, and what has been
+    /// done about it. Out of [`UiState`] for the reason `autosave` is — it
+    /// holds a list — and above the `--- documents ---` line because it
+    /// describes a session that is over rather than any document that is open.
+    pub recovery: crate::recoverdlg::Recovery,
     /// True once the application has been asked to close and every document
     /// with unsaved work has been accounted for.
     ///
@@ -474,6 +479,7 @@ impl Default for Editor {
             export_form: crate::exportdlg::ExportForm::default(),
             updates: crate::update::Updates::default(),
             autosave: crate::autosave::Autosave::default(),
+            recovery: crate::recoverdlg::Recovery::default(),
             quit_requested: false,
             // Read here rather than in `app.rs` so the window-creation path,
             // which several things already contend over, stays untouched.
