@@ -908,11 +908,24 @@ fn layer_xml(
 /// [`VERSION`], and it is why [`required_version`] has nothing to say about
 /// them.
 ///
+/// **`isolation="auto"` is written, and it is not optional.** ORA's `isolation`
+/// defaults to `isolate`, so a `<stack>` that says nothing declares itself an
+/// isolated group — the opposite of every folder in this build. The two agree
+/// for as long as every child composites `svg:src-over`, which is why this went
+/// unnoticed; they diverge the moment one does not, because a child inside an
+/// isolated group blends against its siblings alone while a pass-through child
+/// blends against the whole backdrop beneath the folder. So a document with a
+/// Multiply layer inside a folder came out of Umber looking one way and opened
+/// in a conforming reader looking another. Saying `auto` costs nothing and
+/// needs no [`VERSION`] bump — it makes the file mean what Umber always
+/// rendered — and it is what the group-compositing work will vary when a folder
+/// finally has an opacity of its own to isolate for.
+///
 /// `umber-selected` can land here: a folder is selectable, and a document
 /// saved with one in hand must reopen with it in hand.
 fn folder_xml(layer: &SaveLayer<'_>, selected: bool) -> String {
     let mut out = format!(
-        "<stack name=\"{}\" visibility=\"{}\"",
+        "<stack name=\"{}\" visibility=\"{}\" isolation=\"auto\"",
         attribute(layer.name),
         if layer.visible { "visible" } else { "hidden" },
     );
@@ -1285,6 +1298,16 @@ mod tests {
         assert!(
             folder_line.contains("visibility=\"hidden\""),
             "{folder_line}"
+        );
+        // Said out loud, because ORA's default is the opposite of what Umber
+        // draws. Leaving it off makes every folder an isolated group in a
+        // conforming reader, which changes the picture as soon as any child
+        // blends with something other than src-over.
+        assert!(
+            folder_line.contains("isolation=\"auto\""),
+            "a pass-through folder must say so, or a reader takes ORA's \
+             `isolate` default and blends a folder's children against each \
+             other instead of against the backdrop:\n{folder_line}"
         );
     }
 
