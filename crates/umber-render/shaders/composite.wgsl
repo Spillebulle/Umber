@@ -112,45 +112,9 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(higher, lower, c <= vec3<f32>(0.04045));
 }
 
-// Separable blend functions, operating on straight (un-premultiplied) colour.
-fn blend_rgb(mode: u32, cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
-    switch mode {
-        case 1u: {  // Multiply
-            return cb * cs;
-        }
-        case 2u: {  // Screen
-            return cb + cs - cb * cs;
-        }
-        case 3u: {  // Overlay — Hard Light with the operands swapped
-            let lo = 2.0 * cb * cs;
-            let hi = 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs);
-            return select(hi, lo, cb <= vec3<f32>(0.5));
-        }
-        case 4u: {  // Add
-            return min(cb + cs, vec3<f32>(1.0));
-        }
-        default: {  // Normal
-            return cs;
-        }
-    }
-}
-
-// W3C compositing, with both operands premultiplied:
-//   Co = (1 - ab)*Sc + as*ab*B(Cb, Cs) + (1 - as)*Bc
-//   ao = as + ab*(1 - as)
-// For Normal this collapses to plain source-over, as it should.
-fn composite_over(dst: vec4<f32>, src: vec4<f32>, mode: u32) -> vec4<f32> {
-    if (src.a <= 0.0) {
-        return dst;
-    }
-    let cs = src.rgb / src.a;
-    let cb = select(vec3<f32>(0.0), dst.rgb / max(dst.a, 1e-5), dst.a > 0.0);
-    let blended = blend_rgb(mode, cb, cs);
-
-    let co = (1.0 - dst.a) * src.rgb + src.a * dst.a * blended + (1.0 - src.a) * dst.rgb;
-    let ao = src.a + dst.a * (1.0 - src.a);
-    return vec4<f32>(co, ao);
-}
+// `blend_rgb` and `composite_over` used to live here. They are now in
+// `blend.wgsl`, concatenated in front of this file — see that file for why, and
+// `Shared::new` for how.
 
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {

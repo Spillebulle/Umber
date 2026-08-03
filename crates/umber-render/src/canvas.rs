@@ -76,6 +76,22 @@ const INITIAL_SLOTS: u32 = 4;
 
 const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 
+/// The composite pass, with the blend modes in front of it.
+///
+/// The two shaders that combine premultiplied colours share one statement of
+/// what each mode *is*, by being compiled from one text. CLAUDE.md's rule that
+/// `composite.wgsl` and `commit.wgsl` must implement identical blending maths
+/// is a rule about a preview and the thing that replaces it; a shared function
+/// makes it structural where two hand-written copies of Multiply would leave it
+/// to discipline. See `shaders/blend.wgsl`.
+///
+/// `concat!` rather than a runtime `format!`: this is a `&'static str` compiled
+/// into the binary exactly as a lone `include_str!` was.
+const BLEND_PRELUDE_COMPOSITE: &str = concat!(
+    include_str!("../shaders/blend.wgsl"),
+    include_str!("../shaders/composite.wgsl"),
+);
+
 /// Per-dab colour, for a smudging stroke only.
 ///
 /// `Rgba16Float` rather than `Rgba8Unorm` because these are **linear** values.
@@ -1286,9 +1302,14 @@ impl Shared {
         });
 
         // ---- composite pass -------------------------------------------------
+        //
+        // `blend.wgsl` in front, so the blend modes are compiled from one text
+        // shared with the commit pass rather than written out twice. See that
+        // file: two copies of Multiply is exactly the drift that makes a stroke
+        // jump at pointer-up.
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/composite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(BLEND_PRELUDE_COMPOSITE.into()),
         });
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite-bgl"),
