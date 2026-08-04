@@ -207,7 +207,35 @@ pub fn from_kpp_in(
     if preset.flag("MaskingBrush/Enabled") {
         dropped.push("masking brushes");
     }
-    if preset.flag("Texture/Enabled") {
+    // `Texture/Pattern/Enabled`, and the prefix is the whole point: this read
+    // `Texture/Enabled` for a while, which is a key Krita has never written.
+    // Every texture setting is under `Texture/Pattern/` — checked against
+    // Krita's own source at both ends of the range these packs were written in,
+    // `kis_texture_option.cpp` at v4.4.8 and `KisTextureOptionData.cpp` on
+    // master, neither of which has a bare `Texture/Enabled`. So the check was
+    // false in all 119 presets of the fetched packs and the paper was dropped
+    // in silence — 31 of them switch a texture on, and **eleven were shipping**
+    // without it, several named for the grain they had lost ("Thick Dry
+    // Canvas", "Texture Fabric", "Rough Rake Textured").
+    // `MaskingBrush/Enabled` beside it is spelled correctly and fires on the
+    // one preset that uses it, which is what made the silence look like an
+    // absence of textured brushes rather than a bug.
+    //
+    // The strength is read for the reason `SharpnessValue` is read eleven lines
+    // below and `ScatterValue` is gated on `PressureScatter`: a setting Krita
+    // leaves in the file is not a setting Krita applies, and a texture at zero
+    // strength paints identically with and without paper — naming it would
+    // refuse a brush from the shipped library over a loss that is not one.
+    // Krita has spelled it twice, `Texture/Strength/Value` on the curve option
+    // and `Texture/Pattern/Strength` before it, and both are in the packs;
+    // absent means the default, which is full. No fetched preset is at zero —
+    // thirty sit at 1.0 and one at 0.45 — so this changes nothing today and is
+    // the guard being stated rather than assumed.
+    let texture_strength = preset
+        .number("Texture/Strength/Value")
+        .or_else(|| preset.number("Texture/Pattern/Strength"))
+        .unwrap_or(1.0);
+    if preset.flag("Texture/Pattern/Enabled") && texture_strength > 0.0 {
         dropped.push("paper texture");
     }
     if preset.flag("PressureMirror") {
@@ -1395,8 +1423,10 @@ mod tests {
     /// stroke; Umber's `max` caps a stroke at the mask's brightest texel and
     /// paints a fraction of the author's mark. `.gbr` and `.abr` have measured
     /// this since build-up existed and `.kpp` did not, which meant a Krita
-    /// stamp — Raghukamath's "Drybrush" is one — shipped at 88% of the strength
-    /// it was drawn at.
+    /// stamp — Raghukamath's "Drybrush" was the one in the library — shipped at
+    /// 88% of the strength it was drawn at. That preset no longer ships, for a
+    /// paper texture Umber cannot carry, so the measurement now serves imports
+    /// alone; it is the same stamp either way.
     #[test]
     fn a_krita_stamp_is_measured_for_build_up() {
         let stamp = |level: u8| {
@@ -1504,6 +1534,11 @@ mod tests {
         assert_eq!(from_kpp(&kpp(&xml)).unwrap().brush.mode, BrushMode::Erase);
     }
 
+    /// Note the texture key. This fixture said `Texture/Enabled`, which is
+    /// what the reader looked for and what Krita has never written, so the two
+    /// agreed with each other and with no real file — a hand-built fixture's
+    /// one failure mode, and the reason the pack sweep in `docs/brushes.md`
+    /// exists beside these tests rather than instead of them.
     #[test]
     fn features_umber_cannot_render_are_named() {
         let xml = format!(
@@ -1515,7 +1550,7 @@ mod tests {
                  hfade=\"0.5\" spikes=\"5\"/></Brush>"
             ),
             "<param type=\"internal\" name=\"MaskingBrush/Enabled\">true</param>",
-            "<param type=\"internal\" name=\"Texture/Enabled\">true</param>",
+            "<param type=\"internal\" name=\"Texture/Pattern/Enabled\">true</param>",
         );
         let dropped = from_kpp(&kpp(&xml)).expect("decode").dropped;
         for expected in [
@@ -1665,6 +1700,58 @@ mod tests {
         }
         assert!(with("drawingangle").is_empty());
         assert!(with("fuzzy").is_empty());
+    }
+
+    /// A paper texture is named, and the *key* is what this pins.
+    ///
+    /// Krita states every texture setting under `Texture/Pattern/`, and this
+    /// reader looked for `Texture/Enabled` — a key nothing writes. So the loss
+    /// was never reported, for the shipped library or for a user's import, and
+    /// eleven textured presets shipped as plain ones. Asserting the flag alone
+    /// would have passed under the old spelling too, so the second half is the
+    /// one that matters: the key Krita does not write must change nothing.
+    #[test]
+    fn a_paper_texture_is_named_under_the_key_krita_actually_writes() {
+        let with = |key: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                internal(key, "true"),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+
+        assert_eq!(with("Texture/Pattern/Enabled"), vec!["paper texture"]);
+        // The spelling this reader used to look for. Krita has never written
+        // it, so a brush that says only this has no texture to lose.
+        assert!(with("Texture/Enabled").is_empty());
+
+        // And a texture switched on at no strength is not a loss. Krita leaves
+        // the option's settings in the file either way, which is the trap
+        // `ScatterValue` and `SharpnessValue` are both read against.
+        let at_strength = |key: &str, value: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                internal("Texture/Pattern/Enabled", "true"),
+                param(key, value),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+        assert!(at_strength("Texture/Strength/Value", "0").is_empty());
+        assert!(at_strength("Texture/Pattern/Strength", "0").is_empty());
+        assert_eq!(
+            at_strength("Texture/Strength/Value", "0.45"),
+            vec!["paper texture"]
+        );
     }
 
     /// All three of PNG's text chunks turn up in one real pack, and a reader

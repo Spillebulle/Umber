@@ -12,28 +12,16 @@
 /// Name and 8-bit greyscale PNG, sorted by name.
 pub(crate) const TIPS: &[(&str, &[u8])] = &[
     (
-        "deevad-c2-mechanical-pencil-detail-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-c2-mechanical-pencil-detail-deevad-25-01.png"),
-    ),
-    (
         "deevad-c4-bristles-lineart-deevad-25-01",
         include_bytes!("../assets/tips/deevad-c4-bristles-lineart-deevad-25-01.png"),
     ),
     (
-        "deevad-c5-thin-brush-hard-edge-textured-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-c5-thin-brush-hard-edge-textured-deevad-25-01.png"),
+        "deevad-d-bristle-flat-glazing-deevad-25-01",
+        include_bytes!("../assets/tips/deevad-d-bristle-flat-glazing-deevad-25-01.png"),
     ),
     (
         "deevad-d-glazing-round-deevad-25-01",
         include_bytes!("../assets/tips/deevad-d-glazing-round-deevad-25-01.png"),
-    ),
-    (
-        "deevad-f-rough-rake-textured-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-f-rough-rake-textured-deevad-25-01.png"),
-    ),
-    (
-        "deevad-f-thick-dry-canvas-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-f-thick-dry-canvas-deevad-25-01.png"),
     ),
     (
         "deevad-y-textured-big-sponge-deevad-25-01",
@@ -54,14 +42,6 @@ pub(crate) const TIPS: &[(&str, &[u8])] = &[
     (
         "gdquest-leaves-patch-1",
         include_bytes!("../assets/tips/gdquest-leaves-patch-1.png"),
-    ),
-    (
-        "raghukamath-pack01-drybrush",
-        include_bytes!("../assets/tips/raghukamath-pack01-drybrush.png"),
-    ),
-    (
-        "raghukamath-pack01-drybrush2",
-        include_bytes!("../assets/tips/raghukamath-pack01-drybrush2.png"),
     ),
     (
         "raghukamath-pack01-fx",

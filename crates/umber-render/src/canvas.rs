@@ -160,10 +160,14 @@ const COVERAGE_TARGET: wgpu::ColorTargetState = wgpu::ColorTargetState {
 /// falls below half a level stops moving the accumulator at all.
 ///
 /// This is the one place a wider scratch would buy anything, and it was
-/// measured rather than argued. Against exact arithmetic, over the whole of the
-/// one shipped preset that sets `build_up` (`pack01-drybrush`, stamped along a
-/// stroke at its own spacing, 50 dabs deep), `R8Unorm` is at most **3 levels of
-/// 255** out and 2.8% of the stroke's pixels are more than one level out. The
+/// measured rather than argued. Against exact arithmetic, over the whole of
+/// Raghukamath's `pack01-drybrush` (stamped along a stroke at its own spacing,
+/// 50 dabs deep), `R8Unorm` is at most **3 levels of 255** out and 2.8% of the
+/// stroke's pixels are more than one level out. That preset no longer ships —
+/// it asks for a paper texture Umber does not carry, see `docs/brushes.md` —
+/// so it is now a brush the *importer* produces rather than one in the
+/// library; it is the same stamp either way, and Umber's own "Stipple chalk"
+/// is the shipped brush that takes this path. The
 /// pathological case needs a *constant* faint coverage on one pixel for a
 /// hundred dabs, which a bitmap tip cannot produce: the mask slides under the
 /// stroke, so a pixel sees a different texel every dab. The mask is itself

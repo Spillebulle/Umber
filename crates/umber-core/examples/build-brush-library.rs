@@ -195,6 +195,7 @@ fn main() {
 
     let mut presets: Vec<BrushPreset> = Vec::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut refusals: Vec<Refusal> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let tips_dir = repo_root.join("crates/umber-core/assets/tips");
@@ -246,13 +247,21 @@ fn main() {
                         .entry(dropped.join(", "))
                         .or_default()
                         .push(label(&preset.name));
+                    refusals.push(Refusal {
+                        pack: pack.dir,
+                        reasons: dropped.iter().map(|r| r.to_string()).collect(),
+                    });
                     continue;
                 }
                 if tip.is_some() && !pack.ship_tips {
                     skipped
-                        .entry("a mask this project does not redistribute".to_string())
+                        .entry(NOT_REDISTRIBUTED.to_string())
                         .or_default()
                         .push(label(&preset.name));
+                    refusals.push(Refusal {
+                        pack: pack.dir,
+                        reasons: vec![NOT_REDISTRIBUTED.to_string()],
+                    });
                     continue;
                 }
 
@@ -401,6 +410,81 @@ fn main() {
     for problem in &failed {
         println!("failed: {problem}");
     }
+
+    report_refusals(&refusals);
+}
+
+/// One brush the generator would not ship, and what it named.
+///
+/// Kept beside `skipped` rather than derived from it because that map is keyed
+/// by the *combination* of reasons — which is what makes its listing checkable
+/// against a single brush, and useless for "how many would this fix unlock".
+/// Fifty-two combinations of fifteen reasons is not a table anybody can add up
+/// by eye, and both figures this file's callers want are per **reason**.
+struct Refusal {
+    pack: &'static str,
+    reasons: Vec<String>,
+}
+
+/// The one refusal that is not about rendering. Named once so the report and
+/// the refusal cannot disagree about its wording.
+const NOT_REDISTRIBUTED: &str = "a mask this project does not redistribute";
+
+/// Print the refusals as reason × pack, with the count each fix would unlock.
+///
+/// The **alone** column is the one to read: a brush refused for one reason is a
+/// brush that ships the day that reason goes away, where one naming three is
+/// three pieces of work. Without it the totals mislead badly in both
+/// directions — 267 brushes name a `.gih` pipe's sequencing and 257 of them
+/// need nothing else, while eighteen of the twenty naming mirrored dabs name
+/// something else as well.
+///
+/// Printed on every run for the reason the classification table is: a count
+/// nobody can re-derive goes stale, and the answer to "why is my favourite
+/// brush not in here" is a number somebody has to be able to check.
+fn report_refusals(refusals: &[Refusal]) {
+    let mut rows: BTreeMap<&str, (Vec<usize>, usize)> = BTreeMap::new();
+    for refusal in refusals {
+        // `refusal.pack` is a `Pack::dir`, so this cannot miss — and filing an
+        // unrecognised pack under the first one silently would be a column of
+        // somebody else's brushes.
+        let pack = PACKS
+            .iter()
+            .position(|p| p.dir == refusal.pack)
+            .expect("a refusal names a pack this run walked");
+        for reason in &refusal.reasons {
+            let row = rows
+                .entry(reason.as_str())
+                .or_insert_with(|| (vec![0; PACKS.len()], 0));
+            row.0[pack] += 1;
+            if refusal.reasons.len() == 1 {
+                row.1 += 1;
+            }
+        }
+    }
+
+    // Heaviest first, which is the order the table in `docs/brushes.md` is in.
+    // The map is keyed alphabetically because it has to be keyed by something;
+    // printing that order would leave the record and the run in two orders
+    // nobody can check one against the other by eye. `sort_by_key` is stable,
+    // so ties keep the map's order and the output does not move between runs.
+    let mut ranked: Vec<_> = rows.iter().collect();
+    ranked.sort_by_key(|(_, (per_pack, _))| std::cmp::Reverse(per_pack.iter().sum::<usize>()));
+
+    println!("\nrefused, by reason and pack:");
+    print!("  {:<54}", "");
+    for pack in PACKS {
+        print!(" {:>11}", pack.dir);
+    }
+    println!(" {:>6} {:>6}", "total", "alone");
+    for (reason, (per_pack, alone)) in ranked {
+        print!("  {reason:<54}");
+        for count in per_pack {
+            print!(" {count:>11}");
+        }
+        println!(" {:>6} {alone:>6}", per_pack.iter().sum::<usize>());
+    }
+    println!("  {} brushes refused in all", refusals.len());
 }
 
 /// The shipped masks, collected as the packs are read and written out at the
