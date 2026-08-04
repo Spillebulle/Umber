@@ -1942,7 +1942,11 @@ fn percent(v: f32) -> String {
 }
 
 /// A caption under a control, explaining why it is off or what it does.
-fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
+///
+/// `pub(crate)` for the reason [`has_angle`] is: the Brush tweaks module draws
+/// the same sentence under the same disabled rails, and a second `RichText`
+/// with the same size and colour written out is a caption that drifts.
+pub(crate) fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
     ui.label(egui::RichText::new(line).size(10.0).color(p.text_dim));
 }
 

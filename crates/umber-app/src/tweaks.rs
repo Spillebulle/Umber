@@ -15,9 +15,11 @@
 //! Three consequences, and each is a question somebody will ask:
 //!
 //! * **Picking a brush puts its own settings back.** `Editor::apply_preset`
-//!   assigns `self.brush = preset.brush` wholesale, so selecting *any* brush —
-//!   including the one already in hand — discards every tweak. That is the
-//!   reset, it is the only one, and it is the same one Size and Opacity have.
+//!   assigns `self.brush = preset.brush` and then restores only the paint or
+//!   erase mode, so selecting *any* brush — including the one already in hand,
+//!   which `brushlib`'s list re-applies on every click — discards every tweak.
+//!   That is the reset, it is the only one, and it is the same one Size and
+//!   Opacity have.
 //! * **A tab switch keeps them.** `Editor::brush` sits above the
 //!   `--- documents ---` line, so the brush in hand is the window's rather than
 //!   the document's. The obvious reading of "just temporary in the project" is
@@ -44,12 +46,14 @@
 //!
 //! `gesture.rs` answers "what does a press **on the canvas** mean", and the
 //! grip's press lands on a panel — where `ui_owns` is true and the answer is
-//! `Press::Ignored`, correctly and unchanged. So nothing here is in that model
-//! and `a_pen_press_resolves_to_what_a_mouse_press_would` did not have to
-//! move. It still reaches a pen: `egui-winit` turns `WindowEvent::Touch` into
-//! ordinary pointer events, so a nib pressing the grip drags it exactly as a
-//! mouse does, and `app.rs`'s touch arm ignores the press for the same reason
-//! its mouse arm does.
+//! `Press::Ignored` unless one of the pan overrides is held, which are tested
+//! first on purpose so a middle-drag or a space-drag pans whatever it started
+//! over. None of that changed. So nothing here is in that model and
+//! `a_pen_press_resolves_to_what_a_mouse_press_would` did not have to move.
+//! It still reaches a pen: `egui-winit`'s `on_touch` emits an ordinary cursor
+//! move and mouse-button press for a contact, so a nib pressing the grip drags
+//! it exactly as a mouse does, and `app.rs`'s touch arm ignores the press for
+//! the same reason its mouse arm does.
 //!
 //! Putting six more settings into `gesture::press` would be the combinatorial
 //! mess: Alt is already spoken for twice on the canvas — the eyedropper with a
@@ -119,8 +123,9 @@ impl Tweak {
         Self::ColourPickup,
     ];
 
-    /// The six the module draws, in the order the brush editor's Tip section
-    /// already puts them.
+    /// The six the module draws: the brush editor's Tip section in its own
+    /// order, less Size and Opacity, with Colour pickup — which lives under
+    /// Blending there — added at the end.
     ///
     /// Size and Opacity are deliberately not among them: both are on the tool
     /// options strip, which is above the canvas whatever the dock is doing, and
@@ -206,7 +211,17 @@ impl Tweak {
             Self::Spacing => brush.spacing,
             // The reciprocal of the engine's long-over-short ratio, which is
             // the word the design and every other paint application uses.
-            Self::Roundness => (1.0 / brush.dab_ratio.max(1.0)).clamp(MIN_ROUNDNESS, 1.0),
+            //
+            // **Not clamped to the rail**, and that is the difference between
+            // a reading and an edit. `brushimport::kpp` bounds nothing, so a
+            // Krita brush with a 40:1 tip is a legitimate `dab_ratio` of 40;
+            // reporting it as the rail's 5% floor would make one press of a
+            // shortcut — which reads, steps and writes — halve the dab's
+            // aspect with nothing on screen to say why. Off the end of the
+            // rail is where it honestly is, which is also exactly what
+            // `ui::brush_editor_tip`'s own Roundness row shows. Only
+            // [`Tweak::apply`] clamps, because only an edit should.
+            Self::Roundness => 1.0 / brush.dab_ratio.max(1.0),
             Self::AirbrushRate => brush.dabs_per_second,
             Self::Angle => brush.dab_angle,
             Self::ColourPickup => brush.smudge,
@@ -299,6 +314,19 @@ impl Tweak {
             // shared rather than copied so this rail and the brush editor's
             // cannot disagree.
             Self::Angle => crate::ui::has_angle(ed),
+            // An eraser deposits no colour, so there is nothing for it to mix
+            // with what is under it. `Brush::blend_applies` is the engine's own
+            // statement of exactly that, already read by the Blending section
+            // to not draw a blend mode for one — the same sentence, so the two
+            // cannot answer differently.
+            //
+            // Live, this is not merely a control that does nothing: `smudge`
+            // drives `Brush::colours_dabs`, which puts the whole stroke on the
+            // two-attachment coloured dab pipeline, and `StrokeBuilder::probe`
+            // is gated on `smudges()` with no mode test — so an erasing stroke
+            // would record a canvas probe every frame for a colour that is
+            // never deposited.
+            Self::ColourPickup => ed.brush.blend_applies(),
             _ => true,
         }
     }
@@ -308,6 +336,7 @@ impl Tweak {
         match self {
             Self::Hardness => "The stamp decides this brush's edge.",
             Self::Angle => "A round dab has no angle to turn.",
+            Self::ColourPickup => "An eraser lays down no colour to pick up.",
             _ => "",
         }
     }
@@ -360,12 +389,16 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             }
             row(ui, p, ed, tweak);
         });
+        // The reason goes *under* the rail, which inserts a line and shifts
+        // everything below it — the shape `ticking_a_layer_does_not_move_the_
+        // layer_list` refuses. It is allowed here because it can never move a
+        // row under the hand that caused it: Hardness flips only when the tip
+        // changes, which is the Brushes panel's; Colour pickup flips only with
+        // the tool, which is the rail's; and Angle flips when Roundness
+        // reaches 100%, which is a rail *above* it. Reserving six blank lines
+        // against a jump that cannot happen would be the worse trade.
         if !live {
-            ui.label(
-                egui::RichText::new(tweak.why_off())
-                    .size(10.0)
-                    .color(p.text_dim),
-            );
+            crate::ui::caption(ui, p, tweak.why_off());
         }
     }
     ui.add_space(6.0);
@@ -376,8 +409,12 @@ fn row(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
     let mut value = tweak.value(&ed.brush);
     // The grip's width comes off the line before the rail is drawn, because
     // `widgets::slider_row` sizes itself from `available_width` and would
-    // otherwise take all of it and push the grip off the panel.
-    let rail = (ui.available_width() - metrics::TWEAK_GRIP - 8.0).max(metrics::TWEAK_GRIP);
+    // otherwise take all of it and push the grip off the panel. The gap is the
+    // style's own, read rather than typed: a number here that was two points
+    // more than the layout actually spends is wrong the moment that token
+    // moves, and wrong in the direction nobody would look at.
+    let gap = ui.spacing().item_spacing.x;
+    let rail = (ui.available_width() - metrics::TWEAK_GRIP - gap).max(metrics::TWEAK_GRIP);
     ui.horizontal(|ui| {
         // **`vertical`, not `scope`.** A `slider_row` is two rows — the name
         // and readout on one baseline, the rail under them — and it allocates
@@ -478,11 +515,18 @@ fn grip(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
         );
     }
 
-    response.on_hover_text(format!(
-        "Hold and drag to set {}. Right and up for more, left and down for \
-         less; come back to where you pressed and it is exactly what it was.",
-        tweak.label().to_lowercase()
-    ));
+    // `on_hover_ui`, not `on_hover_text`: the closure runs only while the
+    // pointer is on the grip, where `on_hover_text` would build this string —
+    // and the `to_lowercase` under it — once per grip per frame, on the
+    // drawing path, for six rows nobody is pointing at.
+    response.on_hover_ui(|ui| {
+        ui.label(format!(
+            "Hold and drag to set {}. Right and up for more, left and down for \
+             less; come back to where you pressed and it is exactly what it \
+             was.",
+            tweak.label().to_lowercase()
+        ));
+    });
 }
 
 /// The module's picture in the module library, painted into `body`.
@@ -630,6 +674,70 @@ mod tests {
         // put off the end of the rail.
         brush.dab_ratio = 1.0;
         assert!((Tweak::Roundness.value(&brush) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_dab_narrower_than_the_rail_reads_as_it_is_and_is_not_quietly_rewritten() {
+        // `brushimport::kpp` bounds nothing, so a Krita brush with a 40:1 tip
+        // arrives as a `dab_ratio` of 40 — off the left end of a rail that
+        // stops at 5%. Reading it as the floor would mean the *first* press of
+        // a shortcut, which reads, steps and writes, halved the dab's aspect
+        // with nothing on screen to explain it. So the reading is honest, and
+        // it is the same one `ui::brush_editor_tip`'s Roundness row takes.
+        let mut brush = Brush {
+            dab_ratio: 40.0,
+            ..Brush::default()
+        };
+        assert!((Tweak::Roundness.value(&brush) - 0.025).abs() < 1e-6);
+
+        // And merely reading it changes nothing, which is the half that
+        // matters: a panel drawn over this brush leaves it at 40:1.
+        let drawn = Tweak::Roundness.value(&brush);
+        Tweak::Roundness.apply(&mut brush, drawn.clamp(MIN_ROUNDNESS, 1.0));
+        assert!(
+            brush.dab_ratio >= 20.0 - 1e-3,
+            "an edit still lands on the rail"
+        );
+    }
+
+    #[test]
+    fn an_eraser_is_not_offered_a_colour_to_pick_up() {
+        // Not merely a control that does nothing: `smudge` drives
+        // `colours_dabs`, which puts the whole stroke on the coloured dab
+        // pipeline, and the canvas probe is gated on `smudges()` with no mode
+        // test — so a live rail here would cost an erasing stroke a readback
+        // every frame for a colour that is never deposited.
+        let mut ed = Editor::default();
+        ed.brush.mode = umber_core::BrushMode::Paint;
+        assert!(Tweak::ColourPickup.enabled(&ed));
+        ed.brush.mode = umber_core::BrushMode::Erase;
+        assert!(!Tweak::ColourPickup.enabled(&ed));
+        assert!(!Tweak::ColourPickup.why_off().is_empty());
+
+        // The other four are about the shape of the mark, not about what
+        // colour it is, so an eraser keeps every one of them.
+        for tweak in Tweak::PANEL {
+            if matches!(tweak, Tweak::ColourPickup | Tweak::Angle) {
+                continue;
+            }
+            assert!(tweak.enabled(&ed), "{tweak:?} went off with the eraser");
+        }
+    }
+
+    #[test]
+    fn every_rail_that_can_be_switched_off_says_why() {
+        // `why_off` is not exhaustive over `Tweak` — most rails are never off —
+        // so this is what stops one being switched off with a blank line under
+        // it. The states are the ones `enabled` actually reads.
+        let mut ed = Editor::default();
+        ed.brush.dab_ratio = 1.0;
+        ed.brush.mode = umber_core::BrushMode::Erase;
+        ed.tip = Some(std::sync::Arc::new(solid_tip()));
+        for tweak in Tweak::ALL {
+            if !tweak.enabled(&ed) {
+                assert!(!tweak.why_off().is_empty(), "{tweak:?} is off and silent");
+            }
+        }
     }
 
     #[test]
@@ -870,20 +978,22 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        // And the schematic the module library draws on this module's card.
-        // The field is what `panels::module_preview` hands `preview`: the
-        // `metrics::MODULE_PREVIEW` card less its 9-point header, its 6-point
-        // left margin and 5 points off each end. Restated here only so there
-        // is something to look at — the caller is still the one that decides
-        // it, and a picture drawn a few points larger than the card is exactly
-        // the kind of thing that has to be seen rather than asserted.
-        let field = egui::vec2(72.0, 34.0);
+        // And the card the module library draws, whole — frame, header and
+        // all — through `panels::module_preview` rather than by calling
+        // `preview` with a field worked out here. The body it hands over is
+        // the card less a 9-point header, 5 points under it, a 6-point left
+        // margin and 5 points off each end, and every one of those is a number
+        // this test would have had to restate and could then have got wrong.
+        // A schematic checked against a field a few points off the real one is
+        // worth less than no picture, because it looks like evidence.
+        let field = egui::Vec2::from(metrics::MODULE_PREVIEW);
         let palette = Palette::with_accent(ThemeKind::Graphite, crate::theme::Accent::Umber);
-        let image = stage.shoot(field, 4.0, &palette, palette.control, |root| {
-            preview(
+        let image = stage.shoot(field, 4.0, &palette, palette.window, |root| {
+            crate::panels::module_preview(
                 root.painter(),
                 &palette,
                 Rect::from_min_size(Pos2::ZERO, field),
+                PanelKind::Tweaks,
             );
         });
         docshot::write_png(&dir.join("4-card.png"), &image).expect("write the png");

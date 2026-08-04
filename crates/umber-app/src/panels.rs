@@ -2095,6 +2095,20 @@ fn module_library(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             );
             ui.add_space(10.0);
 
+            // **This list does not scroll, and at seven cards it is close to
+            // needing to.** A card is about eighty-four points, so the header,
+            // the note and the cards come to roughly 750 — taller than a
+            // modest window, and `egui::Modal` centres what it is given rather
+            // than clamping it, so the overflow goes off *both* ends and takes
+            // the way back to a removed module with it.
+            //
+            // A `ScrollArea` here was tried and is not the fix on its own: the
+            // modal's `Ui` is bounded from wherever the centred `Area` was
+            // placed, so the scroll area settles at about half the screen and
+            // the list then scrolls on a tall window where it used to fit. The
+            // eighth module needs the modal's own height solved first —
+            // two columns, or a `Sides`-style header with the list sized
+            // against the viewport rather than against what is left of it.
             for kind in PanelKind::ALL {
                 if module_card(ui, p, ed, kind) {
                     picked = Some(kind);
@@ -2182,7 +2196,12 @@ fn module_card(ui: &mut Ui, p: &Palette, ed: &Editor, kind: PanelKind) -> bool {
 /// other theme immediately. A schematic in the palette's own tokens is never
 /// either: it says which module this is by its *shape*, which is what the eye
 /// is matching against the sidebar anyway.
-fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelKind) {
+///
+/// `pub(crate)` so a module's own preview test can shoot the card it ships
+/// into rather than restating the header height and the two margins below —
+/// a picture checked against a field a few points off the real one is worth
+/// less than no picture, because it looks like evidence.
+pub(crate) fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelKind) {
     painter.rect_filled(rect, metrics::RADIUS, p.chrome);
     painter.rect_stroke(
         rect,
