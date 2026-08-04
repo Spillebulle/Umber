@@ -12,6 +12,16 @@
 //! black and the hue would snap back to red on the way out. The Harmony mode
 //! leans on that hardest: a harmony is a function of hue alone, so a mode that
 //! read the hue off the colour would offer a red harmony for every grey.
+//!
+//! A wheel carries two controls in one hit area, and they are kept apart by two
+//! rules that have to hold together. [`Hub`] is the centre's geometry, handed to
+//! the hit test and to the painting by one function, so a press cannot land on a
+//! shape that is not drawn there — and it turns with the shape, because both
+//! centres carry an angle and the triangle can be turned by the hue itself.
+//! [`gesture`] settles which control a gesture belongs to from where it was
+//! *pressed*, and holds that for the whole gesture. Each was a bug on its own:
+//! together they had a press on the hue ring moving the saturation and value
+//! marker towards whatever direction the ring was grabbed from.
 
 use crate::theme::{Palette, metrics};
 use egui::{
