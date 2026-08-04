@@ -144,21 +144,27 @@ else, which is what a fix aimed at that reason would actually ship.
 
 | Refused for | mypaint | deevad | raghukamath | gdquest | rubberduck | total | alone |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| animated brush sequences (a `.gih` pipe) | 0 | 12 | 1 | 2 | 252 | 267 | 257 |
-| paper texture | 0 | 11 | 11 | 9 | 0 | 31 | 11 |
-| coloured stamps | 0 | 4 | 7 | 14 | 0 | 25 | 11 |
-| dynamics driven by speed, tilt or stroke position | 0 | 7 | 1 | 12 | 0 | 20 | 3 |
-| mirrored dabs | 0 | 9 | 3 | 8 | 0 | 20 | 2 |
-| a separate paint-deposit rate | 0 | 5 | 1 | 13 | 0 | 19 | 7 |
+| animated brush sequences (a `.gih` pipe) | 0 | 12 | 1 | 2 | 252 | 267 | 259 |
+| mirrored dabs | 0 | 9 | 3 | 7 | 0 | 19 | 7 |
+| a paper texture in one of Krita's other blending modes | 0 | 5 | 5 | 8 | 0 | 18 | 6 |
 | a mask this project does not redistribute | 0 | 0 | 0 | 0 | 17 | 17 | 17 |
-| dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 1 |
-| bitmap tips stored outside the file | 0 | 0 | 0 | 10 | 0 | 10 | 1 |
+| dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 2 |
+| bitmap tips stored outside the file | 0 | 0 | 0 | 10 | 0 | 10 | 3 |
 | square brush shapes | 0 | 0 | 5 | 2 | 0 | 7 | 0 |
-| brush-tip randomness | 0 | 0 | 6 | 0 | 0 | 6 | 1 |
-| brush-tip density | 0 | 0 | 5 | 0 | 0 | 5 | 0 |
+| a paper texture whose strength follows pressure | 0 | 1 | 5 | 0 | 0 | 6 | 4 |
+| brush-tip density | 0 | 0 | 5 | 0 | 0 | 5 | 1 |
+| brush-tip randomness | 0 | 0 | 4 | 0 | 0 | 4 | 0 |
 | edge sharpening | 0 | 1 | 1 | 2 | 0 | 4 | 1 |
 | star-shaped brushes | 0 | 0 | 1 | 2 | 0 | 3 | 1 |
+| a dynamic driven by an input Umber cannot produce | 0 | 0 | 0 | 2 | 0 | 2 | 0 |
+| a dynamic that varies in Krita and arrives constant here | 0 | 1 | 0 | 0 | 0 | 1 | 1 |
+| a stamp too faint to make a mark | 0 | 0 | 1 | 0 | 0 | 1 | 1 |
 | masking brushes | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
+
+333 refused in all, against 252 shipped. **"paper texture" used to be one row of
+31, eleven of them alone**; it is two rows of 18 and 6 now, because the pattern
+itself comes across and only the parts of Krita's texture option Umber has no
+model for are left. See the section under the Krita reader.
 
 **Thirteen more presets are refused whole, before a brush comes out of them**,
 because they name one of Krita's other paint engines: `experimentbrush` ×4,
@@ -230,9 +236,8 @@ is not, which is most of why the second is worth doing first.
    well as the random one. No shipped preset is affected, because all 20 are
    refused today.
 
-Two more, for scale: **coloured stamps** (25, 11 alone) needs a colour scratch
-the dab pass does not have and is a large change; **paper texture** (31, 11
-alone) is the section below.
+One more, for scale: **paper texture**, which was 31 refusals with 11 of them
+alone and is now 24 with 10, is the section below.
 
 It was 128 for a while. The 68 missing were refused by the generator rather than
 lost by accident, and both reasons were engine gaps rather than import gaps:
@@ -582,7 +587,8 @@ of them are:
 |---|---|---|---|
 | `min_size_ratio` | 92 of 222 | the other 130, all of which set `pressure_size` | dead where defaulted |
 | `min_hardness_ratio` | 154 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
-| `grain`, `grain_scale`, `grain_pattern` | 222 | none — **but 31 of the packs' presets ask for paper**, and all 31 are refused for it | see "The paper texture" under the Krita reader |
+| `grain`, `grain_scale` | all but 6 | 6, all Krita presets whose texture is a plain Multiply | see "The paper texture" under the Krita reader |
+| `grain_pattern` | every one | none, and it cannot be otherwise: an import names its own tile through `BrushPreset::paper`, which overrides the enum | the enum is the *shipped* set, and an imported paper is never one of them |
 | `build_up` | 222 | none, and this row used to be 232/1 | see below |
 | `stroke_span` | 166 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
 | `stabilization` | 26 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
@@ -597,7 +603,8 @@ the three Krita packs switch a texture on, and `kpp.rs` never saw one because it
 read `Texture/Enabled` where Krita writes `Texture/Pattern/Enabled`. Eleven of
 them were shipping without their grain. A table of defaults is only evidence
 that a field is dead if the reader that would have filled it in is looking in
-the right place.
+the right place. It then said all 31 were refused for it, which was true when it
+was written and is not now: six of them ship with their author's own paper.
 
 `build_up` went with them. It was 232 default and 1 live — Raghukamath's
 "Drybrush", measured — and that one brush asks for paper, so **no brush out of a
@@ -608,10 +615,12 @@ answer as before. What has gone is the *third-party* example of it, which is
 what `crates/umber-render/src/canvas.rs` measured its `R8Unorm` accumulation
 error against.
 
-Note also that this table counts the 222 the generator writes, not
-`preset::builtin()`. Umber's own six are on top of it, and Stipple chalk is
-where the `grain` row's "none" stops being true for the library as a whole: it
-is the one shipped brush that paints through paper.
+Note also that this table counts what the generator writes rather than
+`preset::builtin()` — Umber's own six are on top of it — and that the two grain
+rows are from the current run where the rest are from the one at 222 presets.
+Stipple chalk used to be the one shipped brush that painted through paper; it is
+now one of seven, and the other six are Krita presets carrying their author's
+own tile.
 
 `smudge_length` and `smudge_radius` look like the same case at a glance — 153
 and 195 presets sit on Umber's default — and are not: those *are* MyPaint's
@@ -886,8 +895,10 @@ thirty-one at 1.0 and the last at 0.45 — and **eleven of them were shipping**.
 Several are named
 for the grain they had lost: "F) Thick Dry Canvas", "GDquest Texture Fabric",
 "GDquest Rock Texture Crevaces", "F) Rough Rake Textured", "C5) Thin Brush Hard
-Edge Textured", both of Raghukamath's Drybrushes. They are refused now, which is
-why the library is 222 presets rather than 233.
+Edge Textured", both of Raghukamath's Drybrushes. Every one of them was refused
+once the option was read, which is why the library dropped to 222 presets from
+233; six have since come back with their paper, and the ten that have not are
+the table two sections down.
 
 `MaskingBrush/Enabled` sits two lines above it in the same reader, is spelled
 correctly, and fires on the one preset that uses it. That is what made the
@@ -896,39 +907,83 @@ the argument for the pack sweeps in this file: a hand-built fixture pins the
 reader against itself, and only a real archive can say whether the reader is
 looking in the right place. The fixture in `kpp.rs` had the invented key too.
 
-**A texture library is not what unblocks these**, and the numbers are worth
-having before anybody assumes it is one job:
+**A texture library was not what unblocked these**, and the numbers are worth
+keeping because they are what said which half of the job was which:
 
 | | |
 |---:|---|
 | 31 | presets switch a texture on |
 | 20 | carry the pattern base64-encoded in the preset itself |
 | 11 | are Revoy's, naming six patterns his bundle ships under `patterns/` |
-| 7 | are plain multiply, no inversion, no cutoff remap — which is what `Brush::grain` already is |
+| 13 | are Multiply, which is what `Brush::grain` already is |
 
-So every pattern is *available*, and every pack's licence is verified inside its
-own download, which is what redistributing a bitmap needs — the `ship_tips`
-question in `docs/brush-sources.md`, asked again about paper. What is missing is
-the **model**. Krita's texture carries a texturing mode — `TexturingMode` in
-`KisTextureOptionData.h`, and the packs use five of its sixteen: Multiply (13),
-Subtract (14), Colour Dodge, Hard Mix (softer) and Height ×2 — plus an
-inversion (11), a levels remap of the pattern
-(`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15), a brightness and contrast on
-it (11 state them and 5 carry a live brightness), and a pressure curve on the
-strength (25). Umber's grain is one multiply — `mix(1.0, tile, strength)` — and
-that is deliberate, because a strength of zero has to be the exact identity.
-Multiply is therefore the only mode of the five that carries across at all.
+So every pattern was *available* — the store is a `BTreeMap` and a resolver, and
+`.kpp`'s tips had already solved that exact shape — and every pack's licence is
+verified inside its own download, which is what redistributing a bitmap needs:
+the `ship_tips` question in `docs/brush-sources.md`, asked again about paper.
+What was missing was the **model**. Krita's texture carries a texturing mode —
+`TexturingMode` in `KisTextureOptionData.h`, and the packs use five of its
+sixteen: Multiply (13), Subtract (14), a dodge, Hard Mix (softer) and Height ×2
+— plus an inversion (11), a levels remap of the pattern
+(`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15), a brightness and contrast on it
+(11 state them and 5 carry a live brightness), and a pressure curve on the
+strength (25).
 
-Of the eleven that were shipping, **four** are plain multiply, no inversion and
-no cutoff: "C2) Mechanical Pencil Detail", "C4) Thin Brush Regular",
-"F) Rough Rake Textured" and "GDquest Texture Fabric". **Two of those four come
-back exactly** — the last two, one at brightness 0 and contrast 1 and one
-written before Krita had those keys. The other two would need their pattern
-darkened first, by 0.1 and 0.29, which a texture store could bake in once when
-it takes the bitmap rather than needing anything in `Brush::grain`. The
-remaining seven need an inverted pattern, a cutoff remap or Subtract, and until
-one of those exists they are correctly refused. Approximating them is the thing
-the generator is fussy in order not to do.
+#### What was built, and why that half
+
+The split that mattered turned out to be **which of those is a function of one
+texel's grey**, not which of them is small.
+
+- The inversion, the levels remap, the brightness, the contrast and the neutral
+  point are *all* per-texel, so all five are **baked into the stored tile** at
+  import by `TextureSpec::levels` — a 256-entry table, applied once, exactly
+  reproducing `KisTextureMaskInfo::recalculateMask`. That is not an
+  approximation and it costs the engine nothing: a tile is stored once and
+  sampled for ever, `Brush` gains no field, the brush editor gains no control,
+  and `mix(1.0, tile, strength)` is still the exact identity at strength zero.
+- The mode is **not**. Krita's Multiply against the dab's alpha is
+  `alpha × (mask × strength + (1 − strength))`, which is Umber's grain written
+  out, so those come across exactly. Subtract is `alpha − mask` and no tile
+  makes a multiply do that — at half coverage through a half-lit texel the two
+  differ by a quarter of the mark.
+- The strength's pressure curve is not either, and for a different reason: the
+  grain strength is a *per-pass uniform*, so following pressure means moving it
+  into the per-dab instance data.
+
+Baking the four cheap ones brought back **six** presets — five of Revoy's and
+GDquest's "Texture Fabric" — and took the library from 247 to 252. The eleven
+that this section used to say were "shipping without their grain" had become
+sixteen by the time the tiles could be read, because other work in between had
+stopped refusing them for other reasons.
+
+#### What the remaining ten would cost
+
+Ten presets are still refused for paper alone, and the order of the two
+remaining features is **not** the order it looked in before the tiles could be
+read:
+
+| Missing | Refused alone | What it needs |
+|---|---:|---|
+| a grain strength that follows pressure | 4 | `grain` per dab rather than per pass: instance data, `StrokeBuilder`, a curve or a `dynamics` target, a control |
+| Krita's Subtract | 3 | a `GrainMode` on `Brush`, a scalar in `DabParams`, a `select` in `dab.wgsl`, a control, a GPU test |
+| Height ×2, Hard Mix ×1 | 3 | the same shader work again, twice more, for one preset each |
+
+All four of the pressure-curve group are Raghukamath's and all four are
+*Multiply* — their tiles are already correct and only the ramp is missing. The
+Subtract three are "Pack01 Chalk02", "Pack01 Crayon09" and "GDquest Rock Texture
+Crevaces".
+
+Neither was built. Each buys three or four brushes for a change that reaches the
+dab pipeline or the shader plus a control in the brush editor, where the bake
+bought six for a table; and the Subtract path in particular has to be weighed
+against the standing rule that a strength of zero is the exact identity — a
+`select` keeps that true (`max(0, m − 0)` is `m`) but puts two extra ALU
+operations on every fragment of every dab, paper or none. If either is picked
+up, the pressure curve is worth more than Subtract and the two Height presets
+and the one Hard Mix are worth neither.
+
+Everything above is `cargo run -p umber-core --example build-brush-library`'s
+own output; re-run it before quoting any of these figures.
 
 #### And three more, all about how a dab turns
 

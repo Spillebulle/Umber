@@ -329,9 +329,17 @@ fn main() {
                     && !umber_core::tip::stroke_coverage(mask, 0.1).is_usable()
                 {
                     skipped
-                        .entry("a stamp too faint to make a mark".to_string())
+                        .entry(TOO_FAINT.to_string())
                         .or_default()
                         .push(label(&preset.name));
+                    // In the by-reason table as well as the list, like the
+                    // redistribution refusal beside it: a generator-side
+                    // refusal that only appeared in one of the two would be
+                    // missing from the table this file calls the honest answer.
+                    refusals.push(Refusal {
+                        pack: pack.dir,
+                        reasons: vec![TOO_FAINT.to_string()],
+                    });
                     continue;
                 }
                 if tip.is_some() && !pack.ship_tips {
@@ -534,6 +542,10 @@ struct Refusal {
 /// The one refusal that is not about rendering. Named once so the report and
 /// the refusal cannot disagree about its wording.
 const NOT_REDISTRIBUTED: &str = "a mask this project does not redistribute";
+
+/// The other refusal this generator makes on its own, rather than reading off
+/// `Imported::dropped`. Named here for the same reason.
+const TOO_FAINT: &str = "a stamp too faint to make a mark";
 
 /// Print the refusals as reason × pack, with the count each fix would unlock.
 ///
