@@ -470,6 +470,54 @@ mod tests {
         assert!(matches!(err, PresetError::Io { .. }));
     }
 
+    /// A pipe becomes one preset per cell, numbered — and **one preset, not
+    /// numbered, where the cells cannot make different marks**. Both halves are
+    /// this function's rather than `gih`'s: `many` is read off the cells the
+    /// pipe can reach, so a collapse changes the name as well as the notice,
+    /// and a pipe of four copies of one stamp arrives as `Copies` rather than
+    /// as `Copies 1`.
+    #[test]
+    fn a_pipe_arrives_as_one_preset_per_cell_it_can_reach() {
+        let dir = std::env::temp_dir().join(format!("umber-gih-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        // A 1x1 version 2 mask, whole, so a pipe is these end to end.
+        let cell = |coverage: u8| {
+            let mut out = Vec::new();
+            for field in [29u32, 2, 1, 1, 1] {
+                out.extend_from_slice(&field.to_be_bytes());
+            }
+            out.extend_from_slice(b"GIMP");
+            out.extend_from_slice(&25u32.to_be_bytes());
+            out.push(0);
+            out.push(coverage);
+            out
+        };
+        let pipe = |name: &str, cells: &[Vec<u8>]| {
+            let mut out = format!("{name}\n{} dim:1 sel0:random\n", cells.len()).into_bytes();
+            for cell in cells {
+                out.extend_from_slice(cell);
+            }
+            out
+        };
+
+        let shuffled = dir.join("bark.gih");
+        std::fs::write(&shuffled, pipe("Bark", &[cell(10), cell(20), cell(30)])).expect("write");
+        let found = read_file(&shuffled).expect("read");
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].preset.name, "Bark 1");
+        assert_eq!(found[2].preset.name, "Bark 3");
+        assert_eq!(found[0].dropped, [gih::ANIMATION]);
+
+        let copies = dir.join("copies.gih");
+        std::fs::write(&copies, pipe("Copies", &[cell(7), cell(7), cell(7)])).expect("write");
+        let found = read_file(&copies).expect("read");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found.len(), 1, "three copies of one stamp are one brush");
+        assert_eq!(found[0].preset.name, "Copies");
+        assert!(found[0].dropped.is_empty(), "{:?}", found[0].dropped);
+    }
+
     /// The point of the whole exercise: a GIMP brush picked in the file dialog
     /// has to arrive as something that paints. Built by hand rather than taken
     /// from a pack — no `.gbr` collection states its licence inside the

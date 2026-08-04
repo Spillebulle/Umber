@@ -47,12 +47,13 @@ fn main() {
     files.sort();
 
     println!(
-        "{:<46} {:>5} {:>5} {:>11} {:>10}  rules",
+        "{:<56} {:>5} {:>5} {:>11} {:>10}  rules",
         "pipe", "cells", "reach", "cell", "array kB"
     );
 
     let mut pipes = 0usize;
     let mut by_rule: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_pack: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut widest = 0usize;
     let mut largest_array = 0usize;
     let mut total_cells = 0usize;
@@ -60,11 +61,11 @@ fn main() {
     let mut dimensions_over_one = 0usize;
     let mut trimmed = 0usize;
 
-    for (label, bytes) in files.into_iter().flat_map(read_pipes) {
+    for (label, bytes) in files.into_iter().flat_map(|path| read_pipes(&root, path)) {
         let pipe = match gih::from_gih(&bytes) {
             Ok(pipe) => pipe,
             Err(e) => {
-                println!("{:<46} {e}", label);
+                println!("{:<56} {e}", label.name);
                 continue;
             }
         };
@@ -73,7 +74,13 @@ fn main() {
         pipes += 1;
         total_cells += report.cells;
         widest = widest.max(report.cells);
-        largest_array = largest_array.max(report.array_bytes);
+        largest_array = largest_array.max(report.array_bytes.unwrap_or(0));
+        // Per pack, because the shipped library's accounting is per pack: it is
+        // the cells in *rubberduck's* pipes that decide how much of the `.gih`
+        // refusal a mask licence would still hold back whatever the engine did.
+        let pack = by_pack.entry(label.pack.clone()).or_default();
+        pack.0 += 1;
+        pack.1 += report.cells;
         if pipe.rules.len() > 1 {
             dimensions_over_one += 1;
         }
@@ -93,28 +100,37 @@ fn main() {
         *by_rule.entry(report.rules.clone()).or_default() += 1;
 
         println!(
-            "{:<46} {:>5} {:>5} {:>11} {:>10.0}  {}",
-            label,
+            "{:<56} {:>5} {:>5} {:>11} {:>10}  {}",
+            label.name,
             report.cells,
             report.reach,
             report.cell_size,
-            report.array_bytes as f32 / 1024.0,
+            match report.array_bytes {
+                Some(bytes) => format!("{:.0}", bytes as f32 / 1024.0),
+                // A collapsed pipe would never be a cell array, and the cells
+                // it dropped are not here to be measured. See `Report`.
+                None => "—".to_string(),
+            },
             report.rules,
         );
     }
 
     println!("\n{pipes} pipes, {total_cells} cells");
-    println!("  widest                     {widest} cells");
+    println!("  widest                                 {widest} cells");
     println!(
-        "  largest cell array         {:.0} kB (every cell padded into the common box)",
+        "  largest cell array                     {:.0} kB (every cell padded into the common box)",
         largest_array as f32 / 1024.0
     );
-    println!("  more than one dimension    {dimensions_over_one}");
+    println!("  more than one dimension                {dimensions_over_one}");
     println!("  collapsed: every cell the same brush   {identical}");
     println!("  collapsed: nothing walks               {trimmed}");
     println!("\nby rule:");
     for (rules, count) in &by_rule {
         println!("  {rules:<40} {count:>4}");
+    }
+    println!("\nby pack (pipes, cells):");
+    for (pack, (pipes, cells)) in &by_pack {
+        println!("  {pack:<40} {pipes:>4} {cells:>6}");
     }
 
     // The one figure the angular argument rests on, printed on its own so a
@@ -138,7 +154,15 @@ struct Report {
     /// What a `texture_2d_array` of the cells would take, with every cell
     /// padded into the box that holds the largest — the shape the dab pass
     /// would need, since an array's layers share one size.
-    array_bytes: usize,
+    ///
+    /// `None` for a **collapsed** pipe, and that is the honest answer rather
+    /// than a gap: `GihPipe::cells` is what the pipe can reach, so the cells a
+    /// collapse dropped are not here to be measured — and a pipe that collapses
+    /// would never be a cell array in the first place. Reporting the box over
+    /// the survivors and multiplying by the file's count would be a figure
+    /// built from two different sets, which is the kind of number that survives
+    /// because it looks deliberate.
+    array_bytes: Option<usize>,
     rules: String,
 }
 
@@ -146,18 +170,20 @@ impl Report {
     fn of(pipe: &GihPipe) -> Self {
         let width = pipe.cells.iter().map(|c| c.tip.width()).max().unwrap_or(0);
         let height = pipe.cells.iter().map(|c| c.tip.height()).max().unwrap_or(0);
+        // A pipe whose cells differ in size is legal and is what an array's
+        // shared layer size has to be padded for. None of the 55 is one, which
+        // is worth knowing and is why the mark is printed rather than assumed.
         let ragged = pipe
             .cells
             .iter()
             .any(|c| c.tip.width() != width || c.tip.height() != height);
+        let whole = pipe.cells.len() == pipe.written;
 
         Self {
             cells: pipe.written,
             reach: pipe.cells.len(),
             cell_size: format!("{width}x{height}{}", if ragged { "*" } else { "" }),
-            // Off `written` rather than the reach: what a cell array would have
-            // to hold is the file's own cells, before either collapse.
-            array_bytes: pipe.written * width as usize * height as usize,
+            array_bytes: whole.then(|| pipe.written * width as usize * height as usize),
             rules: describe(&pipe.rules),
         }
     }
@@ -183,19 +209,36 @@ fn describe(rules: &[Option<Selection>]) -> String {
         .join(" + ")
 }
 
+/// Where a pipe came from: the pack directory, and something to print.
+struct Label {
+    pack: String,
+    name: String,
+}
+
 /// Every pipe in one file: a loose `.gih` is one, and a `.bundle` is a zip that
 /// may hold several as the tips of its presets.
-fn read_pipes(path: PathBuf) -> Vec<(String, Vec<u8>)> {
-    let name = |extra: &str| {
+fn read_pipes(root: &Path, path: PathBuf) -> Vec<(Label, Vec<u8>)> {
+    // The first component under `assets/brushes` is the pack, which is the unit
+    // the licence decision is made in.
+    let pack = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = |extra: &str| {
         let stem = path.file_name().unwrap_or_default().to_string_lossy();
-        format!("{stem}{extra}")
+        Label {
+            pack: pack.clone(),
+            name: format!("{stem}{extra}"),
+        }
     };
     let Ok(bytes) = std::fs::read(&path) else {
         return Vec::new();
     };
 
     if path.extension().is_some_and(|e| e == "gih") {
-        return vec![(name(""), bytes)];
+        return vec![(label(""), bytes)];
     }
 
     let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
@@ -219,7 +262,7 @@ fn read_pipes(path: PathBuf) -> Vec<(String, Vec<u8>)> {
             let mut out = Vec::new();
             std::io::copy(&mut file, &mut out).ok()?;
             let leaf = entry.rsplit('/').next().unwrap_or(&entry).to_string();
-            Some((name(&format!(":{leaf}")), out))
+            Some((label(&format!(":{leaf}")), out))
         })
         .collect()
 }

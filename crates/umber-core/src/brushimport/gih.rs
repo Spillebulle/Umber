@@ -18,8 +18,13 @@
 //! Line one is the pipe's name. Line two starts with the number of cells and
 //! continues with `key:value` parameters. The cells carry their own dimensions
 //! and spacing in their `.gbr` headers, so `cellwidth`, `cellheight` and `step`
-//! are a summary rather than the truth — a pipe whose cells differ in size is
-//! legal, and `rocky1.gih` is one.
+//! are a summary rather than the truth. A pipe whose cells differ in size is
+//! legal — which is why the cells are found by *walking* the file rather than
+//! by a stride — and **none of the 55 in the fetched packs is one**, which is
+//! exactly why the walk has to be right rather than checked by eye:
+//! `examples/measure-pipes.rs` marks a ragged pipe with a `*` and has never
+//! printed one. This file used to name `rocky1.gih` as an example and that was
+//! wrong; its five cells are all 350×250.
 //!
 //! **The leading count is the number of cells; `rank0:` is not.** They usually
 //! agree and are not required to: `wood1b.gih` in rubberduck's pack says four
@@ -45,7 +50,7 @@
 //! needs the dab pass to hold an array of tips and an index per instance.
 //! `docs/brush-pipes.md` is the design and the measurements, and the headline
 //! is that the *memory* is not what stands in the way — the widest pipe in
-//! every pack Umber fetches is 9 cells of 300², which is 810 kB beside a
+//! every pack Umber fetches is 9 cells of 300², which is 791 kB beside a
 //! canvas-sized scratch. What stands in the way is that a tip is bound once
 //! per pass and named by a single [`crate::BrushPreset::tip`].
 //!
@@ -61,10 +66,18 @@
 //! the mark is a shuffle.
 //!
 //! [`Selection`] is one dimension's rule and [`GihPipe::rules`] is all of them.
-//! A dimension the file says nothing about is taken as **walking** its cells,
-//! because the two readings fail in opposite directions and only one of them
-//! fails safely: naming a loss that may not be there costs a sentence, where
-//! assuming a rule that is not stated loses stamps in silence.
+//! **The pipe walks unless every dimension states `constant`**, and silence
+//! and an unknown word both walk — one rule, not three postures, and it is the
+//! rule the collapse below forces: a collapse discards cells, so it may only
+//! follow a positive statement that they are unreachable. GIMP's own defaults
+//! agree about silence (`gimp_pixpipe_params_init` fills an unstated dimension
+//! with `random`) and deliberately do not about the unknown word, which
+//! [`Selection::Unknown`] argues on its own terms.
+//!
+//! The header is read in **one ordered pass, as GIMP reads it**: a `selN:`
+//! counts only where `N` is inside the `dim` seen so far. That matters in
+//! exactly one direction — a rule accepted ahead of the dimension it names
+//! could complete a set of `constant`s and collapse a pipe GIMP walks.
 //!
 //! # Two collapses that are exact, and one that is not
 //!
@@ -74,24 +87,30 @@
 //! `count > 1`.
 //!
 //! **Nothing walks.** `constant` names a dimension whose index never leaves
-//! where it started, so a pipe whose every dimension is constant paints its
-//! first cell for ever and the others are cells GIMP would never reach. Read
-//! off the header. `count > 1` on its own got both halves wrong at once for
-//! such a file: a five-cell constant pipe arrived as five brushes, four of
-//! which GIMP would never paint, and each of the five claimed a sequencing
-//! loss that had not happened.
+//! where it started — `gimp_brush_pipe_select_brush`'s `PIPE_SELECT_CONSTANT`
+//! arm re-reads the index it was given, and nothing else writes it after
+//! `set_params` zeroes it — so a pipe whose every dimension is constant paints
+//! its first cell for ever and the others are cells GIMP would never reach.
+//! Read off the header. Reading `count > 1` as animation instead gets both
+//! halves wrong at once for such a file: it would arrive as five brushes, four
+//! of which GIMP never paints, each of the five naming a sequencing loss that
+//! had not happened. **No such file exists in any fetched pack**, so this is a
+//! rule stated before it is needed rather than a bug that was found.
 //!
 //! **The cells cannot differ.** Where every cell is the same brush, choosing
 //! between them — at random, by direction, by anything — makes exactly the mark
-//! one of them repeated makes. Compared byte for byte, so there is no threshold
-//! to get wrong; and over everything the import reads off a cell rather than
-//! over its coverage alone, so a `.gpb` whose colour differs is not "the same".
-//! **Two of the 55 pipes in the fetched packs are this**, both tips inside
-//! David Revoy's Krita bundle, and they are the only brushes anywhere in the
-//! packs that this module's own work moves into the shipped library. A one-cell
-//! pipe is the degenerate case of the same rule: a sequence of one has no
-//! sequencing, so `ncells:1 sel0:incremental` used to name a loss that had not
-//! happened.
+//! one of them repeated makes. Compared byte for byte over what the import
+//! keeps, which is not the same as what the file holds: see [`same_brush`],
+//! which is where the one subtlety lives. **Two of the 55 pipes in the fetched
+//! packs are this**, both tips inside David Revoy's Krita bundle; four of his
+//! presets stop naming a loss they had not suffered, and none of them ships,
+//! because every one is still refused for something else.
+//!
+//! A one-cell pipe is `uniform` vacuously, which is how it comes out as no loss
+//! whatever rule it states — and it is also what GIMP does, since
+//! `gimp_brush_pipe_select_brush` returns the current brush without consulting
+//! the rules at all when `n_brushes == 1`. `ncells:1 sel0:incremental` used to
+//! be reported as a loss on the reasoning that a pipe is taken at its word.
 //!
 //! The third case is [`Selection::Angular`], and it is *not* exact — see below.
 //! The difference is the whole reason two of these are built and one is not:
@@ -107,18 +126,20 @@
 //! - **Colour**, exactly as [`super::gbr`] drops it: a cell may be a 4-byte
 //!   RGBA stamp or a `.gpb`, and only its coverage survives.
 //!
-//! `placement` is **not** in that list, and that is deliberate rather than an
-//! omission: it says where a dab lands relative to the stroke, which is
-//! [`crate::Brush::scatter`]'s question and not the cell array's. Naming it
-//! beside the sequence would be a second sentence about the same loss.
+//! `placement` is **not** in that list, and not because it was overlooked:
+//! GIMP's brush-pipe core mentions it once, in a comment reading "placement is
+//! not used at all ??". It is a hint for the export plug-in that arranges the
+//! cells on a sheet, and nothing in painting reads it. Umber loses nothing by
+//! ignoring it, which is why it is named here and nowhere a user can see.
 //!
 //! # `sel0:angular` is the stroke-following stamp, and it is named separately
 //!
 //! GIMP's selection modes are `constant`, `incremental`, `random`, `angular`,
 //! `velocity`, `pressure`, `xtilt` and `ytilt`, and one of them is a different
 //! kind of thing from the rest. **`angular` picks the cell by the direction of
-//! the stroke**: the cells are one stamp drawn at `ncells` rotations, and
-//! painting a curve turns the mark through them. That is a brush whose tip
+//! the stroke** — GIMP's index is `RINT((1 - direction + 0.25) * rank) % rank`
+//! — so the cells are one stamp drawn at `rank` rotations, and painting a
+//! curve turns the mark through them. That is a brush whose tip
 //! follows the stroke, and Umber's dab does exactly that natively —
 //! [`Brush::dab_angle_follows_stroke`](crate::Brush::dab_angle_follows_stroke)
 //! turns the quad, tip and all, so *one* cell plus that flag would reproduce
@@ -147,16 +168,18 @@ use super::gbr::{self, GbrBrush};
 ///
 /// The number is read from a text header before any of the cells exist, so it
 /// sizes an allocation on a stranger's say-so. GIMP's own animated brushes top
-/// out in the low tens; the widest in every pack Umber fetches is **9**, and
-/// the widest anywhere it has looked is 24.
+/// out in the low tens; the widest in every pack Umber fetches is **9**
+/// (`examples/measure-pipes.rs`).
 const MAX_CELLS: usize = 1024;
 
-/// Refuse a pipe claiming more dimensions than any real brush has.
+/// Clamp `dim` to what the format itself allows.
 ///
-/// Same reasoning as [`MAX_CELLS`] and a much tighter number, because `dim`
-/// sizes the rule table off a stranger's word and GIMP's own editor offers
-/// four. Every pipe in every fetched pack is `dim:1`.
-const MAX_DIMENSIONS: usize = 8;
+/// **GIMP's own number**: `GIMP_PIXPIPE_MAXDIM` is 4, and
+/// `gimp_pixpipe_params_parse` clamps to it, so a header claiming more is one
+/// GIMP would clamp too. Not merely a guard against a stranger's word sizing a
+/// table, though it is that as well — every pipe in every fetched pack is
+/// `dim:1`.
+const MAX_DIMENSIONS: usize = 4;
 
 /// The longest header line this will read, matching GIMP's own limit.
 const MAX_LINE: usize = 1024;
@@ -191,8 +214,15 @@ pub enum Selection {
     YTilt,
     /// A word this build has never heard of.
     ///
-    /// Taken as walking the cells, like every other unknown here: the reading
-    /// that costs a sentence beats the reading that loses stamps in silence.
+    /// **Taken as walking, which is deliberately not what GIMP does** — its
+    /// own string-to-enum chain ends `else … = PIPE_SELECT_CONSTANT`, so an
+    /// unrecognised word pins the index there. Matching that would let a word
+    /// nobody has defined collapse a pipe and throw its cells away, and the
+    /// likeliest such word is a mode a *later* GIMP walks: the file would be
+    /// written by a build that knows it, read by one that does not, and the
+    /// stamps would be gone with nothing said. The collapse is allowed only on
+    /// a positive statement of [`Constant`](Self::Constant), and this is that
+    /// rule rather than an exception to it.
     Unknown,
 }
 
@@ -319,11 +349,20 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
 
     // Everything after the count is `key:value`. A pipe has `dim` dimensions
     // and a `selN:` rule for each, and reading only `sel0:` would under-report
-    // a two-dimensional one — see the module docs. `dim` is read before the
-    // rules are placed, so a `sel3:` on a `dim:1` pipe is ignored rather than
-    // inventing a dimension the file does not have.
+    // a two-dimensional one — see the module docs.
+    //
+    // **One ordered pass, because that is what GIMP does.**
+    // `gimp_pixpipe_params_parse` reads the words left to right and keeps a
+    // `selN:` only where `N` is inside the `dim` *it has seen so far*, so a
+    // rule stated before the dimension it names is dropped. Two passes would
+    // be tidier and would disagree with GIMP about a header no GIMP wrote —
+    // and disagreeing in this direction is not harmless, because a `sel1:`
+    // accepted ahead of its `dim:2` could complete a set of `constant`s and
+    // collapse a pipe whose second dimension GIMP walks. Discarding somebody's
+    // stamps in silence is the failure this module exists to prevent, so the
+    // reader matches the writer rather than being reasonable at it.
     let mut dimensions = 1usize;
-    let mut stated: Vec<(usize, Selection)> = Vec::new();
+    let mut rules: Vec<Option<Selection>> = vec![None; MAX_DIMENSIONS];
     for word in words {
         if let Some(value) = word.strip_prefix("dim:") {
             if let Ok(n) = value.parse::<usize>() {
@@ -332,26 +371,22 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
         } else if let Some(rest) = word.strip_prefix("sel")
             && let Some((index, value)) = rest.split_once(':')
             && let Ok(index) = index.parse::<usize>()
+            && index < dimensions
         {
-            stated.push((index, Selection::parse(value)));
-        }
-    }
-    let mut rules = vec![None; dimensions];
-    for (index, rule) in stated {
-        if let Some(slot) = rules.get_mut(index) {
             // Last wins, which is what the old single-rule read did.
-            *slot = Some(rule);
+            rules[index] = Some(Selection::parse(value));
         }
     }
+    rules.truncate(dimensions);
 
-    // A dimension the file says nothing about is taken as walking its cells,
-    // which for a single-cell pipe is a walk of length one and therefore no
-    // loss at all. `constant` is the only rule that pins the index, so it is
-    // the only one a pipe can be trimmed under — see the module docs for why
-    // that has to be *stated* rather than inferred from the cell count.
-    let animated = rules
-        .iter()
-        .any(|rule| rule.is_none_or(Selection::walks) && (rule.is_some() || count > 1));
+    // The pipe walks unless every dimension **states** `constant`. Silence
+    // walks and so does a word this build does not know, and those are one
+    // rule rather than three postures: the collapse below discards cells, so
+    // it is allowed only on a positive statement that they are unreachable.
+    // GIMP's own defaults agree about the first — `gimp_pixpipe_params_init`
+    // fills every unstated dimension with `random` — and deliberately do not
+    // about the second; see [`Selection::Unknown`].
+    let animated = rules.iter().any(|rule| rule.is_none_or(Selection::walks));
     let angular = rules.contains(&Some(Selection::Angular));
 
     let mut cells = Vec::with_capacity(count.min(64));
@@ -388,20 +423,20 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
     //   reach. Read off the header.
     // - **The cells cannot differ.** Every one of them is the same brush, so
     //   choosing between them — by chance, by direction, by anything — makes
-    //   exactly the mark one of them repeated makes. Compared byte for byte
-    //   over everything the import reads off a cell, so a `.gpb` whose colour
-    //   differs is not "the same" and neither is a cell at another spacing.
-    //   Two of the 55 pipes in the fetched packs are this, both of them tips
-    //   inside David Revoy's Krita bundle. A one-cell pipe is the degenerate
-    //   case and falls out of the same line: a sequence of one has no
-    //   sequencing, so `sel0:incremental` on it names a loss that did not
-    //   happen.
+    //   exactly the mark one of them repeated makes. Two of the 55 pipes in
+    //   the fetched packs are this, both of them tips inside David Revoy's
+    //   Krita bundle.
+    //
+    // A one-cell pipe is `uniform` vacuously, and that is how it comes out as
+    // no loss whatever rule it states — which is also what GIMP does:
+    // `gimp_brush_pipe_select_brush` returns the current brush without
+    // consulting the rules at all when `n_brushes == 1`.
     let written = cells.len();
     let uniform = cells.iter().all(|cell| same_brush(cell, &cells[0]));
-    if !animated || uniform {
+    let collapsed = !animated || uniform;
+    if collapsed {
         cells.truncate(1);
     }
-    let collapsed = cells.len() < written || uniform;
 
     Ok(GihPipe {
         name,
@@ -419,11 +454,30 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
 
 /// Whether two cells are the same brush in everything the import keeps.
 ///
-/// Not `==` on the whole [`GbrBrush`]: the **name** is a label rather than part
-/// of the mark, and cells routinely carry different ones. Everything else is
-/// compared, and comparing [`crate::tip::TipMask`] whole rather than its
-/// coverage bytes is deliberate — it is what makes this stay right on the day a
-/// mask carries more than coverage.
+/// Every field of [`GbrBrush`] except the **name**, which is a label rather
+/// than part of the mark: `read_file` builds a preset's name from the pipe's
+/// own and an index and never reads a cell's, so two cells that differ only
+/// there cannot produce two different brushes.
+///
+/// **This is sameness of what Umber keeps, not of what the file holds**, and
+/// the difference is `coloured`: that is a *flag* saying the cell described a
+/// colour, not the colour. Two `.gpb` cells with one mask and two different
+/// patterns compare equal here and are collapsed — which is exact **because
+/// [`super::gbr::read_one`] discards the colour** before either ever reaches a
+/// `TipMask`. That is the whole of why this is lossless, and it is a fact about
+/// `gbr.rs` rather than about this function.
+///
+/// So: **the day a cell's colour survives the decode, this comparison is
+/// unsound until the colour is in what it compares.** Putting it inside
+/// [`crate::tip::TipMask`]'s own equality is what would make that automatic,
+/// which is why the mask is compared whole rather than through `coverage()` —
+/// but a colour carried anywhere else on a `GbrBrush` has to be added here by
+/// hand, and the cells it would have distinguished are gone by the time
+/// anything downstream could notice.
+///
+/// `spacing` is an `Option<f32>` compared with `==`. Safe rather than lucky:
+/// it is `percent / 100.0` from a `u32` in the header, so it is never NaN and
+/// two cells that stated the same percentage compare exactly equal.
 fn same_brush(a: &GbrBrush, b: &GbrBrush) -> bool {
     a.tip == b.tip && a.spacing == b.spacing && a.coloured == b.coloured
 }
@@ -517,7 +571,9 @@ mod tests {
 
     /// Cells are found by walking, so a cell whose length is misjudged makes
     /// rubbish of every one after it. A pipe of differently sized cells is the
-    /// case that catches an assumed stride — and `rocky1.gih` is one.
+    /// case that catches an assumed stride, and it is legal — no pipe in any
+    /// fetched pack is one, so this fixture is the only thing standing between
+    /// the walk and a stride nobody would notice.
     #[test]
     fn cells_of_different_sizes_are_all_found() {
         let file = gih(
@@ -640,6 +696,16 @@ mod tests {
         assert!(!pipe.animated);
         assert!(dropped_features(&same).is_empty());
 
+        // A one-cell pipe is this rule holding vacuously, and it is the whole
+        // mechanism behind `ncells:1 <anything>` reporting nothing — GIMP short-
+        // circuits on `n_brushes == 1` before it consults a rule at all. Stated
+        // here rather than beside the rules, because it is not a fact about
+        // them: a pipe with no rule *and* one cell would otherwise pass for two
+        // independent reasons and pin neither.
+        let alone = gih("Alone", "ncells:1", &[cell(1)]);
+        assert!(!from_gih(&alone).expect("decode").animated);
+        assert!(dropped_features(&alone).is_empty());
+
         // One cell out of four differing is a pipe that genuinely shuffles.
         let nearly = gih(
             "Nearly",
@@ -712,18 +778,16 @@ mod tests {
         assert_eq!(pipe.cells.len(), 3);
         assert_eq!(dropped_features(&silent), [ANIMATION]);
 
-        // One cell walked by nothing in particular is a walk of length one,
-        // which is a plain `.gbr` wearing a pipe's header.
-        let alone = gih("Alone", "ncells:1", &[cell(1)]);
-        assert!(!from_gih(&alone).expect("decode").animated);
-        assert!(dropped_features(&alone).is_empty());
-
-        // A word this build has never heard of walks, for the same reason.
+        // A word this build has never heard of walks too, and that one is
+        // deliberately *not* what GIMP does — it reads an unrecognised word as
+        // constant. The likeliest such word is a mode a later GIMP walks, and
+        // collapsing on it would throw the cells away with nothing said.
         let strange = gih("Strange", "ncells:2 sel0:hyperbolic", &[cell(1), cell(2)]);
         let pipe = from_gih(&strange).expect("decode");
         assert_eq!(pipe.rules, [Some(Selection::Unknown)]);
         assert!(pipe.animated);
         assert_eq!(pipe.cells.len(), 2);
+        assert_eq!(dropped_features(&strange), [ANIMATION]);
     }
 
     /// A pipe can lose two different things at once, and the `if angular …
@@ -753,27 +817,51 @@ mod tests {
         );
     }
 
-    /// `dim` is read before the rules are placed, so a `selN:` naming a
-    /// dimension the pipe does not have is ignored rather than inventing one —
-    /// which would make a pinned pipe look as though something walked it.
+    /// The header is read in one ordered pass, because `gimp_pixpipe_params_
+    /// parse` is: a `selN:` counts only where `N` is inside the `dim` seen so
+    /// far. Being reasonable at GIMP instead is not harmless — a rule accepted
+    /// ahead of the dimension it names could complete a set of `constant`s and
+    /// collapse a pipe GIMP walks, which is stamps discarded in silence.
     #[test]
-    fn a_rule_for_a_dimension_the_pipe_does_not_have_is_ignored() {
-        // `sel1:` on a one-dimensional pipe. The `dim:` word comes *after* it,
-        // so this also pins that the two passes are ordered rather than
-        // interleaved.
-        let file = gih(
-            "Stray",
-            "ncells:2 sel1:random sel0:constant dim:1",
+    fn a_rule_stated_before_the_dimension_it_names_is_dropped_as_gimp_drops_it() {
+        // `sel1:` ahead of `dim:2`. GIMP throws it away and leaves dimension 1
+        // walking, so the pipe keeps both cells and names its loss.
+        let early = gih(
+            "Early",
+            "ncells:2 sel1:constant dim:2 rank0:1 rank1:2 sel0:constant",
             &[cell(1), cell(2)],
         );
-        let pipe = from_gih(&file).expect("decode");
-        assert_eq!(pipe.rules, [Some(Selection::Constant)]);
+        let pipe = from_gih(&early).expect("decode");
+        assert_eq!(pipe.rules, [Some(Selection::Constant), None]);
+        assert!(pipe.animated, "dimension 1 has no rule, so it walks");
+        assert_eq!(pipe.cells.len(), 2);
+
+        // The same words with the `sel1:` after its `dim:` do pin both.
+        let ordered = gih(
+            "Ordered",
+            "ncells:2 dim:2 rank0:1 rank1:2 sel0:constant sel1:constant",
+            &[cell(1), cell(2)],
+        );
+        let pipe = from_gih(&ordered).expect("decode");
         assert!(!pipe.animated);
         assert_eq!(pipe.cells.len(), 1);
 
-        // A `dim` no allocation should be sized from is clamped, not trusted.
+        // A `sel1:` on a pipe that never has a second dimension is dropped
+        // whatever the order, so this one really is pinned.
+        let stray = gih(
+            "Stray",
+            "ncells:2 dim:1 sel0:constant sel1:random",
+            &[cell(1), cell(2)],
+        );
+        let pipe = from_gih(&stray).expect("decode");
+        assert_eq!(pipe.rules, [Some(Selection::Constant)]);
+        assert!(!pipe.animated);
+
+        // `dim` is clamped to the format's own maximum rather than trusted:
+        // `GIMP_PIXPIPE_MAXDIM` is 4 and GIMP clamps to it too.
         let wide = gih("Wide", "ncells:1 dim:99999999", &[cell(1)]);
         assert_eq!(from_gih(&wide).expect("decode").rules.len(), MAX_DIMENSIONS);
+        assert_eq!(MAX_DIMENSIONS, 4);
     }
 
     #[test]
@@ -792,6 +880,29 @@ mod tests {
         // A cell count no allocation should be sized from.
         assert!(from_gih(b"Name\n99999999 ncells:99999999\n").is_err());
         assert!(dropped_features(b"rubbish").is_empty());
+
+        // The header's own words are a stranger's too, and every one of these
+        // has to parse-or-ignore rather than panic or size anything. They fail
+        // afterwards for want of cells, which is the point: the failure must be
+        // the missing pixels rather than the header.
+        for header in [
+            "1 dim:abc",
+            "1 dim:0",
+            "1 dim:-1",
+            "1 dim:99999999999999999999",
+            "1 sel:random",
+            "1 sel-1:random",
+            "1 sel0:",
+            "1 sel99999999999999999999:random",
+            "1 selx0:random",
+            "1 sel0:random sel0:constant sel0:angular",
+            "1 dim: sel0",
+            "1 ::: ncells: rank0:",
+        ] {
+            let file = format!("Name\n{header}\n").into_bytes();
+            assert!(from_gih(&file).is_err(), "{header}");
+            assert!(dropped_features(&file).is_empty(), "{header}");
+        }
 
         let full = gih("Bark", "ncells:2 sel0:random", &[cell(1), cell(2)]);
         for cut in 0..full.len() {

@@ -1286,9 +1286,9 @@ per pack. See `docs/brush-sources.md`.
   order to build it in.** The short version: the tip binding becomes a
   `texture_2d_array` and the dab instance carries an index, chosen by the same
   seeded RNG that already drives scatter and angle jitter — and the thing that
-  actually stands in the way is neither memory (the widest pipe in the packs is
-  1221 kB against a canvas-sized scratch) nor the shader (a cell index is a
-  third coordinate on one `textureSample`), but what a `TipMask` *is*. A pipe
+  actually stands in the way is neither memory (the largest cell array in the
+  packs is 1221 kB against a canvas-sized scratch) nor the shader (a cell index
+  is a third coordinate on one `textureSample`), but what a `TipMask` *is*. A pipe
   has to be one mask of several cells, because `Brush` is `Copy` and
   `BrushPreset::tip` holding one name is what lets two brushes share one upload
   — and that changes the meaning of "the mask" for the tip canvas, the library

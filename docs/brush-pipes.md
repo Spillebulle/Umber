@@ -26,14 +26,19 @@ the same rule `measure-undo.rs` and `measure-history.rs` state for theirs.
 | 4 | walk them **incrementally** |
 | 0 | **angular** — the one rule Umber's dab could reproduce natively |
 | 0 | with more than one dimension |
-| 9 | cells in the widest pipe (`scratches_rough.gih`) |
+| 9 | cells in the widest pipe (`scratches_rough.gih`, 300² each, 791 kB) |
 | 1221 kB | the largest cell array, every cell padded into the common box (`painted-style.gih`, 5 × 500²) |
+| 0 | pipes whose cells differ in size — legal, and none of them does it |
 | 2 | pipes whose cells are all **the same brush**, so nothing is lost collapsing them |
+| 43 / 252 | of those pipes and cells are rubberduck's |
 
-And in the library generator's own accounting: **267 presets touch a `.gih`,
-257 of them refused for its sequencing and nothing else.** 252 of those 257 are
-rubberduck's, whose masks this project does not redistribute (`docs/brush-
-sources.md`), so they would not ship even with the sequencing solved.
+The library generator (`cargo run --release -p umber-core --example
+build-brush-library`) prints the other half: **257 presets refused for a `.gih`
+pipe's sequencing and nothing else**, out of 267 that touch one at all, against
+233 shipped. 252 of the 257 are rubberduck's — the row above is where that
+number comes from — and rubberduck's masks are not redistributed
+(`docs/brush-sources.md`), so they would not ship even with the sequencing
+solved.
 
 That asymmetry is the whole shape of the problem. **The shipped library gains
 about five brushes. An import gains 252 faithful stamps** — for somebody who
@@ -112,10 +117,28 @@ row of a cell and the encoder's filters see what they expect — and the cell
 count rides in the file rather than beside it, because a mask whose cell count
 lived in the `.ron` would be two files that have to agree.
 
-Cells of a pipe differ in size (`rocky1.gih`), so they are padded into the
-common box on the way in. Padding is not resampling: the empty margin is
-coverage of zero, which is the exact identity, and it is what `TipMask::aspect`
-already replaced for the *outer* shape.
+**`TipMask::MAX_SIZE` has to become a cap on the *cell*, and the strip has to
+stay the disk form.** This is the piece it is easiest to get to the point of a
+compile before noticing. `MAX_SIZE` is 2048 because `downlevel_defaults`
+guarantees exactly that for `max_texture_dimension_2d`, and `TipMask::new`
+refuses either axis over it. As a vertical strip, `scratches_rough.gih` is 9 ×
+300 = 2700 rows, `blocky.gih` is 2800 and `painted-style.gih` is 2500 — so most
+of the pipes in the packs, including the two this document quotes as its
+headline figures, would be refused by the very constructor they are meant to
+go through. The cap belongs on one cell's dimensions, with the layer count
+checked against `max_texture_array_layers` separately; the strip is how the
+bytes sit in a file and in memory and is never a texture. That change to
+`MAX_SIZE`'s meaning is part of the cost in "What it costs", not a detail below
+it.
+
+A pipe whose cells differ in size is legal, and would be padded into the common
+box on the way in, because an array's layers share one size. Padding is not
+resampling: the empty margin is coverage of zero, which is the exact identity,
+and it is what `TipMask::aspect` already replaced for the *outer* shape. **No
+pipe in any fetched pack is ragged** — `measure-pipes` marks one with a `*` and
+has never printed one — so this is the case with no evidence behind it, and it
+should be built from the format's own permission rather than from a file
+somebody can point at.
 
 This is the piece that costs the most elsewhere. `tip.rs` is read by the brush
 editor's tip canvas, `UserLibrary::save`, `tip::builtin`, `stroke_coverage` and
@@ -179,18 +202,27 @@ already the enum that says which rules are honoured; the four that are not —
 it should be.** The widest pipe in the packs is 9 cells; the largest cell
 array, padded, is **1221 kB**. The stroke scratch is canvas-sized — 100 MB on a
 10000² canvas — so a pipe's cells are a rounding error beside the texture the
-dab pass already read-modify-writes per fragment. `TipMask::MAX_SIZE` is 2048
-and `downlevel_defaults` guarantees exactly that for `max_texture_dimension_2d`;
-`max_texture_array_layers` is 256 there, against a measured widest of 9 and a
-`MAX_CELLS` of 1024, so **the cell count needs a cap the array can hold** and
-that cap is the one new limit this introduces.
+dab pass already read-modify-writes per fragment.
 
-The shipped library is the other figure people reach for and it is the smaller
-one: **about five presets**, because 252 of the 257 refused for sequencing
-alone are rubberduck's and are refused for their masks regardless. The
-generator would report the same total the day this landed and the day after.
-What changes is the import: 269 of rubberduck's stamps arriving as 60 brushes
-that paint like rubberduck's, instead of 269 that do not.
+The limits are the thing to check rather than the megabytes.
+`max_texture_array_layers` is **256** under `downlevel_defaults`, and
+`using_resolution` raises only the three `max_texture_dimension_*` fields, so
+`gpu.rs` does not lift it — against a measured widest of 9 and a `MAX_CELLS` of
+1024, so **the cell count needs a cap the array can hold**. And
+`TipMask::MAX_SIZE`, today a cap on the whole mask, has to become a cap on one
+**cell**, for the reason §1 gives. Those two are the new limits this
+introduces, and neither is a size somebody runs out of.
+
+**The shipped library gains about five presets, and that is the smaller half of
+the reason to do it.** 252 of the 257 refused for sequencing alone are
+rubberduck's and are refused for their masks regardless, so the generator's
+total moves by roughly the five that are not. What changes is the *import*:
+269 of rubberduck's stamps arriving as 60 brushes that paint like rubberduck's,
+instead of 269 that do not.
+
+(The `.gih` work that has already landed — the two exact collapses — moves the
+total by **nothing**. It took a false sequencing notice off four of David
+Revoy's presets, and every one of the four is still refused for something else.)
 
 The cost that is real is **`tip.rs`'s contract**, and it is the reason this is
 a document rather than a branch. A mask that is a sheet of cells is read

@@ -996,8 +996,11 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
     // are a plausible header size, which for text they never are.
     if let Ok(pipe) = gih::from_gih(raw) {
         // The pipe's own list, so a preset whose tip is a `.gih` reports what a
-        // loose `.gih` would — including both losses where a pipe turns *and*
-        // shuffles, which naming one of the two could not.
+        // loose `.gih` would: both losses where a pipe turns *and* shuffles,
+        // which naming one of the two could not — and, the half that actually
+        // moves brushes, *nothing* where the pipe collapsed. Four of David
+        // Revoy's presets stamp a pipe of four copies of one bitmap and used to
+        // be told they had lost a sequence.
         let mut dropped = pipe.sequence_losses();
         if pipe.cells.iter().any(|c| c.coloured) {
             dropped.push(gbr::COLOURED);
