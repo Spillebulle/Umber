@@ -420,6 +420,53 @@ pub fn dropped_features(path: &Path) -> Vec<&'static str> {
     }
 }
 
+/// Brushes inside a *container* that could not be read at all, with the reason.
+///
+/// A file that fails whole comes back as the `Err` of [`read_file`], and every
+/// caller already reports that. A container is the case with nowhere to put the
+/// answer: one preset written by a paint engine Umber does not have must not
+/// take the other forty-five with it, so [`bundle::from_bundle`] collects the
+/// refusal and carries on — and `read_file`'s `bundle` arm then drops it,
+/// because its return type has room for brushes and not for the ones that were
+/// not brushes. Six of the thirteen presets the fetched packs write in another
+/// engine are inside a `.bundle`, so the library generator's refusal table was
+/// counting seven of them and reading as though the rest did not exist.
+///
+/// A sibling of [`dropped_features`] rather than a wider `read_file` **because
+/// the wider return type is the more expensive answer for the same fact**: it
+/// touches all nine arms and every caller, for a question only one arm can ever
+/// answer non-empty, and every one of those edits is a chance to lose something
+/// that is currently working. This is best-effort in exactly the way
+/// `dropped_features` is — an unreadable file answers nothing here and fails
+/// properly in `read_file`, so nothing is reported on twice — and it costs a
+/// **second full decode of the archive**, every preset's PNG and every tip in
+/// it, which is a price the library generator pays once per run and nothing on
+/// a drawing path pays at all.
+///
+/// One boundary it does not reach: a bundle in which *every* preset is refused
+/// makes [`bundle::from_bundle`] fail whole, so there is nothing to return
+/// here. That case is not silent — `read_file` reports it, and its message
+/// carries the count and one of the reasons — but it is a count rather than a
+/// list.
+pub fn refusals(path: &Path) -> Vec<String> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "bundle" => preset::read_bytes(path)
+            .ok()
+            .and_then(|bytes| bundle::from_bundle(&bytes).ok())
+            .map(|contents| contents.refused)
+            .unwrap_or_default(),
+        // Every other reader either yields a brush or fails whole. A `.gih`
+        // and a `.sutg` are containers too and neither has a partial failure
+        // to report: a pipe's cells all come out of one decode, and a
+        // sub-tool group's tools are approximated rather than refused.
+        _ => Vec::new(),
+    }
+}
+
 /// Turn a brush file's stem into something worth showing in a picker.
 ///
 /// Brush packs name files for the filesystem — `8B_Pencil#1`, `coarse_bulk_1`,
@@ -489,6 +536,72 @@ mod tests {
     fn a_missing_file_is_an_io_error_not_a_panic() {
         let err = read_file(Path::new("definitely/not/here.myb")).unwrap_err();
         assert!(matches!(err, PresetError::Io { .. }));
+    }
+
+    /// A container's own refusals have to be reachable, or the shipped
+    /// library's report counts a preset refused on its own and passes over the
+    /// identical one inside an archive.
+    ///
+    /// This is the case `read_file` structurally cannot answer: it returns the
+    /// brushes, and a preset written by another paint engine is not one.
+    #[test]
+    fn a_bundle_reports_the_presets_it_could_not_read() {
+        let kpp = |xml: &str| {
+            let mut out = Vec::new();
+            let mut encoder = png::Encoder::new(&mut out, 1, 1);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .add_ztxt_chunk("preset".to_string(), xml.to_string())
+                .expect("chunk");
+            let mut writer = encoder.write_header().expect("header");
+            writer.write_image_data(&[9]).expect("data");
+            drop(writer);
+            out
+        };
+        let paintbrush = kpp("<Preset name=\"Ink\" paintopid=\"paintbrush\">\
+             <param name=\"brush_definition\" type=\"string\"><![CDATA[\
+             <Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+             <MaskGenerator diameter=\"20\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+             </Brush>]]></param></Preset>");
+        let warp = kpp("<Preset name=\"Warp\" paintopid=\"deformbrush\">\
+             <param type=\"internal\" name=\"x\">1</param></Preset>");
+
+        let mut archive = Vec::new();
+        {
+            use std::io::Write;
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut archive));
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, data) in [
+                ("mimetype", &b"application/x-krita-resourcebundle"[..]),
+                ("paintoppresets/a.kpp", &paintbrush),
+                ("paintoppresets/b.kpp", &warp),
+            ] {
+                writer.start_file(name, options).expect("entry");
+                writer.write_all(data).expect("write");
+            }
+            writer.finish().expect("finish");
+        }
+
+        let dir = std::env::temp_dir().join(format!("umber-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("pack.bundle");
+        std::fs::write(&path, &archive).expect("write");
+
+        let found = read_file(&path).expect("read");
+        let refused = refusals(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The good one still arrives; the other one is not lost in silence.
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].preset.name, "Ink");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("deformbrush"), "{refused:?}");
+
+        // Best-effort, exactly as `dropped_features` is: nothing is reported
+        // on twice, and a file that fails whole fails through `read_file`.
+        assert!(refusals(Path::new("definitely/not/here.bundle")).is_empty());
+        assert!(refusals(Path::new("somewhere/nice.kpp")).is_empty());
     }
 
     /// The point of the whole exercise: a GIMP brush picked in the file dialog

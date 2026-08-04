@@ -222,6 +222,16 @@ fn main() {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
 
+            // A container reports its own refusals separately, because a
+            // `.bundle` of forty-six brushes must not be lost to the one
+            // written by a paint engine Umber does not have. Collected here or
+            // the run's report counts a `.kpp` refused on its own and passes
+            // over the identical preset sitting inside an archive — which is
+            // six of the thirteen in these packs, and a refusal table that
+            // undercounts is a measuring instrument that lies.
+            for reason in brushimport::refusals(&file) {
+                failed.push(format!("{}: {reason}", file.display()));
+            }
             let found = match brushimport::read_file(&file) {
                 Ok(found) => found,
                 Err(e) => {

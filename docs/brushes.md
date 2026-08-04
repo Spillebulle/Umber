@@ -285,7 +285,7 @@ these and sort the same way.
 | Charcoal, chalk & pastel | 6 |
 | Paint & brushes | 58 |
 | Watercolour & wet media | 22 |
-| Airbrush & spray | 13 |
+| Airbrush & spray | 14 |
 | Blenders & smudge | 22 |
 | Erasers | 9 |
 | Texture & grain | 13 |
@@ -821,7 +821,8 @@ wrong, and all three were got wrong first:
 | `Brush@angle`, in **radians** | `dab_angle` |
 | `Brush@spacing` | `spacing` |
 | `OpacityValue` × `FlowValue` × the opacity curve's peak | `opacity` |
-| `Pressure<X>` + `<X>Sensor` + `<X>commonCurve` | `pressure_*`, `min_*_ratio`, `*_curve` |
+| `Pressure<X>` + a `pressure` sensor + its curve | `pressure_*`, `min_*_ratio`, `*_curve` |
+| the same option's `fuzzy` sensor | a `Modulation` on `DabInput::Random`; its peak scales the setting |
 | `RotationSensor` `id="drawingangle"` / `"fuzzy"`, including inside a `sensorslist` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
 | `RotationSensor@angleOffset`, degrees | added to `dab_angle` — the rake's lean |
 | a bitmap tip's measured stroke coverage | `build_up` |
@@ -957,12 +958,99 @@ Krita adds dabs through a sharp corner so a rake fans round it; Umber's dab
 turns with the heading and the heading turns at the corner, so a stroke differs
 only where it changes direction abruptly. Six presets ask for it.
 
+#### A dynamic is a *set* of sensors, and only one of them was being read
+
+The rotation fix above stopped at rotation, and the same fault was sitting on
+Size, Opacity and Scatter — where it cost both halves of the dynamic rather
+than one. Krita states an option as a set of sensors and **multiplies** their
+outputs together; `sensor_id` took the first id in the blob, which for a
+compound `<params id="sensorslist">` is the wrapper's own name. So a preset
+driven by pressure *and* something else lost its pressure curve entirely, and
+was then refused for a foreign sensor it had never actually been tested for.
+Eleven presets in the fetched packs drive one of the three that way. The only
+reason none of them shipped painting wrongly is that the same fault refused all
+eleven.
+
+Both halves now go through `sensor_ids`. Pressure stays the curve on the brush;
+the rest become modulation-table entries where Umber has the input, which
+today means `fuzzy` — Krita's fresh uniform draw per dab, exactly
+`DabInput::Random`. Because Krita multiplies, each sensor's **peak** lands on
+the setting's own value and the entry carries the fraction of that peak the
+draw asks for, which is the arrangement `mypaint`'s opacity path already uses
+and the reason `Brush::size` and `Brush::opacity` stay "the value at the peak".
+The units are the target's own, and all three differ: a log offset for size,
+a factor for opacity, and `scatter × (factor − 1)` for scatter, because Umber
+adds where Krita multiplies. That last is the one approximation — exact for a
+brush whose scatter has no pressure sensor beside it, which is seven of the
+nine in the packs, and at light pressure an under-estimate rather than a spray
+nobody asked for.
+
+**Two sensors stay named rather than approximated.** Krita's `speed` is a
+fraction of a fixed maximum drawing speed and `DabInput::Speed` is MyPaint's
+log-speed axis, on which 45 px/s reads 0.5; nothing in the preset says where
+the other's axis begins, so a curve written for one cannot be placed on the
+other from what is in the file, and a guess is a brush that thins at a speed
+nobody draws at. `fuzzystroke` is one draw for a whole stroke where Umber's
+random is one per dab, which would turn a single splash into confetti. One
+preset in the packs asks for each.
+
+Two more things fell out of reading the sensors properly:
+
+- **`<Name>UseSameCurve` decides which of the two curves in the file is in
+  force**, and Krita's editor leaves the other behind either way. Six options
+  across four presets carry both.
+  Deevad's "Eraser Kneaded Soft" states the flag false and a bare
+  pressure sensor with no curve of its own, so Krita gives it a linear ramp
+  where Umber was giving it the shared curve sitting unused beside it — the one
+  brush already in the library that this changed.
+- **A sensor that states no curve is the identity**, not a dynamic that does
+  nothing: Krita's curve object is constructed as the diagonal and only a
+  `<curve>` child replaces it.
+
+The net is 233 presets to 235: "C3) Thin Brush Textured" arrives with both its
+pressure ramp and an Opacity/Random entry running 0.42 to 1, and "Y) Splatters
+Light" varies each stamp between a sixth and all of its 230 px, which is what
+makes it splatter. A third, "X) Textured Chaotic Irregular", is still refused
+and correctly — see the open question below.
+
+**Two sentences, not one, for what is left behind.** A sensor Umber has no input
+for and a sensor reaching a curve Krita switched off are different losses, and
+one message covering both names a cause that is not the cause: `fuzzy` is an
+input Umber demonstrably *can* produce. So `FOREIGN_INPUT` and `UNREAD_CURVE`,
+with the first winning where both apply, for the reason the generator asks what
+was dropped before it asks about the mask.
+
+#### The open question: `<Name>UseCurve` switched off
+
+This reader treats `Pressure<Name>` on with `<Name>UseCurve` off as **no
+dynamic**. Krita's own default for that flag is on, and its curve object is the
+diagonal, so the reading that fits everything else here is "the sensor, applied
+straight" — a *linear* ramp rather than a constant. **34 of the fetched presets'
+Opacity and Scatter options have it off**, so if that is right they are all
+importing without a pressure ramp their author drew.
+
+It is not settled here, and deliberately. This module's other polarity question
+— `hfade` — was settled by looking at Krita's own preview inside the `.kpp`,
+and that technique cannot separate these two readings: almost every preview
+tapers because *size* follows pressure too. Changing 34 shipped brushes on a
+reading nobody has checked is the larger risk of the two, and naming it as a
+loss on all of them would be the same claim in the other direction. So the
+reading stands, this paragraph is the record, and the one place it does surface
+is where a *non-pressure* sensor reaches such a curve: `UNREAD_CURVE` names it,
+which is what keeps "X) Textured Chaotic Irregular" out of the library rather
+than shipping half of what its author drew.
+
 **Only two of Krita's paint engines are accepted**: `paintbrush` and
 `colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an
 outline, `hairybrush` simulates bristles, `spraybrush` scatters particles — they
 are *different programs*, not settings, and a round dab wearing their name would
 be pure invention. They are refused by name, and inside a bundle one refusal
-does not take the other forty-five with it.
+does not take the other forty-five with it — which is why
+`brushimport::refusals` exists beside `read_file`: the brushes come back as the
+`Ok`, so a preset that is not a brush has nowhere in that answer to go, and six
+of the thirteen such presets in the packs are inside an archive. The generator's
+refusal table was counting the seven loose ones and reading as though the rest
+did not exist.
 
 The tip is either a generated ellipse — which Umber draws exactly — or a
 predefined brush naming a file. A preset with `embedded_resources` carries that

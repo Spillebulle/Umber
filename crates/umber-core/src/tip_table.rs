@@ -11,48 +11,16 @@
 
 /// Name and 8-bit greyscale PNG, sorted by name.
 pub(crate) const TIPS: &[(&str, &[u8])] = &[
-    (
-        "deevad-c4-bristles-lineart-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-c4-bristles-lineart-deevad-25-01.png"),
-    ),
-    (
-        "deevad-d-bristle-flat-glazing-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-d-bristle-flat-glazing-deevad-25-01.png"),
-    ),
-    (
-        "deevad-d-glazing-round-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-d-glazing-round-deevad-25-01.png"),
-    ),
-    (
-        "deevad-y-textured-big-sponge-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-y-textured-big-sponge-deevad-25-01.png"),
-    ),
-    (
-        "gdquest-block",
-        include_bytes!("../assets/tips/gdquest-block.png"),
-    ),
-    (
-        "gdquest-gdquest-cloud-medium",
-        include_bytes!("../assets/tips/gdquest-gdquest-cloud-medium.png"),
-    ),
-    (
-        "gdquest-gdquest-shadow-directional-dark",
-        include_bytes!("../assets/tips/gdquest-gdquest-shadow-directional-dark.png"),
-    ),
-    (
-        "gdquest-leaves-patch-1",
-        include_bytes!("../assets/tips/gdquest-leaves-patch-1.png"),
-    ),
-    (
-        "raghukamath-pack01-fx",
-        include_bytes!("../assets/tips/raghukamath-pack01-fx.png"),
-    ),
-    (
-        "raghukamath-pack01-sponze-dry",
-        include_bytes!("../assets/tips/raghukamath-pack01-sponze-dry.png"),
-    ),
-    (
-        "umber-stipple",
-        include_bytes!("../assets/tips/umber-stipple.png"),
-    ),
+    ("deevad-c4-bristles-lineart-deevad-25-01", include_bytes!("../assets/tips/deevad-c4-bristles-lineart-deevad-25-01.png")),
+    ("deevad-d-bristle-flat-glazing-deevad-25-01", include_bytes!("../assets/tips/deevad-d-bristle-flat-glazing-deevad-25-01.png")),
+    ("deevad-d-glazing-round-deevad-25-01", include_bytes!("../assets/tips/deevad-d-glazing-round-deevad-25-01.png")),
+    ("deevad-y-splatters-light-deevad-25-01", include_bytes!("../assets/tips/deevad-y-splatters-light-deevad-25-01.png")),
+    ("deevad-y-textured-big-sponge-deevad-25-01", include_bytes!("../assets/tips/deevad-y-textured-big-sponge-deevad-25-01.png")),
+    ("gdquest-block", include_bytes!("../assets/tips/gdquest-block.png")),
+    ("gdquest-gdquest-cloud-medium", include_bytes!("../assets/tips/gdquest-gdquest-cloud-medium.png")),
+    ("gdquest-gdquest-shadow-directional-dark", include_bytes!("../assets/tips/gdquest-gdquest-shadow-directional-dark.png")),
+    ("gdquest-leaves-patch-1", include_bytes!("../assets/tips/gdquest-leaves-patch-1.png")),
+    ("raghukamath-pack01-fx", include_bytes!("../assets/tips/raghukamath-pack01-fx.png")),
+    ("raghukamath-pack01-sponze-dry", include_bytes!("../assets/tips/raghukamath-pack01-sponze-dry.png")),
+    ("umber-stipple", include_bytes!("../assets/tips/umber-stipple.png")),
 ];
