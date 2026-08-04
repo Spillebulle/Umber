@@ -107,6 +107,7 @@
 //! a usable approximation that says what it lost beats a rejection.
 
 use crate::brush::{Brush, GrainPattern};
+use crate::brushimport::csmaterial;
 use crate::curve::ResponseCurve;
 use crate::dynamics::{DabInput, DabTarget, Modulation};
 use crate::preset::PresetError;
@@ -120,9 +121,45 @@ use crate::tip::{TipMask, stroke_coverage};
 /// cannot do is worth being able to read in one screen.
 pub mod dropped {
     /// The tip is the material's thumbnail, not its full-resolution pixels.
+    ///
+    /// Named only where the fallback was actually taken — see `tip_for`. It
+    /// used to be named on every brush that had a tip at all, which was true
+    /// when the thumbnail was the only route and is a false apology now that
+    /// it is the second one.
     pub const THUMBNAIL_TIP: &str = "bitmap tips at their full resolution";
+    /// The material was read whole and is larger than the engine can stamp.
+    ///
+    /// It names the *strength* as well as the size, and that is not padding:
+    /// reducing a stamp that is not solid lowers its peak, and a `max` stroke
+    /// is capped at the mask's own brightest texel. `TipMask::reduced`'s docs
+    /// have the argument, and `stroke_coverage` runs on the reduced mask so
+    /// that a stamp thinned far enough arrives with `build_up` set. No figure
+    /// is quoted, because `TipMask::MAX_SIZE` is the one that decides it and a
+    /// number written here would go stale the moment it moved.
+    pub const REDUCED_TIP: &str =
+        "a bitmap tip larger than Umber can stamp (reduced to fit, which softens it)";
     pub const SEVERAL_TIPS: &str = "brushes that cycle through several tip images";
-    pub const PAPER_TEXTURE: &str = "the paper texture's own picture";
+    /// The paper's own picture, and — said out loud, because grain
+    /// **multiplies coverage** — that one of Umber's own is used in its place.
+    ///
+    /// The pixels are readable: [`super::csmaterial`] reads a paper exactly as
+    /// it reads a tip, and does so for the paper in one of the sample files.
+    /// What is missing is somewhere to put them. [`Brush::grain_pattern`] is a
+    /// closed enum resolved against a shipped table, so a brush cannot name a
+    /// paper of its own; and a `.sut`'s paper is not guaranteed seamless, where
+    /// the grain is anchored to the document and repeats across it, so an
+    /// imported tile that did not join would draw a grid over every stroke.
+    ///
+    /// Naming the substitution matters because a reader who is told only that
+    /// "the paper texture's own picture" was lost will not expect the *strength*
+    /// to have carried across onto a different tile.
+    ///
+    /// **A noun phrase, with the aside in brackets**, like every other constant
+    /// here. `brushlib`'s notice joins these into "Umber could not bring across
+    /// A, B and C, so it will paint differently", so a comma inside one reads
+    /// as a fourth item and a "so" inside one collides with the frame's own.
+    pub const PAPER_TEXTURE: &str =
+        "the paper texture's own picture (one of Umber's is used instead)";
     /// Umber has no tilt input on any platform it runs on, so a tilt mapping
     /// could only ever be evaluated at a value the pen never reports.
     pub const TILT_INPUT: &str = "settings driven by pen tilt";
@@ -661,6 +698,22 @@ fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str>
 #[derive(Default)]
 struct Materials {
     by_path: Vec<(String, Vec<u8>)>,
+    /// What [`csmaterial::from_archive`] answered for each archive already
+    /// asked about, including the `None`s.
+    ///
+    /// **A group shares its materials**, and heavily: in the sample `.sutg`
+    /// four of the thirteen sub-tools name one archive and three name another.
+    /// Reading a material is a tar walk, a page scan that materialises every
+    /// row's blob, a zlib inflate per block and a canvas-sized allocation — so
+    /// without this a group of fifty brushes cut from one 1174 × 1120 stamp
+    /// pays all of that fifty times, where the thumbnail it replaced was one
+    /// small PNG decode. An import is not a drawing path, so this is somebody
+    /// waiting rather than a dropped frame; it is still the difference between
+    /// a moment and a minute.
+    ///
+    /// Keyed by the path rather than by the archive, because that is what a
+    /// reference names and what `by_path` has already made unique.
+    read: std::cell::RefCell<Vec<(String, Option<csmaterial::Material>)>>,
 }
 
 impl Materials {
@@ -679,7 +732,10 @@ impl Materials {
             }
             by_path.push((key.to_string(), bytes.to_vec()));
         }
-        Self { by_path }
+        Self {
+            by_path,
+            read: std::cell::RefCell::new(Vec::new()),
+        }
     }
 
     /// The tar archive a reference blob points at.
@@ -689,6 +745,17 @@ impl Materials {
             .iter()
             .find(|(key, _)| *key == path)
             .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// The full-resolution pixels a reference names, read once per file.
+    fn pixels(&self, reference: &[u8]) -> Option<csmaterial::Material> {
+        let path = reference_path(reference)?;
+        if let Some((_, cached)) = self.read.borrow().iter().find(|(key, _)| *key == path) {
+            return cached.clone();
+        }
+        let material = self.resolve(reference).and_then(csmaterial::from_archive);
+        self.read.borrow_mut().push((path, material.clone()));
+        material
     }
 }
 
@@ -735,7 +802,7 @@ fn reference_count(blob: &[u8]) -> u32 {
 /// [`crate::sqlite`] is: it is fifty lines, it is the only tar Umber will ever
 /// read, and a dependency here would be one more thing between a brush file and
 /// a cross-build.
-fn tar_member(archive: &[u8], wanted: &str) -> Option<Vec<u8>> {
+pub(super) fn tar_member(archive: &[u8], wanted: &str) -> Option<Vec<u8>> {
     let mut at = 0usize;
     while at + 512 <= archive.len() {
         let header = &archive[at..at + 512];
@@ -818,11 +885,50 @@ fn mask_from_thumbnail(png_bytes: &[u8]) -> Option<TipMask> {
     TipMask::new(info.width, info.height, coverage).ok()
 }
 
+/// A mask a material reference resolved to, and the one thing it may have cost.
+struct ResolvedTip {
+    mask: TipMask,
+    /// At most one, because the two cannot both happen: a thumbnail's longest
+    /// side is 300 and the cap it would have to breach is [`TipMask::MAX_SIZE`].
+    lost: Option<&'static str>,
+}
+
 /// The mask a material reference resolves to, if there is one.
-fn tip_for(reference: &[u8], materials: &Materials) -> Option<TipMask> {
+///
+/// **The material's own pixels first, its thumbnail second.** Both are in the
+/// archive; the first is what the artist drew and the second is a preview of
+/// it with a longest side of 300, which for the spatter brush in the sample
+/// files is a fifteenth of the area. [`csmaterial`] has the route and the
+/// cases where it answers nothing — a material shape it will not guess at, or
+/// one Clip Studio left out of the file — and the thumbnail is what those fall
+/// back to, which is what this reader did before it existed.
+///
+/// Nothing about the *reading* changes with the route.
+/// [`csmaterial::Material::coverage`] is measured against
+/// [`mask_from_thumbnail`]'s own answer, material by material, so a brush that
+/// takes the fallback is the same stamp at a coarser resolution rather than a
+/// different one.
+fn tip_for(reference: &[u8], materials: &Materials) -> Option<ResolvedTip> {
     let archive = materials.resolve(reference)?;
+    if let Some(material) = materials.pixels(reference) {
+        // A material may be larger than the engine can stamp — see
+        // `TipMask::reduced` for why the ceiling is not simply raised. Reduced
+        // rather than refused, because the alternative here is not the mask on
+        // disk but a 300-pixel preview of it.
+        if let Ok((mask, reduced)) =
+            TipMask::reduced(material.width, material.height, material.coverage)
+        {
+            return Some(ResolvedTip {
+                mask,
+                lost: reduced.then_some(dropped::REDUCED_TIP),
+            });
+        }
+    }
     let png_bytes = tar_member(archive, "thumbnail/thumbnail.png")?;
-    mask_from_thumbnail(&png_bytes)
+    Some(ResolvedTip {
+        mask: mask_from_thumbnail(&png_bytes)?,
+        lost: Some(dropped::THUMBNAIL_TIP),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,8 +1250,10 @@ fn convert(
             push_once(&mut dropped, dropped::SEVERAL_TIPS);
         }
         match tip_for(reference, materials) {
-            Some(mask) => {
-                push_once(&mut dropped, dropped::THUMBNAIL_TIP);
+            Some(ResolvedTip { mask, lost }) => {
+                if let Some(loss) = lost {
+                    push_once(&mut dropped, loss);
+                }
                 // A stamp is the overlap of many faint impressions, and Clip
                 // Studio composites every dab as GIMP and Krita do. Measured
                 // rather than assumed, by the same function that decides it for
@@ -1568,8 +1676,22 @@ mod tests {
         out
     }
 
-    /// A material archive whose thumbnail is `w` by `h` of one RGBA pixel.
+    /// A material archive whose thumbnail is `w` by `h` of one RGBA pixel, and
+    /// which carries no full-resolution layer at all.
+    ///
+    /// That is a real case — Clip Studio leaves an installed material out of
+    /// the file — and it is the one that exercises the thumbnail fallback.
     fn material(w: u32, h: u32, pixel: [u8; 4]) -> Vec<u8> {
+        material_with_pixels(w, h, pixel, None)
+    }
+
+    /// The same, plus the material's own pixels as a `data/material_0.layer`.
+    fn material_with_pixels(
+        w: u32,
+        h: u32,
+        pixel: [u8; 4],
+        layer: Option<(u32, u32, Vec<u8>)>,
+    ) -> Vec<u8> {
         let rgba: Vec<u8> = std::iter::repeat_n(pixel, (w * h) as usize)
             .flatten()
             .collect();
@@ -1581,11 +1703,21 @@ mod tests {
             let mut writer = encoder.write_header().expect("fixture png header");
             writer.write_image_data(&rgba).expect("fixture png data");
         }
-        tar(&[
+        let mut members = vec![
             ("catalog.zip", vec![0x89, b'C', b'2', b'F']),
             ("thumbnail/thumbnail.png", png_bytes),
             ("icedata/layerData.xml", b"<infolist/>".to_vec()),
-        ])
+        ];
+        if let Some((width, height, coverage)) = layer {
+            members.insert(
+                1,
+                (
+                    "data/material_0.layer",
+                    csmaterial::fixture::material_layer(width, height, &coverage, 1),
+                ),
+            );
+        }
+        tar(&members)
     }
 
     // ----------------------------------------------------------------- tests
@@ -2453,9 +2585,105 @@ mod tests {
         // A solid stamp is the same mark under either coverage rule, so it does
         // not need build-up — measured rather than assumed.
         assert!(!tool.brush.build_up);
-        // The thumbnail is not the material's full resolution, and that is
-        // named however well it works out.
+        // This material carries no full-resolution layer at all, which is a
+        // real case — Clip Studio leaves an installed one out of the file — so
+        // the thumbnail is what was used, and that is named.
         assert!(tool.dropped.contains(&dropped::THUMBNAIL_TIP));
+    }
+
+    /// **A tip whose real peak coverage is 1.0 must not import as a mask that
+    /// peaks at 0.6**, and this is the test that would have caught the thing
+    /// two rounds of bug reports were spent on.
+    ///
+    /// The thumbnail is a *downscaled preview*, and downscaling lowers the peak
+    /// of any stamp that is not solid — while `CLAUDE.md` says exactly what a
+    /// lowered peak produces: "a `max` caps a stroke at the mask's own
+    /// brightest texel and paints half the author's mark". So the fixture makes
+    /// the two disagree on purpose: the material is solid ink and its thumbnail
+    /// is the same picture at three fifths of the strength. Reading the
+    /// thumbnail gives a brush that paints at 60% however hard it is pressed.
+    ///
+    /// It pins the resolution as well, because the two are the same defect: a
+    /// 300-pixel preview of a 400-pixel material is both fainter *and* coarser.
+    #[test]
+    fn a_tip_arrives_at_the_materials_own_strength_and_resolution() {
+        let path = ".:full:data:material_0.layer";
+        let bytes = sut(
+            &[(
+                "Spatter",
+                Variant::plain(1)
+                    .int("BrushUsePatternImage", 1)
+                    .set("BrushPatternImageArray", reference(path, 1)),
+            )],
+            &[(
+                path,
+                material_with_pixels(
+                    300,
+                    300,
+                    // The preview: the same ink, three fifths as strong.
+                    [0, 0, 0, 153],
+                    Some((400, 400, vec![255u8; 400 * 400])),
+                ),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        let mask = tool.tip.as_ref().expect("a mask came with it");
+
+        assert_eq!((mask.width(), mask.height()), (400, 400));
+        assert_eq!(
+            mask.coverage().iter().copied().max(),
+            Some(255),
+            "the material is solid ink and the mask has to be too"
+        );
+        // And the notice no longer apologises for a resolution that was not
+        // lost. Naming it here is the false apology `unreachable_inputs`
+        // refuses for pressure and randomness.
+        assert!(
+            !tool.dropped.contains(&dropped::THUMBNAIL_TIP),
+            "{:?}",
+            tool.dropped
+        );
+    }
+
+    /// The engine can bind a mask up to [`TipMask::MAX_SIZE`] and a material
+    /// may be larger, so it is reduced to fit rather than refused — because
+    /// what refusing falls back to here is a 300-pixel preview, not the picture
+    /// on disk. Named, like every other approximation this reader makes.
+    #[test]
+    fn a_material_larger_than_the_engine_can_stamp_is_reduced_and_named() {
+        let path = ".:huge:data:material_0.layer";
+        let (w, h) = (TipMask::MAX_SIZE + 600, (TipMask::MAX_SIZE + 600) / 2);
+        let bytes = sut(
+            &[(
+                "Huge",
+                Variant::plain(1)
+                    .int("BrushUsePatternImage", 1)
+                    .set("BrushPatternImageArray", reference(path, 1)),
+            )],
+            &[(
+                path,
+                material_with_pixels(
+                    64,
+                    32,
+                    [0, 0, 0, 255],
+                    Some((w, h, vec![255u8; (w * h) as usize])),
+                ),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        let mask = tool.tip.as_ref().expect("a mask");
+
+        assert_eq!(mask.width(), TipMask::MAX_SIZE);
+        // Both axes by the same factor, so `aspect` still hands the dab pass
+        // the material's own proportions.
+        assert_eq!(mask.height(), TipMask::MAX_SIZE / 2);
+        // A solid material stays solid through the reduction — near enough,
+        // because the last level is `image`'s rounding rather than ours.
+        assert!(mask.coverage().iter().copied().max().unwrap_or(0) >= 250);
+        assert!(tool.dropped.contains(&dropped::REDUCED_TIP));
+        // It is still the material rather than the thumbnail, so the other
+        // loss is not named.
+        assert!(!tool.dropped.contains(&dropped::THUMBNAIL_TIP));
     }
 
     /// Clip Studio composites every dab, so a stamp whose brightest texel is

@@ -72,6 +72,72 @@ impl TipMask {
         })
     }
 
+    /// Build a mask from coverage that may be larger than [`MAX_SIZE`],
+    /// reducing it to fit and saying whether it had to.
+    ///
+    /// [`from_picture`](Self::from_picture) **refuses** an oversized picture
+    /// and must go on refusing it: there the alternative is the file on disk,
+    /// so a stamp that came back softer than the one the artist chose, with
+    /// nothing saying why, would be the quiet failure that rule exists to
+    /// prevent. This is the opposite case. It is for a format that carries a
+    /// small preview beside the real pixels —
+    /// [`crate::brushimport::clipstudio`] — where refusing means falling back
+    /// to a picture 300 pixels across, and where the caller *does* say so.
+    ///
+    /// **The cap is not simply raised**, and cannot be. Device limits are
+    /// `downlevel_defaults`, which guarantees a `max_texture_dimension_2d` of
+    /// exactly 2048; a wider mask is a texture the dab pass could not bind at
+    /// all on a device Umber promises to run on. It is also four megabytes of
+    /// coverage per brush in memory and a PNG per brush in the library, where
+    /// every stamp any pack ships is 256 or smaller.
+    ///
+    /// Both axes are scaled by the same factor, so the proportions
+    /// [`TipMask::aspect`] hands the dab pass are the material's own.
+    ///
+    /// **Reducing a sparse stamp lowers its peak**, and `CLAUDE.md` says what a
+    /// lowered peak costs: a `max` stroke is capped at the mask's own brightest
+    /// texel. That is exactly why the caller must measure
+    /// [`stroke_coverage`] on the mask this returns rather than on the one that
+    /// went in — [`crate::brushimport::clipstudio`] does, and a stamp the
+    /// reduction thinned then arrives with `build_up` set, which is the
+    /// mechanism that recovers strength without changing shape.
+    pub fn reduced(
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+    ) -> Result<(Self, bool), PresetError> {
+        let longest = width.max(height);
+        if longest <= Self::MAX_SIZE {
+            return Ok((Self::new(width, height, coverage)?, false));
+        }
+        if coverage.len() != width as usize * height as usize {
+            return Err(malformed(format!(
+                "brush tip has {} bytes, expected {}",
+                coverage.len(),
+                width as usize * height as usize
+            )));
+        }
+        // `image`'s resampler rather than one of ours: it is already a
+        // dependency, it scales the filter's support by the ratio — so a 3:1
+        // reduction averages over three texels rather than point-sampling one
+        // — and a resampler written here would be the second implementation
+        // this codebase refuses everywhere else.
+        let scale = f64::from(Self::MAX_SIZE) / f64::from(longest);
+        let to = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(1, Self::MAX_SIZE);
+        let source = image::GrayImage::from_raw(width, height, coverage)
+            .ok_or_else(|| malformed("the brush tip could not be read".to_string()))?;
+        let small = image::imageops::resize(
+            &source,
+            to(width),
+            to(height),
+            image::imageops::FilterType::Triangle,
+        );
+        Ok((
+            Self::new(small.width(), small.height(), small.into_raw())?,
+            true,
+        ))
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -662,6 +728,37 @@ mod tests {
         assert!(err.to_string().contains("greyscale"), "{err}");
 
         assert!(TipMask::from_png(b"not a png").is_err());
+    }
+
+    /// A mask within the cap must be the bytes that went in — not resampled,
+    /// not "resampled by a factor of one". Every stamp any pack ships is well
+    /// inside it, so this is the path that matters.
+    #[test]
+    fn a_mask_within_the_cap_is_not_touched_and_a_larger_one_keeps_its_shape() {
+        let coverage: Vec<u8> = (0..(13 * 7)).map(|i| (i * 11 % 256) as u8).collect();
+        let (mask, reduced) = TipMask::reduced(13, 7, coverage.clone()).expect("build");
+        assert!(!reduced);
+        assert_eq!(mask.coverage(), coverage);
+        assert_eq!((mask.width(), mask.height()), (13, 7));
+
+        // Over the cap on the long axis: both axes scale by the same factor, so
+        // the proportions the dab pass is handed are the material's own.
+        let (w, h) = (TipMask::MAX_SIZE * 2, TipMask::MAX_SIZE / 2);
+        let (mask, reduced) = TipMask::reduced(w, h, vec![255; (w * h) as usize]).expect("build");
+        assert!(reduced);
+        assert_eq!((mask.width(), mask.height()), (TipMask::MAX_SIZE, 512));
+        assert_eq!(mask.aspect(), (1.0, 0.25));
+        // A solid stamp reduced is still solid: the resampler must not have
+        // averaged the edge against nothing. Not an exact byte — that would be
+        // a promise about `image`'s accumulation and rounding rather than about
+        // anything here, and `CLAUDE.md` refuses that shape of assertion for
+        // the composite pass for the same reason.
+        assert!(mask.coverage().iter().all(|v| *v >= 250));
+
+        // A buffer that does not match its dimensions is refused rather than
+        // read past, on both sides of the cap.
+        assert!(TipMask::reduced(4, 4, vec![0; 15]).is_err());
+        assert!(TipMask::reduced(TipMask::MAX_SIZE + 1, 4, vec![0; 15]).is_err());
     }
 
     #[test]

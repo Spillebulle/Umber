@@ -172,6 +172,16 @@ impl Row {
     pub fn get(&self, index: usize) -> &Value {
         self.values.get(index).unwrap_or(&Value::Null)
     }
+
+    /// Every value in the record, in column order.
+    ///
+    /// For a table found through the schema, [`Row::get`] is the way in — the
+    /// column names are what a caller has. This is for [`Database::scan`],
+    /// where there is no schema at all and a row is identified by what is *in*
+    /// it.
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
 }
 
 /// A database open over a byte slice.
@@ -185,6 +195,9 @@ pub struct Database<'a> {
     /// rather than from the header's count, because a truncated file must fail
     /// on the page that is missing rather than be trusted about its own size.
     pages: u32,
+    /// The page number the slice *starts* at. `1` for an ordinary file, and
+    /// something else for [`Database::headerless`] — see its docs.
+    first_page: u32,
     encoding: TextEncoding,
 }
 
@@ -237,8 +250,121 @@ impl<'a> Database<'a> {
             page_size,
             usable,
             pages,
+            first_page: 1,
             encoding,
         })
+    }
+
+    /// Open a database that has **no file header and no first pages**.
+    ///
+    /// Clip Studio stores a material's full-resolution pixels this way: the
+    /// `dATA` chunk of `data/material_0.layer` whose flag is zero is an
+    /// ordinary SQLite database with its header and its first six pages sliced
+    /// off, so the slice begins part way through the page sequence and a page
+    /// number `n` names the byte range `(n - first_page) * page_size`. See
+    /// [`crate::brushimport::clipstudio`].
+    ///
+    /// Two things the header would have said have to be supplied instead, and
+    /// one is simply gone:
+    ///
+    /// - the **page size**, which the caller states;
+    /// - the **text encoding**, which is only ever needed for column names this
+    ///   database has none of — every value read out of one of these is an
+    ///   integer or a blob — so it is taken as UTF-16LE, which is what the
+    ///   fragments of `CREATE TABLE` text in the sample materials are;
+    /// - the **schema**, which lived on page 1. There is no `sqlite_master` to
+    ///   find a table's root with, which is why the way in is [`Database::scan`]
+    ///   rather than [`Database::table`].
+    ///
+    /// The reserved region is taken as zero. SQLite only ever writes a non-zero
+    /// one when an extension asks for it, and none of the arithmetic below can
+    /// tell — a wrong answer here would slice every large blob in the wrong
+    /// place, which is exactly the failure the round-trip check in
+    /// `clipstudio`'s tests exists to catch.
+    pub fn headerless(bytes: &'a [u8], page_size: usize, first_page: u32) -> Result<Self> {
+        if page_size < MIN_PAGE_SIZE || !page_size.is_power_of_two() {
+            return Err(SqliteError::new(format!(
+                "its page size is {page_size}, which is not a power of two of at least {MIN_PAGE_SIZE}"
+            )));
+        }
+        if first_page == 0 {
+            return Err(SqliteError::new("page numbering starts at one"));
+        }
+        let pages = (bytes.len() / page_size) as u32;
+        if pages == 0 {
+            return Err(SqliteError::new("it is shorter than one page"));
+        }
+        Ok(Self {
+            bytes,
+            page_size,
+            usable: page_size,
+            pages,
+            first_page,
+            encoding: TextEncoding::Utf16Le,
+        })
+    }
+
+    /// Every record on every **table-leaf** page in the slice, in page order.
+    ///
+    /// The answer to a database with no schema. Interior pages are passed over
+    /// rather than descended, because their leaves are in the slice too and
+    /// would then be read twice; index pages and anything that is not a b-tree
+    /// page are passed over as well.
+    ///
+    /// **A page that is not a b-tree page can still look like one**, and this
+    /// is the reason the result is a bag of rows rather than a table: an
+    /// overflow page holds raw bytes, so one whose first byte happens to be
+    /// `0x0d` is decoded as a leaf and yields whatever the arithmetic makes of
+    /// the compressed pixels underneath it. Everything is bounds-checked and a
+    /// page that will not decode is dropped, so the cost is a spurious row and
+    /// never a panic — but a caller must identify what it wants by what is
+    /// *in* a row, never by counting them.
+    pub fn scan(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        for index in 0..self.pages {
+            // `checked_add`, because `first_page` is a caller's number and this
+            // is a `pub` API: a debug build panics on the overflow.
+            let Some(page) = self.first_page.checked_add(index) else {
+                break;
+            };
+            let Ok(bytes) = self.page_bytes(page) else {
+                continue;
+            };
+            let base = if page == 1 { 100 } else { 0 };
+            if bytes.get(base) != Some(&0x0d) {
+                continue;
+            }
+            let cells = u16::from_be_bytes([bytes[base + 3], bytes[base + 4]]) as usize;
+            let pointers = base + 8;
+            if pointers + cells * 2 > self.usable {
+                continue;
+            }
+            for i in 0..cells {
+                let at = pointers + i * 2;
+                let cell = u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+                if cell >= self.usable {
+                    continue;
+                }
+                if let Ok(row) = self.leaf_cell(bytes, cell) {
+                    out.push(row);
+                }
+            }
+        }
+        out
+    }
+
+    /// One whole page, by its own page number.
+    fn page_bytes(&self, page: u32) -> Result<&'a [u8]> {
+        let index = page
+            .checked_sub(self.first_page)
+            .filter(|i| *i < self.pages)
+            .ok_or_else(|| {
+                SqliteError::new(format!(
+                    "it points at page {page}, which is not in the file"
+                ))
+            })?;
+        let start = index as usize * self.page_size;
+        Ok(&self.bytes[start..start + self.page_size])
     }
 
     /// Look a table up in the schema.
@@ -294,19 +420,13 @@ impl<'a> Database<'a> {
 
     /// Walk one page of a table b-tree, appending every leaf record below it.
     fn walk(&self, page: u32, seen: &mut BTreeSet<u32>, out: &mut Vec<Row>) -> Result<()> {
-        if page == 0 || page > self.pages {
-            return Err(SqliteError::new(format!(
-                "it points at page {page}, which is past the end of the file"
-            )));
-        }
+        let page_bytes = self.page_bytes(page)?;
         if !seen.insert(page) {
             return Err(SqliteError::new(format!(
                 "page {page} appears twice in one table, so the file is not a tree"
             )));
         }
 
-        let start = (page as usize - 1) * self.page_size;
-        let page_bytes = &self.bytes[start..start + self.page_size];
         // Page 1 carries the hundred-byte file header before its b-tree page
         // header; every other page starts with the b-tree header.
         let base = if page == 1 { 100 } else { 0 };
@@ -436,16 +556,14 @@ impl<'a> Database<'a> {
         // Each overflow page spends four bytes on the pointer to the next.
         let per_page = self.usable - 4;
         while remaining > 0 {
-            if page == 0 || page > self.pages {
-                return Err(SqliteError::new(format!(
+            let bytes = self.page_bytes(page).map_err(|_| {
+                SqliteError::new(format!(
                     "an overflow chain reaches page {page}, which is not in the file"
-                )));
-            }
+                ))
+            })?;
             if !seen.insert(page) {
                 return Err(SqliteError::new("an overflow chain loops back on itself"));
             }
-            let start = (page as usize - 1) * self.page_size;
-            let bytes = &self.bytes[start..start + self.page_size];
             let take = remaining.min(per_page);
             out.extend_from_slice(&bytes[4..4 + take]);
             remaining -= take;
@@ -727,6 +845,80 @@ pub(crate) mod fixture {
             self.rows.push(values);
             self
         }
+    }
+
+    /// Write a database with **no file header and no pages before
+    /// `first_page`** — what a Clip Studio material carries, and what
+    /// [`super::Database::headerless`] reads.
+    ///
+    /// **One leaf page per record**, each followed by whatever overflow chain
+    /// that record needs. There is no interior page and no tree, because
+    /// [`super::Database::scan`] does not walk one — it visits every page and
+    /// decodes the leaves, which is what a database with no `sqlite_master` to
+    /// find a root in leaves it able to do.
+    ///
+    /// The overflow chain is what makes this worth building: its page numbers
+    /// are absolute, so a reader whose `first_page` is off by one reaches the
+    /// wrong bytes — which is the mistake `docs/brushes.md` recorded, and the
+    /// reason the number is now pinned by a test rather than by a note.
+    pub fn headerless(records: &[Vec<Value>], page_size: usize, first_page: u32) -> Vec<u8> {
+        let max_local = page_size - 35;
+        let min_local = ((page_size - 12) * 32 / 255) - 23;
+        let per_page = page_size - 4;
+
+        let mut out: Vec<u8> = Vec::new();
+        for (i, values) in records.iter().enumerate() {
+            let record = encode_record(values);
+            let total = record.len();
+            let local = if total <= max_local {
+                total
+            } else {
+                let k = min_local + ((total - min_local) % per_page);
+                if k <= max_local { k } else { min_local }
+            };
+
+            let mut cell = varint(total as i64);
+            cell.extend_from_slice(&varint(i as i64 + 1));
+            cell.extend_from_slice(&record[..local]);
+
+            // This record's own pages start where the file has reached; the
+            // leaf is the first of them and the chain follows it.
+            let leaf_page = first_page + (out.len() / page_size) as u32;
+            let mut overflow: Vec<Vec<u8>> = Vec::new();
+            if local < total {
+                let mut rest = &record[local..];
+                let first = leaf_page + 1;
+                let count = rest.len().div_ceil(per_page);
+                for step in 0..count {
+                    let take = rest.len().min(per_page);
+                    let mut buffer = vec![0u8; page_size];
+                    let next = if step + 1 < count {
+                        first + step as u32 + 1
+                    } else {
+                        0
+                    };
+                    buffer[..4].copy_from_slice(&next.to_be_bytes());
+                    buffer[4..4 + take].copy_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    overflow.push(buffer);
+                }
+                cell.extend_from_slice(&first.to_be_bytes());
+            }
+
+            let mut leaf = vec![0u8; page_size];
+            leaf[0] = 0x0d;
+            leaf[3..5].copy_from_slice(&1u16.to_be_bytes());
+            let at = page_size - cell.len();
+            leaf[at..].copy_from_slice(&cell);
+            leaf[5..7].copy_from_slice(&(at as u16).to_be_bytes());
+            leaf[8..10].copy_from_slice(&(at as u16).to_be_bytes());
+
+            out.extend_from_slice(&leaf);
+            for page in overflow {
+                out.extend_from_slice(&page);
+            }
+        }
+        out
     }
 
     /// Write a database holding exactly these tables.
@@ -1188,6 +1380,43 @@ mod tests {
 
     /// The file is somebody else's. A page pointing into itself must stop,
     /// rather than recurse until the stack runs out.
+    /// A database with no file header and no first pages — a Clip Studio
+    /// material's, see [`crate::brushimport::csmaterial`]. There is no
+    /// `sqlite_master`, so the way in is the page scan; and the record has to
+    /// be large enough to spill, because an overflow chain names **absolute**
+    /// page numbers and is the one thing that tells a right `first_page` from
+    /// a wrong one.
+    #[test]
+    fn a_headerless_database_is_scanned_and_its_overflow_chains_resolve() {
+        let big: Vec<u8> = (0..9_001u32).map(|i| (i % 251) as u8).collect();
+        let records = vec![
+            vec![Value::Integer(3), Value::Blob(big.clone())],
+            vec![Value::Integer(7), Value::Blob(vec![1, 2, 3])],
+        ];
+        let bytes = fixture::headerless(&records, 1024, 6);
+
+        let db = Database::headerless(&bytes, 1024, 6).expect("open");
+        let rows = db.scan();
+        let found: Vec<&Row> = rows.iter().filter(|r| r.values().len() == 2).collect();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].get(0).as_i64(), Some(3));
+        assert_eq!(found[0].get(1).as_blob(), Some(&big[..]));
+        assert_eq!(found[1].get(1).as_blob(), Some(&[1u8, 2, 3][..]));
+
+        // Off by one on either side and the chain reaches the wrong bytes, so
+        // the large record does not come back. This is the check that settles
+        // the page number rather than a note saying what it is.
+        for wrong in [5u32, 7] {
+            let db = Database::headerless(&bytes, 1024, wrong).expect("open");
+            assert!(
+                !db.scan()
+                    .iter()
+                    .any(|r| r.get(1).as_blob() == Some(&big[..])),
+                "first_page {wrong} should not resolve the chain"
+            );
+        }
+    }
+
     #[test]
     fn a_page_that_points_at_itself_is_refused_rather_than_followed() {
         let mut bytes = database(&[

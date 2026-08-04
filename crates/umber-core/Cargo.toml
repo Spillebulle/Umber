@@ -14,6 +14,7 @@ bytemuck = { workspace = true }
 # so the crate boundary in CLAUDE.md still holds.
 zip = { workspace = true }
 png = { workspace = true }
+flate2 = { workspace = true }
 image = { workspace = true }
 quick-xml = { workspace = true }
 psd = { workspace = true }
@@ -25,7 +26,15 @@ directories = { workspace = true }
 [dev-dependencies]
 # The export tests decode what the encoders wrote, and one of the formats they
 # have to check is PNG — which the crate itself only ever *writes*, through the
-# `png` crate. Enabling the feature here rather than above is what keeps the
-# decoder out of the shipped binary: Cargo only unifies a dev-dependency's
-# features when it is building tests.
+# `png` crate. Enabling the feature here rather than above is what keeps this
+# crate from being the one that asks for it: Cargo only unifies a
+# dev-dependency's features when it is building tests.
+#
+# It no longer keeps `image`'s PNG codec out of the *shipped binary*, and that
+# sentence used to be here. `umber-app` depends on `arboard` for the desktop's
+# clipboard, whose `image-data` feature needs a PNG codec to put a picture on
+# it, so the whole workspace build now unifies `image/png` in. Nothing about
+# the export moved — a PNG Umber writes is still the `png` crate's, which is
+# what carries the `sRGB` chunk — and the codec underneath `image/png` is that
+# same `png` crate. Reachability, not a second encoder.
 image = { workspace = true, features = ["png"] }
