@@ -116,6 +116,14 @@
 //!
 //! # Approximated rather than dropped
 //!
+//! - **The paint-deposit rate.** Krita's colour-smudge engine states the
+//!   pickup and the deposit as two knobs (`SmudgeRate`, `ColorRate`) where
+//!   Umber has one mix. It is the *ratio* that decides a dab's colour and the
+//!   ratio that carries across, through [`Brush::smudge_from_rates`]; what is
+//!   lost is only the pair's magnitude, which for every preset in the fetched
+//!   packs that switches the deposit on is within a tenth of full. This used
+//!   to be dropped whole, which turned a brush laying down as much paint as it
+//!   lifts into a pure blender.
 //! - **Fan corners.** Krita adds extra dabs through a sharp corner so that a
 //!   rake fans round it instead of jumping; Umber's dab turns with the heading
 //!   and the heading turns at the corner. Six presets in the fetched packs ask
@@ -354,14 +362,40 @@ pub fn from_kpp_in(
     }
 
     // A smudging brush picks colour up off the canvas. Krita states the pickup
-    // and the deposit separately (`SmudgeRate` and `ColorRate`); Umber has one
-    // mix, so the pickup is the one that carries across.
+    // and the deposit separately — `SmudgeRate` is how much of the canvas a dab
+    // lifts, `ColorRate` how much fresh paint it lays down — and Umber has one
+    // mix between the palette and what was found. That is not a feature it
+    // lacks: `1 - Brush::smudge` *is* a deposit rate, so what carries across is
+    // the ratio of the two, through `Brush::smudge_from_rates`.
+    //
+    // **`PressureColorRate` is the enable flag**, the rule the module docs open
+    // with, and reading the value without it is the `ScatterValue` bug again.
+    // Krita leaves `ColorRateValue` in the file with Color Rate switched off,
+    // and the packs settle what it means beyond argument: of the nineteen
+    // colour-smudge presets, every one with the flag clear is called Blend,
+    // Blender or Smear and every one with it set is called Paint, OilPaint,
+    // Impasto, Glazing Mix or Wet — the flag *is* "this brush deposits paint".
+    // With it clear the brush is a pure blender, which is exactly what Umber
+    // already imported, so there was never anything to drop.
     let (smudge, smudge_radius) = if smudging {
+        let pickup = preset
+            .number("SmudgeRateValue")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        // Krita's own default for the rate, matching `SmudgeRateValue` above.
+        let smudge = if preset.flag("PressureColorRate") {
+            Brush::smudge_from_rates(
+                pickup,
+                preset
+                    .number("ColorRateValue")
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0),
+            )
+        } else {
+            pickup
+        };
         (
-            preset
-                .number("SmudgeRateValue")
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0),
+            smudge,
             preset
                 .number("SmudgeRadiusValue")
                 .unwrap_or(1.0)
@@ -370,9 +404,6 @@ pub fn from_kpp_in(
     } else {
         (0.0, default.smudge_radius)
     };
-    if smudging && preset.number("ColorRateValue").is_some_and(|r| r > 0.0) {
-        dropped.push("a separate paint-deposit rate");
-    }
 
     let (min_scatter_ratio, scatter_curve, pressure_scatter) = scatter.split(0.0);
     let (_, opacity_curve, pressure_opacity) = opacity.split(0.0);
@@ -1488,6 +1519,57 @@ mod tests {
         assert!((preset.brush.smudge - 0.8).abs() < 1e-5);
         assert!((preset.brush.smudge_radius - 1.5).abs() < 1e-5);
         assert_eq!(preset.brush.dab_ratio, 2.0);
+    }
+
+    /// Krita's deposit rate is a second knob on the one mix Umber has, and
+    /// `PressureColorRate` is its enable flag — the rule the module docs open
+    /// with, and the `ScatterValue` bug again if it is not read. With the flag
+    /// clear the value is a leftover and the brush is a pure blender; with it
+    /// set the ratio decides the mix, and neither case loses anything to name.
+    #[test]
+    fn the_deposit_rate_is_the_other_half_of_the_mix_and_only_counts_when_it_is_on() {
+        let brush = |deposit_on: bool| {
+            let xml = format!(
+                "<Preset name=\"Mix\" paintopid=\"colorsmudge\">{}{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                param("SmudgeRateValue", "0.8"),
+                param("ColorRateValue", "0.6"),
+                format!("<param type=\"internal\" name=\"PressureColorRate\">{deposit_on}</param>"),
+            );
+            from_kpp(&kpp(&xml)).expect("decode")
+        };
+
+        // Off: the value in the file says nothing and the brush is the pure
+        // blender Umber already imported.
+        let off = brush(false);
+        assert!(
+            (off.brush.smudge - 0.8).abs() < 1e-5,
+            "{}",
+            off.brush.smudge
+        );
+
+        // On: 0.8 lifted against 0.6 laid down, so four sevenths of a dab's
+        // colour came off the canvas — less pickup than the rate alone says,
+        // which is the whole correction.
+        let on = brush(true);
+        assert!(
+            (on.brush.smudge - 4.0 / 7.0).abs() < 1e-5,
+            "{}",
+            on.brush.smudge
+        );
+
+        // Neither reading has anything left over to apologise for.
+        for preset in [&off, &on] {
+            assert!(
+                !preset.dropped.iter().any(|d| d.contains("deposit")),
+                "{:?}",
+                preset.dropped
+            );
+        }
     }
 
     #[test]
