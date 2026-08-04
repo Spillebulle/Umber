@@ -149,9 +149,10 @@ straight past all of it, which is what keeps the file a plain `.ora`.
 Three things had to be got right.
 
 **A texture slot is not a layer.** `PixelPatch::slot` is a slice of the layer
-texture array, and slots are **recycled** when a layer is deleted — which is
-exactly why deleting one clears the history. A slot written into a file and read
-back into a different session's allocation is that same bug, made permanent. So
+texture array, and slots are **recycled** — which is why a deleted layer's
+slice is parked inside the undo entry that could put it back rather than
+returned to the pool. A slot written into a file and read back into a
+*different session's* allocation is that same bug with no such defence. So
 a slot is never written: each entry names a **stack position**, bottom first,
 which is the order the file itself is in and the order the reader rebuilds.
 `SaveHistory::new` makes that mapping once, at save time, and refuses the whole

@@ -20,7 +20,37 @@ one of the two mistakes a layers panel makes easy — the other, `remove_many`'s
 reverse loop, has already deleted a layer nobody ticked, and cleared the history
 on the way out so it could not be taken back.
 
-This document is the design. Nothing in it is built.
+This document is the design. **Pieces 1 to 4 of §11 are built**, and the two
+`history.clear()` calls above are gone. What is not:
+
+- **§11.5, the file.** A structural entry is not written. `SaveHistory::new`
+  cuts the timeline at the newest structural entry instead — the machinery
+  `write` already uses when the file's budget bites — so a session with one
+  deletion near the start saves only the run after it. §8 has the argument for
+  why the cut is *sufficient* rather than arbitrary, and §8's open question,
+  what a deleted layer costs as a PNG, is still open. `history::VERSION` did
+  not move and neither did `umber-version`.
+- **§11.6, Clear layer as an `Erase` entry.** Independent of everything here
+  and still the last command that clears the history.
+- **The GPU test in §12.** The parked-slice guarantee is asserted on the CPU —
+  a slice claimed by an entry is never handed to another layer, which is the
+  thing that could go wrong — and nothing in the change touches a shader.
+- **§10 stands**: renaming, opacity, visibility, blend, lock, link and clipping
+  are still not undoable, and §4's `Kept`-restores-shape-not-values rule is what
+  keeps deferring them safe.
+
+Two things the design left implicit and the build had to settle, both in §7's
+territory:
+
+- **`SlotPool::give_back` compacts the tail**, so `slot_capacity_needed` is one
+  past the highest slice *still claimed*. Without it, parking walks that number
+  to `MAX_SLOTS` one delete-then-add at a time and `begin_float` refuses every
+  transform from then on — which `roadmap-review.md` §1.3 flagged and the
+  release valve alone does not fix, because giving a slice back to the free list
+  does not lower the high-water mark.
+- **The release is `App::free_a_slot`**, in front of `add`, `add_mask` *and*
+  `begin_float` — the three gates §7 and the review between them name, and the
+  one nobody owned.
 
 ---
 

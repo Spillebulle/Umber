@@ -1867,9 +1867,9 @@ mod tests {
         assert_eq!(s.len(), 2);
     }
 
-    /// Reordering must be a shuffle of the order and nothing else. If a slot
-    /// ever followed a position, deleting a layer would not be the only thing
-    /// that had to clear the undo history — a patch names a slot.
+    /// Reordering must be a shuffle of the order and nothing else. A patch
+    /// names a slot, so a slot that followed a *position* would make every
+    /// recorded patch in the history wrong the moment anything was dragged.
     #[test]
     fn reordering_preserves_every_layers_slot() {
         let mut s = LayerStack::new();
@@ -2674,9 +2674,9 @@ mod tests {
         assert_eq!(s.ancestors_of(0).count(), LayerStack::MAX_DEPTH as usize);
     }
 
-    /// Deleting a folder takes its contents, frees every slice inside it, and
-    /// therefore **clears the undo history** for exactly the reason deleting
-    /// one layer does — which is the caller's duty, and is now a larger one.
+    /// Deleting a folder takes its contents and hands back every entry inside
+    /// it, so a caller that parks them holds every slice — and one that drops
+    /// them frees every slice, which is what happens here.
     #[test]
     fn deleting_a_folder_takes_its_contents_and_frees_every_slice() {
         let mut s = grouped();

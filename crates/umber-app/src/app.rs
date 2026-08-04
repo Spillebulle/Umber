@@ -1379,7 +1379,9 @@ impl UmberApp {
     /// even one walking backwards, which is what this used to be — hands the
     /// next iteration an index that now names a different entry. Ticking a
     /// layer and a group above it deleted a third layer nobody chose, and
-    /// because a delete clears the undo history it could not be taken back.
+    /// because a delete cleared the undo history it could not be taken back —
+    /// it can now, which makes this the wrong thing to rely on rather than the
+    /// only thing standing between the bug and the artist.
     /// `LayerStack::remove_many` resolves the whole set against the stack as it
     /// stands before anything moves.
     fn delete_entries(&mut self, indices: &[usize]) {
@@ -1856,9 +1858,10 @@ impl UmberApp {
             // captured at commit time, so this adds nothing to the blocking
             // readbacks above. `SaveHistory::new` refuses outright if any patch
             // names a slot no layer holds, which cannot happen from here —
-            // deleting a layer clears the history — and is checked anyway
-            // because a patch replayed into the wrong layer is far worse than
-            // no saved history at all.
+            // a deleted layer's slice is parked in the entry that could put it
+            // back, and an entry naming one is cut out of the file — and is
+            // checked anyway because a patch replayed into the wrong layer is
+            // far worse than no saved history at all.
             let history = self
                 .editor
                 .ui

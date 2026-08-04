@@ -18,9 +18,13 @@
 //! * that "the layer is empty" is a cached *answer* and not a missing one.
 //!   Without that, a document with a blank layer would re-read it every frame
 //!   for as long as it was open.
-//! * that a slot no longer in the stack loses its picture. Slots are recycled,
-//!   so an entry left behind would be the deleted layer's picture drawn on
-//!   whichever layer inherited its slice.
+//! * that a slot no longer in the stack loses its picture. That rule was
+//!   written when a deleted layer's slice went straight back on the free list,
+//!   so an entry left behind would have been the deleted layer's picture drawn
+//!   on whichever layer inherited it. Structural undo parks the slice instead,
+//!   so the *reason* has softened and the behaviour has not: an undone delete
+//!   simply re-reads the thumbnail, which costs one frame. Do not "fix" this
+//!   into a cache that grows with the history.
 //!
 //! # Why it is keyed by document
 //!
@@ -183,9 +187,11 @@ impl Thumbs {
 
     /// Forget every slot not in `live`.
     ///
-    /// Slots are recycled, so an entry for a deleted layer is not merely waste:
-    /// it is that layer's picture, waiting to be drawn on whichever layer
-    /// inherits the slice.
+    /// A slot leaving the stack still loses its picture, and that is correct
+    /// even now that structural undo parks a deleted layer's slice rather than
+    /// recycling it on the spot: an undone delete re-reads the thumbnail. See
+    /// the module docs before turning this into a cache that grows with the
+    /// history.
     pub fn retain(&mut self, live: &[u32]) {
         self.entries.retain(|slot, _| live.contains(slot));
     }

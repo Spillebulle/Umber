@@ -451,9 +451,13 @@ pub struct PixelPatch {
     /// what a list of the history would call the edit's extent. The pieces are
     /// inside it and generally do not fill it.
     pub rect: PixelRect,
-    /// Texture-array slot this patch belongs to. Slots are recycled on layer
-    /// deletion, which is why [`History::clear`] must be called then — replaying
-    /// this patch into a layer that merely inherited the slot would corrupt it.
+    /// Texture-array slot this patch belongs to.
+    ///
+    /// Slots are recycled, so a patch replayed into a layer that merely
+    /// inherited one would corrupt it. What keeps this valid is that a deleted
+    /// layer travels into the [`EditBody::Structure`] entry that could put it
+    /// back, **holding its slice** — see `crate::layer::SlotClaim` — so no other
+    /// layer can be given the number while any entry names it.
     pub slot: u32,
     pieces: Vec<PatchPiece>,
 }

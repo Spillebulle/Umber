@@ -767,8 +767,7 @@ mod tests {
     /// A patch belongs to a *layer*, and a texture slot is not one — slots are
     /// recycled, so a stack whose order no longer matches its slot numbers is
     /// exactly where writing a slot down would corrupt a document. Reordered
-    /// here, which is the cheap way to produce that state; deleting a layer
-    /// clears the history and so cannot.
+    /// here, which is the cheap way to produce that state.
     #[test]
     fn a_patch_finds_its_layer_again_however_the_slots_fell_out() {
         let mut stack = stack(&["Paper", "Ink", "Wash"]);
