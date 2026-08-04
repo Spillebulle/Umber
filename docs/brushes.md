@@ -1357,6 +1357,36 @@ with a mean of 0.775 — so a single stroke at full opacity could not reach 1.0
 anywhere, and a second pass over the first was darker, because the pits are
 anchored to the document and the second stroke fell into the same ones.
 
+**The `Dual*` columns are a second whole brush, and `UseDualBrush` is the only
+field that says whether it is live.** Clip Studio's dual brush stamps a second
+brush on top of the first at the same time: `Variant` carries a parallel copy of
+everything — `DualSize`, `DualFlow`, `DualHardness`, `DualInterval`,
+`DualRotation`, `DualPatternImageArray`, a complete `DualTexture*` block and a
+complete `DualSpray*` one — which is `2-Brush tip`, `2-Spray effect`,
+`2-Stroke` and `2-Paper quality` under `2-Brush shape` in the interface. Four
+columns are about the pairing rather than copies of it: `UseDualBrush`,
+`DualBrushCompositeMode` (thirteen modes, of which "Height (Linear)" exists
+nowhere else in Clip Studio), `SyncDualBrushSize` ("Link to main brush size")
+and `ChangeRGBByDual` ("Apply RGB value" — whether the second tip's colour is
+applied or only its alpha).
+
+Umber binds one tip and one paper per brush, so there is no half of this worth
+painting and `dropped::DUAL_BRUSH` names it. What matters is the gate. **All
+thirty variants across the two sample files have `UseDualBrush = 0`**, and every
+one has residue beside it — and not the same residue: the `.sut` leaves
+`DualSize = 30` where the `.sutg` leaves that column null and
+`DualTextureDensity = 50` instead, with `DualBrushCompositeMode = 1` and a
+`DualTextureDensityEffector` blob in both. So no neighbour of the flag can stand
+in for it, and reading one would put "dual brushes" on the notice of every Clip
+Studio brush anybody has ever imported, over a feature none of them uses. That
+is the same trap `BrushUseIn`, `BrushAutoIntervalType`, the rotation effector and
+the texture reference are each read to avoid;
+`a_dual_brush_that_is_switched_off_is_not_reported_from_the_values_left_beside_it`
+is what pins it, and the fixture's `VARIANT_COLUMNS` carries those five unread
+columns for no other purpose. No `Dual*Effector` has an enabled bit set in
+either file, which is why `unreachable_inputs` skipping that whole prefix costs
+nothing today.
+
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
 brush in both sample files is set that way, so a note about it would appear on

@@ -114,7 +114,24 @@
 //!   stands in when the material could not be read, and for what it used to
 //!   cost when it stood in for every case.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
-//!   have no engine behind them at all** and are named.
+//!   have no engine behind them at all** and are named. The dual brush is the
+//!   largest of the four and the one whose column family invites a guess: a
+//!   parallel copy of the *whole* brush — `DualSize`, `DualFlow`,
+//!   `DualHardness`, `DualInterval`, `DualRotation`, `DualPatternImageArray`,
+//!   a complete `DualTexture*` block and a complete `DualSpray*` one — which is
+//!   Clip Studio's `2-Brush tip`, `2-Spray effect`, `2-Stroke` and `2-Paper
+//!   quality` under `2-Brush shape`, a second brush stamped on top of the first
+//!   at the same time. Four columns are about the pairing rather than copies of
+//!   it: `UseDualBrush`, `DualBrushCompositeMode` (thirteen modes, of which
+//!   Height (Linear) exists only here), `SyncDualBrushSize` ("Link to main
+//!   brush size") and `ChangeRGBByDual` ("Apply RGB value"). Umber binds one
+//!   tip and one paper per brush, so there is no half of this worth painting.
+//!   **`UseDualBrush` is the field that says whether any of it is live**, and
+//!   it is zero on all thirty variants of both sample files while stale values
+//!   sit beside it — see
+//!   `a_dual_brush_that_is_switched_off_is_not_reported_from_the_values_left_
+//!   beside_it` for the residue and for why no neighbour may stand in for the
+//!   flag.
 //! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
 //!   a tool group and a group holding a fill or a selection tool is the
 //!   ordinary case; a note about it would appear on nearly every import ever
@@ -1734,9 +1751,19 @@ mod tests {
     /// The columns of `Variant` this importer actually reads, in an order that
     /// is deliberately *not* the order the code reads them in — the point of
     /// the schema being name-addressed is that neither one matters.
-    const VARIANT_COLUMNS: [&str; 41] = [
+    const VARIANT_COLUMNS: [&str; 46] = [
         "TextureDensityEffector",
         "VariantID",
+        // Five columns this importer never reads, and that is why they are
+        // here: the row has to be able to carry the dual brush's leftovers so
+        // that `a_dual_brush_that_is_switched_off_is_not_reported_from_the_
+        // values_left_beside_it` can put them in it. A fixture that could not
+        // hold them would make that test vacuous.
+        "DualBrushCompositeMode",
+        "DualSize",
+        "DualTextureDensity",
+        "ChangeRGBByDual",
+        "DualUsePatternImage",
         "BrushRotation",
         "Opacity",
         "BrushThickness",
@@ -3593,6 +3620,47 @@ mod tests {
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
         assert_eq!(tool.dropped, [dropped::DUAL_BRUSH]);
+    }
+
+    /// A dual brush that is switched **off** says nothing, however much of its
+    /// settings block is still lying in the row.
+    ///
+    /// `UseDualBrush` is the one field that decides, and the rest of the family
+    /// is the trap `BrushUseIn`, `BrushAutoIntervalType`, the rotation effector
+    /// and the texture reference are each read to avoid. Every one of the 30
+    /// variants in the two sample files has `UseDualBrush = 0` and residue
+    /// beside it, and the residue is not even the same residue: the `.sut`
+    /// leaves `DualSize = 30` and the `.sutg` leaves that column null and
+    /// `DualTextureDensity = 50` instead, with `DualBrushCompositeMode = 1` and
+    /// a `DualTextureDensityEffector` blob in both. So no neighbour of the flag
+    /// can stand in for it, and reading one would put "dual brushes" on the
+    /// notice of every Clip Studio brush anybody has ever imported — which is
+    /// the list that cries wolf, over a feature none of them uses.
+    ///
+    /// The `Dual*` family is a parallel copy of the whole brush: tip, spray,
+    /// stroke and paper, which is Clip Studio's `2-Brush tip`, `2-Spray
+    /// effect`, `2-Stroke` and `2-Paper quality` under `2-Brush shape`. Umber
+    /// binds one tip and one paper per brush, so there is nothing to
+    /// approximate it with and `DUAL_BRUSH` names it rather than half of it
+    /// being painted.
+    #[test]
+    fn a_dual_brush_that_is_switched_off_is_not_reported_from_the_values_left_beside_it() {
+        let bytes = sut(
+            &[(
+                "Sketch",
+                Variant::plain(1)
+                    .int("UseDualBrush", 0)
+                    // Exactly what both sample files leave behind.
+                    .int("DualBrushCompositeMode", 1)
+                    .int("DualSize", 30)
+                    .int("DualTextureDensity", 50)
+                    .int("ChangeRGBByDual", 0)
+                    .int("DualUsePatternImage", 0),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
     }
 
     /// The whole-file answer the import notice uses: one list, no repeats,
