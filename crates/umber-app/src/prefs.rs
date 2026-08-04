@@ -137,6 +137,18 @@ pub struct Prefs {
     pub wheel_angles: WheelAngles,
     /// Whether a saved document carries its undo history.
     pub save_history: bool,
+    /// A directory of the user's own fonts, scanned beside the machine's own.
+    ///
+    /// The third of `umber_core::fonts`' three sources, and the one somebody
+    /// with a foundry licence or a work library needs. Umber **reads** it and
+    /// copies nothing out of it: the moment it copied a face it would be
+    /// redistributing one, in somebody's own documents folder.
+    ///
+    /// A path rather than a list, because one folder is the whole feature and a
+    /// list is a management interface. Empty means none, and a folder that is
+    /// no longer there is simply scanned as nothing rather than being an error
+    /// somebody has to clear before they can set a caption.
+    pub font_folder: Option<PathBuf>,
     /// How much memory one document's undo history may hold, in megabytes.
     ///
     /// Per document, not per session — see [`MIN_UNDO_BUDGET_MB`]. Stored in
@@ -183,6 +195,7 @@ impl Default for Prefs {
             harmony: Harmony::default(),
             wheel_angles: WheelAngles::default(),
             save_history: true,
+            font_folder: None,
             // Exactly what every build before the setting existed held, so a
             // missing or older preferences file changes nobody's behaviour.
             undo_budget_mb: (umber_core::history::DEFAULT_BUDGET_BYTES / (1024 * 1024)) as u32,
@@ -382,6 +395,11 @@ pub fn to_text(prefs: &Prefs) -> String {
         ));
     }
     out.push_str(&format!("save_history = {}\n", prefs.save_history));
+    // Written only when there is one, so a preferences file from a session that
+    // never set it is byte for byte what it was before this key existed.
+    if let Some(folder) = &prefs.font_folder {
+        out.push_str(&format!("font_folder = {}\n", folder.display()));
+    }
     out.push_str(&format!("undo_budget_mb = {}\n", prefs.undo_budget_mb));
     out.push_str(&format!("autosave = {}\n", prefs.autosave));
     out.push_str(&format!(
@@ -523,6 +541,16 @@ pub fn from_text(text: &str) -> Prefs {
             "save_history" => {
                 if let Some(v) = parse_bool(value) {
                     prefs.save_history = v;
+                }
+            }
+            // Taken verbatim, and deliberately not checked for existence here:
+            // a removable drive that is not plugged in today is still the
+            // folder somebody chose, and clearing the setting because of it
+            // would be Umber quietly forgetting a choice. A folder that is not
+            // there scans as nothing.
+            "font_folder" => {
+                if !value.is_empty() {
+                    prefs.font_folder = Some(PathBuf::from(value));
                 }
             }
             // Clamped like every other number here. A line that cannot be read
@@ -797,6 +825,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
         harmony: ed.ui.harmony,
         wheel_angles: ed.ui.wheel_angles,
         save_history: ed.ui.save_history,
+        font_folder: ed.font_folder.clone(),
         // Read off the live history, like every other value here is read off
         // the thing that uses it, so the file cannot come to disagree with what
         // the running documents are actually held to.
@@ -810,6 +839,22 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
             .unwrap_or(0),
         shortcuts: shortcuts::published(),
     }
+}
+
+/// Point the font scan at a folder of the user's own, or at none.
+///
+/// One door, because changing it has to **forget the scan** as well as record
+/// the choice: a library still holding the old folder's faces would go on
+/// offering faces the artist has just pointed Umber away from, and the picker
+/// would then resolve a name to a file that is no longer in the search. Setting
+/// it to what it already is does nothing, so applying preferences at start-up
+/// does not throw away a scan that has just landed.
+pub fn set_font_folder(ed: &mut Editor, folder: Option<PathBuf>) {
+    if ed.font_folder == folder {
+        return;
+    }
+    ed.font_folder = folder;
+    ed.text.fonts.forget();
 }
 
 /// Hand a new undo budget to the running application.
@@ -860,6 +905,7 @@ pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.harmony = prefs.harmony;
     ed.ui.wheel_angles = prefs.wheel_angles;
     ed.ui.save_history = prefs.save_history;
+    set_font_folder(ed, prefs.font_folder.clone());
     set_undo_budget(ed, prefs.undo_budget_mb);
     ed.autosave.enabled = prefs.autosave;
     ed.autosave.interval =
@@ -1346,6 +1392,7 @@ mod tests {
             wheel_shape: WheelShape::Square,
             wheel_angles: turned(30.0, 200.0),
             save_history: false,
+            font_folder: Some(PathBuf::from("/home/painter/type/My Foundry")),
             undo_budget_mb: 1024,
             autosave: false,
             autosave_interval_minutes: 12,
@@ -1376,6 +1423,9 @@ mod tests {
         assert_eq!(back.wheel_shape, prefs.wheel_shape);
         assert_eq!(back.wheel_angles, prefs.wheel_angles);
         assert_eq!(back.save_history, prefs.save_history);
+        // A path with a space in it, because the file is `key = value` split on
+        // the first `=` and a folder somebody actually has is not one word.
+        assert_eq!(back.font_folder, prefs.font_folder);
         assert_eq!(back.undo_budget_mb, prefs.undo_budget_mb);
         assert_eq!(back.autosave, prefs.autosave);
         assert_eq!(

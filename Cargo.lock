@@ -3035,10 +3035,12 @@ dependencies = [
 name = "umber-core"
 version = "0.0.6"
 dependencies = [
+ "ab_glyph_rasterizer",
  "bytemuck",
  "directories",
  "flate2",
  "glam",
+ "harfrust",
  "image",
  "png",
  "psd",
@@ -3046,6 +3048,7 @@ dependencies = [
  "ron",
  "serde",
  "serde_json",
+ "skrifa",
  "zip",
 ]
 

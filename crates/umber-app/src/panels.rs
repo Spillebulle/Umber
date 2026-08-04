@@ -498,6 +498,7 @@ pub(crate) fn panel(
                     PanelKind::Tweaks => crate::tweaks::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
                     PanelKind::History => history_body(ui, p, ed, actions),
+                    PanelKind::Text => crate::textpanel::panel(ui, p, ed, actions),
                 });
         },
     );
@@ -2098,26 +2099,39 @@ fn module_library(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             );
             ui.add_space(10.0);
 
-            // **This list does not scroll, and at seven cards it is close to
-            // needing to.** A card is about eighty-four points, so the header,
-            // the note and the cards come to roughly 750 — taller than a
-            // modest window, and `egui::Modal` centres what it is given rather
-            // than clamping it, so the overflow goes off *both* ends and takes
-            // the way back to a removed module with it.
+            // **Scrolled, and bounded by the window rather than by the cards.**
+            // A card is about 84 points and the list is one per module, so the
+            // modal's height is a function of how many modules exist — which
+            // means adding one is a change to whether the dialog fits on
+            // somebody's screen. It was already close with six at a raised
+            // interface scale, and the *last* card is the Add button of the
+            // module somebody came here for. `egui::Modal` centres what it is
+            // given rather than clamping it, so an overflow goes off **both**
+            // ends and takes the way back to a removed module with it.
             //
-            // A `ScrollArea` here was tried and is not the fix on its own: the
-            // modal's `Ui` is bounded from wherever the centred `Area` was
-            // placed, so the scroll area settles at about half the screen and
-            // the list then scrolls on a tall window where it used to fit. The
-            // eighth module needs the modal's own height solved first —
-            // two columns, or a `Sides`-style header with the list sized
-            // against the viewport rather than against what is left of it.
-            for kind in PanelKind::ALL {
-                if module_card(ui, p, ed, kind) {
-                    picked = Some(kind);
-                }
-                ui.add_space(6.0);
-            }
+            // **Against the viewport, not against what is left of the `Ui`**,
+            // and that is the whole of why this works. Bounding it by the
+            // remaining space was tried and is not the fix: the modal's `Ui` is
+            // sized from wherever the centred `Area` landed, so the scroll area
+            // settles at about half the screen and the list then scrolls on a
+            // *tall* window where it used to fit — a regression in the common
+            // case, to fix the rare one.
+            //
+            // This is not the nested scrolling the settings dialog refuses:
+            // there is no scroll area above it, so the wheel still means one
+            // thing. Two thirds of the window, so it is plainly a list with
+            // more below rather than a dialog that happens to be cut off.
+            egui::ScrollArea::vertical()
+                .max_height(ui.ctx().viewport_rect().height() * 0.66)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for kind in PanelKind::ALL {
+                        if module_card(ui, p, ed, kind) {
+                            picked = Some(kind);
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
         });
 
     if response.should_close() {
@@ -2345,6 +2359,28 @@ pub(crate) fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, k
                 );
                 bar(y, 11.0, 11.0 + 30.0 - k as f32 * 6.0, ink);
             }
+        }
+        // A line of type over a baseline, with the caret that is not there yet
+        // deliberately absent: what this module draws is a block you compose
+        // and place, not one you type into on the canvas.
+        PanelKind::Text => {
+            let y = body.top() + 9.0;
+            painter.line_segment(
+                [
+                    pos2(body.left(), y + 3.0),
+                    pos2(body.left() + 34.0, y + 3.0),
+                ],
+                Stroke::new(1.0, ink),
+            );
+            for (x, w, h) in [(0.0, 7.0, 12.0), (9.0, 5.0, 9.0), (16.0, 6.0, 9.0)] {
+                painter.rect_filled(
+                    Rect::from_min_size(pos2(body.left() + x, y + 3.0 - h), vec2(w, h)),
+                    1.0,
+                    p.accent,
+                );
+            }
+            bar(y + 14.0, 0.0, 30.0, ink);
+            bar(y + 20.0, 0.0, 22.0, ink);
         }
         // A timeline: a marker per entry, filled where the document stands.
         PanelKind::History => {

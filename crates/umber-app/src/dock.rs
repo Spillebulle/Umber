@@ -118,10 +118,11 @@ pub enum PanelKind {
     Tweaks,
     Layers,
     History,
+    Text,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 7] = [
+    pub const ALL: [PanelKind; 8] = [
         Self::Tools,
         Self::Colour,
         Self::Palette,
@@ -129,6 +130,7 @@ impl PanelKind {
         Self::Tweaks,
         Self::Layers,
         Self::History,
+        Self::Text,
     ];
 
     /// The arrangement Umber ships with, a column per side: the tool rail alone
@@ -159,6 +161,7 @@ impl PanelKind {
             Self::Tweaks => "Brush tweaks",
             Self::Layers => "Layers",
             Self::History => "History",
+            Self::Text => "Text",
         }
     }
 
@@ -196,6 +199,10 @@ impl PanelKind {
                 "Every stroke on this document, and a click to go back to any \
                  of them."
             }
+            Self::Text => {
+                "Set a line of text in the fonts on this machine, and place it \
+                 on the canvas to move, scale and turn."
+            }
         }
     }
 
@@ -210,6 +217,7 @@ impl PanelKind {
             Self::Tweaks => "tweaks",
             Self::Layers => "layers",
             Self::History => "history",
+            Self::Text => "text",
         }
     }
 
@@ -232,6 +240,9 @@ impl PanelKind {
             Self::Tweaks => 1.8,
             Self::Layers => 2.2,
             Self::History => 2.0,
+            // A field to type into, four controls and a preview: about what
+            // the layer list wants, and more than the shortlist of brushes.
+            Self::Text => 2.2,
         }
     }
 

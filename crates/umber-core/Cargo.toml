@@ -23,6 +23,12 @@ serde_json = { workspace = true }
 ron = { workspace = true }
 directories = { workspace = true }
 
+# `text` and `fonts`. See the workspace manifest for why these three versions
+# and not `cosmic-text`.
+skrifa = { workspace = true }
+harfrust = { workspace = true }
+ab_glyph_rasterizer = { workspace = true }
+
 [dev-dependencies]
 # The export tests decode what the encoders wrote, and one of the formats they
 # have to check is PNG — which the crate itself only ever *writes*, through the

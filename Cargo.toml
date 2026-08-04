@@ -44,6 +44,25 @@ egui-winit = { version = "0.35", default-features = false, features = [
 
 glam = "0.33"
 bytemuck = { version = "1", features = ["derive"] }
+
+# Text. All three are already in the tree — `skrifa` and `ab_glyph_rasterizer`
+# as direct dependencies of `umber-app` (the splash's `cputext.rs`), `harfrust`
+# under `epaint` — and all three are plain data with no GPU, windowing or
+# platform reach, so `umber-core::text` can hold the layout without touching the
+# crate boundary.
+#
+# **The versions are pinned to what `epaint` already asks for**, and that is the
+# whole reason this set was chosen over `cosmic-text`. cosmic-text 0.19 wants
+# `skrifa ^0.40` and `harfrust ^0.5` where epaint 0.35 wants `^0.42.1` and
+# `^0.7.0`; 0.x caret ranges do not unify, so both would be *built twice* — two
+# extra compilations of a font parser and a shaper, for no behaviour. At these
+# versions there is one `read-fonts` underneath all of it and nothing new is
+# compiled at all. What cosmic-text would have added on top of shaping is bidi
+# reordering, Unicode line breaking and font fallback; `text.rs` says out loud
+# which of those Umber therefore does not do.
+skrifa = "0.42"
+harfrust = "0.7"
+ab_glyph_rasterizer = "0.1"
 pollster = "1"
 log = "0.4"
 env_logger = "0.11"

@@ -152,6 +152,15 @@ pub enum Icon {
     /// browser — and a row that drew a pencil for renaming and a pencil for
     /// editing would be two marks with one meaning and two outcomes.
     Rename,
+    // Text. At the end for the reason every mark above it is: this enum is
+    // shared, and renumbering it would be a merge that compiles and draws the
+    // wrong marks.
+    /// A serifed capital `A` — the mark every application uses for text, and
+    /// deliberately *drawn* rather than the letter set in Archivo. A glyph
+    /// would be the one icon in the interface whose weight and proportions came
+    /// from the font rather than from the stroke weight beside it, and it would
+    /// change shape the day the interface changed typeface.
+    Text,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -323,6 +332,16 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
         Icon::ChevronDown => path(vec![at(6.0, 9.0), at(12.0, 15.0), at(18.0, 9.0)]),
 
         Icon::ChevronRight => path(vec![at(9.0, 6.0), at(15.0, 12.0), at(9.0, 18.0)]),
+
+        Icon::Text => {
+            // A capital `A` with a serifed foot on each leg. The crossbar sits
+            // low, at 40% of the height rather than halfway, because a bar in
+            // the middle reads as a triangle with a line through it at 16 px.
+            path(vec![at(5.0, 20.0), at(12.0, 4.0), at(19.0, 20.0)]);
+            line(at(8.2, 13.0), at(15.8, 13.0));
+            line(at(2.5, 20.0), at(7.5, 20.0));
+            line(at(16.5, 20.0), at(21.5, 20.0));
+        }
 
         Icon::SelectReplace | Icon::SelectAdd | Icon::SelectSubtract | Icon::SelectIntersect => {
             // One motif, four fills. The squares are the same two in every

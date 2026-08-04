@@ -173,6 +173,49 @@ impl Transform {
         self.source
     }
 
+    /// Put a **different** rectangle under the same transform, leaving every
+    /// point exactly where the old one put it.
+    ///
+    /// The source rectangle's centre is the pivot for the scale and the
+    /// rotation, so growing it — which is what typing another word into a text
+    /// float does — moves the pivot, and moving a pivot moves everything that
+    /// was already on screen. `Transform::identity(new_rect)` is the obvious
+    /// repair and throws away every drag the artist has made.
+    ///
+    /// The compensation is one line and it is **exact** rather than close.
+    /// With `m = R·S`, `apply(p) = m·(p − pivot) + pivot + offset`; moving the
+    /// pivot from `p₀` to `q` and setting `offset' = offset + (m − I)·(q − p₀)`
+    /// makes the two expressions identical term for term, so no glyph already
+    /// placed moves by a millionth of a pixel and the new ones land in identity
+    /// space and are carried by the same matrix.
+    ///
+    /// At identity `m = I`, so the correction is exactly zero and
+    /// [`Self::is_identity`] still reads true — which is what stops a text
+    /// float that was typed into but never dragged from recording an edit it
+    /// did not make.
+    ///
+    /// **Nothing calls this yet**, and that is said here rather than left to be
+    /// discovered. Text placed on the canvas today is a *paste* — pixels the
+    /// moment they land, with no caret and therefore no box that grows as it is
+    /// typed into. This is here because the exactness is the part that is worth
+    /// proving before anything depends on it, and it is provable without a
+    /// device: the pair of tests beside
+    /// `a_transform_and_its_inverse_are_exact_opposites` is the whole of the
+    /// argument, and it will not have to be reconstructed by whoever builds the
+    /// caret. See `docs/text-tool.md` §4(a).
+    pub fn reseat(&mut self, source: PixelRect) {
+        let was = self.pivot();
+        let m = self.rotation() * Mat2::from_diagonal(self.scale);
+        self.source = Rect::new(
+            Vec2::new(source.x as f32, source.y as f32),
+            Vec2::new(
+                (source.x + source.width) as f32,
+                (source.y + source.height) as f32,
+            ),
+        );
+        self.offset += (m - Mat2::IDENTITY) * (self.pivot() - was);
+    }
+
     /// True when this transform would leave every pixel exactly where it is.
     ///
     /// What decides whether a gesture is worth committing at all: a click that
@@ -1100,6 +1143,55 @@ mod tests {
         // And the map they describe is column-major, as glam and WGSL both are.
         near(a.apply(vec2(1.0, 0.0)), vec2(6.0, 8.0), "x axis");
         near(a.apply(vec2(0.0, 1.0)), vec2(8.0, 10.0), "y axis");
+    }
+
+    /// Re-seating leaves the map alone, exactly — which is what lets a text
+    /// float grow as it is typed into without the words already on screen
+    /// drifting under the hand that placed them.
+    #[test]
+    fn a_reseated_transform_maps_every_point_exactly_where_it_did() {
+        let mut t = Transform::identity(source());
+        t.offset = vec2(11.0, -4.5);
+        t.scale = vec2(1.8, -0.6);
+        t.angle = 0.9;
+        let before = t.matrix();
+
+        // Grown to the right and downwards, as a line of text grows.
+        t.reseat(PixelRect {
+            x: 10,
+            y: 20,
+            width: 57,
+            height: 33,
+        });
+        let after = t.matrix();
+        for p in [
+            vec2(0.0, 0.0),
+            vec2(10.0, 20.0),
+            vec2(30.0, 30.0),
+            vec2(-5.0, 63.0),
+            vec2(200.0, -140.0),
+        ] {
+            near(after.apply(p), before.apply(p), "the map moved");
+        }
+        // And the *new* rectangle is what the box now describes.
+        near(t.source().min, vec2(10.0, 20.0), "source min");
+        near(t.source().max, vec2(67.0, 53.0), "source max");
+    }
+
+    /// At identity the correction is exactly zero, so a float that was typed
+    /// into and never dragged still reads as unchanged and still records no
+    /// edit.
+    #[test]
+    fn reseating_an_untouched_transform_leaves_it_untouched() {
+        let mut t = Transform::identity(source());
+        t.reseat(PixelRect {
+            x: 4,
+            y: 7,
+            width: 90,
+            height: 12,
+        });
+        assert!(t.is_identity(), "{t:?}");
+        assert_eq!(t.offset, Vec2::ZERO);
     }
 
     #[test]

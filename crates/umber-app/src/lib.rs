@@ -55,6 +55,7 @@ mod sysclip;
 mod syscursor;
 mod tabs;
 mod taskbar;
+mod textpanel;
 mod theme;
 mod themelib;
 mod thumbs;

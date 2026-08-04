@@ -580,10 +580,68 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
     );
 
     ui.add_space(16.0);
+    fonts_section(ui, p, ed);
+
+    ui.add_space(16.0);
     undo_section(ui, p, ed);
 
     ui.add_space(16.0);
     autosave_section(ui, p, ed, actions);
+}
+
+/// Where the Text module looks for faces.
+///
+/// One folder and no list. Umber already reads every font installed on this
+/// machine — see `umber_core::fonts` for why that is the feature rather than a
+/// bundle — and this is the third source: a directory somebody keeps their own
+/// faces in, for a foundry licence or a work library. Umber **reads** it and
+/// copies nothing out of it, which the note says, because the moment it copied
+/// a face it would be redistributing one inside somebody's own documents
+/// folder.
+///
+/// The dialog blocks, which is what an explicit click may do; nothing on the
+/// drawing path reaches it. Changing the folder goes through
+/// [`prefs::set_font_folder`], which also throws the scan away — a library
+/// still holding the old folder's faces would offer faces the artist has just
+/// pointed Umber away from.
+fn fonts_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    controls::section(ui, p, "Fonts");
+    let current = ed
+        .font_folder
+        .as_ref()
+        .map(|f| f.display().to_string())
+        .unwrap_or_else(|| "None".to_string());
+    controls::row(ui, p, "Extra font folder", |ui| {
+        if ed.font_folder.is_some()
+            && controls::text_button(ui, p, "Clear", false, true)
+                .on_hover_text("Go back to this machine's own font directories alone")
+                .clicked()
+        {
+            prefs::set_font_folder(ed, None);
+            prefs::mark_dirty();
+        }
+        if controls::text_button(ui, p, "Choose…", false, true)
+            .on_hover_text("Pick a directory of fonts to read beside the machine's own")
+            .clicked()
+            && let Some(folder) = rfd::FileDialog::new()
+                .set_title("Choose a folder of fonts")
+                .pick_folder()
+        {
+            prefs::set_font_folder(ed, Some(folder));
+            prefs::mark_dirty();
+        }
+    });
+    controls::note(
+        ui,
+        p,
+        &format!(
+            "Currently: {current}.\nEvery font installed on this machine is already \
+             offered in the Text panel — this is for a folder of your own beside them, \
+             such as a foundry licence or a work library. Umber reads it and copies \
+             nothing out of it. TrueType and OpenType are read — .ttf, .otf, .ttc \
+             and .otc — and web fonts are not."
+        ),
+    );
 }
 
 /// The Interface scale control's shape: a factor shown as a percentage, landing

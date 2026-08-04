@@ -216,6 +216,22 @@ Next, roughly in order:
   a folder that fades or blends its contents is group compositing and needs an
   accumulator stack in `composite.wgsl`. `docs/layer-folders.md` is the whole
   design, the invariants it collides with and the order to build it in.
+- **Text, the rest of it.** The Text module sets a block in any font on the
+  machine and places it as a float, which is the useful first piece and is
+  built. Four things it deliberately is not: there is **no caret on the
+  canvas**, because key dispatch happens at the winit level and a canvas caret
+  needs `shortcuts` suspended, characters from `KeyEvent::text`, `Enter` and
+  `Escape` prised away from the float commands, and an **IME** — which Umber
+  has none of, so an on-canvas caret could not type Chinese, Japanese or Korean
+  at all and nobody here could test it once added. There is no **line
+  wrapping** (lines break at `\n`, which is what "point text" means), no
+  **bidirectional reordering** (a line mixing an English phrase into an Arabic
+  sentence is flagged rather than reordered), and no **font fallback** (a
+  character the face has no glyph for is named rather than filled in from
+  somewhere else). Re-editable text *layers* are a fifth thing and a much
+  larger one — a layer kind, with a paint gate, a row mark and an answer for
+  masks, clipping and folders. `docs/text-tool.md` is the design and
+  `docs/roadmap-review.md` §6 is the argument for stopping where this stops.
 - Structural undo, so layer add/delete/reorder joins the history — and stops
   the History module having to explain that it lists strokes and not layers
 - Getting the *explicit* save off the drawing thread. It still reads every
@@ -283,3 +299,4 @@ pwsh tools/release.ps1 0.0.2
 | [`document-format.md`](document-format.md) | Why OpenRaster, and exactly what Umber writes into one |
 | [`document-import.md`](document-import.md) | What each importer reads, and why some formats are refused |
 | [`layer-folders.md`](layer-folders.md) | The folder design, what it collides with, and why it is not built yet |
+| [`text-tool.md`](text-tool.md) | The text design: what a font costs to bundle, why placed text is a paste, and what an on-canvas caret would take |

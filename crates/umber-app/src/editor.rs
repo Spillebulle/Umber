@@ -485,6 +485,27 @@ pub struct Editor {
     /// pane. Nothing on the stroke path may start reading it, or the diagnostic
     /// becomes part of what it is meant to be observing.
     pub input: crate::inputlog::InputLog,
+    /// What the Text module holds: the block being composed, the face it is in,
+    /// and the machine's fonts once they have been found.
+    ///
+    /// Above the `--- documents ---` line, like the clipboard and the brush in
+    /// hand and for the same reason — a caption somebody is composing belongs
+    /// to the person, not to one picture, and placing the same one on a second
+    /// document is the ordinary thing to want. The font library is a *cache of
+    /// the machine* rather than of a document, so a tab switch has nothing to
+    /// do with it either.
+    pub text: crate::textpanel::TextState,
+    /// A directory of the user's own fonts, scanned beside the machine's.
+    ///
+    /// A *preference*, and here rather than in [`UiState`] because that struct
+    /// is `Copy` and a path is not — which is also why it is not simply another
+    /// `bool` beside `save_history`. Umber reads this folder and **copies
+    /// nothing out of it**: the moment it copied a face it would be
+    /// redistributing one, inside somebody's own documents folder, and
+    /// `umber_core::fonts` says why that is the line. Changing it forgets the
+    /// scan, because a library still holding the old folder's faces would offer
+    /// faces the artist has just pointed Umber away from.
+    pub font_folder: Option<std::path::PathBuf>,
 
     pub interaction: Interaction,
     /// Cursor in physical window pixels.
@@ -598,6 +619,8 @@ impl Default for Editor {
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
+            text: crate::textpanel::TextState::default(),
+            font_folder: None,
             interaction: Interaction::Idle,
             cursor: Vec2::ZERO,
             last_cursor: Vec2::ZERO,
