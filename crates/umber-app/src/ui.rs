@@ -1852,11 +1852,45 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
     .clicked()
 }
 
+/// Height the brush editor's footer claims at the bottom of the dialog.
+///
+/// Named because two places have to agree on it: [`brush_editor`], which hands
+/// the body whatever is left over, and `brushlib::save_row`, which must not
+/// draw more than this — the two transient things that used to make it taller,
+/// the notice and the "Save this brush as" field, are `brushlib::save_bar`'s
+/// now and sit above the body instead.
+///
+/// The style's 6 points of item spacing above the hairline, the hairline, the
+/// ten points under it, and one 22-point line of buttons.
+///
+/// `the_brush_editor_is_one_size_whatever_section_is_in_front` is what holds
+/// this to what the footer actually costs, which is the half of this that is
+/// easy to get wrong: a reserve one point short is a footer that overruns the
+/// frame, and the dialog grows by that point rather than the row being clipped.
+const BRUSH_EDITOR_FOOTER: f32 = 39.0;
+
+/// Breathing space between the body and the footer's hairline.
+const BRUSH_EDITOR_GAP: f32 = 14.0;
+
 /// The brush editor, matching the design's dialog.
 ///
 /// Holds every brush parameter that is not on the options strip, so the strip
 /// can stay short. Edits apply live — there is no OK or Cancel, because a paint
 /// app should let you see a change as you make it.
+///
+/// **One size, whatever section is in front**, which is the settings dialog's
+/// rule and was arrived at the same way: each section used to size the modal,
+/// so moving from Tip to Inputs grew it by a third and moving back shrank it —
+/// with the tab strip you had just clicked sliding out from under the pointer,
+/// because a modal is centred and a modal that changes height moves both edges.
+/// A header, one vertical `ScrollArea` with `auto_shrink([false, false])` and
+/// an explicit max height, a footer. The scroll area claiming its space
+/// whatever is in it is the whole of the fix; being vertical, it also cannot
+/// grow a horizontal bar out of a section that overruns.
+///
+/// **Sections must not add scroll areas of their own** — nested scrolling makes
+/// the wheel mean two things — and must not be given the dialog's height to
+/// size themselves against, or this comes straight back.
 fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if !ed.ui.brush_editor_open {
         return;
@@ -1867,6 +1901,15 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         .and_then(|i| ed.presets.get(i))
         .map(|preset| preset.name.clone())
         .unwrap_or_else(|| "Brush".to_string());
+
+    // Clamped to the window, because a modal taller than the screen has its
+    // footer — the only way to keep an edit — off the bottom of it. The clamp
+    // reads the window and never the section, so it cannot reintroduce the
+    // thing above.
+    let available = root.ctx().content_rect().size();
+    let [full_width, full_height] = metrics::BRUSH_EDITOR;
+    let width = full_width.min(available.x - 48.0).max(420.0);
+    let height = full_height.min(available.y - 48.0).max(320.0);
 
     let response = egui::Modal::new(egui::Id::new("brush-editor"))
         .frame(
@@ -1881,7 +1924,8 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // design's two-column grid and the Dynamics section is three curves
             // side by side. At 430 px either would have to stack, and a brush
             // editor you have to scroll is one you stop reaching for.
-            ui.set_width(metrics::BRUSH_EDITOR_WIDTH);
+            ui.set_width(width);
+            ui.set_height(height);
 
             ui.horizontal(|ui| {
                 ui.label(
@@ -1913,17 +1957,32 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             );
             ui.add_space(12.0);
 
-            match ed.ui.brush_tab {
-                BrushTab::Tip => brush_editor_tip(ui, p, ed),
-                BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
-                BrushTab::Inputs => brush_editor_inputs(ui, p, ed),
-                BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
-                BrushTab::Texture => brush_editor_texture(ui, p, ed),
-                BrushTab::Blending => brush_editor_blending(ui, p, ed),
-            }
+            // Above the body, so the space they take comes off what scrolls
+            // rather than off the dialog's height. See `brushlib::save_bar`.
+            crate::brushlib::save_bar(ui, p, ed);
+
+            let body = (ui.available_height() - BRUSH_EDITOR_FOOTER - BRUSH_EDITOR_GAP).max(0.0);
+            egui::ScrollArea::vertical()
+                // A scroll position per section. One shared position would
+                // carry Inputs' offset onto Tip, which is short enough to be
+                // left showing nothing.
+                .id_salt(("brush-editor", ed.ui.brush_tab))
+                .max_height(body)
+                .auto_shrink([false, false])
+                .show(ui, |ui| match ed.ui.brush_tab {
+                    BrushTab::Tip => brush_editor_tip(ui, p, ed),
+                    BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
+                    BrushTab::Inputs => brush_editor_inputs(ui, p, ed),
+                    BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
+                    BrushTab::Texture => brush_editor_texture(ui, p, ed),
+                    BrushTab::Blending => brush_editor_blending(ui, p, ed),
+                });
 
             // The design's footer: name what you have made, or write it back
-            // over the brush you started from.
+            // over the brush you started from. Pushed to the bottom by whatever
+            // is left, exactly as the settings dialog's is.
+            let left = (ui.available_height() - BRUSH_EDITOR_FOOTER).max(0.0);
+            ui.allocate_space(vec2(0.0, left));
             crate::brushlib::save_row(ui, p, ed);
         });
 
@@ -2839,4 +2898,156 @@ fn curve_column(
             widgets::slider_row(ui, p, label, value, 0.0..=1.0, false, percent);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::brushlib;
+    use crate::editor::{BrushTab, Editor};
+    use crate::theme::{Palette, ThemeKind, metrics};
+    use egui::{Rect, pos2, vec2};
+
+    /// Every section of the brush editor, and how big the dialog came out.
+    fn section_sizes() -> Vec<(BrushTab, egui::Vec2)> {
+        let input = egui::RawInput {
+            // Comfortably larger than the dialog in both directions, so the
+            // clamp to the window is not what is being measured.
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+
+        let mut out = Vec::new();
+        for tab in [
+            BrushTab::Tip,
+            BrushTab::Dynamics,
+            BrushTab::Inputs,
+            BrushTab::Scatter,
+            BrushTab::Texture,
+            BrushTab::Blending,
+        ] {
+            // A context per section, not one shared by the six. egui remembers
+            // an area's rect between frames, and a modal that has already been
+            // laid out taller stays taller — so a shared context can report six
+            // sections agreeing when what they agree on is the largest of them.
+            let ctx = egui::Context::default();
+            let mut ed = Editor::default();
+            ed.ui.brush_editor_open = true;
+            ed.ui.brush_tab = tab;
+            let mut size = egui::Vec2::ZERO;
+            // Three passes and the last is the one read: the first through a
+            // fresh context builds the font atlas, and a modal lays itself out
+            // against the previous frame's screen — text measured against a
+            // half-built atlas is not the height it settles at.
+            for _ in 0..3 {
+                // Seeded rather than loaded, so this never touches the brush
+                // library of whoever is running it.
+                brushlib::seed_broken_library(&ctx, &ed, "no library");
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    super::brush_editor(ui, &palette, &mut ed);
+                });
+                size = ctx
+                    .memory(|m| m.area_rect(egui::Id::new("brush-editor")))
+                    .expect("the brush editor draws an area")
+                    .size();
+            }
+            out.push((tab, size));
+        }
+        out
+    }
+
+    /// The brush editor is one size, whatever section is in front.
+    ///
+    /// Each section used to size the modal: Inputs is a list of arbitrary
+    /// length where Tip is a fixed grid, so moving between them grew and shrank
+    /// the dialog — and a modal is centred, so a change of height moves *both*
+    /// edges and takes the tab strip out from under the pointer that has just
+    /// clicked it. It is now a header, one vertical `ScrollArea` with
+    /// `auto_shrink([false, false])` and an explicit max height, and a footer,
+    /// which is the settings dialog's rule applied here.
+    ///
+    /// The absolute size is asserted as well as the agreement between the six,
+    /// because the two are different failures: six sections that agree on the
+    /// wrong number is a header or a footer overrunning what the frame reserved
+    /// for it, and that is the same on every tab — so equality alone would pass
+    /// straight over it.
+    #[test]
+    fn the_brush_editor_is_one_size_whatever_section_is_in_front() {
+        let sizes = section_sizes();
+        let [width, height] = metrics::BRUSH_EDITOR;
+        // The frame's `Margin::same(18)` and its one-point border, on all four
+        // sides: 18 + 1 either way.
+        let expected = vec2(width + 38.0, height + 38.0);
+        for (tab, size) in &sizes {
+            // Within a tenth of a point rather than exactly. The height is the
+            // frame's own arithmetic over a sum of `add_space`s and row
+            // heights, so the last bit of the f32 differs between sections; a
+            // tenth of a point is far below anything that could be a layout
+            // changing size and far above that.
+            let off = (*size - expected).abs();
+            assert!(
+                off.x < 0.1 && off.y < 0.1,
+                "the brush editor is {:.4} × {:.4} on {tab:?}, not {:.4} × {:.4}",
+                size.x,
+                size.y,
+                expected.x,
+                expected.y
+            );
+        }
+    }
+
+    /// The brush editor, on each of its six sections.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is:
+    /// the test above says the frame is one size, and only a picture says
+    /// whether the section inside it is laid out sensibly at that size — how
+    /// much of the frame a short section leaves empty, and whether a long one
+    /// scrolls where it should.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app brush_editor_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn brush_editor_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The dialog is 560 × 600 and clamps to `available - 48`, so a field 48
+        // larger either way holds it at full size with an even margin of dimmed
+        // backdrop around it.
+        let [w, h] = metrics::BRUSH_EDITOR;
+        let field = vec2(w + 48.0, h + 48.0);
+        for (n, tab) in [
+            BrushTab::Tip,
+            BrushTab::Dynamics,
+            BrushTab::Inputs,
+            BrushTab::Scatter,
+            BrushTab::Texture,
+            BrushTab::Blending,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            ed.ui.brush_editor_open = true;
+            ed.ui.brush_tab = tab;
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |root| {
+                super::brush_editor(root, &palette, &mut ed);
+            });
+            let name = format!("{}-{tab:?}.png", n + 1);
+            docshot::write_png(&dir.join(name.to_lowercase()), &image).expect("write the png");
+        }
+        println!("wrote 6 shots to {}", dir.display());
+    }
 }

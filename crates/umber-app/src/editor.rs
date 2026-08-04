@@ -187,7 +187,10 @@ pub struct UiState {
 /// it. `Inputs` is the modulation table — everything that drives the brush and
 /// is not pressure — and `Dynamics` is already taken by the pressure curves,
 /// which is exactly the distinction the two names have to draw.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Hash` so it can salt the brush editor's scroll area: the position is per
+/// section, or Inputs' offset would be carried onto Tip, which is short enough
+/// to be left showing nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BrushTab {
     Tip,
     Dynamics,

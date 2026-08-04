@@ -934,6 +934,35 @@ fn attribution(ui: &mut Ui, preset: &BrushPreset) {
 // Saving out of the editor
 // ---------------------------------------------------------------------------
 
+/// What the brush editor says between its tab strip and its sections: whatever
+/// just happened, and the "Save this brush as" field while it is up.
+///
+/// **Above the body rather than in the footer, and that is the whole reason it
+/// is a separate function.** Both of these come and go — a notice is a sentence
+/// as long as the import that produced it, and the field is a framed box with a
+/// label, a text field and two buttons — so a footer holding them is a footer
+/// whose height changes, and the dialog is one size. Drawn here they cost the
+/// *body* its space instead, which is what a scroll area is for. It is also
+/// where the Brushes panel puts its own notice, so the two read alike.
+pub fn save_bar(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    let mut state = load(ui.ctx(), ed);
+
+    // The browser owns the notice while it is up, so the same sentence is never
+    // reported in two places at once.
+    if !state.browser_open
+        && state.saving.is_none()
+        && let Some(notice) = state.notice.clone()
+        && notice_bar(ui, p, &notice, true)
+    {
+        state.notice = None;
+    }
+    if save_field(ui, p, ed, &mut state) {
+        ui.add_space(2.0);
+    }
+
+    store(ui.ctx(), state);
+}
+
 /// The design's "Save brush" footer, for the brush editor dialog.
 ///
 /// The design draws Cancel and Save at the foot of the editor. Umber's editor
@@ -941,25 +970,21 @@ fn attribution(ui: &mut Ui, preset: &BrushPreset) {
 /// as you make it — so there is nothing for Cancel to undo and it is not drawn.
 /// What is left is the half that does something: name what you have made, or
 /// write it back over the brush you started from.
+///
+/// **Its height must not depend on what is in it**, because the dialog reserves
+/// exactly `ui::BRUSH_EDITOR_FOOTER` for it and hands the rest to the body. The
+/// two things that used to vary are [`save_bar`]'s now; what is left is one
+/// line of buttons, and while the field is up it is the same line with the note
+/// alone on it — the buttons that arm it would be a second way to start what is
+/// already started.
 pub fn save_row(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
 
-    ui.add_space(14.0);
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(line, 0.0, p.border);
     ui.add_space(10.0);
 
-    if state.saving.is_none()
-        && let Some(notice) = state.notice.clone()
-        && notice_bar(ui, p, &notice, true)
-    {
-        state.notice = None;
-    }
-
-    if save_field(ui, p, ed, &mut state) {
-        store(ui.ctx(), state);
-        return;
-    }
+    let naming = state.saving.is_some();
 
     // Updating in place is offered only for a brush that is actually yours: the
     // shipped library is read-only, and a button that says otherwise is a lie
@@ -975,12 +1000,24 @@ pub fn save_row(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let why_not = state.why_not().to_owned();
 
     ui.horizontal(|ui| {
+        // The row is `controls::text_button`'s own 22 points whatever is on it.
+        // `ui::BRUSH_EDITOR_FOOTER` reserves exactly what this row costs, and
+        // the note alone is only 13 — so without this the footer would lift 9
+        // points off the bottom of the dialog the moment the name field went
+        // up, which is the same wandering the dialog's fixed size exists to
+        // stop, made small enough to be mystifying.
+        ui.allocate_exact_size(vec2(0.0, 22.0), Sense::hover());
         controls::note(
             ui,
             p,
             "Changes here reach the brush in your hand straight away. \
              Saving is what keeps them.",
         );
+        if naming {
+            // The field above is already asking for the name; a button that
+            // arms it would be a second way to start what is started.
+            return;
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &existing {
             Some((id, name)) => {
                 if controls::text_button(ui, p, &format!("Update \"{name}\""), true, writable)
@@ -2783,34 +2820,42 @@ fn sized_link(
     response
 }
 
+/// A state the panel, the browser and the brush editor can all be drawn from
+/// without reading the user's own library off the machine the tests run on.
+///
+/// [`load`] returns whatever is already in the context, so seeding it is what
+/// keeps a test from depending on — or, where a pre-tips `brushes.ron` is
+/// sitting there, *migrating* — a brush directory belonging to whoever is
+/// running it. A broken store rather than an empty one, because there is no way
+/// to build a [`UserLibrary`] that is not a directory somewhere: what it costs
+/// is that everything which writes draws disabled, which is a state worth
+/// laying out anyway.
+///
+/// `query` is a string no preset matches, so a caller measuring the panel is
+/// measuring its furniture rather than this machine's brush collection.
+#[cfg(test)]
+pub(crate) fn seed_broken_library(ctx: &egui::Context, ed: &Editor, why: &str) {
+    store(
+        ctx,
+        State {
+            index: Arc::new(Index::build(&ed.presets, &[])),
+            store: Store::Broken(why.to_owned()),
+            query: "zzzz".to_owned(),
+            scope: Scope::All,
+            browser_open: false,
+            saving: None,
+            renaming: None,
+            confirming: None,
+            creating: None,
+            drag: None,
+            notice: None,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A state the panel can be drawn from without reading the user's own
-    /// library off this machine's disk.
-    ///
-    /// [`load`] returns whatever is already in the context, so seeding it is
-    /// what keeps these tests from depending on — or creating — a brush
-    /// directory belonging to whoever is running them.
-    fn seed(ctx: &egui::Context, ed: &Editor, why: &str) {
-        store(
-            ctx,
-            State {
-                index: Arc::new(Index::build(&ed.presets, &[])),
-                store: Store::Broken(why.to_owned()),
-                query: "zzzz".to_owned(),
-                scope: Scope::All,
-                browser_open: false,
-                saving: None,
-                renaming: None,
-                confirming: None,
-                creating: None,
-                drag: None,
-                notice: None,
-            },
-        );
-    }
 
     /// Nothing the Brushes panel offers sits below its list.
     ///
@@ -2850,7 +2895,7 @@ mod tests {
         // one is not the height it will settle at.
         let mut measured = 0.0;
         for _ in 0..2 {
-            seed(&ctx, &ed, "no library");
+            seed_broken_library(&ctx, &ed, "no library");
             let _ = ctx.run_ui(input.clone(), |ui| {
                 super::panel(ui, &palette, &mut ed);
                 measured = ui.min_rect().height();

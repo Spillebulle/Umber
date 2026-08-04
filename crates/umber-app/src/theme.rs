@@ -421,7 +421,25 @@ pub mod metrics {
     /// The brush editor dialog. Wider than the other modals because the design
     /// lays its Tip section out as two columns and its Dynamics section as a
     /// row of curve panels, and neither survives being narrowed.
-    pub const BRUSH_EDITOR_WIDTH: f32 = 560.0;
+    ///
+    /// A *fixed* size, for the reason [`BRUSH_LIBRARY`] is one and then some:
+    /// its six sections are different lengths — Inputs is a list of arbitrary
+    /// length and Tip is a fixed grid — so a dialog sized by its content was a
+    /// different dialog on every tab, and a modal is centred, so changing
+    /// height moves both of its edges and takes the tab strip out from under
+    /// the pointer that had just clicked it.
+    ///
+    /// The height is measured rather than chosen, off `brush_editor_preview`.
+    /// The dialog's own header, tab strip, footer and gaps take about 136,
+    /// leaving a body of 464; the tallest section that cannot grow is Scatter
+    /// at 444, so this clears it by twenty points. The shortest are Texture and
+    /// Blending at about 220, which leaves a good deal of the frame empty — and
+    /// that is the price of one size, paid deliberately, because the thing it
+    /// buys is a tab strip that stays where it was clicked. Inputs is the one
+    /// section with no ceiling: it is the shortest of the six until a brush has
+    /// a modulation on it and by far the tallest afterwards, and it scrolls
+    /// inside the frame rather than moving it. See `ui::brush_editor`.
+    pub const BRUSH_EDITOR: [f32; 2] = [560.0, 600.0];
     /// One dynamics curve panel, square.
     pub const CURVE_PANEL: f32 = 150.0;
     /// A dropdown trigger — [`crate::widgets::dropdown`], which is every
