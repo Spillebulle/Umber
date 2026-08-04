@@ -1806,6 +1806,217 @@ fn a_second_brush_with_a_different_tip_replaces_the_first() {
 }
 
 // ---------------------------------------------------------------------------
+// Coloured stamps
+// ---------------------------------------------------------------------------
+
+/// A two-texel stamp: red on the left, blue on the right, solid throughout.
+///
+/// Two colours rather than one, because a stamp that put down a single colour
+/// could be passing it through the *dab*'s colour rather than the tip's and
+/// nothing here would know. Sampled at x = 22 and x = 42, which is where
+/// `a_second_brush_with_a_different_tip_replaces_the_first` already establishes
+/// a 2x1 tip's halves land.
+fn two_colour_tip() -> TipMask {
+    TipMask::coloured(2, 1, vec![255, 255], vec![255, 0, 0, 0, 0, 255]).expect("tip")
+}
+
+#[test]
+fn a_coloured_stamp_puts_down_its_own_colour_and_not_the_palettes() {
+    // The whole feature in one assertion. The palette is green and the mark is
+    // red and blue, so a stamp whose colour never reached the scratch — the flag
+    // unset, the texture unbound, the un-premultiply wrong — comes out green.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(two_colour_tip()));
+    assert!(h.canvas.has_coloured_tip());
+    h.stamp_colored(&[dab(32.0, 32.0, 12.0, 1.0)], true);
+    h.commit(Color::from_srgb_u8(0, 255, 0, 255), 1.0, BrushMode::Paint);
+
+    // The tip's colour is straight sRGB and the layer stores sRGB, so a solid
+    // texel comes back as the byte that went in.
+    assert_near(h.pixel(22, 32), [255, 0, 0], 4, "the stamp's left half");
+    assert_near(h.pixel(42, 32), [0, 0, 255], 4, "the stamp's right half");
+}
+
+/// **The test a coloured stamp hangs on**, and the reason this feature could be
+/// built inside the existing pipelines at all.
+///
+/// `composite.wgsl` draws the stroke as a live preview and `commit.wgsl`
+/// replaces it at pointer-up, and the two must agree or the mark jumps under the
+/// artist's hand. Neither was touched for this: the stamp's colour goes into the
+/// same scratch a smudging brush writes, so both read it through the code they
+/// already shared. That is the claim, and this is what would catch it being
+/// false — a preview reading the palette where the commit read the stamp is a
+/// mark that turns a different colour on release.
+///
+/// Across the blended commits as well as Normal, because `fs_blend` is a second
+/// entry point that could have been given the colour differently.
+#[test]
+fn a_coloured_stamps_preview_and_its_commit_agree() {
+    let mut h = harness_or_skip!();
+
+    let under = [70u8, 160, 110, 255];
+    // Deliberately not the stamp's own colours, so a preview or a commit reading
+    // the wrong source of the two is a visible difference rather than a
+    // coincidence.
+    let palette = Color::from_srgb_u8(20, 20, 240, 255);
+
+    for blend in [BlendMode::Normal].into_iter().chain(BRUSH_BLENDS) {
+        reset(&mut h);
+        let rect = whole(&h);
+        h.write_block(0, rect, under);
+        h.set_tip(Some(two_colour_tip()));
+        h.stamp_colored(&[dab(32.0, 32.0, 16.0, 1.0)], true);
+
+        let stack = [layer(0, 1.0, BlendMode::Normal)];
+        let style = StrokeStyle {
+            color: palette,
+            opacity: 1.0,
+            mode: BrushMode::Paint,
+            blend,
+            per_dab_color: true,
+            on_mask: false,
+        };
+        // Both halves of the stamp, because a divergence could be in the
+        // un-premultiply and show up on one colour and not the other.
+        for x in [22, 42] {
+            let previewed = h.composite_pixel_with(&stack, style, x, 32);
+            h.commit_blended_to(0, palette, 1.0, BrushMode::Paint, blend);
+            let committed = h.composite_pixel(&stack, x, 32);
+            assert_near(
+                committed,
+                [previewed[0], previewed[1], previewed[2]],
+                2,
+                &format!("{blend:?} jumped at pointer-up under a coloured stamp at x={x}"),
+            );
+            // The commit consumed the scratch, so put it back for the second
+            // sample rather than measuring an empty one.
+            h.stamp_colored(&[dab(32.0, 32.0, 16.0, 1.0)], true);
+        }
+    }
+}
+
+#[test]
+fn a_tip_with_no_colour_is_the_exact_identity_on_the_colour_path() {
+    // The rule the whole shape of this rests on: a brush with no coloured stamp
+    // must pay nothing and change by nothing. `dab_rgb` returns `in.color`
+    // through a `select` when `use_tip_color` is zero, so a smudging stroke
+    // through a plain tip has to deposit precisely what it deposited before
+    // coloured stamps existed — and this compares against a stroke with no tip
+    // bound at all, at the centre where both are at full coverage.
+    let mut h = harness_or_skip!();
+
+    let picked = [0.85f32, 0.25, 0.55];
+
+    h.stamp_colored(&[coloured_dab(32.0, 32.0, 12.0, 1.0, picked)], true);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    let round = h.pixel(32, 32);
+
+    h.set_tip(Some(TipMask::new(2, 2, vec![255; 4]).expect("tip")));
+    assert!(!h.canvas.has_coloured_tip());
+    h.stamp_colored(&[coloured_dab(32.0, 32.0, 12.0, 1.0, picked)], true);
+    h.commit_to(1, Color::BLACK, 1.0, BrushMode::Paint);
+
+    assert_eq!(
+        h.pixel_in(1, 32, 32),
+        round,
+        "a tip with no colour moved what the dab deposited"
+    );
+}
+
+#[test]
+fn a_coloured_stamp_stops_being_one_when_the_tip_is_taken_off() {
+    // A stale `use_tip_color` would leave every later stroke reading a texture
+    // that has gone back to its 1x1 placeholder — which is not the palette
+    // colour, it is whatever that texture happens to hold. Tips are per stroke,
+    // so going back has to actually go back, exactly as `use_tip` does.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(two_colour_tip()));
+    assert!(h.canvas.has_coloured_tip());
+
+    h.set_tip(Some(TipMask::new(2, 1, vec![255, 255]).expect("tip")));
+    assert!(!h.canvas.has_coloured_tip());
+    h.stamp_colored(&[coloured_dab(32.0, 32.0, 12.0, 1.0, [0.0, 1.0, 0.0])], true);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+    assert_near(h.pixel(22, 32), [0, 255, 0], 4, "the stamp is still red");
+
+    h.set_tip(None);
+    assert!(!h.canvas.has_coloured_tip());
+}
+
+#[test]
+fn a_coloured_stamp_still_does_not_compound() {
+    // The wet-layer guarantee, through the third source of per-dab colour. The
+    // stamp modulates *coverage* exactly as a plain tip does and its colour
+    // rides in the second attachment, so a stroke crossing itself is no more
+    // opaque than one that does not — which is the thing that would break if the
+    // colour had been folded into the coverage instead.
+    let mut h = harness_or_skip!();
+
+    h.set_tip(Some(two_colour_tip()));
+    let d = dab(32.0, 32.0, 12.0, 0.5);
+    h.stamp_colored(&[d, d, d, d], true);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    let px = h.pixel(22, 32);
+    assert!(
+        px[3].abs_diff(128) <= 2,
+        "four half-coverage stamps compounded to {}",
+        px[3]
+    );
+    // And still the stamp's own red. Not compared against 255: the layer holds
+    // colour *premultiplied*, so half-covered red is stored as the sRGB encoding
+    // of a linear half — which is why the two channels that must be nothing are
+    // what this asserts on.
+    assert!(
+        px[0] > 150 && px[1] == 0 && px[2] == 0,
+        "the stamp's colour did not survive the overlap: {px:?}"
+    );
+}
+
+/// A stamp whose edge is soft has to keep the colour it was drawn in there too.
+///
+/// This is what the premultiply on upload is for. Filtering *straight* colour
+/// across the boundary of a stamp pulls in the colour of texels that are not
+/// there — the classic halo — so a red blot on a transparent field comes back
+/// with a dark rim. Premultiplied, the filtered colour and the filtered alpha
+/// agree, and the un-premultiply recovers red all the way out.
+#[test]
+fn a_soft_edged_colour_stamp_does_not_halo() {
+    let mut h = harness_or_skip!();
+
+    // A 4x1 stamp: solid red, then fading out. The colour is red everywhere,
+    // including the texels with no coverage — which is exactly the case a
+    // straight-alpha filter would let bleed in, if the colour there were the
+    // black `Vec::default` would have put in it.
+    let tip = TipMask::coloured(
+        4,
+        1,
+        vec![255, 255, 128, 0],
+        vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0],
+    )
+    .expect("tip");
+    h.set_tip(Some(tip));
+    h.stamp_colored(&[dab(32.0, 32.0, 16.0, 1.0)], true);
+    h.commit(Color::BLACK, 1.0, BrushMode::Paint);
+
+    // Walk out through the fade. Colour is only asserted where there is enough
+    // alpha for it to mean anything — below a level or two the stored byte moves
+    // by six for one level of alpha, which says nothing about this code.
+    for x in 26..38 {
+        let px = h.pixel(x, 32);
+        if px[3] < 40 {
+            continue;
+        }
+        assert!(
+            px[1] < 8 && px[2] < 8,
+            "the stamp haloed at x={x}: {px:?} is not red"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Paper grain
 // ---------------------------------------------------------------------------
 

@@ -1167,6 +1167,23 @@ impl Editor {
         } else {
             (self.color, self.brush.mode)
         };
+        // Whether the tip in hand stamps a colour of its own.
+        //
+        // It cannot be read off `Brush`, for `Brush::dab_has_angle`'s reason:
+        // `BrushPreset::tip` is a *name* and the editor is what resolves it. So
+        // the two halves of "does this stroke carry a colour per dab" are
+        // combined here, which is also the one place they are snapshotted.
+        //
+        // Refused where there is nowhere for a colour to land, at this one gate
+        // rather than at the preview and the commit separately — the rule the
+        // blend mode two lines below already follows. **An eraser** deposits no
+        // colour, and **a mask** holds coverage on one channel, so a stamp's
+        // reds and blues would become "reveal" and "hide". A coloured stamp used
+        // for either paints as the mask it also is, which is what those two
+        // tools mean by it, and costs no colour attachment at all.
+        let stamps_colour = mode == BrushMode::Paint
+            && !on_mask
+            && self.tip.as_ref().is_some_and(|tip| tip.is_coloured());
         // Snapshot the brush: the user can change colour, opacity or layer via
         // the panel mid-stroke, but the stroke must finish as it started.
         self.stroke_style = StrokeStyle {
@@ -1195,10 +1212,16 @@ impl Editor {
             // smudged.
             //
             // Colour pickup is no longer the only thing that colours a dab: a
-            // hue, saturation or brightness modulation does too. This must
-            // agree with `StrokeBuilder::is_coloured`, which is what decides
-            // which dab pipeline the frame uses.
-            per_dab_color: self.brush.colours_dabs(),
+            // hue, saturation or brightness modulation does too, and so does a
+            // **coloured stamp** — a tip whose texels carry colour rather than
+            // coverage alone. All three write the one colour scratch, which is
+            // per fragment already, so the third needed no attachment, no
+            // pipeline and no line of `composite.wgsl` or `commit.wgsl`.
+            //
+            // This is the field `app.rs` builds its `DabStyle` from, so the two
+            // cannot disagree about which pipeline the frame uses — the thing
+            // that must hold for every frame of a stroke.
+            per_dab_color: self.brush.colours_dabs() || stamps_colour,
             // Snapshotted with everything else, for the same reason: switching
             // the edit target mid-stroke must not send the second half of a
             // mark somewhere the first half did not go.

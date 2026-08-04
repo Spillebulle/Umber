@@ -175,6 +175,30 @@ impl TipMask {
         self.colour.as_deref()
     }
 
+    /// A coloured stamp as the GPU wants it: RGBA8, sRGB-encoded, **alpha
+    /// premultiplied in linear light**, with the coverage in the fourth byte.
+    ///
+    /// The same form `ImportedLayer::pixels` hands over and produced by the same
+    /// encoder, which is the point of it living here rather than in
+    /// `umber-render`: the conversion is arithmetic, it has an exact inverse
+    /// that other things depend on, and it is testable without a device.
+    ///
+    /// Why premultiplied at all, when the model holds the colour straight: this
+    /// is what a bilinear tap may be taken of. Filtering straight colour across
+    /// the edge of a stamp pulls in the colour of texels that are not there and
+    /// haloes it, and doing the multiply in sRGB rather than linear is the
+    /// classic second way to get the same halo.
+    pub fn colour_premultiplied(&self) -> Option<Vec<u8>> {
+        let colour = self.colour.as_ref()?;
+        let mut out = Vec::with_capacity(self.coverage.len() * 4);
+        for (px, &a) in colour.chunks_exact(3).zip(&self.coverage) {
+            out.extend_from_slice(&crate::docimport::srgb::encode_pixel([
+                px[0], px[1], px[2], a,
+            ]));
+        }
+        Some(out)
+    }
+
     /// Whether this tip stamps a colour of its own.
     ///
     /// **This is what puts a stroke on the per-dab colour path**, alongside
