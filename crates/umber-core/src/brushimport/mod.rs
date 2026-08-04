@@ -47,6 +47,14 @@ use crate::tip::TipMask;
 pub struct Imported {
     pub preset: BrushPreset,
     pub tip: Option<TipMask>,
+    /// The paper the brush paints through, where the format carries its own
+    /// picture and this reader could resolve it.
+    ///
+    /// Beside the tip and for the same reason — the preset stores a *name*, and
+    /// the name is not known until the library has somewhere to put the tile.
+    /// Only [`clipstudio`] produces one: the other formats either name a system
+    /// texture that is not in the file or have no paper at all.
+    pub paper: Option<TipMask>,
     /// What this *particular* brush lost on the way in.
     ///
     /// [`dropped_features`] answers the same question for a whole file, which
@@ -82,6 +90,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("mypaint", name, brush),
                 tip: None,
+                paper: None,
                 dropped: mypaint::unsupported_features(&text).unwrap_or_default(),
             }])
         }
@@ -100,6 +109,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("gbr", name, parameters),
                 tip: Some(tip),
+                paper: None,
                 dropped,
             }])
         }
@@ -138,6 +148,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset: preset_for("gih", name, parameters),
                         tip: Some(tip),
+                        paper: None,
                         dropped,
                     }
                 })
@@ -150,6 +161,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("vbr", name, decoded.brush),
                 tip: None,
+                paper: None,
                 dropped: vbr::dropped_features(&text),
             }])
         }
@@ -165,6 +177,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("kpp", name, decoded.brush),
                 tip: decoded.tip,
+                paper: None,
                 dropped,
             }])
         }
@@ -188,6 +201,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset,
                         tip: decoded.tip,
+                        paper: None,
                         dropped,
                     }
                 })
@@ -216,6 +230,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset: preset_for("abr", name, parameters),
                         tip: Some(tip),
+                        paper: None,
                         dropped: dropped.clone(),
                     }
                 })
@@ -255,6 +270,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset: preset_for("clipstudio", name, tool.brush),
                         tip: tool.tip,
+                        paper: tool.paper,
                         dropped,
                     }
                 })
@@ -271,6 +287,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                 .map(|preset| Imported {
                     preset,
                     tip: None,
+                    paper: None,
                     // An Umber library holds Umber brushes; there is nothing in
                     // it that Umber cannot render.
                     dropped: Vec::new(),
@@ -300,6 +317,7 @@ fn preset_for(source: &str, name: String, brush: Brush) -> BrushPreset {
         credit: None,
         brush,
         tip: None,
+        paper: None,
     }
 }
 
@@ -500,8 +518,13 @@ mod tests {
         let Imported {
             preset,
             tip,
+            paper,
             dropped,
         } = &found[0];
+        // A `.gbr` is a stamp and nothing else — there is no paper in the
+        // format at all, so this is the shape every reader but Clip Studio's
+        // has.
+        assert!(paper.is_none());
         // A plain 8-bit `.gbr` is exactly what Umber stamps, so nothing about
         // it is an approximation and the import has nothing to apologise for.
         assert!(dropped.is_empty(), "{dropped:?}");

@@ -89,12 +89,17 @@
 //!   is a size ramp over the first stretch of the mark, which is precisely what
 //!   [`DabInput::Stroke`] is. "Out" is measured back from an end the engine
 //!   does not know until the stroke is over.
-//! - **The paper texture becomes one of Umber's three.** Umber's grain is a
-//!   closed set (see [`GrainPattern`]), so the strength and the tile size carry
-//!   across and the picture does not. It is read only where the reference
-//!   actually names a material: grain multiplies coverage, so a stale
-//!   reference left behind by a texture that was switched off would be a brush
-//!   painting through paper it does not have.
+//! - **The paper texture arrives as a picture, into the user's texture
+//!   library.** It used to become one of Umber's three, on the reasoning that
+//!   the grain is a closed set — which it still is; what changed is that
+//!   [`crate::BrushPreset::paper`] can name a tile beside it. Substituting
+//!   inside the closed set was wrong because grain **multiplies coverage**:
+//!   `Tooth`'s mean is 0.775, so every textured brush arrived painting at about
+//!   78% of the opacity its author set, through pits nobody drew. A texture
+//!   this reader cannot resolve is now named as a loss and the brush paints
+//!   flat. It is read only where the reference actually names a material: a
+//!   stale reference left behind by a texture that was switched off would be a
+//!   brush painting through paper it does not have.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
 //!   have no engine behind them at all** and are named.
 //! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
@@ -106,7 +111,7 @@
 //! which `CLAUDE.md` holds to a different standard than the shipped library —
 //! a usable approximation that says what it lost beats a rejection.
 
-use crate::brush::{Brush, GrainPattern};
+use crate::brush::Brush;
 use crate::curve::ResponseCurve;
 use crate::dynamics::{DabInput, DabTarget, Modulation};
 use crate::preset::PresetError;
@@ -122,6 +127,11 @@ pub mod dropped {
     /// The tip is the material's thumbnail, not its full-resolution pixels.
     pub const THUMBNAIL_TIP: &str = "bitmap tips at their full resolution";
     pub const SEVERAL_TIPS: &str = "brushes that cycle through several tip images";
+    /// The material was named and its picture could not be turned into a tile.
+    /// The strength and the tile size are still the author's numbers, but the
+    /// paper itself is gone and the brush paints flat — the same answer
+    /// [`UNUSABLE_TIP`] gives for the analogous tip, and for the same reason:
+    /// a substituted paper is a grain nobody drew.
     pub const PAPER_TEXTURE: &str = "the paper texture's own picture";
     /// Umber has no tilt input on any platform it runs on, so a tilt mapping
     /// could only ever be evaluated at a value the pen never reports.
@@ -161,6 +171,9 @@ pub struct SubTool {
     pub name: String,
     pub brush: Brush,
     pub tip: Option<TipMask>,
+    /// The paper this sub-tool paints through, where the texture material was
+    /// in the file. See [`crate::brushimport::Imported::paper`].
+    pub paper: Option<TipMask>,
     /// What this particular sub-tool lost.
     pub dropped: Vec<&'static str>,
 }
@@ -217,12 +230,13 @@ pub fn from_sut(bytes: &[u8]) -> Result<SutFile, PresetError> {
         }
 
         let name = node_name(&node_table, node);
-        let (brush, tip, dropped) = convert(&settings, &materials);
+        let converted = convert(&settings, &materials);
         file.tools.push(SubTool {
             name,
-            brush,
-            tip,
-            dropped,
+            brush: converted.brush,
+            tip: converted.tip,
+            paper: converted.paper,
+            dropped: converted.dropped,
         });
     }
 
@@ -768,6 +782,49 @@ fn tar_member(archive: &[u8], wanted: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Decode a material's thumbnail to straight-alpha, sRGB RGBA8.
+///
+/// Split out from the two readings above it so that a tip and a paper come out
+/// of one decoder: the material is the same PNG either way, and what differs is
+/// only what its texels are taken to *mean*.
+fn thumbnail_rgba(png_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    // Expands a palette or a low bit depth, and 16-bit down to 8, and adds the
+    // alpha channel every reading below wants, so one shape covers all five
+    // colour types.
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buffer).ok()?;
+
+    let texels = (info.width as usize).checked_mul(info.height as usize)?;
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buffer[..texels * 4].to_vec(),
+        png::ColorType::GrayscaleAlpha => buffer[..texels * 2]
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        // `Transformations::ALPHA` gives every other type one, so these are
+        // unreachable rather than approximated — and a shape that guessed at
+        // an alpha would be the silent kind of wrong.
+        _ => return None,
+    };
+    Some((info.width, info.height, rgba))
+}
+
+/// Turn a material's thumbnail into a paper tile.
+///
+/// [`crate::tip::grain_of`]'s rule, not a second statement of it: brightness,
+/// with transparency composited over white. That matters more than it looks —
+/// the tip reading immediately below is very nearly its negative, and a paper
+/// read as ink bites exactly where its author drew a peak.
+fn paper_from_thumbnail(png_bytes: &[u8]) -> Option<TipMask> {
+    let (width, height, rgba) = thumbnail_rgba(png_bytes)?;
+    TipMask::new(width, height, crate::tip::grain_of(&rgba)).ok()
+}
+
 /// Turn a material's thumbnail into a coverage mask.
 ///
 /// Coverage is `alpha * (1 - luminance)`, which is what "how much ink is here"
@@ -825,6 +882,13 @@ fn tip_for(reference: &[u8], materials: &Materials) -> Option<TipMask> {
     mask_from_thumbnail(&png_bytes)
 }
 
+/// The paper tile a material reference resolves to, if there is one.
+fn paper_for(reference: &[u8], materials: &Materials) -> Option<TipMask> {
+    let archive = materials.resolve(reference)?;
+    let png_bytes = tar_member(archive, "thumbnail/thumbnail.png")?;
+    paper_from_thumbnail(&png_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Conversion
 // ---------------------------------------------------------------------------
@@ -878,10 +942,20 @@ const SPEED_TARGETS: [(&str, DabTarget); 3] = [
 /// start of a mark; a ramp that wrapped would be a row of tapers.
 const NEVER_WRAP: f32 = 10.0;
 
-fn convert(
-    settings: &Settings,
-    materials: &Materials,
-) -> (Brush, Option<TipMask>, Vec<&'static str>) {
+/// What [`convert`] made of one sub-tool's settings.
+///
+/// A struct rather than the tuple this used to be, because it now carries two
+/// `Option<TipMask>`s side by side: a caller can hand a tuple's pair over the
+/// wrong way round and the compiler will not say a word, and a paper stamped as
+/// a tip is a brush shaped like a sheet of paper.
+struct Converted {
+    brush: Brush,
+    tip: Option<TipMask>,
+    paper: Option<TipMask>,
+    dropped: Vec<&'static str>,
+}
+
+fn convert(settings: &Settings, materials: &Materials) -> Converted {
     let mut dropped = Vec::new();
     let default = Brush::default();
 
@@ -1119,7 +1193,8 @@ fn convert(
     if texture.is_some_and(|r| reference_path(r).is_none()) {
         push_once(&mut dropped, dropped::UNREADABLE_TEXTURE);
     }
-    if texture.is_some_and(|r| reference_path(r).is_some()) {
+    let mut paper = None;
+    if let Some(reference) = texture.filter(|r| reference_path(r).is_some()) {
         brush.grain = settings
             .percent("TextureDensity")
             .unwrap_or(0.0)
@@ -1127,10 +1202,20 @@ fn convert(
         let scale = settings.real("TextureScale2").unwrap_or(100.0) as f32 / 100.0;
         brush.grain_scale = (GRAIN_TILE_AT_FULL_SCALE * scale)
             .clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
-        // Umber's papers are a closed set, so the strength and the tile size
-        // come across and the picture does not.
-        brush.grain_pattern = GrainPattern::Tooth;
-        if brush.has_grain() {
+        // The paper's own picture, where the material is in the file. It goes
+        // into the user's texture library and the preset names it — see
+        // `BrushPreset::paper`.
+        //
+        // This used to be `GrainPattern::Tooth` at whatever strength the file
+        // asked for, on the reasoning that Umber's papers were a closed set. It
+        // still is one, and substituting inside it was the wrong answer: grain
+        // **multiplies coverage**, and Tooth's mean is 0.775, so every textured
+        // brush arrived painting at about 78% of the opacity its author set —
+        // through pits in places that author never drew. A paper Umber cannot
+        // resolve now paints flat rather than through a stranger's tile, which
+        // is the honest half of the same rule.
+        paper = paper_for(reference, materials);
+        if paper.is_none() && brush.has_grain() {
             push_once(&mut dropped, dropped::PAPER_TEXTURE);
         }
     }
@@ -1224,7 +1309,12 @@ fn convert(
         push_once(&mut dropped, dropped::COLOUR_JITTER);
     }
 
-    (brush, tip, dropped)
+    Converted {
+        brush,
+        tip,
+        paper,
+        dropped,
+    }
 }
 
 /// A response with a floor under it: the curve rescaled into `floor..=1`.
@@ -2570,10 +2660,12 @@ mod tests {
         assert!(tool.dropped.contains(&dropped::SEVERAL_TIPS));
     }
 
-    /// Umber's grain is a closed set of three papers, so the strength and the
-    /// tile size come across and the picture does not.
+    /// The strength, the tile size **and the picture** now come across. The
+    /// last of those is why `dropped::PAPER_TEXTURE` no longer appears: the
+    /// brush is painting through its author's paper rather than through one of
+    /// Umber's three, which is what it was apologising for.
     #[test]
-    fn a_paper_texture_becomes_strength_and_a_tile_size() {
+    fn a_paper_texture_brings_its_own_picture() {
         let path = ".:paper:data:material_0.layer";
         let bytes = sut(
             &[(
@@ -2589,6 +2681,38 @@ mod tests {
         assert!((tool.brush.grain - 0.8).abs() < 1e-6);
         assert!((tool.brush.grain_scale - 64.0).abs() < 1e-4);
         assert!(tool.brush.has_grain());
+        assert!(!tool.dropped.contains(&dropped::PAPER_TEXTURE));
+
+        // Brightness, not ink: a mid-grey paper keeps about half the dab.
+        // Read the other way round this tile would keep the other half, which
+        // on a real paper is every pit where the author drew a peak.
+        let paper = tool.paper.as_ref().expect("the picture came with it");
+        assert_eq!((paper.width(), paper.height()), (8, 8));
+        assert!(
+            (paper.at(4, 4) as i32 - 128).abs() <= 2,
+            "got {}",
+            paper.at(4, 4)
+        );
+    }
+
+    /// A texture the reader cannot resolve is still named as a loss, and the
+    /// brush paints flat rather than through a paper nobody chose. This is the
+    /// half of the old behaviour that was right.
+    #[test]
+    fn a_paper_the_reader_cannot_resolve_is_named_and_paints_flat() {
+        let path = ".:paper:data:material_0.layer";
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 80),
+            )],
+            // Clip Studio leaves an installed material out of the file.
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.paper.is_none());
         assert!(tool.dropped.contains(&dropped::PAPER_TEXTURE));
     }
 

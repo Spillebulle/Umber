@@ -509,7 +509,13 @@ impl Seams {
 pub fn seams(tile: &TipMask) -> Seams {
     let (w, h) = (tile.width(), tile.height());
     let step = |a: u8, b: u8| a.abs_diff(b) as f32;
-    let mean = |total: f32, count: u32| if count == 0 { 0.0 } else { total / count as f32 };
+    let mean = |total: f32, count: u32| {
+        if count == 0 {
+            0.0
+        } else {
+            total / count as f32
+        }
+    };
 
     let mut inside_x = 0.0;
     let mut inside_x_n = 0;
