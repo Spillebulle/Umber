@@ -980,8 +980,8 @@ a loss — the same argument the automatic dab interval gets below.
 What else carries: hardness, opacity, stabilisation (`FlickerReduction`), the
 dab's flatness (`BrushThickness`, as `1 / thickness`, since `Brush::size` names
 the long axis either way) and its angle, the fixed dab interval, the spray as
-scatter, the paper's strength and tile size, and the underlying-colour mixing as
-one smudge amount. Clip Studio splits mixing into how much paint the brush
+scatter, the paper's strength, tile size **and its own picture**, and the
+underlying-colour mixing as one smudge amount. Clip Studio splits mixing into how much paint the brush
 carries and how dense it is, so the stronger of "carries none" and "is dense" is
 what survives — which puts a pure blender at 1.0 and an oil brush at its density,
 and says it approximated either way.
@@ -1001,6 +1001,19 @@ reference holding no materials is a texture that was never set and there is
 nothing to report, while one naming a material this reader cannot resolve is a
 paper the brush genuinely has, and it is named rather than passed over, which is
 the answer `UNUSABLE_TIP` already gives for the analogous tip.
+
+**And the paper's own picture comes across**, into the user's texture library,
+with the preset naming it — see "A paper of your own". It used to become
+`GrainPattern::Tooth` at whatever strength the file asked for, on the reasoning
+that Umber's papers were a closed set. They still are; what changed is that
+`BrushPreset::paper` can name a tile beside them, and substituting inside the
+closed set was wrong for the reason above turned round: `Tooth`'s mean is 0.775,
+so every textured brush arrived painting at about 78% of the opacity its author
+set, through pits nobody drew. A material this reader cannot resolve now paints
+flat and says so. The picture is taken only where the grain actually bites,
+which is the threshold the renderer binds a tile at — a strength left in the
+file at zero is a setting that was switched off, and a tile stored for it is a
+file per sub-tool that nothing samples.
 
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
@@ -1195,6 +1208,42 @@ Three papers ship, generated rather than photographed.
 closed enum rather than a name because `Brush` is `Copy` — the same constraint
 that makes `ResponseCurve` a fixed array of samples.
 
+### A paper of your own
+
+`BrushPreset::paper` names a tile in the user library's `papers/` directory,
+exactly as `BrushPreset::tip` names one in `tips/`, and it overrides the enum
+where it is set. The enum stays closed: a `Custom(String)` arm would end
+`Brush: Copy` and would have to be carried through every `Brush` a preview, a
+stroke snapshot and an undo entry copies. `Editor::paper_tile` is the one place
+a name becomes a tile — the user's library first, then the shipped table, which
+is `Editor::apply_preset`'s order for the tip.
+
+- **A name that resolves to nothing paints flat**, and does *not* fall back to
+  one of the three. Substituting a paper the author did not choose is the bug
+  the Clip Studio importer used to have: grain multiplies coverage and `Tooth`'s
+  mean is 0.775, so every textured brush arrived painting at about 78% of the
+  opacity it was set to, through pits nobody drew. That is also why a texture
+  the importer cannot resolve is still named as a loss.
+- **A picture read as paper is read as its *brightness*, with transparency
+  composited over white** — `tip::grain_of`. There is nothing to guess, unlike a
+  tip: the tile multiplies coverage, so the value at a texel already means how
+  much of the dab that texel keeps. It is very nearly the negative of
+  `coverage_of`'s ink reading, and it has to be — ink is where the paint goes,
+  grain is where the paint stays.
+- **Whether a tile joins to itself is measured and reported, not enforced.**
+  `tip::seams` compares the step across each edge against the steps inside the
+  tile; a paper that fails draws a hard line every `grain_scale` pixels across
+  the whole canvas. Textures authored for a painting application are usually
+  made to tile, so refusing one would turn away most of what people have, and
+  mirroring it into place swaps a seam for an axis of symmetry through every
+  stroke — a different artefact rather than none. So it is said out loud, at the
+  import and on the row, and the preview draws the tile **two by two** so the
+  join is visible at all.
+- **A tile is written once and shared.** `UserLibrary::store_paper` reuses a
+  paper equal to one already held, where `store_tip` does not: a Clip Studio
+  texture material is referenced by every sub-tool in a file that uses it, so a
+  group of fifteen brushes over one paper is one picture rather than fifteen.
+
 ## Tips in the shipped library
 
 `BrushPreset::tip` used to resolve against the *user's* library only, so nothing
@@ -1266,8 +1315,6 @@ per pack. See `docs/brush-sources.md`.
   full — and `angular`, the one rule that is not a shuffle, would be better
   served by a single stroke-following cell than by an array. Until then a pipe
   arrives as one preset per cell and says which rule it lost.
-- **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
-  and reading a fourth off disk needs a variant that names a file.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
   miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
   ellipticity is thrown per dab draws its row as though it were not. Fixing it
@@ -1290,8 +1337,10 @@ per pack. See `docs/brush-sources.md`.
   the 116 presets in the fetched Krita packs.
 - **Krita's masking brush, mirrored dabs and impasto**, and its brush-tip
   randomness and density. All are reported when a preset asks for one. Its
-  paper texture is a near miss: Umber has a grain channel now, but it takes one
-  of three shipped papers rather than the bitmap the preset names.
+  paper texture is a near miss and a narrower one than it was: Umber can now
+  hold a bitmap paper of its own, and what a `.kpp` names is a pattern resource
+  in a bundle beside it — so this is a resolution problem rather than a missing
+  engine feature, of the shape `.kpp`'s tips already solved.
 - **Photoshop's brush descriptors.** A `.abr` brings its stamps; its spacing,
   angle, roundness and scatter are in a nested binary descriptor section that
   would be a second format inside the first.
@@ -1307,7 +1356,7 @@ a name for the thing:
 | Dynamics | pressure source, and pressure → size / opacity / hardness with their curves and floors |
 | Inputs | the modulation table — target, input, both ends of its range and its curve — plus the stroke ramp and hold |
 | Scatter | scatter, size jitter, angle jitter, speed lead, pressure → scatter |
-| Texture | build-up, paper strength, which paper, tile size |
+| Texture | build-up, paper strength, which paper — the shipped three or one of yours — and tile size |
 | Blending | blend mode, colour pickup, smear length, pickup radius |
 
 That is every field of `Brush` except `mode`, which is the tool choice (Brush
