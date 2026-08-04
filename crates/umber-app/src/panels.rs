@@ -2095,12 +2095,29 @@ fn module_library(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             );
             ui.add_space(10.0);
 
-            for kind in PanelKind::ALL {
-                if module_card(ui, p, ed, kind) {
-                    picked = Some(kind);
-                }
-                ui.add_space(6.0);
-            }
+            // **Scrolled, and bounded by the window rather than by the cards.**
+            // A card is about 84 points and the list is one per module, so the
+            // modal's height is a function of how many modules exist — which
+            // means adding one is a change to whether the dialog fits on
+            // somebody's screen. It was already close with six at a raised
+            // interface scale, and the *last* card is the Add button of the
+            // module somebody came here for.
+            //
+            // This is not the nested scrolling the settings dialog refuses:
+            // there is no scroll area above it, so the wheel still means one
+            // thing. Two thirds of the window, so it is plainly a list with
+            // more below rather than a dialog that happens to be cut off.
+            egui::ScrollArea::vertical()
+                .max_height(ui.ctx().viewport_rect().height() * 0.66)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for kind in PanelKind::ALL {
+                        if module_card(ui, p, ed, kind) {
+                            picked = Some(kind);
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
         });
 
     if response.should_close() {
