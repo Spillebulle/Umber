@@ -1928,7 +1928,11 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// bitmap is not rotationally symmetric. [`Brush::dab_has_angle`] can only
 /// answer the first half — `BrushPreset::tip` is a name the editor resolves —
 /// so the two are combined here rather than in the engine.
-fn has_angle(ed: &Editor) -> bool {
+///
+/// `pub(crate)` because the Brush tweaks module asks the same question about
+/// the same rail. A second copy of the OR would be two readings that can
+/// disagree — a rail live in one panel and dead in the other.
+pub(crate) fn has_angle(ed: &Editor) -> bool {
     ed.brush.dab_has_angle() || ed.tip.is_some()
 }
 

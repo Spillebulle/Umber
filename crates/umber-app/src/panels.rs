@@ -492,6 +492,7 @@ pub(crate) fn panel(
                     PanelKind::Colour => colour_body(ui, p, ed),
                     PanelKind::Palette => palettelib::panel(ui, p, ed),
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
+                    PanelKind::Tweaks => crate::tweaks::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
                     PanelKind::History => history_body(ui, p, ed, actions),
                 });
@@ -2304,6 +2305,11 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
                 bar(y, 20.0, 20.0 + 26.0 - k as f32 * 5.0, ink);
             }
         }
+        // Rails with a grab handle beside each, which is what the module is.
+        // Drawn by the module itself rather than here, because the schematic
+        // belongs to the thing it is a picture of and this match is
+        // everybody's.
+        PanelKind::Tweaks => crate::tweaks::preview(painter, p, body),
         // A stack, with a thumbnail on every row and one of them selected.
         PanelKind::Layers => {
             for k in 0..3 {

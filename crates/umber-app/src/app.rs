@@ -1488,13 +1488,30 @@ impl UmberApp {
             Action::PanTool => self.pick_tool(Tool::Pan),
             Action::ZoomTool => self.pick_tool(Tool::Zoom),
             Action::SwapColours => self.editor.swap_colors(),
-            Action::SizeDown => {
-                self.editor.brush.size =
-                    (self.editor.brush.size / 1.15).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE);
-            }
-            Action::SizeUp => {
-                self.editor.brush.size =
-                    (self.editor.brush.size * 1.15).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE);
+            // Every temporary brush change goes through one table, so the
+            // shortcut, the Brush tweaks rail and its hold-grip cannot
+            // disagree about what "a bit more" is worth — see `tweaks`. The
+            // two size arms used to spell 1.15 here; that figure is now what
+            // `STEP_PX` of the drag comes to, which is where it came from.
+            Action::SizeDown
+            | Action::SizeUp
+            | Action::OpacityDown
+            | Action::OpacityUp
+            | Action::HardnessDown
+            | Action::HardnessUp
+            | Action::SpacingDown
+            | Action::SpacingUp
+            | Action::RoundnessDown
+            | Action::RoundnessUp
+            | Action::AirbrushDown
+            | Action::AirbrushUp
+            | Action::AngleDown
+            | Action::AngleUp
+            | Action::PickupDown
+            | Action::PickupUp => {
+                if let Some((tweak, steps)) = crate::tweaks::of_action(action) {
+                    tweak.nudge(&mut self.editor.brush, steps);
+                }
             }
             Action::FitView => self.editor.fit_view(),
             Action::ActualSize => self.editor.camera.zoom = 1.0,

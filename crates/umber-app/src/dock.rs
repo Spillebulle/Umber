@@ -115,16 +115,18 @@ pub enum PanelKind {
     Colour,
     Palette,
     Brushes,
+    Tweaks,
     Layers,
     History,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 6] = [
+    pub const ALL: [PanelKind; 7] = [
         Self::Tools,
         Self::Colour,
         Self::Palette,
         Self::Brushes,
+        Self::Tweaks,
         Self::Layers,
         Self::History,
     ];
@@ -154,6 +156,7 @@ impl PanelKind {
             Self::Colour => "Colour",
             Self::Palette => "Palette",
             Self::Brushes => "Brushes",
+            Self::Tweaks => "Brush tweaks",
             Self::Layers => "Layers",
             Self::History => "History",
         }
@@ -184,6 +187,10 @@ impl PanelKind {
                 "The brushes in reach, and the way in to the whole library and \
                  to importing more."
             }
+            Self::Tweaks => {
+                "Hardness, spacing, roundness and three more, for the brush in \
+                 hand — changed without changing the brush you saved."
+            }
             Self::Layers => "The layer stack: order, visibility, opacity and blend mode.",
             Self::History => {
                 "Every stroke on this document, and a click to go back to any \
@@ -200,6 +207,7 @@ impl PanelKind {
             Self::Colour => "colour",
             Self::Palette => "palette",
             Self::Brushes => "brushes",
+            Self::Tweaks => "tweaks",
             Self::Layers => "layers",
             Self::History => "history",
         }
@@ -219,6 +227,9 @@ impl PanelKind {
             // a shortlist of brushes wants.
             Self::Palette => 1.3,
             Self::Brushes => 1.3,
+            // Six rails and a caption. Taller than a shortlist of brushes,
+            // shorter than a stack that grows.
+            Self::Tweaks => 1.8,
             Self::Layers => 2.2,
             Self::History => 2.0,
         }
