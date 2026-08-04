@@ -168,9 +168,9 @@ Three things the table says that are worth reading twice.
   "Bitmap tips stored outside the file" is a `.kpp` naming a predefined brush
   that is in no pack Umber fetched — nothing in Umber can supply what is not in
   the download.
-- **The `.gih` row is 257 brushes and 252 of them are rubberduck's**, whose
-  masks do not ship anyway. A dab pass that could rotate through an array of
-  tips would therefore add 5 brushes to the library and 252 to what an
+- **The `.gih` row's 257 are 252 of rubberduck's and five others**, and
+  rubberduck's masks do not ship anyway. A dab pass that could rotate through an
+  array of tips would therefore add 5 brushes to the library and 252 to what an
   *import* reproduces faithfully. Both are worth having and they are not the
   same claim.
 - **`umber-core::dynamics` exists and `kpp.rs` does not use it.** That row is a
@@ -191,12 +191,13 @@ Three things the table says that are worth reading twice.
 
 #### The two things that would unlock the most
 
-Ranked by brushes gained for work done, and both are reader work rather than
-engine work.
+Ranked by brushes gained for work done. The first is engine work and the second
+is not, which is most of why the second is worth doing first.
 
-1. **A `.gih` pipe chosen per dab.** 257 brushes, more than every other reason
-   put together. It needs the dab pass to hold an array of tips and an index per
-   instance — engine work, and the only entry here that is. 252 of the 257 are
+1. **A `.gih` pipe chosen per dab.** 257 brushes refused for this and nothing
+   else, more than every other reason put together. It needs the dab pass to
+   hold an array of tips and an index per instance — engine work, and the only
+   entry here that is. 252 of the 257 are
    rubberduck's, whose masks do not ship, so the *library* gains 5 and an
    import gains 252 faithful stamps. Both are real and they are not the same
    number.
