@@ -389,8 +389,8 @@ pub fn from_kpp_in(bytes: &[u8], beside: &Sidecar<'_>) -> Result<KppPreset, Pres
         return Err(PresetError::Malformed(
             None,
             format!(
-                "`{paintop}` is one of Krita's other painting engines, not a brush setting — \
-                 Umber has no equivalent to approximate it with"
+                "`{paintop}` is one of Krita's other painting engines rather than a brush \
+                 setting, and Umber has no equivalent to approximate it with"
             ),
         ));
     }

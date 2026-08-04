@@ -140,7 +140,7 @@ impl fmt::Display for PaletteError {
         match self {
             Self::NotAPalette(path) => write!(
                 f,
-                "{} is not a GIMP palette — the first line has to be “{GPL_HEADER}”",
+                "{} is not a GIMP palette. The first line has to be “{GPL_HEADER}”.",
                 path.display()
             ),
             Self::TooManySwatches { path, found, max } => write!(

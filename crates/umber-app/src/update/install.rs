@@ -153,15 +153,15 @@ impl InstallKind {
             Self::Managed(m) => Some(match m.command() {
                 Some(command) => format!(
                     "This copy was installed by {}, which keeps its own record of \
-                     every file it owns. Umber will not write over that — the next \
-                     system upgrade would put the old version back. Update it with:\
-                     \n\n    {command}",
+                     every file it owns. Umber will not write over that: the next \
+                     system upgrade would put the old version back.\n\nUpdate it \
+                     with:\n\n    {command}",
                     m.label(),
                 ),
                 None => format!(
                     "This copy was installed by {}, which keeps its own record of \
-                     every file it owns. Umber will not write over that — the next \
-                     system upgrade would put the old version back. Update it \
+                     every file it owns. Umber will not write over that: the next \
+                     system upgrade would put the old version back.\n\nUpdate it \
                      through your package manager, or take the new package from \
                      the releases page.",
                     m.label(),

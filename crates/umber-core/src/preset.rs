@@ -715,6 +715,34 @@ impl UserLibrary {
             .map(|dirs| dirs.data_dir().join(Self::DIR_NAME))
     }
 
+    /// A library with nothing in it, at a directory nothing has looked at.
+    ///
+    /// No filesystem read, so it cannot fail and cannot be influenced by what
+    /// happens to be on the disk. That is the whole point of it: `docshot`
+    /// stages one in front of the Brushes panel so a committed picture carries
+    /// Umber's own presets and not the contributor's, and reaching that through
+    /// [`Self::load_from`] on a path chosen to be absent was a guarantee about
+    /// a world-writable directory rather than a property of the code — a stray
+    /// `<dir>.ron` beside it is a *migration*, which reads it and then writes
+    /// the whole thing out.
+    ///
+    /// `dir` is only ever the directory a later [`Self::save`] would write to,
+    /// and nothing here creates it.
+    pub fn empty(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            presets: Vec::new(),
+            collections: BTreeMap::new(),
+            made_collections: Vec::new(),
+            tips: BTreeMap::new(),
+            papers: BTreeMap::new(),
+            kept_tips: Vec::new(),
+            kept_papers: Vec::new(),
+            migrated: false,
+            warnings: Vec::new(),
+        }
+    }
+
     /// Load the user's library from the default location.
     ///
     /// A missing directory is an empty library, not an error — that is the

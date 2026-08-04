@@ -499,7 +499,18 @@ pub enum ImportWarning {
     },
     /// Umber has nothing like the source mode; the layer is Normal.
     BlendDropped { layer: String, source: String },
-    /// A layer group became plain layers.
+    /// A layer group lost its grouping.
+    ///
+    /// Raised from three places that lose it three different ways: a `.kra` and
+    /// a `.psd` group become plain layers at the top level, while an ORA group
+    /// nested deeper than [`LayerStack::MAX_DEPTH`](crate::LayerStack::MAX_DEPTH)
+    /// is merged into the folder outside it. So the sentence names the loss —
+    /// the grouping — and deliberately says nothing about where the layers
+    /// ended up or that they all arrived. It used to claim "Umber has no layer
+    /// groups", which folders made false; a draft after that claimed the layers
+    /// were all there, which is not this warning's to promise. A child Umber
+    /// cannot rasterise raises its own [`Self::LayerSkipped`] beside this one,
+    /// and the two must not contradict each other.
     GroupFlattened { group: String },
     /// A group's own opacity was folded into its children, which is only the
     /// same picture when they do not overlap.
@@ -552,7 +563,7 @@ impl fmt::Display for ImportWarning {
             Self::GroupFlattened { group } => {
                 write!(
                     f,
-                    "Group “{group}” was flattened — Umber has no layer groups."
+                    "Group “{group}” was flattened, so its layers are no longer grouped together."
                 )
             }
             Self::GroupOpacityFolded { group } => write!(
@@ -561,7 +572,7 @@ impl fmt::Display for ImportWarning {
             ),
             Self::MaskIgnored { layer } => write!(
                 f,
-                "Layer “{layer}” has a mask, which was ignored — the layer covers more than it did."
+                "Layer “{layer}” has a mask, which was ignored. The layer covers more than it did."
             ),
             Self::MaskUnsupported { layer, what } => {
                 write!(f, "Layer “{layer}”: {what} was not imported.")

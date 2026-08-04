@@ -231,7 +231,7 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     } else if !state.writable() {
         state.why_not().to_owned()
     } else if state.current().is_none() {
-        "Make a palette first — the grid mark opens the library".to_owned()
+        "Make a palette first. The grid mark opens the library.".to_owned()
     } else {
         format!(
             "This palette already holds {} colours",
@@ -246,7 +246,7 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         p,
         Icon::Grid,
         true,
-        "Palettes — make, import and manage them",
+        "Palettes: make, import and manage them",
     ) {
         state.library_open = true;
     }
@@ -478,7 +478,7 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
             let name = if swatch.name.trim().is_empty() {
                 swatch.hex()
             } else {
-                format!("{} — {}", swatch.name, swatch.hex())
+                format!("{} · {}", swatch.name, swatch.hex())
             };
             if remove.on_hover_text("Remove this colour").clicked() {
                 act = Some(Act::Remove(index));
@@ -500,7 +500,7 @@ fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
         ui,
         p,
         "No palettes yet. Make one and it fills with the colours you save into \
-         it, or bring one in — Umber reads and writes GIMP's .gpl, which GIMP, \
+         it, or bring one in. Umber reads and writes GIMP's .gpl, which GIMP, \
          Krita, Inkscape and Aseprite all read.",
     );
     ui.add_space(8.0);
@@ -713,8 +713,8 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
             controls::note(
                 ui,
                 p,
-                "Every palette is one .gpl file in a folder of its own, which \
-                 is the format GIMP, Krita, Inkscape and Aseprite all read — so \
+                "Every palette is one .gpl file in a folder of its own. That is \
+                 the format GIMP, Krita, Inkscape and Aseprite all read, so \
                  importing is bringing a file in and exporting is taking one \
                  out.",
             );
@@ -992,7 +992,7 @@ fn library_row(
                     if confirming {
                         if controls::text_button(ui, p, "Delete", true, true)
                             .on_hover_text(
-                                "This cannot be undone — the history covers painting only",
+                                "This cannot be undone. The history covers painting only.",
                             )
                             .clicked()
                         {

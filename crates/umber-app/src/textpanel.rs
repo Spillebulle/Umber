@@ -119,6 +119,19 @@ impl Fonts {
         &self.library
     }
 
+    /// Hold the library at the built-in face, so [`Self::start`] never scans.
+    ///
+    /// For `docshot`, and the reason `brushlib::stage_library` exists: the shot
+    /// is committed, and a picture whose face count is the number of fonts
+    /// installed on a contributor's machine is a picture of that machine. The
+    /// scan lands on a *later* frame and `docshot` draws one, so the count was
+    /// already the built-in's own nine styles — but that is a race won rather
+    /// than a guarantee, and this makes it the second. It also stops the tool
+    /// spawning a several-hundred-file thread it has no use for.
+    pub fn hold_at_builtin(&mut self) {
+        self.started = true;
+    }
+
     pub fn scanning(&self) -> bool {
         self.pending.is_some()
     }
@@ -756,7 +769,7 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             ui,
             p,
             &format!(
-                "This face has no glyph for {list}{more} — they are left blank \
+                "This face has no glyph for {list}{more}. They are left blank \
                  rather than drawn as a box. Choose another font, or remove them."
             ),
         );
@@ -828,7 +841,7 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let tooltip = if locked {
         "The layer is locked. Unlock it in the Layers panel, or select another."
     } else if folder {
-        "A folder is selected. A folder holds no pixels — select a layer."
+        "A folder is selected. A folder holds no pixels, so select a layer."
     } else if empty {
         "Type something first."
     } else {
@@ -848,7 +861,7 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     controls::note(
         ui,
         p,
-        "Text is painted into the layer when it is put down — it is pixels \
+        "Text is painted into the layer when it is put down. It is pixels \
          afterwards, not something that can be re-typed.",
     );
 }

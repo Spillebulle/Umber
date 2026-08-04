@@ -533,8 +533,8 @@ fn unsigned_footnote(ui: &mut egui::Ui, p: &Palette) {
         egui::Label::new(
             egui::RichText::new(
                 "Umber does not sign its releases. The download is fetched over \
-                 HTTPS from an address GitHub's API gave, and checked against the \
-                 size GitHub reports — which is not the same as a signature.",
+                 HTTPS from an address GitHub's API gave, and checked against \
+                 the size GitHub reports. That is not the same as a signature.",
             )
             .size(9.5)
             .color(p.text_dim.gamma_multiply(0.85))

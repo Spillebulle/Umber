@@ -66,8 +66,8 @@ fn first_run_notice(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 p,
                 "When Umber starts, it asks GitHub which release is newest and \
                  tells you if there is one. The request carries nothing about you \
-                 or your work — no document, no identifier, not even a count of \
-                 how often you run it.",
+                 or your work. No document, no identifier, not even a count \
+                 of how often you run it.",
             );
             ui.add_space(8.0);
             body(
@@ -221,7 +221,7 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     // An update already under way outranks whatever the check last said: it is
     // the newer fact, and the dialog carrying it is on top of this one anyway.
     if let Some(stage) = working {
-        note(ui, p, &format!("An update is in progress — {stage}."));
+        note(ui, p, &format!("An update is in progress: {stage}."));
         return;
     }
 

@@ -266,6 +266,35 @@ fn store(ctx: &egui::Context, state: State) {
     ctx.data_mut(|d| d.insert_temp(state_id(), state));
 }
 
+/// Put a library in front of [`load`], so its first frame reads no disk.
+///
+/// For `docshot`, and exactly the door `settings::stage_themes` opens for the
+/// Themes pane — including that the caller supplies the library, so the one
+/// call that can fail stays in the tool rather than here. `load` would
+/// otherwise read the *user's* own `brushes.ron`, and this picture is
+/// committed: the count in the collection row would be however many brushes the
+/// person regenerating it happens to have saved, which publishes a
+/// contributor's collection in the README and makes the shot disagree with the
+/// README's own figure for what ships. It is the leak
+/// `prefs::set_config_path_label` exists to stop, two doors over.
+pub(crate) fn stage_library(ctx: &egui::Context, ed: &mut Editor, library: UserLibrary) {
+    let held = Store::Ready(Arc::new(library));
+    let state = State {
+        index: Arc::new(Index::build(&ed.presets, made_of(&held))),
+        store: held,
+        query: String::new(),
+        scope: Scope::All,
+        browser_open: false,
+        saving: None,
+        renaming: None,
+        confirming: None,
+        creating: None,
+        drag: None,
+        notice: None,
+    };
+    store(ctx, state);
+}
+
 // ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------
@@ -985,9 +1014,9 @@ fn empty_message(state: &State) -> &'static str {
 /// as "you may not edit this".
 fn row_controls(ui: &mut Ui, p: &Palette, rect: Rect, id: &str, user: bool) -> Option<Request> {
     const READ_ONLY: &str = "Brushes that ship with Umber are part of the application, so there \
-                             is nothing here to rename or delete — an update replaces the \
-                             shipped library wholesale. Edit this one and save it as your own; \
-                             that copy is yours to rename and delete.";
+                             is nothing here to rename or delete. An update replaces the \
+                             shipped library wholesale. Edit this one and save it as your \
+                             own; that copy is yours to rename and delete.";
     let marks = [
         (Icon::Pencil, "Edit this brush in the brush editor", true),
         (Icon::Rename, "Rename this brush", false),
@@ -1035,7 +1064,7 @@ fn attribution(ui: &mut Ui, preset: &BrushPreset) {
     let Some(credit) = &preset.credit else {
         return;
     };
-    ui.label(RichText::new(format!("{} — {}", credit.author, credit.licence)).small());
+    ui.label(RichText::new(format!("{} · {}", credit.author, credit.licence)).small());
     if !credit.source.is_empty() {
         ui.label(RichText::new(&credit.source).small().weak());
     }
@@ -1474,8 +1503,8 @@ fn new_brush(state: &mut State, ed: &mut Editor) {
     state.scope = Scope::All;
     state.query.clear();
     state.notice = Some(Notice::good(format!(
-        "Made \"{label}\" and put it in your hand. It is saved in your library — \
-         change it here, then press Update."
+        "Made \"{label}\" and put it in your hand. It is saved in your library. \
+         Change it here, then press Update."
     )));
 }
 
@@ -1613,13 +1642,34 @@ fn import_notice(
             };
         }
         1 => failures[0].clone(),
-        n => format!("{} — and {} more failed.", failures[0], n - 1),
+        // The first reason, then a count of the rest. It has to punctuate the
+        // join itself: `failures[0]` is either this module's own "… could not
+        // be read." or a `PresetError`, and none of that enum's sentences ends
+        // in a full stop — so a bare "And" ran the two together into "…Umber
+        // can read And 2 more failed."
+        n => format!("{} And {} more failed.", end_sentence(&failures[0]), n - 1),
     };
     Notice::bad(if summary.is_empty() {
         trailer
     } else {
         format!("{summary}{losses} {trailer}")
     })
+}
+
+/// The sentence with a full stop on the end, adding one only where there is
+/// not already terminal punctuation.
+///
+/// The reasons collected by an import come from two places with two
+/// conventions: this module writes "… could not be read." and `PresetError`'s
+/// `Display` writes a clause with nothing on the end. Anything joining them to
+/// a following sentence has to settle that itself.
+fn end_sentence(sentence: &str) -> String {
+    let trimmed = sentence.trim_end();
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}.")
+    }
 }
 
 /// `smudge`, `smudge and tilt`, `smudge, tilt and direction`.
@@ -1770,7 +1820,7 @@ fn tip_labels(ed: &Editor) -> (&'static str, String) {
         // more than the symptom: the library was copied without its pictures.
         (None, Some(name)) => (
             "Bitmap tip missing",
-            format!("\"{name}\" is not in your library — painting round"),
+            format!("\"{name}\" is not in your library, so this brush paints round"),
         ),
         (None, None) => (
             "Round tip",
@@ -1800,7 +1850,7 @@ fn tip_picker(ui: &mut Ui, p: &Palette, ed: &Editor) -> Option<Option<String>> {
         widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(132.0)),
         |ui| {
             if ui
-                .selectable_label(current.is_none(), "Round — no stamp")
+                .selectable_label(current.is_none(), "Round, no stamp")
                 .clicked()
             {
                 chosen = Some(None);
@@ -2013,13 +2063,13 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                     RichText::new(if gone {
                         format!(
                             "for \"{}\", which is no longer in your library · \
-                             what you paint becomes coverage — colour is ignored, \
+                             what you paint becomes coverage: colour is ignored, \
                              opacity is the strength",
                             target.name
                         )
                     } else {
                         format!(
-                            "for \"{}\" · what you paint becomes coverage — colour is \
+                            "for \"{}\" · what you paint becomes coverage: colour is \
                              ignored, opacity is the strength, and the eraser takes it \
                              back off",
                             target.name
@@ -2031,8 +2081,8 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Use as tip", true, true)
                         .on_hover_text(if gone {
-                            "Put the stamp in the brush you are holding — the brush this \
-                             canvas was for has gone"
+                            "Put the stamp in the brush you are holding. The brush this \
+                             canvas was for has gone."
                         } else {
                             "Write this canvas into your brush library as that brush's stamp"
                         })
@@ -2109,7 +2159,7 @@ pub fn commit_tip(
                 TipCommit {
                     title: format!("\"{}\" now stamps what you drew", target.name),
                     detail: "The picture is in your brush library's tips folder, and the \
-                             brush is in your hand. This canvas is still open — paint on \
+                             brush is in your hand. This canvas is still open. Paint on \
                              it again and press Use as tip to replace the stamp."
                         .to_owned(),
                 }
@@ -2130,7 +2180,7 @@ pub fn commit_tip(
         TipCommit {
             title: format!("The stamp is in your hand, not on \"{}\"", target.name),
             detail: format!(
-                "\"{}\" is not a brush Umber can write to — it has been deleted, or it is \
+                "\"{}\" is not a brush Umber can write to. It has been deleted, or it is \
                  one Umber ships and those are read-only. Nothing is lost: you are \
                  painting with the stamp now, and \"Save as new…\" in the brush editor \
                  keeps it.",
@@ -2227,11 +2277,12 @@ fn drag_ghost(ctx: &egui::Context, p: &Palette, drag: &brushdrag::Drag) {
         egui::Order::Tooltip,
         Id::new("brush-library-drag"),
     ));
-    // An em dash rather than an arrow. Archivo carries no arrow glyph and would
-    // draw a blank box; the dash is ordinary punctuation and is already how the
-    // attribution tooltip joins two things together.
+    // The word "to" rather than an arrow. Archivo carries no arrow glyph and
+    // would draw a blank box, and a dash would have to be read as one anyway —
+    // this label is the one place in the interface that has a *direction* to
+    // say, so it says it.
     let label = match drag.destination() {
-        Some(to) => format!("{} — {to}", drag.name),
+        Some(to) => format!("{} to {to}", drag.name),
         None => drag.name.clone(),
     };
     let galley = painter.layout_no_wrap(label, FontId::proportional(text::TINY), p.text_strong);
@@ -2389,7 +2440,7 @@ fn create_collection(state: &mut State, ed: &mut Editor, name: String) {
                 .map(|group| group.name.clone());
             state.notice = Some(Notice::bad(match &found {
                 Some(name) => {
-                    format!("\"{name}\" is already a collection — showing that one instead.")
+                    format!("\"{name}\" is already a collection. Showing that one instead.")
                 }
                 // Only reachable for a collection that exists as a rule rather
                 // than as a row: `preset::IMPORTED` is where every import
@@ -3455,6 +3506,26 @@ mod tests {
         );
         assert!(notice.bad);
         assert!(notice.text.contains("2 more failed"), "{}", notice.text);
+        // The first reason and the count are two sentences, whichever
+        // convention the reason arrived under. `PresetError`'s `Display` ends
+        // in a clause with no full stop, and this module's own wording ends in
+        // one; running them together produced "…a failed And 2 more failed."
+        assert!(
+            notice.text.contains("a failed. And 2 more failed."),
+            "{}",
+            notice.text
+        );
+        let punctuated = import_notice(
+            &[PathBuf::from("a"), PathBuf::from("b")],
+            &[],
+            &["a failed.".to_owned(), "b failed.".to_owned()],
+            &[],
+        );
+        assert!(
+            punctuated.text.contains("a failed. And 1 more failed."),
+            "and a reason that already had one does not gain a second: {}",
+            punctuated.text
+        );
     }
 
     /// The brush arrives, and is *said* to be an approximation. Shipping it

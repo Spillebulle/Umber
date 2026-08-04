@@ -785,7 +785,7 @@ impl UmberApp {
                 self.editor.notice = Some(Notice {
                     title: "A folder is selected".to_string(),
                     lines: vec![
-                        "Nothing was pasted. A folder holds no pixels — select a \
+                        "Nothing was pasted. A folder holds no pixels. Select a \
                          layer in the Layers panel and paste again."
                             .to_string(),
                     ],
@@ -854,10 +854,10 @@ impl UmberApp {
                 // only true when the slice that comes free happens to be the
                 // one at the top of the range.
                 lines: vec![
-                    "A transform needs a spare texture slice to preview into, and this \
-                     document is using every one Umber has — a layer takes one and a \
-                     mask takes another, of 129. Fewer layers, or fewer masks, will \
-                     make room."
+                    "A transform needs a spare texture slice to preview into, and \
+                     this document is using every one Umber has. A layer takes one \
+                     and a mask takes another, of 129. Fewer layers, or fewer \
+                     masks, will make room."
                         .to_string(),
                 ],
             });
@@ -1344,8 +1344,8 @@ impl UmberApp {
                         "Type something into the Text panel first.".to_string()
                     }
                     umber_core::TextError::NoInk => {
-                        "What is typed makes no mark — spaces, or characters this face \
-                         has no glyph for."
+                        "What is typed makes no mark. It is spaces, or characters \
+                         this face has no glyph for."
                             .to_string()
                     }
                     umber_core::TextError::TooLarge { width, height } => format!(

@@ -57,6 +57,7 @@ use crate::{panels, prefs, settings, shortcuts, splash, ui};
 use egui::{Color32, Pos2, Rect, Vec2, vec2};
 use std::path::{Path, PathBuf};
 use umber_core::Color;
+use umber_core::preset::UserLibrary;
 use umber_render::Gpu;
 
 /// Must match the real surface: non-sRGB, so egui's gamma-space output is
@@ -327,6 +328,36 @@ fn interface(stage: &mut Stage, dir: &Path) -> Result<Vec<(PathBuf, u64, u32, u3
         "layers.png",
     )?);
 
+    // The Brush tweaks module: six rails and a grip beside each. An elliptical
+    // dab so the Angle rail is live rather than greyed, which is the one row
+    // whose enablement is decided by another row.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Tweaks,
+        vec2(theme::metrics::PANEL, 420.0),
+        |ed| ed.brush.dab_ratio = 2.5,
+        "tweaks.png",
+    )?);
+
+    // The Text module, with something set in it.
+    //
+    // `hold_at_builtin` for the reason `stage_library` is staged above: the
+    // face count the dropdown draws would otherwise be the number of fonts
+    // installed on whichever machine regenerated this, published in the README.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Text,
+        vec2(theme::metrics::PANEL, 545.0),
+        |ed| {
+            ed.text.fonts.hold_at_builtin();
+            ed.text.block.text = "Painted in Umber\non a Tuesday".to_string();
+            ed.text.block.align = umber_core::text::Align::Centre;
+        },
+        "text.png",
+    )?);
+
     Ok(out)
 }
 
@@ -344,6 +375,22 @@ fn panel_shot(
 ) -> Result<(PathBuf, u64, u32, u32), String> {
     let mut ed = editor();
     setup(&mut ed);
+    // The same door `settings_shot` opens for the Themes pane, and for the same
+    // reason: the Brushes module reads the *user's* own library on its first
+    // frame, so this picture would carry however many brushes the person
+    // regenerating it happens to have saved — published in the README, and
+    // disagreeing with the README's own figure for what ships.
+    //
+    // `UserLibrary::empty` rather than `load_from` on a path chosen to be
+    // absent. That reads no disk at all, so the guarantee is a property of the
+    // code rather than a claim about a directory anybody can write to: a stray
+    // `<dir>.ron` beside such a path is a *migration*, which `load_from` reads
+    // and then writes back out, and the picture would have been of that.
+    //
+    // It is staged for every panel rather than only for Brushes, because the
+    // rule is about the panel that reads a library and not about which shot is
+    // being taken.
+    crate::brushlib::stage_library(&stage.ctx, &mut ed, UserLibrary::empty(""));
     let palette = ed.palette();
     let rect = Rect::from_min_size(Pos2::ZERO, field);
     let image = stage

@@ -158,7 +158,7 @@ pub fn sessions_dir() -> Option<PathBuf> {
 pub fn internal_dir_label() -> String {
     match internal_dir() {
         Some(path) => path.display().to_string(),
-        None => "unavailable — this system has no data directory".to_string(),
+        None => "unavailable: this system has no data directory".to_string(),
     }
 }
 
@@ -1796,7 +1796,7 @@ pub fn collect(
                     title: format!("Could not autosave “{title}”"),
                     lines: vec![
                         message,
-                        "Autosave will keep trying. Your work is not lost — use \
+                        "Autosave will keep trying. Your work is not lost. Use \
                          File, Save to write it where you want it."
                             .to_string(),
                     ],
@@ -1971,7 +1971,7 @@ fn run_task(task: Task) -> Vec<Report> {
             }
             Err(e) => reports.push(Report::Failed {
                 title: doc.title.clone(),
-                message: format!("{} — {e}", path.display()),
+                message: format!("{}: {e}", path.display()),
             }),
         }
     }
@@ -1998,9 +1998,9 @@ fn write_internal(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
-        return Err(format!("{} could not be created — {e}", dir.display()));
+        return Err(format!("{} could not be created: {e}", dir.display()));
     }
-    docformat::write_encoded(path, bytes).map_err(|e| format!("{} — {e}", path.display()))?;
+    docformat::write_encoded(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     log::debug!("autosave copy at {}", path.display());
     Ok(())
 }

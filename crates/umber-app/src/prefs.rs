@@ -229,7 +229,7 @@ pub fn config_path_label() -> String {
     }
     match config_path() {
         Some(path) => path.display().to_string(),
-        None => "unavailable — this system has no configuration directory".to_string(),
+        None => "unavailable: this system has no configuration directory".to_string(),
     }
 }
 

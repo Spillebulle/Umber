@@ -101,7 +101,7 @@ impl Stage {
         match self {
             Self::Adapter => "requesting a GPU adapter",
             Self::Surface => "configuring the surface",
-            Self::Shaders => "compiling shaders — dab.wgsl",
+            Self::Shaders => "compiling shaders: dab.wgsl",
             Self::Fonts => "loading Archivo",
             Self::Ready => "ready",
         }

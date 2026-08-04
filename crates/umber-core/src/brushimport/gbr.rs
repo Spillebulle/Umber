@@ -327,7 +327,7 @@ fn malformed(message: String) -> PresetError {
 
 fn short_data(needed: usize, got: usize) -> PresetError {
     malformed(format!(
-        "pixel data is {got} bytes, {needed} expected — is the file truncated, \
+        "pixel data is {got} bytes, {needed} expected. Is the file truncated, \
          or was it read little-endian?"
     ))
 }

@@ -216,7 +216,7 @@ fn paint_tab(
 
     // The active tab's document is live in the editor rather than parked.
     let size = tab.parked_size().unwrap_or(ed.doc.size);
-    let mut tip = format!("{} — {} × {}", tab.title, size.x, size.y);
+    let mut tip = format!("{} · {} × {}", tab.title, size.x, size.y);
     if let Some(path) = &tab.path {
         tip.push('\n');
         tip.push_str(&path.display().to_string());
@@ -343,7 +343,7 @@ pub fn strip(ui: &mut egui::Ui, p: &Palette, ed: &Editor) -> TabActions {
             );
             ui.interact(overflow, ui.id().with("doc-tab-overflow"), Sense::hover())
                 .on_hover_text(format!(
-                    "{hidden} more document{} open — the window is too narrow to \
+                    "{hidden} more document{} open. The window is too narrow to \
                      show {}. File, Close document makes room.",
                     if hidden == 1 { "" } else { "s" },
                     if hidden == 1 { "it" } else { "them" },

@@ -128,9 +128,9 @@ impl Stage {
         match self {
             Self::Contacting => "contacting GitHub".to_string(),
             Self::Downloading { received, total } => match total {
-                0 => format!("downloading — {} so far", megabytes(received)),
+                0 => format!("downloading, {} so far", megabytes(received)),
                 _ => format!(
-                    "downloading — {} of {} ({}%)",
+                    "downloading, {} of {} ({}%)",
                     megabytes(received),
                     megabytes(total),
                     (received.min(total) * 100 / total.max(1)),
@@ -139,7 +139,7 @@ impl Stage {
             Self::CheckingLength => "checking the length against GitHub's figure".to_string(),
             Self::Unpacking => "unpacking the archive".to_string(),
             Self::Installing => "putting the new build in place".to_string(),
-            Self::HandingOver => "installing — Windows is handling this from here".to_string(),
+            Self::HandingOver => "installing, Windows is handling this from here".to_string(),
         }
     }
 

@@ -323,9 +323,10 @@ fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
                 ui.label(
-                    // An em dash, not a middle dot: the workspace title already
-                    // proves Archivo carries this one.
-                    egui::RichText::new(format!("v{} — GPL-3.0", env!("CARGO_PKG_VERSION")))
+                    // A middle dot, which the workspace title and the tab strip
+                    // both already prove Archivo carries. It used to be an em
+                    // dash; nothing the interface draws uses one now.
+                    egui::RichText::new(format!("v{} · GPL-3.0", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
                         .color(p.text_dim.gamma_multiply(0.7)),
                 );
@@ -512,7 +513,7 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
     controls::note(
         ui,
         p,
-        "Scales the panels and the type. The canvas is unaffected — brush sizes \
+        "Scales the panels and the type. The canvas is unaffected: brush sizes \
          are in document pixels, so painting looks the same at any scale.",
     );
 
@@ -549,10 +550,10 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
         ui,
         p,
         "Asks GitHub which release is newest, once, when Umber starts. The \
-         request carries nothing about you or your work. Umber does not sign \
-         its releases — a download is checked against the size GitHub reports \
-         and nothing stronger. Help, About has the details and a button to \
-         check on demand.",
+         request carries nothing about you or your work.\n\nUmber does not \
+         sign its releases. A download is checked against the size GitHub \
+         reports and nothing stronger. Help, About has the details and a \
+         button to check on demand.",
     );
 
     ui.add_space(16.0);
@@ -572,11 +573,11 @@ fn general_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut U
         p,
         "Lets a document be undone after it has been closed and reopened. The \
          history goes in as private entries other applications ignore, so the \
-         file is still an ordinary OpenRaster. The newest edits are kept, up to \
-         32 MB of them — a sketching session is well under a megabyte of that, \
-         while an hour of full-canvas painting reaches the limit and its oldest \
-         strokes are dropped. Switching this off makes saving quicker and the \
-         file smaller, and costs only the history.",
+         file is still an ordinary OpenRaster.\n\nThe newest edits are kept, \
+         up to 32 MB of them. A sketching session is well under a megabyte of \
+         that; an hour of full-canvas painting reaches the limit and its \
+         oldest strokes are dropped.\n\nSwitching this off makes saving \
+         quicker and the file smaller, and costs only the history.",
     );
 
     ui.add_space(16.0);
@@ -635,11 +636,11 @@ fn fonts_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ui,
         p,
         &format!(
-            "Currently: {current}.\nEvery font installed on this machine is already \
-             offered in the Text panel — this is for a folder of your own beside them, \
-             such as a foundry licence or a work library. Umber reads it and copies \
-             nothing out of it. TrueType and OpenType are read — .ttf, .otf, .ttc \
-             and .otc — and web fonts are not."
+            "Currently: {current}.\n\nEvery font installed on this machine is already \
+             offered in the Text panel. This is for a folder of your own beside \
+             them, such as a foundry licence or a work library. Umber reads it and \
+             copies nothing out of it.\n\nTrueType and OpenType are read: .ttf, \
+             .otf, .ttc and .otc. Web fonts are not."
         ),
     );
 }
@@ -717,12 +718,13 @@ fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ui,
         p,
         "Per document, not per session: four tabs at 1 GB each is four \
-         gigabytes of memory. How many steps that buys depends on the canvas, \
-         because an entry holds the whole rectangle a stroke covered — a sketch \
-         gets hundreds, while on a very large canvas a few broad strokes fill \
-         any figure offered here and the oldest are dropped. More costs memory \
-         the rest of the machine cannot then use; less costs how far back you \
-         can go. The History panel says when it has started dropping edits.",
+         gigabytes of memory.\n\nHow many steps that buys depends on the \
+         canvas, because an entry holds the whole rectangle a stroke covered. \
+         A sketch gets hundreds; on a very large canvas a few broad strokes \
+         fill any figure offered here and the oldest are dropped.\n\nMore \
+         costs memory the rest of the machine cannot then use, less costs how \
+         far back you can go. The History panel says when it has started \
+         dropping edits.",
     );
 }
 
@@ -761,11 +763,11 @@ fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &m
     controls::note(
         ui,
         p,
-        "Waits for a gap between strokes, so it never interrupts one — “every \
-         five minutes” means at the first quiet moment after five minutes. A \
-         document you have saved somewhere is written back to that file, \
-         replacing it without asking; one you have never saved goes only to \
-         Umber's own folder.",
+        "Waits for a gap between strokes, so it never interrupts one. “Every \
+         five minutes” means at the first quiet moment after five \
+         minutes.\n\nA document you have saved somewhere is written back to \
+         that file, replacing it without asking. One you have never saved goes \
+         only to Umber's own folder.",
     );
 
     if !on {
@@ -830,7 +832,7 @@ fn autosave_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &m
         ui,
         p,
         "Only Umber's own copies are ever deleted. Nothing here can reach a file \
-         you chose the place for — a document saved to your own folder stays \
+         you chose the place for: a document saved to your own folder stays \
          there whatever this says.",
     );
 
@@ -960,7 +962,7 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             p,
             "Mouse events",
             &ed.input.mouse_events.to_string(),
-            "CursorMoved and MouseInput. A mouse sends these — and so does a pen \
+            "CursorMoved and MouseInput. A mouse sends these, and so does a pen \
              whose tablet driver is in mouse mode, which is the usual reason a \
              pen behaves like one.",
         );
@@ -1003,7 +1005,7 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         }
         ui.label(
             egui::RichText::new(match last {
-                Some(s) => format!("{} — {}", s.route.label(), s.motion.label()),
+                Some(s) => format!("{} · {}", s.route.label(), s.motion.label()),
                 None => "nothing yet".to_string(),
             })
             .size(text::SMALL)
@@ -1076,14 +1078,14 @@ fn route_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// "the ordinary pointer" meant Umber had decided the pen was not over the
 /// canvas; that was false whenever this dialog was open, which is whenever
 /// anybody could read it.
-const CURSOR_HELP: &str = "What Umber asked the window system for, which is not \
-     the same as what ended up on screen — nothing in this process can see what \
-     was actually drawn. Frames with a dialog over the canvas are left out, \
+const CURSOR_HELP: &str = "What Umber asked the window system for. That is not \
+     the same as what ended up on screen: nothing in this process can see what \
+     was actually drawn.\n\nFrames with a dialog over the canvas are left out, \
      because Umber correctly asks for an ordinary pointer on those and this one \
-     is a dialog. So: hover a pen over the canvas, then come back. If the count \
-     is rising and an arrow is still showing under the pen, the request is being \
-     dropped below Umber. If it stays at zero, Umber never asked — look at the \
-     route and gesture rows above for why.";
+     is a dialog. So hover a pen over the canvas, then come back.\n\nIf the \
+     count is rising and an arrow is still showing under the pen, the request \
+     is being dropped below Umber. If it stays at zero, Umber never asked. Look \
+     at the route and gesture rows above for why.";
 
 /// Where pressure comes from: the one setting on this page, and the two knobs
 /// that hang off one of its answers.
@@ -1112,7 +1114,7 @@ fn source_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             p,
             "Touch screens report real pressure, and so do pens on Windows. Pens on \
              macOS and Linux do not reach Umber through the window system yet, so \
-             there this behaves as Off — pick Speed for a stand-in. A mouse always \
+             there this behaves as Off. Pick Speed for a stand-in. A mouse always \
              paints at full pressure.",
         ),
         PressureSource::Simulated => controls::note(
@@ -1278,21 +1280,21 @@ fn guide_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     controls::note(
         ui,
         p,
-        "Hover a pen over the tablet without touching it. “Touch / pen — hovering” \
-         means Umber can see it. If only the mouse counter moves, the driver is \
-         sending the pen as a mouse and no pressure will ever arrive — that is a \
-         tablet setting, not an Umber one.",
+        "Hover a pen over the tablet without touching it. “Touch / pen, hovering” \
+         means Umber can see it.\n\nIf only the mouse counter moves, the driver \
+         is sending the pen as a mouse and no pressure will ever arrive. That is \
+         a tablet setting, not an Umber one.",
     );
     ui.add_space(6.0);
     controls::note(
         ui,
         p,
-        "Reported and resolved are two different numbers and the difference is the \
-         point. “Reported” is exactly what the device sent, and “none” means it \
-         sent no reading at all — which the window system cannot tell apart from a \
-         pen a hair off the glass, so Umber has to decide between them itself. \
-         “Resolved” is what the brush was actually given, recorded from the one \
-         real call rather than worked out again for the display.",
+        "Reported and resolved are two different numbers, and the difference is \
+         the point.\n\n“Reported” is exactly what the device sent. “None” means \
+         it sent no reading at all, which the window system cannot tell apart \
+         from a pen a hair off the glass, so Umber has to decide between them \
+         itself.\n\n“Resolved” is what the brush was actually given, recorded \
+         from the one real call rather than worked out again for the display.",
     );
     ui.add_space(6.0);
     controls::note(
@@ -1309,10 +1311,10 @@ fn guide_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         p,
         "The strip is its own picture. It goes through no document, no layer and \
          no undo history, and it resolves through a copy of the pressure model \
-         reset on each press — asking the real one a second time would disturb the \
-         stroke it is driving. On Speed the copy measures the strip's own pixels \
-         rather than document pixels, so the threshold reads a little differently \
-         here than on the canvas.",
+         reset on each press. Asking the real one a second time would disturb \
+         the stroke it is driving.\n\nOn Speed the copy measures the strip's own \
+         pixels rather than document pixels, so the threshold reads a little \
+         differently here than on the canvas.",
     );
 
     ui.add_space(6.0);
@@ -1335,18 +1337,18 @@ fn guide_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 ui,
                 p,
                 "90 is upright. No brush setting follows tilt yet, so nothing is \
-                 done with this — but it is arriving.",
+                 done with this, but it is arriving.",
             );
         }
         None => controls::note(
             ui,
             p,
             "There is no tilt reading. The only place winit has for one is the \
-             stylus altitude inside a calibrated force, which is iOS's form; \
+             stylus altitude inside a calibrated force, which is iOS's form. \
              Windows Ink sends a normalised force with nowhere to put an angle, \
-             and macOS and Linux send no pen events at all. Tilt needs a native \
-             tablet path, which is not built — so this says so rather than showing \
-             a zero.",
+             and macOS and Linux send no pen events at all.\n\nTilt needs a \
+             native tablet path, which is not built, so this says so rather \
+             than showing a zero.",
         ),
     }
 }
@@ -2085,7 +2087,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                 let label = if confirming { "Delete?" } else { "Delete" };
                 if controls::text_button(ui, p, label, confirming, true)
                     .on_hover_text(if confirming {
-                        "Click again to delete this theme. It cannot be undone — the \
+                        "Click again to delete this theme. It cannot be undone: the \
                          history covers painting only."
                     } else {
                         "Delete this theme"
@@ -2157,7 +2159,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                 None => {
                     ui.label(
                         egui::RichText::new(format!(
-                            "— {} is built in, so these are read-only",
+                            "{} is built in, so these are read-only",
                             ed.ui.theme.label()
                         ))
                         .size(10.0)
@@ -2180,7 +2182,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
         p,
         if ed.custom_theme.is_some() {
             "Type a colour as six hex digits. Changes are saved as you make them, \
-             in a file of their own — there is nothing to click."
+             in a file of their own, so there is nothing to click."
         } else {
             "Pick New theme above to make a copy you can edit. The two that ship \
              with Umber are compiled into it, so a change written here would \
