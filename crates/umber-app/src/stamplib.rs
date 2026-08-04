@@ -883,11 +883,18 @@ mod tests {
             // paper control became a dropdown when the closed set of three
             // stopped being the whole list.
             ("3-texture-section", None),
+            // And the Brushes header, which now carries four marks in a 264 px
+            // panel. `CLAUDE.md` records the layers panel's version of exactly
+            // this: controls that fit in the abstract and were drawn over each
+            // other at the panel's real width.
+            ("4-brushes-header", None),
         ] {
+            let panel_shot = name == "4-brushes-header";
             let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
             ed.paper_name = Some("wove".to_owned());
             ed.brush.grain = 0.45;
-            ed.ui.brush_editor_open = kind.is_none();
+            ed.ui.brush_editor_open = kind.is_none() && !panel_shot;
             ed.ui.brush_tab = crate::editor::BrushTab::Texture;
 
             let seed = State {
@@ -895,10 +902,12 @@ mod tests {
                 ..State::default()
             };
             let palette = Theme::with_accent(ed.ui.theme, ed.ui.accent);
-            let field = match kind {
-                Some(_) => vec2(metrics::STAMP_LIBRARY[0] + 80.0, 560.0),
-                None => vec2(metrics::BRUSH_EDITOR_WIDTH + 120.0, 560.0),
+            let field = match (kind, panel_shot) {
+                (Some(_), _) => vec2(metrics::STAMP_LIBRARY[0] + 80.0, 560.0),
+                (None, true) => vec2(metrics::PANEL, 360.0),
+                (None, false) => vec2(metrics::BRUSH_EDITOR_WIDTH + 120.0, 560.0),
             };
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, field);
             let staged = staged.clone();
             let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
                 // Re-seeded every frame: the state is read back out of egui's
@@ -906,13 +915,25 @@ mod tests {
                 // nothing at all.
                 store(root.ctx(), seed.clone());
                 brushlib::seed_library(root.ctx(), &mut ed, staged.clone());
+                if panel_shot {
+                    let mut actions = crate::ui::UiActions::default();
+                    crate::panels::panel(
+                        root,
+                        &palette,
+                        &mut ed,
+                        &mut actions,
+                        crate::dock::PanelKind::Brushes,
+                        rect,
+                    );
+                    return;
+                }
                 dialogs(root, &palette, &mut ed);
                 crate::ui::brush_editor(root, &palette, &mut ed);
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         let _ = std::fs::remove_dir_all(&scratch);
-        println!("wrote 3 shots to {}", dir.display());
+        println!("wrote 4 shots to {}", dir.display());
     }
 
     /// The list is the merged one and the user's own comes first, which is the
