@@ -374,13 +374,20 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 /// One setting: the rail, and the grip beside it.
 fn row(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
     let mut value = tweak.value(&ed.brush);
+    // The grip's width comes off the line before the rail is drawn, because
+    // `widgets::slider_row` sizes itself from `available_width` and would
+    // otherwise take all of it and push the grip off the panel.
+    let rail = (ui.available_width() - metrics::TWEAK_GRIP - 8.0).max(metrics::TWEAK_GRIP);
     ui.horizontal(|ui| {
-        // The grip is allocated out of the line's width up front, because
-        // `widgets::slider_row` sizes itself from `available_width` and would
-        // otherwise take the whole of it and push the grip onto the next line.
-        let reserved = metrics::TWEAK_GRIP + 8.0;
-        ui.scope(|ui| {
-            ui.set_width((ui.available_width() - reserved).max(metrics::TWEAK_GRIP));
+        // **`vertical`, not `scope`.** A `slider_row` is two rows — the name
+        // and readout on one baseline, the rail under them — and it allocates
+        // them one after another in whatever layout it is handed. Given the
+        // horizontal one this line is in, it laid the rail out *beside* its own
+        // header and pushed both off the edge of the panel: labels with no
+        // rails under them, which is what the first shot of
+        // `tweaks_panel_preview` showed.
+        ui.vertical(|ui| {
+            ui.set_width(rail);
             if widgets::slider_row(
                 ui,
                 p,
@@ -410,6 +417,13 @@ fn row(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
 /// per-widget memory rather than on [`Editor`]: they belong to one gesture on
 /// one widget, which is exactly what that memory is for, and it keeps a
 /// transient out of the state a tab switch has to reason about.
+///
+/// A panel body is a `ScrollArea`, which senses a drag of its own so a finger
+/// can scroll it, and this widget is drawn over that. It wins for the same
+/// reason every rail already in a panel does — the layer stack's opacity
+/// slider, the colour picker's three — because egui resolves an overlap to the
+/// topmost widget that senses the drag. A control here that lost to the scroll
+/// would be a control every panel in Umber has already been proving works.
 fn grip(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
     let size = metrics::TWEAK_GRIP;
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
@@ -719,6 +733,28 @@ mod tests {
     }
 
     #[test]
+    fn the_shortcuts_search_finds_every_rail_by_the_name_on_it() {
+        // Fourteen rows is a long enough list that the search is how somebody
+        // gets to one, and `settings::shortcuts_pane` filters on the label and
+        // the category folded to lower case. So the name on the rail has to be
+        // in the label of the pair that moves it — which is not automatic:
+        // "Angle" is spelt "dab angle" there, and an action named for the
+        // engine's field rather than for the control would be unfindable by
+        // anybody looking at the panel.
+        for tweak in Tweak::PANEL {
+            let needle = tweak.label().to_lowercase();
+            let hits = Action::ALL
+                .iter()
+                .filter(|a| {
+                    a.label().to_lowercase().contains(&needle)
+                        || a.category().to_lowercase().contains(&needle)
+                })
+                .count();
+            assert_eq!(hits, 2, "searching for {needle:?} found {hits} rows");
+        }
+    }
+
+    #[test]
     fn a_panel_tweak_is_one_a_shortcut_can_reach() {
         for tweak in Tweak::PANEL {
             assert!(Tweak::ALL.contains(&tweak));
@@ -834,6 +870,24 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 3 shots to {}", dir.display());
+        // And the schematic the module library draws on this module's card.
+        // The field is what `panels::module_preview` hands `preview`: the
+        // `metrics::MODULE_PREVIEW` card less its 9-point header, its 6-point
+        // left margin and 5 points off each end. Restated here only so there
+        // is something to look at — the caller is still the one that decides
+        // it, and a picture drawn a few points larger than the card is exactly
+        // the kind of thing that has to be seen rather than asserted.
+        let field = egui::vec2(72.0, 34.0);
+        let palette = Palette::with_accent(ThemeKind::Graphite, crate::theme::Accent::Umber);
+        let image = stage.shoot(field, 4.0, &palette, palette.control, |root| {
+            preview(
+                root.painter(),
+                &palette,
+                Rect::from_min_size(Pos2::ZERO, field),
+            );
+        });
+        docshot::write_png(&dir.join("4-card.png"), &image).expect("write the png");
+
+        println!("wrote 4 shots to {}", dir.display());
     }
 }
