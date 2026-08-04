@@ -22,7 +22,11 @@ use umber_core::{
 /// its min, which does not panic — it paints somewhere unrelated, or fills the
 /// whole panel. Clamping here means a squeezed control is merely useless rather
 /// than wrong.
-const MIN_TRACK: f32 = 8.0;
+/// The shortest track worth drawing a thumb on. `pub(crate)` because
+/// `ui::canvas_scrollbars` has to ask before it *records* a canvas scrollbar as
+/// a live target: a bar refused here for being too short would otherwise be a
+/// strip of canvas that swallows presses and cannot be dragged.
+pub(crate) const MIN_TRACK: f32 = 8.0;
 
 /// Label on the left, monospace readout on the right, thin rail beneath.
 ///
@@ -580,6 +584,11 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// Unlike the sliders above there is no track fill and no round knob: a
 /// scrollbar's thumb *is* the value, and an accent-coloured bar down the side of
 /// the canvas would read as something selected rather than as somewhere to be.
+///
+/// These are on screen on every frame of every document — see
+/// `ui::canvas_scrollbars` — so the idle ink is the quietest token there is and
+/// the track is left unpainted. Two permanent filled strips down the edges of a
+/// picture is the furniture that decision is against.
 pub fn canvas_scrollbar(
     ui: &mut Ui,
     p: &Palette,
@@ -617,8 +626,9 @@ pub fn canvas_scrollbar(
 
     // The track is left unpainted. The canvas is behind it and the document may
     // be too, and a filled strip along two edges of the picture is exactly the
-    // furniture a paint application is trying not to put there. Only the thumb
-    // is drawn, and only while it is needed.
+    // furniture a paint application is trying not to put there — the more so
+    // now that the bars are drawn on every frame rather than only where the
+    // picture runs off the view. Only the thumb is drawn.
     let ink = if response.dragged() {
         p.text_muted
     } else if response.hovered() {

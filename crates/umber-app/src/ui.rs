@@ -915,14 +915,23 @@ fn canvas_button(
 /// The canvas scrollbars, along the bottom and the right of the document
 /// region — the right being the left edge of whatever is docked there.
 ///
-/// Drawn only where the document actually runs off the view, on the axis it
-/// runs off. That covers both "larger than the window" and "small enough to
-/// fit, but pushed under a panel", which are the same complaint: part of the
-/// picture is somewhere the artist cannot see it.
+/// Drawn on both axes of every document, and [`ScrollSpan`]'s own docs have the
+/// argument. Short version: these used to be drawn only where part of the
+/// picture was off the view, which reads as the honest rule and hid travel the
+/// camera already had — zoom out until the whole canvas fits and the only way
+/// to shift it off centre was to zoom back in. The tell, from a running window,
+/// was that a single notch of the wheel made both bars appear.
 ///
 /// The geometry is [`ScrollSpan`]'s, in `umber-core`, so what the thumb says
 /// and where the camera is cannot drift apart — the same division `dock.rs` and
 /// `panels.rs` keep.
+///
+/// Recording the rectangles in [`Editor::scroll_bars`] carries more weight than
+/// it used to rather than less: the bars are now a live target over the canvas
+/// on *every* frame, and that record is the only thing between a press on one
+/// and a dab under it. Both pointers reach it through
+/// `Editor::pointer_over_canvas`, so a pen cannot paint through a bar a mouse
+/// is refused by.
 fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
     // The viewport in *document* units, so the spans are worked out from the
     // region actually being laid out this frame rather than from last frame's
@@ -933,15 +942,21 @@ fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     let across = ScrollSpan::new(doc.x, rect.width() * scale, zoom, ed.camera.center.x);
     let down = ScrollSpan::new(doc.y, rect.height() * scale, zoom, ed.camera.center.y);
 
-    let (show_x, show_y) = (across.overflows(), down.overflows());
+    // Neither bar runs under the other: a thumb sliding into the corner where
+    // they cross would be under the one on top of it for its last few pixels.
+    let bar = metrics::SCROLLBAR;
+
+    // A track too short to hold a thumb is refused outright rather than drawn
+    // and left undraggable — it would be a strip of canvas that swallows every
+    // press for nothing, which is worse than no bar. The length tested is the
+    // one the bar actually gets, after the corner has been taken out of it.
+    let show_x = across.scrollable() && rect.width() - bar > widgets::MIN_TRACK;
+    let show_y = down.scrollable() && rect.height() - bar > widgets::MIN_TRACK;
     ed.scroll_bars = [None, None];
     if !show_x && !show_y {
         return;
     }
 
-    // Neither bar runs under the other: a thumb sliding into the corner where
-    // they cross would be under the one on top of it for its last few pixels.
-    let bar = metrics::SCROLLBAR;
     let corner_x = rect.right() - if show_y { bar } else { 0.0 };
     let corner_y = rect.bottom() - if show_x { bar } else { 0.0 };
 
@@ -2825,4 +2840,69 @@ fn curve_column(
             widgets::slider_row(ui, p, label, value, 0.0..=1.0, false, percent);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// The canvas scrollbars in the three states that matter, over a canvas
+    /// region the size a real one is.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is.
+    /// The question drawing the bars always raises is not a geometry one —
+    /// [`ScrollSpan`]'s own tests settle that — it is whether two thumbs sitting
+    /// permanently along the edges of somebody's picture read as furniture, and
+    /// no assertion about widgets can answer that. `docshot::Stage` is the only
+    /// thing in the crate that can look at a piece of interface.
+    ///
+    /// The middle shot is the one to judge: that is the fitted document, which
+    /// used to draw no bars at all and is the whole of what changed.
+    ///
+    /// The background is `chrome` rather than the backdrop the composite pass
+    /// actually paints, which is on the GPU and not this module's to reach —
+    /// close enough to say whether the idle thumb is too loud, and not a claim
+    /// about the exact contrast.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app canvas_scrollbar_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn canvas_scrollbar_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::Palette;
+        use egui::{Pos2, Rect, vec2};
+        use glam::Vec2;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/canvas-scrollbars");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // 720x480 points at two pixels a point is 1440x960 physical, so this is
+        // the zoom at which the default 2048-square document just fits.
+        let field = vec2(720.0, 480.0);
+        let fits = 960.0 / 2048.0;
+        for (name, zoom, centre) in [
+            ("1-zoomed-in", 1.0, Vec2::splat(1024.0)),
+            ("2-fits", fits, Vec2::splat(1024.0)),
+            ("3-pushed-off", fits, Vec2::new(1800.0, 300.0)),
+        ] {
+            let mut ed = Editor::default();
+            ed.pixels_per_point = 2.0;
+            ed.camera.zoom = zoom;
+            ed.camera.center = centre;
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |ui| {
+                super::canvas_scrollbars(ui, &palette, &mut ed, rect);
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 3 shots to {}", dir.display());
+    }
 }

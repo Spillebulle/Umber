@@ -93,6 +93,17 @@ impl Camera {
 /// the pointer mid-drag, and the thumb would accelerate away from the hand
 /// holding it. This one depends on the zoom and the document, and not on where
 /// the camera is — so a drag maps to a distance linearly and stays put.
+///
+/// **A bar exists wherever a document does**, and not only where part of the
+/// picture is off the view. It used to be drawn on exactly that test, which
+/// reads as the honest rule and is not: the travel above is the document plus a
+/// viewport *at every zoom*, so a picture that fits in the window is still one
+/// the camera can be moved a whole document's width across — the bar was hiding
+/// travel it already had, and zooming out was the only way to a canvas that
+/// could not be shifted off centre. What gave it away, from a running window,
+/// is that one notch of the wheel made both bars appear out of nowhere: panning
+/// is the moment the old test starts answering yes. A control offered only once
+/// you have found another way to do the thing is not a control.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollSpan {
     /// The document's size along this axis.
@@ -113,15 +124,22 @@ impl ScrollSpan {
         }
     }
 
-    /// True when any of the document is outside the view — which is exactly
-    /// when a bar is worth drawing, and covers both "too big to fit" and
-    /// "fits, but has been pushed off the side".
-    pub fn overflows(&self) -> bool {
-        let half = self.extent * 0.5;
-        // A hair of tolerance: a fitted document sits a rounding error from its
-        // own edges, and a bar that flickered on and off as the camera drifted
-        // would be worse than one that appears a pixel late.
-        self.centre - half > 0.5 || self.centre + half < self.doc - 0.5
+    /// True when this bar has somewhere to go, and therefore when it is worth
+    /// drawing — which, the travel being the document plus a viewport, is
+    /// wherever there is a document at all.
+    ///
+    /// It reads a *property of the document*, never one of the camera: a rule
+    /// that turned the bars on and off as the picture was pushed about would
+    /// take the canvas region's last eleven points away and give them back
+    /// under a hand that is painting in them.
+    ///
+    /// The consequence worth knowing is that [`ScrollSpan::thumb`] is then
+    /// always shorter than its own track, so this never draws a full-length
+    /// thumb meaning "nothing to scroll" — which was the other way this could
+    /// have been spelled, and would have been a bar that says one thing and
+    /// does another.
+    pub fn scrollable(&self) -> bool {
+        self.doc > 0.0
     }
 
     /// The total distance a full bar's worth of dragging covers.
@@ -144,9 +162,28 @@ impl ScrollSpan {
     /// How far the camera moves for a drag of `fraction` of the bar's length.
     ///
     /// The inverse of [`ScrollSpan::thumb`], and a plain multiply because the
-    /// travel does not depend on where the camera is.
+    /// travel does not depend on where the camera is — that is the whole of the
+    /// rule the type exists to hold, and the clamp below does not touch it.
+    ///
+    /// What the clamp does is stop a drag banking distance past the end of the
+    /// track. `thumb` pins its start inside the bar, so without this a drag
+    /// carried past an end goes on moving the camera under a thumb that has
+    /// stopped, and the same distance has to be spent again before anything
+    /// moves on the way back — the pointer travelling while the thumb sits
+    /// still, which is the complaint the fixed travel exists to prevent,
+    /// arrived at from the other side. It matters far more now the bars are
+    /// drawn on a document that fits, because then the ends are a short drag
+    /// away rather than somewhere nobody goes.
+    ///
+    /// A camera already outside the document — a space-drag has no limit — is
+    /// left where it is rather than snapped back in, so the bounds are widened
+    /// to wherever it stands. The bar can then only ever improve matters, and
+    /// a hair of a drag can never teleport a picture that was pushed a long way
+    /// out.
     pub fn pan_by(&self, fraction: f32) -> f32 {
-        fraction * self.travel()
+        let lo = self.centre.min(0.0);
+        let hi = self.centre.max(self.doc);
+        (self.centre + fraction * self.travel()).clamp(lo, hi) - self.centre
     }
 }
 
@@ -274,25 +311,72 @@ mod tests {
         ScrollSpan::new(1000.0, 500.0, 1.0, 500.0)
     }
 
-    #[test]
-    fn a_document_that_fits_needs_no_bar() {
-        // The whole document inside the view, with room to spare: nothing is
-        // hidden, so nothing is drawn.
-        let span = ScrollSpan::new(1000.0, 2000.0, 1.0, 500.0);
-        assert!(!span.overflows());
+    /// The same document at a zoom that puts the whole of it on screen twice
+    /// over — the case the bars used to refuse to draw at all.
+    fn zoomed_out() -> ScrollSpan {
+        ScrollSpan::new(1000.0, 2000.0, 1.0, 500.0)
     }
 
     #[test]
-    fn a_document_pushed_off_the_side_needs_one_even_though_it_fits() {
-        // The case the bars are actually for: the document is smaller than the
-        // window and has been panned until half of it is under a panel.
+    fn a_document_that_fits_still_gets_a_bar() {
+        // The report this was changed for: the whole picture is in the window,
+        // so nothing is hidden — and the camera can still be moved a whole
+        // document across, which is travel the old rule hid.
+        assert!(zoomed_out().scrollable());
+        assert!(half_shown().scrollable());
+    }
+
+    #[test]
+    fn a_bar_that_is_drawn_can_always_be_dragged_somewhere() {
+        // The pair the drawing rule turns on: a bar is offered exactly where
+        // there is somewhere to go, so it can never be a control that does
+        // nothing. Both directions are checked, because "moves" has to hold
+        // whichever end the camera starts nearer.
+        for span in [half_shown(), zoomed_out()] {
+            assert!(span.scrollable());
+            assert!(span.pan_by(0.1) > 0.0, "{span:?} would not move forwards");
+            assert!(span.pan_by(-0.1) < 0.0, "{span:?} would not move back");
+        }
+    }
+
+    #[test]
+    fn the_thumb_never_fills_a_bar_that_is_drawn() {
+        // What makes "always drawn" honest rather than a full-length thumb
+        // sitting there meaning nothing. Swept over the zoom range a canvas
+        // this size is actually looked at through.
+        for zoom in [0.02f32, 0.1, 0.25, 1.0, 4.0, 64.0] {
+            let span = ScrollSpan::new(4000.0, 1600.0, zoom, 2000.0);
+            assert!(span.scrollable());
+            let (_, length) = span.thumb();
+            assert!(length < 0.999, "at zoom {zoom} the thumb was {length}");
+        }
+    }
+
+    #[test]
+    fn a_zoomed_out_bar_still_reaches_the_whole_document() {
+        // Dragging the thumb from one end of its track to the other has to put
+        // the corner of a fitted picture in the middle of the view — otherwise
+        // "the bars are always there" would be true and useless.
+        let span = zoomed_out();
+        let (start, length) = span.thumb();
+        let reach = span.pan_by(1.0 - length - start);
+        assert!(
+            (span.centre + reach - span.doc).abs() < 1e-3,
+            "reached {} of {}",
+            span.centre + reach,
+            span.doc
+        );
+    }
+
+    #[test]
+    fn a_document_pushed_off_the_side_keeps_its_bar() {
+        // The document is smaller than the window and has been panned until
+        // half of it is under a panel. This was the case the old rule existed
+        // for, and it must go on working.
         let span = ScrollSpan::new(1000.0, 2000.0, 1.0, 1800.0);
-        assert!(span.overflows());
-    }
-
-    #[test]
-    fn a_document_larger_than_the_view_needs_one() {
-        assert!(half_shown().overflows());
+        assert!(span.scrollable());
+        let (start, length) = span.thumb();
+        assert!((start + length - 1.0).abs() < 1e-4, "{start} + {length}");
     }
 
     #[test]
@@ -349,6 +433,54 @@ mod tests {
             ..span
         };
         assert_eq!(span.travel(), far.travel());
+
+        // And the same on a document that fits, which is where the bars are
+        // now drawn and where the temptation to make the span "the document or
+        // the view, whichever reaches further" is strongest.
+        let fitted = zoomed_out();
+        let pushed = ScrollSpan {
+            centre: -5000.0,
+            ..fitted
+        };
+        assert_eq!(fitted.travel(), pushed.travel());
+    }
+
+    #[test]
+    fn a_drag_stops_at_the_end_of_the_track_instead_of_banking_distance() {
+        // Without this the camera goes on moving under a thumb that has
+        // stopped, and the overshoot has to be paid back before the picture
+        // moves at all on the way home — the pointer travelling while the thumb
+        // stands still. Reachable in a couple of centimetres now the bars are
+        // drawn on a document that fits.
+        let span = zoomed_out();
+        let hard = span.pan_by(10.0);
+        assert!(
+            (span.centre + hard - span.doc).abs() < 1e-3,
+            "landed at {}",
+            span.centre + hard
+        );
+        let back = span.pan_by(-10.0);
+        assert!(
+            (span.centre + back).abs() < 1e-3,
+            "landed at {}",
+            span.centre + back
+        );
+    }
+
+    #[test]
+    fn a_camera_already_outside_the_document_is_not_snapped_back_by_the_bar() {
+        // A space-drag has no limit, so the camera can stand well outside the
+        // travel. Clamping to the document would make a hair of a drag teleport
+        // the picture; the bounds widen to wherever it is instead, so the bar
+        // can only ever improve matters.
+        let far = ScrollSpan {
+            centre: -5000.0,
+            ..zoomed_out()
+        };
+        // Away from the document: refused outright rather than made worse.
+        assert_eq!(far.pan_by(-0.5), 0.0);
+        // Towards it: an ordinary drag, worth exactly what it is worth.
+        assert!((far.pan_by(0.1) - 0.1 * far.travel()).abs() < 1e-3);
     }
 
     #[test]
