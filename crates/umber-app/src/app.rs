@@ -472,9 +472,12 @@ impl UmberApp {
             // binding per pass, changed only between strokes. Read off the
             // *snapshotted* brush, so changing the Texture sliders mid-stroke
             // cannot re-texture the half already painted.
+            // Which tile is `Editor::paper_tile`'s answer and nobody else's:
+            // the brush may name one out of the user's library, in which case
+            // `grain_pattern` says nothing about it. A name that resolves to
+            // nothing binds no grain, which is the exact identity.
             let grain = self.editor.stroke.grain().and_then(|(strength, scale)| {
-                let key = self.editor.brush.grain_pattern.key();
-                umber_core::tip::pattern(key).map(|tile| (tile.clone(), strength, scale))
+                self.editor.paper_tile().map(|tile| (tile, strength, scale))
             });
             canvas.set_grain(&gfx.gpu.device, &gfx.gpu.queue, grain);
 

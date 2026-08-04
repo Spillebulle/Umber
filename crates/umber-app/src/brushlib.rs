@@ -103,20 +103,20 @@ enum Scope {
 /// Failures carry [`PresetError`]'s own wording: it writes finished sentences
 /// that name the file, which is more than this module knows.
 #[derive(Clone)]
-struct Notice {
+pub(crate) struct Notice {
     text: String,
     bad: bool,
 }
 
 impl Notice {
-    fn good(text: impl Into<String>) -> Self {
+    pub(crate) fn good(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             bad: false,
         }
     }
 
-    fn bad(text: impl Into<String>) -> Self {
+    pub(crate) fn bad(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             bad: true,
@@ -494,6 +494,7 @@ fn resync(ed: &mut Editor, library: &UserLibrary) {
     // `Arc`s, not the bitmaps, and it happens when the library changes rather
     // than per frame.
     ed.tips = library.tips().clone();
+    ed.papers = library.papers().clone();
 }
 
 /// Run a write against the user's library and put everything back in step.
@@ -532,19 +533,87 @@ fn write<T>(
     }
 }
 
+/// The user's library, for a module that is not this one.
+///
+/// [`crate::stamplib`] shows and edits the stamps and papers inside it, and
+/// reaching them means reaching this module's store: the library is read from
+/// disk **once**, on the first frame that asks for it, and a second loader
+/// would be a second copy of somebody's collection that the two could then
+/// write over each other's. `Err` carries the library's own wording, so a
+/// control that cannot write can say why in the sentence the library used.
+pub(crate) fn library(ctx: &egui::Context, ed: &mut Editor) -> Result<Arc<UserLibrary>, String> {
+    let state = load(ctx, ed);
+    let held = match &state.store {
+        Store::Ready(library) => Ok(Arc::clone(library)),
+        Store::Broken(why) => Err(why.clone()),
+    };
+    store(ctx, state);
+    held
+}
+
+/// Run a write against the user's library from another module, and put
+/// everything back in step.
+///
+/// [`write`]'s job with the state loaded and stored around it, so that a caller
+/// outside this module cannot skip the `resync` that follows every write — the
+/// merged preset list, the editor's tips and its papers all come out of it.
+/// The error is returned rather than left in this module's notice, because the
+/// caller has its own strip to put it in and a sentence in a modal nobody has
+/// open is a sentence nobody reads.
+pub(crate) fn edit_library<T>(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    op: impl FnOnce(&mut UserLibrary) -> Result<T, PresetError>,
+) -> Result<T, String> {
+    let mut state = load(ctx, ed);
+    let Store::Broken(why) = &state.store else {
+        // `write` puts its own failure in the notice, which is the wrong place
+        // for this caller — so the operation is wrapped to carry the message
+        // out instead.
+        let mut failure = None;
+        let done = write(&mut state, ed, |library| match op(library) {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                failure = Some(e.to_string());
+                Err(e)
+            }
+        });
+        // A failed write leaves `state.notice` set by `write`; clearing it here
+        // would be this module apologising for somebody else's control.
+        state.notice = None;
+        store(ctx, state);
+        return match (done, failure) {
+            (Some(value), _) => Ok(value),
+            (None, Some(why)) => Err(why),
+            // `write` answers `None` with no error only where the store is not
+            // ready, which the arm above has already ruled out.
+            (None, None) => Err("the brush library could not be written".to_owned()),
+        };
+    };
+    let why = why.clone();
+    store(ctx, state);
+    Err(why)
+}
+
 // ---------------------------------------------------------------------------
 // The Brushes panel
 // ---------------------------------------------------------------------------
 
-/// The three marks in the Brushes panel's header: save, browse, and edit.
+/// The four marks in the Brushes panel's header: save, browse, stamps and
+/// papers, and edit.
 ///
-/// The design puts a `＋` there and nothing else. The other two are this
-/// module's: with 239 presets the panel is a shortlist rather than the library,
-/// so something has to open the rest of it, and the way into the brush editor
-/// used to be a `✎ Edit "<name>"…` link at the foot of the panel body. A link
-/// is what the design draws, and it was wrong on two counts — it sat below a
-/// scrolling list, so a panel dragged short hid the only way to change a brush,
-/// and it spent a whole row of a 264 px panel on one verb.
+/// The design puts a `＋` there and nothing else. The others are this module's:
+/// with 239 presets the panel is a shortlist rather than the library, so
+/// something has to open the rest of it, and the way into the brush editor used
+/// to be a `✎ Edit "<name>"…` link at the foot of the panel body. A link is what
+/// the design draws, and it was wrong on two counts — it sat below a scrolling
+/// list, so a panel dragged short hid the only way to change a brush, and it
+/// spent a whole row of a 264 px panel on one verb.
+///
+/// The stamps-and-papers mark is here rather than only inside the brush editor
+/// because importing a picture is something somebody does *before* they have a
+/// brush to put it on — and a library reachable only from a control inside
+/// another modal is one nobody finds.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
     let writable = state.writable();
@@ -567,6 +636,15 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     }
     if icon_button(ui, p, Icon::Grid, true, "Browse the whole brush library") {
         state.browser_open = true;
+    }
+    if icon_button(
+        ui,
+        p,
+        Icon::Stamps,
+        true,
+        "Browse the stamps and papers brushes paint through",
+    ) {
+        crate::stamplib::open(ui.ctx(), crate::stamplib::Kind::Stamps);
     }
     // Left of the library mark, and the same pencil the link it replaces
     // carried. The brush is named in the tooltip because the mark cannot say
@@ -1158,11 +1236,13 @@ fn adopt_saved_tip(ed: &mut Editor, id: &str) -> Option<String> {
 fn save_new(state: &mut State, ed: &mut Editor, name: String) {
     let brush = ed.brush;
     let (named, tip) = tip_for_save(ed);
+    let paper = ed.paper_name.clone();
     let label = name.clone();
     let saved = write(state, ed, move |library| {
         library.save(
             BrushPreset {
                 tip: named,
+                paper,
                 ..BrushPreset::unsaved(name, brush)
             },
             tip,
@@ -1196,6 +1276,12 @@ fn update(state: &mut State, ed: &mut Editor, id: String) {
     let before = preset.tip.clone();
     let (named, mask) = tip_for_save(ed);
     preset.tip = named;
+    // The paper is a name and only ever a name — see `Editor::paper_name` —
+    // so there is no second half of it to store and no `paper_for_save` to
+    // write. A name the library does not hold is still written down, for
+    // `Editor::tip_name`'s reason: it is a machine that is missing the picture,
+    // not a brush that has stopped naming one.
+    preset.paper = ed.paper_name.clone();
     let label = preset.name.clone();
     if write(state, ed, move |library| library.save(preset, mask)).is_some() {
         let after = adopt_saved_tip(ed, &id);
@@ -1582,6 +1668,7 @@ fn tip_picker(ui: &mut Ui, p: &Palette, ed: &Editor) -> Option<Option<String>> {
     let current = ed.tip_name.as_deref();
     let label = current.unwrap_or("Round");
     let mut chosen = None;
+    let mut browse = false;
     widgets::dropdown(
         ui,
         p,
@@ -1618,8 +1705,20 @@ fn tip_picker(ui: &mut Ui, p: &Palette, ed: &Editor) -> Option<Option<String>> {
                 ui.separator();
                 let _ = ui.selectable_label(true, name);
             }
+            // The way to the shipped masks, which this list still declines to
+            // name for the reason above — twenty names nobody chose would bury
+            // the two the user made. The browser shows them as *pictures* with
+            // a size beside them, which is what makes them worth offering, and
+            // that is a different control rather than this one relenting.
+            ui.separator();
+            if ui.selectable_label(false, "Browse stamps…").clicked() {
+                browse = true;
+            }
         },
     );
+    if browse {
+        crate::stamplib::open(ui.ctx(), crate::stamplib::Kind::Stamps);
+    }
     chosen
 }
 
@@ -2665,7 +2764,7 @@ fn browser_footer(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) {
 /// `controls::banner` lays its message out on one line, which is right in a
 /// 1000 px dialog and wrong in a 264 px panel; this wraps. Returns whether the
 /// dismiss mark was clicked.
-fn notice_bar(ui: &mut Ui, p: &Palette, notice: &Notice, dismissable: bool) -> bool {
+pub(crate) fn notice_bar(ui: &mut Ui, p: &Palette, notice: &Notice, dismissable: bool) -> bool {
     let mut dismissed = false;
     Frame::NONE
         .fill(if notice.bad { p.warning_bg } else { p.window })
@@ -2783,6 +2882,7 @@ mod tests {
             credit: None,
             brush: umber_core::Brush::default(),
             tip: None,
+            paper: None,
         }
     }
 

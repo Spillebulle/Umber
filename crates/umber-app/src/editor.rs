@@ -269,6 +269,21 @@ pub struct Editor {
     /// resolved against. Filled in by `brushlib::resync`, which is also what
     /// keeps `presets` in step.
     pub tips: BTreeMap<String, Arc<TipMask>>,
+    /// The *name* of the paper the brush in hand bites through, or `None` for
+    /// whichever of the shipped three `Brush::grain_pattern` names.
+    ///
+    /// **A name and no mask beside it, which is deliberately not the tip's
+    /// shape.** A tip can be drawn or imported into the hand and stay there,
+    /// unnamed, until the brush is saved, so `Editor::tip` has to carry a mask
+    /// the library has never seen. A paper cannot be in that state: it is a
+    /// tile of the *document*, shared by construction, so it goes into the
+    /// library the moment it arrives and is only ever chosen by name after
+    /// that. One field and one resolver — [`Editor::paper_tile`] — is therefore
+    /// the whole of it, where two would be two things to keep in step.
+    pub paper_name: Option<String>,
+    /// Every paper tile the user's library holds, by name. Filled in by
+    /// `brushlib::resync` beside [`Editor::tips`].
+    pub papers: BTreeMap<String, Arc<TipMask>>,
     pub layers: LayerStack,
     /// The layer list's thumbnails.
     ///
@@ -520,6 +535,8 @@ impl Default for Editor {
             tip: None,
             tip_name: None,
             tips: BTreeMap::new(),
+            paper_name: None,
+            papers: BTreeMap::new(),
             layers: LayerStack::new(),
             thumbs: crate::thumbs::Thumbs::default(),
             session: Session::default(),
@@ -809,7 +826,41 @@ impl Editor {
         // its `tips/` directory and pressing Update took the reference off the
         // brush for every machine.
         self.tip_name = preset.tip.clone();
+        // The paper is a name and stays one — see `Editor::paper_name`. It is
+        // resolved at `paper_tile`, not here, because unlike the tip it has no
+        // second state to be caught in.
+        self.paper_name = preset.paper.clone();
         self.active_preset = Some(index);
+    }
+
+    /// The tile the brush in hand paints through, or `None` for no grain.
+    ///
+    /// The one place a paper is resolved, and the two-tier lookup is the tip's:
+    /// the user's library first, then the tiles Umber ships. Both hand back an
+    /// `Arc` that is stable for as long as it is reachable, which is what
+    /// `CanvasRenderer::set_grain`'s identity check needs — so calling this
+    /// once per stroke costs a map lookup and a pointer copy, and never an
+    /// upload.
+    ///
+    /// A name that resolves to neither answers `None`, which paints **flat**.
+    /// That is `BrushPreset::paper`'s promise and it is the exact identity the
+    /// shader already pays for; falling back to a shipped tile would put a
+    /// grain the author never chose into the mark, which is how a Clip Studio
+    /// import came to paint at 78% of its own opacity.
+    pub fn paper_tile(&self) -> Option<Arc<TipMask>> {
+        match &self.paper_name {
+            Some(name) => self
+                .papers
+                .get(name)
+                .cloned()
+                .or_else(|| umber_core::tip::pattern(name).cloned()),
+            None => umber_core::tip::pattern(self.brush.grain_pattern.key()).cloned(),
+        }
+    }
+
+    /// Choose the paper by name, or go back to the shipped set with `None`.
+    pub fn set_paper(&mut self, name: Option<String>) {
+        self.paper_name = name;
     }
 
     /// Put a bitmap tip in the brush's hand, by name where it has one.

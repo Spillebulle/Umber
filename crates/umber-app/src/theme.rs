@@ -462,6 +462,19 @@ pub mod metrics {
     /// the two buttons above it claim their own room first, and a scroll area
     /// given the whole height would push them off the bottom on a short window.
     pub const PALETTE_LIBRARY: [f32; 2] = [560.0, 380.0];
+    /// The stamps-and-papers browser: how wide the modal is, and how tall its
+    /// list is.
+    ///
+    /// Fixed, for the reason [`BRUSH_LIBRARY`] is, plus one of its own: an
+    /// import here says which reading it took and whether the tile joins to
+    /// itself, which is the longest sentence in the interface after a Clip
+    /// Studio import's. Narrower than the brush browser because the rows carry
+    /// a picture and a name rather than a picture, a name, a credit line and
+    /// two controls. The second figure is the *list*, as the palette library's
+    /// is: the header, the pair of tabs and the footer claim their room first.
+    pub const STAMP_LIBRARY: [f32; 2] = [520.0, 360.0];
+    /// The square one stamp or paper is previewed in, in the browser's rows.
+    pub const STAMP_PREVIEW: f32 = 44.0;
     /// The tallest a dropdown's menu grows before it scrolls.
     ///
     /// Some of the lists are long — thirteen dab inputs, ten blend modes, a

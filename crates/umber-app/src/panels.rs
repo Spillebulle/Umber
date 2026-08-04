@@ -99,6 +99,9 @@ pub fn sidebars(
     // the Brushes panel, which the layout is free to hide — a modal that goes
     // with its panel cannot be shut and cannot be reopened.
     brushlib::dialogs(root, p, ed);
+    // Beside the brush library's own modals and for the same reason: this one
+    // is opened from the brush editor, which the layout can hide.
+    crate::stamplib::dialogs(root, p, ed);
     // The palette library, for exactly the reason above.
     palettelib::dialogs(root, p, ed);
     // The module library, for the same reason and one more: it is how a module
