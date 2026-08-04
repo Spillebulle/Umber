@@ -1847,7 +1847,7 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
 /// Holds every brush parameter that is not on the options strip, so the strip
 /// can stay short. Edits apply live — there is no OK or Cancel, because a paint
 /// app should let you see a change as you make it.
-fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if !ed.ui.brush_editor_open {
         return;
     }
@@ -2738,11 +2738,15 @@ fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
         }
     };
 
-    ui.painter().image(
+    // Four separate draws, not one with a uv range past 1: egui's textures are
+    // clamped rather than repeating, so the wide uv would magnify the top-left
+    // quarter and smear its edge row over the rest — which is the one thing a
+    // square that exists to show a join must not do.
+    crate::stamplib::tiled(
+        ui,
         texture.id(),
         rect.shrink(2.0),
-        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2.0, 2.0)),
-        egui::Color32::WHITE,
+        crate::stamplib::Kind::Papers.repeats(),
     );
 }
 

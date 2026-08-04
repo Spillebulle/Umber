@@ -69,6 +69,18 @@ impl Kind {
         }
     }
 
+    /// How many copies of the picture a preview shows across and down.
+    ///
+    /// Two for a paper, because the grain repeats across the document and a
+    /// seam is invisible until the tile meets itself; one for a stamp, which is
+    /// stretched over a single dab and has nothing to meet.
+    pub(crate) fn repeats(self) -> u32 {
+        match self {
+            Self::Stamps => 1,
+            Self::Papers => 2,
+        }
+    }
+
     /// What a row's Use button does, said before it is pressed.
     fn use_tip(self) -> &'static str {
         match self {
@@ -502,16 +514,37 @@ fn preview(ui: &mut Ui, p: &Palette, kind: Kind, name: &str, mask: &Arc<TipMask>
     // Two copies across and two down for a paper, one for a stamp: the sampler
     // that draws a paper on the canvas repeats and the one that draws a stamp
     // does not, so this is the preview showing what each really does.
-    let repeats = match kind {
-        Kind::Papers => 2.0,
-        Kind::Stamps => 1.0,
-    };
-    ui.painter().image(
-        texture.id(),
-        rect.shrink(2.0),
-        Rect::from_min_max(pos2(0.0, 0.0), pos2(repeats, repeats)),
-        egui::Color32::WHITE,
+    //
+    // Drawn as N separate images rather than as one with a uv range past 1.
+    // egui's textures are **clamped**, not repeating, so the wide uv magnifies
+    // the top-left quarter and smears its edge row across the rest — which is
+    // the one thing this square must not do, since it is here to show a join.
+    tiled(ui, texture.id(), rect.shrink(2.0), kind.repeats());
+}
+
+/// Draw one texture `repeats` times across and down inside `rect`.
+///
+/// Shared with `ui::paper_preview`, which shows the same tiles at a different
+/// size in the brush editor. One function rather than two, because the two
+/// squares have to *agree* about what a paper looks like — a seam visible in
+/// one and not the other is worse than neither showing it.
+pub(crate) fn tiled(ui: &Ui, texture: egui::TextureId, rect: Rect, repeats: u32) {
+    let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    let step = vec2(
+        rect.width() / repeats as f32,
+        rect.height() / repeats as f32,
     );
+    for row in 0..repeats {
+        for column in 0..repeats {
+            let corner = rect.min + vec2(column as f32 * step.x, row as f32 * step.y);
+            ui.painter().image(
+                texture,
+                Rect::from_min_size(corner, step),
+                full,
+                egui::Color32::WHITE,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +765,111 @@ fn import(ctx: &egui::Context, ed: &mut Editor, state: &mut State, kind: Kind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tile with a hard join down the middle, which is what an unprepared
+    /// photograph of paper looks like.
+    fn split_tile(side: u32) -> Arc<TipMask> {
+        let mut texels = vec![0u8; (side * side) as usize];
+        for y in 0..side {
+            for x in 0..side {
+                texels[(y * side + x) as usize] = if x < side / 2 { 40 } else { 220 };
+            }
+        }
+        Arc::new(TipMask::new(side, side, texels).expect("tile"))
+    }
+
+    /// The browser, both halves, and the brush editor's Texture section with a
+    /// paper of the user's own on it.
+    ///
+    /// Written rather than asserted for the reason `palette_module_preview` is:
+    /// what can go wrong in a list of rows carrying a picture, two labels and
+    /// two buttons inside a 520 px modal is a *layout*, and no assertion about
+    /// widgets catches controls drawn over each other. The tiled preview is the
+    /// other half of why this exists — a seam is a thing to be looked at, and
+    /// the shots are what say the square shows one.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app stamp_library_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn stamp_library_preview() {
+        use crate::docshot;
+        use crate::theme::Palette as Theme;
+        use egui::vec2;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/stamp-library");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // A scratch library, so the shot is a picture of the interface rather
+        // than of whoever ran it — `brushlib::load` reads the *real* one on the
+        // first frame of a fresh context. One of the papers deliberately does
+        // not join, which is the row that has to say so and the case the tiled
+        // preview exists to show.
+        let scratch = std::env::temp_dir().join("umber-stamp-shot");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let mut staged =
+            umber_core::preset::UserLibrary::load_from(&scratch).expect("a scratch library");
+        staged
+            .add_paper("linen", (*split_tile(64)).clone())
+            .expect("add");
+        staged
+            .add_paper(
+                "wove",
+                (**umber_core::tip::pattern("canvas").expect("shipped")).clone(),
+            )
+            .expect("add");
+        staged
+            .add_tip(
+                "my-nib",
+                (**umber_core::tip::builtin("umber-stipple").expect("shipped")).clone(),
+            )
+            .expect("add");
+
+        for (name, kind) in [
+            ("1-stamps", Some(Kind::Stamps)),
+            ("2-papers", Some(Kind::Papers)),
+            // The other end of the same feature: the Texture section, whose
+            // paper control became a dropdown when the closed set of three
+            // stopped being the whole list.
+            ("3-texture-section", None),
+        ] {
+            let mut ed = Editor::default();
+            ed.paper_name = Some("wove".to_owned());
+            ed.brush.grain = 0.45;
+            ed.ui.brush_editor_open = kind.is_none();
+            ed.ui.brush_tab = crate::editor::BrushTab::Texture;
+
+            let seed = State {
+                open: kind,
+                ..State::default()
+            };
+            let palette = Theme::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = match kind {
+                Some(_) => vec2(metrics::STAMP_LIBRARY[0] + 80.0, 560.0),
+                None => vec2(metrics::BRUSH_EDITOR_WIDTH + 120.0, 560.0),
+            };
+            let staged = staged.clone();
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                // Re-seeded every frame: the state is read back out of egui's
+                // memory, and a frame that had not been seeded would draw
+                // nothing at all.
+                store(root.ctx(), seed.clone());
+                brushlib::seed_library(root.ctx(), &mut ed, staged.clone());
+                dialogs(root, &palette, &mut ed);
+                crate::ui::brush_editor(root, &palette, &mut ed);
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        println!("wrote 3 shots to {}", dir.display());
+    }
 
     /// The list is the merged one and the user's own comes first, which is the
     /// order `Editor::paper_tile` and `Editor::apply_preset` resolve a name in

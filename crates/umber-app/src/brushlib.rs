@@ -595,6 +595,36 @@ pub(crate) fn edit_library<T>(
     Err(why)
 }
 
+/// Put a library into the store without reading one off disk.
+///
+/// For the preview shots alone, and it is the difference between a picture of
+/// the interface and a picture of whoever ran the test: [`load`] reads the real
+/// user library on the first frame of a fresh context, so a shot that did not
+/// seed one would show that machine's brushes and stamps. `palettelib`'s own
+/// shot seeds its state for exactly this reason; this is the same trick reached
+/// from another module.
+#[cfg(test)]
+pub(crate) fn seed_library(ctx: &egui::Context, ed: &mut Editor, library: UserLibrary) {
+    resync(ed, &library);
+    let index = Index::build(&ed.presets, library.made_collections());
+    store(
+        ctx,
+        State {
+            index: Arc::new(index),
+            store: Store::Ready(Arc::new(library)),
+            query: String::new(),
+            scope: Scope::All,
+            browser_open: false,
+            saving: None,
+            renaming: None,
+            confirming: None,
+            creating: None,
+            drag: None,
+            notice: None,
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The Brushes panel
 // ---------------------------------------------------------------------------
