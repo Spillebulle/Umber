@@ -1402,7 +1402,7 @@ mod strip_budget {
     /// The stabiliser rail. It used to be 110 for a `widgets::chip`, which is a
     /// label and a small pill; it is a third [`crate::widgets::inline_slider`]
     /// now, so it costs what one costs — the 90 point rail, the readout, and a
-    /// label two characters longer than "Opacity"'s.
+    /// label three characters longer than "Opacity"'s.
     pub const STABILISER: f32 = 190.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
@@ -1860,14 +1860,20 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
 /// the notice and the "Save this brush as" field, are `brushlib::save_bar`'s
 /// now and sit above the body instead.
 ///
-/// The style's 6 points of item spacing above the hairline, the hairline, the
-/// ten points under it, and one 22-point line of buttons.
+/// **Two** of `theme::apply`'s 6 points of item spacing — egui appends one
+/// after every allocated rect, including the zero-height one that pushes the
+/// footer down and the one-point hairline — plus that hairline, the ten points
+/// under it, and one 22-point line of buttons. 12 + 1 + 10 + 22.
 ///
 /// `the_brush_editor_is_one_size_whatever_section_is_in_front` is what holds
 /// this to what the footer actually costs, which is the half of this that is
 /// easy to get wrong: a reserve one point short is a footer that overruns the
 /// frame, and the dialog grows by that point rather than the row being clipped.
-const BRUSH_EDITOR_FOOTER: f32 = 39.0;
+/// That test therefore has to install Umber's **own** style — this was 39 while
+/// it did not, because egui's default `item_spacing.y` is 3 where Umber's is 6,
+/// and the dialog was six points taller in a running window than in the test
+/// that was supposed to be pinning it.
+const BRUSH_EDITOR_FOOTER: f32 = 45.0;
 
 /// Breathing space between the body and the footer's hairline.
 const BRUSH_EDITOR_GAP: f32 = 14.0;
@@ -1928,17 +1934,39 @@ fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.set_height(height);
 
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Edit brush — {name}"))
-                        .size(text::CONTROL)
-                        .color(p.text_strong)
-                        .strong(),
+                // The close mark first, then the title painted into what it
+                // leaves — `status_bar`'s order, and the same reason the
+                // footer's is that way round. The title carries the brush's
+                // *name*, which is text somebody else typed and therefore the
+                // one thing on this line with no length anybody can promise; as
+                // a label it would extend, and a long enough name would be
+                // drawn straight over the close mark.
+                let band = ui.max_rect();
+                // The close mark's own height, so the row is the same whatever
+                // the title elides to.
+                ui.allocate_exact_size(vec2(0.0, 18.0), Sense::hover());
+                let used = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, p, Icon::Close, true, "Close") {
+                            ed.ui.brush_editor_open = false;
+                        }
+                    })
+                    .response
+                    .rect
+                    .left();
+                let painter = ui.painter();
+                painter.text(
+                    pos2(band.left(), band.top() + 9.0),
+                    Align2::LEFT_CENTER,
+                    widgets::elide(
+                        painter,
+                        &format!("Edit brush — {name}"),
+                        text::CONTROL,
+                        used - band.left() - 8.0,
+                    ),
+                    FontId::proportional(text::CONTROL),
+                    p.text_strong,
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, p, Icon::Close, true, "Close") {
-                        ed.ui.brush_editor_open = false;
-                    }
-                });
             });
 
             ui.add_space(10.0);
@@ -2907,8 +2935,27 @@ mod tests {
     use crate::theme::{Palette, ThemeKind, metrics};
     use egui::{Rect, pos2, vec2};
 
-    /// Every section of the brush editor, and how big the dialog came out.
-    fn section_sizes() -> Vec<(BrushTab, egui::Vec2)> {
+    /// What the footer is asked to hold, beyond the six sections.
+    ///
+    /// The two that are not the ordinary case are the ones that used to make it
+    /// taller or wider: a name field armed takes the buttons off the row, and a
+    /// brush of the user's own replaces one button with two — the second
+    /// carrying a name somebody else chose, which is the width nobody here can
+    /// bound.
+    #[derive(Clone, Copy, Debug)]
+    enum Footer {
+        /// A shipped brush in hand: one "Save brush…" button.
+        Shipped,
+        /// One of the user's own, with a name long enough to be a problem:
+        /// `Update "<name>"` and `Save as new…` on one line.
+        Yours,
+        /// The "Save this brush as" field up, which takes the buttons away.
+        Naming,
+    }
+
+    /// Every section of the brush editor in every footer state, and how big the
+    /// dialog came out.
+    fn section_sizes() -> Vec<(BrushTab, Footer, egui::Vec2)> {
         let input = egui::RawInput {
             // Comfortably larger than the dialog in both directions, so the
             // clamp to the window is not what is being measured.
@@ -2926,32 +2973,58 @@ mod tests {
             BrushTab::Texture,
             BrushTab::Blending,
         ] {
-            // A context per section, not one shared by the six. egui remembers
-            // an area's rect between frames, and a modal that has already been
-            // laid out taller stays taller — so a shared context can report six
-            // sections agreeing when what they agree on is the largest of them.
-            let ctx = egui::Context::default();
-            let mut ed = Editor::default();
-            ed.ui.brush_editor_open = true;
-            ed.ui.brush_tab = tab;
-            let mut size = egui::Vec2::ZERO;
-            // Three passes and the last is the one read: the first through a
-            // fresh context builds the font atlas, and a modal lays itself out
-            // against the previous frame's screen — text measured against a
-            // half-built atlas is not the height it settles at.
-            for _ in 0..3 {
-                // Seeded rather than loaded, so this never touches the brush
-                // library of whoever is running it.
-                brushlib::seed_broken_library(&ctx, &ed, "no library");
-                let _ = ctx.run_ui(input.clone(), |ui| {
-                    super::brush_editor(ui, &palette, &mut ed);
-                });
-                size = ctx
-                    .memory(|m| m.area_rect(egui::Id::new("brush-editor")))
-                    .expect("the brush editor draws an area")
-                    .size();
+            for footer in [Footer::Shipped, Footer::Yours, Footer::Naming] {
+                // A context per measurement, not one shared. egui remembers an
+                // area's rect between frames, and a modal that has already been
+                // laid out taller stays taller — so a shared context can report
+                // every case agreeing when what they agree on is the largest.
+                let ctx = egui::Context::default();
+                // Umber's own font and spacing, not egui's defaults. This is
+                // what `docshot::Stage::shoot` does and what `ui::draw` does,
+                // and without it the whole measurement is of a style Umber
+                // never draws with: egui's `item_spacing.y` is 3 where
+                // `theme::apply` sets 6, so a footer reserve calibrated here
+                // would be six points short in a running window — which is
+                // exactly the "reserve that does not match what the footer
+                // costs" this test exists to prevent.
+                crate::theme::install_fonts(&ctx);
+                crate::theme::apply(&ctx, &palette);
+                let mut ed = Editor::default();
+                ed.ui.brush_editor_open = true;
+                ed.ui.brush_tab = tab;
+                if matches!(footer, Footer::Yours) {
+                    // Past the shipped library, which is what `Index::is_user`
+                    // reads — so the footer offers Update as well as Save as
+                    // new. The name is deliberately absurd: it is the one piece
+                    // of text in this dialog that Umber did not write.
+                    let mut mine = ed.presets[0].clone();
+                    mine.id = "user/long".to_owned();
+                    mine.name = "A stupendously long name somebody typed into the field".to_owned();
+                    ed.presets.push(mine);
+                    ed.active_preset = Some(ed.presets.len() - 1);
+                }
+                let naming = matches!(footer, Footer::Naming)
+                    .then_some("Another name of quite unreasonable length");
+                let mut size = egui::Vec2::ZERO;
+                // Three passes and the last is the one read: the first through
+                // a fresh context builds the font atlas, and a modal lays
+                // itself out against the previous frame's screen — text
+                // measured against a half-built atlas is not the height it
+                // settles at.
+                for _ in 0..3 {
+                    // Seeded rather than loaded, so this never touches the
+                    // brush library of whoever is running it.
+                    brushlib::seed_broken_library(&ctx, &ed, "no library", naming);
+                    let _ = ctx.run_ui(input.clone(), |ui| {
+                        super::brush_editor(ui, &palette, &mut ed);
+                    });
+                    size = ctx
+                        .memory(|m| m.area_rect(egui::Id::new("brush-editor")))
+                        .expect("the brush editor draws an area")
+                        .size();
+                }
+                out.push((tab, footer, size));
             }
-            out.push((tab, size));
         }
         out
     }
@@ -2978,7 +3051,7 @@ mod tests {
         // The frame's `Margin::same(18)` and its one-point border, on all four
         // sides: 18 + 1 either way.
         let expected = vec2(width + 38.0, height + 38.0);
-        for (tab, size) in &sizes {
+        for (tab, footer, size) in &sizes {
             // Within a tenth of a point rather than exactly. The height is the
             // frame's own arithmetic over a sum of `add_space`s and row
             // heights, so the last bit of the f32 differs between sections; a
@@ -2987,7 +3060,8 @@ mod tests {
             let off = (*size - expected).abs();
             assert!(
                 off.x < 0.1 && off.y < 0.1,
-                "the brush editor is {:.4} × {:.4} on {tab:?}, not {:.4} × {:.4}",
+                "the brush editor is {:.4} × {:.4} on {tab:?} with {footer:?}, \
+                 not {:.4} × {:.4}",
                 size.x,
                 size.y,
                 expected.x,
@@ -3026,29 +3100,50 @@ mod tests {
         // backdrop around it.
         let [w, h] = metrics::BRUSH_EDITOR;
         let field = vec2(w + 48.0, h + 48.0);
-        for (n, tab) in [
+        // The six sections, then the footer state the assertion above cannot
+        // speak for. `ui.set_width` bounds the dialog, so a footer whose
+        // buttons are wider than the room left beside the note does not grow
+        // the modal — it is drawn over the note, and only a picture says so.
+        // A brush of the user's own is the case: it replaces one button with
+        // two, and the second carries a name Umber did not write.
+        let sections = [
             BrushTab::Tip,
             BrushTab::Dynamics,
             BrushTab::Inputs,
             BrushTab::Scatter,
             BrushTab::Texture,
             BrushTab::Blending,
-        ]
-        .into_iter()
-        .enumerate()
+        ];
+        for (n, (tab, long_name)) in sections
+            .into_iter()
+            .map(|tab| (tab, false))
+            .chain(std::iter::once((BrushTab::Tip, true)))
+            .enumerate()
         {
             let mut ed = Editor::default();
             ed.layout = crate::dock::Layout::default();
             ed.ui.brush_editor_open = true;
             ed.ui.brush_tab = tab;
+            if long_name {
+                let mut mine = ed.presets[0].clone();
+                mine.id = "user/long".to_owned();
+                mine.name = "A stupendously long name somebody typed into the field".to_owned();
+                ed.presets.push(mine);
+                ed.active_preset = Some(ed.presets.len() - 1);
+            }
             let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
             let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |root| {
+                brushlib::seed_broken_library(root.ctx(), &ed, "no library", None);
                 super::brush_editor(root, &palette, &mut ed);
             });
-            let name = format!("{}-{tab:?}.png", n + 1);
-            docshot::write_png(&dir.join(name.to_lowercase()), &image).expect("write the png");
+            let name = if long_name {
+                "7-footer-long-name.png".to_owned()
+            } else {
+                format!("{}-{tab:?}.png", n + 1).to_lowercase()
+            };
+            docshot::write_png(&dir.join(name), &image).expect("write the png");
         }
-        println!("wrote 6 shots to {}", dir.display());
+        println!("wrote 7 shots to {}", dir.display());
     }
 
     /// The tool options strip, with the brush in hand and at three widths.

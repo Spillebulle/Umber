@@ -554,7 +554,7 @@ fn write<T>(
 ///
 /// So Import is in the browser, behind the mark beside this one. It is a
 /// *labelled* button there, which is what the rule it was left as a link for
-/// asks — a mark cannot say which six applications' brushes Umber reads, and a
+/// asks — a mark cannot say which five applications' brushes Umber reads, and a
 /// tooltip on a mark nobody hovers is not the same as a word. It is also where
 /// an import *lands*: `preset::IMPORTED` files the arrivals in one collection,
 /// and the browser is the only place that collection can be seen. See [`panel`]
@@ -944,6 +944,14 @@ fn attribution(ui: &mut Ui, preset: &BrushPreset) {
 /// whose height changes, and the dialog is one size. Drawn here they cost the
 /// *body* its space instead, which is what a scroll area is for. It is also
 /// where the Brushes panel puts its own notice, so the two read alike.
+///
+/// **The cost is real and is recorded rather than glossed**: the button that
+/// arms the field is at the foot of the dialog and the field appears at its
+/// head, six hundred points away with the whole body between them. The
+/// alternative is a footer that changes height, which is the bug this dialog
+/// was just fixed for; if that distance ever has to be closed, the answer is to
+/// give the field the footer's own reserved band and size the band for the
+/// larger of the two states, not to put it back below the body.
 pub fn save_bar(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
 
@@ -1007,53 +1015,97 @@ pub fn save_row(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         // up, which is the same wandering the dialog's fixed size exists to
         // stop, made small enough to be mystifying.
         ui.allocate_exact_size(vec2(0.0, 22.0), Sense::hover());
-        controls::note(
-            ui,
-            p,
-            "Changes here reach the brush in your hand straight away. \
-             Saving is what keeps them.",
-        );
-        if naming {
-            // The field above is already asking for the name; a button that
-            // arms it would be a second way to start what is started.
-            return;
+        let band = ui.max_rect();
+
+        // **The buttons go on first, even though they read last.** They are the
+        // half that must not be lost, and placing them first is what lets the
+        // note be measured against what is actually left rather than against
+        // the whole row — `ui::status_bar` keeps the same order for the same
+        // reason. The other way round, the note is an extending label that
+        // claims most of the row and the buttons are drawn over the top of it,
+        // which is what a brush of the user's own with a long name did: the
+        // sentence read "Changes here reach the bru" with "Save as new…"
+        // painted across it. `brush_editor_preview`'s seventh shot is that
+        // case.
+        let mut used = band.right();
+        if !naming {
+            used = ui
+                .with_layout(Layout::right_to_left(Align::Center), |ui| match &existing {
+                    Some((id, name)) => {
+                        // Elided, and to a share of the row rather than to a
+                        // number: the name is the one piece of text in this
+                        // dialog that Umber did not write, so it is the one
+                        // thing here that has no length anybody can promise.
+                        let label = widgets::elide(
+                            ui.painter(),
+                            name,
+                            text::TINY,
+                            (band.width() * 0.45).max(60.0),
+                        );
+                        if controls::text_button(
+                            ui,
+                            p,
+                            &format!("Update \"{label}\""),
+                            true,
+                            writable,
+                        )
+                        .on_hover_text(if writable {
+                            "Write these settings back over the saved brush"
+                        } else {
+                            why_not.as_str()
+                        })
+                        .clicked()
+                        {
+                            update(&mut state, ed, id.clone());
+                        }
+                        if controls::text_button(ui, p, "Save as new…", false, writable)
+                            .on_hover_text(if writable {
+                                "Keep the saved brush as it is and add another"
+                            } else {
+                                why_not.as_str()
+                            })
+                            .clicked()
+                        {
+                            state.saving = Some(Field::new(suggested_name(ed)));
+                        }
+                    }
+                    None => {
+                        if controls::text_button(ui, p, "Save brush…", true, writable)
+                            .on_hover_text(if writable {
+                                "Add this brush to your library"
+                            } else {
+                                why_not.as_str()
+                            })
+                            .clicked()
+                        {
+                            state.saving = Some(Field::new(suggested_name(ed)));
+                        }
+                    }
+                })
+                .response
+                .rect
+                .left();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &existing {
-            Some((id, name)) => {
-                if controls::text_button(ui, p, &format!("Update \"{name}\""), true, writable)
-                    .on_hover_text(if writable {
-                        "Write these settings back over the saved brush"
-                    } else {
-                        why_not.as_str()
-                    })
-                    .clicked()
-                {
-                    update(&mut state, ed, id.clone());
-                }
-                if controls::text_button(ui, p, "Save as new…", false, writable)
-                    .on_hover_text(if writable {
-                        "Keep the saved brush as it is and add another"
-                    } else {
-                        why_not.as_str()
-                    })
-                    .clicked()
-                {
-                    state.saving = Some(Field::new(suggested_name(ed)));
-                }
-            }
-            None => {
-                if controls::text_button(ui, p, "Save brush…", true, writable)
-                    .on_hover_text(if writable {
-                        "Add this brush to your library"
-                    } else {
-                        why_not.as_str()
-                    })
-                    .clicked()
-                {
-                    state.saving = Some(Field::new(suggested_name(ed)));
-                }
-            }
-        });
+
+        // Painted rather than added, because the layout above has already
+        // claimed the row: this is `status_bar`'s arrangement exactly. Elided
+        // to the band the buttons left, so it can never be the thing that
+        // widens the dialog.
+        let room = used - band.left() - 8.0;
+        let painter = ui.painter();
+        painter.text(
+            pos2(band.left(), band.center().y),
+            Align2::LEFT_CENTER,
+            widgets::elide(
+                painter,
+                "Changes here reach the brush in your hand straight away. \
+                 Saving is what keeps them.",
+                10.0,
+                room,
+            ),
+            FontId::proportional(10.0),
+            p.text_dim,
+        );
     });
 
     store(ui.ctx(), state);
@@ -1250,13 +1302,17 @@ const NEW_BRUSH: &str = "My brush";
 
 /// Make a brush, put it in the user's hand, and open the editor on it.
 ///
-/// The distinction against the `＋` in the Brushes header is worth stating,
-/// because they look alike and are not: `＋` **saves what you are holding**, so
-/// it starts from whichever preset was selected and asks for a name. This one
-/// starts from [`BrushPreset::fresh`] — the middle of every range, no stamp —
-/// which is what somebody who wants to *build* a brush rather than vary one is
-/// asking for, and it needs no name field because it can always pick a free
-/// one itself.
+/// This is what the `＋` in the Brushes header does, and what the browser's
+/// "New brush" does. It starts from [`BrushPreset::fresh`] — the middle of
+/// every range, no stamp — which is what somebody who wants to *build* a brush
+/// rather than vary one is asking for, and it needs no name field because it
+/// can always pick a free one itself.
+///
+/// The `＋` used to do the opposite: arm a "Save this brush as" field over
+/// whichever preset was selected. That made `Plus` mean "save what you are
+/// holding" in this one header and "make a new one" everywhere else in the
+/// interface. Saving what is in your hand is the brush editor's footer now, and
+/// the distinction the two once needed no longer exists.
 ///
 /// Three things here are the ones to be careful of, and all three are
 /// `Editor::presets`' doing:
@@ -2382,7 +2438,15 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                     // same pairing and the same order the panel's links keep.
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
-                            "Read MyPaint, GIMP, Krita or Photoshop brushes, or an Umber .ron library"
+                            // Every application `import`'s own file filters
+                            // name, and this is now the *only* place in the
+                            // interface that names them — the panel link that
+                            // used to carry the same sentence is gone. Clip
+                            // Studio was missing from it, so the one place a
+                            // `.sut` user could be told their files are read
+                            // was telling them the opposite.
+                            "Read MyPaint, GIMP, Krita, Photoshop or Clip Studio brushes, \
+                             or an Umber .ron library"
                         } else {
                             why_not.as_str()
                         })
@@ -2833,8 +2897,17 @@ fn sized_link(
 ///
 /// `query` is a string no preset matches, so a caller measuring the panel is
 /// measuring its furniture rather than this machine's brush collection.
+///
+/// `naming` arms the "Save this brush as" field with that name, which is one of
+/// the two states the brush editor's fixed height has to survive and cannot be
+/// reached from a test without pressing a button.
 #[cfg(test)]
-pub(crate) fn seed_broken_library(ctx: &egui::Context, ed: &Editor, why: &str) {
+pub(crate) fn seed_broken_library(
+    ctx: &egui::Context,
+    ed: &Editor,
+    why: &str,
+    naming: Option<&str>,
+) {
     store(
         ctx,
         State {
@@ -2843,7 +2916,7 @@ pub(crate) fn seed_broken_library(ctx: &egui::Context, ed: &Editor, why: &str) {
             query: "zzzz".to_owned(),
             scope: Scope::All,
             browser_open: false,
-            saving: None,
+            saving: naming.map(Field::new),
             renaming: None,
             confirming: None,
             creating: None,
@@ -2869,10 +2942,12 @@ mod tests {
     /// Measured rather than asserted about the source, and measured with a
     /// search that matches nothing so that the list is one note and the bound
     /// is about the *furniture*: a broken-library notice, the search field, the
-    /// collection picker and that note. That comes to 121 points. A link row is
-    /// 18 plus egui's 6 of spacing, so **one** put back under the list is 145
-    /// and fails here; the bound is not set at 122, because the same layout has
-    /// to hold on three platforms.
+    /// collection picker and that note. Under Umber's own style — which this
+    /// has to install, or it measures egui's 3 points of item spacing where the
+    /// application draws 6 — that comes to 133 points. A link row is 18 plus
+    /// that spacing, so **one** put back under the list is 157 and fails here.
+    /// The bound sits between the two rather than just over 133, because the
+    /// same layout has to hold on three platforms.
     #[test]
     fn the_brushes_panel_body_ends_at_its_list() {
         use crate::editor::Editor;
@@ -2888,6 +2963,12 @@ mod tests {
             ..Default::default()
         };
         let palette = Palette::of(ThemeKind::Graphite);
+        // Umber's own font and spacing, not egui's defaults, or this measures a
+        // style Umber never draws with — egui's `item_spacing.y` is 3 where
+        // `theme::apply` sets 6, so every gap counted here would be half the
+        // one on screen.
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
         let mut ed = Editor::default();
 
         // Twice, and the second is the one read: the first pass through a fresh
@@ -2895,7 +2976,7 @@ mod tests {
         // one is not the height it will settle at.
         let mut measured = 0.0;
         for _ in 0..2 {
-            seed_broken_library(&ctx, &ed, "no library");
+            seed_broken_library(&ctx, &ed, "no library", None);
             let _ = ctx.run_ui(input.clone(), |ui| {
                 super::panel(ui, &palette, &mut ed);
                 measured = ui.min_rect().height();
@@ -2903,7 +2984,7 @@ mod tests {
         }
 
         assert!(
-            measured < 135.0,
+            measured < 145.0,
             "the Brushes panel body is {measured} points with nothing listed, \
              which is room for a control under the list"
         );
