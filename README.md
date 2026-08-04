@@ -280,8 +280,6 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 ## What is not there yet
 
 - **Text and shapes.** Six tools where the design draws sixteen.
-- **Mobile.** Android and iOS are prepared for architecturally but have never
-  been built or run. Do not believe anyone who says otherwise.
 - **Structural undo.** Undo covers painting, transforms and canvas flips; adding,
   deleting or reordering a layer is not recorded, and deleting a layer clears the
   history.
@@ -290,11 +288,7 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 - **A folder's own opacity and blend mode.** Folders hold layers and their eye
   and lock reach inside, but a group opacity needs group compositing.
   [`docs/layer-folders.md`](docs/layer-folders.md) has the design and its cost.
-- **Photoshop's layer masks.** Krita's transparency masks come across; a `.psd`
-  mask is reported as lost rather than converted, and Krita's filter, transform,
-  selection and colorize masks are named rather than approximated.
-- **Pen pressure on macOS and Linux**, as above. Windows works.
-- A navigator, and stylus tilt.
+- A navigator.
 
 ## Building from source
 
