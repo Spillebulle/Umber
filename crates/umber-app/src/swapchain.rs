@@ -35,7 +35,7 @@ pub enum Acquisition {
     Suboptimal,
     /// No texture: the surface's configuration is out of date.
     Outdated,
-    /// No texture: the swapchain is gone and has to be built again.
+    /// No texture: the swapchain is gone.
     Lost,
     /// No texture: the window is minimised or hidden.
     Occluded,
@@ -108,7 +108,15 @@ pub fn plan(acquisition: Acquisition) -> Frame {
         },
         // No texture was handed over, so there is nothing to hold the
         // reconfigure back and every reason to do it before returning: wgpu's
-        // own guidance for both is "configure and try again".
+        // guidance for `Outdated` is "configure and try again".
+        //
+        // `Lost` is the same answer and is deliberately not a stronger one.
+        // wgpu says a lost surface should be created again through
+        // `Instance::create_surface`, which means a new window handle and a
+        // new `egui_wgpu::Renderer`; nothing has ever done that here, and a
+        // reconfigure is what Umber has always tried. Making that a rebuild is
+        // a change worth making on evidence that it happens, not on the way
+        // past.
         Acquisition::Outdated | Acquisition::Lost => Frame {
             draws: false,
             reconfigure: true,
