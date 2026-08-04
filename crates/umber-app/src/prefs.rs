@@ -84,6 +84,15 @@ pub struct Prefs {
     /// theme that has gone would leave the interface with no colours at all.
     /// `theme` is what it falls back to, which is the built-in the custom one
     /// was made from.
+    ///
+    /// An id is read back exactly as written, with no check that it names
+    /// anything — this module cannot see the library. It is [`apply`] that
+    /// tries to resolve it, and an id that does not resolve leaves
+    /// `Editor::custom_theme` empty, so the *next* thing to write the file
+    /// drops the line. That is deliberate rather than tidy-minded: the theme
+    /// is genuinely not there, and a preferences file that went on naming it
+    /// would mean an interface that changed colour whenever the file came
+    /// back.
     pub custom_theme: Option<String>,
     /// egui's zoom factor: everything drawn in points scales by this.
     pub interface_scale: f32,

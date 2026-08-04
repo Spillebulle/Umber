@@ -1536,25 +1536,47 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     // whatever the enclosing layout last said.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(CARD_GAP, CARD_GAP);
+        let mut built_in = None;
         for kind in ThemeKind::ALL {
             let selected = ed.custom_theme.is_none() && ed.ui.theme == kind;
             if theme_card(ui, p, &Palette::of(kind), kind.label(), selected) {
-                ed.ui.theme = kind;
-                ed.custom_theme = None;
-                prefs::mark_dirty();
+                built_in = Some(kind);
             }
         }
-        let mine: Vec<themelib::CustomTheme> = state
-            .library()
-            .map(|library| library.themes().to_vec())
-            .unwrap_or_default();
-        for theme in &mine {
-            let selected = ed.custom_theme.as_ref().is_some_and(|t| t.id == theme.id);
-            if theme_card(ui, p, &theme.palette, &theme.name, selected) {
-                use_custom(ed, theme);
+        // Which card was clicked, applied after the row: putting a theme in
+        // hand while the row is still being drawn would leave the cards after
+        // it disagreeing with the ones before about which is in use. The rule
+        // the layer panel's "All" box already follows — and it is also what
+        // keeps this to one clone on a click rather than a copy of every theme
+        // in the library on every frame.
+        let mut chosen = None;
+        if let Some(library) = state.library() {
+            for (at, theme) in library.themes().iter().enumerate() {
+                let selected = ed.custom_theme.as_ref().is_some_and(|t| t.id == theme.id);
+                if theme_card(ui, p, &theme.palette, &theme.name, selected) {
+                    chosen = Some(at);
+                }
             }
         }
-        if new_theme_card(ui, p, &state) {
+        let make = new_theme_card(ui, p, &state);
+
+        if let Some(kind) = built_in {
+            ed.ui.theme = kind;
+            ed.custom_theme = None;
+            prefs::mark_dirty();
+            // The fields are filled from the theme in hand, and it has just
+            // changed. `load_themes` refills at the top of the frame, so
+            // without this the editor below would spend one frame showing the
+            // colours of the theme that was in hand a moment ago.
+            state.refill(ed);
+        }
+        if let Some(at) = chosen
+            && let Some(theme) = state.library().and_then(|l| l.themes().get(at).cloned())
+        {
+            use_custom(ed, &theme);
+            state.refill(ed);
+        }
+        if make {
             new_theme(&mut state, ed);
         }
     });
@@ -1680,7 +1702,7 @@ fn theme_card(
     painter.text(
         strip.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
-        elide(&painter.clone(), name, room.max(20.0)),
+        elide(painter, name, room.max(20.0)),
         FontId::proportional(text::SMALL),
         swatch.text_strong,
     );
@@ -1934,6 +1956,13 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
         // of the row naming a theme that had gone. The rule the layer panel's
         // "All" box already follows.
         let mut request: Option<Request> = None;
+        // A rename is not one of those, and cannot be: clicking any of the
+        // buttons takes the focus off the name field, so the two arrive in the
+        // *same* frame. Collected separately and applied first, or a name typed
+        // and then Exported would export under the name it had before — and a
+        // name typed and then Deleted would spend the click on the rename and
+        // need a second one.
+        let mut renamed = false;
         let mine = ed.custom_theme.clone();
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1997,9 +2026,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                     // letter would be unusable. Escape abandons; anything else
                     // keeps what was typed, and an emptied field is not a
                     // nameless theme — the model substitutes "Untitled theme".
-                    if field.lost_focus() {
-                        request = Some(Request::Rename);
-                    }
+                    renamed = field.lost_focus();
                 }
                 None => {
                     ui.label(
@@ -2014,6 +2041,9 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
             }
         });
 
+        if renamed {
+            rename_theme(state, ed);
+        }
         if let Some(request) = request {
             act_on(request, state, ed);
         }
@@ -2040,7 +2070,6 @@ enum Request {
     Delete,
     Export,
     Import,
-    Rename,
 }
 
 fn act_on(request: Request, state: &mut Themes, ed: &mut Editor) {
@@ -2049,7 +2078,6 @@ fn act_on(request: Request, state: &mut Themes, ed: &mut Editor) {
         Request::Delete => delete_theme(state, ed),
         Request::Export => export_theme(state, ed),
         Request::Import => import_theme(state, ed),
-        Request::Rename => rename_theme(state, ed),
     }
 }
 
