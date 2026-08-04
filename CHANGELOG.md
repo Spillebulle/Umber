@@ -12,6 +12,69 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.6 — 2026-08-04
+
+The clipboard now reaches other applications, an autosaved copy is offered back
+after a crash instead of waiting in a folder for you to find it, selections gain
+intersect and feather, and brushes gain blend modes. Clip Studio brushes were
+importing at roughly two thirds of the opacity they were set to — three separate
+causes, all fixed.
+
+### New
+
+- **The system clipboard.** Copy and paste pictures to and from other
+  applications: a screenshot pastes straight onto the canvas, and a region
+  copied out of Umber can be pasted anywhere else. Text works in every field
+  too, and the crash box finally has a **Copy details** button.
+- **Crash recovery.** If Umber stops without closing properly, the next start
+  offers its autosaved copies back — naming each document and when it was last
+  written. Opening one puts the painting in front of you and writes nothing over
+  the file it came from until you save it there yourself. Saying no keeps every
+  copy where it is.
+- **Selections gain intersect, subtract and a feather.** Hold `Shift` to add,
+  `Ctrl` to take away, both to keep only the overlap; or pick a mode on the tool
+  strip. The feather softens an edge by as many pixels as you ask for, and an
+  axis-aligned rectangle stays exact on both axes.
+- **Per-brush blend modes.** A marker that multiplies into the paper without
+  putting the whole layer into Multiply. Brushes that do not set one paint
+  exactly as before, and cost nothing extra.
+- **A Palette module.** Click a slot to keep the colour in hand, and save a
+  whole set to a library. Palettes are plain GIMP `.gpl` files in a folder of
+  their own, so anything that reads them can read yours.
+- **A Harmony picker mode**, marking the complement, triad, tetrad, analogues or
+  split-complement of the hue you are on.
+- **Krita transparency masks import.** Opening a `.kra` brings its transparency
+  masks across rather than reporting them lost. Krita's filter, transform,
+  selection and colorize masks are still named rather than approximated, because
+  Umber has no equivalent for them.
+
+### Fixed
+
+- **Clip Studio brushes imported far too transparent.** Setting opacity to 100%
+  gave roughly 60%, and laying the stroke down again got closer to the colour
+  you asked for. Three causes: a dynamic's floor was read for brush size but
+  thrown away for opacity, so a brush meant to paint from six tenths at a
+  feather touch painted from nothing; brush density never followed the pen; and
+  a texture that was switched *off* still had its value in the file, so
+  untextured brushes painted through paper they did not have — mottled, weak,
+  and darker on every pass. Pressure now also reaches brush hardness, which was
+  never read at all.
+- **A document with more than 64 layer slices could not be transformed.** With
+  33 masked layers, lifting, pasting and transforming all refused — with 63
+  slices free — under a notice saying Umber had run out of room.
+- **The Windows pointer stayed on screen under a pen.** Umber had been asking
+  for it to be hidden since 0.0.5; the request was being dropped, because a pen
+  does not produce the mouse message the window system requires before it will
+  hide anything. Umber now hides it directly, and Settings → Input & pen reports
+  what it asked for.
+- **Umber's folders claimed to be isolated groups.** OpenRaster assumes a folder
+  isolates its contents unless told otherwise, and Umber's folders do not — so a
+  document with a Multiply layer inside a folder looked one way in Umber and
+  another in Krita or GIMP. The file now says what Umber actually draws.
+- **A damaged Clip Studio brush file could take Umber down**, and a Photoshop
+  file with a compressed layer mask is now refused with a message rather than
+  crashing partway through opening.
+
 ## 0.0.5 — 2026-08-03
 
 Layer folders, a selection that carries its own commands, and three bugs that
