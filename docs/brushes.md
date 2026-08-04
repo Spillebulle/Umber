@@ -107,27 +107,112 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-**239 presets**: Umber's own six, all 196 MyPaint brushes, and 37 out of four
-more packs — David Revoy's 2025-01 Krita bundle (18), Raghavendra Kamath's v2.1
-(8), GDQuest's (11), and rubberduck's 60 GIMP stamps (none). All CC0 except
+**228 presets**: Umber's own six, all 196 MyPaint brushes, and 26 out of four
+more packs — David Revoy's 2025-01 Krita bundle (11), Raghavendra Kamath's v2.1
+(6), GDQuest's (9), and rubberduck's 60 GIMP stamps (none). All CC0 except
 GDQuest's, which is CC-BY and therefore carries its credit.
 
-Eighteen of those 37 are Krita brushes whose dab is *generated* rather than
-stamped, so they convert exactly. **The other nineteen stamp a bitmap tip**,
-which the shipped library carries now: 15 masks, 624 kB of 8-bit greyscale PNG
-in `crates/umber-core/assets/tips/`, 664 kB of release binary. See "Tips in the
-shipped library" below.
+Fifteen of those 26 are Krita brushes whose dab is *generated* rather than
+stamped, so they convert exactly. **The other eleven stamp a bitmap tip**,
+which the shipped library carries now: 10 masks, 295 kB of 8-bit greyscale PNG
+in `crates/umber-core/assets/tips/`. Measured once at 624 kB of PNG, the
+release binary grew by 664 kB, so a mask costs the binary about what it costs
+the directory. See "Tips in the shipped library" below.
 
 The rest of what those packs hold needs a mask too and still does not ship. 338
 brushes across the five packs carry one, and the numbers say where they went:
 
 | | |
 |---:|---|
-| 19 | ship |
+| 11 | ship |
 | 17 | are rubberduck's, whose masks this project does not redistribute — a licence decision, in `docs/brush-sources.md` |
-| 302 | lost something else on the way in and would have been refused whatever happened to their masks; 257 of them for one reason alone — a `.gih` pipe's sequencing, which Umber cannot reproduce |
+| 310 | lost something else on the way in and would have been refused whatever happened to their masks; 257 of them for one reason alone — a `.gih` pipe's sequencing, which Umber cannot reproduce |
 
 Every one of the 338 imports.
+
+### Why the other 363 are refused
+
+The generator prints this on every run, and it is the honest answer to "why is
+my favourite brush not in here". A brush is counted under every reason it names,
+so the rows overlap; **alone** is the number refused for that reason and nothing
+else, which is what a fix aimed at that reason would actually ship.
+
+| Refused for | mypaint | deevad | raghukamath | gdquest | rubberduck | total | alone |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| animated brush sequences (a `.gih` pipe) | 0 | 12 | 1 | 2 | 252 | 267 | 257 |
+| paper texture | 0 | 11 | 11 | 9 | 0 | 31 | 11 |
+| coloured stamps | 0 | 4 | 7 | 14 | 0 | 25 | 11 |
+| mirrored dabs | 0 | 9 | 3 | 8 | 0 | 20 | 2 |
+| dynamics driven by speed, tilt or stroke position | 0 | 7 | 1 | 12 | 0 | 20 | 3 |
+| a separate paint-deposit rate | 0 | 5 | 1 | 13 | 0 | 19 | 7 |
+| a mask this project does not redistribute | 0 | 0 | 0 | 0 | 17 | 17 | 17 |
+| dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 1 |
+| bitmap tips stored outside the file | 0 | 0 | 0 | 10 | 0 | 10 | 1 |
+| square brush shapes | 0 | 0 | 5 | 2 | 0 | 7 | 0 |
+| brush-tip randomness | 0 | 0 | 6 | 0 | 0 | 6 | 1 |
+| brush-tip density | 0 | 0 | 5 | 0 | 0 | 5 | 0 |
+| edge sharpening | 0 | 1 | 1 | 2 | 0 | 4 | 1 |
+| star-shaped brushes | 0 | 0 | 1 | 2 | 0 | 3 | 1 |
+| masking brushes | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
+
+Seven more files are refused whole, before a brush comes out of them, because
+they are one of Krita's other paint engines — `spraybrush` ×3,
+`experimentbrush` ×2, `deformbrush`, `hatchingbrush`, all GDQuest's.
+
+Three things the table says that are worth reading twice.
+
+- **Not one of these refusals is about having nowhere to put a bitmap.** The
+  shipped library has carried masks since `tip::builtin` arrived, so the tip
+  half of the question is already answered; a *user's* tip library changes
+  nothing here, because what the generator ships is not what the user stores.
+  "Bitmap tips stored outside the file" is a `.kpp` naming a predefined brush
+  that is in no pack Umber fetched — nothing in Umber can supply what is not in
+  the download.
+- **The `.gih` row is 257 brushes and 252 of them are rubberduck's**, whose
+  masks do not ship anyway. A dab pass that could rotate through an array of
+  tips would therefore add 5 brushes to the library and 252 to what an
+  *import* reproduces faithfully. Both are worth having and they are not the
+  same claim.
+- **`umber-core::dynamics` exists and `kpp.rs` does not use it.** That row is a
+  refusal the *reader* makes rather than one the engine forces, and its own
+  wording is wrong about these packs. All 20 are `fuzzy` — Krita's per-dab
+  random — either alone (9) or compounded with pressure (11), plus one `speed`
+  and one `fuzzystroke`. Umber has had `DabInput::Random` and `DabInput::Speed`
+  since the MyPaint importer needed them, so **19 of the 20 name an input the
+  engine can drive**; only `fuzzystroke`, a draw held for a whole stroke, has no
+  equivalent. What is missing is the half of `mypaint.rs` that turns a mapping
+  into a `Modulated` entry, which this reader never grew. See "The two things
+  that would unlock the most" below.
+
+  The **rotation** row is the opposite case and is genuinely blocked: 7
+  `ascension` (tilt direction), 4 `rotation` (barrel), 1 `tangentialpressure` —
+  none of which any desktop pointer here reports — and one `pressure`, which
+  would want an Angle target driven by pressure that `dynamics` does not carry.
+
+#### The two things that would unlock the most
+
+Ranked by brushes gained for work done, and both are reader work rather than
+engine work.
+
+1. **A `.gih` pipe chosen per dab.** 257 brushes, more than every other reason
+   put together. It needs the dab pass to hold an array of tips and an index per
+   instance — engine work, and the only entry here that is. 252 of the 257 are
+   rubberduck's, whose masks do not ship, so the *library* gains 5 and an
+   import gains 252 faithful stamps. Both are real and they are not the same
+   number.
+2. **Krita dynamics as `Modulated` entries.** 3 brushes ship the day it lands,
+   19 stop being approximated on import, and it needs no engine change at all —
+   the table, the inputs and the targets are all there. It also closes a second
+   fault on the way: `Preset::dynamic` and `has_foreign_sensor` both read
+   `sensor_id`, the *first* id in the sensor, which for Krita's compound
+   `<params id="sensorslist">` is the wrapper's own name. That is the exact bug
+   `sensor_ids` was written for and it was only ever applied to rotation, so
+   for those 11 presets the pressure curve is being dropped as well as the
+   random one. No shipped preset is affected, because all 20 are refused today.
+
+Two more, for scale: **coloured stamps** (25, 11 alone) needs a colour scratch
+the dab pass does not have and is a large change; **paper texture** (31, 11
+alone) is the section below.
 
 It was 128 for a while. The 68 missing were refused by the generator rather than
 lost by accident, and both reasons were engine gaps rather than import gaps:
@@ -169,21 +254,21 @@ pack ever need it.
 
 Twelve collections, in the order the picker lists them:
 
-Counted over the 233 the generator converts; Umber's own six are on top of
+Counted over the 222 the generator converts; Umber's own six are on top of
 these and sort the same way.
 
 | Collection | Count |
 |---|---|
-| Pencils & sketching | 15 |
+| Pencils & sketching | 13 |
 | Inks & pens | 32 |
 | Markers | 5 |
 | Charcoal, chalk & pastel | 6 |
-| Paint & brushes | 61 |
+| Paint & brushes | 58 |
 | Watercolour & wet media | 22 |
 | Airbrush & spray | 13 |
 | Blenders & smudge | 22 |
 | Erasers | 9 |
-| Texture & grain | 19 |
+| Texture & grain | 13 |
 | Foliage & fur | 9 |
 | Effects & experimental | 20 |
 
@@ -434,7 +519,7 @@ Documented in full in the module docs of
   its average density. Umber's `max` coverage has no per-dab density to keep.
 - **Bitmap tips.** MyPaint has none either — a `.myb` is always a round dab, so
   nothing is lost here. The engine and the library both have them now, and
-  nineteen Krita stamps ship through them; it is the Krita and GIMP packs they
+  eleven Krita stamps ship through them; it is the Krita and GIMP packs they
   exist for.
 - **Opacity build-up.** MyPaint composites each dab, so a low-opacity brush
   darkens as a stroke crosses itself. Umber takes a `max` of coverage and
@@ -475,22 +560,36 @@ of them are:
 
 | Field | Default in | Live in | Verdict |
 |---|---|---|---|
-| `min_size_ratio` | 95 of 233 | the other 138, all of which set `pressure_size` | dead where defaulted |
-| `min_hardness_ratio` | 165 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
-| `grain`, `grain_scale`, `grain_pattern` | 233 | none | nothing in any pack asks for paper |
-| `build_up` | 232 | 1 — Raghukamath's "Drybrush", measured | see below |
-| `stroke_span` | 177 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
-| `stabilization` | 37 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
+| `min_size_ratio` | 92 of 222 | the other 130, all of which set `pressure_size` | dead where defaulted |
+| `min_hardness_ratio` | 154 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
+| `grain`, `grain_scale`, `grain_pattern` | 222 | none — **but 31 of the packs' presets ask for paper**, and all 31 are refused for it | see "The paper texture" under the Krita reader |
+| `build_up` | 222 | none, and this row used to be 232/1 | see below |
+| `stroke_span` | 166 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
+| `stabilization` | 26 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
 
-The two ratios are the useful result: the counts add up to 233 exactly, so no
+The two ratios are the useful result: the counts add up to 222 exactly, so no
 brush that varies with pressure is falling back on a default, and the ones that
-do not vary are carrying a number nothing reads. `build_up` stopped being all
-default when the stamps arrived, and it is the one row here that is *measured*
-per brush rather than defaulted: `stroke_coverage` decides it, and it comes out
-true for exactly one of the nineteen shipped stamps. `smudge_length` and
-`smudge_radius` look like the same case at a glance — 153 and 195 presets sit on
-Umber's default — and are not: those *are* MyPaint's defaults, read out of the
-file through the same evaluation as everything else.
+do not vary are carrying a number nothing reads.
+
+The grain row said "nothing in any pack asks for paper" and was **wrong**, which
+is worth leaving in the record rather than quietly correcting: 31 presets across
+the three Krita packs switch a texture on, and `kpp.rs` never saw one because it
+read `Texture/Enabled` where Krita writes `Texture/Pattern/Enabled`. Eleven of
+them were shipping without their grain. A table of defaults is only evidence
+that a field is dead if the reader that would have filled it in is looking in
+the right place.
+
+`build_up` went with them. It was 232 default and 1 live — Raghukamath's
+"Drybrush", measured — and that one brush asks for paper, so **no shipped preset
+sets `build_up` today**. The flag is still measured per brush rather than
+defaulted, by `stroke_coverage`, and every stamp an import produces still gets
+the same answer; what has gone is the library's own example of it, which is what
+`crates/umber-render/src/canvas.rs` measured its `R8Unorm` accumulation error
+against.
+
+`smudge_length` and `smudge_radius` look like the same case at a glance — 153
+and 195 presets sit on Umber's default — and are not: those *are* MyPaint's
+defaults, read out of the file through the same evaluation as everything else.
 
 Krita's is the one place a default is doing real work. Its stabiliser belongs to
 the freehand tool rather than to the preset, so there is nothing in a `.kpp` to
@@ -739,6 +838,57 @@ antialiases unconditionally and has nothing to switch off. It is the whole of a
 pixel-art brush, so it is now named — which costs the library GDQuest's two
 pixel-art presets, correctly: a one-pixel brush that paints a soft grey dot is
 not the brush its author drew.
+
+#### The paper texture, and what a texture library would buy
+
+A fifth fault, and the same shape as the first four: a value read without the
+thing that decides whether Krita reads it — except here the *key itself* was
+invented. The reader tested `Texture/Enabled`. Krita has never written that:
+`KisTextureOption` states every one of its settings under `Texture/Pattern/`, so
+the flag was false in all 119 presets of the fetched packs, no import has ever
+mentioned a paper, and the table of fields no source fills recorded "nothing in
+any pack asks for paper" as a *finding*.
+
+**31 presets switch a texture on**, at a live strength — 0.45 at the lowest and
+1 in thirty of them — and **eleven of them were shipping**. Several are named
+for the grain they had lost: "F) Thick Dry Canvas", "GDquest Texture Fabric",
+"GDquest Rock Texture Crevaces", "F) Rough Rake Textured", "C5) Thin Brush Hard
+Edge Textured", both of Raghukamath's Drybrushes. They are refused now, which is
+why the library is 222 presets rather than 233.
+
+`MaskingBrush/Enabled` sits two lines above it in the same reader, is spelled
+correctly, and fires on the one preset that uses it. That is what made the
+silence read as an absence of textured brushes rather than as a bug, and it is
+the argument for the pack sweeps in this file: a hand-built fixture pins the
+reader against itself, and only a real archive can say whether the reader is
+looking in the right place. The fixture in `kpp.rs` had the invented key too.
+
+**A texture library is not what unblocks these**, and the numbers are worth
+having before anybody assumes it is one job:
+
+| | |
+|---:|---|
+| 31 | presets switch a texture on |
+| 20 | carry the pattern base64-encoded in the preset itself |
+| 11 | are Revoy's, naming six patterns his bundle ships under `patterns/` |
+| 7 | are plain multiply, no inversion, no cutoff remap — which is what `Brush::grain` already is |
+
+So every pattern is *available*, and every pack's licence is verified inside its
+own download, which is what redistributing a bitmap needs — the `ship_tips`
+question in `docs/brush-sources.md`, asked again about paper. What is missing is
+the **model**. Krita's texture carries a texturing mode (14 of the 31 use
+Subtract, which Umber has no equivalent for, and four use modes this project has
+not identified at all), an inversion (11), a levels remap of the pattern
+(`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15) and a pressure curve on the
+strength (25). Umber's grain is one multiply — `mix(1.0, tile, strength)` — and
+that is deliberate, because a strength of zero has to be the exact identity.
+
+Of the eleven that were shipping, **four** are plain multiply and would come
+back exactly once a preset can name a paper: "C2) Mechanical Pencil Detail",
+"C4) Thin Brush Regular", "F) Rough Rake Textured" and "GDquest Texture Fabric".
+The other seven need an inverted pattern, a cutoff remap or Subtract, and until
+one of those exists they are correctly refused. Approximating them is the thing
+the generator is fussy in order not to do.
 
 #### And three more, all about how a dab turns
 
@@ -1204,7 +1354,7 @@ decodes an `include_bytes!` table generated from the files in
 is stable for the life of the process, which is what `CanvasRenderer::set_tip`'s
 identity check needs.
 
-**Twenty shipped brushes use it**, carried by sixteen masks.
+**Twelve shipped brushes use it**, carried by eleven masks.
 
 One is Umber's own: **Stipple chalk**, a sparse speckle drawn by
 `examples/build-bitmaps.rs`. Sparse on purpose — a dense silhouette would paint
@@ -1212,25 +1362,30 @@ identically under either coverage rule and would demonstrate nothing. Its
 brightest texel is 0.44, so it ships with `build_up` set, and
 `a_shipped_stamp_paints_at_the_strength_it_was_drawn_at` checks that flag
 against the measurement rather than against anybody's memory. It checks the
-other nineteen the same way, which is what makes the flag a measurement rather
-than a habit: exactly one of them — Raghukamath's "Drybrush", peak texel 0.878 —
-comes out needing it.
+other eleven the same way, which is what makes the flag a measurement rather
+than a habit — and **it is now the only shipped stamp that needs build-up**.
+Raghukamath's "Drybrush", peak texel 0.878, was the other one and asks for a
+paper texture Umber does not carry, so it no longer ships.
 
-The other nineteen are Revoy's, Raghukamath's and GDQuest's stamps, written by
+The other eleven are Revoy's, Raghukamath's and GDQuest's stamps, written by
 `examples/build-brush-library.rs` into the same directory. Three things about
 how they get there:
 
-- **Deduplicated by content.** Fifteen masks carry nineteen brushes, because a
-  pack routinely cuts several presets from one stamp. That is exactly what
+- **Deduplicated by content.** Ten masks carry eleven brushes, because a pack
+  routinely cuts several presets from one stamp. That is exactly what
   `BrushPreset::tip` holding a *name* buys — one file, one embedded copy, one
   GPU upload, and `CanvasRenderer::set_tip`'s identity check skipping the upload
-  when a second such brush is picked up.
+  when a second such brush is picked up. A mask takes its name from the **first**
+  preset to use it, so refusing an earlier user hands the name to a later one:
+  two files were renamed when the textured presets stopped shipping, and that is
+  the rule working rather than a fault.
 - **At their original resolution.** A cap was measured rather than assumed and
   is not worth having: the median mask in the packs is 350 px, so capping the
   long side at 512 saves 6% of the bytes and capping it at 256 flips eleven
   build-up verdicts and takes one mask below the strength at which eight-bit
-  coverage can accumulate at all. Fifteen masks at full size are 624 kB, which
-  is 664 kB of release binary — measured, before and after.
+  coverage can accumulate at all. Ten masks at full size are 295 kB; measured
+  once at fifteen masks and 624 kB, the release binary grew by 664 kB, so a mask
+  costs the binary about what it costs the directory.
 - **The generator owns the pack half of the directory.** It deletes the masks a
   previous run left behind, so a brush that stops shipping cannot leave a
   megabyte in the binary that nothing references, and it rewrites `tip_table.rs`
@@ -1268,6 +1423,27 @@ per pack. See `docs/brush-sources.md`.
   arrives as one preset per cell and says which rule it lost.
 - **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
   and reading a fourth off disk needs a variant that names a file.
+
+  This is now the library's largest single refusal after the `.gih` pipes: 31
+  Krita presets ask for a paper and 11 of them would otherwise ship. A texture
+  store is **necessary and not sufficient** — the patterns are all available,
+  20 embedded in their presets and 11 in Revoy's bundle, and the licences are
+  verified inside the downloads, but only 7 of the 31 are the plain multiply
+  `Brush::grain` performs. Bringing back four of the eleven needs the store
+  alone; the other seven need Krita's Subtract mode, an inverted pattern or a
+  cutoff remap, in that order of frequency. See "The paper texture, and what a
+  texture library would buy".
+- **Krita's dynamics as `Modulated` entries.** `mypaint.rs` turns a mapping into
+  a table entry and `kpp.rs` never learned to; the engine's side has existed
+  since. 20 presets are refused for a dynamic driven by something other than
+  pressure, and 19 of them name `fuzzy` (per-dab random), `pressure` and
+  `fuzzy` compounded, or `speed` — every one of which `DabInput` already
+  carries. Three ship the day it lands and the rest stop being approximated on
+  import. It would also fix `Preset::dynamic` and `has_foreign_sensor` reading
+  `sensor_id` rather than `sensor_ids`, which for Krita's compound
+  `<params id="sensorslist">` takes the wrapper's own name and drops the
+  pressure curve with the random one — the same fault `sensor_ids` was written
+  for, applied to rotation only.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
   miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
   ellipticity is thrown per dab draws its row as though it were not. Fixing it

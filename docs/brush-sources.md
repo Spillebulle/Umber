@@ -63,9 +63,9 @@ better.
   check that can open a nested archive.
 - Result: **44 of the 46 read**; the other two are `deformbrush` and
   `experimentbrush`, which are separate Krita paint engines rather than brush
-  settings. Of the 44, **18 ship** — 7 procedural and **11 stamps**, carried by
-  7 masks. The rest drop something Umber cannot render. All 44 import through
-  **Import brushes…** today, tips and all.
+  settings. Of the 44, **11 ship** — 6 procedural and **5 stamps**, carried by
+  4 masks. The rest drop something Umber cannot render, 11 of them a paper
+  texture. All 44 import through **Import brushes…** today, tips and all.
 - Masks shipped: yes. CC0 stated in the bundle's own `meta.xml`, which is a
   licence statement inside the download.
 
@@ -78,9 +78,10 @@ better.
 - Licence evidence: **passes.** `LICENSE` at the root of the repository is the
   full CC0 1.0 Universal text, and `README.md` states "## Licence — [CC0]".
   Both are in any archive of it.
-- Result: 26 read, **8 ship** — 4 procedural and **4 stamps**, carried by 4
+- Result: 26 read, **6 ship** — 4 procedural and **2 stamps**, carried by 2
   masks. The rest use Krita's brush-tip randomness and density, which Umber's
-  dab has no equivalent for, or drop something else.
+  dab has no equivalent for, or a paper texture (11 of them), or drop something
+  else.
 - Masks shipped: yes. CC0 stated in the repository's `LICENSE` and `README.md`,
   both of which are in any archive of it.
 - The repository also ships the same presets loose under `paintoppresets/`. The
@@ -100,8 +101,9 @@ better.
   row, and `every_shipped_preset_is_usable_and_attributed` fails the build if
   one ever does not. This is what `BrushPreset::credit` was built for.
 - Result: 43 read (7 refused as other paint engines — `spraybrush`,
-  `hatchingbrush`, `experimentbrush`, `deformbrush`), **11 ship** — 7 procedural
-  and **4 stamps**, carried by 4 masks.
+  `hatchingbrush`, `experimentbrush`, `deformbrush`), **9 ship** — 5 procedural
+  and **4 stamps**, carried by 4 masks. Nine of the refusals are a paper
+  texture.
 - Masks shipped: yes, **with attribution**, which for CC-BY is a condition
   rather than a courtesy. Every preset generated from this pack carries a
   `Credit` naming GDquest whether it stamps a mask or not, and
@@ -159,22 +161,28 @@ better.
 
 ## Shipping a stamp
 
-Stamps ship now: **19 brushes carried by 15 masks, 624 kB of 8-bit greyscale
-PNG in `crates/umber-core/assets/tips/`, 664 kB of release binary** — measured,
-17,162,752 bytes before and 17,842,176 after. The generator writes the masks,
-deduplicates them by content and rewrites the `include_bytes!` table;
-`preset::builtin()` resolves a shipped tip through `tip::builtin` before the
-user's library. `docs/brushes.md` has the mechanism.
+Stamps ship now: **11 brushes carried by 10 masks, 295 kB of 8-bit greyscale
+PNG in `crates/umber-core/assets/tips/`**. It was 19 brushes and 624 kB, which
+was 664 kB of release binary — measured, 17,162,752 bytes before and 17,842,176
+after — so a mask costs the binary about what it costs the directory. Eight of
+those nineteen have since been refused for a **paper texture** the Krita reader
+had never noticed; see "The paper texture, and what a texture library would
+buy" in `docs/brushes.md`. The generator writes the masks, deduplicates them by
+content and rewrites the `include_bytes!` table; `preset::builtin()` resolves a
+shipped tip through `tip::builtin` before the user's library. `docs/brushes.md`
+has the mechanism.
 
 What decided the shape of it, in the order the questions were asked.
 
 ### How many brushes is this actually about
 
-**338** across the five packs carry a mask. Only **37** of them drop nothing
-else, so the other 301 were never candidates whatever the library could hold —
+**338** across the five packs carry a mask. Only **28** of them drop nothing
+else, so the other 310 were never candidates whatever the library could hold —
 257 are refused for a `.gih` pipe's sequencing alone, and the rest for coloured
-stamps, mirrored dabs, brush-tip randomness, a separate paint-deposit rate or a
-rotation Umber cannot drive. Of the 37, 19 ship and 17 are rubberduck's.
+stamps, a paper texture, mirrored dabs, brush-tip randomness, a separate
+paint-deposit rate or a rotation Umber cannot drive. Of the 28, 11 ship and 17
+are rubberduck's. `docs/brushes.md` has the whole table, reason by reason and
+pack by pack, and the generator prints it on every run.
 
 ### How big the whole thing would have been
 
@@ -201,11 +209,11 @@ Three things follow, and the first two are why the answer is not "downsample".
   masks that ship are shipped at their original resolution**, which needs no cap
   and no re-measurement.
 - **12.4 MB was never the question**, because 315 masks was never the set. The
-  masks the shipping brushes need are 33, and without rubberduck's 15.
+  masks the shipping brushes need are 25, and without rubberduck's 10.
 
 ### The three that ship, and the one that does not
 
-624 kB on a 5.9 MB MSI is about 11%, for 19 brushes — a trade worth making and
+295 kB on a 5.9 MB MSI is about 5%, for 11 brushes — a trade worth making and
 stated rather than made quietly. Revoy's, Raghukamath's and GDQuest's licences
 are verified inside their downloads, which is what shipping artwork requires.
 
@@ -305,8 +313,8 @@ Umber claims*, and it is the same distinction everywhere else in the importer.
   Reasons 2 and 3 are ordinary work — curate a folder, name the brushes by
   hand, pin the commit in `tools/fetch-brushes.ps1` — and they are what stands
   between this pack and the library now. Neither the engine nor the library is
-  the obstacle any more: `assets/tips/` carries fifteen third-party masks and
-  nineteen brushes stamp them, and this pack's licence is *verifiable from the
+  the obstacle any more: `assets/tips/` carries ten third-party masks and
+  eleven brushes stamp them, and this pack's licence is *verifiable from the
   download*, which is the test rubberduck's fails. It is the strongest
   remaining candidate.
 
