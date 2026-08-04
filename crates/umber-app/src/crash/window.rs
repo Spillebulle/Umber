@@ -321,6 +321,19 @@ impl Reporter<'_> {
         let pixels_per_point = gfx.egui_ctx.pixels_per_point();
         let paint_jobs = gfx.egui_ctx.tessellate(output.shapes, pixels_per_point);
 
+        // Uploaded before the surface is acquired, for the reason `app::render`
+        // states at the same point and which applies here with more force: the
+        // acquisition below can decide not to draw, and a skipped frame that
+        // dropped `textures_delta.set` would leave `egui_wgpu` holding a
+        // partial update for a texture it never allocated — met with
+        // `.expect("Tried to update a texture that has not been allocated
+        // yet.")`. That is a panic inside the process whose whole job is to
+        // survive one, which is the double fault this window exists to avoid.
+        for (id, delta) in &output.textures_delta.set {
+            gfx.egui_renderer
+                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
+        }
+
         // The same arms `app::render` takes, minus the logging: a box that
         // misses one frame is redrawn by the next event and nothing is lost in
         // the meantime, so anything but a usable texture simply skips.
@@ -342,6 +355,12 @@ impl Reporter<'_> {
             _ => None,
         };
         let Some(frame) = acquired else {
+            // Nothing was recorded, so the frees may be applied at once — the
+            // one case where that is true, exactly as in `app::render`.
+            crate::app::release_finished_textures(
+                &mut gfx.egui_renderer,
+                &output.textures_delta.free,
+            );
             return close;
         };
         let view = frame
@@ -354,10 +373,6 @@ impl Reporter<'_> {
                 label: Some("crash-report"),
             });
 
-        for (id, delta) in &output.textures_delta.set {
-            gfx.egui_renderer
-                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
-        }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gfx.config.width, gfx.config.height],
             pixels_per_point,
@@ -392,10 +407,21 @@ impl Reporter<'_> {
             gfx.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
         }
-        for id in &output.textures_delta.free {
-            gfx.egui_renderer.free_texture(id);
-        }
-        gfx.gpu.queue.submit(Some(encoder.finish()));
+        // Submit, and only then give egui's finished textures back — through
+        // `app::submit_frame`, which is the one place that does both so the two
+        // cannot be put the wrong way round. This file used to free first,
+        // which is the ordering that makes a same-frame free a wgpu validation
+        // error at submit: `free_texture` calls `Texture::destroy`, and that
+        // takes effect immediately rather than when the last reference goes.
+        // wgpu's default handler turns it into a panic, and this process
+        // installs no `on_uncaptured_error` — so it would have been a panic
+        // while reporting a panic.
+        crate::app::submit_frame(
+            &gfx.gpu,
+            &mut gfx.egui_renderer,
+            encoder,
+            &output.textures_delta.free,
+        );
         frame.present();
 
         if output

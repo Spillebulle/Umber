@@ -268,7 +268,7 @@ const PUT_DOWN_SLOP: f32 = 4.0;
 /// the underlying resource alive for as long as the submission using it. This
 /// is what `egui_wgpu`'s own painter does, for the same reason, stated in the
 /// same place.
-fn submit_frame(
+pub(crate) fn submit_frame(
     gpu: &Gpu,
     renderer: &mut egui_wgpu::Renderer,
     encoder: wgpu::CommandEncoder,
@@ -282,7 +282,10 @@ fn submit_frame(
 ///
 /// Only ever called with nothing recorded and unsubmitted: [`submit_frame`] is
 /// the one caller that has a command buffer, and it submits first.
-fn release_finished_textures(renderer: &mut egui_wgpu::Renderer, finished: &[egui::TextureId]) {
+pub(crate) fn release_finished_textures(
+    renderer: &mut egui_wgpu::Renderer,
+    finished: &[egui::TextureId],
+) {
     for id in finished {
         renderer.free_texture(id);
     }
