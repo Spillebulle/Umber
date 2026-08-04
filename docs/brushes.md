@@ -825,9 +825,34 @@ The net is 233 presets to 235: "C3) Thin Brush Textured" arrives with both its
 pressure ramp and an Opacity/Random entry running 0.42 to 1, and "Y) Splatters
 Light" varies each stamp between a sixth and all of its 230 px, which is what
 makes it splatter. A third, "X) Textured Chaotic Irregular", is still refused
-and correctly: it switches its scatter curve *off*, and this reader reads that
-as no dynamic where Krita reads it as the sensor applied straight — a separate
-question, left alone, and named rather than silently half-carried.
+and correctly — see the open question below.
+
+**Two sentences, not one, for what is left behind.** A sensor Umber has no input
+for and a sensor reaching a curve Krita switched off are different losses, and
+one message covering both names a cause that is not the cause: `fuzzy` is an
+input Umber demonstrably *can* produce. So `FOREIGN_INPUT` and `UNREAD_CURVE`,
+with the first winning where both apply, for the reason the generator asks what
+was dropped before it asks about the mask.
+
+#### The open question: `<Name>UseCurve` switched off
+
+This reader treats `Pressure<Name>` on with `<Name>UseCurve` off as **no
+dynamic**. Krita's own default for that flag is on, and its curve object is the
+diagonal, so the reading that fits everything else here is "the sensor, applied
+straight" — a *linear* ramp rather than a constant. **34 of the fetched presets'
+Opacity and Scatter options have it off**, so if that is right they are all
+importing without a pressure ramp their author drew.
+
+It is not settled here, and deliberately. This module's other polarity question
+— `hfade` — was settled by looking at Krita's own preview inside the `.kpp`,
+and that technique cannot separate these two readings: almost every preview
+tapers because *size* follows pressure too. Changing 34 shipped brushes on a
+reading nobody has checked is the larger risk of the two, and naming it as a
+loss on all of them would be the same claim in the other direction. So the
+reading stands, this paragraph is the record, and the one place it does surface
+is where a *non-pressure* sensor reaches such a curve: `UNREAD_CURVE` names it,
+which is what keeps "X) Textured Chaotic Irregular" out of the library rather
+than shipping half of what its author drew.
 
 **Only two of Krita's paint engines are accepted**: `paintbrush` and
 `colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an

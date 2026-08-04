@@ -420,8 +420,15 @@ pub fn dropped_features(path: &Path) -> Vec<&'static str> {
 /// that is currently working. This is best-effort in exactly the way
 /// `dropped_features` is — an unreadable file answers nothing here and fails
 /// properly in `read_file`, so nothing is reported on twice — and it costs a
-/// second pass over the archive, which is a price the generator pays once per
-/// run and nothing on a drawing path pays at all.
+/// **second full decode of the archive**, every preset's PNG and every tip in
+/// it, which is a price the library generator pays once per run and nothing on
+/// a drawing path pays at all.
+///
+/// One boundary it does not reach: a bundle in which *every* preset is refused
+/// makes [`bundle::from_bundle`] fail whole, so there is nothing to return
+/// here. That case is not silent — `read_file` reports it, and its message
+/// carries the count and one of the reasons — but it is a count rather than a
+/// list.
 pub fn refusals(path: &Path) -> Vec<String> {
     let extension = path
         .extension()
