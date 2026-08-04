@@ -165,6 +165,16 @@ pub const MANIFEST: &str = "umber/history/index.json";
 /// reports the true one.
 ///
 /// This build still reads revisions 1 and 2. Nothing about them changed.
+///
+/// **Structural entries did not raise it, because none is written.** An entry
+/// that restores a deleted layer needs that layer's pixels, and they live in a
+/// parked slice which is deliberately not part of the saved picture; so
+/// [`SaveHistory::new`] cuts the timeline at the newest structural entry rather
+/// than describing one. Writing them is what would earn revision 4, on the
+/// flip's grounds and more sharply: the entries around a structural one are not
+/// independently valid, because a patch recorded before a delete was recorded
+/// against a stack of a different shape, so the degradation would have to be a
+/// whole-history discard rather than a shorter history.
 pub const VERSION: u32 = 3;
 
 /// How much encoded patch data a document will carry.
@@ -240,21 +250,51 @@ pub struct SaveHistory<'a> {
 impl<'a> SaveHistory<'a> {
     /// Resolve every patch in `history` against `layers`.
     ///
-    /// `None` when any patch names a slot no layer in the stack holds. That
-    /// cannot arise from the editor — deleting a layer clears the history for
-    /// exactly this reason — but it is the one check that stands between a
-    /// saved history and a patch replayed into a layer that merely inherited a
-    /// slot, so it is made here rather than assumed, and it refuses the *whole*
-    /// history: the entries are a sequence, each restoring the pixels the next
-    /// one expects, and one missing from the middle is not a shorter history
-    /// but a wrong one.
+    /// `None` when any patch names a slot no layer in the stack holds. It is
+    /// the one check that stands between a saved history and a patch replayed
+    /// into a layer that merely inherited a slot, so it is made here rather
+    /// than assumed, and it refuses the *whole* history: the entries are a
+    /// sequence, each restoring the pixels the next one expects, and one
+    /// missing from the middle is not a shorter history but a wrong one.
+    ///
+    /// # Structural entries, which this revision cannot write
+    ///
+    /// The file can carry a patch and a canvas flip. It cannot yet carry an
+    /// entry that restores a *deleted layer* — that layer's pixels are in a
+    /// parked slice, and a parked slice is deliberately not written to the
+    /// document, since it is not part of the picture.
+    ///
+    /// So a save **keeps the newest run of the timeline containing no
+    /// structural entry**, exactly as `write` already truncates when the file's
+    /// budget bites: `position` moves back by however much was dropped and
+    /// `dropped` moves forward by it. What makes that sufficient rather than
+    /// arbitrary is the theorem the stepped timeline gives — *a patch on a
+    /// deleted layer is necessarily older than the delete*, because you cannot
+    /// paint on a layer you have already deleted — so cutting at the newest
+    /// structural entry removes precisely the entries that could not be placed,
+    /// and the ones after it are an ordinary history that every build reads.
+    ///
+    /// It is a real loss and worth saying plainly: a session with one deletion
+    /// near the start saves almost no history. Writing the removed layers'
+    /// images under `umber/history/` beside the patch PNGs is what would fix
+    /// it, and it needs a measurement nobody has taken — see
+    /// `docs/structural-undo.md` §8.
     pub fn new(history: &'a History, layers: &LayerStack) -> Option<Self> {
-        let mut entries = Vec::with_capacity(history.len());
-        for i in 0..history.len() {
+        // One past the newest structural entry, or 0 where there is none.
+        let cut = (0..history.len())
+            .rev()
+            .find(|i| history.kind_at(*i).is_some_and(EditKind::is_structural))
+            .map_or(0, |i| i + 1);
+        let mut entries = Vec::with_capacity(history.len() - cut);
+        for i in cut..history.len() {
             let edit = history.entry_at(i)?;
             // An entry with no patch names no layer, so there is nothing to
             // resolve and nothing that could fail to. A flip belongs to the
             // document rather than to one slice of it.
+            debug_assert!(
+                !edit.kind.is_structural(),
+                "the cut above leaves no structural entry to be written as a flip"
+            );
             let body = match edit.patch() {
                 Some(patch) => {
                     // Either of the layer's two slices. A patch that matches
@@ -295,8 +335,8 @@ impl<'a> SaveHistory<'a> {
         }
         Some(Self {
             entries,
-            position: history.position(),
-            dropped: history.dropped(),
+            position: history.position().saturating_sub(cut),
+            dropped: history.dropped() + cut,
         })
     }
 

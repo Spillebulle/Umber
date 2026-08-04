@@ -7,9 +7,22 @@
 //! just the order of this `Vec`, so reordering layers is a pointer shuffle
 //! rather than 16 MB of texture copies per move.
 //!
-//! Slots are recycled when a layer is deleted, which is why deleting a layer
-//! invalidates undo history — an entry recorded against slot 3 would otherwise
-//! be replayed into whatever new layer inherited that slot.
+//! Slots are recycled when a layer is deleted — but not while anything still
+//! *holds* one. That is [`SlotClaim`], and it is the whole of how deleting a
+//! layer stopped clearing the undo history: the deleted [`Layer`] moves into
+//! the history entry, the claim moves with it, and the slice it names is left
+//! holding exactly the picture an undo would want to put back. See
+//! [`StackShape`] and `docs/structural-undo.md`.
+//!
+//! # A layer has two identities, doing two different jobs
+//!
+//! The **slot claim** answers "which slice do these pixels live in". It is what
+//! `PixelPatch` names, and holding one is what keeps a patch valid.
+//!
+//! [`Layer::id`] answers "which entry is this". A structural undo entry has to
+//! be able to say "the entry that was at position 3 goes back to position 3",
+//! and a slot cannot say it, because **a folder holds no slot**. Neither
+//! identity can do the other's job.
 //!
 //! # A mask is a slot too
 //!
@@ -28,11 +41,10 @@
 //! two slices instead of one, which is exactly the arithmetic a painter already
 //! does when they think of a mask as "another layer's worth of memory".
 //!
-//! The consequences are the same ones slots always had, and both are load
-//! bearing: removing a mask frees its slot for the next layer or mask to
-//! inherit, so it **clears the undo history** for precisely the reason deleting
-//! a layer does; and a mask slice is ordinary RGBA, of which the composite
-//! reads one channel.
+//! The consequences are the same ones slots always had: a mask's slice is
+//! claimed exactly as a layer's is, so taking a mask off parks the slice in the
+//! history entry rather than putting it straight back on the free list; and a
+//! mask slice is ordinary RGBA, of which the composite reads one channel.
 //!
 //! # Folders
 //!
@@ -86,9 +98,129 @@
 //! statement that the argument is expected to hold and not a check that runs
 //! in a release build.
 
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
+
+/// The slices of one document's layer array: which are in use, and which
+/// number the next one would take.
+///
+/// Private, and reached only through [`SlotClaim`] and [`SlotRoom`], because
+/// the one thing that must never happen is a number handed to two layers.
+#[derive(Debug, Default)]
+struct SlotPool {
+    /// Numbers given back and not yet handed out again, **ascending** — see
+    /// [`SlotPool::give_back`], which relies on the order to compact the tail.
+    free: Vec<u32>,
+    /// One past the highest number currently claimed.
+    next: u32,
+}
+
+impl SlotPool {
+    /// Could this pool hand a slice out?
+    fn has_room(&self) -> bool {
+        !self.free.is_empty() || self.next < LayerStack::MAX_SLOTS
+    }
+
+    fn take(&mut self) -> Option<u32> {
+        if let Some(n) = self.free.pop() {
+            return Some(n);
+        }
+        if self.next >= LayerStack::MAX_SLOTS {
+            return None;
+        }
+        let n = self.next;
+        self.next += 1;
+        Some(n)
+    }
+
+    /// Take a number back, and **compact the tail** so `next` is one past the
+    /// highest slice still claimed.
+    ///
+    /// The compaction is not tidiness. `next` is what
+    /// [`LayerStack::slot_capacity_needed`] reports and therefore what
+    /// `CanvasRenderer::begin_float` reserves its preview slice at, and that
+    /// reservation is refused once it reaches [`LayerStack::MAX_SLOTS`].
+    /// Without compacting, a session of deleting and adding layers walks `next`
+    /// up to the ceiling one slice at a time — parking is what stops a delete
+    /// returning the number immediately — and the transform tool then refuses
+    /// for ever, on a document with a handful of layers and no way back.
+    ///
+    /// The array itself never shrinks (`ensure_slots` only grows), so a
+    /// capacity that falls and rises again costs nothing.
+    fn give_back(&mut self, n: u32) {
+        self.free.push(n);
+        self.free.sort_unstable();
+        while self.next > 0 && self.free.last() == Some(&(self.next - 1)) {
+            self.free.pop();
+            self.next -= 1;
+        }
+    }
+}
+
+/// A slice of the layer array, held for as long as anything names it.
+///
+/// `Drop` is what returns the number to the pool, which is why this is the only
+/// way to hold one: a `free_slots.push` beside each of the places a layer can
+/// leave the stack is the "forgotten at the sixth" failure written out in
+/// advance, and the failure it produces — one slice handed to two layers — is
+/// silent corruption of somebody's painting.
+///
+/// **Cloning shares the claim** rather than duplicating it, which is the
+/// semantics a snapshot wants and the only safe one: two independent claims on
+/// one number would give it back twice. The slice is freed when the last holder
+/// lets go.
+#[derive(Clone, Debug)]
+pub struct SlotClaim(Arc<Claim>);
+
+/// The claim itself. Separate from [`SlotClaim`] so that `Drop` runs once, when
+/// the last clone goes, rather than once per clone.
+#[derive(Debug)]
+struct Claim {
+    number: u32,
+    pool: Arc<Mutex<SlotPool>>,
+}
+
+impl SlotClaim {
+    /// The slice this claim names.
+    ///
+    /// No lock: the number is fixed for the claim's life, so every existing
+    /// caller and the whole drawing path read it as cheaply as they read a
+    /// `u32` field. Only `Drop` takes the lock.
+    pub fn number(&self) -> u32 {
+        self.0.number
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // A poisoned pool means another thread panicked holding it. Losing a
+        // slice is a leak; panicking in a `Drop` while something else is
+        // already unwinding is an abort.
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.give_back(self.number);
+        }
+    }
+}
+
+/// "Has this document a slice to hand out?", answerable without borrowing the
+/// stack.
+///
+/// It exists for one caller: the undo history has to be able to give an old
+/// entry's parked slice back when a new layer needs one, and it cannot be
+/// handed a `&LayerStack` because the two are separate fields of the editor and
+/// the history is being mutated at the time. Read-only by construction, so it
+/// cannot become a second way to take a slot.
+#[derive(Clone, Debug)]
+pub struct SlotRoom(Arc<Mutex<SlotPool>>);
+
+impl SlotRoom {
+    pub fn has_room(&self) -> bool {
+        self.0.lock().is_ok_and(|pool| pool.has_room())
+    }
+}
 
 /// What a stroke on the active layer lands in.
 ///
@@ -213,6 +345,13 @@ pub struct Layer {
     /// This entry is a folder: it holds no pixels, and owns the run of entries
     /// immediately below it whose [`Layer::depth`] is greater than its own.
     folder: bool,
+    /// Which entry this is, for as long as the document is open.
+    ///
+    /// From a per-document counter, never recycled, and **never written to the
+    /// file**: it is an identity within one session, which is all a structural
+    /// undo entry needs. A folder has one, which is the whole reason it exists
+    /// — see the module docs.
+    id: u32,
     /// Texture-array slice holding this layer's pixels. Stable for the layer's
     /// lifetime, and `None` for a folder.
     ///
@@ -221,16 +360,21 @@ pub struct Layer {
     /// slot back, so a folder holding one would be written to the file as a
     /// blank layer nobody made — and on a large canvas it would cost 400 MB of
     /// texture per folder for the privilege.
-    slot: Option<u32>,
+    slot: Option<SlotClaim>,
     /// Slice holding this layer's mask, when it has one. Another slot of the
     /// same array — see the module docs.
-    mask: Option<u32>,
+    mask: Option<SlotClaim>,
 }
 
 impl Layer {
+    /// Which entry this is. See the field.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     /// The slice holding this layer's pixels, or `None` for a folder.
     pub fn slot(&self) -> Option<u32> {
-        self.slot
+        self.slot.as_ref().map(SlotClaim::number)
     }
 
     /// This entry is a folder and holds no pixels.
@@ -240,7 +384,7 @@ impl Layer {
 
     /// The slice holding this layer's mask, if it has one.
     pub fn mask(&self) -> Option<u32> {
-        self.mask
+        self.mask.as_ref().map(SlotClaim::number)
     }
 
     pub fn has_mask(&self) -> bool {
@@ -253,7 +397,7 @@ impl Layer {
     /// One constructor rather than two struct literals, so a field added here
     /// cannot be given one default by `LayerStack::new` and another by
     /// `LayerStack::add`.
-    fn named(name: &str, slot: u32) -> Self {
+    fn named(name: &str, id: u32, slot: Option<SlotClaim>) -> Self {
         Self {
             name: name.to_string(),
             visible: true,
@@ -266,7 +410,8 @@ impl Layer {
             depth: 0,
             collapsed: false,
             folder: false,
-            slot: Some(slot),
+            id,
+            slot,
             mask: None,
         }
     }
@@ -279,11 +424,10 @@ impl Layer {
     /// things that make it one, and `opacity` and `blend` are left at the
     /// values a pass-through folder means: no fade and no mode. They are not
     /// drawn, and until group compositing exists nothing reads them.
-    fn folder_named(name: &str) -> Self {
+    fn folder_named(name: &str, id: u32) -> Self {
         Self {
             folder: true,
-            slot: None,
-            ..Self::named(name, 0)
+            ..Self::named(name, id, None)
         }
     }
 }
@@ -318,9 +462,12 @@ pub fn well_formed(entries: &[(u8, bool)]) -> bool {
 pub struct LayerStack {
     layers: Vec<Layer>,
     active: usize,
-    /// Slots freed by deletion, reused before allocating new ones.
-    free_slots: Vec<u32>,
-    next_slot: u32,
+    /// The document's slices. Shared with every [`SlotClaim`] this stack has
+    /// handed out, including the ones parked in undo entries.
+    pool: Arc<Mutex<SlotPool>>,
+    /// Next [`Layer::id`]. Never recycled, so an entry that has left the stack
+    /// and comes back is still the same entry.
+    next_id: u32,
 }
 
 impl Default for LayerStack {
@@ -370,12 +517,12 @@ impl LayerStack {
     pub const LINK_GROUPS: usize = 6;
 
     pub fn new() -> Self {
-        Self {
-            layers: vec![Layer::named("Layer 1", 0)],
-            active: 0,
-            free_slots: Vec::new(),
-            next_slot: 1,
-        }
+        let mut stack = Self::empty();
+        let slot = stack.take_slot();
+        debug_assert!(slot.is_some(), "a fresh pool has room for one layer");
+        stack.layers.push(Layer::named("Layer 1", 0, slot));
+        stack.next_id = 1;
+        stack
     }
 
     /// An empty stack, for [`LayerStack::push_imported`] to fill.
@@ -390,9 +537,15 @@ impl LayerStack {
         Self {
             layers: Vec::new(),
             active: 0,
-            free_slots: Vec::new(),
-            next_slot: 0,
+            pool: Arc::new(Mutex::new(SlotPool::default())),
+            next_id: 0,
         }
+    }
+
+    /// A handle answering "is there a slice to hand out", for the undo history
+    /// to check as it gives parked entries up. See [`SlotRoom`].
+    pub fn room(&self) -> SlotRoom {
+        SlotRoom(Arc::clone(&self.pool))
     }
 
     /// Append an entry at the top, for an import.
@@ -402,15 +555,16 @@ impl LayerStack {
     /// cannot forget that a folder has no pixels to upload into.
     pub(crate) fn push_imported(&mut self, folder: bool, depth: u8, name: String) -> Option<u32> {
         let depth = depth.min(Self::MAX_DEPTH);
+        let id = self.take_id();
         let mut entry = if folder {
-            Layer::folder_named(&name)
+            Layer::folder_named(&name, id)
         } else {
             let slot = self.take_slot();
-            Layer::named(&name, slot)
+            Layer::named(&name, id, slot)
         };
         entry.name = name;
         entry.depth = depth;
-        let slot = entry.slot;
+        let slot = entry.slot();
         self.layers.push(entry);
         slot
     }
@@ -434,7 +588,7 @@ impl LayerStack {
                 entry.depth
             };
         }
-        debug_assert!(well_formed(&self.shape()));
+        debug_assert!(well_formed(&self.shape_pairs()));
     }
 
     pub fn len(&self) -> usize {
@@ -478,7 +632,7 @@ impl LayerStack {
     /// arise. `Editor::begin_stroke` refuses on it at the same gate a lock is
     /// refused at.
     pub fn active_slot(&self) -> Option<u32> {
-        self.layers[self.active].slot
+        self.layers[self.active].slot()
     }
 
     /// Is the selected entry a folder, and therefore not somewhere to paint?
@@ -563,12 +717,6 @@ impl LayerStack {
     pub fn effective_locked(&self, index: usize) -> bool {
         self.layers.get(index).is_some_and(|l| l.locked)
             || self.ancestors_of(index).any(|i| self.layers[i].locked)
-    }
-
-    /// The depth sequence this stack would have with `change` applied, for
-    /// [`well_formed`] to judge before anything is written.
-    fn shape(&self) -> Vec<(u8, bool)> {
-        self.layers.iter().map(|l| (l.depth, l.folder)).collect()
     }
 
     /// How many entries hold pixels. A document needs at least one.
@@ -694,7 +842,7 @@ impl LayerStack {
         // topmost member, so the folder sits exactly where that member did.
         let top = *members.last()?;
         let at = (0..top).filter(|i| !members.contains(i)).count();
-        let mut folder = Layer::folder_named(&name);
+        let mut folder = Layer::folder_named(&name, self.take_id());
         folder.depth = base;
         let n = taken.len();
         for (k, layer) in taken.into_iter().enumerate() {
@@ -702,7 +850,7 @@ impl LayerStack {
         }
         self.layers.insert(at + n, folder);
 
-        debug_assert!(well_formed(&self.shape()), "group left a malformed stack");
+        debug_assert!(well_formed(&self.shape_pairs()), "group left a malformed stack");
         // The new folder is selected, which is what makes it renameable the
         // moment it exists. Nothing was removed, so no slot changed hands and
         // the layer that *was* selected is still in the stack — inside the
@@ -732,10 +880,19 @@ impl LayerStack {
 
     /// How many texture-array slices the renderer must have allocated.
     ///
-    /// This is one past the highest slot ever handed out, not the layer count:
-    /// slots are stable, so a stack of two layers can still be using slot 5.
+    /// This is one past the highest slice **currently claimed**, not the layer
+    /// count: slots are stable, so a stack of two layers can still be using
+    /// slot 5, and a slice parked in an undo entry is claimed even though it is
+    /// in no layer.
+    ///
+    /// **A parked slice must stay below this number, and that is load
+    /// bearing.** `CanvasRenderer::begin_float` takes its preview slice at
+    /// exactly this value, so a preview can never be rendered into a deleted
+    /// layer's pixels — the obvious tidy-up, making this the high-water mark of
+    /// the *live stack* alone, creates precisely that bug and it would look
+    /// like a transform quietly eating an undone layer.
     pub fn slot_capacity_needed(&self) -> u32 {
-        self.next_slot
+        self.pool.lock().map_or(Self::MAX_SLOTS, |pool| pool.next)
     }
 
     /// Insert a new empty layer directly above the active one and select it.
@@ -762,26 +919,37 @@ impl LayerStack {
         } else {
             (self.active + 1, selected.depth)
         };
-        let slot = self.take_slot();
+        // Before the insert, so a pool with nothing left changes nothing at
+        // all. The caller's remedy is to give a parked slice back — see
+        // [`SlotRoom`] — not to be handed a layer with nowhere to paint.
+        let slot = self.take_slot()?;
+        let number = slot.number();
         let name = format!("Layer {}", self.next_name_number());
-        let mut layer = Layer::named(&name, slot);
+        let mut layer = Layer::named(&name, self.take_id(), Some(slot));
         layer.depth = depth;
         self.layers.insert(at, layer);
-        debug_assert!(well_formed(&self.shape()), "add left a malformed stack");
+        debug_assert!(well_formed(&self.shape_pairs()), "add left a malformed stack");
         self.active = at;
-        Some(slot)
+        Some(number)
     }
 
     /// Hand out the next free slice, recycling before growing.
-    fn take_slot(&mut self) -> u32 {
-        match self.free_slots.pop() {
-            Some(s) => s,
-            None => {
-                let s = self.next_slot;
-                self.next_slot += 1;
-                s
-            }
-        }
+    ///
+    /// `None` when every slice is claimed — by the stack, or by a layer parked
+    /// in an undo entry. See [`SlotPool::has_room`].
+    fn take_slot(&mut self) -> Option<SlotClaim> {
+        let number = self.pool.lock().ok()?.take()?;
+        Some(SlotClaim(Arc::new(Claim {
+            number,
+            pool: Arc::clone(&self.pool),
+        })))
+    }
+
+    /// The next entry identity. See [`Layer::id`].
+    fn take_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Give the layer at `index` a mask, returning the slice it took.
@@ -797,54 +965,49 @@ impl LayerStack {
         if self.layers.get(index)?.mask.is_some() {
             return None;
         }
-        let slot = self.take_slot();
+        let slot = self.take_slot()?;
+        let number = slot.number();
         self.layers[index].mask = Some(slot);
-        Some(slot)
+        Some(number)
     }
 
-    /// Take the mask off the layer at `index`, returning the slice it gave
-    /// back.
+    /// Take the mask off the layer at `index`, returning the claim it held.
     ///
-    /// **The caller must clear the undo history**, for the reason deleting a
-    /// layer does: the slice goes on the free list, and a patch recorded
-    /// against it would be replayed into whichever layer or mask inherits it.
-    pub fn remove_mask(&mut self, index: usize) -> Option<u32> {
-        let slot = self.layers.get_mut(index)?.mask.take()?;
-        self.free_slots.push(slot);
-        Some(slot)
+    /// **The caller must park that claim in the undo entry it records**, or
+    /// dropping it puts the slice straight back on the free list — which is
+    /// what used to make this clear the whole history, because a patch recorded
+    /// against the slice would then be replayed into whatever inherited it.
+    /// [`LayerStack::shape_with_mask`] is where it goes.
+    pub fn remove_mask(&mut self, index: usize) -> Option<SlotClaim> {
+        self.layers.get_mut(index)?.mask.take()
     }
 
     /// The mask slice of the layer at `index`, if it has one.
     pub fn mask_at(&self, index: usize) -> Option<u32> {
-        self.layers.get(index)?.mask
+        self.layers.get(index)?.mask()
     }
 
     /// The mask slice of the selected layer, if it has one.
     pub fn active_mask(&self) -> Option<u32> {
-        self.layers[self.active].mask
+        self.layers[self.active].mask()
     }
 
-    /// Remove a layer, returning its freed slot.
+    /// Remove a layer, handing it over.
     ///
-    /// Its mask's slice is freed too, and is deliberately *not* returned: the
-    /// caller has nothing to do with it, because a freed slice is cleared when
-    /// it is next handed out rather than when it is given back. What the caller
-    /// does owe is the same thing it always owed — clearing the undo history,
-    /// since both slices are now on the free list.
+    /// **The layers come back rather than their slot numbers, and that is the
+    /// whole of parking.** A [`Layer`] owns its [`SlotClaim`] and its mask's,
+    /// so whoever holds the returned layers holds the slices — nothing else can
+    /// be given them, and every recorded patch naming one goes on meaning the
+    /// pixels it was captured from. Drop them and the slices go back on the
+    /// free list, which is exactly what happened before parking existed.
     ///
     /// Refuses to remove the last layer — a document with no layers has nowhere
     /// to paint.
     /// **A folder takes its contents with it.** Deleting a group and leaving
     /// the layers in it behind would need every one of them re-parented, and
     /// the entry the painter pressed delete on is the one they meant; every
-    /// application that has folders does the same. Every slice inside goes on
-    /// the free list, which is why the caller's duty to clear the undo history
-    /// is now larger rather than different.
-    ///
-    /// Returns the slots freed, ascending — the caller has to clear them on the
-    /// GPU before they are handed out again. Refuses to leave the document with
-    /// no layer holding pixels: a folder is not somewhere to paint.
-    pub fn remove(&mut self, index: usize) -> Option<Vec<u32>> {
+    /// application that has folders does the same.
+    pub fn remove(&mut self, index: usize) -> Option<Vec<Layer>> {
         self.remove_many(&[index])
     }
 
@@ -860,13 +1023,12 @@ impl LayerStack {
     /// against the stack as it stands now, before anything moves, is the only
     /// arrangement where no index goes stale.
     ///
-    /// Returns the slices freed, ascending — the caller has to clear them on the
-    /// GPU before they are handed out again, and **clear the undo history**,
-    /// because every one of them is now on the free list for another layer to
-    /// inherit. Refuses whole, changing nothing, where it would leave the
+    /// Returns the entries removed, **bottom first** — see [`LayerStack::
+    /// remove`] for why the layers themselves come back and not their slot
+    /// numbers. Refuses whole, changing nothing, where it would leave the
     /// document with no layer holding pixels: a folder is not somewhere to
     /// paint. [`LayerStack::can_remove`] is that same question, for the buttons.
-    pub fn remove_many(&mut self, indices: &[usize]) -> Option<Vec<u32>> {
+    pub fn remove_many(&mut self, indices: &[usize]) -> Option<Vec<Layer>> {
         if !self.can_remove(indices) {
             return None;
         }
@@ -878,16 +1040,13 @@ impl LayerStack {
         going.sort_unstable();
         going.dedup();
 
-        let mut freed = Vec::new();
+        let mut taken = Vec::with_capacity(going.len());
         // Descending, so each removal only moves entries this loop has already
         // dealt with. The set itself was resolved above and does not change.
         for i in going.iter().rev() {
-            let layer = self.layers.remove(*i);
-            freed.extend(layer.slot);
-            freed.extend(layer.mask);
+            taken.push(self.layers.remove(*i));
         }
-        freed.sort_unstable();
-        self.free_slots.extend(freed.iter().copied());
+        taken.reverse();
 
         // The selection follows the stack rather than the number: it shifts
         // down by however many entries below it went, and where it was one of
@@ -898,13 +1057,13 @@ impl LayerStack {
             .saturating_sub(below)
             .min(self.layers.len().saturating_sub(1));
         debug_assert!(
-            well_formed(&self.shape()),
+            well_formed(&self.shape_pairs()),
             "removing a set of subtrees left a malformed stack"
         );
         // Deleting one of a pair would otherwise leave the survivor in a group
         // of one — see `dissolve_lone_groups`.
         self.dissolve_lone_groups();
-        Some(freed)
+        Some(taken)
     }
 
     // --- locking ------------------------------------------------------------
@@ -1216,7 +1375,7 @@ impl LayerStack {
                 layer
             })
             .collect();
-        debug_assert!(well_formed(&self.shape()), "reorder left a malformed stack");
+        debug_assert!(well_formed(&self.shape_pairs()), "reorder left a malformed stack");
         self.active = after
             .iter()
             .position(|(i, _)| *i == was)
@@ -1356,6 +1515,145 @@ impl LayerStack {
             .any(|i| self.effective_visible(i) && self.layers[i].opacity > 0.0)
     }
 
+    // --- structural undo ----------------------------------------------------
+
+    /// The stack as it stands: every entry [`ShapeEntry::Kept`], no layers held
+    /// and no mask recorded.
+    ///
+    /// This is what a structural edit snapshots **before** it runs. What the
+    /// edit removes is folded in afterwards by [`StackShape::with_removed`],
+    /// because the layers do not exist to be held until the operation has
+    /// handed them over.
+    pub fn shape(&self) -> StackShape {
+        StackShape {
+            entries: self
+                .layers
+                .iter()
+                .map(|l| ShapeEntry::Kept {
+                    id: l.id,
+                    depth: l.depth,
+                })
+                .collect(),
+            active: self.layers.get(self.active).map_or(0, |l| l.id),
+            masks: Vec::new(),
+        }
+    }
+
+    /// The same, also recording the mask the entry at `index` has now.
+    ///
+    /// For the two edits that change one — adding a mask and taking one off.
+    /// The claim is *cloned*, so the slice stays alive when the layer's own
+    /// copy is dropped; that is the whole of how removing a mask stopped
+    /// clearing the history.
+    pub fn shape_with_mask(&self, index: usize) -> StackShape {
+        let mut shape = self.shape();
+        if let Some(layer) = self.layers.get(index) {
+            shape.masks.push((layer.id, layer.mask.clone()));
+        }
+        shape
+    }
+
+    /// Make the stack the shape `target` describes, and hand back the shape it
+    /// had — which is exactly what putting this edit back would be.
+    ///
+    /// One function, called twice, so undo and redo cannot be two
+    /// implementations that disagree; the same arrangement `render_float` keeps
+    /// for the transform's preview and its commit.
+    ///
+    /// **It restores shape, not values.** A [`ShapeEntry::Kept`] carries an id
+    /// and a depth and nothing else, so undoing a reorder cannot revert an
+    /// opacity dragged afterwards — which it would if an entry were a snapshot
+    /// of the whole `Vec`. A [`ShapeEntry::Gone`] carries the whole layer,
+    /// and may: it has not been in the stack to be changed.
+    ///
+    /// Entries currently in the stack that `target` does not name are removed
+    /// and come back in the returned shape as `Gone`, holding their slices.
+    /// That is what parks a layer an undo has just taken out.
+    pub fn restore_shape(&mut self, target: StackShape) -> StackShape {
+        // What the stack is now, in its own order, before anything moves.
+        let was: Vec<(u32, u8)> = self.layers.iter().map(|l| (l.id, l.depth)).collect();
+        let was_active = self.layers.get(self.active).map_or(0, |l| l.id);
+
+        let mut held: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
+        let mut find = |id: u32| -> Option<Layer> {
+            held.iter_mut()
+                .find(|l| l.as_ref().is_some_and(|l| l.id == id))
+                .and_then(Option::take)
+        };
+
+        for entry in target.entries {
+            match entry {
+                ShapeEntry::Kept { id, depth } => {
+                    // Missing means an entry this shape was recorded against is
+                    // not in the stack, which the stepped-not-seeked guarantee
+                    // says cannot happen: an older shape is only ever reached
+                    // with everything above it already undone.
+                    match find(id) {
+                        Some(mut layer) => {
+                            layer.depth = depth;
+                            self.layers.push(layer);
+                        }
+                        None => debug_assert!(false, "a recorded shape named an entry that is gone"),
+                    }
+                }
+                ShapeEntry::Gone { layer } => self.layers.push(layer),
+            }
+        }
+
+        // Everything the target did not name leaves the stack and is parked in
+        // the shape that undoes this.
+        let mut left: Vec<Layer> = held.into_iter().flatten().collect();
+        let mut back = StackShape {
+            entries: was
+                .iter()
+                .map(|(id, depth)| ShapeEntry::Kept {
+                    id: *id,
+                    depth: *depth,
+                })
+                .collect(),
+            active: was_active,
+            masks: Vec::new(),
+        };
+        back.adopt(&mut left);
+        debug_assert!(left.is_empty(), "a removed entry was not in the shape");
+
+        // The masks, swapped the same way round, so redo puts back exactly what
+        // undo took off.
+        for (id, mask) in target.masks {
+            let Some(layer) = self.layers.iter_mut().find(|l| l.id == id) else {
+                debug_assert!(false, "a recorded mask named an entry that is gone");
+                continue;
+            };
+            let had = std::mem::replace(&mut layer.mask, mask);
+            back.masks.push((id, had));
+        }
+
+        self.active = self
+            .layers
+            .iter()
+            .position(|l| l.id == target.active)
+            .unwrap_or(0)
+            .min(self.layers.len().saturating_sub(1));
+        debug_assert!(
+            well_formed(&self.shape_pairs()),
+            "restoring a recorded shape left a malformed stack"
+        );
+        // A group can have lost a member while it was out of the stack, and can
+        // regain one coming back; both are `link`'s refusal to make a group of
+        // one, from the other side.
+        self.dissolve_lone_groups();
+        back
+    }
+
+    /// [`well_formed`]'s input for the stack as it stands.
+    ///
+    /// Named apart from [`LayerStack::shape`], which now answers a different
+    /// question — this one is the depth sequence and that one is the record a
+    /// structural undo entry holds.
+    fn shape_pairs(&self) -> Vec<(u8, bool)> {
+        self.layers.iter().map(|l| (l.depth, l.folder)).collect()
+    }
+
     fn next_name_number(&self) -> usize {
         // Not the layer count: deleting "Layer 2" of three should not make the
         // next new layer collide with the existing "Layer 3".
@@ -1367,6 +1665,114 @@ impl LayerStack {
             .max()
             .unwrap_or(0);
         highest + 1
+    }
+}
+
+/// One position in a recorded stack shape.
+#[derive(Clone, Debug)]
+enum ShapeEntry {
+    /// An entry that survived the edit. Put it back here, at this depth, and
+    /// **leave everything else about it alone** — its opacity may have been
+    /// changed since, and that is not this entry's to revert.
+    Kept { id: u32, depth: u8 },
+    /// An entry the edit removed. Put the whole layer back: nothing could have
+    /// changed it, because it has not been in the stack to be changed.
+    ///
+    /// This is also what parks the slice. The [`Layer`] owns its
+    /// [`SlotClaim`], so holding it here is what stops the number being handed
+    /// to the next layer that asks — no copy, no readback, and no pixel path
+    /// involved in a structural undo at all.
+    Gone { layer: Layer },
+}
+
+/// The stack as it was before one structural edit.
+///
+/// What an undo entry holds, and the argument for its shape is in
+/// `docs/structural-undo.md`. Two things it is deliberately not:
+///
+/// * **Not a snapshot of the `Vec`.** See [`ShapeEntry::Kept`]: an undo of a
+///   reorder that reverted an opacity somebody set afterwards would be an undo
+///   damaging something it was never asked about.
+/// * **Not a per-operation inverse.** One recorded shape covers a delete of a
+///   whole folder in one step, with no index arithmetic — which is where
+///   `remove_many`'s reverse loop once deleted a layer nobody ticked — and it
+///   is well formed because it was well formed when it was recorded.
+#[derive(Clone, Debug)]
+pub struct StackShape {
+    entries: Vec<ShapeEntry>,
+    /// Which entry was selected, **by [`Layer::id`]**: the selection follows
+    /// the layer, which is the rule [`LayerStack::reorder_to`] already keeps.
+    active: u32,
+    /// The mask each named entry had, for the two edits that change one.
+    ///
+    /// Deliberately not a field of [`ShapeEntry::Kept`], which restores shape
+    /// and not values — a `Kept` row carrying a mask would take masks *off*
+    /// every layer whenever a reorder was undone. It cannot simply be left out
+    /// either, the way an opacity is: a mask is a *slice*, so taking one off
+    /// frees storage, and that is the whole reason removing one used to clear
+    /// the history.
+    masks: Vec<(u32, Option<SlotClaim>)>,
+}
+
+impl StackShape {
+    /// Fold the entries an edit removed into this shape, so it holds them —
+    /// and therefore their slices — rather than merely naming them.
+    ///
+    /// Called with what [`LayerStack::remove_many`] handed back, on a shape
+    /// taken immediately before it ran.
+    pub fn with_removed(mut self, mut removed: Vec<Layer>) -> Self {
+        self.adopt(&mut removed);
+        debug_assert!(
+            removed.is_empty(),
+            "a removed entry was not in the shape recorded before the removal"
+        );
+        self
+    }
+
+    /// Turn every `Kept` row naming one of `layers` into a `Gone` holding it,
+    /// taking those layers out of the list.
+    fn adopt(&mut self, layers: &mut Vec<Layer>) {
+        for entry in &mut self.entries {
+            let ShapeEntry::Kept { id, .. } = entry else {
+                continue;
+            };
+            if let Some(at) = layers.iter().position(|l| l.id == *id) {
+                *entry = ShapeEntry::Gone {
+                    layer: layers.remove(at),
+                };
+            }
+        }
+    }
+
+    /// How many entries the stack had.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// What this costs in memory, which is what the undo budget counts.
+    ///
+    /// Tens of bytes an entry against patches measured in megabytes, so it is
+    /// never what evicts anything — the slice ceiling is what bounds these, not
+    /// the budget. Counted anyway, because a session of thousands of structural
+    /// edits is the case where a budget that could not see them would be
+    /// counting the wrong thing.
+    pub fn byte_len(&self) -> usize {
+        self.entries.len() * std::mem::size_of::<ShapeEntry>()
+            + self
+                .entries
+                .iter()
+                .map(|e| match e {
+                    ShapeEntry::Kept { .. } => 0,
+                    ShapeEntry::Gone { layer } => {
+                        std::mem::size_of::<Layer>() + layer.name.len()
+                    }
+                })
+                .sum::<usize>()
+            + self.masks.len() * std::mem::size_of::<(u32, Option<SlotClaim>)>()
     }
 }
 
@@ -1392,7 +1798,9 @@ mod tests {
     /// Every slice a removal gave back, which for a layer is one — or two,
     /// where it had a mask.
     fn removed(stack: &mut LayerStack, index: usize) -> Option<u32> {
-        stack.remove(index).and_then(|freed| freed.first().copied())
+        stack
+            .remove(index)
+            .and_then(|gone| gone.first().and_then(Layer::slot))
     }
 
     #[test]
@@ -1649,7 +2057,11 @@ mod tests {
         assert_eq!(s.slot_capacity_needed(), 2);
         assert_eq!(s.add_mask(0), None, "a second mask is not a thing");
 
-        assert_eq!(s.remove_mask(0), Some(1));
+        assert_eq!(
+            s.remove_mask(0).map(|claim| claim.number()),
+            Some(1),
+            "the claim comes back so a caller can park it"
+        );
         assert_eq!(s.active_mask(), None);
         assert_eq!(
             s.add().unwrap(),
@@ -1668,10 +2080,12 @@ mod tests {
         s.add();
         let mask = s.add_mask(1).unwrap();
         let slot = slot_of(s.get(1).unwrap());
+        // Measured *before* the removal: what "the array grew" means is that
+        // re-adding needed a slice the document had never used.
+        let capacity = s.slot_capacity_needed();
         assert_eq!(removed(&mut s, 1), Some(slot));
 
         // Both come back, in some order, before the array grows.
-        let capacity = s.slot_capacity_needed();
         let a = s.add().unwrap();
         let b = s.add_mask(s.active_index()).unwrap();
         assert_eq!(s.slot_capacity_needed(), capacity, "the array grew");
@@ -2257,16 +2671,19 @@ mod tests {
     #[test]
     fn deleting_a_folder_takes_its_contents_and_frees_every_slice() {
         let mut s = grouped();
+        let capacity = s.slot_capacity_needed();
         let inside: Vec<u32> = s.layers()[1..3].iter().filter_map(Layer::slot).collect();
         assert_eq!(inside.len(), 2);
 
-        let freed = s.remove(3).expect("the group can go");
+        let gone = s.remove(3).expect("the group can go");
+        let freed: Vec<u32> = gone.iter().filter_map(Layer::slot).collect();
         assert_eq!(freed, inside, "both slices came back");
+        // Dropped rather than parked, which is what puts them on the free list.
+        drop(gone);
         assert_eq!(shape_of(&s), vec![("Layer 1".into(), 0, false)]);
 
         // And they are reused before the texture array grows, exactly as a
         // deleted layer's is.
-        let capacity = s.slot_capacity_needed();
         s.add();
         s.add();
         assert_eq!(s.slot_capacity_needed(), capacity);

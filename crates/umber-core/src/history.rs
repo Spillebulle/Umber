@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use crate::brush::BrushMode;
 use crate::geom::{FlipAxis, PixelRect};
+use crate::layer::StackShape;
 use crate::time::Timestamp;
 
 /// What one document's history is allowed to hold unless it is told otherwise,
@@ -73,11 +74,11 @@ pub fn default_budget() -> usize {
 
 /// What one recorded edit was, so a list of them can be named.
 ///
-/// Deliberately closed and short. An entry exists only where a patch was
-/// captured: adding a layer, deleting one or reordering the stack are not
-/// undoable, and deleting one clears the history outright. A variant here would
-/// be a promise the engine cannot keep — a row naming an action that clicking
-/// it will not restore is worse than an action the list stays quiet about.
+/// Deliberately closed. An entry exists only for something the engine can
+/// genuinely restore — a variant here would be a promise it cannot keep, and a
+/// row naming an action that clicking it will not restore is worse than an
+/// action the list stays quiet about. Clearing a layer and resizing the canvas
+/// are still outside it, and the History module's footnote says so.
 ///
 /// [`EditKind::Transform`] earns its place under that rule rather than being an
 /// exception to it. A transform captures one patch spanning the source *and*
@@ -98,6 +99,20 @@ pub fn default_budget() -> usize {
 /// already been undone and the canvas is back in the orientation that patch was
 /// recorded in. That is what makes "no coordinate mapping, no mirrored bytes"
 /// true rather than merely convenient.
+///
+/// The six structural kinds earn it a third way, and they are the ones that
+/// need the "two rows that undo identically must not have two names" rule
+/// stated precisely, because under [`EditBody::Structure`] *every* structural
+/// edit undoes identically — they all restore a shape. Read that way the rule
+/// would collapse the lot into one row saying "Layers", which is plainly wrong.
+/// The rule is about what the **painter did**, not how the engine stores it: a
+/// paste and a transform fail it because both are a rectangle of pixels
+/// arriving on a layer, and Add, Delete and Move pass it because somebody
+/// scanning the list for "where did my layer go" is looking for exactly that
+/// word. Hence also no `Ungroup` — dissolving a folder *is* a delete of the
+/// folder or a set of moves out of it, and records as whichever it was — and no
+/// separate kind for deleting a folder, which restores identically to deleting
+/// a layer and out of the same entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
     Paint,
@@ -109,15 +124,35 @@ pub enum EditKind {
     FlipHorizontal,
     /// The whole canvas mirrored top to bottom.
     FlipVertical,
+    /// A layer, or an empty folder, added to the stack.
+    AddLayer,
+    /// An entry deleted — a layer, or a folder and everything in it.
+    DeleteLayer,
+    /// An entry moved, or re-nested, in the stack.
+    MoveLayer,
+    /// Entries gathered into a new folder.
+    Group,
+    /// A layer given a mask.
+    AddMask,
+    /// A layer's mask taken off. The one structural edit that changes the
+    /// picture — what the mask hid comes back — which is why it is not filed
+    /// under `DeleteLayer`.
+    RemoveMask,
 }
 
 impl EditKind {
-    pub const ALL: [EditKind; 5] = [
+    pub const ALL: [EditKind; 11] = [
         Self::Paint,
         Self::Erase,
         Self::Transform,
         Self::FlipHorizontal,
         Self::FlipVertical,
+        Self::AddLayer,
+        Self::DeleteLayer,
+        Self::MoveLayer,
+        Self::Group,
+        Self::AddMask,
+        Self::RemoveMask,
     ];
 
     /// Which kind a stroke in `mode` records.
@@ -148,8 +183,32 @@ impl EditKind {
         match self {
             Self::FlipHorizontal => Some(FlipAxis::Horizontal),
             Self::FlipVertical => Some(FlipAxis::Vertical),
-            Self::Paint | Self::Erase | Self::Transform => None,
+            Self::Paint
+            | Self::Erase
+            | Self::Transform
+            | Self::AddLayer
+            | Self::DeleteLayer
+            | Self::MoveLayer
+            | Self::Group
+            | Self::AddMask
+            | Self::RemoveMask => None,
         }
+    }
+
+    /// Is this an edit to the *stack* rather than to pixels?
+    ///
+    /// Read by the writer, which cannot yet put one in a file — see
+    /// `docformat::history::SaveHistory::new`.
+    pub fn is_structural(self) -> bool {
+        matches!(
+            self,
+            Self::AddLayer
+                | Self::DeleteLayer
+                | Self::MoveLayer
+                | Self::Group
+                | Self::AddMask
+                | Self::RemoveMask
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -159,27 +218,46 @@ impl EditKind {
             Self::Transform => "Transform",
             Self::FlipHorizontal => "Flip horizontally",
             Self::FlipVertical => "Flip vertically",
+            Self::AddLayer => "Add layer",
+            Self::DeleteLayer => "Delete layer",
+            Self::MoveLayer => "Move layer",
+            Self::Group => "Group",
+            Self::AddMask => "Add mask",
+            Self::RemoveMask => "Remove mask",
         }
     }
 }
 
 /// What an entry holds in order to be undone.
 ///
-/// Two shapes, because there are two ways an edit can be reversible and only
-/// one of them costs memory:
+/// Three shapes, because there are three ways an edit can be reversible and
+/// only one of them costs memory:
 ///
 /// * [`EditBody::Pixels`] is everything that paints. The engine cannot work out
 ///   what was under a stroke, so it keeps it.
+/// * [`EditBody::Structure`] is an edit to the layer *stack*. It stores no
+///   pixels at all: what it holds is the shape the stack had, and the layers
+///   the edit removed — which own their texture slices, so the pixels never
+///   move and nothing is copied. See [`StackShape`].
 /// * [`EditBody::Flip`] is an edit that is **its own inverse**, so there is
 ///   nothing to keep. Undoing it is doing it again.
 ///
-/// Deliberately not a third arm for "some other self-inverse thing later": the
+/// **No entry mixes them.** A structural entry never carries a patch, for the
+/// reason the timeline is stepped rather than seeked: a delete and the paint
+/// before it are reached in order, so the paint never has to be carried inside
+/// the delete. A body that meant two different things depending on the kind is
+/// exactly what that buys freedom from.
+///
+/// Deliberately not a fourth arm for "some other self-inverse thing later": the
 /// axis is in the [`EditKind`], and a body that carried its own copy of it
 /// would be a second place for the row's icon and the pixels to disagree.
 #[derive(Clone, Debug)]
 pub enum EditBody {
     /// The pixels the edit replaced.
     Pixels(PixelPatch),
+    /// The stack as it was. Boxed because it is much the largest arm and every
+    /// painting entry would otherwise carry its footprint.
+    Structure(Box<StackShape>),
     /// Nothing. See [`EditKind::flip_axis`] for which way.
     Flip,
 }
@@ -190,13 +268,25 @@ impl From<PixelPatch> for EditBody {
     }
 }
 
+impl From<StackShape> for EditBody {
+    fn from(shape: StackShape) -> Self {
+        Self::Structure(Box::new(shape))
+    }
+}
+
 impl EditBody {
     /// What this costs in memory, which is what the budget counts. A flip is
     /// free, and the list is allowed to hold as many of them as somebody has
     /// the patience to press.
+    ///
+    /// A structural entry is nearly free — tens of bytes an entry — so what
+    /// bounds *those* is not the budget but the slice ceiling: a parked layer
+    /// holds a slot claim, and there are [`crate::layer::LayerStack::MAX_SLOTS`]
+    /// of those. [`History::free_until`] is the release valve.
     fn byte_len(&self) -> usize {
         match self {
             Self::Pixels(patch) => patch.byte_len(),
+            Self::Structure(shape) => shape.byte_len(),
             Self::Flip => 0,
         }
     }
@@ -250,7 +340,22 @@ impl Edit {
     pub fn patch(&self) -> Option<&PixelPatch> {
         match &self.body {
             EditBody::Pixels(patch) => Some(patch),
-            EditBody::Flip => None,
+            EditBody::Structure(_) | EditBody::Flip => None,
+        }
+    }
+
+    /// The same, as a slice.
+    ///
+    /// The form the multi-layer transform wants — one gesture moving a linked
+    /// set records several patches in one entry, or an undo would step through
+    /// it a layer at a time and leave the document in states it was never in.
+    /// Nothing writes more than one yet, so this is `patch()` with the
+    /// signature that will not have to change at the call sites when something
+    /// does.
+    pub fn patches(&self) -> &[PixelPatch] {
+        match &self.body {
+            EditBody::Pixels(patch) => std::slice::from_ref(patch),
+            EditBody::Structure(_) | EditBody::Flip => &[],
         }
     }
 
@@ -632,7 +737,55 @@ impl History {
     /// budget still has to go first. The loop advances regardless, because it
     /// removes an entry every pass and stops at one.
     fn evict_to_budget(&mut self) {
-        while self.used_bytes > self.budget_bytes && self.undo.len() > 1 {
+        self.evict_while(1, |h| h.used_bytes > h.budget_bytes);
+    }
+
+    /// Give the oldest entries up until the document has a texture slice to
+    /// hand out again, and say whether it now has.
+    ///
+    /// **A structural entry holds a slice, so a history now competes with the
+    /// live stack for them.** A deleted layer's slot is not returned while the
+    /// entry that could put the layer back still names it, so a session of
+    /// adding and deleting can walk the pool empty. When that happens the
+    /// history gives a slot back — it does not refuse the layer. Entries are
+    /// dropped oldest first, exactly as the budget drops them, and
+    /// [`History::dropped`] counts them so the panel's existing "Earlier edits
+    /// discarded" note already covers the case.
+    ///
+    /// Only when the history is empty **and** the live stack holds every slice
+    /// is an operation genuinely refused, which is precisely the condition that
+    /// refused it before any of this existed.
+    ///
+    /// `has_room` rather than a `&LayerStack`, because the history and the
+    /// stack are separate fields of the editor and this is called while the
+    /// history is being mutated. `crate::layer::SlotRoom` is what to pass.
+    pub fn free_until(&mut self, has_room: impl Fn() -> bool) -> bool {
+        // Oldest first, and down to nothing: unlike the budget, which keeps the
+        // newest entry because there is always *some* memory for it, there is
+        // no partial answer here — either a slice comes free or the operation
+        // is refused.
+        self.evict_while(0, |_| !has_room());
+        if !has_room() {
+            // Then the entries ahead of the cursor, **whole**. They are a run
+            // in which each redo restores what the next expects, so one dropped
+            // out of the middle is not a shorter run but a wrong one; and they
+            // are not counted in `dropped`, which says how far short of the
+            // document's *beginning* the list stops.
+            for e in self.redo.drain(..) {
+                self.used_bytes -= e.byte_len();
+            }
+        }
+        has_room()
+    }
+
+    /// Drop the oldest undo entry while `over` says the history is too large,
+    /// keeping at least `floor` of them.
+    ///
+    /// One loop with two stopping conditions rather than two loops: the budget
+    /// and the slice ceiling age entries out the same way and in the same
+    /// order, and a second copy would eventually disagree about `dropped`.
+    fn evict_while(&mut self, floor: usize, over: impl Fn(&Self) -> bool) {
+        while self.undo.len() > floor && over(self) {
             let e = self.undo.remove(0);
             self.used_bytes -= e.byte_len();
             self.dropped += 1;
@@ -643,6 +796,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::{Layer, LayerStack};
 
     fn patch(w: u32, h: u32, fill: u8) -> PixelPatch {
         let rect = PixelRect {
@@ -1085,12 +1239,17 @@ mod tests {
 
     /// Step one entry backwards the way `app.rs` does, and hand back what
     /// putting it forward again would be.
-    fn reverse(model: &mut Model, edit: Edit) -> Edit {
+    fn reverse(model: &mut Model, stack: &mut LayerStack, edit: Edit) -> Edit {
         let body = match edit.body {
             EditBody::Pixels(patch) => {
                 let now = model.read(patch.rect);
                 model.write(patch.rect, &patch.pieces()[0].bytes());
                 EditBody::Pixels(PixelPatch::new(patch.rect, patch.slot, now))
+            }
+            // No pixels at all: the shape goes back and the shape that was
+            // there comes out, holding whatever left the stack.
+            EditBody::Structure(shape) => {
+                EditBody::Structure(Box::new(stack.restore_shape(*shape)))
             }
             // The whole of it: a flip is undone by flipping.
             EditBody::Flip => {
@@ -1114,6 +1273,7 @@ mod tests {
     fn stepping_back_over_a_flip_puts_older_patches_where_they_were_recorded() {
         let start = Model::new(8, 6);
         let mut model = start.clone();
+        let mut stack = LayerStack::new();
         let mut h = History::default();
 
         // Paint in a corner, so a flip plainly moves it.
@@ -1152,23 +1312,23 @@ mod tests {
 
         // Back one: the second mark goes, the picture stays flipped.
         let e = h.take_undo().unwrap();
-        h.push_redo(reverse(&mut model, e));
+        h.push_redo(reverse(&mut model, &mut stack, e));
         assert_eq!(model, after_flip);
 
         // Back another: the flip is undone by flipping.
         let e = h.take_undo().unwrap();
-        h.push_redo(reverse(&mut model, e));
+        h.push_redo(reverse(&mut model, &mut stack, e));
         assert_eq!(model, after_paint, "undoing the flip did not put it back");
 
         // And back to the beginning, through a patch recorded before the flip
         // ever happened. This is the assertion the design exists for.
         let e = h.take_undo().unwrap();
-        h.push_redo(reverse(&mut model, e));
+        h.push_redo(reverse(&mut model, &mut stack, e));
         assert_eq!(model, start, "the older patch landed in the wrong pixels");
 
         // Forward again, by the same route, to exactly where it was.
         while let Some(e) = h.take_redo() {
-            let back = reverse(&mut model, e);
+            let back = reverse(&mut model, &mut stack, e);
             h.push_undo(back);
         }
         assert_eq!(h.position(), 3);
