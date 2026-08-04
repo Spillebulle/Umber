@@ -615,11 +615,14 @@ the stamp paints like its author's. It is **measured** by
 stroke is as strong as a compositing one stays on the `max` path, and a sparse
 photographic texture gets `build_up: true`. See `docs/brush-sources.md`.
 
-A 4-byte `.gbr` is a coloured stamp and imports as its silhouette — the stroke
-scratch is one coverage channel by design. `brushimport::dropped_features` says
-so, the same way a `.myb` that leans on `colorize` does. A `.gpb` — GIMP's
-obsolete pixmap brush — is a `.gbr` with a whole colour *pattern* stapled to the
-end of it, and reads through the same path with the same note.
+A 4-byte `.gbr` is a **coloured stamp** and keeps its colour. It used to import
+as its silhouette, because the stroke scratch is one coverage channel and a tip
+was a coverage mask; see "Coloured stamps" below for why neither of those had to
+change. A `.gpb` — GIMP's obsolete pixmap brush — is a `.gbr` with a whole
+colour *pattern* stapled to the end of it, and reads through the same path with
+the same result. GIMP writes **straight** alpha, which is the form `TipMask`
+holds, so both planes go across as they are and
+`brushimport::dropped_features` reports nothing at all for either.
 
 Knowing where a `.gbr` **ends** is load-bearing rather than tidy: a `.gih` is
 made of whole `.gbr` files concatenated, so a length misjudged by one byte makes
@@ -1166,6 +1169,87 @@ box of the rotated quad: exact for a tip, conservative for a round dab, and
 *tighter* than the circle for an unrotated ellipse.
 `a_rotated_stamp_is_committed_all_the_way_into_its_corners` guards it.
 
+## Coloured stamps
+
+A Clip Studio or Krita "coloured stamp" is a tip whose *pixels carry colour*,
+not just coverage: a leaf, a spatter of two hues, a texture that stamps its own
+palette rather than the brush's. Umber's tips were coverage only, so every such
+brush arrived as its own silhouette — 25 shipped-library presets are refused for
+it, 11 for that reason alone, which makes it the largest single engine feature
+blocking brushes.
+
+**It turned out to be a third source of per-dab colour, not something new**, and
+that is the whole of why it cost so little. The obvious reading is that a tip
+carries colour per *texel* where the existing path carries it per *dab*, and
+that the difference needs a second scratch texture. It does not, because **there
+is already one and it is a texture**: `CanvasRenderer`'s colour scratch holds a
+colour per fragment, and a smudging dab merely happens to write one flat colour
+across its own footprint. A stamp writes a different colour at each fragment
+into the same target, through the same two coloured pipelines, and everything
+downstream reads it through the code it already shared.
+
+So none of this was touched: the `R8Unorm` coverage scratch, its `max` blend,
+the build-up target, the selection clip, the four dab pipelines,
+`composite.wgsl`, `commit.wgsl`. `dab_coverage` is byte for byte what it was.
+`a_coloured_stamps_preview_and_its_commit_agree` is the guard, run across Normal
+and all four blended commits.
+
+What was added:
+
+- **`TipMask` gains an optional colour plane.** Straight sRGB, three bytes a
+  texel, for the reason `clipboard::Clip` holds a picture that way: it is what
+  the file held, so the PNG round trip is byte for byte. Three channels and not
+  four, because the fourth would be the coverage written down twice — two
+  numbers that could disagree about the edge of a stamp.
+- **On disk it is an 8-bit RGBA PNG** in the library's `tips/`, where a mask is
+  greyscale. `from_png` reads RGBA as a stamp — the alpha is the coverage,
+  unambiguously — and still refuses plain **RGB**, which genuinely has no answer
+  to "which channel is the coverage".
+- **One binding on the dab pass**, `Rgba8UnormSrgb`, premultiplied in linear
+  light with the coverage in the alpha: the layer array's convention and for its
+  reason, since only premultiplied colour may be bilinearly filtered without
+  haloing the edge of a stamp. `fs_colored` un-premultiplies it and it
+  **overrides** `in.color`, which is what a coloured stamp means — the picture in
+  the file is the mark, so the palette has nothing to say about it, exactly as
+  GIMP's pixmap brushes and Krita's colour stamps behave. `fs`, every ordinary
+  stroke, never samples it.
+- **The premultiply is `umber-core`'s**, `TipMask::colour_premultiplied`, so it
+  is testable without a device and reuses `docimport::srgb`'s encoder rather than
+  being a second copy of it.
+
+Which pipeline a stroke uses comes from **one snapshot**. `Brush` cannot answer
+"is the tip coloured", because a tip is a *name* the editor resolves — the same
+split `Brush::dab_has_angle` already has — so `Editor::begin_stroke` combines
+the two halves into `StrokeStyle::per_dab_color` and `app.rs` builds its
+`DabStyle` from that same field. That is stronger than what was there, where the
+dab pipeline and the stroke style were two readings that had to agree.
+
+It is **refused at that one gate** for an eraser and for a stroke on a mask.
+Neither has anywhere for a colour to land: an eraser deposits none, and a mask
+is read on `.r`, so a stamp's reds and blues would become "reveal" and "hide". A
+coloured stamp used for either paints as the mask it also is, and costs no
+colour attachment at all. The smudge probe is gated on the *brush* rather than
+on the style, so a coloured stamp does not sample the canvas it never reads.
+
+A coloured tip costs **five bytes a texel** — one of coverage, four of colour —
+where a mask costs one. Only the brushes that carry a colour pay it.
+
+**A picture imported as a tip is still read as coverage**, and that is decided
+rather than missing. A black-on-transparent PNG is overwhelmingly somebody's
+*mask* — it is how every brush pack on the internet distributes one — and
+reading its colour would turn a stamp that has always painted in the palette
+colour into one that paints black. Colour arrives only where the file states it
+is one: a `.gbr`'s depth of 4, a `.gpb`'s trailing pattern, an RGBA tip in the
+library. An explicit "import as a colour stamp" is a control somebody has to be
+offered, not a reading to take behind their back — see "Not done yet".
+
+The brush editor's stamp thumbnail shows a coloured stamp's own colour rather
+than the theme's ink, because a grey leaf that paints green is a picture that
+lies. The brush *row*'s stroke sample still previews in the palette colour: it
+is a CPU rasteriser and the deliberate one exception to "no second copy of the
+blend rules", so it stays the one thing it is, in the same way it already
+declines to show a brush's blend mode.
+
 ## Paper grain
 
 An optional tiling texture multiplied into dab coverage:
@@ -1268,6 +1352,20 @@ per pack. See `docs/brush-sources.md`.
   arrives as one preset per cell and says which rule it lost.
 - **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
   and reading a fourth off disk needs a variant that names a file.
+- **Importing a picture *as* a colour stamp.** The engine carries one and the
+  library stores one, and the only doors into it today are the file formats that
+  say so in their own bytes — a `.gbr` at four bytes a pixel, a `.gpb`'s
+  pattern, an RGBA tip already in `tips/`. `TipMask::from_picture` deliberately
+  keeps reading a picture as coverage, because a black-on-transparent PNG is
+  overwhelmingly a mask and reading its colour would silently change what every
+  such brush paints. What is missing is the *control* — a choice offered at the
+  import, beside the sentence that already names which reading was taken.
+- **Drawing a colour stamp on the canvas.** A tip document is transparent and
+  `TipMask::from_alpha` takes its alpha and discards the colour, which is the
+  rule that makes what you paint what stamps. Keeping the colour is now
+  expressible and is a second question for the same control as above: the
+  canvas would have to say which of the two it was for, since a mask drawn in
+  red and one drawn in black must stay the same stamp.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
   miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
   ellipticity is thrown per dab draws its row as though it were not. Fixing it

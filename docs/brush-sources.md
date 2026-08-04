@@ -176,6 +176,14 @@ else, so the other 301 were never candidates whatever the library could hold —
 stamps, mirrored dabs, brush-tip randomness, a separate paint-deposit rate or a
 rotation Umber cannot drive. Of the 37, 19 ship and 17 are rubberduck's.
 
+**These figures predate coloured stamps and are now pessimistic.** Umber carries
+a coloured tip since `TipMask::coloured` — see `docs/brushes.md` — so a `.gbr` at
+four bytes a pixel and a `.gpb`'s pattern no longer drop anything, and every
+brush refused for that reason alone is now shippable. Nobody has re-run
+`examples/build-brush-library.rs` against the fetched packs to say how many that
+is, and the number is not worth guessing at: run it, and replace the sentence
+above with what it says.
+
 ### How big the whole thing would have been
 
 Every unique mask the 338 need, as 8-bit PNG, at four maximum long sides:
