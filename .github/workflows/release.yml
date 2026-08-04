@@ -134,6 +134,11 @@ jobs:
           # run locally.
           mkdir -p wixassets
           cp assets/icons/umber.ico wixassets/umber.ico
+          # The installer's own artwork. Generated from `theme::Palette` by
+          # `umber-app`'s `installart` module and committed, like the icons,
+          # rather than drawn here: see that module, and `taskbar`'s tests,
+          # which fail if this step stops copying something the .wxs names.
+          cp packaging/windows/banner.bmp packaging/windows/dialog.bmp wixassets/
           sh packaging/windows/make-licence-rtf.sh LICENSE wixassets/licence.rtf
 
           # `-pdbtype none`: WiX otherwise drops a .wixpdb beside the installer,
