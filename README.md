@@ -311,8 +311,9 @@ a speed-derived approximation, and a mouse always paints at full pressure.
   wraps. A line mixing left-to-right and right-to-left writing is shaped but not
   reordered. A character the chosen face has no glyph for is left blank rather
   than borrowed from another font.
-- **Clearing a layer** is the one command that still throws the undo history
-  away. Everything else is undoable, including deleting a layer.
+- **Two commands still throw the undo history away**: clearing a layer, and
+  resizing the canvas. Both say so before you do them. Everything else is
+  undoable, including deleting a layer.
 - **Transforming a linked set.** Link groups move together through the stack.
   Moving several layers at once on the *canvas* is a larger change.
 - **A folder's own opacity and blend mode.** Folders hold layers, and their eye

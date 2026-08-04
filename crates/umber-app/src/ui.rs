@@ -1279,11 +1279,16 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                     ui.close();
                 }
                 ui.separator();
+                // Said before the click, like removing a mask and like the
+                // canvas dialog's own line: clearing is the last command that
+                // is not an undoable edit, so it takes the history with it and
+                // there is no way back afterwards.
                 if ui
                     .add_enabled(
                         !ed.layers.active_is_locked(),
                         egui::Button::new("Clear layer"),
                     )
+                    .on_hover_text("Empties the layer, and clears the undo history with it.")
                     .on_disabled_hover_text("Unlock the layer to clear it.")
                     .clicked()
                 {
