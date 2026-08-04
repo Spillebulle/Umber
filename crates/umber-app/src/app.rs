@@ -2155,7 +2155,7 @@ impl UmberApp {
         // the surface is touched, and this is the order rather than the
         // reverse: a reconfigure is refused while any acquired texture is
         // alive, whether or not the frame holding it meant to use it.
-        let acquired = texture.filter(|_| frame.draws);
+        let acquired = texture.filter(|_| frame.draws());
         if frame.reconfigure_now() {
             gfx.reconfigure_surface();
         }
@@ -2170,10 +2170,13 @@ impl UmberApp {
         // scale for the window, not the wrong picture — and asking for a frame
         // whose only purpose is to reconfigure is the shape that burned a
         // fifth of a core before `repaint_at` existed, since a driver that
-        // keeps answering `Suboptimal` would keep asking. Every way a surface
-        // becomes suboptimal is a resize or a scale change, and winit emits
-        // `Resized` for both — including on Wayland, where a scale change
-        // queues one — which requests a redraw and reconfigures on the spot.
+        // keeps answering `Suboptimal` would keep asking. On the desktop what
+        // makes a surface suboptimal is a resize or a scale change, and winit
+        // emits `Resized` for both — including on Wayland, where a scale
+        // change queues one — which requests a redraw and reconfigures on the
+        // spot. Vulkan also reports it for a surface *transform* change, which
+        // is a device rotation: no desktop produces one, and it is the case to
+        // re-examine if Android is ever built.
         gfx.reconfigure_pending |= frame.reconfigure_later();
 
         // The renderer of the document in front. Every other open document has
@@ -3561,10 +3564,11 @@ impl ApplicationHandler<Wake> for UmberApp {
                 }
             }
 
-            // A zero on either axis is refused rather than clamped: wgpu
-            // rejects a zero-area configure outright, and a window with no area
-            // is one there is nothing to draw on anyway. Wayland reports one
-            // while a window is being mapped.
+            // A zero on either axis skips the whole handler: wgpu refuses a
+            // zero-area configure outright, and a window with no area is one
+            // there is nothing to draw on anyway, so the surface keeps the
+            // configuration it had. Wayland reports one while a window is
+            // being mapped.
             //
             // No surface texture can be alive here — `render` presents or
             // drops its own before returning — so this may configure at once,

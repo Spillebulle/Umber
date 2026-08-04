@@ -46,11 +46,14 @@ pub enum Acquisition {
 }
 
 impl Acquisition {
-    /// Every answer, so the tests below can sweep them rather than naming the
-    /// cases they happen to remember — which is how a variant added later ends
-    /// up outside the one property that matters. `cfg(test)` because the sweep
-    /// is the only caller and the shipped binary should not carry a table
-    /// nothing reads.
+    /// Every answer, so the tests below sweep them rather than naming the
+    /// cases they happen to remember.
+    ///
+    /// It is **not** exhaustive by construction and saying so matters: a
+    /// variant added later has to be written in here by hand. What is forced
+    /// is the *implementation* — `plan` and [`Acquisition::carries_texture`]
+    /// are exhaustive matches, so neither compiles until the new answer has
+    /// been thought about. `cfg(test)` because the sweep is the only caller.
     #[cfg(test)]
     pub const ALL: [Self; 7] = [
         Self::Fresh,
@@ -61,32 +64,65 @@ impl Acquisition {
         Self::Timeout,
         Self::Failed,
     ];
+
+    /// Whether wgpu handed a surface texture over with this answer.
+    ///
+    /// A fact about `CurrentSurfaceTexture`, written down separately from
+    /// [`plan`] and deliberately not derived from it — that is the whole
+    /// reason the tests below say anything. A property checked against a
+    /// restatement of the code it is checking is a tautology, and two of them
+    /// shipped in the first draft of this module.
+    ///
+    /// An exhaustive `match` rather than a `matches!`, so an answer added
+    /// later cannot default to "no texture" — which is the reading that would
+    /// quietly make the safety property hold by never being tested.
+    #[cfg(test)]
+    pub fn carries_texture(self) -> bool {
+        match self {
+            Self::Fresh | Self::Suboptimal => true,
+            Self::Outdated | Self::Lost | Self::Occluded | Self::Timeout | Self::Failed => false,
+        }
+    }
 }
 
 /// What the frame that received an [`Acquisition`] does about it.
+///
+/// An enum of the four whole answers rather than a pair of booleans, and that
+/// is the guarantee: **there is no variant meaning "draw into the texture and
+/// configure the surface now"**, so the state that crashed Umber cannot be
+/// written down, let alone acted on. A `draws` flag beside a `reconfigure`
+/// flag can spell it, and a test asserting the two are never combined is a
+/// test of the accessors rather than of the decision — which is what the first
+/// draft of this module shipped, unfalsifiably.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frame {
-    /// Whether this frame draws into the texture it was handed.
-    pub draws: bool,
-    /// Whether the surface has to be configured again before the next
-    /// acquisition. *When* is [`Frame::reconfigure_now`]'s answer, not this
-    /// one's — reading this field alone is the bug this module documents.
-    pub reconfigure: bool,
+pub enum Frame {
+    /// Draw into the texture. The surface is as it should be.
+    Draw,
+    /// Draw into the texture, and configure the surface before the *next*
+    /// acquisition — never before this frame has let go of it.
+    DrawThenReconfigure,
+    /// No texture came back, so there is nothing to let go of: configure now
+    /// and skip the frame.
+    ReconfigureAndSkip,
+    /// No texture came back and there is nothing to put right. Skip.
+    Skip,
 }
 
 impl Frame {
-    /// Whether the reconfigure may be carried out on the spot.
-    ///
-    /// Only where the frame is not drawing, because only then is there no
-    /// surface texture alive to refuse it.
-    pub fn reconfigure_now(self) -> bool {
-        self.reconfigure && !self.draws
+    /// Whether this frame draws into the texture it was handed.
+    pub fn draws(self) -> bool {
+        matches!(self, Self::Draw | Self::DrawThenReconfigure)
     }
 
-    /// Whether the reconfigure has to wait until the texture in hand has been
+    /// Whether the surface may be configured on the spot.
+    pub fn reconfigure_now(self) -> bool {
+        matches!(self, Self::ReconfigureAndSkip)
+    }
+
+    /// Whether a reconfigure has to wait until the texture in hand has been
     /// presented — in practice, until just before the next acquisition.
     pub fn reconfigure_later(self) -> bool {
-        self.reconfigure && self.draws
+        matches!(self, Self::DrawThenReconfigure)
     }
 }
 
@@ -94,18 +130,12 @@ impl Frame {
 pub fn plan(acquisition: Acquisition) -> Frame {
     match acquisition {
         // Nothing to put right.
-        Acquisition::Fresh => Frame {
-            draws: true,
-            reconfigure: false,
-        },
+        Acquisition::Fresh => Frame::Draw,
         // The texture is usable, so the frame is drawn rather than thrown
         // away — a dropped frame during a resize drag is a window that
         // visibly stutters. The reconfigure is what the *next* acquisition
         // needs, and waits for it.
-        Acquisition::Suboptimal => Frame {
-            draws: true,
-            reconfigure: true,
-        },
+        Acquisition::Suboptimal => Frame::DrawThenReconfigure,
         // No texture was handed over, so there is nothing to hold the
         // reconfigure back and every reason to do it before returning: wgpu's
         // guidance for `Outdated` is "configure and try again".
@@ -117,17 +147,11 @@ pub fn plan(acquisition: Acquisition) -> Frame {
         // reconfigure is what Umber has always tried. Making that a rebuild is
         // a change worth making on evidence that it happens, not on the way
         // past.
-        Acquisition::Outdated | Acquisition::Lost => Frame {
-            draws: false,
-            reconfigure: true,
-        },
+        Acquisition::Outdated | Acquisition::Lost => Frame::ReconfigureAndSkip,
         // A minimised window and a swapchain that was busy are both "come back
         // later". Reconfiguring would be a stall for nothing, and on a
         // minimised window it would be a stall for nothing every frame.
-        Acquisition::Occluded | Acquisition::Timeout | Acquisition::Failed => Frame {
-            draws: false,
-            reconfigure: false,
-        },
+        Acquisition::Occluded | Acquisition::Timeout | Acquisition::Failed => Frame::Skip,
     }
 }
 
@@ -135,30 +159,35 @@ pub fn plan(acquisition: Acquisition) -> Frame {
 mod tests {
     use super::*;
 
-    /// The whole of the crash, as a property rather than as one case: nothing
-    /// that keeps a surface texture may reconfigure while it holds it. Written
-    /// over `ALL` so an acquisition added later is covered by construction.
+    /// The crash, stated against something other than itself: an answer that
+    /// carries a surface texture must never be planned to configure the
+    /// surface on the spot.
+    ///
+    /// `carries_texture` is a fact about wgpu's API written down beside
+    /// `plan` rather than read out of it, which is the only reason this says
+    /// anything. Asserting `!(frame.draws() && frame.reconfigure_now())`
+    /// instead is a tautology — with either spelling of `Frame`, `draws` and
+    /// `reconfigure_now` are derived from the same value — and two such tests
+    /// shipped in the first draft of this module and could not have failed.
     #[test]
-    fn no_frame_reconfigures_while_it_holds_a_texture() {
+    fn nothing_that_was_handed_a_texture_reconfigures_on_the_spot() {
         for acquisition in Acquisition::ALL {
-            let frame = plan(acquisition);
             assert!(
-                !(frame.draws && frame.reconfigure_now()),
+                !(acquisition.carries_texture() && plan(acquisition).reconfigure_now()),
                 "{acquisition:?} would configure the surface with its texture still alive"
             );
         }
     }
 
-    /// A reconfigure happens once — now or later, never both and never
-    /// neither. Reading `reconfigure` and picking a moment by hand at the call
-    /// site is what this replaces.
+    /// The other half, and the reason the one above cannot be satisfied by
+    /// simply never drawing: every texture wgpu hands over is drawn into, and
+    /// no frame claims to draw without one.
     #[test]
-    fn a_reconfigure_is_either_immediate_or_deferred_and_never_both() {
+    fn a_texture_that_came_back_is_the_one_that_is_drawn_into() {
         for acquisition in Acquisition::ALL {
-            let frame = plan(acquisition);
             assert_eq!(
-                frame.reconfigure,
-                frame.reconfigure_now() ^ frame.reconfigure_later(),
+                plan(acquisition).draws(),
+                acquisition.carries_texture(),
                 "{acquisition:?}"
             );
         }
@@ -168,17 +197,12 @@ mod tests {
     /// suboptimal acquisition is still drawn, and its reconfigure is pending.
     #[test]
     fn a_suboptimal_frame_draws_and_leaves_a_reconfigure_pending() {
-        let frame = plan(Acquisition::Suboptimal);
-        assert!(frame.draws);
-        assert!(frame.reconfigure_later());
-        assert!(!frame.reconfigure_now());
+        assert_eq!(plan(Acquisition::Suboptimal), Frame::DrawThenReconfigure);
     }
 
     #[test]
     fn a_fresh_acquisition_draws_and_touches_nothing() {
-        let frame = plan(Acquisition::Fresh);
-        assert!(frame.draws);
-        assert!(!frame.reconfigure);
+        assert_eq!(plan(Acquisition::Fresh), Frame::Draw);
     }
 
     /// Where no texture came back there is nothing to wait for, so the
@@ -187,9 +211,11 @@ mod tests {
     #[test]
     fn an_outdated_or_lost_surface_is_reconfigured_at_once() {
         for acquisition in [Acquisition::Outdated, Acquisition::Lost] {
-            let frame = plan(acquisition);
-            assert!(!frame.draws, "{acquisition:?}");
-            assert!(frame.reconfigure_now(), "{acquisition:?}");
+            assert_eq!(
+                plan(acquisition),
+                Frame::ReconfigureAndSkip,
+                "{acquisition:?}"
+            );
         }
     }
 
@@ -201,9 +227,7 @@ mod tests {
             Acquisition::Timeout,
             Acquisition::Failed,
         ] {
-            let frame = plan(acquisition);
-            assert!(!frame.draws, "{acquisition:?}");
-            assert!(!frame.reconfigure, "{acquisition:?}");
+            assert_eq!(plan(acquisition), Frame::Skip, "{acquisition:?}");
         }
     }
 }
