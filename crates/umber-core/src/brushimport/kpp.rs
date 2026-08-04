@@ -94,7 +94,7 @@
 //!   hard, aliased edge; `dab.wgsl` antialiases unconditionally and has nothing
 //!   to switch off. It is the whole of a pixel-art brush, so it is named rather
 //!   than ignored.
-//! - **Paper texture**, **paint thickness (impasto)**.
+//! - **Paint thickness (impasto)**.
 //! - **Mirrored dabs**, where Krita is actually asked for one: the option has
 //!   an enable flag *and* a checkbox per axis, and with neither axis ticked it
 //!   mirrors nothing however the sensor reads.
@@ -144,6 +144,59 @@
 //! regardless gave Deevad's "Eraser Kneaded Soft" an opacity ramp Krita never
 //! applies to it. A sensor that states no curve of its own is the *identity*,
 //! which is what Krita's own curve object is constructed as.
+//!
+//! # The paper texture
+//!
+//! Krita's texture option is a **pattern**, a scale, a levels pipeline over the
+//! pattern's own greyscale, and a *blending mode* saying how the finished mask
+//! meets the dab's alpha. Umber's grain is one line of that —
+//! `mix(1.0, tile, strength)` multiplied into coverage — so the reading here is
+//! decided by which of those four Umber holds exactly.
+//!
+//! - **The pattern comes across.** Twenty of the thirty-one textured presets in
+//!   the fetched packs carry it base64-encoded in `Texture/Pattern/Pattern` and
+//!   eleven name a file in the bundle's `patterns/`; [`from_kpp_in`] takes the
+//!   same shape of resolver for both that it already takes for a tip.
+//! - **The scale comes across**, as [`Brush::grain_scale`]: the tile is stored
+//!   at its own resolution and the shader stretches it over `width × scale`
+//!   document pixels, which is the picture Krita's own pre-resample produces
+//!   with the resampling left to the sampler that was going to run anyway.
+//! - **The levels pipeline is baked into the stored tile**, by
+//!   [`TextureSpec::levels`]. Brightness, contrast, invert, the neutral point
+//!   and the two cutoffs are each a pure function of one texel's grey, so the
+//!   whole of it is a 256-entry table applied once at import — where a shader
+//!   would pay for it on every fragment of every dab for ever, and `Brush`
+//!   would have to grow six `Copy` fields and six controls to carry settings
+//!   that describe a *picture* rather than a brush.
+//! - **The blending mode is the one part that cannot be**, and it is why a
+//!   texture is still named as a loss rather more often than not.
+//!   `TexturingMode` 0 is Multiply, and Krita's own arithmetic there is
+//!   `alpha × (mask × strength + (1 − strength))` — Umber's grain exactly, so
+//!   those presets are reproduced rather than approximated. Every other mode
+//!   subtracts, dodges, burns or thresholds; the largest of them is Subtract
+//!   (`alpha − mask`), which no multiply can stand in for at all.
+//!
+//! Three further readings, each a field that decides whether another is read:
+//!
+//! - **`Texture/Pattern/Enabled`, and the prefix is the whole point.** This
+//!   read `Texture/Enabled` for a while, which is a key Krita has never
+//!   written, so the paper was dropped in silence from all 119 presets.
+//! - **The strength**, `Texture/Strength/Value` or the older
+//!   `Texture/Pattern/Strength`, because a texture at zero strength paints
+//!   identically with and without paper and naming it would refuse a brush over
+//!   a loss that is not one.
+//! - **Whether that strength follows pressure.** Krita puts a curve on it;
+//!   Umber's grain is one number for the stroke, so a curve that actually moves
+//!   is named. A curve that does not move is Krita's editor leaving a default
+//!   behind — the judgement [`Dynamic::from_samples`] already makes.
+//!
+//! The greyscale is [`crate::tip::grain_of`]'s rather than a second copy of
+//! `qGray`, and the difference was measured rather than waved through: Umber
+//! weights Rec. 709 where Krita weights Rec. 601, which on a **neutral** texel
+//! is exactly the same number. Twenty-eight of the thirty-one patterns are
+//! neutral in every texel and differ by nothing at all; the three that are
+//! faintly tinted differ by at most 1.9 levels of 255, on one of them, and by
+//! 0.3 on average.
 //!
 //! # Approximated rather than dropped
 //!
@@ -242,6 +295,15 @@ pub struct KppPreset {
     /// The file name of a predefined tip this preset wanted and nothing could
     /// supply. The brush still paints — round — and the caller says so.
     pub missing_tip: Option<String>,
+    /// The paper this brush's grain bites through, where the texture was one
+    /// Umber can reproduce and its pattern could be found.
+    ///
+    /// `None` and [`Brush::grain`] at zero go together, and deliberately: a
+    /// strength kept without a tile would send [`crate::BrushPreset::paper`] to
+    /// nothing and paint **flat**, which is the exact identity, where a
+    /// strength kept with one of Umber's own tiles substituted would be a grain
+    /// the author never chose. See `BrushPreset::paper`'s own note on that.
+    pub paper: Option<TipMask>,
     pub dropped: Vec<&'static str>,
 }
 
@@ -251,14 +313,38 @@ pub struct KppPreset {
 /// [`from_kpp_in`] when there is somewhere to look the file up, which for a
 /// `.bundle` is its `brushes/` directory.
 pub fn from_kpp(bytes: &[u8]) -> Result<KppPreset, PresetError> {
-    from_kpp_in(bytes, &|_| None)
+    from_kpp_in(bytes, &Sidecar::none())
 }
 
-/// Decode a `.kpp`, resolving a predefined tip through `brushes`.
-pub fn from_kpp_in(
-    bytes: &[u8],
-    brushes: &dyn Fn(&str) -> Option<Vec<u8>>,
-) -> Result<KppPreset, PresetError> {
+/// Where a `.kpp` looks for the files it names rather than carries.
+///
+/// Two resolvers rather than one taking a directory, because a `.bundle` holds
+/// its entries in memory and a loose preset's are on disk beside it — and
+/// because the two directories are different (`brushes/` and `patterns/`), so a
+/// single lookup would have to be told which kind of file it was after and
+/// would then be two functions wearing one name.
+pub struct Sidecar<'a> {
+    /// A predefined brush tip, by the file name `brush_definition` gives.
+    pub brushes: &'a dyn Fn(&str) -> Option<Vec<u8>>,
+    /// A paper pattern, by the file name the texture option gives.
+    pub patterns: &'a dyn Fn(&str) -> Option<Vec<u8>>,
+}
+
+impl Sidecar<'_> {
+    /// Nothing beside the file. A preset that embeds everything it names reads
+    /// identically either way; one that does not arrives round, or flat, and
+    /// says so.
+    pub fn none() -> Self {
+        Self {
+            brushes: &|_| None,
+            patterns: &|_| None,
+        }
+    }
+}
+
+/// Decode a `.kpp`, resolving what it names but does not carry through `beside`.
+pub fn from_kpp_in(bytes: &[u8], beside: &Sidecar<'_>) -> Result<KppPreset, PresetError> {
+    let brushes = beside.brushes;
     let xml = preset_chunk(bytes)?;
     let preset = Preset::parse(&xml)?;
 
@@ -289,37 +375,24 @@ pub fn from_kpp_in(
     if preset.flag("MaskingBrush/Enabled") {
         dropped.push("masking brushes");
     }
-    // `Texture/Pattern/Enabled`, and the prefix is the whole point: this read
-    // `Texture/Enabled` for a while, which is a key Krita has never written.
-    // Every texture setting is under `Texture/Pattern/` — checked against
-    // Krita's own source at both ends of the range these packs were written in,
-    // `kis_texture_option.cpp` at v4.4.8 and `KisTextureOptionData.cpp` on
-    // master, neither of which has a bare `Texture/Enabled`. So the check was
-    // false in all 119 presets of the fetched packs and the paper was dropped
-    // in silence — 31 of them switch a texture on, and **eleven were shipping**
-    // without it, several named for the grain they had lost ("Thick Dry
-    // Canvas", "Texture Fabric", "Rough Rake Textured").
-    // `MaskingBrush/Enabled` beside it is spelled correctly and fires on the
-    // one preset that uses it, which is what made the silence look like an
-    // absence of textured brushes rather than a bug.
-    //
-    // The strength is read for the reason `SharpnessValue` is read eleven lines
-    // below and `ScatterValue` is gated on `PressureScatter`: a setting Krita
-    // leaves in the file is not a setting Krita applies, and a texture at zero
-    // strength paints identically with and without paper — naming it would
-    // refuse a brush from the shipped library over a loss that is not one.
-    // Krita has spelled it twice, `Texture/Strength/Value` on the curve option
-    // and `Texture/Pattern/Strength` before it, and both are in the packs;
-    // absent means the default, which is full. No fetched preset is at zero —
-    // thirty sit at 1.0 and one at 0.45 — so this changes nothing today and is
-    // the guard being stated rather than assumed.
-    let texture_strength = preset
-        .number("Texture/Strength/Value")
-        .or_else(|| preset.number("Texture/Pattern/Strength"))
-        .unwrap_or(1.0);
-    if preset.flag("Texture/Pattern/Enabled") && texture_strength > 0.0 {
-        dropped.push("paper texture");
-    }
+    // The paper. See the module's own section: the pattern, the scale and the
+    // levels pipeline all come across, and the *blending mode* is what decides
+    // whether the brush is reproduced or named as a loss.
+    let (paper, grain, grain_scale) = match TextureSpec::read(&preset) {
+        None => (None, 0.0, Brush::default().grain_scale),
+        Some(spec) => {
+            let (paper, losses) = spec.resolve(beside.patterns);
+            dropped.extend(losses);
+            match paper {
+                // Reading the strength and leaving the tile behind would be the
+                // worst of both: `BrushPreset::paper` names nothing, the shader
+                // paints flat, and the brush claims a grain it does not have.
+                // They go together or neither does.
+                Some(paper) => (Some(paper.tile), spec.strength, paper.scale),
+                None => (None, 0.0, Brush::default().grain_scale),
+            }
+        }
+    };
     // Mirroring has an enable flag *and* a checkbox per axis: Krita's
     // `KisMirrorOption::apply` guards the whole of its work on
     // `isChecked() && (horizontal || vertical)`, so with neither axis ticked
@@ -660,6 +733,8 @@ pub fn from_kpp_in(
         pressure_scatter,
         smudge,
         smudge_radius,
+        grain,
+        grain_scale,
         // Heaviest first, which is `mypaint`'s rule and is currently inert
         // here: `dab_input` maps one id to a non-pressure input and three
         // options are read, so this can never exceed three entries against
@@ -681,6 +756,7 @@ pub fn from_kpp_in(
         brush,
         tip,
         missing_tip,
+        paper,
         dropped,
     })
 }
@@ -1430,6 +1506,322 @@ impl TipSpec {
         }
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The paper texture
+// ---------------------------------------------------------------------------
+
+/// Krita's Multiply, whose arithmetic against the dab's alpha is Umber's grain
+/// exactly. Thirteen of the thirty-one textured presets in the fetched packs.
+///
+/// Every other value of `TexturingMode` names a mode that subtracts, dodges,
+/// burns or thresholds, and the largest of them is Subtract (14 presets):
+/// `alpha − mask`, which `mix(1.0, tile, strength)` cannot stand in for at any
+/// tile. Those are named rather than approximated, which is this reader's
+/// standing rule and the reason `build-brush-library.rs` refuses them.
+const MULTIPLY: i32 = 0;
+
+/// A texture Umber cannot reproduce, because Krita composites its mask with the
+/// dab in a way a multiply is not.
+pub const OTHER_TEXTURE_MODE: &str = "a paper texture in one of Krita's other blending modes";
+
+/// The texture is on and its pattern is not in the file or beside it.
+///
+/// Named rather than substituted, for the reason [`KppPreset::paper`] gives:
+/// one of Umber's own papers in place of the author's is a grain nobody drew.
+pub const MISSING_PATTERN: &str = "a paper texture whose pattern is stored outside the file";
+
+/// Krita's texture strength follows pressure and Umber's grain is one number
+/// for the whole stroke.
+pub const PAPER_UNDER_PRESSURE: &str = "a paper texture whose strength follows pressure";
+
+/// What Krita's texture option says, read only where Krita reads it.
+struct TextureSpec {
+    /// `Texture/Strength/Value`, or `Texture/Pattern/Strength` before it.
+    strength: f32,
+    mode: i32,
+    /// How much Krita resamples the pattern by before tiling it.
+    scale: f32,
+    invert: bool,
+    brightness: f32,
+    contrast: f32,
+    neutral_point: f32,
+    cutoff_left: f32,
+    cutoff_right: f32,
+    cutoff_policy: i32,
+    /// The pattern, base64-encoded inside the preset.
+    embedded: Option<String>,
+    /// The file the pattern is in, when it is not embedded.
+    file: Option<String>,
+    /// Whether the strength's own curve actually moves.
+    strength_varies: bool,
+}
+
+/// A pattern read, levelled and measured into what a `Brush` needs.
+struct Paper {
+    tile: TipMask,
+    /// [`Brush::grain_scale`]: the side of one tile in document pixels.
+    scale: f32,
+}
+
+impl TextureSpec {
+    /// The texture option, where it is switched on and doing something.
+    ///
+    /// `None` covers both "no texture" and "a texture at zero strength", which
+    /// paint identically — the same guard `ScatterValue` gets from
+    /// `PressureScatter`, and for the same reason: a setting Krita leaves in
+    /// the file is not a setting Krita applies, so naming it would refuse a
+    /// brush from the shipped library over a loss that is not one. No fetched
+    /// preset is at zero (thirty at 1.0 and one at 0.45), so this is the guard
+    /// stated rather than assumed.
+    fn read(preset: &Preset) -> Option<Self> {
+        if !preset.flag("Texture/Pattern/Enabled") {
+            return None;
+        }
+        // Krita's two spellings, current first. Both are in the packs — the
+        // curve option's `Value` in eleven presets and the older
+        // `Pattern/Strength` in twenty. Absent is Krita's own default of full.
+        let strength = preset
+            .number("Texture/Strength/Value")
+            .or_else(|| preset.number("Texture/Pattern/Strength"))
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        if strength <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            strength,
+            mode: preset
+                .number("Texture/Pattern/TexturingMode")
+                .unwrap_or(0.0)
+                .round() as i32,
+            // Krita's own default, and clamped to what a tile can be stretched
+            // to: `Brush::grain_scale` bounds the result and a scale of zero
+            // would ask for a tile no pixels wide.
+            scale: preset
+                .number("Texture/Pattern/Scale")
+                .unwrap_or(1.0)
+                .clamp(0.001, 100.0),
+            invert: preset.flag("Texture/Pattern/Invert"),
+            brightness: preset.number("Texture/Pattern/Brightness").unwrap_or(0.0),
+            contrast: preset.number("Texture/Pattern/Contrast").unwrap_or(1.0),
+            neutral_point: preset
+                .number("Texture/Pattern/NeutralPoint")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            cutoff_left: preset.number("Texture/Pattern/CutoffLeft").unwrap_or(0.0),
+            cutoff_right: preset
+                .number("Texture/Pattern/CutoffRight")
+                .unwrap_or(255.0),
+            cutoff_policy: preset
+                .number("Texture/Pattern/CutoffPolicy")
+                .unwrap_or(0.0)
+                .round() as i32,
+            embedded: preset.params.get("Texture/Pattern/Pattern").cloned(),
+            file: preset
+                .params
+                .get("Texture/Pattern/PatternFileName")
+                .or_else(|| preset.params.get("Texture/Pattern/Name"))
+                .map(|name| {
+                    // Krita records whatever path the pattern had on its
+                    // author's machine — `/home/raghu/kf5/…` and
+                    // `C:/Users/…/AppData/…` are both in the packs — and a
+                    // bundle holds the file under its bare name. Never a path,
+                    // so a preset cannot reach out of the pack it came in.
+                    name.rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(name)
+                        .trim()
+                        .to_string()
+                })
+                .filter(|name| !name.is_empty()),
+            // `Texture/Strength/UseCurve` gates the sensors exactly as
+            // `<Name>UseCurve` gates a dynamic's — `KisCurveOption` reads no
+            // sensor at all without it — and the curve is found the same two
+            // ways, shared or on the sensor. A sensor that states no curve is
+            // the *identity*, which for a strength means one that ramps from
+            // nothing at a feather touch: the same reading `sensor_dynamic`
+            // takes, and the reason it is not "flat" there either.
+            strength_varies: preset.flag("Texture/Strength/UseCurve")
+                && Dynamic::from_samples(
+                    preset
+                        .sensor_curve("Texture/Strength/", "pressure")
+                        .unwrap_or_else(|| vec![(0.0, 0.0), (1.0, 1.0)]),
+                )
+                .live,
+        })
+    }
+
+    /// The paper this texture paints through, and what it cost to get there.
+    ///
+    /// One method rather than a `tile` beside a `losses`, because the two
+    /// answers are the same answer: a paper that did not resolve *is* the loss,
+    /// and two functions deciding that separately is how a texture comes back
+    /// carrying a tile and a sentence saying it lost one — or, the way round it
+    /// actually failed, painting flat with nothing said.
+    ///
+    /// **One sentence at most, and the mode goes first.** A Subtract texture
+    /// reproduces nothing whatever its pattern does, so naming its pressure
+    /// curve underneath would be noise on top of a loss already named — the
+    /// rule the library generator follows when it asks what was dropped before
+    /// it asks about the mask. An import that cries wolf costs the losses that
+    /// matter.
+    fn resolve(
+        &self,
+        patterns: &dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> (Option<Paper>, Vec<&'static str>) {
+        if self.mode != MULTIPLY {
+            return (None, vec![OTHER_TEXTURE_MODE]);
+        }
+        let Some(paper) = self.tile(patterns) else {
+            return (None, vec![MISSING_PATTERN]);
+        };
+        if self.strength_varies {
+            return (Some(paper), vec![PAPER_UNDER_PRESSURE]);
+        }
+        (Some(paper), Vec::new())
+    }
+
+    /// Krita's mask pipeline as a table, one entry per greyscale value.
+    ///
+    /// **A table because every step of it is a pure function of one texel's
+    /// grey** — `KisTextureMaskInfo::recalculateMask`, in order: subtract the
+    /// brightness, apply the contrast about a half, clamp, invert, then the
+    /// neutral-point remap and the cutoff. Nothing in it looks at a neighbour
+    /// and nothing at the dab, so applying it once at import is exactly what
+    /// applying it per fragment would produce, minus six `Copy` fields on
+    /// `Brush`, six controls in the brush editor and the arithmetic on every
+    /// fragment of every dab for ever.
+    ///
+    /// The input is [`crate::tip::grain_of`]'s eight-bit reading rather than
+    /// Krita's float, which costs at most half a level before a contrast that
+    /// is 1.0 in thirty of the thirty-one fetched presets and below 1.0 in the
+    /// other — so the one case that could magnify the rounding shrinks it.
+    fn levels(&self) -> [u8; 256] {
+        let mut table = [0u8; 256];
+        for (grey, out) in table.iter_mut().enumerate() {
+            let mut value = grey as f32 / 255.0;
+            value -= self.brightness;
+            value = (value - 0.5) * self.contrast + 0.5;
+            value = value.clamp(0.0, 1.0);
+            if self.invert {
+                value = 1.0 - value;
+            }
+            // Krita's own two-segment remap, which at the default neutral point
+            // of a half is the identity in both segments. It is here rather
+            // than skipped because eleven of the fetched presets state the
+            // field at all, and a reader that ignored it would be right about
+            // those eleven by luck.
+            value = if self.neutral_point >= 1.0
+                || (self.neutral_point > 0.0 && value <= self.neutral_point)
+            {
+                value / (2.0 * self.neutral_point.max(f32::EPSILON))
+            } else {
+                0.5 + (value - self.neutral_point) / (2.0 - 2.0 * self.neutral_point)
+            };
+            // Outside the cutoff the texel becomes all pit (policy 1) or all
+            // paper (policy 2); a policy of zero is off, which is what
+            // twenty-two of the thirty-one say.
+            let outside = value < self.cutoff_left / 255.0 || value > self.cutoff_right / 255.0;
+            if outside {
+                match self.cutoff_policy {
+                    1 => value = 0.0,
+                    2 => value = 1.0,
+                    _ => {}
+                }
+            }
+            *out = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        table
+    }
+
+    /// The tile this texture paints through, where Umber can paint it at all.
+    ///
+    /// `None` is "paint flat and say why": either the mode is one no multiply
+    /// reproduces, or the pattern is somewhere this reader cannot reach.
+    /// [`Self::losses`] has already named which.
+    fn tile(&self, patterns: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<Paper> {
+        if self.mode != MULTIPLY {
+            return None;
+        }
+        let png = self.pattern(patterns)?;
+        let (width, height, rgba) = decode_rgba(&png)?;
+        // The tile is stored at the pattern's own resolution and stretched over
+        // `side × scale` document pixels by the sampler that was going to run
+        // anyway — which is the picture Krita's pre-resample makes, without a
+        // second resampler in `umber-core` to keep in step with the hardware's.
+        let side = width.max(height) as f32;
+        let scale = (side * self.scale).clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
+
+        let table = self.levels();
+        let coverage: Vec<u8> = crate::tip::grain_of(&rgba)
+            .into_iter()
+            .map(|grey| table[grey as usize])
+            .collect();
+        // A pattern larger than a mask may be is refused rather than resampled
+        // down, exactly as `TipMask::from_picture` refuses an oversized stamp:
+        // a silent reduction is a paper that bites at the wrong pitch with
+        // nothing saying so. Nothing in the fetched packs is over 512.
+        let tile = TipMask::new(width, height, coverage).ok()?;
+        Some(Paper { tile, scale })
+    }
+
+    /// The pattern's PNG bytes, from inside the preset or from beside it.
+    ///
+    /// **Krita's embedded pattern is base64 twice**: the option holds the
+    /// picture as a base64 string and the properties configuration then encodes
+    /// that string in turn, so one decode hands back text beginning `iVBORw0K`.
+    /// Sniffing the result rather than decoding a fixed number of times is what
+    /// keeps this right for a writer that only does it once.
+    fn pattern(&self, patterns: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+        if let Some(text) = &self.embedded {
+            let mut raw = base64(text)?;
+            if !raw.starts_with(PNG_MAGIC) {
+                raw = base64(std::str::from_utf8(&raw).ok()?)?;
+            }
+            if raw.starts_with(PNG_MAGIC) {
+                return Some(raw);
+            }
+        }
+        self.file.as_ref().and_then(|name| patterns(name))
+    }
+}
+
+/// A pattern's pixels as straight-alpha sRGB RGBA8 — what
+/// [`crate::tip::grain_of`] takes.
+///
+/// Every pattern in the fetched packs is a PNG, including the three whose names
+/// end `.pat`: Krita re-encodes a GIMP pattern when it embeds one, so there is
+/// no second decoder to write and none is written on the guess that there might
+/// be. A pattern in any other format resolves to nothing and the brush is told
+/// it lost its paper.
+fn decode_rgba(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+    // Palette and 16-bit patterns are both in the packs, and this expands
+    // either to the eight-bit channels the reading below assumes.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+
+    let texels = info.width as usize * info.height as usize;
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Grayscale => buf[..texels].iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf[..texels * 2]
+            .chunks_exact(2)
+            .flat_map(|px| [px[0], px[0], px[0], px[1]])
+            .collect(),
+        png::ColorType::Rgb => buf[..texels * 3]
+            .chunks_exact(3)
+            .flat_map(|px| [px[0], px[1], px[2], 255])
+            .collect(),
+        png::ColorType::Rgba => buf[..texels * 4].to_vec(),
+        _ => return None,
+    };
+    Some((info.width, info.height, rgba))
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,9 +2579,13 @@ mod tests {
                  angle=\"0\" scale=\"1\"/>"
             ),
         );
-        let preset = from_kpp_in(&kpp(&xml), &|name| {
-            (name == "outside.png").then(|| png.clone())
-        })
+        let preset = from_kpp_in(
+            &kpp(&xml),
+            &Sidecar {
+                brushes: &|name| (name == "outside.png").then(|| png.clone()),
+                patterns: &|_| None,
+            },
+        )
         .expect("decode");
         assert!(preset.missing_tip.is_none());
         assert_eq!(preset.tip.expect("mask").at(0, 0), 255);
@@ -2323,7 +2719,9 @@ mod tests {
             "star-shaped brushes",
             "square brush shapes",
             "masking brushes",
-            "paper texture",
+            // The texture is on and its pattern is nowhere: this fixture
+            // embeds none and there is nothing beside it.
+            MISSING_PATTERN,
         ] {
             assert!(
                 dropped.contains(&expected),
@@ -2502,56 +2900,396 @@ mod tests {
         assert!(with("fuzzy").is_empty());
     }
 
-    /// A paper texture is named, and the *key* is what this pins.
+    /// An 8-bit greyscale PNG of the given texels, which is what every pattern
+    /// in the fetched packs turns out to be.
+    fn grey_pattern(width: u32, height: u32, texels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("header");
+        writer.write_image_data(texels).expect("data");
+        drop(writer);
+        out
+    }
+
+    /// Base64, the encoder to [`base64`]'s decoder. Fifteen lines and used by
+    /// the tests alone, for the reason the decoder is hand-written: a
+    /// dependency in the engine crate has to buy more than this.
+    fn to_base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut block = [0u8; 3];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let n = u32::from_be_bytes([0, block[0], block[1], block[2]]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The `Texture/Pattern/Pattern` param as Krita writes it: the picture's
+    /// base64, base64'd again by the properties configuration around it.
+    fn embedded_pattern(png: &[u8]) -> String {
+        param(
+            "Texture/Pattern/Pattern",
+            &to_base64(to_base64(png).as_bytes()),
+        )
+    }
+
+    /// A textured preset, with whatever extra settings the caller wants.
+    fn textured(extra: &str) -> Vec<u8> {
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{extra}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                 <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+            ),
+            internal("Texture/Pattern/Enabled", "true"),
+        );
+        kpp(&xml)
+    }
+
+    /// A paper texture is read under the key Krita actually writes.
     ///
     /// Krita states every texture setting under `Texture/Pattern/`, and this
-    /// reader looked for `Texture/Enabled` — a key nothing writes. So the loss
-    /// was never reported, for the shipped library or for a user's import, and
-    /// eleven textured presets shipped as plain ones. Asserting the flag alone
-    /// would have passed under the old spelling too, so the second half is the
-    /// one that matters: the key Krita does not write must change nothing.
+    /// reader looked for `Texture/Enabled` — a key nothing writes. So the
+    /// option was never seen at all, for the shipped library or for a user's
+    /// import, and thirty-one textured presets read as plain ones. Asserting
+    /// the flag alone would have passed under the old spelling too, so the
+    /// second half is the one that matters: the key Krita does not write must
+    /// change nothing.
     #[test]
-    fn a_paper_texture_is_named_under_the_key_krita_actually_writes() {
-        let with = |key: &str| {
-            let xml = format!(
-                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}</Preset>",
-                param(
-                    "brush_definition",
-                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
-                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
-                ),
-                internal(key, "true"),
-            );
-            from_kpp(&kpp(&xml)).expect("decode").dropped
-        };
+    fn a_paper_texture_is_read_under_the_key_krita_actually_writes() {
+        let png = grey_pattern(2, 2, &[255, 128, 128, 255]);
 
-        assert_eq!(with("Texture/Pattern/Enabled"), vec!["paper texture"]);
+        let read = from_kpp(&textured(&embedded_pattern(&png))).expect("decode");
+        assert!(read.dropped.is_empty(), "{:?}", read.dropped);
+        assert_eq!(read.paper.expect("tile").coverage(), [255, 128, 128, 255]);
+        assert_eq!(read.brush.grain, 1.0);
+
         // The spelling this reader used to look for. Krita has never written
-        // it, so a brush that says only this has no texture to lose.
-        assert!(with("Texture/Enabled").is_empty());
-
-        // And a texture switched on at no strength is not a loss. Krita leaves
-        // the option's settings in the file either way, which is the trap
-        // `ScatterValue` and `SharpnessValue` are both read against.
-        let at_strength = |key: &str, value: &str| {
-            let xml = format!(
-                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
-                param(
-                    "brush_definition",
-                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
-                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
-                ),
-                internal("Texture/Pattern/Enabled", "true"),
-                param(key, value),
-            );
-            from_kpp(&kpp(&xml)).expect("decode").dropped
-        };
-        assert!(at_strength("Texture/Strength/Value", "0").is_empty());
-        assert!(at_strength("Texture/Pattern/Strength", "0").is_empty());
-        assert_eq!(
-            at_strength("Texture/Strength/Value", "0.45"),
-            vec!["paper texture"]
+        // it, so a brush that says only this has no texture at all — no paper
+        // and, since nothing was asked for, nothing lost.
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                 <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+            ),
+            internal("Texture/Enabled", "true"),
+            embedded_pattern(&png),
         );
+        let old_key = from_kpp(&kpp(&xml)).expect("decode");
+        assert!(old_key.dropped.is_empty());
+        assert!(old_key.paper.is_none());
+        assert_eq!(old_key.brush.grain, 0.0);
+
+        // And a texture switched on at no strength is neither paper nor a loss.
+        // Krita leaves the option's settings in the file either way, which is
+        // the trap `ScatterValue` and `SharpnessValue` are both read against.
+        for key in ["Texture/Strength/Value", "Texture/Pattern/Strength"] {
+            let off = from_kpp(&textured(&format!(
+                "{}{}",
+                embedded_pattern(&png),
+                param(key, "0")
+            )))
+            .expect("decode");
+            assert!(off.dropped.is_empty(), "{key}: {:?}", off.dropped);
+            assert!(off.paper.is_none(), "{key}");
+            assert_eq!(off.brush.grain, 0.0, "{key}");
+        }
+
+        // A strength between the two is the strength, and 0.45 is what one
+        // fetched preset actually states.
+        let faint = from_kpp(&textured(&format!(
+            "{}{}",
+            embedded_pattern(&png),
+            param("Texture/Strength/Value", "0.45")
+        )))
+        .expect("decode");
+        assert!(faint.paper.is_some());
+        assert!((faint.brush.grain - 0.45).abs() < 1e-6);
+    }
+
+    /// The strength and the tile travel together or neither does.
+    ///
+    /// A pattern this reader cannot reach leaves `BrushPreset::paper` naming
+    /// nothing, and `Editor::paper_tile` then paints **flat** — which is the
+    /// exact identity and the right answer. Keeping the strength would make
+    /// that brush claim a grain it does not have; substituting one of Umber's
+    /// own papers would put a texture the author never chose into every mark,
+    /// which is the fault that made a Clip Studio import paint at 78% of its
+    /// stated opacity.
+    #[test]
+    fn a_pattern_this_reader_cannot_reach_paints_flat_and_says_so() {
+        let named = param("Texture/Pattern/PatternFileName", "elsewhere.png");
+        let missing = from_kpp(&textured(&named)).expect("decode");
+        assert_eq!(missing.dropped, vec![MISSING_PATTERN]);
+        assert!(missing.paper.is_none());
+        assert_eq!(missing.brush.grain, 0.0);
+
+        // The same preset with the file supplied beside it: no loss, and the
+        // tile is the picture. This is the `.bundle`'s `patterns/` route, and
+        // eleven of Revoy's presets take it.
+        let png = grey_pattern(1, 1, &[64]);
+        let found = from_kpp_in(
+            &textured(&named),
+            &Sidecar {
+                brushes: &|_| None,
+                patterns: &|wanted| (wanted == "elsewhere.png").then(|| png.clone()),
+            },
+        )
+        .expect("decode");
+        assert!(found.dropped.is_empty(), "{:?}", found.dropped);
+        assert_eq!(found.paper.expect("tile").coverage(), [64]);
+
+        // Krita records whatever path the pattern had on its author's machine —
+        // `/home/raghu/kf5/inst/share/krita/patterns/07_big-grain.png` is in the
+        // fetched packs — and a bundle holds it under the bare name. Reading
+        // the path through would find nothing; reading it as a *path* would let
+        // a stranger's preset name a file outside the pack.
+        let absolute = param(
+            "Texture/Pattern/PatternFileName",
+            "/home/somebody/.local/share/krita/patterns/elsewhere.png",
+        );
+        let resolved = from_kpp_in(
+            &textured(&absolute),
+            &Sidecar {
+                brushes: &|_| None,
+                patterns: &|wanted| (wanted == "elsewhere.png").then(|| png.clone()),
+            },
+        )
+        .expect("decode");
+        assert!(resolved.paper.is_some(), "{:?}", resolved.dropped);
+    }
+
+    /// Multiply is the one texturing mode Umber's grain *is*, and every other
+    /// one is named rather than approximated.
+    ///
+    /// Krita's Multiply against the dab's alpha is
+    /// `alpha × (mask × strength + (1 − strength))`, which is
+    /// `mix(1.0, tile, strength)` written out. Subtract — the largest group in
+    /// the fetched packs, fourteen presets — is `alpha − mask`, and no tile
+    /// makes a multiply do that: at half coverage through a half-lit texel the
+    /// two differ by a quarter of the mark.
+    #[test]
+    fn only_krita_multiply_is_a_grain_umber_can_paint() {
+        let png = grey_pattern(1, 1, &[128]);
+        let with_mode = |mode: &str| {
+            from_kpp(&textured(&format!(
+                "{}{}",
+                embedded_pattern(&png),
+                param("Texture/Pattern/TexturingMode", mode)
+            )))
+            .expect("decode")
+        };
+
+        let multiply = with_mode("0");
+        assert!(multiply.dropped.is_empty());
+        assert!(multiply.paper.is_some());
+
+        // 1 is Subtract, 6 a dodge, 11 Hard Mix and 12 Height — the four other
+        // modes the fetched packs actually use.
+        for mode in ["1", "6", "11", "12"] {
+            let other = with_mode(mode);
+            assert_eq!(other.dropped, vec![OTHER_TEXTURE_MODE], "mode {mode}");
+            assert!(other.paper.is_none(), "mode {mode}");
+            assert_eq!(other.brush.grain, 0.0, "mode {mode}");
+        }
+    }
+
+    /// Krita's levels pipeline is baked into the stored tile, and each step of
+    /// it is pinned against `KisTextureMaskInfo::recalculateMask` by hand.
+    ///
+    /// Baked rather than carried, because every one of these is a pure function
+    /// of one texel's grey: a shader would pay for it on every fragment of
+    /// every dab for ever, and `Brush` would grow six `Copy` fields and six
+    /// controls describing a picture rather than a brush.
+    #[test]
+    fn the_patterns_levels_are_baked_into_the_tile() {
+        let png = grey_pattern(4, 1, &[0, 64, 192, 255]);
+        let baked = |settings: &str| {
+            from_kpp(&textured(&format!("{}{settings}", embedded_pattern(&png))))
+                .expect("decode")
+                .paper
+                .expect("tile")
+                .coverage()
+                .to_vec()
+        };
+
+        // No levels at all is the picture, byte for byte. Krita's defaults are
+        // brightness 0, contrast 1, neutral point a half and no cutoff, and all
+        // four have to be the identity or every untweaked pattern moves.
+        assert_eq!(baked(""), [0, 64, 192, 255]);
+
+        // Brightness is *subtracted*, which is the way round Krita has it — so
+        // a positive brightness darkens the paper and bites harder. Two fetched
+        // presets sit at −0.1 and −0.29, which lighten.
+        assert_eq!(
+            baked(&param("Texture/Pattern/Brightness", "-0.2")),
+            [51, 115, 243, 255]
+        );
+
+        // Contrast pivots about a half.
+        assert_eq!(
+            baked(&param("Texture/Pattern/Contrast", "0.5")),
+            [64, 96, 160, 191]
+        );
+
+        // Invert is the complement, and it is eleven of the thirty-one.
+        assert_eq!(
+            baked(&internal("Texture/Pattern/Invert", "true")),
+            [255, 191, 63, 0]
+        );
+
+        // Cutoff policy 1 makes everything outside the window all pit, and
+        // policy 2 makes it all paper. Policy 0 — twenty-two of the
+        // thirty-one — is off, whatever the window says. The window is stated
+        // in eight-bit levels and compared against the value as a fraction, so
+        // 64 and 192 sit inside 50..=200 and the two ends do not.
+        let window = format!(
+            "{}{}",
+            param("Texture/Pattern/CutoffLeft", "50"),
+            param("Texture/Pattern/CutoffRight", "200")
+        );
+        assert_eq!(
+            baked(&format!(
+                "{window}{}",
+                param("Texture/Pattern/CutoffPolicy", "1")
+            )),
+            [0, 64, 192, 0]
+        );
+        assert_eq!(
+            baked(&format!(
+                "{window}{}",
+                param("Texture/Pattern/CutoffPolicy", "2")
+            )),
+            [255, 64, 192, 255]
+        );
+        assert_eq!(
+            baked(&format!(
+                "{window}{}",
+                param("Texture/Pattern/CutoffPolicy", "0")
+            )),
+            [0, 64, 192, 255]
+        );
+
+        // The neutral point stretches the two halves of the range separately,
+        // and its default of a half is the identity in both — which is what
+        // makes the twenty presets that never state it read correctly.
+        assert_eq!(
+            baked(&param("Texture/Pattern/NeutralPoint", "0.5")),
+            [0, 64, 192, 255]
+        );
+        assert_eq!(
+            baked(&param("Texture/Pattern/NeutralPoint", "0.25")),
+            [0, 128, 213, 255]
+        );
+    }
+
+    /// The tile is stored at the pattern's own resolution and the *scale*
+    /// becomes the size of one tile in document pixels.
+    ///
+    /// Krita resamples the pattern and tiles the result 1:1; Umber stores the
+    /// picture and lets the sampler stretch it, which is the same tiling
+    /// without a second resampler in `umber-core` to keep in step with the
+    /// hardware's. A 512-texel pattern at Krita's 0.37 is a 189-pixel tile, and
+    /// reading the scale as anything else makes a paper twice as fine or twice
+    /// as coarse as its author's — which is the whole of what a grain looks
+    /// like.
+    #[test]
+    fn the_patterns_scale_becomes_the_tile_size_in_document_pixels() {
+        let png = grey_pattern(64, 32, &[200; 64 * 32]);
+        let at = |scale: &str| {
+            from_kpp(&textured(&format!(
+                "{}{}",
+                embedded_pattern(&png),
+                param("Texture/Pattern/Scale", scale)
+            )))
+            .expect("decode")
+            .brush
+            .grain_scale
+        };
+
+        // The longer side, because `Brush::grain_scale` is one number and the
+        // shader stretches the tile square over it.
+        assert_eq!(at("1"), 64.0);
+        assert_eq!(at("2"), 128.0);
+        assert!((at("0.5") - 32.0).abs() < 1e-6);
+
+        // And it is bounded by what a grain scale may be, rather than trusting
+        // a number out of somebody else's file.
+        assert_eq!(at("0.001"), Brush::MIN_GRAIN_SCALE);
+        assert_eq!(at("100"), Brush::MAX_GRAIN_SCALE);
+
+        // The tile itself is the pattern, unresampled.
+        let read = from_kpp(&textured(&embedded_pattern(&png))).expect("decode");
+        let tile = read.paper.expect("tile");
+        assert_eq!((tile.width(), tile.height()), (64, 32));
+    }
+
+    /// A texture strength that follows pressure is named, and one that does not
+    /// is left alone.
+    ///
+    /// Umber's grain is one number for the whole stroke, so a curve that
+    /// actually moves is a real difference — the paper appearing as the hand
+    /// presses. A curve that does not move is Krita's editor leaving a default
+    /// behind, which is the judgement `Dynamic::from_samples` already makes,
+    /// and naming it would cry wolf on a brush that paints identically.
+    #[test]
+    fn a_texture_strength_that_follows_pressure_is_named() {
+        let png = grey_pattern(1, 1, &[128]);
+        let with_curve = |use_curve: &str, curve: &str| {
+            from_kpp(&textured(&format!(
+                "{}{}{}",
+                embedded_pattern(&png),
+                internal("Texture/Strength/UseCurve", use_curve),
+                param("Texture/Strength/commonCurve", curve)
+            )))
+            .expect("decode")
+        };
+
+        let ramp = with_curve("true", "0,0;1,1;");
+        assert_eq!(ramp.dropped, vec![PAPER_UNDER_PRESSURE]);
+        // The paper still comes across: the brush paints its author's grain,
+        // and what it loses is only that the grain does not fade at a light
+        // touch. That is an approximation, which is why it keeps the tile —
+        // unlike the mode, which keeps nothing.
+        assert!(ramp.paper.is_some());
+        assert_eq!(ramp.brush.grain, 1.0);
+
+        assert!(with_curve("true", "0,1;1,1;").dropped.is_empty());
+        // Switched off, the curve in the file is not a curve Krita applies.
+        assert!(with_curve("false", "0,0;1,1;").dropped.is_empty());
+    }
+
+    /// One sentence at most, and the mode wins.
+    ///
+    /// A Subtract texture reproduces nothing whatever its pattern does, so a
+    /// second sentence about its pressure curve would be noise on top of a loss
+    /// already named — the rule the library generator follows when it asks what
+    /// was dropped before it asks about the mask.
+    #[test]
+    fn a_texture_umber_cannot_paint_is_named_once() {
+        let png = grey_pattern(1, 1, &[128]);
+        let both = from_kpp(&textured(&format!(
+            "{}{}{}{}",
+            embedded_pattern(&png),
+            param("Texture/Pattern/TexturingMode", "1"),
+            internal("Texture/Strength/UseCurve", "true"),
+            param("Texture/Strength/commonCurve", "0,0;1,1;")
+        )))
+        .expect("decode");
+        assert_eq!(both.dropped, vec![OTHER_TEXTURE_MODE]);
     }
 
     /// All three of PNG's text chunks turn up in one real pack, and a reader

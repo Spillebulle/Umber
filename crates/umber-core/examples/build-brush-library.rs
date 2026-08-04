@@ -41,6 +41,20 @@
 //! it is too faint for a `max` to reach the mark its author drew. Each of those
 //! is measured or tested rather than assumed — `docs/brushes.md` says where.
 //!
+//! # And so do paper textures
+//!
+//! The same arrangement, one directory over: a Krita preset's pattern is
+//! levelled at import, written to `assets/patterns/` beside Umber's own three
+//! tiles, and named from `BrushPreset::paper`, which `Editor::paper_tile`
+//! resolves against the user's library and then against `tip::pattern`. This
+//! used to be a refusal on the reasoning that the shipped library had nowhere
+//! to put a picture, which was true of the RON and false of the lookup.
+//!
+//! Only Krita's **Multiply** texturing mode comes across, because that is the
+//! one whose arithmetic Umber's `mix(1.0, tile, strength)` already is; the
+//! other four the packs use are named as losses by `brushimport::kpp` and
+//! refused here like any other loss. See that module's own section.
+//!
 //! # Shipping a mask is redistributing artwork
 //!
 //! Shipping a brush's *settings* is a description of somebody's work. Shipping
@@ -199,7 +213,13 @@ fn main() {
     let mut failed: Vec<String> = Vec::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let tips_dir = repo_root.join("crates/umber-core/assets/tips");
-    let mut tips = TipLibrary::open(&tips_dir);
+    let mut tips = BitmapLibrary::open(&tips_dir);
+    // The papers go in the directory Umber's own three tiles are already in,
+    // and `BitmapLibrary` owns only what a *pack* put there — so `tooth`, `canvas`
+    // and `grit` are `build-bitmaps.rs`'s and are left alone, exactly as
+    // Umber's own stamps are in `tips/`.
+    let papers_dir = repo_root.join("assets/patterns");
+    let mut papers = BitmapLibrary::open(&papers_dir);
 
     for pack in PACKS {
         let dir = brush_root.join(pack.dir);
@@ -264,17 +284,52 @@ fn main() {
                     });
                     continue;
                 }
-                // A paper this generator has nowhere to put. `BrushPreset::
-                // paper` names a picture in the **user's** library, and the
-                // shipped one is an embedded RON with no `papers/` beside it —
-                // so keeping the brush would ship it with its grain strength
-                // set and no tile to bite through, painting flat where its
-                // author painted through paper. Refused rather than flattened,
-                // which is this file's standing rule and the opposite of what
-                // an interactive import does.
-                if paper.is_some() {
+                // A paper travels the way a mask does: beside the library
+                // rather than in it, named from the preset. It used to be
+                // refused here, on the reasoning that `BrushPreset::paper`
+                // names a picture in the *user's* library and the shipped one
+                // is an embedded RON — which was true of the RON and false of
+                // the lookup: `Editor::paper_tile` already falls through to
+                // `tip::pattern`, so a tile in `assets/patterns/` resolves for
+                // a shipped brush exactly as a tip in `assets/tips/` does.
+                //
+                // The redistribution rule is the mask's, and for the same
+                // reason: a pattern is somebody's artwork rather than a
+                // description of it, so a pack whose licence was not verified
+                // for its bitmaps may not ship its papers either.
+                if paper.is_some() && !pack.ship_tips {
                     skipped
-                        .entry("a paper texture the shipped library cannot carry".to_string())
+                        .entry(NOT_REDISTRIBUTED.to_string())
+                        .or_default()
+                        .push(label(&preset.name));
+                    refusals.push(Refusal {
+                        pack: pack.dir,
+                        reasons: vec![NOT_REDISTRIBUTED.to_string()],
+                    });
+                    continue;
+                }
+                // A stamp too faint for eight-bit coverage to accumulate is a
+                // brush that paints nothing however hard it is pressed, and
+                // `tip::stroke_coverage` is the same measurement `build_up` is
+                // decided by four lines further down every reader. Measured at
+                // the densest spacing the engine is ever asked for rather than
+                // at this brush's own, because that is the *loosest* reading —
+                // closer dabs build higher — so a mask refused here could not
+                // have made a mark at any spacing.
+                //
+                // It is `every_shipped_tip_decodes_and_makes_a_mark`'s rule,
+                // applied where the file is written instead of only where it is
+                // read: that test fails the build on a mask this generator has
+                // already committed, which is a red suite pointing at an asset
+                // rather than at the decision that produced it. Reached first
+                // by Raghukamath's "Pack01 Clouds", whose stamp peaks at an
+                // alpha of 67 and which only became eligible at all once a
+                // coloured `.gih` cell stopped being refused for its colour.
+                if let Some(mask) = &tip
+                    && !umber_core::tip::stroke_coverage(mask, 0.1).is_usable()
+                {
+                    skipped
+                        .entry("a stamp too faint to make a mark".to_string())
                         .or_default()
                         .push(label(&preset.name));
                     continue;
@@ -338,6 +393,15 @@ fn main() {
                 // upload, which is what `BrushPreset::tip` holding a name
                 // rather than a picture is for.
                 preset.tip = tip.map(|mask| tips.store(pack.id_prefix, &preset.id, mask));
+                // And the paper the same way, into the directory Umber's own
+                // three tiles already live in. Deduplicated by content like the
+                // masks, which matters more here: four of Revoy's presets bite
+                // through one 280-texel tile, and three of Raghukamath's
+                // through one 512-texel one — but only where the *levelled*
+                // tiles agree, since brightness, inversion and the cutoffs are
+                // baked in, so two brushes tweaking one pattern differently
+                // correctly get two files.
+                preset.paper = paper.map(|tile| papers.store(pack.id_prefix, &preset.id, tile));
                 presets.push(preset);
             }
         }
@@ -372,6 +436,14 @@ fn main() {
         "../assets/tips",
         &tips_dir,
     );
+    let papers_written = papers.finish();
+    write_table(
+        &repo_root.join("crates/umber-core/src/pattern_table.rs"),
+        "pattern",
+        "PATTERNS",
+        "../../../assets/patterns",
+        &papers_dir,
+    );
 
     println!("{} brushes -> {}", presets.len(), out.display());
     println!(
@@ -379,6 +451,12 @@ fn main() {
         written.count,
         written.bytes as f32 / 1024.0,
         tips_dir.display()
+    );
+    println!(
+        "{} papers, {:.0} kB -> {}",
+        papers_written.count,
+        papers_written.bytes as f32 / 1024.0,
+        papers_dir.display()
     );
 
     // Printed so the classification can actually be checked. A rule that sends
@@ -405,8 +483,9 @@ fn main() {
         let mine = || presets.iter().filter(|p| p.id.starts_with(&prefix));
         let kept = mine().count();
         let stamped = mine().filter(|p| p.tip.is_some()).count();
+        let papered = mine().filter(|p| p.paper.is_some()).count();
         println!(
-            "  {:14} {kept:4} shipped, {stamped:3} of them stamps ({}{})",
+            "  {:14} {kept:4} shipped, {stamped:3} of them stamps, {papered:3} papered ({}{})",
             pack.dir,
             pack.licence,
             if pack.ship_tips {
@@ -523,7 +602,7 @@ fn report_refusals(refusals: &[Refusal]) {
 /// would otherwise leave a file behind that the table would go on embedding
 /// for ever, and megabytes of binary nobody could account for is exactly the
 /// kind of rot a generated directory invites.
-struct TipLibrary {
+struct BitmapLibrary {
     dir: PathBuf,
     /// Mask contents to the name allotted to it. Deduplication is by the whole
     /// mask, which is the only definition that makes two brushes "cut from the
@@ -535,13 +614,13 @@ struct TipLibrary {
     files: BTreeMap<String, Vec<u8>>,
 }
 
-/// What [`TipLibrary::finish`] wrote, for the run's own report.
-struct TipsWritten {
+/// What [`BitmapLibrary::finish`] wrote, for the run's own report.
+struct BitmapsWritten {
     count: usize,
     bytes: usize,
 }
 
-impl TipLibrary {
+impl BitmapLibrary {
     fn open(dir: &Path) -> Self {
         fs::create_dir_all(dir).expect("create the tips directory");
         Self {
@@ -580,7 +659,7 @@ impl TipLibrary {
     }
 
     /// Delete the masks a previous run left, write this run's, and report.
-    fn finish(self) -> TipsWritten {
+    fn finish(self) -> BitmapsWritten {
         let owned = |name: &str| PACKS.iter().any(|p| name.starts_with(p.id_prefix));
         for entry in fs::read_dir(&self.dir)
             .expect("read the tips directory")
@@ -605,7 +684,7 @@ impl TipLibrary {
                 fs::write(&path, png).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
             }
         }
-        TipsWritten {
+        BitmapsWritten {
             count: self.files.len(),
             bytes,
         }
