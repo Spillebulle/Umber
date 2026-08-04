@@ -26,8 +26,8 @@ use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
-    Brush, Color, Dab, Document, Edit, EditBody, EditKind, InputPoint, Jump, PixelPatch, PixelRect,
-    SelectionOp, Transform,
+    Brush, Clip, Color, Dab, Document, Edit, EditBody, EditKind, InputPoint, Jump, PixelPatch,
+    PixelRect, SelectionOp, Transform,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, FloatParams, FloatSource, Gpu, ProbeParams,
@@ -1126,14 +1126,47 @@ impl UmberApp {
                 (clip, true)
             }
         };
+        if !self.float_a_clip(&clip, "pasted") {
+            // Refused — off the canvas, or a locked layer, or a folder, which
+            // `float_a_clip` has already said so about. Nothing has been
+            // pasted, so nothing is adopted: Umber's own clipboard has to
+            // survive a paste that did not happen, or Ctrl+V on the wrong layer
+            // would throw away the region the artist copied. The desktop still
+            // holds its picture, so the next Ctrl+V finds it again.
+            return;
+        }
+        // Adopted only now, and only for a picture that came off the desktop:
+        // a second Ctrl+V then puts down the same picture once the desktop's
+        // clipboard has moved on, which is the rule that keeps Umber's own copy
+        // alive when somebody copies a line of text. `note_adopted` is what
+        // stops `decide` reading the adopted clip as one the desktop never
+        // received.
+        if foreign {
+            self.editor.clipboard = Some(clip);
+            self.sysclip.note_adopted();
+        }
+    }
+
+    /// Put a rectangle of pixels on the canvas as a floating transform.
+    ///
+    /// The whole of what a paste does after it has decided *what* to put down,
+    /// and therefore the whole of what placing a block of text does: `verb`
+    /// is the only difference between the two, and it is a word in a sentence.
+    /// Sharing it is what stops the crop notice, the centring rule and the
+    /// switch to the transform tool being stated twice and drifting.
+    ///
+    /// False when nothing was put down — off the canvas entirely, a locked
+    /// layer, or a folder selected. The last two have already raised a notice
+    /// of their own inside `begin_float`.
+    fn float_a_clip(&mut self, clip: &Clip, verb: &str) -> bool {
         self.finish_transform();
         self.finish_stroke();
 
         let doc = self.editor.doc.size;
-        // Into the middle of the selection where there is one — "paste into
+        // Into the middle of the selection where there is one — "put it into
         // what I marked out" — and otherwise into the middle of what the artist
-        // is looking at. A paste that lands in a corner of the canvas nobody is
-        // looking at appears to have done nothing.
+        // is looking at. Something that lands in a corner of the canvas nobody
+        // is looking at appears to have done nothing.
         let centre = match self.editor.selection.as_ref() {
             Some(sel) => {
                 let b = sel.bounds();
@@ -1149,19 +1182,19 @@ impl UmberApp {
                 .clamp(Vec2::ZERO, self.editor.doc.size_vec2()),
         };
         let Some(placed) = clip.place(doc, centre) else {
-            log::info!("the paste landed entirely off the canvas");
-            return;
+            log::info!("what was {verb} landed entirely off the canvas");
+            return false;
         };
         if placed.rect.width < clip.size().x || placed.rect.height < clip.size().y {
             // Said out loud rather than logged, for the same reason an import
             // that loses something says so: silently cropping somebody's
             // picture is worse than refusing to.
             self.editor.notice = Some(Notice {
-                title: "The paste was cropped".to_string(),
+                title: format!("What was {verb} was cropped"),
                 lines: vec![format!(
-                    "What was copied is {} × {} and this canvas is {} × {}, so only the \
-                     middle of it was pasted. Enlarge the canvas under File → Canvas \
-                     settings and paste again to keep the rest.",
+                    "It is {} × {} and this canvas is {} × {}, so only the middle of it \
+                     reached the canvas. Enlarge the canvas under File → Canvas settings \
+                     and try again to keep the rest.",
                     clip.size().x,
                     clip.size().y,
                     doc.x,
@@ -1170,28 +1203,67 @@ impl UmberApp {
             });
         }
         if !self.begin_float(placed.rect, Some(&placed.pixels)) {
-            // Refused — a locked layer, or a folder, which `begin_float` has
-            // already said so about. Nothing has been pasted, so nothing is
-            // adopted: Umber's own clipboard has to survive a paste that did
-            // not happen, or Ctrl+V on the wrong layer would throw away the
-            // region the artist copied. The desktop still holds its picture,
-            // so the next Ctrl+V finds it again.
-            return;
-        }
-        // Adopted only now, and only for a picture that came off the desktop:
-        // a second Ctrl+V then puts down the same picture once the desktop's
-        // clipboard has moved on, which is the rule that keeps Umber's own copy
-        // alive when somebody copies a line of text. `note_adopted` is what
-        // stops `decide` reading the adopted clip as one the desktop never
-        // received.
-        if foreign {
-            self.editor.clipboard = Some(clip);
-            self.sysclip.note_adopted();
+            return false;
         }
         // The box has handles, and they are the transform tool's. Landing in
         // another tool would leave a preview nothing could act on.
         self.editor.set_tool(Tool::Transform);
         self.request_redraw();
+        true
+    }
+
+    /// Set the Text module's block and float it over the canvas.
+    ///
+    /// **Placed text is a paste**, and this is that sentence written out: the
+    /// coverage becomes a `Clip` in the artist's own colour and goes through
+    /// the same [`Self::float_a_clip`] Ctrl+V does. So it arrives with the
+    /// transform tool's handles, Escape abandons it, a click outside puts it
+    /// down, the undo entry is the `Transform` a paste already records, and the
+    /// preview is byte for byte what commits — none of which is restated
+    /// anywhere, and none of which reaches `umber-render`, `composite.wgsl` or
+    /// the file format.
+    ///
+    /// Blocking: a font file is read and the glyphs are rasterised. That is
+    /// what an explicit click may do and the drawing loop may not, exactly as
+    /// the export and the blocking readback are.
+    fn place_text(&mut self) {
+        let setting = match self.editor.text.set() {
+            Ok(setting) => setting,
+            Err(err) => {
+                // Every one of these is a finished sentence rather than a code:
+                // the panel is where the artist was looking, and being told
+                // "nothing happened" is the failure a notice exists to prevent.
+                let lines = match err {
+                    umber_core::TextError::Empty => {
+                        "Type something into the Text panel first.".to_string()
+                    }
+                    umber_core::TextError::NoInk => {
+                        "What is typed makes no mark — spaces, or characters this face \
+                         has no glyph for."
+                            .to_string()
+                    }
+                    umber_core::TextError::TooLarge { width, height } => format!(
+                        "At this size the text would be {width} × {height} pixels, which is \
+                         more than Umber will rasterise at once. Reduce the size, or the \
+                         amount of text."
+                    ),
+                    umber_core::TextError::Unreadable => {
+                        "The font could not be read. It may have been moved or removed \
+                         since Umber found it; reopen the Text panel to look again."
+                            .to_string()
+                    }
+                };
+                self.editor.notice = Some(Notice {
+                    title: "Nothing was placed".to_string(),
+                    lines: vec![lines],
+                });
+                return;
+            }
+        };
+        let Some(clip) = setting.clip(self.editor.color) else {
+            return;
+        };
+        self.float_a_clip(&clip, "set");
     }
 
     /// Move the document to `position` in the history — the number of recorded
@@ -2444,6 +2516,9 @@ impl UmberApp {
             if self.commit_tip() {
                 self.close_document(index);
             }
+        }
+        if actions.place_text {
+            self.place_text();
         }
         if actions.group_layers {
             self.group_layers();

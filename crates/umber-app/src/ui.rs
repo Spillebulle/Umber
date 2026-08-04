@@ -72,6 +72,16 @@ pub struct UiActions {
     pub history_jump: Option<usize>,
     pub fit_view: bool,
     pub reset_zoom: bool,
+    /// Set the Text module's block and float it over the canvas. The caller's,
+    /// because it blocks on a font file and on the rasteriser and then does
+    /// exactly what a paste does — `Clip::place`, `begin_float`, and the
+    /// transform tool in hand.
+    ///
+    /// A `bool` rather than the pixels, because [`UiActions`] is `Copy`: the
+    /// caller reads the block off the editor in the frame the flag was set,
+    /// which is the frame the button was clicked in. Same arrangement, and the
+    /// same reason, as [`UiActions::delete_picked`].
+    pub place_text: bool,
     pub add_layer: bool,
     /// Put the ticked layers — or the selected one — into a new folder. The
     /// caller's, because it commits a float first; nothing else about it

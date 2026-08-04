@@ -82,7 +82,7 @@ pub const MAX_SIZE: f32 = 1000.0;
 pub const MIN_SIZE: f32 = 4.0;
 
 /// Where a line sits within the block.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Align {
     #[default]
     Left,

@@ -29,7 +29,12 @@ use skrifa::{FontRef, MetadataProvider};
 
 /// Archivo, the typeface the design specifies — the same file the interface
 /// loads, under the SIL Open Font License. See `assets/fonts/`.
-const ARCHIVO: &[u8] = include_bytes!("../../../assets/fonts/Archivo[wdth,wght].ttf");
+///
+/// Public to the crate because `textpanel` registers it as the one face
+/// `umber_core::fonts` is guaranteed to have. That is what stops the bytes
+/// being compiled in a *third* time: `umber-core` deliberately holds no font
+/// of its own and is handed this one.
+pub const ARCHIVO: &[u8] = include_bytes!("../../../assets/fonts/Archivo[wdth,wght].ttf");
 
 /// Archivo instanced at one size and weight, ready to draw.
 ///

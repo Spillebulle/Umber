@@ -494,6 +494,7 @@ pub(crate) fn panel(
                     PanelKind::Brushes => brushlib::panel(ui, p, ed),
                     PanelKind::Layers => layers_body(ui, p, ed, actions),
                     PanelKind::History => history_body(ui, p, ed, actions),
+                    PanelKind::Text => crate::textpanel::panel(ui, p, ed, actions),
                 });
         },
     );
@@ -2317,6 +2318,25 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
                 );
                 bar(y, 11.0, 11.0 + 30.0 - k as f32 * 6.0, ink);
             }
+        }
+        // A line of type over a baseline, with the caret that is not there yet
+        // deliberately absent: what this module draws is a block you compose
+        // and place, not one you type into on the canvas.
+        PanelKind::Text => {
+            let y = body.top() + 9.0;
+            painter.line_segment(
+                [pos2(body.left(), y + 3.0), pos2(body.left() + 34.0, y + 3.0)],
+                Stroke::new(1.0, ink),
+            );
+            for (x, w, h) in [(0.0, 7.0, 12.0), (9.0, 5.0, 9.0), (16.0, 6.0, 9.0)] {
+                painter.rect_filled(
+                    Rect::from_min_size(pos2(body.left() + x, y + 3.0 - h), vec2(w, h)),
+                    1.0,
+                    p.accent,
+                );
+            }
+            bar(y + 14.0, 0.0, 30.0, ink);
+            bar(y + 20.0, 0.0, 22.0, ink);
         }
         // A timeline: a marker per entry, filled where the document stands.
         PanelKind::History => {
