@@ -2600,6 +2600,44 @@ half-publish; `.github/workflows/release.yml` does the rest.
   so `libvulkan.so.1()(64bit)` resolves on all of them. Debian's names are
   stable across its derivatives, so the `.deb` may name packages.
 
+### Verifying a release actually landed
+
+The script's CI wait is what stops a *bad* tag being spent. It says nothing
+about whether the workflow then built anything, and pushing the tag is the point
+at which walking away has already gone wrong once. So:
+
+- **Before running the script, re-run the whole suite with no escape hatch, on a
+  quiet machine.** `CI=1` is legitimate for gating a merge while several agents
+  are loading the box, and it is *not* legitimate for deciding a release: it
+  runs only the machine-independent half of the timing assertions, which is
+  exactly the half that was never the risk. If shaders changed, run
+  `UMBER_TEST_SOFTWARE=1` over `umber-render` as well — CI has no graphics card,
+  and the last bit of floating point is where hardware and lavapipe disagree.
+- **`pwsh` may not be installed.** `release.ps1` needs PowerShell 7, because
+  under 5.1 a native command's stderr becomes an error record and
+  `$ErrorActionPreference = 'Stop'` aborts on cargo's ordinary progress output.
+  Do not loosen the preference — that is what makes a failing gate stop the
+  release. Run `sh tools/release.sh` instead, which is also the only thing that
+  exercises the half of the pair a Linux or macOS machine would take.
+- **Do a `--dry-run` first.** It runs every gate and every check and touches no
+  remote, so the only thing left to fail afterwards is the network.
+- **Watch the release workflow to completion, not just the CI wait.** They are
+  different runs against different matrices: CI proves the code compiles and
+  passes everywhere, the release workflow proves fifteen artefacts can be
+  *built and packaged*, and the Flatpak and Arch jobs exist only in the second.
+- **Then verify what was published, rather than assuming the green tick.**
+  Every job's conclusion; the asset list compared against `ASSETS` in
+  `crates/umber-desktop/tests/release.rs`, which is where their names are
+  stated; that the release is not a draft and not a pre-release; that the notes
+  are the changelog section verbatim rather than an empty body; and — this is
+  the one worth doing by hand — **fetch some of the README's download links and
+  check they answer 200**. The tests prove the README *names* the right files;
+  only a request proves the files are there. A 404 on the front page is a worse
+  first impression than no link at all.
+- **Clean up afterwards.** Remove the agent worktrees, delete the merged
+  branches and reclaim the target directories. A stale `.claude/worktrees` entry
+  is what makes the *next* fan-out fail at `mkdir`.
+
 ### Updating an installed copy
 
 `umber-app::update` asks the releases API what the newest version is, and — for
@@ -2802,6 +2840,86 @@ standing instruction and it overrides the usual reluctance to delegate.
   (`fmt --check`, `clippy`, `test`) run in the worktree *and* after the merge —
   a clean branch and a clean merge of several clean branches are different
   claims.
+
+### The shape that worked, for twelve agents at once
+
+Fourteen features and two bug reports arrived in one session. What follows is
+the arrangement that landed nine of them, and it is written down because the
+parts that mattered are not the obvious ones.
+
+- **Split the work by what it *needs*, not by how much of it there is.** Six
+  pieces were self-contained enough to implement, and each got a worktree. Seven
+  could not be built blind and got a **design document** instead — three because
+  they rewrite the same three things (`EditBody`, `Float`, the single composite
+  pass) so building them concurrently is agents overwriting each other and
+  building them serially without a design first is three half-answers; three
+  because nobody here has the hardware to verify them; one because "every open
+  source font we can find" needed a number in megabytes before it needed code.
+  `docs/layer-folders.md` was written before folders were, for this reason.
+- **Design agents work in the main checkout and must not build.** Each creates
+  one new file under `docs/` and touches nothing else, so there is no conflict
+  to have; and the main `target/` belongs to whoever is merging. Tell them so
+  explicitly, or one will run `cargo test` and fight the supervisor for the lock.
+- **Forbid every agent from editing `CLAUDE.md`, `README.md` and `CHANGELOG.md`,
+  and have them report the prose instead.** Twelve agents editing one paragraph
+  is twelve conflicts, and these three are exactly the files several of them
+  will want at once. The supervisor applies the collected prose in one commit at
+  the end — which is also the only point at which anyone can see that four
+  agents have made the *same* rule false in four different ways.
+- **Every implementation agent spawns a critic on its own diff before
+  reporting.** This is the highest-value instruction in the whole arrangement.
+  In one session the critics caught: a paste that would put down a picture the
+  artist never copied; a palette library that told you a file was unreadable and
+  then renamed over it; a stroke on a mask reaching a path that writes four
+  channels to a one-channel slice; and a canvas flip that could delete a
+  selection unrecoverably, since undoing a flip is another flip.
+- **A critic that returns nothing has not reviewed anything.** One died leaving
+  a zero-byte transcript and its agent self-reviewed instead — and that branch
+  was the one that turned out to have two real defects, including a diagnostic
+  readout that could only ever give one answer while its tooltip explained the
+  wrong reason. **Check that the critic actually reported**, and run an
+  independent one over anything that reached `main` without a real review.
+- **Cross-wire the agents that will collide, before they start.** Structural
+  undo and the linked transform both need one undo entry holding several
+  patches; the Android and pen-platform research both turn on what winit
+  carries. Each was told the other existed and asked to propose the shared
+  shape, which produced documents that reference each other instead of
+  contradicting each other.
+- **Then run a supervisor over the whole design set.** It found five collisions
+  none of the six authors had flagged, including that three of them rewrite
+  `Editor::layer_draws` and one changes its type. `docs/roadmap-review.md` is
+  that pass, and it is deliberately shorter than any document it reviews.
+- **Require every report to lead with what was *not* finished.** That is what
+  surfaced the navigator not being built, `.psd` masks being impossible rather
+  than merely undone, and a macOS clipboard path that could darken every soft
+  edge — none of which would have appeared in a summary of what was achieved.
+- **An agent's finding is a lead, not a fact — verify it before acting.** Two
+  live bugs were reported by agents designing something else and both were real,
+  but both were checked against the source and the specification first. That
+  mattered once: a web search summary said ORA's `isolation` attribute defaults
+  to `auto`, and the published specification says `isolate`. The agent was
+  right and the search was wrong.
+- **Agents stall.** Two stopped and said they were waiting for a notification
+  that was never coming. A short, direct "nothing is waiting; run this command,
+  commit, and report" unblocks them; do not spawn a replacement.
+- **Merge one branch at a time, gates after each.** Every conflict in nine
+  merges was a two-line import list, because the worktrees were split by remit
+  — but the gates after each merge are what make the two claims separate.
+- **Budget the disk, and reclaim a target directory the moment its branch is
+  merged.** Seven concurrent `CARGO_TARGET_DIR`s came to about 42 GB and the
+  machine ran out; one agent had to be told to use another drive, and another's
+  critic could not run its gates at all. The symptom is `os error 112` or a
+  linker complaining about disk space, and it reads like a broken change.
+- **Concurrency makes the wall-clock assertions flake, and `CI=1` is the right
+  answer *while merging only*.** `a_capture_of_a_large_document_never_costs_a_
+  frame` failed for four agents under load and passes alone. Gating a merge on
+  its structural half is fine; deciding a release that way is not — see
+  "Verifying a release actually landed".
+- **Never let an agent edit a file with PowerShell's `Get-Content |
+  Set-Content`.** On Windows it reads as ANSI and writes UTF-8 *with a BOM*, so
+  one round trip adds a BOM and turns every em-dash into mojibake. It stays
+  valid UTF-8, so `fmt`, `clippy` and the whole suite pass; the only symptom is
+  a two-line change committing as 109 insertions. Say so in the brief.
 
 ## The README
 
