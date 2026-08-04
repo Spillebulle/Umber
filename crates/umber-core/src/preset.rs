@@ -1182,7 +1182,20 @@ impl UserLibrary {
     /// record on it. [`Self::store_tip`]'s twin, and deliberately **not** in
     /// [`Library::kept_papers`]: this tile arrived with a brush and belongs to
     /// it, so deleting that brush should take it with them.
+    ///
+    /// **A tile equal to one already held is shared rather than copied**, which
+    /// [`Self::store_tip`] deliberately does not do. The difference is in the
+    /// formats: a stamp belongs to one brush, where a Clip Studio texture
+    /// material is *referenced* by every sub-tool in the file that uses it — so
+    /// a group of fifteen brushes over one paper wrote fifteen copies of the
+    /// same half-megabyte picture and put fifteen indistinguishable rows in the
+    /// browser. Compared by value and only against what this library holds,
+    /// which is a few tiles rather than a content-addressed store; the naming
+    /// stays [`free_stem`]'s, so the directory is still readable.
     fn store_paper(&mut self, preset_id: &str, tile: TipMask) -> Result<String, PresetError> {
+        if let Some((name, _)) = self.papers.iter().find(|(_, held)| ***held == tile) {
+            return Ok(name.clone());
+        }
         let name = free_stem(preset_id, "paper", &self.papers, &self.papers_dir());
         write_mask(&self.papers_dir(), &name, &tile)?;
         self.papers.insert(name.clone(), Arc::new(tile));
@@ -2276,6 +2289,35 @@ mod tests {
             scratch.paper_file(&kept).exists(),
             "a paper in the library is not any brush's to take"
         );
+    }
+
+    /// A Clip Studio tool group references one texture material from every
+    /// sub-tool that uses it, so fifteen brushes over one paper used to write
+    /// fifteen copies of the same half-megabyte picture and put fifteen
+    /// indistinguishable rows in the browser. A stamp does not share this rule:
+    /// it belongs to one brush, and two brushes drawn the same stamp are two
+    /// people's work that happen to match.
+    #[test]
+    fn one_paper_behind_several_brushes_is_stored_once() {
+        let scratch = Scratch::new("shared-paper");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let tile = || TipMask::new(4, 4, vec![120; 16]).expect("tile");
+
+        let first = library.store_paper("clipstudio/pencil", tile()).expect("a");
+        let second = library.store_paper("clipstudio/ink", tile()).expect("b");
+        assert_eq!(first, second, "the same tile should share one file");
+        assert_eq!(library.papers().len(), 1);
+
+        // A different tile is a different file, or the sharing would be a
+        // silent substitution.
+        let other = library
+            .store_paper(
+                "clipstudio/chalk",
+                TipMask::new(4, 4, vec![30; 16]).expect("tile"),
+            )
+            .expect("c");
+        assert_ne!(other, first);
+        assert_eq!(library.papers().len(), 2);
     }
 
     /// Removing a picture two brushes are painting with would leave both

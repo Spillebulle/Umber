@@ -200,7 +200,10 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
 fn close(ctx: &egui::Context, state: &mut State) {
     state.open = None;
     state.confirming = None;
-    ctx.data_mut(|d| d.remove::<Previews>(preview_id()));
+    ctx.data_mut(|d| {
+        d.remove::<Previews>(preview_id());
+        d.remove::<Joins>(joins_id());
+    });
 }
 
 fn header(ui: &mut Ui, p: &Palette, state: &mut State) {
@@ -393,8 +396,9 @@ fn row(
                             .size(text::SMALL)
                             .color(p.text_strong),
                     );
+                    let joins = joins(ui, kind, &entry.name, &entry.mask);
                     ui.label(
-                        RichText::new(detail(kind, entry))
+                        RichText::new(detail(entry, joins))
                             .size(text::TINY)
                             .color(p.text_dim),
                     );
@@ -436,7 +440,10 @@ fn row(
 
 /// The line under a picture's name: how big it is, where it came from, and —
 /// for a paper — whether it joins to itself.
-fn detail(kind: Kind, entry: &Entry) -> String {
+///
+/// `joins` is `None` for a stamp, which is never asked the question: it is
+/// stretched over one dab and has no second copy of itself to meet.
+fn detail(entry: &Entry, joins: Option<bool>) -> String {
     let size = format!("{} × {} px", entry.mask.width(), entry.mask.height());
     let source = match entry.source {
         Source::Yours => "yours",
@@ -446,12 +453,49 @@ fn detail(kind: Kind, entry: &Entry) -> String {
         // name resolves to the user's copy first.
         Source::Hidden => "shipped — hidden by one of yours with the same name",
     };
-    match kind {
-        Kind::Papers if !umber_core::tip::seams(&entry.mask).tiles() => {
-            format!("{size} · {source} · does not tile — shows a grid")
-        }
+    match joins {
+        Some(false) => format!("{size} · {source} · does not tile — shows a grid"),
         _ => format!("{size} · {source}"),
     }
+}
+
+/// Whether a tile joins to itself, worked out once per tile rather than once
+/// per frame.
+///
+/// [`umber_core::tip::seams`] walks the whole picture, which is 65 000 texel
+/// pairs for a 256-square and four million for the largest a library may hold.
+/// The modal redraws every frame and the answer cannot change while it is open
+/// — the tiles are `Arc`s of immutable masks — so leaving the call in the row
+/// would put a full pass per visible paper into every frame, for a sentence
+/// that does not change. Cached beside the previews, keyed the same way and
+/// validated by the same `Arc` identity, and thrown away with them when the
+/// browser shuts.
+type Joins = std::collections::HashMap<String, (Arc<TipMask>, bool)>;
+
+fn joins_id() -> Id {
+    Id::new("stamp-library-joins")
+}
+
+fn joins(ui: &Ui, kind: Kind, name: &str, mask: &Arc<TipMask>) -> Option<bool> {
+    if kind != Kind::Papers {
+        return None;
+    }
+    let key = format!("{}:{name}", kind.title());
+    let cached = ui
+        .ctx()
+        .data(|d| d.get_temp::<Joins>(joins_id()))
+        .and_then(|held| held.get(&key).cloned());
+    if let Some((held, answer)) = cached
+        && Arc::ptr_eq(&held, mask)
+    {
+        return Some(answer);
+    }
+    let answer = umber_core::tip::seams(mask).tiles();
+    ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<Joins>(joins_id())
+            .insert(key, (Arc::clone(mask), answer));
+    });
+    Some(answer)
 }
 
 // ---------------------------------------------------------------------------
@@ -895,7 +939,7 @@ mod tests {
         let hidden: Vec<&Entry> = rows.iter().filter(|r| r.source == Source::Hidden).collect();
         assert_eq!(hidden.len(), 1);
         assert_eq!(hidden[0].name, "tooth");
-        assert!(detail(Kind::Papers, hidden[0]).contains("hidden"));
+        assert!(detail(hidden[0], Some(true)).contains("hidden"));
     }
 
     /// The one thing a single square cannot show and the one thing that ruins a
@@ -904,26 +948,27 @@ mod tests {
     #[test]
     fn a_paper_that_does_not_join_says_so_on_its_own_row() {
         let mut ed = Editor::default();
-        let mut split = vec![0u8; 16 * 16];
-        for y in 0..16 {
-            for x in 0..16 {
-                split[y * 16 + x] = if x < 8 { 30 } else { 230 };
-            }
-        }
-        ed.papers.insert(
-            "photo".to_owned(),
-            Arc::new(TipMask::new(16, 16, split).expect("tile")),
-        );
+        ed.papers.insert("photo".to_owned(), split_tile(16));
         let rows = entries(&ed, &State::default(), Kind::Papers);
         let row = rows.iter().find(|r| r.name == "photo").expect("listed");
-        assert!(detail(Kind::Papers, row).contains("does not tile"));
+        // The verdict the row's cache carries, computed the way `joins` does.
+        let seamed = umber_core::tip::seams(&row.mask).tiles();
+        assert!(!seamed);
+        assert!(detail(row, Some(seamed)).contains("does not tile"));
+
+        // A shipped tile does join, and is not nagged about — a notice on every
+        // row is one nobody reads.
+        let shipped = rows
+            .iter()
+            .find(|r| r.source == Source::Shipped)
+            .expect("listed");
+        let joins = umber_core::tip::seams(&shipped.mask).tiles();
+        assert!(joins, "a shipped paper should tile");
+        assert!(!detail(shipped, Some(joins)).contains("does not tile"));
 
         // A stamp is never asked the question: it is stretched over one dab and
-        // has no second copy of itself to meet.
-        ed.tips.insert("photo".to_owned(), Arc::clone(&row.mask));
-        let stamps = entries(&ed, &State::default(), Kind::Stamps);
-        let stamp = stamps.iter().find(|r| r.name == "photo").expect("listed");
-        assert!(!detail(Kind::Stamps, stamp).contains("tile"));
+        // has no second copy of itself to meet, which is what the `None` means.
+        assert!(!detail(row, None).contains("tile"));
     }
 
     /// The search reaches both halves of the merged list, and folds case and

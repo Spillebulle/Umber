@@ -1214,9 +1214,17 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
         // through pits in places that author never drew. A paper Umber cannot
         // resolve now paints flat rather than through a stranger's tile, which
         // is the honest half of the same rule.
-        paper = paper_for(reference, materials);
-        if paper.is_none() && brush.has_grain() {
-            push_once(&mut dropped, dropped::PAPER_TEXTURE);
+        //
+        // Gated on the grain actually biting, which is the same threshold the
+        // renderer binds a tile at: Clip Studio leaves a texture's strength in
+        // the file at zero when the setting is switched off, and a picture
+        // stored for a brush that cannot feel it is a file per sub-tool that
+        // nothing ever samples. A `.sutg` is fifteen of them.
+        if brush.has_grain() {
+            paper = paper_for(reference, materials);
+            if paper.is_none() {
+                push_once(&mut dropped, dropped::PAPER_TEXTURE);
+            }
         }
     }
 

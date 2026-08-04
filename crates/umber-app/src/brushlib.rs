@@ -566,33 +566,38 @@ pub(crate) fn edit_library<T>(
     op: impl FnOnce(&mut UserLibrary) -> Result<T, PresetError>,
 ) -> Result<T, String> {
     let mut state = load(ctx, ed);
-    let Store::Broken(why) = &state.store else {
-        // `write` puts its own failure in the notice, which is the wrong place
-        // for this caller — so the operation is wrapped to carry the message
-        // out instead.
-        let mut failure = None;
-        let done = write(&mut state, ed, |library| match op(library) {
-            Ok(value) => Ok(value),
-            Err(e) => {
-                failure = Some(e.to_string());
-                Err(e)
-            }
-        });
-        // A failed write leaves `state.notice` set by `write`; clearing it here
-        // would be this module apologising for somebody else's control.
-        state.notice = None;
+    if let Store::Broken(why) = &state.store {
+        let why = why.clone();
         store(ctx, state);
-        return match (done, failure) {
-            (Some(value), _) => Ok(value),
-            (None, Some(why)) => Err(why),
-            // `write` answers `None` with no error only where the store is not
-            // ready, which the arm above has already ruled out.
-            (None, None) => Err("the brush library could not be written".to_owned()),
-        };
-    };
-    let why = why.clone();
+        return Err(why);
+    }
+
+    // `write` puts its own failure in this module's notice, which is the wrong
+    // place for somebody else's control — so the operation is wrapped to carry
+    // the message out, and the notice is put back the way it was found.
+    //
+    // Restored rather than cleared: a load can leave a sentence there (the
+    // library moved, a mask would not decode), and this module apologising for
+    // another's failure and *losing* its own message in the process is two
+    // mistakes rather than one.
+    let held = state.notice.clone();
+    let mut failure = None;
+    let done = write(&mut state, ed, |library| match op(library) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            failure = Some(e.to_string());
+            Err(e)
+        }
+    });
+    state.notice = held;
     store(ctx, state);
-    Err(why)
+    match (done, failure) {
+        (Some(value), _) => Ok(value),
+        (None, Some(why)) => Err(why),
+        // `write` answers `None` with no error only where the store is not
+        // ready, which the guard above has already ruled out.
+        (None, None) => Err("the brush library could not be written".to_owned()),
+    }
 }
 
 /// Put a library into the store without reading one off disk.
