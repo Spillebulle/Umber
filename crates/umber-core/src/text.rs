@@ -885,6 +885,53 @@ mod tests {
         }
     }
 
+    /// The whole claim, end to end and without a device: **placed text is a
+    /// paste**. What comes out of here goes through the same `Clip::place` a
+    /// Ctrl+V does, lands on the canvas, and hands back a rectangle in the
+    /// layer-texture form `write_texture` wants — with no second placer, no
+    /// second premultiply and nothing in `umber-render` that knows what text
+    /// is.
+    #[test]
+    fn text_reaches_the_canvas_by_exactly_the_route_a_paste_does() {
+        use glam::{UVec2, Vec2};
+        let doc = UVec2::new(2048, 2048);
+        let lib = library();
+        let mut b = block("Umber");
+        b.size = 200.0;
+        let setting = set_with(&lib, "Regular", &b).expect("ink");
+        let clip = setting
+            .clip(Color::from_srgb_u8(255, 255, 255, 255))
+            .expect("a clip");
+
+        let placed = clip
+            .place(doc, Vec2::new(1024.0, 1024.0))
+            .expect("on canvas");
+        // Centred on where it was asked for, whole, and in bounds.
+        assert_eq!(placed.rect.width, setting.width);
+        assert_eq!(placed.rect.height, setting.height);
+        assert_eq!(
+            placed.rect.x + placed.rect.width / 2,
+            1024,
+            "not centred: {:?}",
+            placed.rect
+        );
+        assert_eq!(
+            placed.pixels.len(),
+            (placed.rect.width * placed.rect.height * 4) as usize
+        );
+        // And it is *premultiplied* on the way in, which is the one conversion
+        // the paste path performs and this module must not have performed
+        // already: white text at half coverage is a half-grey premultiplied
+        // pixel, never white with an alpha beside it.
+        let half = placed
+            .pixels
+            .chunks_exact(4)
+            .find(|px| (60..=200).contains(&px[3]));
+        if let Some(px) = half {
+            assert!(px[0] < 250, "the colour was not premultiplied: {px:?}");
+        }
+    }
+
     /// Two lines whose descenders and ascenders meet saturate rather than
     /// compounding into a dark band — the dab pass's `max`, for the same
     /// reason, one module along.
