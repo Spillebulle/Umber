@@ -306,9 +306,11 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 
 - **Ten of the sixteen tools**, shapes among them. What is not built is not
   drawn, rather than drawn and dead.
-- **Text that reflows.** Lines break where you break them. A line mixing
-  left-to-right and right-to-left writing is shaped but not reordered, and Umber
-  says so when it matters.
+- **Three things about text**, each of which the panel tells you about rather
+  than letting you find out later. Lines break where you break them and nothing
+  wraps. A line mixing left-to-right and right-to-left writing is shaped but not
+  reordered. A character the chosen face has no glyph for is left blank rather
+  than borrowed from another font.
 - **Clearing a layer** is the one command that still throws the undo history
   away. Everything else is undoable, including deleting a layer.
 - **Transforming a linked set.** Link groups move together through the stack.
