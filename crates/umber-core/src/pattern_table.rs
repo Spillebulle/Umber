@@ -15,6 +15,32 @@ pub(crate) const PATTERNS: &[(&str, &[u8])] = &[
         "canvas",
         include_bytes!("../../../assets/patterns/canvas.png"),
     ),
+    (
+        "deevad-c2-mechanical-pencil-detail-deevad-25-01",
+        include_bytes!(
+            "../../../assets/patterns/deevad-c2-mechanical-pencil-detail-deevad-25-01.png"
+        ),
+    ),
+    (
+        "deevad-c2-pencil-2b-deevad-25-01",
+        include_bytes!("../../../assets/patterns/deevad-c2-pencil-2b-deevad-25-01.png"),
+    ),
+    (
+        "deevad-c4-thin-brush-regular-deevad-25-01",
+        include_bytes!("../../../assets/patterns/deevad-c4-thin-brush-regular-deevad-25-01.png"),
+    ),
+    (
+        "deevad-f-rough-rake-textured-deevad-25-01",
+        include_bytes!("../../../assets/patterns/deevad-f-rough-rake-textured-deevad-25-01.png"),
+    ),
+    (
+        "deevad-k-blender-textured-soft-deevad-25-01",
+        include_bytes!("../../../assets/patterns/deevad-k-blender-textured-soft-deevad-25-01.png"),
+    ),
+    (
+        "gdquest-gdquest-texture-fabric",
+        include_bytes!("../../../assets/patterns/gdquest-gdquest-texture-fabric.png"),
+    ),
     ("grit", include_bytes!("../../../assets/patterns/grit.png")),
     (
         "tooth",

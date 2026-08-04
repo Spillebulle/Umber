@@ -8,15 +8,18 @@
 //! preview.png
 //! paintoppresets/*.kpp          the brushes
 //! brushes/*.png|.gbr|.gih       the tips they name
-//! patterns/*                    paper textures, which Umber has no use for yet
+//! patterns/*                    the paper textures they name
 //! ```
 //!
 //! Two things make it worth a reader of its own rather than "unzip it first".
 //!
-//! - **The tips are in a sibling directory.** A `.kpp` inside a bundle names
-//!   `bristle.png` and does not embed it, so pulling one preset out on its own
-//!   gives a brush that paints round. Reading the container is what lets
-//!   [`super::kpp::from_kpp_in`] find the file.
+//! - **The tips and the papers are in sibling directories.** A `.kpp` inside a
+//!   bundle names `bristle.png`, or `4-paper-soft-grain.png`, and embeds
+//!   neither — so pulling one preset out on its own gives a brush that paints
+//!   round, or flat. Reading the container is what lets
+//!   [`super::kpp::from_kpp_in`] find both files. Eleven of Revoy's forty-six
+//!   presets name a pattern this way and twenty across the other packs carry
+//!   theirs inside the preset, which is why both routes have to exist.
 //! - **`meta.xml` is where the licence and the author live**, and Umber's whole
 //!   attribution story runs on [`Credit`]. The Revoy bundle states
 //!   `<meta:license>CC-0</meta:license>` and `<dc:author>David Revoy
@@ -27,9 +30,6 @@
 //!
 //! Whatever the presets inside drop, collected and de-duplicated, plus:
 //!
-//! - **Patterns.** A bundle's `patterns/` are paper textures for Krita's
-//!   texture option, and the dab pass has no grain channel — the same reason
-//!   `docs/brush-sources.md` is not fetching texture packs yet.
 //! - **Tags.** A bundle carries Krita's own grouping; Umber files a brush by
 //!   the mark it makes (`crate::style`), deliberately, because a library sorted
 //!   by pack puts the pencils in six places.
@@ -118,7 +118,18 @@ pub fn from_bundle(bytes: &[u8]) -> Result<BundleContents, PresetError> {
             tips.insert(file.to_string(), data);
         }
     }
-    let has_patterns = names.iter().any(|n| n.starts_with("patterns/"));
+    // The papers, on the same terms and for the same reason: four of Revoy's
+    // presets bite through one 280-texel tile, so re-inflating it per preset
+    // would be the cost `BrushPreset::paper` naming rather than carrying a
+    // picture exists to avoid.
+    let mut patterns: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for name in names.iter().filter(|n| n.starts_with("patterns/")) {
+        if let Some(data) = entry(&mut zip, name)?
+            && let Some(file) = name.rsplit('/').next()
+        {
+            patterns.insert(file.to_string(), data);
+        }
+    }
 
     let mut out = BundleContents {
         credit: meta.credit(),
@@ -127,16 +138,19 @@ pub fn from_bundle(bytes: &[u8]) -> Result<BundleContents, PresetError> {
         refused: Vec::new(),
         dropped: Vec::new(),
     };
-    if has_patterns {
-        out.dropped.push("paper textures");
-    }
 
     for name in &presets {
         let Some(raw) = entry(&mut zip, name)? else {
             continue;
         };
         let file = name.rsplit('/').next().unwrap_or(name);
-        match kpp::from_kpp_in(&raw, &|wanted| tips.get(wanted).cloned()) {
+        match kpp::from_kpp_in(
+            &raw,
+            &kpp::Sidecar {
+                brushes: &|wanted| tips.get(wanted).cloned(),
+                patterns: &|wanted| patterns.get(wanted).cloned(),
+            },
+        ) {
             Ok(mut preset) => {
                 if preset.name.trim().is_empty() {
                     preset.name = super::display_name(file.trim_end_matches(".kpp"));
@@ -374,6 +388,31 @@ mod tests {
         out
     }
 
+    /// The same, painting through a paper it does not carry either — the other
+    /// half of what reading the container buys.
+    fn preset_through_paper(tip: &str, pattern: &str) -> Vec<u8> {
+        let xml = format!(
+            "<Preset name=\"Bristle\" paintopid=\"paintbrush\">\
+             <param name=\"brush_definition\" type=\"string\"><![CDATA[\
+             <Brush type=\"png_brush\" filename=\"{tip}\" spacing=\"0.05\" angle=\"0\" \
+             scale=\"1\"/>]]></param>\
+             <param type=\"internal\" name=\"Texture/Pattern/Enabled\">true</param>\
+             <param name=\"Texture/Pattern/PatternFileName\" type=\"string\">\
+             <![CDATA[{pattern}]]></param></Preset>"
+        );
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, 1, 1);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .add_ztxt_chunk("preset".to_string(), xml)
+            .expect("chunk");
+        let mut writer = encoder.write_header().expect("header");
+        writer.write_image_data(&[9]).expect("data");
+        drop(writer);
+        out
+    }
+
     fn grey_png(value: u8) -> Vec<u8> {
         let mut out = Vec::new();
         let mut encoder = png::Encoder::new(&mut out, 1, 1);
@@ -485,14 +524,40 @@ mod tests {
         assert!(dropped_features(&file).contains(&OTHER_ENGINES));
     }
 
+    /// A preset finds its paper in `patterns/` exactly as it finds its tip in
+    /// `brushes/`, and that is what eleven of Revoy's forty-six presets need.
+    ///
+    /// The bundle's own `patterns/` used to be reported as a blanket loss —
+    /// "paper textures", once for the whole file, whether or not any preset
+    /// asked for one. Both halves were wrong once the pattern could be read:
+    /// the ones that name a pattern now carry it, and the ones that do not
+    /// never lost anything.
     #[test]
-    fn patterns_are_reported_as_dropped() {
+    fn a_preset_finds_its_paper_in_the_bundles_patterns_directory() {
         let file = bundle(&[
             ("mimetype", b"application/x-krita-resourcebundle"),
             ("patterns/paper.png", &grey_png(200)),
-            ("paintoppresets/a.kpp", &preset_referring_to("x.png")),
+            ("brushes/bristle.png", &grey_png(0)),
+            (
+                "paintoppresets/a.kpp",
+                &preset_through_paper("bristle.png", "paper.png"),
+            ),
         ]);
-        assert!(dropped_features(&file).contains(&"paper textures"));
+        let contents = from_bundle(&file).expect("read");
+        let brush = &contents.brushes[0];
+        assert_eq!(brush.paper.as_ref().expect("tile").coverage(), [200]);
+        assert!(brush.dropped.is_empty(), "{:?}", brush.dropped);
+        assert!(dropped_features(&file).is_empty());
+
+        // And a bundle whose `patterns/` nothing names loses nothing by having
+        // one — which the blanket sentence got wrong for every preset in it.
+        let unused = bundle(&[
+            ("mimetype", b"application/x-krita-resourcebundle"),
+            ("patterns/paper.png", &grey_png(200)),
+            ("brushes/bristle.png", &grey_png(0)),
+            ("paintoppresets/a.kpp", &preset_referring_to("bristle.png")),
+        ]);
+        assert!(dropped_features(&unused).is_empty());
     }
 
     #[test]

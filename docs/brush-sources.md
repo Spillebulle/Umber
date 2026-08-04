@@ -66,8 +66,9 @@ better.
   settings. Of the 44, **11 ship** — 6 procedural and **5 stamps**, carried by
   4 masks. The rest drop something Umber cannot render, 11 of them a paper
   texture. All 44 import through **Import brushes…** today, tips and all.
-- Masks shipped: yes. CC0 stated in the bundle's own `meta.xml`, which is a
-  licence statement inside the download.
+- Masks shipped: yes, and **five paper patterns** with them, on the same
+  licence evidence and through the same `Pack::ship_tips` switch. See
+  `assets/patterns/LICENSES.md`.
 
 ### Raghavendra Kamath — Krita brush presets v2.1 — CC0-1.0
 
@@ -198,17 +199,29 @@ colour and what a dab lifted, so `1 - smudge` already is a deposit rate, and
 what the reader was missing was the enable flag beside the value. **Brush-tip
 randomness** is now ignored below a hundredth rather than at any value at all.
 And a **paper texture** the Krita reader had never noticed went the other way,
-refusing brushes that had been shipping without their grain.
-`crates/umber-core/src/brushimport/kpp.rs` has the first two arguments and
-`docs/brushes.md` the third.
+refusing brushes that had been shipping without their grain — six of which have
+since come back carrying their author's own tile, because the pattern and
+Krita's levels pipeline over it are now read and only the *blending mode* is
+missing. `crates/umber-core/src/brushimport/kpp.rs` has the first two arguments
+and `docs/brushes.md` the third.
 
-**These figures predate coloured stamps and are now pessimistic.** Umber carries
-a coloured tip since `TipMask::coloured` — see `docs/brushes.md` — so a `.gbr` at
-four bytes a pixel and a `.gpb`'s pattern no longer drop anything, and every
-brush refused for that reason alone is now shippable. Nobody has re-run
-`examples/build-brush-library.rs` against the fetched packs to say how many that
-is, and the number is not worth guessing at: run it, and replace the sentence
-above with what it says.
+**The per-pack figures above predate coloured stamps and are pessimistic.** Umber
+carries a coloured tip since `TipMask::coloured` — see `docs/brushes.md` — so a
+`.gbr` at four bytes a pixel and a `.gpb`'s pattern no longer drop anything, and
+every brush refused for that reason alone became shippable. The run that was
+asked for has been made, and it also carries the paper work below, so the two
+cannot now be told apart from here; what it says is:
+
+| Pack | shipped | of them stamps | papered |
+|---|---:|---:|---:|
+| mypaint | 196 | 0 | 0 |
+| deevad | 21 | 12 | 5 |
+| raghukamath | 9 | 4 | 0 |
+| gdquest | 26 | 16 | 1 |
+| rubberduck | 0 | 0 | 0 |
+
+252 in all, against 233 before either change. **Take these from the run rather
+than from here**, for the reason the paragraph above gives.
 
 ### How big the whole thing would have been
 
@@ -369,6 +382,13 @@ Umber claims*, and it is the same distinction everywhere else in the importer.
   lattice wraps, and a seam would draw a grid across every textured mark, since
   the grain is anchored to the document — and three of them are 200 kB rather
   than megabytes.
+- **Five more arrived from the brush packs**, and they are the exception that
+  proves the rule rather than a loosening of it: they come out of downloads
+  whose licence `tools/fetch-brushes.*` verifies *inside the archive*, which is
+  exactly what ambientCG and Poly Haven do not offer. They ride on
+  `Pack::ship_tips`, the same switch that decides whether a pack's masks may
+  travel, because the question is the same question. See
+  `assets/patterns/LICENSES.md`.
 - A photographic set is still worth having, and the way in is somebody
   satisfying themselves about a particular download and dropping the files into
   `assets/patterns/`. The project will not claim a licence it cannot check.

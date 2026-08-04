@@ -53,8 +53,8 @@ pub struct Imported {
     ///
     /// Beside the tip and for the same reason — the preset stores a *name*, and
     /// the name is not known until the library has somewhere to put the tile.
-    /// Only [`clipstudio`] produces one: the other formats either name a system
-    /// texture that is not in the file or have no paper at all.
+    /// [`clipstudio`] and [`kpp`] produce one; the rest of the formats have no
+    /// paper in them at all.
     pub paper: Option<TipMask>,
     /// What this *particular* brush lost on the way in.
     ///
@@ -162,8 +162,14 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
         }
         "kpp" => {
             let bytes = preset::read_bytes(path)?;
-            let decoded =
-                kpp::from_kpp_in(&bytes, &sibling_brushes(path)).map_err(|e| e.at(path))?;
+            let decoded = kpp::from_kpp_in(
+                &bytes,
+                &kpp::Sidecar {
+                    brushes: &sibling_brushes(path),
+                    patterns: &sibling_patterns(path),
+                },
+            )
+            .map_err(|e| e.at(path))?;
             let name = embedded_name(&decoded.name, &stem);
             let mut dropped = decoded.dropped;
             if decoded.missing_tip.is_some() {
@@ -172,7 +178,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             Ok(vec![Imported {
                 preset: preset_for("kpp", name, decoded.brush),
                 tip: decoded.tip,
-                paper: None,
+                paper: decoded.paper,
                 dropped,
             }])
         }
@@ -196,7 +202,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     Imported {
                         preset,
                         tip: decoded.tip,
-                        paper: None,
+                        paper: decoded.paper,
                         dropped,
                     }
                 })
@@ -328,18 +334,42 @@ fn preset_for(source: &str, name: String, brush: Brush) -> BrushPreset {
 /// the filesystem for a file name a stranger supplied is a way to read things
 /// nobody meant to offer.
 fn sibling_brushes(path: &Path) -> impl Fn(&str) -> Option<Vec<u8>> {
+    sibling_files(path, "brushes")
+}
+
+/// The same three places for a paper pattern, in `patterns/`.
+///
+/// A separate directory rather than a wider search, for exactly the reason
+/// above: a `.kpp` names its pattern by a file name a stranger wrote, and Krita
+/// keeps its own patterns and its own brush tips in two directories that a
+/// bundle mirrors. Looking for a pattern among the tips would let a preset name
+/// one and be handed the other.
+fn sibling_patterns(path: &Path) -> impl Fn(&str) -> Option<Vec<u8>> {
+    sibling_files(path, "patterns")
+}
+
+fn sibling_files(path: &Path, directory: &'static str) -> impl Fn(&str) -> Option<Vec<u8>> {
     let here = path.parent().map(Path::to_path_buf);
     move |wanted: &str| {
         // A file name, never a path: `../../etc/passwd` in a preset must not
         // reach outside the pack.
-        if wanted.contains(['/', '\\']) || wanted.is_empty() {
+        //
+        // The colon is in the set for Windows alone, and it is not decoration.
+        // `PathBuf::join` replaces the base entirely when what it is given is
+        // drive-relative, so `C:passwd` — which holds neither separator — would
+        // resolve against the current directory of the C: drive rather than
+        // against the pack. `kpp.rs` already reduces a pattern's name to its
+        // last component before this is called, so nothing in the packs can
+        // reach it; the guard is what makes the sentence above true rather than
+        // true-by-luck for the next caller.
+        if wanted.contains(['/', '\\', ':']) || wanted.is_empty() {
             return None;
         }
         let here = here.as_ref()?;
         [
             here.join(wanted),
-            here.join("brushes").join(wanted),
-            here.join("..").join("brushes").join(wanted),
+            here.join(directory).join(wanted),
+            here.join("..").join(directory).join(wanted),
         ]
         .into_iter()
         .find_map(|candidate| std::fs::read(candidate).ok())
@@ -394,9 +424,16 @@ pub fn dropped_features(path: &Path) -> Vec<&'static str> {
         "vbr" => vbr::dropped_features(&text()),
         "kpp" => {
             // Resolved the same way the read will resolve it, or a preset
-            // whose tip *is* beside it would be reported as missing one.
+            // whose tip — or whose pattern — *is* beside it would be reported
+            // as missing one.
             let raw = bytes();
-            let Ok(preset) = kpp::from_kpp_in(&raw, &sibling_brushes(path)) else {
+            let Ok(preset) = kpp::from_kpp_in(
+                &raw,
+                &kpp::Sidecar {
+                    brushes: &sibling_brushes(path),
+                    patterns: &sibling_patterns(path),
+                },
+            ) else {
                 return Vec::new();
             };
             let mut out = preset.dropped;
