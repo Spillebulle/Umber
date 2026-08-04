@@ -1579,6 +1579,32 @@ impl LayerStack {
     /// and come back in the returned shape as `Gone`, holding their slices.
     /// That is what parks a layer an undo has just taken out.
     pub fn restore_shape(&mut self, target: StackShape) -> StackShape {
+        // **Judged before a byte moves**, the rule the module docs state for
+        // every other structural mutation. A `Kept` row naming an entry that is
+        // not in the stack cannot happen — the stepped-not-seeked guarantee
+        // says an older shape is only ever reached with everything above it
+        // already undone — but a *half* rebuilt stack is the one outcome worse
+        // than nothing happening, and in a release build a `debug_assert` is
+        // not there to stop it. Handing the shape straight back makes the undo
+        // a no-op: the entry stays on the other stack and the document is
+        // untouched, which is a step that appears to do nothing rather than a
+        // layer that silently vanishes or a panic on the undo path.
+        let present = |id: u32| self.layers.iter().any(|l| l.id == id);
+        let placeable = target.entries.iter().all(|e| match e {
+            ShapeEntry::Kept { id, .. } => present(*id),
+            ShapeEntry::Gone { .. } => true,
+        }) && target.masks.iter().all(|(id, _)| {
+            present(*id)
+                || target
+                    .entries
+                    .iter()
+                    .any(|e| matches!(e, ShapeEntry::Gone { layer } if layer.id == *id))
+        });
+        if !placeable {
+            debug_assert!(false, "a recorded shape named an entry that is gone");
+            return target;
+        }
+
         // What the stack is now, in its own order, before anything moves.
         let was: Vec<(u32, u8)> = self.layers.iter().map(|l| (l.id, l.depth)).collect();
         let was_active = self.layers.get(self.active).map_or(0, |l| l.id);
@@ -1593,17 +1619,16 @@ impl LayerStack {
         for entry in target.entries {
             match entry {
                 ShapeEntry::Kept { id, depth } => {
-                    // Missing means an entry this shape was recorded against is
-                    // not in the stack, which the stepped-not-seeked guarantee
-                    // says cannot happen: an older shape is only ever reached
-                    // with everything above it already undone.
+                    // Checked above, so this arm is unreachable; a shape naming
+                    // one entry twice is the only way in and `shape` cannot
+                    // build one, because a stack holds each id once.
                     match find(id) {
                         Some(mut layer) => {
                             layer.depth = depth;
                             self.layers.push(layer);
                         }
                         None => {
-                            debug_assert!(false, "a recorded shape named an entry that is gone")
+                            debug_assert!(false, "a recorded shape named an entry twice")
                         }
                     }
                 }
