@@ -43,7 +43,15 @@ struct DabUniforms {
     // may be painted. Hence a flag, read through a `select` rather than a
     // branch — see `selection_mask`.
     use_selection: u32,
-    _pad1: f32,
+    // Non-zero when `tip_color` holds a real coloured stamp rather than the 1x1
+    // placeholder. Read by `fs_colored` alone — the ordinary fragment shader
+    // never looks at it, and never samples the texture either, which is what
+    // keeps a stroke with no coloured tip paying exactly nothing for this.
+    //
+    // Took the place of one of the three padding words already here, so the
+    // block is the size it always was. A scalar, not a vec3: see the
+    // uniform-layout note in CLAUDE.md.
+    use_tip_color: u32,
     _pad2: f32,
     _pad3: f32,
 };
@@ -65,6 +73,16 @@ struct DabUniforms {
 // zero and it is never read. Sampled through `tip_sampler`, which clamps: a
 // mask must not wrap, for the same reason a tip must not.
 @group(0) @binding(5) var selection: texture_2d<f32>;
+// A **coloured stamp**: the tip's own colour, `Rgba8UnormSrgb`, premultiplied
+// in linear light with the coverage in the alpha — the layer array's convention,
+// and for its reason. The hardware decodes the RGB on the way out, so a
+// bilinear tap lands on filtered *premultiplied linear* values, which is the
+// only form that does not halo at the edge of a stamp.
+//
+// A 1x1 placeholder unless the tip carries a colour. Sampled through
+// `tip_sampler` beside the coverage, at the same uv, so the two cannot land on
+// different texels.
+@group(0) @binding(6) var tip_color: texture_2d<f32>;
 
 struct Instance {
     @location(0) pos: vec2<f32>,
@@ -182,6 +200,20 @@ fn selection_mask(doc: vec2<f32>) -> f32 {
     return select(1.0, select(0.0, m, inside), u.use_selection != 0u);
 }
 
+// Where in the tip this fragment lands.
+//
+// `local` runs -1..1 across the quad and the quad has already been given the
+// tip's proportions in the vertex shader, so the mask fills it with no padding
+// and no empty margin to shade.
+//
+// One function because **two** things sample the tip at it — the coverage and,
+// for a coloured stamp, the colour — and those two landing on different texels
+// would put a stamp's colour half a texel out of step with its own edge. Same
+// rule `blend.wgsl` exists for, at a much smaller scale.
+fn tip_uv(local: vec2<f32>) -> vec2<f32> {
+    return local * 0.5 + vec2<f32>(0.5, 0.5);
+}
+
 // Coverage of one dab at this fragment, before the stroke's own opacity.
 //
 // Shared by both fragment entry points so the two pipelines cannot drift into
@@ -194,11 +226,9 @@ fn dab_coverage(in: VsOut) -> f32 {
     // that happens to come from a uniform buffer. With no tip bound this reads
     // a 1x1 white texture, which is a cache hit and nothing else.
     //
-    // `local` runs -1..1 across the quad, and the quad has already been given
-    // the tip's proportions in the vertex shader, so the mask lands unsquashed
-    // and fills its whole quad — no padding, no empty margin to shade.
-    let uv = in.local * 0.5 + vec2<f32>(0.5, 0.5);
-    let masked = textureSample(tip, tip_sampler, uv).r;
+    // `tip_uv` because a coloured stamp's colour is sampled at the same place —
+    // see there.
+    let masked = textureSample(tip, tip_sampler, tip_uv(in.local)).r;
 
     let d = length(in.local);
 
@@ -241,8 +271,33 @@ struct ColoredOut {
     @location(1) color: vec4<f32>,
 };
 
-// The smudging path: coverage as above, plus the colour this particular dab
-// deposits.
+// The colour this fragment deposits, in **straight linear RGB**.
+//
+// Three things can put a colour on a dab, and this is where the third joins the
+// other two. `in.color` already carries whatever the stroke worked out per dab
+// — the palette colour, what a smudging brush picked up, or a colour
+// modulation's shift of it. A **coloured stamp** overrides that, per *texel*:
+// the whole point of a leaf or a two-hue spatter is that the picture in the
+// file is the mark, so the palette has nothing to say about it. That is also
+// how GIMP's pixmap brushes and Krita's colour stamps behave.
+//
+// The stored colour is premultiplied, because that is the only form that
+// survives bilinear filtering at the edge of a stamp. Un-premultiplying here
+// rather than folding the multiply into `cov` keeps `dab_coverage` byte for
+// byte what it was — the coverage a coloured stamp writes is the same number an
+// uncoloured one would, so the `max`, the paper, the selection clip and the
+// build-up blend are all untouched. The guard is `stroke_rgb`'s in
+// `composite.wgsl` and for the same reason: where nothing was stamped the
+// sample is all zeroes and the divide would be a NaN.
+fn dab_rgb(in: VsOut) -> vec3<f32> {
+    let stamped = textureSample(tip_color, tip_sampler, tip_uv(in.local));
+    let own = select(in.color, stamped.rgb / max(stamped.a, 1e-4), stamped.a > 1e-4);
+    return select(in.color, own, u.use_tip_color != 0u);
+}
+
+// The per-dab colour path: coverage as above, plus the colour this particular
+// dab deposits — picked up off the canvas, shifted by a modulation, or the
+// stamp's own.
 //
 // The two attachments blend *differently*, which is the whole point. Coverage
 // still takes a `max`, so a smudging stroke crossing itself is no more opaque
@@ -258,6 +313,6 @@ fn fs_colored(in: VsOut) -> ColoredOut {
     let cov = dab_coverage(in);
     var out: ColoredOut;
     out.coverage = vec4<f32>(cov, 0.0, 0.0, 1.0);
-    out.color = vec4<f32>(in.color * cov, cov);
+    out.color = vec4<f32>(dab_rgb(in) * cov, cov);
     return out;
 }

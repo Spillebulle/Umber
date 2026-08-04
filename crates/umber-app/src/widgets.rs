@@ -11,7 +11,7 @@ use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2, pos
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use umber_core::{
-    Brush, Dab, InputPoint, ResponseCurve, ScrollSpan, StrokeBuilder, TipMask, preview,
+    Brush, Color, Dab, InputPoint, ResponseCurve, ScrollSpan, StrokeBuilder, TipMask, preview,
 };
 
 /// Narrowest anything here will draw itself.
@@ -1676,37 +1676,92 @@ fn brush_sample(
 /// into view.
 const ROW_TIP_TEXELS: u32 = 32;
 
-/// Box-average a coverage mask down to a thumbnail, tinted with an ink.
+/// `sRGB byte -> linear`, 256 entries, built once.
+///
+/// `tip_image` decodes a colour per *source* texel, and a source is the whole
+/// mask: a 1024² coloured stamp is three million `powf` pairs per rebuild, and
+/// `brush_sample`'s cache is keyed on the brush **by value**, so dragging any
+/// slider in the brush editor rebuilds it every frame. That is the same reason
+/// `docimport::srgb` carries a table rather than calling `powf` per component,
+/// and this is the small version of it — the *encode* is per output texel and
+/// there are at most a thousand of those, so it stays a call.
+fn srgb_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|v| Color::from_srgb_u8(v as u8, 0, 0, 255).r))
+}
+
+/// Box-average a coverage mask down to a thumbnail, tinted with an ink — or
+/// with the stamp's **own** colour where it has one.
 ///
 /// Coverage becomes *alpha* rather than luminance, so a stamp reads the same way
 /// on either theme and an empty texel is the surface behind it rather than
 /// black. Box-averaged rather than point-sampled: a sparse spatter tip shown by
 /// nearest neighbour is an empty square about half the time.
+///
+/// A **coloured stamp** ignores `ink` and shows what it will paint. Tinting one
+/// with the theme's ink would be a thumbnail that lies about the mark, which is
+/// the whole reason a coloured tip exists — and it is the same lie whichever
+/// theme is on, since the stamp's colours are its own.
+///
+/// The colour average is over **premultiplied linear** values, which is the rule
+/// the smudge probe and every other average in this codebase keep. Averaging the
+/// stored bytes would lighten a stamp crossing an edge by a gamma curve, and
+/// averaging *straight* colour would pull the colour of empty texels into the
+/// rim of every cell on the boundary.
 pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage {
     let scale = (mask.width().max(mask.height()).div_ceil(texels)).max(1);
     let (w, h) = (
         mask.width().div_ceil(scale).max(1),
         mask.height().div_ceil(scale).max(1),
     );
+    let colour = mask.colour();
+    let decode = srgb_table();
     let mut pixels = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
             let mut sum = 0u32;
             let mut n = 0u32;
+            // Premultiplied linear RGB, and the coverage it was weighted by.
+            let mut lit = [0.0f32; 3];
+            let mut weight = 0.0f32;
             for sy in y * scale..((y + 1) * scale).min(mask.height()) {
                 for sx in x * scale..((x + 1) * scale).min(mask.width()) {
-                    sum += u32::from(mask.at(sx, sy));
+                    let a = mask.at(sx, sy);
+                    sum += u32::from(a);
                     n += 1;
+                    if let Some(rgb) = colour {
+                        let i = (sy * mask.width() + sx) as usize * 3;
+                        let a = f32::from(a) / 255.0;
+                        for (c, lit) in rgb[i..i + 3].iter().zip(&mut lit) {
+                            *lit += decode[*c as usize] * a;
+                        }
+                        weight += a;
+                    }
                 }
             }
             // `n` is zero only for a cell entirely past the mask's edge, which
             // the ceiling division above cannot produce — the guard is there so
             // an off-by-one here can never be a division by zero.
             let coverage = sum.checked_div(n).unwrap_or(0) as u8;
+            // Un-premultiply back to a colour to draw with. Where nothing was
+            // stamped there is no colour to recover and the ink stands in, which
+            // is invisible: the alpha there is zero.
+            let tint = if colour.is_some() && weight > 1e-4 {
+                let [r, g, b, _] = Color {
+                    r: lit[0] / weight,
+                    g: lit[1] / weight,
+                    b: lit[2] / weight,
+                    a: 1.0,
+                }
+                .to_srgb_u8();
+                Color32::from_rgb(r, g, b)
+            } else {
+                ink
+            };
             pixels.push(Color32::from_rgba_unmultiplied(
-                ink.r(),
-                ink.g(),
-                ink.b(),
+                tint.r(),
+                tint.g(),
+                tint.b(),
                 coverage,
             ));
         }
@@ -2489,6 +2544,60 @@ pub fn pressure_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stamp's thumbnail has to show what it will paint.
+    ///
+    /// Tinting a coloured stamp with the theme's ink would be a picture that
+    /// lies about the mark — and it is the same lie in both themes, because the
+    /// stamp's colours are its own. A coverage-only mask is unchanged and still
+    /// takes the ink, which is what lets one thumbnail read on either theme.
+    #[test]
+    fn a_coloured_stamps_thumbnail_shows_its_own_colour() {
+        let ink = Color32::from_rgb(200, 200, 200);
+
+        // Two solid texels, red and blue, at full and half coverage.
+        let stamp =
+            TipMask::coloured(2, 1, vec![255, 128], vec![255, 0, 0, 0, 0, 255]).expect("tip");
+        let image = tip_image(&stamp, ink, 32);
+        assert_eq!(image.pixels[0].to_srgba_unmultiplied(), [255, 0, 0, 255]);
+        assert_eq!(image.pixels[1].to_srgba_unmultiplied(), [0, 0, 255, 128]);
+
+        // And a mask still takes the ink it is given, on both texels. Compared
+        // to a level rather than exactly: egui holds a `Color32`
+        // premultiplied, so a half-transparent colour does not survive its own
+        // round trip byte for byte, and that has nothing to do with this code.
+        let plain = TipMask::new(2, 1, vec![255, 128]).expect("tip");
+        let image = tip_image(&plain, ink, 32);
+        assert_eq!(
+            image.pixels[0].to_srgba_unmultiplied(),
+            [200, 200, 200, 255]
+        );
+        let [r, g, b, a] = image.pixels[1].to_srgba_unmultiplied();
+        assert!(
+            r.abs_diff(200) <= 1 && g.abs_diff(200) <= 1 && b.abs_diff(200) <= 1 && a == 128,
+            "got {:?}",
+            [r, g, b, a]
+        );
+    }
+
+    /// The average is over premultiplied colour, so an empty texel contributes
+    /// its coverage and not its colour.
+    ///
+    /// A straight average would pull the black of the untouched half into the
+    /// cell and hand back a dark red — the rim every stamp would then be drawn
+    /// with, at whatever scale its thumbnail happened to land on.
+    #[test]
+    fn an_empty_texel_lends_a_thumbnail_no_colour() {
+        // Solid red beside a texel that is black and covers nothing, averaged
+        // into one cell by asking for a single texel of thumbnail.
+        let stamp = TipMask::coloured(2, 1, vec![255, 0], vec![255, 0, 0, 0, 0, 0]).expect("tip");
+        let image = tip_image(&stamp, Color32::WHITE, 1);
+        assert_eq!(image.width(), 1);
+        let [r, g, b, a] = image.pixels[0].to_srgba_unmultiplied();
+        assert_eq!([r, g, b], [255, 0, 0], "the empty texel darkened the cell");
+        // Half the cell is covered, so half the alpha.
+        assert!(a.abs_diff(128) <= 1, "got {a}");
+    }
 
     /// Settings' Interface scale, as the dialog itself states it — not a copy
     /// of its numbers. A range typed out again here would go on passing while

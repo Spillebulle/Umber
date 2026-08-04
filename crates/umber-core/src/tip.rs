@@ -1,24 +1,51 @@
 //! Bitmap brush tips.
 //!
 //! A tip is an 8-bit coverage mask stamped in place of the procedural round
-//! falloff. It **modulates coverage** and nothing else: the dab pass still
-//! writes a single channel into the stroke scratch with a `max` blend, so the
-//! wet-layer invariant in `CLAUDE.md` is untouched — a tipped stroke saturates
-//! at 1.0 under overlap exactly as a round one does, and stroke opacity is
-//! still applied once at commit.
+//! falloff. It **modulates coverage**: the dab pass still writes a single
+//! channel into the stroke scratch with a `max` blend, so the wet-layer
+//! invariant in `CLAUDE.md` is untouched — a tipped stroke saturates at 1.0
+//! under overlap exactly as a round one does, and stroke opacity is still
+//! applied once at commit.
+//!
+//! # Coloured stamps
+//!
+//! A tip may also carry a **colour per texel** — a leaf, a spatter of two hues,
+//! a texture that stamps its own palette rather than the brush's. That is one
+//! extra plane beside the coverage ([`TipMask::colour`]) and it changes nothing
+//! about the coverage half: the mask still modulates, still saturates, and a
+//! coverage-only tip is byte for byte the thing it always was.
+//!
+//! Where the colour goes on the GPU is the part worth knowing before reaching
+//! for a second scratch texture: **there is already one**. A smudging stroke
+//! records a colour per dab in `CanvasRenderer`'s colour scratch, and that
+//! scratch is a *texture* — it holds a colour per fragment, and a smudging dab
+//! merely happens to write one flat colour across its own footprint. So a
+//! coloured tip is a third source of per-dab colour beside pickup and colour
+//! modulation, it reuses the pipelines that already exist for those two, and
+//! neither `composite.wgsl` nor `commit.wgsl` learns that it happened.
+//!
+//! The colour is **straight sRGB**, three bytes a texel, exactly as
+//! [`crate::clipboard::Clip`] holds a picture and for the same reason: it is
+//! what a file holds, so a PNG round trip is byte for byte. Premultiplying is
+//! the renderer's, on upload, in linear light — doing it here would lose the
+//! colour of every texel the stamp only half covers, and doing it in sRGB is
+//! the classic way to halo an edge.
 //!
 //! Plain bytes, no GPU types: `umber-render` uploads one of these to an
-//! `R8Unorm` texture, and the engine stays testable without a device.
+//! `R8Unorm` texture — and to an `Rgba8UnormSrgb` one where there is a colour —
+//! and the engine stays testable without a device.
 //!
 //! On disk a tip is an 8-bit greyscale PNG in the brush library's `tips/`
-//! directory — see [`crate::preset::UserLibrary`] for why the library is a
-//! directory rather than the single RON file it used to be.
+//! directory, or an 8-bit **RGBA** one where it carries a colour. See
+//! [`crate::preset::UserLibrary`] for why the library is a directory rather
+//! than the single RON file it used to be.
 
 use crate::preset::PresetError;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
-/// An 8-bit coverage mask, row-major from the top-left.
+/// An 8-bit coverage mask, row-major from the top-left, optionally with a
+/// colour of its own.
 ///
 /// `0` is no paint and `255` is full paint. That is the same convention GIMP's
 /// `.gbr` uses, which is why the importer needs no inversion — worth stating,
@@ -28,6 +55,18 @@ pub struct TipMask {
     width: u32,
     height: u32,
     coverage: Vec<u8>,
+    /// A **coloured stamp**: straight sRGB, three bytes a texel, row-major
+    /// beside `coverage`.
+    ///
+    /// `None` — the overwhelming majority — is a mask that takes the palette
+    /// colour, and it costs nothing at all: no plane here, no texture on the
+    /// GPU, and the stroke stays on the single-attachment dab pipeline.
+    ///
+    /// Straight rather than premultiplied so that the bytes are the file's own,
+    /// and three channels rather than four because the fourth would be the
+    /// coverage written down twice — two numbers that can disagree about the
+    /// edge of a stamp.
+    colour: Option<Vec<u8>>,
 }
 
 impl TipMask {
@@ -40,6 +79,37 @@ impl TipMask {
 
     /// `coverage` must hold exactly `width * height` bytes.
     pub fn new(width: u32, height: u32, coverage: Vec<u8>) -> Result<Self, PresetError> {
+        Self::build(width, height, coverage, None)
+    }
+
+    /// A **coloured stamp**: coverage as [`TipMask::new`], plus `width * height
+    /// * 3` bytes of straight sRGB colour.
+    ///
+    /// What this buys is a tip whose pixels *are* the mark — a leaf, a spatter
+    /// of two hues — rather than a silhouette the palette fills in. It reaches
+    /// the canvas through the per-dab colour path a smudging brush already
+    /// uses, so nothing downstream of the dab pass knows the difference; see
+    /// this module's docs.
+    ///
+    /// The colour of a texel the stamp does not cover is kept rather than
+    /// zeroed. It is what the file held, it is never read where the coverage is
+    /// zero, and throwing it away would make the PNG round trip lossy for a
+    /// reason nobody could see.
+    pub fn coloured(
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+        colour: Vec<u8>,
+    ) -> Result<Self, PresetError> {
+        Self::build(width, height, coverage, Some(colour))
+    }
+
+    fn build(
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+        colour: Option<Vec<u8>>,
+    ) -> Result<Self, PresetError> {
         if width == 0 || height == 0 {
             return Err(PresetError::Malformed(
                 None,
@@ -65,10 +135,23 @@ impl TipMask {
                 ),
             ));
         }
+        if let Some(colour) = &colour
+            && colour.len() != expected * 3
+        {
+            return Err(PresetError::Malformed(
+                None,
+                format!(
+                    "a coloured brush tip has {} colour bytes, expected {}",
+                    colour.len(),
+                    expected * 3
+                ),
+            ));
+        }
         Ok(Self {
             width,
             height,
             coverage,
+            colour,
         })
     }
 
@@ -151,6 +234,47 @@ impl TipMask {
         &self.coverage
     }
 
+    /// Row-major straight sRGB colour, `width * height * 3` bytes, for a
+    /// coloured stamp. `None` for the ordinary mask, which takes the palette
+    /// colour.
+    pub fn colour(&self) -> Option<&[u8]> {
+        self.colour.as_deref()
+    }
+
+    /// A coloured stamp as the GPU wants it: RGBA8, sRGB-encoded, **alpha
+    /// premultiplied in linear light**, with the coverage in the fourth byte.
+    ///
+    /// The same form `ImportedLayer::pixels` hands over and produced by the same
+    /// encoder, which is the point of it living here rather than in
+    /// `umber-render`: the conversion is arithmetic, it has an exact inverse
+    /// that other things depend on, and it is testable without a device.
+    ///
+    /// Why premultiplied at all, when the model holds the colour straight: this
+    /// is what a bilinear tap may be taken of. Filtering straight colour across
+    /// the edge of a stamp pulls in the colour of texels that are not there and
+    /// haloes it, and doing the multiply in sRGB rather than linear is the
+    /// classic second way to get the same halo.
+    pub fn colour_premultiplied(&self) -> Option<Vec<u8>> {
+        let colour = self.colour.as_ref()?;
+        let mut out = Vec::with_capacity(self.coverage.len() * 4);
+        for (px, &a) in colour.chunks_exact(3).zip(&self.coverage) {
+            out.extend_from_slice(&crate::docimport::srgb::encode_pixel([
+                px[0], px[1], px[2], a,
+            ]));
+        }
+        Some(out)
+    }
+
+    /// Whether this tip stamps a colour of its own.
+    ///
+    /// **This is what puts a stroke on the per-dab colour path**, alongside
+    /// `Brush::colours_dabs`. The tip is a *name* the editor resolves rather
+    /// than a field of `Brush`, so the two have to be combined where the tip is
+    /// known — exactly as `Brush::dab_has_angle` is combined with `Editor::tip`.
+    pub fn is_coloured(&self) -> bool {
+        self.colour.is_some()
+    }
+
     /// Coverage at one texel. Out of range reads as no paint rather than
     /// panicking — a tip is data from a file somebody else wrote.
     pub fn at(&self, x: u32, y: u32) -> u8 {
@@ -182,7 +306,12 @@ impl TipMask {
         (self.width as f32 / long, self.height as f32 / long)
     }
 
-    /// Encode as an 8-bit greyscale PNG — how a tip is stored in the library.
+    /// Encode as an 8-bit PNG — how a tip is stored in the library.
+    ///
+    /// **Greyscale for a mask and RGBA for a coloured stamp**, which is the
+    /// smaller of the two in each case and, more to the point, is what
+    /// [`TipMask::from_png`] can read back without being told which it is: a
+    /// greyscale file has one meaning and an RGBA one has the other.
     ///
     /// PNG rather than the raw bytes because it carries its own dimensions and
     /// because the files are then ordinary images: a tip can be looked at,
@@ -191,16 +320,26 @@ impl TipMask {
     /// bitmap. `png` is already a dependency of this crate for document import,
     /// so it costs nothing to build.
     pub fn to_png(&self) -> Result<Vec<u8>, PresetError> {
+        let (colour_type, data) = match &self.colour {
+            None => (png::ColorType::Grayscale, self.coverage.clone()),
+            Some(rgb) => {
+                let mut rgba = Vec::with_capacity(self.coverage.len() * 4);
+                for (px, &a) in rgb.chunks_exact(3).zip(&self.coverage) {
+                    rgba.extend_from_slice(&[px[0], px[1], px[2], a]);
+                }
+                (png::ColorType::Rgba, rgba)
+            }
+        };
         let mut out = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
-            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_color(colour_type);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder
                 .write_header()
                 .map_err(|e| malformed(format!("the brush tip could not be written ({e})")))?;
             writer
-                .write_image_data(&self.coverage)
+                .write_image_data(&data)
                 .map_err(|e| malformed(format!("the brush tip could not be written ({e})")))?;
         }
         Ok(out)
@@ -208,10 +347,13 @@ impl TipMask {
 
     /// Decode a tip written by [`TipMask::to_png`].
     ///
-    /// Only greyscale is accepted. A tip *is* a coverage mask, and for a
-    /// colour image there is no answer to "which channel is the coverage" that
-    /// is right for every file — guessing produces a brush that is quietly the
-    /// wrong shape, which is worse than a sentence saying what was expected.
+    /// Greyscale is a coverage mask and **RGBA is a coloured stamp**: the alpha
+    /// is the coverage and the RGB is what it stamps. There is nothing to guess
+    /// in either — which is exactly why plain **RGB is still refused**. A file
+    /// with no alpha channel says nothing about which of its three channels the
+    /// coverage is, and a wrong guess is a brush that is quietly the wrong
+    /// shape; [`TipMask::from_picture`] is where a picture with no answer of its
+    /// own gets one, out loud.
     pub fn from_png(bytes: &[u8]) -> Result<Self, PresetError> {
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         // Expands a 1/2/4-bit or 16-bit greyscale file to the 8 bits the mask
@@ -233,23 +375,38 @@ impl TipMask {
             .map_err(|e| malformed(format!("the brush tip could not be decoded ({e})")))?;
 
         let texels = info.width as usize * info.height as usize;
-        let coverage = match info.color_type {
+        let (coverage, colour) = match info.color_type {
             png::ColorType::Grayscale => {
                 buf.truncate(texels);
-                buf
+                (buf, None)
             }
             // Written by some editors when the image has an alpha channel it
             // does not use. The grey is still the coverage.
-            png::ColorType::GrayscaleAlpha => {
-                buf[..texels * 2].chunks_exact(2).map(|px| px[0]).collect()
+            png::ColorType::GrayscaleAlpha => (
+                buf[..texels * 2].chunks_exact(2).map(|px| px[0]).collect(),
+                None,
+            ),
+            // A coloured stamp: the alpha is the coverage and the colour is
+            // what it puts down. No reading to choose between, which is what
+            // separates this from `from_picture`.
+            png::ColorType::Rgba => {
+                let px = &buf[..texels * 4];
+                (
+                    px.chunks_exact(4).map(|p| p[3]).collect(),
+                    Some(
+                        px.chunks_exact(4)
+                            .flat_map(|p| [p[0], p[1], p[2]])
+                            .collect(),
+                    ),
+                )
             }
             other => {
                 return Err(malformed(format!(
-                    "a brush tip must be an 8-bit greyscale PNG, and this one is {other:?}"
+                    "a brush tip must be an 8-bit greyscale or RGBA PNG, and this one is {other:?}"
                 )));
             }
         };
-        Self::new(info.width, info.height, coverage)
+        Self::build(info.width, info.height, coverage, colour)
     }
 
     /// Coverage from the **alpha** of straight-alpha, sRGB RGBA8 pixels, with
@@ -293,6 +450,17 @@ impl TipMask {
     /// resampled. Downscaling would be a second resampler nothing else calls,
     /// and — worse — it would change the mask silently, so a spatter stamp
     /// would come back softer than the one on disk with nothing saying why.
+    ///
+    /// **A picture never imports as a coloured stamp, and that is decided
+    /// rather than missing.** Umber can carry one now ([`TipMask::coloured`]),
+    /// but a black-on-transparent PNG is overwhelmingly somebody's *mask* — it
+    /// is how every brush pack on the internet distributes one — and reading its
+    /// colour would turn a stamp that has always painted in the palette colour
+    /// into one that paints black whatever the palette says. So the rule below
+    /// is unchanged and a colour arrives only where the file states it is one:
+    /// a `.gbr`'s depth of 4, a `.gpb`'s trailing pattern, an RGBA tip in the
+    /// library. An explicit "import as a colour stamp" is a control somebody has
+    /// to be offered, not a reading to take behind their back.
     pub fn from_picture(bytes: &[u8]) -> Result<(Self, TipReading), PresetError> {
         let (width, height, rgba) = decode_picture(bytes)?;
         let (coverage, reading) = coverage_of(&rgba);
@@ -901,6 +1069,41 @@ mod tests {
         assert_eq!(back.height(), 5);
         assert_eq!(back.coverage(), coverage);
         assert_eq!(back, tip);
+    }
+
+    /// The same promise for a coloured stamp, and it is the one that decides
+    /// whether the library can hold one at all: the colour is stored straight,
+    /// so what comes back is the file's own bytes rather than something that
+    /// has been through a premultiply and back.
+    #[test]
+    fn a_coloured_stamp_survives_a_png_round_trip_byte_for_byte() {
+        let coverage: Vec<u8> = (0..12).map(|i| (i * 21) as u8).collect();
+        let colour: Vec<u8> = (0..36).map(|i| (i * 5 + 3) as u8).collect();
+        let tip = TipMask::coloured(4, 3, coverage.clone(), colour.clone()).expect("build");
+        assert!(tip.is_coloured());
+
+        let back = TipMask::from_png(&tip.to_png().expect("encode")).expect("decode");
+        assert_eq!(back.coverage(), coverage);
+        assert_eq!(back.colour(), Some(colour.as_slice()));
+        assert_eq!(back, tip);
+
+        // And a mask is still written as greyscale, so nothing already in
+        // somebody's `tips/` directory grows three channels it does not use.
+        let plain = TipMask::new(4, 3, coverage).expect("build");
+        assert!(!plain.is_coloured());
+        let png = plain.to_png().expect("encode");
+        assert_eq!(TipMask::from_png(&png).expect("decode"), plain);
+        // Greyscale is one byte a texel plus the PNG's own overhead; RGBA is
+        // four. Checked as a size rather than by parsing the header, because
+        // what matters is that the file did not grow.
+        assert!(png.len() < tip.to_png().expect("encode").len());
+    }
+
+    #[test]
+    fn a_stamp_and_its_colour_have_to_be_the_same_size() {
+        assert!(TipMask::coloured(2, 2, vec![0; 4], vec![0; 12]).is_ok());
+        assert!(TipMask::coloured(2, 2, vec![0; 4], vec![0; 11]).is_err());
+        assert!(TipMask::coloured(2, 2, vec![0; 4], vec![0; 16]).is_err());
     }
 
     #[test]

@@ -358,7 +358,14 @@ impl UmberApp {
 
         let bounds = self.editor.stroke.bounds();
         let dab_style = DabStyle {
-            per_dab_color: self.editor.stroke.is_coloured(),
+            // The style the stroke was begun with, not a fresh reading. It is
+            // the same snapshot the preview and the commit are handed, so the
+            // dab pipeline and `StrokeStyle::per_dab_color` cannot disagree
+            // about whether a colour was recorded — the thing that has to hold
+            // for every frame of a stroke. It is also where a coloured *stamp*
+            // joins pickup and colour modulation, which `StrokeBuilder` cannot
+            // see because a tip is a name the editor resolves.
+            per_dab_color: self.editor.stroke_style.per_dab_color,
             build_up: self.editor.stroke.builds_up(),
         };
         self.editor.stroke.end();
@@ -496,7 +503,18 @@ impl UmberApp {
         {
             // Cheap when the brush has not changed: `set_tip` compares the mask
             // by identity and returns without touching the GPU.
-            canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
+            //
+            // Whether the tip's *own* colour is stamped is decided in
+            // `begin_stroke`, above, and handed over rather than re-derived —
+            // it is the same answer `StrokeStyle::per_dab_color` was built
+            // from, and the two must not be able to disagree. An eraser and a
+            // stroke on a mask both say no.
+            canvas.set_tip(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                tip,
+                self.editor.stroke_stamps_colour,
+            );
 
             // The selection, on exactly the same footing and for the same
             // reasons: one binding covers a whole dab pass, and a selection
@@ -2273,8 +2291,11 @@ impl UmberApp {
             return;
         };
         canvas.begin_frame();
+        // The stroke's own snapshot — see `finish_stroke`, which builds the
+        // same style from the same field so the two frames of one stroke cannot
+        // be drawn by two different pipelines.
         let dab_style = DabStyle {
-            per_dab_color: self.editor.stroke.is_coloured(),
+            per_dab_color: self.editor.stroke_style.per_dab_color,
             build_up: self.editor.stroke.builds_up(),
         };
         if self.editor.stroke.pending_len() > 0 {
@@ -2397,7 +2418,12 @@ impl UmberApp {
         // The probe's copy is only submitted now, so mapping it has to wait
         // until here. Collecting is a non-blocking poll: whatever came home
         // feeds the stroke, and whatever did not is picked up next frame.
-        if dab_style.per_dab_color
+        // Gated on the *brush*, not on `dab_style`. The probe exists to tell a
+        // smudging stroke what it is passing over, and a coloured stamp is on
+        // the same colour path without wanting any of that — sampling the canvas
+        // for a stroke that never reads the answer is a readback a frame, in
+        // rotation, for nothing.
+        if self.editor.stroke.is_coloured()
             && let Some(canvas) = gfx.canvases.get_mut(&self.editor.session.active_id())
         {
             canvas.submit_probes();

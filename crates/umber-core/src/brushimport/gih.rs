@@ -177,9 +177,8 @@ pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
     } else if pipe.animated {
         out.push(ANIMATION);
     }
-    if pipe.cells.iter().any(|cell| cell.coloured) {
-        out.push(gbr::COLOURED);
-    }
+    // A coloured cell used to be reported here. It is not a loss any more —
+    // `gbr` carries the colour across — so the sequence is all a pipe drops.
     out
 }
 
@@ -298,10 +297,10 @@ mod tests {
         let pipe = from_gih(&file).expect("decode");
         assert_eq!(pipe.cells.len(), 2);
         assert_eq!(pipe.cells[1].tip.coverage(), [50, 51, 52, 53]);
-        assert_eq!(
-            dropped_features(&file),
-            ["animated brush sequences", "coloured stamps"]
-        );
+        // Each cell keeps its pattern's colour, so the sequence is the only
+        // thing left for the pipe to report.
+        assert!(pipe.cells[1].tip.is_coloured());
+        assert_eq!(dropped_features(&file), ["animated brush sequences"]);
     }
 
     /// The sequence is the thing Umber cannot reproduce, and the import has to

@@ -115,6 +115,28 @@ const BLEND_PRELUDE_COMMIT: &str = concat!(
 /// only when a smudging stroke starts, so an ordinary session never holds it.
 const STROKE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// A **coloured stamp**'s colour: the tip's own pixels, for the tips that carry
+/// any.
+///
+/// The same convention as [`LAYER_FORMAT`] and chosen for its reasons — sRGB
+/// storage, alpha premultiplied in linear light. Eight bits are enough because
+/// this *is* eight-bit source data: a `.gbr`, a `.gpb`'s pattern and a PNG in
+/// the library all hold a byte a channel, so a wider texture would be storing
+/// the same numbers in more space. That is the opposite of
+/// [`STROKE_COLOR_FORMAT`], which holds values the engine computed rather than
+/// values a file stated.
+///
+/// sRGB rather than `Rgba8Unorm` for the sake of the *hardware* decode: a
+/// bilinear tap on an sRGB texture filters the decoded linear values, which is
+/// what the dab pass needs, and encoding the low end costs nothing here where a
+/// linear byte would band.
+///
+/// A coloured tip therefore costs five bytes a texel — one of coverage and four
+/// of this — where a mask costs one. It is paid only by the brushes that carry a
+/// colour, and at [`TipMask::MAX_SIZE`] it is 20 MB for a stamp nothing else in
+/// this codebase would allocate at all.
+const TIP_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
 /// The coverage attachment's blend state.
 ///
 /// `Max` is the whole trick: coverage saturates instead of accumulating, so a
@@ -872,8 +894,11 @@ struct DabUniforms {
     /// Non-zero when a real mask is bound. Unlike the tip and the grain this
     /// cannot be folded into a placeholder — see the WGSL struct.
     use_selection: u32,
+    /// Non-zero when the tip carries a colour of its own. Took the place of one
+    /// of the three padding words already here, so the block is the size it
+    /// always was.
+    use_tip_color: u32,
     /// Scalar padding, not a vec3: see the uniform-layout note in CLAUDE.md.
-    _pad1: f32,
     _pad2: f32,
     _pad3: f32,
 }
@@ -892,7 +917,7 @@ impl DabUniforms {
             sel_min: [0.0, 0.0],
             sel_size: [1.0, 1.0],
             use_selection: 0,
-            _pad1: 0.0,
+            use_tip_color: 0,
             _pad2: 0.0,
             _pad3: 0.0,
         }
@@ -1191,6 +1216,11 @@ pub struct CanvasRenderer {
     /// group that references it.
     tip: wgpu::Texture,
     has_tip: bool,
+    /// A coloured stamp's colour, or a 1x1 placeholder. Held so it outlives the
+    /// bind group. Allocated only for the tips that carry one — see
+    /// [`TIP_COLOR_FORMAT`] for what it costs when they do.
+    tip_color: wgpu::Texture,
+    tip_color_view: wgpu::TextureView,
     /// Which mask is in that texture, so [`CanvasRenderer::set_tip`] can tell
     /// "the same brush again" from "a different brush".
     tip_mask: Option<Arc<TipMask>>,
@@ -1291,6 +1321,7 @@ impl Shared {
                 texture_entry(3),
                 sampler_entry(4),
                 texture_entry(5),
+                texture_entry(6),
             ],
         });
 
@@ -1822,6 +1853,12 @@ impl CanvasRenderer {
         // not vary — there is still exactly one set of dab pipelines.
         let selection = make_coverage_texture(device, 1, 1, "umber-selection-mask");
         let selection_view = selection.create_view(&wgpu::TextureViewDescriptor::default());
+        // The tip's colour, when it has one. A placeholder for the tip's own
+        // reason rather than the selection's: `use_tip_color` is zero, so
+        // `fs_colored` samples it and throws the answer away, and `fs` — every
+        // ordinary stroke — does not sample it at all.
+        let tip_color = make_tip_color_texture(device, 1, 1);
+        let tip_color_view = tip_color.create_view(&wgpu::TextureViewDescriptor::default());
         let dab_bind_group = make_dab_bind_group(
             device,
             &shared.dab_layout,
@@ -1831,6 +1868,7 @@ impl CanvasRenderer {
             &grain_view,
             &shared.grain_sampler,
             &selection_view,
+            &tip_color_view,
         );
 
         let view_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1897,6 +1935,8 @@ impl CanvasRenderer {
             dabs_this_frame: 0,
             tip,
             has_tip: false,
+            tip_color,
+            tip_color_view,
             tip_mask: None,
             grain,
             grain_view,
@@ -2169,18 +2209,35 @@ impl CanvasRenderer {
     /// answer "same brush as last time?" would put the cost back. Without the
     /// guard a texture allocation and a copy land on the first frame of every
     /// stroke, which is the one moment this project exists to keep short.
+    ///
+    /// `stamps_color` is whether a **coloured stamp**'s colour should be
+    /// honoured, and it is a parameter rather than being read off the mask on
+    /// purpose. It has to be the *same decision* as
+    /// [`StrokeStyle::per_dab_color`], which turns on for a smudging brush as
+    /// well — so a brush that smudges *and* carries a coloured tip would
+    /// otherwise take the coloured pipeline for one reason and stamp its tip's
+    /// colour for another, in cases where the caller had refused the second.
+    /// An eraser and a stroke on a mask are exactly those cases: neither has
+    /// anywhere for a colour to land, a mask is read on `.r`, and the result
+    /// was a mask stroke that previewed grey and committed the stamp's red.
+    /// One argument, decided once by the caller, is what stops the two.
     pub fn set_tip(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tip: Option<Arc<TipMask>>,
+        stamps_color: bool,
     ) {
-        let unchanged = match (&self.tip_mask, &tip) {
+        // What the colour plane is about to be. Part of the early-out, because
+        // the same brush can come back with the answer changed — pick up the
+        // eraser without changing tip and the stamp must stop colouring.
+        let want_color = stamps_color && tip.as_ref().is_some_and(|mask| mask.is_coloured());
+        let same_mask = match (&self.tip_mask, &tip) {
             (Some(current), Some(next)) => Arc::ptr_eq(current, next),
             (None, None) => true,
             _ => false,
         };
-        if unchanged {
+        if same_mask && self.dab_state.use_tip_color == u32::from(want_color) {
             return;
         }
 
@@ -2201,11 +2258,40 @@ impl CanvasRenderer {
             }
         };
 
+        // A coloured stamp's second plane. Uploaded here rather than lazily,
+        // because it is bound for the whole dab pass exactly as the coverage is
+        // — and dropped back to the placeholder the moment a tip without one is
+        // chosen, or the moment the caller declines it, so a session that
+        // touched one coloured brush does not go on holding its pixels.
+        let color = want_color
+            .then_some(tip.as_ref())
+            .flatten()
+            .and_then(|mask| mask.colour_premultiplied().map(|rgba| (mask, rgba)));
+        let color_texture = match color {
+            Some((mask, rgba)) => upload_tip_color(device, queue, mask, &rgba),
+            None => make_tip_color_texture(device, 1, 1),
+        };
+        self.dab_state.use_tip_color = u32::from(want_color);
+        self.tip_color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.tip_color = color_texture;
+
         self.tip = texture;
         self.has_tip = has_tip;
         self.tip_mask = tip;
         self.rebuild_dab_bind_group(device);
         queue.write_buffer(&self.dab_uniforms, 0, bytemuck::bytes_of(&self.dab_state));
+    }
+
+    /// Whether the dab pass will stamp the tip's own colour.
+    ///
+    /// This is [`Self::set_tip`]'s `stamps_color` **and** the tip actually
+    /// carrying a colour, which is the one thing that has to agree with
+    /// [`StrokeStyle::per_dab_color`]: a stroke that stamped a colour without
+    /// the colour attachment attached would have it thrown away and commit as
+    /// the flat palette colour. The caller decides both from one snapshot — see
+    /// `Editor::begin_stroke` — so this reports rather than requires.
+    pub fn stamps_tip_color(&self) -> bool {
+        self.dab_state.use_tip_color != 0
     }
 
     /// Set the paper the dab pass bites through, or `None` for none.
@@ -2337,6 +2423,7 @@ impl CanvasRenderer {
             &self.grain_view,
             &self.shared.grain_sampler,
             &self.selection_view,
+            &self.tip_color_view,
         );
     }
 
@@ -5175,6 +5262,59 @@ fn make_tip_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Tex
     make_coverage_texture(device, width, height, "umber-brush-tip")
 }
 
+/// Storage for a coloured stamp's colour. See [`TIP_COLOR_FORMAT`].
+fn make_tip_color_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("umber-brush-tip-colour"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TIP_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// Upload a coloured stamp's colour plane.
+///
+/// The premultiply is `umber-core`'s — [`TipMask::colour_premultiplied`] — for
+/// the reason every other conversion in this codebase lives there: it is
+/// arithmetic with an exact inverse and it is testable without a device. This
+/// function is the `write_texture` and nothing else.
+fn upload_tip_color(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mask: &TipMask,
+    rgba: &[u8],
+) -> wgpu::Texture {
+    let texture = make_tip_color_texture(device, mask.width(), mask.height());
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(mask.width() * 4),
+            rows_per_image: Some(mask.height()),
+        },
+        wgpu::Extent3d {
+            width: mask.width(),
+            height: mask.height(),
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
+}
+
 /// Single-channel coverage storage — a brush tip, a paper tile or a selection
 /// mask. One function because they are the same texture with different
 /// contents, and a second copy of this descriptor is a second place for the
@@ -5211,6 +5351,7 @@ fn make_dab_bind_group(
     grain: &wgpu::TextureView,
     grain_sampler: &wgpu::Sampler,
     selection: &wgpu::TextureView,
+    tip_color: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dab-bg"),
@@ -5239,6 +5380,10 @@ fn make_dab_bind_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(selection),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(tip_color),
             },
         ],
     })

@@ -96,22 +96,18 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             }])
         }
         // `.gpb` is a `.gbr` with a colour pattern stapled on; the same reader
-        // handles both, and reports the colour it could not keep.
+        // handles both, and both keep their colour now — so neither has
+        // anything left to report.
         "gbr" | "gpb" => {
             let bytes = preset::read_bytes(path)?;
             let brush = gbr::from_gbr(&bytes).map_err(|e| e.at(path))?;
             let name = embedded_name(&brush.name, &stem);
-            let dropped = if brush.coloured {
-                vec![gbr::COLOURED]
-            } else {
-                Vec::new()
-            };
             let (parameters, tip) = gbr::to_brush(brush);
             Ok(vec![Imported {
                 preset: preset_for("gbr", name, parameters),
                 tip: Some(tip),
                 paper: None,
-                dropped,
+                dropped: Vec::new(),
             }])
         }
         // A pipe is a container: every cell arrives as its own brush, because
@@ -142,9 +138,9 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     } else if animated {
                         dropped.push(gih::ANIMATION);
                     }
-                    if cell.coloured {
-                        dropped.push(gbr::COLOURED);
-                    }
+                    // A coloured cell no longer loses anything: the same `.gbr`
+                    // reader carries the colour across, so the only thing a pipe
+                    // drops is the sequence itself.
                     let (parameters, tip) = gbr::to_brush(cell);
                     Imported {
                         preset: preset_for("gih", name, parameters),
