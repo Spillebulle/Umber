@@ -71,10 +71,15 @@ panel, and never again.
 git show HEAD:crates/umber-core/assets/builtin-brushes.ron > /tmp/before.ron
 pwsh tools/fetch-brushes.ps1     # or: sh tools/fetch-brushes.sh
 cargo run -p umber-core --example build-brush-library
+cargo fmt --all                  # tip_table.rs is source, and is written raw
 cargo run -p umber-core --example diff-brush-library -- \
     /tmp/before.ron crates/umber-core/assets/builtin-brushes.ron
 cargo run -p umber-core --example survey-mypaint   # the tables below
 ```
+
+`cargo fmt` is not tidiness there: `tip_table.rs` is a Rust file the generator
+writes one entry per line, and CI runs `fmt --check`. Leave it out and a
+regeneration that changed nothing still shows up as a diff.
 
 The first step downloads the packs into `assets/brushes/`, which is git-ignored,
 and records what it took in `assets/brushes/LICENSES.md`, which is not. The
