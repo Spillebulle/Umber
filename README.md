@@ -281,9 +281,8 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 ## What is not there yet
 
 - **Text and shapes.** Six tools where the design draws sixteen.
-- **Structural undo.** Undo covers painting, transforms and canvas flips; adding,
-  deleting or reordering a layer is not recorded, and deleting a layer clears the
-  history.
+- **Clearing a layer** is the one command that still throws the undo history
+  away. Everything else is undoable, including deleting a layer.
 - **Transforming a linked set.** Link groups move together through the stack;
   moving several layers at once on the *canvas* is a larger change.
 - **A folder's own opacity and blend mode.** Folders hold layers and their eye

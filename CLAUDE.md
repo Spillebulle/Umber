@@ -558,9 +558,20 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   folders are flattened away, and deliberately so, because a folder that
   composites as a group *will* occupy a slot in that array and a cap tightened
   later would shut documents this build had already written.
-- **Deleting a layer clears undo history.** Slots are recycled, so a patch
-  recorded against a freed slot would be replayed into whichever layer inherits
-  it. Structural undo is the real fix and is not built yet.
+- **Deleting a layer parks its slice rather than recycling it**, which is what
+  lets the undo history survive a delete. A `PixelPatch` names a slot, so a
+  patch recorded against a *freed* slot would be replayed into whichever layer
+  inherited it — the history used to be cleared for exactly that reason. The
+  deleted layer now moves into the undo entry and owns its `SlotClaim`, so the
+  slice cannot be reissued and no patch stops meaning its own pixels. No copy,
+  no readback, no GPU work: the pixels never move at all.
+- **A parked slice is charged to the undo budget**, and the design said it cost
+  nothing until a critic proved otherwise. `slot_capacity_needed` is one past
+  the highest slice ever *claimed* and `ensure_slots` never shrinks, so 128
+  delete-then-add cycles took the layer array to 129 slices and left it there —
+  2.16 GB at 2048², **51.6 GB at 10000²**, with the budget reporting kilobytes.
+  `StackShape::byte_len` puts a parked slice in the same currency as a patch,
+  which is what makes eviction able to reach it.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
   when a new layer takes it.
 - **A mask is another slice of the *same* layer array, not a second
@@ -573,10 +584,10 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   sample is behind a **uniform** branch on `has_mask`, which is legal because
   `textureSampleLevel` takes no derivatives. `MAX_SLOTS` is therefore *not*
   `MAX_LAYERS` — the latter still sizes the uniform array.
-- **Removing a mask clears the undo history**, for exactly the reason deleting a
-  layer does: the slice goes back on the free list, and a patch naming a freed
-  slot would replay into whatever inherits it. The tooltip says so before the
-  click.
+- **Removing a mask parks its slice too**, for exactly the reason deleting a
+  layer does: the slice would otherwise go back on the free list, and a patch
+  naming a freed slot would replay into whatever inherited it. Both go through
+  the same entry, and neither clears the history any more.
 - **`StrokeStyle::on_mask` is the one edit-target switch**, in the struct that
   already carries "the preview and the commit must be handed the same style",
   and `Editor::stroke_target` is the single place it becomes a slot — falling
@@ -633,9 +644,10 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   the same picture and merely has one set where this build has three, which is
   exactly what that build did with the file it wrote. A file with the flag and
   no group reads as group zero: the single set it was written as.
-- **Reordering does not clear the undo history; deleting does.** The difference
-  is whether a slot changes hands — a `PixelPatch` names one, and only a delete
-  frees one for the next layer to inherit. `LayerStack::reorder` is the whole of
+- **Nothing here clears the undo history any more, and reordering never did.**
+  The difference was always whether a slot changes hands — a `PixelPatch` names
+  one, and only a delete freed one for the next layer to inherit. A delete now
+  parks the slice instead, so neither does. `LayerStack::reorder` is the whole of
   it, and `move_up`/`move_down` are written in terms of it so the rule that the
   selection follows the *layer* rather than the position exists once instead of
   in three places that have to agree.
@@ -685,10 +697,11 @@ are the contiguous run immediately below it whose `depth` is greater.
 - **Folders cost the undo history nothing**, and the rule is the one reordering
   answers to: no slot changes hands. Grouping, re-nesting and folding free none
   and reassign none, so every recorded patch still names its own pixels.
-  *Deleting* a folder deletes its contents, which frees their slices, so it
-  clears the history for exactly the reason deleting one layer does — and the
-  lock gate is over the whole subtree, because half a deletion is not a state
-  to leave a stack in.
+  *Deleting* a folder deletes its contents, and their slices are **parked** in
+  the one undo entry rather than freed, for exactly the reason deleting one
+  layer parks its own — so a folder deletion is undoable whole, which is the
+  only shape it could take. The lock gate is over the whole subtree, because
+  half a deletion is not a state to leave a stack in.
 - **The history's stack positions count folders**, and the manifest's name
   fingerprint is built the same way, so the two cannot disagree about what
   "layer 3" means. A folder holds no slot so it can never be what a patch
@@ -964,10 +977,10 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   the two agree only for as long as every child composites `svg:src-over`.
 - **The undo history is written too**, under `umber/`, pointed at by
   `umber-history`. `docformat::history` has the argument; the rules it lives by:
-  - **A slot is never written down.** `PixelPatch::slot` is a texture slice and
-    slots are recycled, which is why deleting a layer clears the history — a
-    slot in a file read into another session's allocation is that bug made
-    permanent. Entries name a **stack position**; `SaveHistory::new` maps slot
+  - **A slot is never written down.** `PixelPatch::slot` is a texture slice, and
+    a slot in a file read into another session's allocation is a patch replayed
+    into whatever inherited that number — the bug that parking a deleted layer's
+    slice exists to prevent in memory, made permanent on disk. Entries name a **stack position**; `SaveHistory::new` maps slot
     to position at save time and refuses the whole history if any patch cannot
     be placed, and `ImportedDocument::open` maps it back — which is why that
     returns an `Opened` rather than a tuple, because the stack and the history
@@ -1717,20 +1730,28 @@ once per stroke but must never move into the drawing loop.
   is stepped through, and the kind is read off the *snapshotted* stroke style,
   so switching tool mid-stroke cannot change what the stroke that is ending
   turns out to have been.
-- **`EditKind` has a variant only for something the engine can restore.** It is
-  Paint, Erase, Transform and the two canvas flips: an entry exists where a
-  patch was captured, or — the flips alone — where the edit is its own inverse.
-  Adding "Clear layer" or "Delete layer" means making those undoable
-  *first*; a row naming an action that clicking it will not undo is worse than
-  one the list stays quiet about, and the History module's footnote exists to
-  say so. The same bound governs the icons: `panels::edit_icon` is exhaustive
-  over `EditKind` deliberately, so a new variant cannot be added without
-  deciding what it looks like — and an icon set richer than the enum would be a
-  promise about what the engine records. **A paste is not a variant of its
-  own**: it is a Transform patch with nothing where the pixels came from, and
-  two rows that undo identically should not have two names. **A cut is not one
-  either**, for the same reason — it is an Erase; see "Transforms and the
-  clipboard".
+- **`EditKind` has a variant only for something the engine can restore**, and
+  the rule is the bound rather than the count. It is Paint, Erase, Transform,
+  the two canvas flips, and the six structural edits — an entry exists where a
+  patch was captured, where the edit is its own inverse (the flips), or where
+  the *shape* of the stack can be put back (a delete, an add, a reorder, a
+  rename, a mask added or removed). **"Clear layer" is the one command left
+  that clears the history**, and adding a row for it means making it undoable
+  first: a row naming an action that clicking it will not undo is worse than
+  one the list stays quiet about. The same bound governs the icons:
+  `panels::edit_icon` is exhaustive over `EditKind` deliberately, so a new
+  variant cannot be added without deciding what it looks like — and an icon set
+  richer than the enum would be a promise about what the engine records. **A
+  paste is not a variant of its own**: it is a Transform patch with nothing
+  where the pixels came from, and two rows that undo identically should not have
+  two names. **A cut is not one either**, for the same reason — it is an Erase;
+  see "Transforms and the clipboard".
+- **A structural entry restores *shape*, not values.** `EditBody::Structure`
+  holds a `StackShape` of `Kept`/`Gone` rather than a snapshot of the whole
+  `Vec<Layer>`, and the difference is the point: a snapshot would make undoing
+  a reorder silently revert an opacity changed after it. What a `Kept` entry
+  carries is where a layer sat; what a `Gone` one carries is the layer itself,
+  slot claim and all.
 - **The time is wall-clock, and may be absent.** `Instant` means nothing outside
   the run that produced it and these go into a file, so `umber_core::time`
   carries a `Timestamp` in Unix milliseconds. `Edit::at` is an `Option`, and

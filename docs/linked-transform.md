@@ -380,11 +380,13 @@ pub enum EditBody {
 }
 ```
 
-That is the whole of what a linked transform needs. What structural undo needs
-*in addition* is the stack itself, and the slots — a delete frees slices, which
-is why deleting a layer clears the history today — so its arm carries a
-structural record beside the patches rather than replacing them. The shared
-decision, and the one worth agreeing explicitly, is:
+That is the whole of what a linked transform needs. What structural undo needed
+*in addition* was the stack itself, and the slots — a delete used to free
+slices, which is why it cleared the history. **That half is built**: a deleted
+layer moves into the entry and owns its slot claim, so nothing is freed and
+nothing is cleared, and `EditBody` gained a `Structure` arm rather than a
+patch list. So the shared decision below was settled the other way — structural
+undo stores no pixels at all, and a list of patches is this feature's alone:
 
 > **An entry holds a list of patches, applied atomically, reversed by one call to
 > `reverse`.** Whatever else a structural entry carries, it carries that list in
@@ -419,12 +421,16 @@ Consequences, each of which the transform half can carry alone:
 
 ### Slots are safe here, and that is the difference from structural undo
 
-A `PixelPatch` names a slot, and slots are recycled, which is why *deleting* a
-layer clears the history. A transform frees no slot and reassigns none — the
-preview slices come from above `slot_capacity_needed()` and are given back at
-`end_float` without ever entering the stack's free list. So a linked transform
-costs the history nothing, exactly as reordering and grouping do. Structural undo
-is the harder half of this precisely because it does not have that.
+A `PixelPatch` names a slot, and slots were recycled, which is why *deleting* a
+layer used to clear the history. A transform frees no slot and reassigns none —
+the preview slices come from above `slot_capacity_needed()` and are given back
+at `end_float` without ever entering the stack's free list. So a linked
+transform costs the history nothing, exactly as reordering and grouping do.
+
+Structural undo was the harder half precisely because it did not have that, and
+its answer changes one number here: a parked slice keeps `slot_capacity_needed`
+climbing, so the headroom a float competes for is smaller than this document
+assumed. `LayerStack::live_slot_ceiling` is what a float should ask.
 
 ---
 
