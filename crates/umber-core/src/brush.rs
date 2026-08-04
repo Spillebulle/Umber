@@ -389,6 +389,48 @@ impl Brush {
         (self.radius_at(pressure) * 2.0 * self.spacing).max(0.25)
     }
 
+    /// [`Brush::smudge`] for an application that states the pickup and the
+    /// **paint-deposit rate** as two separate numbers.
+    ///
+    /// Krita's colour-smudge engine is the case this exists for: `SmudgeRate`
+    /// is how much of the canvas a dab lifts and `ColorRate` is how much fresh
+    /// paint it lays down, and the two are independent knobs. Umber has one,
+    /// and it is not a missing feature — a dab deposits
+    /// `lerp(palette, picked-up, smudge)`, so **`1 - smudge` already *is* a
+    /// paint-deposit rate**. What a two-knob application says that one number
+    /// cannot is the pair's *magnitude*; what decides the colour is their
+    /// *ratio*, and that is what carries across exactly.
+    ///
+    /// So the mix is the pickup's share of the two, `p / (p + d)`. Reading the
+    /// pickup alone — which is what a reader does when it has nowhere to put
+    /// the other number — is wrong in the direction that shows: a brush whose
+    /// author had it laying down as much paint as it lifts arrives as a pure
+    /// blender that deposits no colour however hard it is leant on, which is
+    /// indistinguishable from an ink that does not work.
+    ///
+    /// Exact at both ends (a deposit of zero is a pure blender, a pickup of
+    /// zero an ordinary brush) and scale-free, so a pair stated out of ten and
+    /// the same pair out of one give the same brush. Two zeroes mean a dab that
+    /// puts nothing anywhere, which is not a state to carry into a mix: it
+    /// answers `0.0`, the ordinary brush, rather than a division by zero.
+    pub fn smudge_from_rates(pickup: f32, deposit: f32) -> f32 {
+        let pickup = if pickup.is_finite() {
+            pickup.max(0.0)
+        } else {
+            0.0
+        };
+        let deposit = if deposit.is_finite() {
+            deposit.max(0.0)
+        } else {
+            0.0
+        };
+        let total = pickup + deposit;
+        if total <= 0.0 {
+            return 0.0;
+        }
+        (pickup / total).clamp(0.0, 1.0)
+    }
+
     /// Whether this brush picks colour up off the canvas.
     ///
     /// The threshold is not zero: a smudge of a few thousandths is a rounding
@@ -659,6 +701,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(round.blend, BlendMode::Screen);
+    }
+
+    /// The two ends are the whole point: a brush that lays down no paint is a
+    /// pure blender, and one that lifts nothing is an ordinary brush. Anything
+    /// between is the pickup's share.
+    #[test]
+    fn a_pair_of_rates_becomes_the_mix_between_them() {
+        assert_eq!(Brush::smudge_from_rates(1.0, 0.0), 1.0);
+        assert_eq!(Brush::smudge_from_rates(0.0, 1.0), 0.0);
+        assert_eq!(Brush::smudge_from_rates(1.0, 1.0), 0.5);
+        // Krita's "Paint Round Dry": lifts 0.38, lays down 0.84 — mostly paint
+        // with a hint of what is under it. Reading the pickup alone made it a
+        // brush that deposits barely a third of its own colour.
+        let dry = Brush::smudge_from_rates(0.38, 0.84);
+        assert!((dry - 0.311_47).abs() < 1e-4, "{dry}");
+        assert!(dry < 0.38);
+    }
+
+    /// Scale-free, because only the ratio is expressible: the same brush stated
+    /// out of one and out of ten has to arrive the same brush.
+    #[test]
+    fn only_the_ratio_of_two_rates_survives() {
+        for scale in [0.01f32, 0.5, 1.0, 10.0] {
+            assert!((Brush::smudge_from_rates(0.7 * scale, 0.3 * scale) - 0.7).abs() < 1e-5);
+        }
+    }
+
+    /// A dab that neither lifts nor deposits is not a mix, and dividing by the
+    /// sum of two zeroes would put a NaN into the colour of every dab.
+    #[test]
+    fn two_rates_of_nothing_are_an_ordinary_brush() {
+        assert_eq!(Brush::smudge_from_rates(0.0, 0.0), 0.0);
+        assert_eq!(Brush::smudge_from_rates(f32::NAN, f32::NAN), 0.0);
+        assert_eq!(Brush::smudge_from_rates(-1.0, -1.0), 0.0);
+        // A file that states one of them as nonsense still has to give a
+        // number the dab pass can use.
+        assert!(Brush::smudge_from_rates(f32::INFINITY, 1.0).is_finite());
+        assert_eq!(Brush::smudge_from_rates(1.0, f32::NAN), 1.0);
     }
 
     #[test]
