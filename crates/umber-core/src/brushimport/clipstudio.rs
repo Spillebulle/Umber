@@ -69,6 +69,15 @@
 //!   is not because the bit cannot be identified — it can, see [`TILT`] — but
 //!   because no platform Umber runs on reports tilt at all, so the modulation
 //!   would sit at a value the pen never produces.
+//! - **The dab's angle answers to a different list of sources in the same
+//!   bits**, and that is the one place a bitmask here means two things. Clip
+//!   Studio's *Direction* dynamic offers None, direction of pen, pen tilt,
+//!   **direction of line** and random — no velocity in it anywhere. So
+//!   `1 << 6` on `BrushRotationEffector` is the stroke's own heading, which is
+//!   [`Brush::dab_angle_follows_stroke`] exactly, and reading it as the sweep's
+//!   velocity imported every sketching pencil in the sample files as a fixed
+//!   nib *and* apologised for a stroke speed Clip Studio cannot drive an angle
+//!   with. See the [`DIR_LINE`] constants for what pins each bit.
 //! - **Pressure and the random draw driving a setting Umber has no field for
 //!   are lost and deliberately not named.** They are as lost as a tilt mapping
 //!   is, and reporting them was tried: the sweep cannot tell a live effector
@@ -131,6 +140,10 @@ pub mod dropped {
     pub const UNKNOWN_INPUT: &str = "settings driven by an effect source this reader cannot name";
     /// Stroke speed reaches size and per-dab opacity; on anything else there is
     /// no Umber setting for it to drive.
+    ///
+    /// It is **not** what the dab's angle answers to — see the `DIR_*`
+    /// constants. Reading that column in this vocabulary is what put this
+    /// sentence on every brush whose tip merely follows the line.
     pub const SPEED_ELSEWHERE: &str = "stroke speed driving a setting Umber has no equivalent for";
     /// The brush names a paper and this reader could not read the reference.
     /// The strength and the tile size are still in the file; applying them to
@@ -411,6 +424,9 @@ impl Settings<'_> {
 
 /// Which input drives a setting, bit by bit.
 ///
+/// **The dab's angle is the one exception and has its own list in the same
+/// bits** — see [`DIR_LINE`]. Everything else is the ordinary Dynamics dialog:
+///
 /// Clip Studio's Dynamics dialog lists its effect sources as **Pen pressure,
 /// Tilt, Velocity, Random**, and the bits are that list from bit 4 upwards.
 /// Three things agree on it:
@@ -434,6 +450,57 @@ const TILT: u32 = 1 << 5;
 const VELOCITY: u32 = 1 << 6;
 const RANDOM: u32 = 1 << 7;
 const UNKNOWN: u32 = 1 << 8;
+
+/// Which input drives the **dab's angle** — a different list, in the same bits.
+///
+/// This is the one setting whose sources are not the four above, and reading it
+/// as though they were is a mistake with a visible cost at both ends. Clip
+/// Studio's *Direction* dynamic has its own dialog, and the manual lists it as
+/// **None, Direction of pen, Pen tilt, Direction of line, Random** — with no
+/// velocity anywhere in it. So `1 << 6` on `BrushRotationEffector` is not
+/// stroke speed; it is **Direction of line**, and that is
+/// [`Brush::dab_angle_follows_stroke`] exactly. Umber used to import such a
+/// brush as a fixed nib and apologise for a stroke speed Clip Studio cannot
+/// drive an angle with — a rake arriving as a ruling pen, under a sentence that
+/// sent the reader looking for a feature that was never the problem.
+///
+/// One bit is anchored in the sample files and the rest follow the dialog's
+/// order, which is a **weaker footing than the four above** and is said so
+/// here rather than left for somebody to discover:
+///
+/// - `1 << 7` is random, and it is the bit that carries an amount. Of the
+///   thirteen brushes, the eight without it hold `BrushRotationRandomScale` at
+///   its untouched 100 and not one holds anything else, while four of the five
+///   with it hold a deliberate 45 or 10. The correlation runs one way — the
+///   fifth sets the bit and leaves the amount at 100, which is a full turn and
+///   a legitimate setting — so what it pins is that **nobody sets the amount
+///   without the bit**. That is also the one bit this reader already had right,
+///   so the jitter it imports is unchanged.
+/// - Random being last then puts the other three sources on bits 4, 5 and 6 in
+///   the dialog's own order, which is the whole of the argument for `1 << 6`.
+///   It sits on four elongated, textured sketch pencils, one of them leaning
+///   45° off the line — a reading a painter would recognise, and **not proof**:
+///   the same four are a plausible pen-tilt brush too, so if the manual's order
+///   is not the file's order, `1 << 6` is pen tilt and those four import as
+///   rakes that should be nibs. That is the way this change can be wrong, and
+///   it is a wrong *mark* where the bug it replaces was only a wrong note.
+/// - `1 << 5` then falls on the two flat brushes, both 30% thick and stated at
+///   90°, and driving a flat marker's angle from pen tilt is a stock Clip
+///   Studio recipe. `1 << 4` falls on three round brushes; "Direction of pen"
+///   is the *azimuth* of the tilt rather than its amount, so it is still tilt
+///   and still something no platform Umber runs on reports.
+/// - `1 << 8` is **never set in either file**, so it keeps
+///   [`dropped::UNKNOWN_INPUT`] rather than being named. A later Clip Studio
+///   adds "Rotation of pen axis" to this dialog and appending it is the reading
+///   that fits — but that is an inference about a version and an insertion
+///   point, stacked on the inference above, for a bit nobody has observed. The
+///   old sentence is *literally* true meanwhile, which is this module's own
+///   rule; naming it costs nothing to defer and cannot be taken back.
+const DIR_PEN: u32 = 1 << 4;
+const DIR_TILT: u32 = 1 << 5;
+const DIR_LINE: u32 = 1 << 6;
+const DIR_RANDOM: u32 = 1 << 7;
+const DIR_PEN_AXIS: u32 = 1 << 8;
 
 /// One `*Effector` blob.
 ///
@@ -597,6 +664,11 @@ fn at(points: &[(f64, f64)], x: f64) -> f64 {
 /// whose velocity mapping *was* imported, so speed is only reported where it
 /// really had nowhere to go.
 ///
+/// The dab's angle is asked separately and in **its own vocabulary**, because
+/// the Direction dynamic's sources are not these four — see the `DIR_*`
+/// constants. It is not in the sweep either way: it is stored as an integer
+/// rather than as a record, so [`Settings::effector`] declines it.
+///
 /// **Only tilt, the unnamed fifth source and stray velocity are reported, and
 /// pressure and the random draw deliberately are not** — even though a mapping
 /// of either onto a setting Umber has no field for is just as lost. Reporting
@@ -618,7 +690,11 @@ fn at(points: &[(f64, f64)], x: f64) -> f64 {
 /// automatic dab interval already make. Naming these properly needs the enable
 /// flag beside each effector, which means knowing what those columns are
 /// called; until then silence beats a false apology.
-fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str> {
+fn unreachable_inputs(
+    settings: &Settings,
+    driven: &[&str],
+    angle_shows: bool,
+) -> Vec<&'static str> {
     let mut out = Vec::new();
     let mut note = |sources: u32, column: &str| {
         if sources & TILT != 0 {
@@ -643,13 +719,36 @@ fn unreachable_inputs(settings: &Settings, driven: &[&str]) -> Vec<&'static str>
         }
     }
 
-    // Rotation states its sources as a bare integer of the same bits rather
-    // than as a record, so it is not in the sweep above and has to be asked
-    // separately — which matters, because a chisel that turns with the stroke
-    // is exactly the brush this would otherwise stay quiet about. Its low bits
-    // are its own and are not effect sources, so only the input bits are read.
+    // Rotation states its sources as a bare integer rather than as a record, so
+    // it is not in the sweep above and has to be asked separately — and it
+    // answers in **its own vocabulary**, which is why it is read here rather
+    // than handed to `note`. See the `DIR_*` constants: the Direction dialog
+    // offers no velocity at all, so putting this column through the sweep's
+    // reading reported a stroke speed that was really a stroke *direction* —
+    // the one source of that apology in both sample files, and Umber now paints
+    // it instead of naming it. Its low bits are its own and are not effect
+    // sources.
+    //
+    // `angle_shows` is why this takes an argument at all. A round dab with no
+    // tip looks identical at every angle, so a direction source on one is a
+    // setting whose absence cannot be seen, and reporting it is the cry-wolf
+    // failure the rest of this function spends two paragraphs refusing. Two of
+    // the thirteen brushes in the sample files are exactly that — round,
+    // untipped, and naming a tilt direction — and the first draft of this
+    // reading gave both of them an apology they had no use for.
     let rotation = settings.int("BrushRotationEffector").unwrap_or(0) as u32;
-    note(rotation, "BrushRotationEffector");
+    if angle_shows {
+        // Both of the first two are tilt: one is how far the pen leans and the
+        // other is which way, and no platform Umber runs on reports either.
+        if rotation & (DIR_PEN | DIR_TILT) != 0 {
+            push_once(&mut out, dropped::TILT_INPUT);
+        }
+        // Never observed set. Kept under the honest name until it is — see the
+        // `DIR_PEN_AXIS` bullet.
+        if rotation & DIR_PEN_AXIS != 0 {
+            push_once(&mut out, dropped::UNKNOWN_INPUT);
+        }
+    }
     out
 }
 
@@ -1046,11 +1145,26 @@ fn convert(
         });
     }
 
-    // Rotation has its own encoding: a plain integer of the same bits rather
-    // than the record every other setting uses, with the amount in a column
-    // beside it.
+    // ---- the dab's angle -----------------------------------------------
+    // Rotation has its own encoding — a plain integer rather than the record
+    // every other setting uses, with the random amount in a column beside it —
+    // and its own list of sources, which is the `DIR_*` constants' whole point.
+    //
+    // "Direction of line" is `dab_angle_follows_stroke` exactly: the tip turns
+    // with the mark, and `dab_angle` above becomes the lean on top of it, which
+    // is what Clip Studio's own angle means once a direction source is on.
+    // Assigned rather than only set: Umber's own default is a fixed angle
+    // *today*, so the two agree, and writing it keeps them agreeing the day
+    // that default moves — which is the trap `pressure_size` fell into, where
+    // Umber's default really is on and a Clip Studio brush without it has to
+    // say so.
+    //
+    // This is the difference between a rake and a nib and it is not cosmetic.
+    // Every sketch pencil in the sample files asks for it, and every one of
+    // them used to arrive holding one angle down the whole stroke.
     let rotation_inputs = settings.int("BrushRotationEffector").unwrap_or(0) as u32;
-    if rotation_inputs & RANDOM != 0 {
+    brush.dab_angle_follows_stroke = rotation_inputs & DIR_LINE != 0;
+    if rotation_inputs & DIR_RANDOM != 0 {
         // Clip Studio's amount is a percentage of a full turn.
         let amount = settings.percent("BrushRotationRandomScale").unwrap_or(0.0);
         brush.dab_angle_jitter = (amount * 360.0).clamp(0.0, 360.0);
@@ -1198,7 +1312,16 @@ fn convert(
     if settings.flag("BrushContinuousPlot") {
         brush.dabs_per_second = HELD_SPRAY_RATE;
     }
-    for loss in unreachable_inputs(settings, &SPEED_TARGETS.map(|(column, _)| column)) {
+    // A round dab with no tip is the same picture at every angle, so whether an
+    // angle *shows* is the two things the brush knows and the settings row does
+    // not. `dab_has_angle` answers the elliptical half and the tip is the
+    // other, exactly as `Editor::tip` combines them for the brush editor.
+    let angle_shows = brush.dab_has_angle() || tip.is_some();
+    for loss in unreachable_inputs(
+        settings,
+        &SPEED_TARGETS.map(|(column, _)| column),
+        angle_shows,
+    ) {
         push_once(&mut dropped, loss);
     }
     if settings.flag("UseDualBrush") {
@@ -2256,7 +2379,7 @@ mod tests {
                 "Charcoal",
                 Variant::plain(1)
                     .int("BrushThickness", 50)
-                    .int("BrushRotationEffector", (RANDOM | 3) as i64)
+                    .int("BrushRotationEffector", (DIR_RANDOM | 3) as i64)
                     .int("BrushRotationRandomScale", 50),
             )],
             &[],
@@ -2329,24 +2452,211 @@ mod tests {
                 "Rake",
                 Variant::plain(1)
                     .int("BrushThickness", 40)
-                    .int("BrushRotationEffector", (TILT | 3) as i64),
+                    .int("BrushRotationEffector", (DIR_TILT | 3) as i64),
             )],
             &[],
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
         assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
         assert_eq!(tool.brush.dab_angle_jitter, 0.0);
+        assert!(!tool.brush.dab_angle_follows_stroke);
 
-        // An angle that turns with the pen's speed has no Umber field either,
-        // and there is no amount beside it to build a modulation out of.
+        // "Direction of pen" is the *azimuth* of the tilt rather than its
+        // amount — still tilt, and still nothing any platform reports, so it is
+        // named. Under the record effectors' vocabulary this same bit would
+        // have read as pressure, which is the one reading dropped in silence;
+        // that is what this pins it is no longer doing.
         let bytes = sut(
             &[(
-                "Speed rake",
-                Variant::plain(1).int("BrushRotationEffector", (VELOCITY | 3) as i64),
+                "Azimuth rake",
+                Variant::plain(1)
+                    .int("BrushThickness", 40)
+                    .int("BrushRotationEffector", (DIR_PEN | 3) as i64),
             )],
             &[],
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
+
+        // The barrel's twist is never set in either sample file, so it keeps
+        // the honest name rather than gaining a confident one for a bit nobody
+        // has seen. Same rule the record effectors' own fifth bit follows.
+        let bytes = sut(
+            &[(
+                "Twist rake",
+                Variant::plain(1)
+                    .int("BrushThickness", 40)
+                    .int("BrushRotationEffector", (DIR_PEN_AXIS | 3) as i64),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert_eq!(tool.dropped, [dropped::UNKNOWN_INPUT]);
+        assert!(!tool.brush.dab_angle_follows_stroke);
+    }
+
+    /// A round dab with no tip is the same picture at every angle, so a
+    /// direction source on one is a setting whose absence cannot be seen —
+    /// and an apology for it is the cry-wolf failure `unreachable_inputs`
+    /// exists to refuse. Two of the thirteen brushes in the sample files are
+    /// exactly this, and the first draft of the Direction reading gave both an
+    /// apology they had no use for: a loss list is only worth reading while
+    /// every line on it is a mark somebody will miss.
+    #[test]
+    fn a_direction_source_on_a_dab_with_no_visible_angle_is_not_worth_reporting() {
+        let round = |thickness: i64| {
+            sut(
+                &[(
+                    "Round",
+                    Variant::plain(1)
+                        .int("BrushThickness", thickness)
+                        .int("BrushRotationEffector", (DIR_TILT | 3) as i64),
+                )],
+                &[],
+            )
+        };
+        let tool = from_sut(&round(100)).expect("read").tools.remove(0);
+        assert!(!tool.brush.dab_has_angle());
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+
+        // Flatten the same brush and the angle is suddenly the whole of what
+        // the mark looks like, so the same bit is worth a line.
+        let tool = from_sut(&round(30)).expect("read").tools.remove(0);
+        assert!(tool.brush.dab_has_angle());
+        assert_eq!(tool.dropped, [dropped::TILT_INPUT]);
+    }
+
+    /// A bitmap tip is not rotationally symmetric whatever its roundness, so
+    /// it is the other half of "does the angle show" — the same pair
+    /// `Brush::dab_has_angle` and `Editor::tip` are combined in for the brush
+    /// editor. A round *stamp* brush losing its direction source is a real
+    /// loss, and reading the ratio alone would have gone quiet about it.
+    #[test]
+    fn a_round_dab_with_a_stamp_still_reports_the_direction_it_lost() {
+        let bytes = sut(
+            &[(
+                "Stamp",
+                Variant::plain(1)
+                    .int("BrushUsePatternImage", 1)
+                    .set("BrushPatternImageArray", reference("m:data:tip", 1))
+                    .int("BrushRotationEffector", (DIR_TILT | 3) as i64),
+            )],
+            &[("m:data:tip", material(8, 8, [0, 0, 0, 255]))],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.tip.is_some());
+        assert!(!tool.brush.dab_has_angle(), "the dab itself is round");
+        assert!(tool.dropped.contains(&dropped::TILT_INPUT));
+    }
+
+    /// The whole of the Clip Studio half of this. `1 << 6` on the *angle* is
+    /// **Direction of line**, not velocity — the Direction dynamic's source
+    /// list has no velocity in it at all — so a brush whose tip follows the
+    /// mark arrives as a rake and has nothing to apologise for. Both halves
+    /// matter: it used to import as a fixed nib *and* raise a sentence about a
+    /// stroke speed that was never the setting in question, which is the worst
+    /// shape this bug takes — a wrong mark under a note pointing elsewhere.
+    #[test]
+    fn an_angle_following_the_line_is_a_rake_and_not_a_lost_stroke_speed() {
+        let bytes = sut(
+            &[(
+                "Sketch",
+                Variant::plain(1)
+                    .int("BrushThickness", 58)
+                    .real("BrushRotation", 45.0)
+                    .int("BrushRotationEffector", (DIR_LINE | 3) as i64),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.brush.dab_angle_follows_stroke);
+        // The stated angle is the lean on top of the heading, which is what it
+        // means in Clip Studio once a direction source is on.
+        assert_eq!(tool.brush.dab_angle, 45.0);
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+        assert!(!dropped_features(&bytes).contains(&dropped::SPEED_ELSEWHERE));
+
+        // 195 — the two bits together — is what four of the thirteen brushes
+        // in the sample files actually hold, and it was the one value the
+        // flag and the jitter were only ever tested apart from. A tip that
+        // follows the mark *and* wobbles is a sketching pencil, and the two
+        // are read off one integer, so nothing but this says they compose.
+        let bytes = sut(
+            &[(
+                "Sketch 2",
+                Variant::plain(1)
+                    .int("BrushThickness", 58)
+                    .int("BrushRotationEffector", (DIR_LINE | DIR_RANDOM | 3) as i64)
+                    .int("BrushRotationRandomScale", 45),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.brush.dab_angle_follows_stroke);
+        assert!((tool.brush.dab_angle_jitter - 162.0).abs() < 1e-4);
+        assert!(tool.dropped.is_empty(), "{:?}", tool.dropped);
+    }
+
+    /// The pair to the rake above rather than a restatement of it: a brush
+    /// asking for a direction source Umber cannot follow — or for none at
+    /// all — must not fall back to the one source it can, which is the
+    /// tempting shape of this fix and would turn every flat marker in
+    /// somebody's library into a rake. The bit has to be *this* bit.
+    ///
+    /// It also pins the assignment against `Brush::default`, asserted here
+    /// rather than assumed: the two agree today, so nothing but a test would
+    /// notice the day that default moves.
+    #[test]
+    fn a_brush_that_does_not_ask_to_follow_the_line_holds_its_angle() {
+        assert!(
+            !Brush::default().dab_angle_follows_stroke,
+            "the default has moved"
+        );
+        for sources in [
+            3,
+            DIR_RANDOM | 3,
+            DIR_TILT | 3,
+            DIR_PEN | 3,
+            DIR_PEN_AXIS | 3,
+        ] {
+            let bytes = sut(
+                &[(
+                    "Nib",
+                    Variant::plain(1)
+                        .int("BrushThickness", 30)
+                        .int("BrushRotationEffector", sources as i64),
+                )],
+                &[],
+            );
+            let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+            assert!(
+                !brush.dab_angle_follows_stroke,
+                "sources {sources:#x} turned a nib into a rake"
+            );
+        }
+    }
+
+    /// Stroke speed on a *record* effector is untouched by any of the above,
+    /// and this is what says the apology still fires where it belongs. The
+    /// angle column is the only one that speaks the other vocabulary.
+    #[test]
+    fn stroke_speed_is_still_named_where_it_really_had_nowhere_to_go() {
+        let bytes = sut(
+            &[(
+                "Textured",
+                Variant::plain(1)
+                    .set(
+                        "TextureDensityEffector",
+                        effector(VELOCITY, [0, 0, 50, 0], &[], &[]),
+                    )
+                    // …even beside an angle that follows the line, which is the
+                    // combination that would hide a real loss behind the fix.
+                    .int("BrushRotationEffector", (DIR_LINE | 3) as i64),
+            )],
+            &[],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!(tool.brush.dab_angle_follows_stroke);
         assert_eq!(tool.dropped, [dropped::SPEED_ELSEWHERE]);
     }
 
