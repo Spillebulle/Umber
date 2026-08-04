@@ -3472,7 +3472,7 @@ mod tests {
             )],
             &[(
                 path,
-                material_with_pixels(8, 8, [128, 128, 128, 255], Some((400, 400, checks.clone()))),
+                material_with_pixels(8, 8, [128, 128, 128, 255], Some((400, 400, checks))),
             )],
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
