@@ -372,9 +372,16 @@ fn row(
     entry: &Entry,
 ) -> Option<Action> {
     let mut action = None;
+    // Which row the brush is actually painting with. A paper is compared by the
+    // **tile**, not by the name: one of the shipped three can be in force
+    // either as `Brush::grain_pattern` or as a name, and a name comparison
+    // would leave the row unmarked in one of those spellings while the brush
+    // painted through it. `paper_tile` is the same answer the dab pass binds.
     let chosen = match kind {
         Kind::Stamps => ed.tip_name.as_deref() == Some(entry.name.as_str()),
-        Kind::Papers => ed.paper_name.as_deref() == Some(entry.name.as_str()),
+        Kind::Papers => ed
+            .paper_tile()
+            .is_some_and(|tile| Arc::ptr_eq(&tile, &entry.mask)),
     } && entry.source != Source::Hidden;
 
     Frame::NONE
@@ -628,7 +635,20 @@ fn choose(ed: &mut Editor, state: &mut State, kind: Kind, name: String) {
             }
         }
         Kind::Papers => {
-            ed.set_paper(Some(name.clone()));
+            // One of the shipped three goes on the *enum*, not on the name, and
+            // that is not a shortcut: the Texture section's dropdown spells it
+            // that way, and two doors leaving the brush in two different states
+            // that paint identically is two states to keep in step for ever —
+            // the saved preset would differ depending on which control was used.
+            // Only where the user's own library does not hold that name, since
+            // theirs wins in every resolution and would make the enum a lie.
+            match shipped_pattern(&name).filter(|_| !ed.papers.contains_key(&name)) {
+                Some(pattern) => {
+                    ed.brush.grain_pattern = pattern;
+                    ed.set_paper(None);
+                }
+                None => ed.set_paper(Some(name.clone())),
+            }
             // A paper the brush cannot feel is worth saying out loud: the
             // control did what it says and the mark will not change, which
             // looks exactly like a control that does nothing.
@@ -647,6 +667,16 @@ fn choose(ed: &mut Editor, state: &mut State, kind: Kind, name: String) {
             }));
         }
     }
+}
+
+/// The `GrainPattern` a shipped tile's name belongs to, if it is one of theirs.
+///
+/// Read off `GrainPattern::key` rather than written out again, so a fourth
+/// shipped paper cannot end up named in one place and not the other.
+fn shipped_pattern(name: &str) -> Option<umber_core::GrainPattern> {
+    umber_core::GrainPattern::ALL
+        .into_iter()
+        .find(|pattern| pattern.key() == name)
 }
 
 /// Take a picture out of the library, asking once first.
@@ -990,6 +1020,46 @@ mod tests {
         // A stamp is never asked the question: it is stretched over one dab and
         // has no second copy of itself to meet, which is what the `None` means.
         assert!(!detail(row, None).contains("tile"));
+    }
+
+    /// The browser and the Texture section's dropdown are two doors onto one
+    /// choice, so they have to leave the brush in the *same* state — otherwise
+    /// which control was used decides what the saved preset says, and two
+    /// spellings that paint identically are two things to keep in step for
+    /// ever.
+    #[test]
+    fn choosing_a_shipped_paper_sets_the_enum_the_dropdown_sets() {
+        let mut ed = Editor::default();
+        let mut state = State::default();
+
+        choose(&mut ed, &mut state, Kind::Papers, "grit".to_owned());
+        assert_eq!(ed.brush.grain_pattern, umber_core::GrainPattern::Grit);
+        assert!(
+            ed.paper_name.is_none(),
+            "a shipped paper goes on the enum, not on the name"
+        );
+
+        // One of the user's own has nowhere else to go.
+        ed.papers.insert(
+            "linen".to_owned(),
+            Arc::new(TipMask::new(2, 2, vec![3; 4]).expect("tile")),
+        );
+        choose(&mut ed, &mut state, Kind::Papers, "linen".to_owned());
+        assert_eq!(ed.paper_name.as_deref(), Some("linen"));
+
+        // And a tile of theirs that has taken a shipped name stays a name:
+        // theirs wins in every resolution, so setting the enum would be a lie
+        // about which picture is in force.
+        ed.papers.insert(
+            "tooth".to_owned(),
+            Arc::new(TipMask::new(2, 2, vec![4; 4]).expect("tile")),
+        );
+        choose(&mut ed, &mut state, Kind::Papers, "tooth".to_owned());
+        assert_eq!(ed.paper_name.as_deref(), Some("tooth"));
+        assert!(Arc::ptr_eq(
+            &ed.paper_tile().expect("theirs"),
+            ed.papers.get("tooth").expect("held")
+        ));
     }
 
     /// The search reaches both halves of the merged list, and folds case and
