@@ -44,13 +44,13 @@
 //! `\x89C2F\r\n\x1a\n`, then chunks of `[u32 le size][4-byte tag][payload]
 //! [u32 checksum]` tagged `HEAD`, `dATA` and `TAIL`.
 //!
-//! **So the tip comes from `thumbnail.png`.** That is a real PNG of the real
-//! material and needs no guesswork, at the cost of a longest side of 300 —
-//! which is a limit only for a material that was bigger, and is well inside
-//! what [`TipMask`] stamps. The full-resolution pixels *are* reachable and
-//! `docs/brushes.md` records exactly how; what stands between them and this
-//! reader is a second SQLite dialect and a zlib dependency, not a mystery.
-//! The lost resolution is named as a loss meanwhile.
+//! **A tip and a paper both come from `data/material_0.layer`**, through
+//! [`super::csmaterial`], and `thumbnail.png` is the fallback for a material
+//! that reader will not guess at or that Clip Studio left out of the file. The
+//! thumbnail is a real PNG of the real material and needs no guesswork, at the
+//! cost of a longest side of 300 — and, for a paper, of a picture under no
+//! obligation to tile. Taking the fallback is named; taking the material is
+//! not, because there is then nothing to apologise for.
 //!
 //! A material reference — `TextureImage`, `BrushPatternImageArray` — is a small
 //! blob whose first field is the `OriginalPath` of the row in `MaterialFile`
@@ -98,17 +98,21 @@
 //!   is a size ramp over the first stretch of the mark, which is precisely what
 //!   [`DabInput::Stroke`] is. "Out" is measured back from an end the engine
 //!   does not know until the stroke is over.
-//! - **The paper texture arrives as a picture, into the user's texture
-//!   library.** It used to become one of Umber's three, on the reasoning that
-//!   the grain is a closed set — which it still is; what changed is that
-//!   [`crate::BrushPreset::paper`] can name a tile beside it. Substituting
-//!   inside the closed set was wrong because grain **multiplies coverage**:
-//!   `Tooth`'s mean is 0.775, so every textured brush arrived painting at about
-//!   78% of the opacity its author set, through pits nobody drew. A texture
-//!   this reader cannot resolve is now named as a loss and the brush paints
-//!   flat. It is read only where the reference actually names a material: a
-//!   stale reference left behind by a texture that was switched off would be a
-//!   brush painting through paper it does not have.
+//! - **The paper texture arrives as a picture, at the material's own
+//!   resolution, into the user's texture library.** It used to become one of
+//!   Umber's three, on the reasoning that the grain is a closed set — which it
+//!   still is; what changed is that [`crate::BrushPreset::paper`] can name a
+//!   tile beside it. Substituting inside the closed set was wrong because grain
+//!   **multiplies coverage**: `Tooth`'s mean is 0.775, so every textured brush
+//!   arrived painting at about 78% of the opacity its author set, through pits
+//!   nobody drew. A texture this reader cannot resolve is named as a loss and
+//!   the brush paints flat. It is read only where the reference actually names
+//!   a material: a stale reference left behind by a texture that was switched
+//!   off would be a brush painting through paper it does not have. The tile
+//!   size is the material's own size times `TextureScale2`, which is what that
+//!   percentage means — see [`GRAIN_TILE_AT_FULL_SCALE`] for the figure that
+//!   stands in when the material could not be read, and for what it used to
+//!   cost when it stood in for every case.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
 //!   have no engine behind them at all** and are named.
 //! - **A sub-tool that is not a brush is skipped without a word.** A `.sutg` is
@@ -165,19 +169,30 @@ pub mod dropped {
     /// A, B and C, so it will paint differently", so a comma inside one reads
     /// as a fourth item and a "so" inside one collides with the frame's own.
     pub const PAPER_TEXTURE: &str = "the paper texture's own picture";
-    /// The paper that *did* arrive is the material's thumbnail, not its full
-    /// pixels — [`THUMBNAIL_TIP`]'s twin, and needed for a sharper reason. The
-    /// tile size comes from the file's own `TextureScale2`, which describes the
-    /// real texture, so a thumbnail is stretched to the author's spatial
-    /// frequency at a fraction of the author's detail: soft blotches where
-    /// there was tooth. And a preview render is under no obligation to *tile*,
-    /// so a paper that arrives this way may well be reported as drawing a grid
-    /// — which it will, because of this and not because the author's texture
-    /// was bad.
+    /// The paper that arrived is the material's thumbnail, not its full pixels
+    /// — [`THUMBNAIL_TIP`]'s twin, and named on the same terms: **only where
+    /// the fallback was actually taken**, which since `paper_for` learned to
+    /// read [`super::csmaterial`] is the rarer half.
     ///
-    /// [`super::csmaterial`] can read a paper's real pixels — it does so for a
-    /// tip — so this is a wiring gap rather than a limit of the format.
+    /// It is the sharper of the two losses. The tile size comes from the file's
+    /// own `TextureScale2`, which is a percentage of the *material's* size, so
+    /// a thumbnail is stretched to the author's spatial frequency at a fraction
+    /// of the author's detail: soft blotches where there was tooth. And a
+    /// preview render is under no obligation to **tile**, where the material
+    /// itself declares `isTiling` and does — measured on the sample files, the
+    /// 500 × 500 paper joins to itself within its own noise and its 300 × 300
+    /// thumbnail steps by 62 levels across the join against an interior figure
+    /// of 2.9, which the browser reports as a grid. That grid was the preview's
+    /// and never the author's.
     pub const THUMBNAIL_PAPER: &str = "paper textures at their full resolution";
+    /// The paper material was read whole and is larger than a tile may be.
+    ///
+    /// [`REDUCED_TIP`]'s twin and reduced by the same function, but what it
+    /// costs is different: a stamp loses its peak, where a paper loses its
+    /// **tooth** — the pits and peaks average towards the middle, so the grain
+    /// bites more evenly and more weakly than the author drew it.
+    pub const REDUCED_PAPER: &str =
+        "a paper texture larger than Umber can hold at full resolution (reduced to fit)";
     /// Umber has no tilt input on any platform it runs on, so a tilt mapping
     /// could only ever be evaluated at a value the pen never reports.
     pub const TILT_INPUT: &str = "settings driven by pen tilt";
@@ -1099,11 +1114,64 @@ fn tip_for(reference: &[u8], materials: &Materials) -> Option<ResolvedTip> {
     })
 }
 
+/// A paper tile a texture reference resolved to.
+struct ResolvedPaper {
+    tile: TipMask,
+    /// The material's own longest side in texels, **before** any reduction, or
+    /// `None` where the thumbnail stood in.
+    ///
+    /// This is what `TextureScale2` is a percentage of, which is why it is
+    /// carried out rather than taken off `tile`: a reduced tile covers exactly
+    /// the same document area as the material it came from, and a thumbnail's
+    /// longest side is capped at 300 and therefore says nothing about the
+    /// picture's. See [`GRAIN_TILE_AT_FULL_SCALE`] for the figure that stands
+    /// in when this is absent.
+    ///
+    /// The *longest* side, because [`Brush::grain_scale`] is one number and the
+    /// dab pass divides the document position by it on both axes — so a
+    /// non-square paper is stretched square whatever is chosen here, and the
+    /// long axis is the one `Brush::size` already sets the precedent for. Both
+    /// papers in the sample files are square.
+    native: Option<u32>,
+    lost: Option<&'static str>,
+}
+
 /// The paper tile a material reference resolves to, if there is one.
-fn paper_for(reference: &[u8], materials: &Materials) -> Option<TipMask> {
+///
+/// **The material's own pixels first, its thumbnail second**, exactly as
+/// [`tip_for`] does and for one reason more: the tile size is derived from the
+/// material's size, and a preview is under no obligation to tile. See
+/// [`dropped::THUMBNAIL_PAPER`].
+///
+/// The material's coverage plane is **complemented** on the way in, and getting
+/// that backwards inverts somebody's paper. [`csmaterial::Material::coverage`]
+/// is *ink* — it is measured against [`mask_from_thumbnail`]'s
+/// `alpha × (1 − luma)` material by material, to a mean absolute 0.0002..0.068
+/// of a level — while a grain texel is the fraction of the dab that **stays**.
+/// The two are exact complements rather than merely opposite in spirit: for
+/// straight-alpha pixels over white, `1 − a(1 − L)` is `(1 − a) + aL`, which is
+/// [`crate::tip::grain_of`] written out, so the composite-over-white that rule
+/// insists on comes across for free. On the neutral grey a paper material is,
+/// Rec. 601 and Rec. 709 agree exactly, so the two routes into a tile do not
+/// disagree about a texel either.
+fn paper_for(reference: &[u8], materials: &Materials) -> Option<ResolvedPaper> {
     let archive = materials.resolve(reference)?;
+    if let Some(material) = materials.pixels(reference) {
+        let grain = material.coverage.iter().map(|v| 255 - *v).collect();
+        if let Ok((tile, reduced)) = TipMask::reduced(material.width, material.height, grain) {
+            return Some(ResolvedPaper {
+                tile,
+                native: Some(material.width.max(material.height)),
+                lost: reduced.then_some(dropped::REDUCED_PAPER),
+            });
+        }
+    }
     let png_bytes = tar_member(archive, "thumbnail/thumbnail.png")?;
-    paper_from_thumbnail(&png_bytes)
+    Some(ResolvedPaper {
+        tile: paper_from_thumbnail(&png_bytes)?,
+        native: None,
+        lost: Some(dropped::THUMBNAIL_PAPER),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,12 +1182,22 @@ fn paper_for(reference: &[u8], materials: &Materials) -> Option<TipMask> {
 /// GIMP's `.gbr` and `.vbr` state theirs in.
 const INTERVAL_PER_CENT: f32 = 100.0;
 
-/// Umber's grain tile is stated in document pixels and Clip Studio's texture
-/// scale is a percentage of the material's own size, which is not recorded
-/// anywhere the thumbnail can be trusted for. A hundred per cent is therefore
-/// read as Umber's own default tile, so the *relative* coarseness of two
-/// brushes out of one file is right even where neither matches Clip Studio's
-/// absolute size.
+/// The tile a hundred per cent means for a texture whose material could not be
+/// read.
+///
+/// Umber's grain tile is stated in document pixels and Clip Studio's
+/// `TextureScale2` is a percentage of the material's **own** size, so the
+/// honest conversion is that size times the percentage — and
+/// [`ResolvedPaper::native`] now carries it, because the material's pixels are
+/// read rather than its 300-pixel preview. This constant is what stands in
+/// where they are not: Umber's own default tile, which keeps the *relative*
+/// coarseness of two brushes out of one file right even where neither matches
+/// Clip Studio's absolute size.
+///
+/// It used to be the answer in every case, and on the sample files that put the
+/// Sketch brushes' paper at 256 × 0.19 ≈ 49 document pixels where their 500 ×
+/// 500 material at 19% is 95 — a paper twice as fine as its author's, which on
+/// a 6-pixel pencil is the difference between tooth and a wash.
 const GRAIN_TILE_AT_FULL_SCALE: f32 = 256.0;
 
 /// Dabs a second for a brush set to keep spraying while the pen is held still.
@@ -1432,8 +1510,10 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
         let scale = settings.real("TextureScale2").unwrap_or(100.0) as f32 / 100.0;
-        brush.grain_scale = (GRAIN_TILE_AT_FULL_SCALE * scale)
-            .clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
+        // The tile the percentage is *of*. The material's own size where it was
+        // read, and `GRAIN_TILE_AT_FULL_SCALE` where it was not — see that
+        // constant for what the invented figure used to cost.
+        let mut full = GRAIN_TILE_AT_FULL_SCALE;
         // The paper's own picture, where the material is in the file. It goes
         // into the user's texture library and the preset names it — see
         // `BrushPreset::paper`.
@@ -1453,17 +1533,25 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
         // stored for a brush that cannot feel it is a file per sub-tool that
         // nothing ever samples. A `.sutg` is fifteen of them.
         if brush.has_grain() {
-            paper = paper_for(reference, materials);
-            match paper {
-                // What arrived is the thumbnail, exactly as a tip is, and it
-                // has to be named for the same reason — see `THUMBNAIL_PAPER`.
-                // Reporting the loss only when the paper is *missing* would be
-                // a brush claiming to carry its author's texture while
-                // carrying a preview of it.
-                Some(_) => push_once(&mut dropped, dropped::THUMBNAIL_PAPER),
+            match paper_for(reference, materials) {
+                Some(ResolvedPaper { tile, native, lost }) => {
+                    // Named only where something was actually given up — the
+                    // thumbnail fallback, or a reduction. Naming the thumbnail
+                    // on every textured brush was true when it was the only
+                    // route and is a false apology now that it is the second
+                    // one, which is exactly the rule `THUMBNAIL_TIP` follows.
+                    if let Some(loss) = lost {
+                        push_once(&mut dropped, loss);
+                    }
+                    if let Some(side) = native {
+                        full = side as f32;
+                    }
+                    paper = Some(tile);
+                }
                 None => push_once(&mut dropped, dropped::PAPER_TEXTURE),
             }
         }
+        brush.grain_scale = (full * scale).clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
     }
 
     // ---- the tip -------------------------------------------------------
@@ -3269,10 +3357,16 @@ mod tests {
         assert!(tool.dropped.contains(&dropped::SEVERAL_TIPS));
     }
 
-    /// The strength, the tile size **and the picture** now come across. The
-    /// last of those is why `dropped::PAPER_TEXTURE` no longer appears: the
-    /// brush is painting through its author's paper rather than through one of
-    /// Umber's three, which is what it was apologising for.
+    /// The strength, the tile size **and the picture** come across. The last of
+    /// those is why `dropped::PAPER_TEXTURE` no longer appears: the brush is
+    /// painting through its author's paper rather than through one of Umber's
+    /// three, which is what it was apologising for.
+    ///
+    /// This is the thumbnail *fallback*, which is why it still names a loss —
+    /// the fixture's material carries no `data/material_0.layer`, exactly as a
+    /// material Clip Studio left out of the file does not.
+    /// `a_paper_texture_comes_from_the_material_and_not_its_thumbnail` is the
+    /// ordinary case beside it.
     #[test]
     fn a_paper_texture_brings_its_own_picture() {
         let path = ".:paper:data:material_0.layer";
@@ -3288,6 +3382,9 @@ mod tests {
         );
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
         assert!((tool.brush.grain - 0.8).abs() < 1e-6);
+        // The thumbnail says nothing about the material's size, so the tile is
+        // `GRAIN_TILE_AT_FULL_SCALE` — the invented figure, in the one case
+        // where there is nothing to derive one from.
         assert!((tool.brush.grain_scale - 64.0).abs() < 1e-4);
         assert!(tool.brush.has_grain());
         assert!(!tool.dropped.contains(&dropped::PAPER_TEXTURE));
@@ -3305,6 +3402,115 @@ mod tests {
             (paper.at(4, 4) as i32 - 128).abs() <= 2,
             "got {}",
             paper.at(4, 4)
+        );
+    }
+
+    /// The paper is the **material's own pixels**, and the thumbnail is only
+    /// the fallback — the wiring `tip_for` already had.
+    ///
+    /// The fixture's two pictures deliberately disagree: the thumbnail is a
+    /// flat mid-grey and the material is a black-and-white check, so a reader
+    /// that took the preview cannot pass by accident. That is the shape the
+    /// bug had — every claim about resolution held, and the tile was a
+    /// 300-pixel render of it.
+    ///
+    /// Three things ride on the route and each is checked here.
+    ///
+    /// - **The polarity.** `csmaterial` hands back *ink* and a grain texel is
+    ///   what the dab **keeps**, so the plane is complemented. Getting it
+    ///   backwards inverts somebody's paper, which reads as a texture biting in
+    ///   exactly the wrong places rather than as a bug.
+    /// - **The tile size.** `TextureScale2` is a percentage of the material's
+    ///   own size, so a 400-texel material at 25% is 100 document pixels — not
+    ///   the 64 the stood-in constant gives, which is what every textured Clip
+    ///   Studio brush used to import at.
+    /// - **The silence.** Nothing was given up, so nothing is named.
+    #[test]
+    fn a_paper_texture_comes_from_the_material_and_not_its_thumbnail() {
+        let path = ".:paper:data:material_0.layer";
+        // Ink: 0 is paper and 255 is a pit, which the reader complements.
+        let checks: Vec<u8> = (0..400 * 400)
+            .map(|i| {
+                let (x, y) = (i % 400, i / 400);
+                if (x / 50 + y / 50) % 2 == 0 { 0 } else { 255 }
+            })
+            .collect();
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 80)
+                    .real("TextureScale2", 25.0),
+            )],
+            &[(
+                path,
+                material_with_pixels(8, 8, [128, 128, 128, 255], Some((400, 400, checks.clone()))),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+
+        let paper = tool.paper.as_ref().expect("the picture came with it");
+        assert_eq!((paper.width(), paper.height()), (400, 400));
+        assert_eq!(
+            paper.at(10, 10),
+            255,
+            "ink of 0 is paper that keeps the dab"
+        );
+        assert_eq!(
+            paper.at(60, 10),
+            0,
+            "ink of 255 is a pit that takes it away"
+        );
+
+        assert!(
+            (tool.brush.grain_scale - 100.0).abs() < 1e-4,
+            "got {}",
+            tool.brush.grain_scale
+        );
+        assert!(!tool.dropped.contains(&dropped::THUMBNAIL_PAPER));
+        assert!(!tool.dropped.contains(&dropped::REDUCED_PAPER));
+        assert!(!tool.dropped.contains(&dropped::PAPER_TEXTURE));
+    }
+
+    /// A material wider than a tile may be is **reduced and named**, not
+    /// refused — the answer `REDUCED_TIP` already gives, and for the same
+    /// reason: the alternative is not the picture on disk but a 300-pixel
+    /// preview of it.
+    ///
+    /// The tile *size* is untouched by the reduction, and that is the half
+    /// worth pinning: `TextureScale2` is a percentage of the material the
+    /// author scaled, so a reduced tile has to cover the same document area as
+    /// the picture it came from or the grain changes frequency to fit Umber's
+    /// texture budget.
+    #[test]
+    fn a_paper_larger_than_a_tile_may_be_is_reduced_and_still_covers_its_own_ground() {
+        let path = ".:paper:data:material_0.layer";
+        let side = TipMask::MAX_SIZE + 400;
+        let flat = vec![64u8; (side * side) as usize];
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 80)
+                    .real("TextureScale2", 50.0),
+            )],
+            &[(
+                path,
+                material_with_pixels(8, 8, [128, 128, 128, 255], Some((side, side, flat))),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+
+        let paper = tool.paper.as_ref().expect("the picture came with it");
+        assert_eq!(paper.width(), TipMask::MAX_SIZE);
+        assert!(tool.dropped.contains(&dropped::REDUCED_PAPER));
+        // Half of the material's own side, not half of the reduced tile's.
+        assert!(
+            (tool.brush.grain_scale - side as f32 * 0.5).abs() < 1e-4,
+            "got {}",
+            tool.brush.grain_scale
         );
     }
 

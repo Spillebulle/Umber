@@ -1031,15 +1031,15 @@ one that would only show up when a release was cut, since the desktop build
 everybody develops against has a C compiler. Its module docs carry the argument
 and the list of what it deliberately will not do.
 
-**The tip is the material's own pixels, and the thumbnail is the fallback.**
-`MaterialFile.FileData` is a USTAR tar holding both:
+**A tip and a paper are both the material's own pixels, and the thumbnail is the
+fallback.** `MaterialFile.FileData` is a USTAR tar holding both:
 `data/material_0.layer`, which is what the artist drew, and
 `thumbnail/thumbnail.png`, a PNG preview of it with a longest side of 300.
 `brushimport::csmaterial` reads the first — see below — and
-`brushimport::clipstudio`'s `tip_for` falls back to the second for a material
-Clip Studio left out of the file or a container shape the reader will not guess
-at. The fallback names itself; taking the material does not, because there is
-then nothing to apologise for.
+`brushimport::clipstudio`'s `tip_for` and `paper_for` fall back to the second
+for a material Clip Studio left out of the file or a container shape the reader
+will not guess at. The fallback names itself; taking the material does not,
+because there is then nothing to apologise for.
 
 The thumbnail's coverage is `alpha × (1 − luminance)` and has to be both terms:
 a brush tip is black on transparent, so its alpha is the mark, and a paper
@@ -1312,6 +1312,43 @@ flat and says so. The picture is taken only where the grain actually bites,
 which is the threshold the renderer binds a tile at — a strength left in the
 file at zero is a setting that was switched off, and a tile stored for it is a
 file per sub-tool that nothing samples.
+
+**The paper is the material's own pixels, on the tip's terms**, through the same
+`csmaterial` reader and with `thumbnail.png` as the same fallback; the fallback
+is named and taking the material is not. Three things ride on the route and only
+the first is the one anybody expects.
+
+- **Resolution.** The 500 × 500 paper in the sample files was arriving as its
+  300 × 300 preview.
+- **Polarity.** `csmaterial` hands back *ink* and a grain texel is the fraction
+  of the dab that **stays**, so the plane is complemented. It is an exact
+  complement rather than an approximate one: for straight-alpha pixels,
+  `1 − a(1 − L)` is `(1 − a) + aL`, which is `tip::grain_of` written out — so
+  the composite-over-white that rule insists on comes across for free, and on
+  the neutral grey a paper is, Rec. 601 and Rec. 709 agree exactly, so the two
+  routes into a tile cannot disagree about a texel. Measured over the four
+  readable materials, the complement of plane 0 lands 0.0397..0.0987 of a level
+  from `grain_of` of the thumbnail — the resampling — against 0.53..0.93 the
+  other way round.
+- **Whether it tiles at all.** A preview render is under no obligation to, and
+  the browser's seam check judges whatever it is given. The 500 × 500 paper's
+  material declares `isTiling` in `icedata/layerData.xml` and joins to itself
+  within its own noise (a signed step of 2.4 levels across the join against an
+  interior figure of 2.0); its thumbnail steps by **62** against an interior
+  figure of 2.9, and by 54 on the other axis. Every brush carrying that paper
+  was being reported as drawing a grid over the canvas, and the grid was the
+  preview's.
+
+**The tile size is the material's own size times `TextureScale2`**, which is
+what that percentage means and what could not be worked out while the picture
+was a preview capped at 300. `GRAIN_TILE_AT_FULL_SCALE` (256) still stands in
+where the material could not be read — and it used to stand in for every case,
+which put the sample file's Sketch brushes on a 256 × 0.19 ≈ 49-pixel tile where
+their 500 × 500 material at 19% is 95: a paper twice as fine as its author's,
+under a 6-pixel pencil. A material larger than `TipMask::MAX_SIZE` is reduced
+and named, as a tip is, and the tile size is taken from the size **before** the
+reduction — a reduced tile has to cover the same document ground as the picture
+it came from, or the grain changes frequency to fit Umber's texture budget.
 
 Measured, because it is the first thing to look at if an imported brush is ever
 reported painting weaker than its opacity says: the `Sketch` brush in the sample
@@ -1627,13 +1664,12 @@ per pack. See `docs/brush-sources.md`.
   arrives as one preset per cell and says which rule it lost.
 - **A wider grain model, and the papers the packs actually ask for.** A paper of
   your own now exists — `BrushPreset::paper` names a tile in the user library —
-  so this is no longer about somewhere to put a picture. Two gaps remain. A
-  Clip Studio paper arrives as the material's **thumbnail** rather than its own
-  pixels, which is a wiring gap and not a limit of the format:
-  `brushimport::csmaterial` reads a paper at full resolution exactly as it reads
-  a tip. And Krita's `.kpp` papers are not resolved at all — what a `.kpp` names
-  is a pattern resource in a sibling bundle, the shape `.kpp`'s tips already
-  solved.
+  so this is no longer about somewhere to put a picture. One gap remains:
+  Krita's `.kpp` papers are not resolved at all — what a `.kpp` names is a
+  pattern resource in a sibling bundle, the shape `.kpp`'s tips already solved.
+  (A Clip Studio paper used to arrive as the material's **thumbnail** rather
+  than its own pixels; `paper_for` now takes the same `csmaterial` route
+  `tip_for` does.)
 
   The shipped library is what makes it worth doing: 31 Krita presets ask for a
   paper and 11 of them would otherwise ship. The store was **necessary and not
