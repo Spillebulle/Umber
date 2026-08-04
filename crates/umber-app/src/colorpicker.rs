@@ -24,6 +24,14 @@
 //! the second is the subtler: a press on the ring sets a hue, the hue swings the
 //! apex round to meet that very press, and a wheel that asked again would read
 //! it as a press on the triangle — hue frozen, marker slammed to the apex.
+//!
+//! What ends one gesture and begins the next is an **event** — the primary
+//! button going down — and never a position. egui's `press_origin` is the
+//! pointer's rather than any widget's, so it moves under a second button and is
+//! cleared by a second release; asking it whether a new gesture began made a
+//! right-click during a ring drag throw the marker at the pointer, and made a
+//! new press at a pixel an abandoned gesture had used inherit that gesture's
+//! aim.
 
 use crate::theme::{Palette, metrics};
 use egui::{
@@ -373,8 +381,8 @@ fn wheel_base(shape: WheelShape, rotate: bool, angles: WheelAngles, hue: f32) ->
 
 /// What egui reported about this frame's gesture on a wheel.
 ///
-/// A plain reading rather than a [`Response`], so that [`gesture`] below is a
-/// pure function of it — the division `gesture::press` and `install::detect`
+/// A plain reading rather than a [`Response`], so that [`frame`] below is a
+/// pure function of it — the division `crate::gesture` and `install::detect`
 /// keep, and the only way the frames a gesture is made of can be driven without
 /// a window.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -385,7 +393,22 @@ struct Reported {
     at: Option<Pos2>,
     /// Where the button went down, while it is still down. egui clears it on
     /// the release.
+    ///
+    /// Read **only** to give a press frame its origin. It is the *pointer's*
+    /// and not this widget's — any button moves it and any release clears
+    /// it — so it can say where a gesture began and must never be asked whether
+    /// one began. That is [`Self::pressed`]'s job.
     press_origin: Option<Pos2>,
+    /// Did the **primary** button go down this frame?
+    ///
+    /// This is the only thing that starts a wheel gesture, so it is the only
+    /// honest reading of "a new one began". `any_pressed` would be true for a
+    /// right button pressed in the middle of a left drag, which is the bug this
+    /// field replaced a position comparison to close. It is safe under touch as
+    /// well: `egui-winit` synthesises pointer buttons for the *first* contact
+    /// only — it tracks one `pointer_touch_id` — so a second finger cannot
+    /// raise it.
+    pressed: bool,
 }
 
 /// Which control a gesture reached, with no position in it.
@@ -417,26 +440,13 @@ impl Aim {
     }
 }
 
-/// A gesture as it was settled at its press: where it began, and what it
-/// reached.
-///
-/// Both halves are recorded. The aim is what the gesture *is*, and the origin
-/// is how a later frame tells this gesture from the next one — egui's own
-/// `press_origin` is the pointer's rather than this widget's, so it moves when
-/// any button is pressed and is cleared when any is released.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Settled {
-    from: Pos2,
-    aim: Aim,
-}
-
 /// What a wheel does with this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Frame {
     /// No gesture. Anything recorded belongs to one that has ended.
     Idle,
     /// A gesture already settled, now at this position.
-    Held(Settled, Pos2),
+    Held(Aim, Pos2),
     /// The first frame of a gesture: settle it from this origin, record the
     /// answer, and work it at this position.
     Press(Pos2, Pos2),
@@ -467,22 +477,26 @@ enum Frame {
 /// A press and a release inside one frame is `Press` with the pointer's own
 /// position for the origin, which it is: there has been no frame in which to
 /// move.
-fn frame(reported: Reported, held: Option<Settled>) -> Frame {
+///
+/// **A new gesture is an event, never a position.** This used to compare egui's
+/// `press_origin` against the origin the record was settled at, and that is
+/// wrong in both directions. It reads a *second* button pressed mid-drag as a
+/// new gesture — egui keeps this widget's interaction, so a right-click while
+/// dragging the ring re-settled against the live hub, threw saturation and value
+/// at the pointer, and did it again on the release; a resting hand on a tablet
+/// is the ordinary way to meet that. And it reads a genuinely new press at the
+/// *same pixel* as the old gesture, so a record abandoned by switching picker
+/// mode mid-drag — where `wheel` is not drawn and so cannot clear it — was
+/// inherited, aim and all, by the next press that happened to land there.
+/// [`Reported::pressed`] separates the two readings: a record is kept unless the
+/// primary button actually went down.
+fn frame(reported: Reported, held: Option<Aim>) -> Frame {
     let Some(at) = reported.at else {
         return Frame::Idle;
     };
     match held {
-        // The same gesture, still. `press_origin` gone means released; equal
-        // means held down since. Anything else is a gesture this widget has not
-        // settled — a new press, or a record left behind by one that ended
-        // without a frame to clear it.
-        Some(settled)
-            if reported
-                .press_origin
-                .is_none_or(|from| from == settled.from) =>
-        {
-            Frame::Held(settled, at)
-        }
+        // Still the gesture this widget settled: nothing has started a new one.
+        Some(aim) if !reported.pressed => Frame::Held(aim, at),
         _ => Frame::Press(reported.press_origin.unwrap_or(at), at),
     }
 }
@@ -521,7 +535,12 @@ impl WheelAim {
 ///
 /// And the ring has an outer edge as well as an inner one. The wheel's hit area
 /// is the square around it, so its four corners reach `outer × √2` with nothing
-/// drawn out there; a press in one used to set a hue.
+/// drawn out there; a press in one used to set a hue. The bound is `outer`
+/// exactly, where [`hue_ring`] fades a skirt one feather *past* it — so the one
+/// faded pixel at the rim takes no press. That is the conservative direction: it
+/// is a pixel the ring is already handing back to the background, and matching
+/// the skirt would mean the hit test tracking a number that exists only to
+/// antialias.
 fn settle(centre: Pos2, inner: f32, outer: f32, hub: Hub, from: Pos2) -> Aim {
     if hub.contains(from) {
         return Aim::Centre;
@@ -537,11 +556,44 @@ fn settle(centre: Pos2, inner: f32, outer: f32, hub: Hub, from: Pos2) -> Aim {
 /// [`frame`] and [`settle`], against what egui and the previous frame have to
 /// say.
 ///
-/// The settled gesture is recorded on its press frame and cleared on the first
-/// frame this widget owns no gesture. A record can therefore outlive its gesture
-/// only where no such frame ran — switching picker mode mid-drag, since `wheel`
-/// is then not called at all — and [`frame`] compares the origin so that the
-/// next press settles itself rather than inheriting it.
+/// One frame of a wheel gesture: what to do now, and what to remember.
+///
+/// **The whole of the dispatch, in one place.** [`wheel_aim`] and the tests used
+/// to hold a copy each, and the copy was exactly the thing this file's bug lives
+/// in: re-settling the aim per frame could be put back into the *shipped* path
+/// with the whole suite green, because the guard only ever drove the harness's
+/// twin. A rule stated twice is the drift `blend.wgsl` and `render_float` are
+/// each one-of-a-kind for.
+///
+/// The aim to keep comes back rather than being stored here, because the two
+/// callers store it differently — egui's per-widget memory in the picker, a
+/// field in the tests — and *where* it is kept is the only part that genuinely
+/// differs.
+fn resolve(
+    reported: Reported,
+    held: Option<Aim>,
+    centre: Pos2,
+    inner: f32,
+    outer: f32,
+    hub: Hub,
+) -> (Option<Aim>, WheelAim) {
+    match frame(reported, held) {
+        Frame::Idle => (None, WheelAim::Idle),
+        Frame::Held(aim, at) => (Some(aim), aim.at(at)),
+        Frame::Press(from, at) => {
+            let aim = settle(centre, inner, outer, hub, from);
+            (Some(aim), aim.at(at))
+        }
+    }
+}
+
+/// [`resolve`], reading egui and keeping its answer in this widget's memory.
+///
+/// The settled aim is recorded on its press frame and cleared on the first frame
+/// this widget owns no gesture. A record can therefore outlive its gesture only
+/// where no such frame ran — switching picker mode mid-drag, since `wheel` is
+/// then not drawn at all — and a stale one is harmless because [`frame`] settles
+/// afresh whenever the primary button goes down.
 fn wheel_aim(
     ui: &Ui,
     id: egui::Id,
@@ -551,28 +603,25 @@ fn wheel_aim(
     outer: f32,
     hub: Hub,
 ) -> WheelAim {
-    let reported = Reported {
+    let reported = ui.ctx().input(|i| Reported {
         at: response.interact_pointer_pos(),
-        press_origin: ui.ctx().input(|i| i.pointer.press_origin()),
-    };
-    let held = ui.ctx().data_mut(|d| d.get_temp::<Settled>(id));
-    match frame(reported, held) {
-        Frame::Idle => {
-            ui.ctx().data_mut(|d| d.remove_temp::<Settled>(id));
-            WheelAim::Idle
+        press_origin: i.pointer.press_origin(),
+        pressed: i.pointer.primary_pressed(),
+    });
+    let held = ui.ctx().data_mut(|d| d.get_temp::<Aim>(id));
+    let (keep, aimed) = resolve(reported, held, centre, inner, outer, hub);
+    ui.ctx().data_mut(|d| match keep {
+        // Written when it changes, which is once per gesture: the aim cannot
+        // move within one, and `insert_temp` boxes what it is given.
+        Some(aim) if held != Some(aim) => {
+            d.insert_temp(id, aim);
         }
-        Frame::Held(settled, at) => settled.aim.at(at),
-        Frame::Press(from, at) => {
-            let settled = Settled {
-                from,
-                aim: settle(centre, inner, outer, hub, from),
-            };
-            // Once per gesture rather than once per frame: the value cannot
-            // change within one, and `insert_temp` boxes what it is given.
-            ui.ctx().data_mut(|d| d.insert_temp(id, settled));
-            settled.aim.at(at)
+        None => {
+            d.remove_temp::<Aim>(id);
         }
-    }
+        Some(_) => {}
+    });
+    aimed
 }
 
 fn wheel(
@@ -1024,6 +1073,23 @@ fn clamp_barycentric(a: f32, b: f32, c: f32) -> (f32, f32, f32) {
     }
 }
 
+/// The hue a position along the Square mode's bar stands for — [`ring_hue`]'s
+/// opposite number, and its own function for the same reason: it is the other
+/// place a gesture writes a hue, and it has two rules that a later tidy-up would
+/// otherwise read as one redundant one.
+///
+/// `t` reaches exactly 1.0 — it is clamped there, and the pointer can be dragged
+/// past the edge — so `t * 360.0` is exactly 360, the one value outside the
+/// range `Hsv` documents. `wrap_hue` alone is not the answer: a whole turn is
+/// the same hue as none, so the right-hand end would store 0 and the knob, which
+/// is drawn *from the hue*, would jump to the far left while the pointer was at
+/// the far right. Stopping one representable step short is the same red, inside
+/// the range, and under the hand. The wrap stays behind it as the door every hue
+/// comes through.
+fn bar_hue(t: f32) -> f32 {
+    umber_core::color::wrap_hue(t.clamp(0.0, 1.0 - f32::EPSILON) * 360.0)
+}
+
 /// Saturation/value square with a hue bar beneath.
 fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     let mut changed = false;
@@ -1031,7 +1097,19 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
 
     let (rect, response) = ui.allocate_exact_size(vec2(width, 130.0), Sense::click_and_drag());
     // Nothing overlaps this one, so it does its own interacting — unlike the
-    // wheel's centre, which shares a hit area with the ring.
+    // wheel's centre, which shares a hit area with the ring, and it keeps
+    // egui's own reading rather than the wheel's.
+    //
+    // That asymmetry is deliberate and it is worth saying exactly what it costs,
+    // because the wheel now answers on the press frame and this does not: here a
+    // press does nothing until the pointer has travelled egui's click threshold
+    // or the button comes up. The wheel needed a press-frame answer because it
+    // has *two* controls in one hit area and a gesture has to be attributed to
+    // one of them before it can be carried out; this field has nothing to be
+    // told apart from, so there is no attribution to make early and the lag is
+    // the same one every other egui drag in the interface has. Making it match
+    // would be a change to how two more controls feel, off the back of a bug
+    // report about neither.
     let drag = (response.dragged() || response.clicked())
         .then(|| response.interact_pointer_pos())
         .flatten();
@@ -1045,20 +1123,7 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     if (response.dragged() || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
-        // A hair short of a whole turn at the right-hand end, and then through
-        // `wrap_hue` like the ring's.
-        //
-        // Both halves are needed and neither is arbitrary. `t` reaches exactly
-        // 1.0 — it is clamped there, and the pointer can be dragged past the
-        // edge — so `t * 360.0` is exactly 360, the one value outside the range
-        // `Hsv` documents; `to_color` wraps again and paints the red it should,
-        // but the field is read by more than that. Storing the *wrap* of it is
-        // not enough on its own: a whole turn is the same hue as none, so the
-        // right-hand end would store 0 and the knob, which is drawn from the
-        // hue, would jump to the left while the pointer was at the right. One
-        // step short is the same red, in range, and under the hand.
-        let t = ((pos.x - bar.left()) / bar.width().max(1.0)).clamp(0.0, 1.0 - f32::EPSILON);
-        hsv.h = umber_core::color::wrap_hue(t * 360.0);
+        hsv.h = bar_hue((pos.x - bar.left()) / bar.width().max(1.0));
         changed = true;
     }
 
@@ -1594,7 +1659,7 @@ mod tests {
         shape: WheelShape,
         rotate: bool,
         angles: WheelAngles,
-        held: Option<Settled>,
+        held: Option<Aim>,
         hsv: Hsv,
     }
 
@@ -1619,21 +1684,11 @@ mod tests {
         }
 
         fn step(&mut self, reported: Reported) -> WheelAim {
-            let aimed = match frame(reported, self.held) {
-                Frame::Idle => {
-                    self.held = None;
-                    WheelAim::Idle
-                }
-                Frame::Held(settled, at) => settled.aim.at(at),
-                Frame::Press(from, at) => {
-                    let settled = Settled {
-                        from,
-                        aim: settle(CENTRE, INNER, OUTER, self.hub(), from),
-                    };
-                    self.held = Some(settled);
-                    settled.aim.at(at)
-                }
-            };
+            // `resolve` and not a copy of it: the dispatch that holds the aim is
+            // the thing under test, so a harness with its own would let the
+            // shipped one be broken with every assertion below still passing.
+            let (keep, aimed) = resolve(reported, self.held, CENTRE, INNER, OUTER, self.hub());
+            self.held = keep;
             match aimed {
                 WheelAim::Idle => {}
                 WheelAim::Ring(pos) => self.hsv.h = ring_hue(CENTRE, pos),
@@ -1657,6 +1712,7 @@ mod tests {
             self.step(Reported {
                 at: Some(at),
                 press_origin: Some(at),
+                pressed: true,
             })
         }
 
@@ -1664,6 +1720,7 @@ mod tests {
             self.step(Reported {
                 at: Some(at),
                 press_origin: Some(from),
+                pressed: false,
             })
         }
 
@@ -1672,7 +1729,35 @@ mod tests {
             self.step(Reported {
                 at: Some(at),
                 press_origin: None,
+                pressed: false,
             })
+        }
+
+        /// A *second* button pressed mid-drag. egui keeps this widget's
+        /// interaction, moves `press_origin` to wherever the pointer is, and
+        /// does not raise `primary_pressed` — the primary button never came up.
+        fn second_button_down(&mut self, at: Pos2) -> WheelAim {
+            self.step(Reported {
+                at: Some(at),
+                press_origin: Some(at),
+                pressed: false,
+            })
+        }
+
+        /// And its release, which clears egui's origin while the primary button
+        /// is still down.
+        fn second_button_up(&mut self, at: Pos2) -> WheelAim {
+            self.step(Reported {
+                at: Some(at),
+                press_origin: None,
+                pressed: false,
+            })
+        }
+
+        /// A frame on which this widget owns no gesture, which is what clears
+        /// the record.
+        fn idle(&mut self) -> WheelAim {
+            self.step(Reported::default())
         }
     }
 
@@ -1838,6 +1923,37 @@ mod tests {
         assert!(ring_hue(CENTRE, CENTRE).is_finite());
     }
 
+    /// The Square mode's bar is the other place a gesture writes a hue, and its
+    /// far end is the same trap by a different route.
+    ///
+    /// The knob is drawn from the hue, so the right-hand end has to store a hue
+    /// that is still at the right-hand end. `wrap_hue` alone would store zero
+    /// and send it to the far left; no clamp at all would store 360, which the
+    /// range excludes.
+    #[test]
+    fn the_hue_bars_far_end_stays_at_its_far_end() {
+        assert_eq!(bar_hue(0.0), 0.0);
+        assert!(
+            (359.0..360.0).contains(&bar_hue(1.0)),
+            "the far right read as {}",
+            bar_hue(1.0)
+        );
+        // Dragged past the edge is the same as the edge, not a wrap round to
+        // red at the left.
+        assert_eq!(bar_hue(1.5), bar_hue(1.0));
+        assert_eq!(bar_hue(-0.5), 0.0);
+        // Every answer is a hue, and the far end is still red.
+        for step in 0..=100 {
+            let h = bar_hue(step as f32 / 100.0);
+            assert!((0.0..360.0).contains(&h), "{h} is not a hue");
+        }
+        assert_eq!(
+            Hsv::new(bar_hue(1.0), 1.0, 1.0).to_color(1.0).to_srgb_u8(),
+            [255, 0, 0, 255],
+            "the far end is red, as the gradient under it is"
+        );
+    }
+
     /// The bug this file was opened for: turning the hue ring moved the
     /// saturation and value marker, towards whatever direction the ring had been
     /// grabbed from.
@@ -1933,7 +2049,9 @@ mod tests {
                 let a = degrees.to_radians();
                 CENTRE + vec2(a.cos(), a.sin()) * (INNER * RING_GRIP + across * INNER)
             };
-            for degrees in [7.0_f32, 100.0, 250.0] {
+            // 340° crosses the wrap on the way round, which is the case a bare
+            // subtraction of hues gets wrong.
+            for degrees in [7.0_f32, 100.0, 250.0, 340.0] {
                 let press = at(degrees);
                 assert!(
                     (press - CENTRE).length() > INNER * RING_GRIP,
@@ -1956,7 +2074,10 @@ mod tests {
                     );
                 }
                 assert_eq!((wheel.hsv.s, wheel.hsv.v), (start.s, start.v));
-                let moved = (wheel.hsv.h - degrees).abs();
+                // Round the circle, not along a line: `340 + 40` is 20, and a
+                // bare subtraction would call that a hue that had not moved.
+                let apart = (wheel.hsv.h - degrees).abs();
+                let moved = apart.min(360.0 - apart);
                 assert!(moved > 30.0, "the hue froze at {}", wheel.hsv.h);
             }
         }
@@ -2098,6 +2219,139 @@ mod tests {
         );
     }
 
+    /// The picker driven the way a hand drives it: real pointer events through
+    /// a real [`egui::Context`], calling [`show`] itself.
+    ///
+    /// Every other test here drives [`resolve`], which is the same dispatch the
+    /// picker runs but not the same *frame timing*. Whether
+    /// `interact_pointer_pos` is `Some` on the press frame, whether egui clears
+    /// `press_origin` on the release, and whether `primary_pressed` is raised
+    /// on exactly one frame were all read out of egui's source and, until this,
+    /// never executed. [`wheel_aim`] — that reading, and the memory the settled
+    /// aim is kept in — had no test over it at all.
+    ///
+    /// The property is geometry-free, which is what lets it be asserted without
+    /// a second copy of where the ring is: **one gesture may move the hue, or
+    /// the saturation and value, or neither — never both.** The ring is one
+    /// control and the centre is the other, and a gesture belongs to one of
+    /// them for its whole life. All three causes of the reported bug break
+    /// exactly this: the press frame handed a ring press to the field, the
+    /// release frame did it again, and re-settling mid-gesture let the triangle
+    /// take a drag the ring had started.
+    #[test]
+    fn a_real_gesture_moves_one_control_and_not_both() {
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Event, Modifiers, PointerButton, RawInput, Rect};
+
+        struct Picker {
+            shape: WheelShape,
+            rotate: bool,
+            angles: WheelAngles,
+            harmony: Harmony,
+            hsv: Hsv,
+        }
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(metrics::PANEL, 600.0));
+
+        let run = |picker: &mut Picker, events: Vec<Event>| {
+            let input = RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                show(
+                    ui,
+                    &palette,
+                    PickerMode::Wheel,
+                    &mut picker.shape,
+                    &mut picker.rotate,
+                    &mut picker.angles,
+                    &mut picker.harmony,
+                    &mut picker.hsv,
+                );
+            });
+        };
+
+        let button = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::default(),
+        };
+
+        // A grid over the whole panel: some of these land on the ring, some in
+        // the centre, some in the gaps and some on the controls below. Which is
+        // which is deliberately not worked out here — the property holds for
+        // every one of them.
+        let mut probed = 0;
+        let mut hue_gestures = 0;
+        let mut sv_gestures = 0;
+        for row in 0..12 {
+            for column in 0..12 {
+                let spot = pos2(
+                    screen.left() + (column as f32 + 0.5) * screen.width() / 12.0,
+                    screen.top() + (row as f32 + 0.5) * 200.0 / 12.0,
+                );
+                // "Rotate with hue" on, which is the shipped default and the
+                // case where the shape moves under the gesture.
+                let mut picker = Picker {
+                    shape: WheelShape::Triangle,
+                    rotate: true,
+                    angles: WheelAngles::default(),
+                    harmony: Harmony::Complementary,
+                    hsv: Hsv::new(210.0, 0.4, 0.6),
+                };
+                // A frame with the pointer merely present, so the widget exists
+                // for egui's hit test before anything is pressed.
+                run(&mut picker, vec![Event::PointerMoved(spot)]);
+                let before = picker.hsv;
+
+                let mut hue_moved = false;
+                let mut sv_moved = false;
+                let mut check = |picker: &Picker, what: &str| {
+                    hue_moved |= picker.hsv.h != before.h;
+                    sv_moved |= (picker.hsv.s, picker.hsv.v) != (before.s, before.v);
+                    assert!(
+                        !(hue_moved && sv_moved),
+                        "one gesture from {spot:?} moved the hue *and* the \
+                         marker, by {what}: {before:?} -> {:?}",
+                        picker.hsv
+                    );
+                    (hue_moved, sv_moved)
+                };
+
+                run(&mut picker, vec![button(spot, true)]);
+                check(&picker, "the press");
+                // Far enough to be a drag by egui's own reckoning, and across
+                // the middle, which is where a re-settled aim changes hands.
+                for step in 1..=6 {
+                    let to = spot + vec2(step as f32 * 7.0, step as f32 * 5.0);
+                    run(&mut picker, vec![Event::PointerMoved(to)]);
+                    check(&picker, "a drag frame");
+                }
+                let last = spot + vec2(42.0, 30.0);
+                run(&mut picker, vec![button(last, false)]);
+                check(&picker, "the release");
+                run(&mut picker, Vec::new());
+                let (hue, sv) = check(&picker, "the frame after");
+
+                probed += 1;
+                hue_gestures += usize::from(hue);
+                sv_gestures += usize::from(sv);
+            }
+        }
+        assert_eq!(probed, 144);
+        // And the sweep reaches both controls, so the property above is about
+        // a picker that answers the pointer rather than one that ignores it.
+        // Counted rather than aimed: working out where the ring is would be a
+        // second copy of the geometry `Hub` exists to be the only statement of.
+        assert!(hue_gestures > 0, "no gesture reached the hue ring");
+        assert!(sv_gestures > 0, "no gesture reached the centre");
+    }
+
     /// A gesture is settled at its press and not at its release.
     ///
     /// egui reports a *drag* only once the pointer has travelled far enough to
@@ -2109,10 +2363,6 @@ mod tests {
     fn a_gesture_is_settled_at_its_press_and_not_at_its_release() {
         let press = pos2(10.0, 10.0);
         let now = pos2(80.0, 90.0);
-        let ring = Settled {
-            from: press,
-            aim: Aim::Ring,
-        };
 
         // The press: nothing recorded yet, so it is settled here.
         assert_eq!(
@@ -2120,6 +2370,7 @@ mod tests {
                 Reported {
                     at: Some(press),
                     press_origin: Some(press),
+                    pressed: true,
                 },
                 None
             ),
@@ -2132,10 +2383,11 @@ mod tests {
                 Reported {
                     at: Some(now),
                     press_origin: Some(press),
+                    pressed: false,
                 },
-                Some(ring)
+                Some(Aim::Ring)
             ),
-            Frame::Held(ring, now)
+            Frame::Held(Aim::Ring, now)
         );
         // Released: egui has cleared its own origin, and what was recorded is
         // all that is left.
@@ -2144,10 +2396,11 @@ mod tests {
                 Reported {
                     at: Some(now),
                     press_origin: None,
+                    pressed: false,
                 },
-                Some(ring)
+                Some(Aim::Ring)
             ),
-            Frame::Held(ring, now)
+            Frame::Held(Aim::Ring, now)
         );
         // Pressed and released inside one frame — a click too fast to be seen
         // twice. Nothing recorded, and the pointer has had no frame in which to
@@ -2157,24 +2410,26 @@ mod tests {
                 Reported {
                     at: Some(now),
                     press_origin: None,
+                    pressed: true,
                 },
                 None
             ),
             Frame::Press(now, now)
         );
-        // A *different* origin is a different gesture, so it settles itself
-        // rather than inheriting a record left behind by one that ended with no
-        // frame to clear it — switching picker mode mid-drag is how that
-        // happens, since the wheel is then not drawn at all.
+        // The primary button going down is a new gesture whatever the position
+        // — including one that lands on the exact pixel an abandoned gesture
+        // was pressed at, which a comparison of origins read as the same
+        // gesture and let inherit its aim.
         assert_eq!(
             frame(
                 Reported {
-                    at: Some(now),
-                    press_origin: Some(now),
+                    at: Some(press),
+                    press_origin: Some(press),
+                    pressed: true,
                 },
-                Some(ring)
+                Some(Aim::Centre)
             ),
-            Frame::Press(now, now)
+            Frame::Press(press, press)
         );
         // No gesture on this widget: a pointer merely passing over the wheel,
         // or one pressed on something else. The record goes.
@@ -2183,12 +2438,90 @@ mod tests {
                 Reported {
                     at: None,
                     press_origin: Some(press),
+                    pressed: false,
                 },
-                Some(ring)
+                Some(Aim::Ring)
             ),
             Frame::Idle
         );
         assert_eq!(frame(Reported::default(), None), Frame::Idle);
+    }
+
+    /// A second button pressed part-way through a drag must change nothing.
+    ///
+    /// egui keeps this widget's interaction — `potential_drag_id` is only
+    /// assigned when it is `None` — so `at` goes on being reported, while
+    /// `press_origin` jumps to wherever the pointer now is and is then cleared
+    /// by that button's release. Reading either as "a new gesture began"
+    /// re-settled the aim against the live hub: a ring drag whose pointer had
+    /// crossed the triangle threw saturation and value at the pointer, twice.
+    /// A resting hand on a tablet is the ordinary way to meet this, which is why
+    /// it is not a remote case.
+    #[test]
+    fn a_second_button_pressed_mid_drag_changes_nothing() {
+        for shape in WheelShape::ALL {
+            let start = Hsv::new(200.0, 0.42, 0.58);
+            let mut wheel = Wheel::new(shape, true, start);
+            let press = on_the_ring(40.0, 0.5);
+            assert!(matches!(wheel.press(press), WheelAim::Ring(_)));
+            // Drag until the pointer is over the middle, which is where the
+            // second button does the damage.
+            assert!(matches!(
+                wheel.drag(press, on_the_ring(80.0, 0.5)),
+                WheelAim::Ring(_)
+            ));
+            let hue = wheel.hsv.h;
+
+            let over_the_centre = CENTRE;
+            for (what, aimed) in [
+                (
+                    "the second press",
+                    wheel.second_button_down(over_the_centre),
+                ),
+                ("the frame after", wheel.drag(press, over_the_centre)),
+                (
+                    "the second release",
+                    wheel.second_button_up(over_the_centre),
+                ),
+            ] {
+                assert!(
+                    matches!(aimed, WheelAim::Ring(_)),
+                    "{shape:?}: {what} took the drag as {aimed:?}"
+                );
+            }
+            assert_eq!(
+                (wheel.hsv.s, wheel.hsv.v),
+                (start.s, start.v),
+                "{shape:?}: the marker moved"
+            );
+            // The hue is still the ring's to move, and moved only because the
+            // pointer did — to the centre, where `ring_hue` reads zero.
+            assert_eq!(wheel.hsv.h, ring_hue(CENTRE, over_the_centre));
+            assert!(hue != wheel.hsv.h || hue == 0.0);
+        }
+    }
+
+    /// A record left behind by a gesture that ended with no frame to clear it
+    /// must not be inherited — not even by a press at the very pixel it was
+    /// settled at, which is an ordinary thing to do at a scale factor of one.
+    #[test]
+    fn a_new_press_on_the_same_pixel_settles_afresh() {
+        let spot = on_the_ring(90.0, 0.5);
+        let mut wheel = Wheel::new(WheelShape::Triangle, true, Hsv::new(10.0, 0.5, 0.5));
+        // A gesture on the ring, abandoned without a release — the picker mode
+        // was switched, so `wheel` was not drawn again to clear the record.
+        assert!(matches!(wheel.press(spot), WheelAim::Ring(_)));
+        wheel.held = Some(Aim::Centre);
+
+        // Back on the wheel, pressing the same pixel. The stale aim would have
+        // made this a press on the saturation and value shape.
+        assert!(
+            matches!(wheel.press(spot), WheelAim::Ring(_)),
+            "the stale aim was inherited"
+        );
+        // And an idle frame is what clears a record in the ordinary case.
+        assert_eq!(wheel.idle(), WheelAim::Idle);
+        assert_eq!(wheel.held, None);
     }
 
     /// The release frame of a drag out of the centre must not be handed to the
