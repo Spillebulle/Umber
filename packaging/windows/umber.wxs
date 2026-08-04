@@ -157,7 +157,9 @@
       sharing a component, and does count a non-advertised shortcut as
       per-machine data here — has nothing left to object to.
     -->
-    <StandardDirectory Id="ProgramMenuFolder">
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="StartMenu" Directory="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="95c43486-778e-4975-9cb5-112e6ba93260">
         <Shortcut Id="UmberShortcut"
                   Name="Umber"
@@ -174,11 +176,11 @@
                        Value="1"
                        KeyPath="yes" />
       </Component>
-    </StandardDirectory>
+    </ComponentGroup>
 
     <Feature Id="Main" Title="Umber" Level="1">
       <ComponentGroupRef Id="Files" />
-      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentGroupRef Id="StartMenu" />
     </Feature>
 
     <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
