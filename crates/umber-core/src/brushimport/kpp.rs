@@ -94,10 +94,14 @@
 //!   hard, aliased edge; `dab.wgsl` antialiases unconditionally and has nothing
 //!   to switch off. It is the whole of a pixel-art brush, so it is named rather
 //!   than ignored.
-//! - **Paper texture**, **mirrored dabs**, **paint thickness (impasto)**.
+//! - **Paper texture**, **paint thickness (impasto)**.
+//! - **Mirrored dabs**, where Krita is actually asked for one: the option has
+//!   an enable flag *and* a checkbox per axis, and with neither axis ticked it
+//!   mirrors nothing however the sensor reads.
 //! - **Square and star mask generators**, exactly as [`super::vbr`] drops them.
 //! - **Brush-tip randomness and density**, which perturb the generated mask
-//!   rather than the dab.
+//!   rather than the dab — above [`NEGLIGIBLE_MASK_NOISE`], below which they
+//!   are a difference of two or three levels of alpha.
 //! - **Flow build-up.** Krita composites each dab, so flow below 1 darkens
 //!   where a stroke crosses itself. Umber takes a `max` of coverage and applies
 //!   opacity once at commit — the wet-layer design in `CLAUDE.md` — so flow is
@@ -157,6 +161,16 @@ const SUPPORTED_PAINTOPS: [&str; 2] = ["paintbrush", "colorsmudge"];
 /// "Bristle Thick Textured" inflates past two. Sixteen leaves room for a brush
 /// built out of several while still refusing a decompression bomb.
 const MAX_PRESET_BYTES: usize = 16 << 20;
+
+/// How much of Krita's per-dab mask noise counts as none.
+///
+/// One part in fifty, and it is a threshold rather than a zero for the reason
+/// [`Brush::has_grain`]'s is: naming a difference nobody can see spends the
+/// credibility of the list that names the ones they can, and — because the
+/// shipped-library generator refuses anything that lost something — it keeps
+/// out brushes that paint exactly like their originals. See [`TipSpec::parse`]
+/// for what the two settings do and why a fiftieth of each disappears.
+const NEGLIGIBLE_MASK_NOISE: f32 = 0.02;
 
 /// A decoded Krita preset.
 #[derive(Clone, Debug)]
@@ -218,7 +232,15 @@ pub fn from_kpp_in(
     if preset.flag("Texture/Enabled") {
         dropped.push("paper texture");
     }
-    if preset.flag("PressureMirror") {
+    // Mirroring has an enable flag *and* a checkbox per axis, and with neither
+    // axis ticked Krita's `KisPressureMirrorOption::apply` returns before it
+    // looks at the sensor — the option is on and does nothing. So this is not
+    // one flag but three, and reading only the first names a loss that did not
+    // happen. Same shape as `ScatterValue` above, and worth the two extra
+    // reads: an import that cries wolf costs the losses that matter.
+    let mirrors = preset.flag("PressureMirror")
+        && (preset.flag("HorizontalMirrorEnabled") || preset.flag("VerticalMirrorEnabled"));
+    if mirrors {
         dropped.push("mirrored dabs");
     }
     if preset.flag("PressurePaintThickness") {
@@ -945,10 +967,29 @@ impl TipSpec {
                         .unwrap_or(0.0)
                         .to_degrees()
                         .rem_euclid(360.0);
-                    if attrs.number("randomness").is_some_and(|r| r > 0.0) {
+                    // Both perturb the generated mask per dab and Umber has
+                    // nothing that does — but neither threshold is zero, for
+                    // the reason `Brush::has_grain`'s and `Brush::smudges`'
+                    // are not. Krita's randomness multiplies each mask texel by
+                    // a draw from `1 - randomness ..= 1`, so a hundredth is at
+                    // most two or three levels of 255 at the darkest point of a
+                    // dab and less everywhere else; its density drops that
+                    // fraction of the texels at random, which at a fiftieth is
+                    // a speckle the next dab of the stroke covers. Two brushes
+                    // that differ by that are not two brushes, and four of the
+                    // fetched packs' presets set exactly such a value — naming
+                    // it refuses them from the shipped library for a difference
+                    // nobody can see.
+                    if attrs
+                        .number("randomness")
+                        .is_some_and(|r| r > NEGLIGIBLE_MASK_NOISE)
+                    {
                         out.dropped.push("brush-tip randomness");
                     }
-                    if attrs.number("density").is_some_and(|d| d < 1.0) {
+                    if attrs
+                        .number("density")
+                        .is_some_and(|d| d < 1.0 - NEGLIGIBLE_MASK_NOISE)
+                    {
                         out.dropped.push("brush-tip density");
                     }
                 }
@@ -1613,6 +1654,42 @@ mod tests {
                 "{expected} missing: {dropped:?}"
             );
         }
+    }
+
+    /// Three settings that are switched on and do nothing, and a reader that
+    /// takes any of them at face value apologises for a loss that did not
+    /// happen. Krita mirrors nothing with neither axis ticked; a hundredth of
+    /// mask randomness and a fiftieth of density are below what the alpha they
+    /// perturb can even hold.
+    #[test]
+    fn a_setting_switched_on_and_doing_nothing_is_not_a_loss() {
+        let xml = format!(
+            "<Preset name=\"Quiet\" paintopid=\"paintbrush\">{}{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\" randomness=\"0.01\" \
+                 density=\"0.99\"><MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" \
+                 hfade=\"0.5\"/></Brush>"
+            ),
+            "<param type=\"internal\" name=\"PressureMirror\">true</param>",
+            "<param type=\"internal\" name=\"HorizontalMirrorEnabled\">false</param>",
+            "<param type=\"internal\" name=\"VerticalMirrorEnabled\">false</param>",
+        );
+        assert!(
+            from_kpp(&kpp(&xml)).expect("decode").dropped.is_empty(),
+            "{:?}",
+            from_kpp(&kpp(&xml)).unwrap().dropped
+        );
+
+        // One axis ticked is a real mirror, and it is still named.
+        let mirrored = xml.replace(
+            "name=\"HorizontalMirrorEnabled\">false",
+            "name=\"HorizontalMirrorEnabled\">true",
+        );
+        assert_eq!(
+            from_kpp(&kpp(&mirrored)).expect("decode").dropped,
+            ["mirrored dabs"]
+        );
     }
 
     #[test]
