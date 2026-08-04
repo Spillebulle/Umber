@@ -61,14 +61,22 @@ use skrifa::{GlyphId, MetadataProvider};
 
 /// The most pixels one block of text may cover.
 ///
-/// A cap rather than a hope. The rasterised block is a byte a pixel and the
-/// clip it becomes is four, so this is 64 MB of coverage and 256 MB of colour —
-/// already past what is reasonable to hand a paste. Text asked for larger than
-/// this is *refused with the figure*, because the alternative is an allocation
-/// nobody asked for on the way to a canvas that could not hold it anyway:
-/// `Clip::place` crops to the document, so pixels beyond it were never going to
-/// arrive.
-pub const MAX_PIXELS: u64 = 64 << 20;
+/// A cap rather than a hope, and the figure is set by the **largest transient**
+/// rather than by the result. Three things are sized off it: the coverage is a
+/// byte a pixel (16 MB), the [`Clip`] it becomes is four (64 MB), and
+/// `ab_glyph_rasterizer` holds an `f32` per accumulator pixel — so a block that
+/// is one enormous *line* puts the whole of it through one rasteriser at four
+/// bytes a pixel (64 MB). Per-line rasterising bounds that for ordinary text
+/// and does nothing at all for a single line, which is exactly the case an
+/// adversarial figure would reach for.
+///
+/// 16 megapixels is a 4096-square block: far past any caption, and small enough
+/// that the worst case above is a transient rather than an event. Text asked
+/// for larger is *refused with the figure*, because the alternative is an
+/// allocation nobody asked for on the way to a canvas that could not hold it
+/// anyway — `Clip::place` crops to the document, so pixels beyond it were never
+/// going to arrive.
+pub const MAX_PIXELS: u64 = 16 << 20;
 
 /// The largest point size the rails offer, in document pixels.
 ///
@@ -408,7 +416,18 @@ fn shape_line(
         if info.glyph_id == 0 {
             // `.notdef`. The cluster is a byte index into the line, so this can
             // name the character rather than reporting a count.
-            if let Some(ch) = text[info.cluster as usize..].chars().next()
+            //
+            // **`str::get`, not `text[..]`.** HarfBuzz's clusters are byte
+            // offsets at grapheme boundaries and this should always be a char
+            // boundary — but "should" is doing the work in that sentence, the
+            // index comes out of a shaper being fed somebody's own typing, and
+            // the failure mode of a direct slice is a panic on the drawing
+            // path. `get` answers `None` for a boundary that is not one and for
+            // an index past the end, and the only cost of being wrong is a
+            // character that goes unnamed in a notice.
+            if let Some(ch) = text
+                .get(info.cluster as usize..)
+                .and_then(|rest| rest.chars().next())
                 && !missing.contains(&ch)
             {
                 missing.push(ch);
