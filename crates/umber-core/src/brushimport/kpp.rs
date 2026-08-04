@@ -1571,7 +1571,9 @@ mod tests {
     fn the_deposit_rate_is_the_other_half_of_the_mix_and_only_counts_when_it_is_on() {
         let brush = |deposit_on: bool| {
             let xml = format!(
-                "<Preset name=\"Mix\" paintopid=\"colorsmudge\">{}{}{}{}</Preset>",
+                "<Preset name=\"Mix\" paintopid=\"colorsmudge\">{}{}{}\
+                 <param type=\"internal\" name=\"PressureColorRate\">{deposit_on}</param>\
+                 </Preset>",
                 param(
                     "brush_definition",
                     "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
@@ -1579,7 +1581,6 @@ mod tests {
                 ),
                 param("SmudgeRateValue", "0.8"),
                 param("ColorRateValue", "0.6"),
-                format!("<param type=\"internal\" name=\"PressureColorRate\">{deposit_on}</param>"),
             );
             from_kpp(&kpp(&xml)).expect("decode")
         };
