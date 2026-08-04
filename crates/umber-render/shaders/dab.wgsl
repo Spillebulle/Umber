@@ -200,6 +200,20 @@ fn selection_mask(doc: vec2<f32>) -> f32 {
     return select(1.0, select(0.0, m, inside), u.use_selection != 0u);
 }
 
+// Where in the tip this fragment lands.
+//
+// `local` runs -1..1 across the quad and the quad has already been given the
+// tip's proportions in the vertex shader, so the mask fills it with no padding
+// and no empty margin to shade.
+//
+// One function because **two** things sample the tip at it — the coverage and,
+// for a coloured stamp, the colour — and those two landing on different texels
+// would put a stamp's colour half a texel out of step with its own edge. Same
+// rule `blend.wgsl` exists for, at a much smaller scale.
+fn tip_uv(local: vec2<f32>) -> vec2<f32> {
+    return local * 0.5 + vec2<f32>(0.5, 0.5);
+}
+
 // Coverage of one dab at this fragment, before the stroke's own opacity.
 //
 // Shared by both fragment entry points so the two pipelines cannot drift into
@@ -212,11 +226,9 @@ fn dab_coverage(in: VsOut) -> f32 {
     // that happens to come from a uniform buffer. With no tip bound this reads
     // a 1x1 white texture, which is a cache hit and nothing else.
     //
-    // `local` runs -1..1 across the quad, and the quad has already been given
-    // the tip's proportions in the vertex shader, so the mask lands unsquashed
-    // and fills its whole quad — no padding, no empty margin to shade.
-    let uv = in.local * 0.5 + vec2<f32>(0.5, 0.5);
-    let masked = textureSample(tip, tip_sampler, uv).r;
+    // `tip_uv` because a coloured stamp's colour is sampled at the same place —
+    // see there.
+    let masked = textureSample(tip, tip_sampler, tip_uv(in.local)).r;
 
     let d = length(in.local);
 
@@ -278,8 +290,7 @@ struct ColoredOut {
 // `composite.wgsl` and for the same reason: where nothing was stamped the
 // sample is all zeroes and the divide would be a NaN.
 fn dab_rgb(in: VsOut) -> vec3<f32> {
-    let uv = in.local * 0.5 + vec2<f32>(0.5, 0.5);
-    let stamped = textureSample(tip_color, tip_sampler, uv);
+    let stamped = textureSample(tip_color, tip_sampler, tip_uv(in.local));
     let own = select(in.color, stamped.rgb / max(stamped.a, 1e-4), stamped.a > 1e-4);
     return select(in.color, own, u.use_tip_color != 0u);
 }
