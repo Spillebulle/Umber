@@ -35,9 +35,18 @@ This document is the design. **Pieces 1 to 4 of §11 are built**, and the two
 - **The GPU test in §12.** The parked-slice guarantee is asserted on the CPU —
   a slice claimed by an entry is never handed to another layer, which is the
   thing that could go wrong — and nothing in the change touches a shader.
-- **§10 stands**: renaming, opacity, visibility, blend, lock, link and clipping
-  are still not undoable, and §4's `Kept`-restores-shape-not-values rule is what
-  keeps deferring them safe.
+- **§10 stands** for renaming, opacity, visibility, blend, lock and clipping:
+  they are still not undoable, and §4's `Kept`-restores-shape-not-values rule is
+  what keeps deferring them safe. **`link` is the exception and is a known
+  defect**: deleting one of a linked pair dissolves the group — correctly, or
+  the survivor draws a chain meaning "moves together with nothing" — and undoing
+  the delete cannot put it back, so an undone delete silently unlinks the pair.
+  It is the *mask's* case rather than the opacity's, because the edit changes
+  the value rather than the artist, so the repair is to record what the removal
+  dissolved and swap it back beside `masks`; that needs
+  `dissolve_lone_groups` to report what it cleared and `remove_many` to hand it
+  over. Putting links on every `Kept` row is the shortcut and is what §4 and §10
+  between them refuse. Written up at `LayerStack::restore_shape`.
 
 **§7 is wrong about the cost, and that is the correction to read before
 anything else here.** It says a parked slot "costs no *new* allocation; what it

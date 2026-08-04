@@ -1773,6 +1773,26 @@ impl LayerStack {
         // A group can have lost a member while it was out of the stack, and can
         // regain one coming back; both are `link`'s refusal to make a group of
         // one, from the other side.
+        //
+        // **A known defect lives here, and it is not this call's to fix.**
+        // Deleting one of a linked pair dissolves the group — `remove_many`
+        // does it, correctly, because the survivor would otherwise draw a chain
+        // meaning "moves together with nothing" and hold a colour `free_group`
+        // could never hand back. Undoing that delete brings the deleted layer
+        // back still carrying its own `link`, finds itself alone in the group,
+        // and this call clears that too. So an undone delete silently unlinks a
+        // pair. Removing the call is not the repair: it would leave the group
+        // of one the model refuses to create.
+        //
+        // The repair is to record what the removal dissolved and swap it back,
+        // exactly as `masks` is — a link is changed by the *edit* rather than by
+        // the artist afterwards, so it is the mask's case and not the opacity's,
+        // and §4's "restores shape, not values" does not cover it. It needs
+        // `dissolve_lone_groups` to report what it cleared and `with_removed` to
+        // take it, which is a signature change to `remove_many`; putting links
+        // on every `Kept` row instead is the tempting shortcut and is the thing
+        // §4 and §10 both refuse, because an undone *reorder* would then revert
+        // a link somebody made after it.
         self.dissolve_lone_groups();
         back
     }
