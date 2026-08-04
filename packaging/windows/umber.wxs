@@ -144,9 +144,18 @@
       than shipping.
 
       The registry value is the price of a non-advertised shortcut: ICE43 is an
-      *error* unless the component holding one has an HKCU key as its keypath,
-      and validation runs as part of `wix build`. It is the arrangement
-      Microsoft's own guidance gives for this case.
+      *error* unless the component holding one has a per-user key as its
+      keypath, and validation runs as part of `wix build`.
+
+      `HKMU` rather than `HKCU`, and the difference is not cosmetic. HKMU
+      compiles to root -1, which Windows Installer resolves to HKLM on a
+      per-machine install and HKCU on a per-user one — and this package is
+      per-machine, so `WriteRegistryValues` runs unimpersonated and a literal
+      HKCU would land in the SYSTEM account's hive: a keypath in a hive no user
+      has, orphaned there for ever. ICE43's own remedy names root -1 alongside
+      HKCU, and ICE57 — which is what objects to per-user and per-machine data
+      sharing a component, and does count a non-advertised shortcut as
+      per-machine data here — has nothing left to object to.
     -->
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="95c43486-778e-4975-9cb5-112e6ba93260">
@@ -158,7 +167,7 @@
                   Advertise="no">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="io.github.spillebulle.umber" />
         </Shortcut>
-        <RegistryValue Root="HKCU"
+        <RegistryValue Root="HKMU"
                        Key="Software\Umber contributors\Umber"
                        Name="StartMenuShortcut"
                        Type="integer"
