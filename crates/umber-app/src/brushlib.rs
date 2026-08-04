@@ -69,8 +69,10 @@ use umber_core::TipMask;
 use umber_core::preset::{self, BrushPreset, NewCollection, PresetError, UserLibrary};
 use umber_core::style;
 
-/// Width kept clear at the right of a browser row for its two controls.
-const ROW_CONTROLS: f32 = 46.0;
+/// Width kept clear at the right of a browser row for its three controls —
+/// edit, rename and delete. See [`row_controls`], which spaces them 22 apart
+/// from 10 inside this margin.
+const ROW_CONTROLS: f32 = 68.0;
 
 // ---------------------------------------------------------------------------
 // State
@@ -714,6 +716,8 @@ fn collection_row(ui: &mut Ui, p: &Palette, ed: &Editor, state: &mut State) {
 /// What a row asked for. At most one per frame: acting on any of them rewrites
 /// the list the loop is walking.
 enum Request {
+    /// Put this brush in the user's hand and open the brush editor on it.
+    Edit(String),
     /// Start renaming this brush.
     Rename(String),
     /// Arm the delete on this brush.
@@ -857,24 +861,42 @@ fn empty_message(state: &State) -> &'static str {
     }
 }
 
-/// Rename and delete, drawn over the right edge of a browser row.
+/// Edit, rename and delete, drawn over the right edge of a browser row.
 ///
 /// Registered *after* the row so they win the hit test against it — egui breaks
 /// ties in favour of the last widget added — which is what stops a click on
 /// Delete also selecting the brush.
 ///
-/// Both are drawn for every row and disabled on the shipped ones. Hiding them
-/// there would leave "why can I not delete this?" for the reader to work out; a
-/// dead control that says why is the house style.
+/// **The pencil is live on a shipped brush and the other two are not**, and the
+/// difference is not an inconsistency: it is exactly what the Brushes panel
+/// already does. Editing a shipped brush is something Umber has always allowed
+/// — the panel header's pencil opens the editor on whatever is in your hand,
+/// shipped or not, and the editor's footer offers "Save as new…" — because the
+/// edit does not land on the shipped preset at all. It cannot: `preset::builtin`
+/// is `include_str!`'d into the binary and replaced wholesale by every update,
+/// so a change written there would vanish silently months later. That is the
+/// same fact that makes renaming and deleting one impossible, and it is why
+/// those two stay dead with a tooltip saying so rather than being hidden.
+/// The browser used to grey the pencil out with them, which said the library's
+/// two hundred and one brushes were the ones you could not start from.
+///
+/// Three marks rather than the two this had, because the pencil now means what
+/// the pencil in the panel header means. Renaming is a different verb and wears
+/// [`Icon::Rename`]; sharing the pencil between them is what made "edit" read
+/// as "you may not edit this".
 fn row_controls(ui: &mut Ui, p: &Palette, rect: Rect, id: &str, user: bool) -> Option<Request> {
-    const READ_ONLY: &str = "Brushes that ship with Umber cannot be renamed or deleted. \
-                             Save a copy out of the brush editor and change that instead.";
+    const READ_ONLY: &str = "Brushes that ship with Umber are part of the application, so there \
+                             is nothing here to rename or delete — an update replaces the \
+                             shipped library wholesale. Edit this one and save it as your own; \
+                             that copy is yours to rename and delete.";
     let marks = [
-        (Icon::Pencil, "Rename this brush"),
-        (Icon::Trash, "Delete this brush"),
+        (Icon::Pencil, "Edit this brush in the brush editor", true),
+        (Icon::Rename, "Rename this brush", false),
+        (Icon::Trash, "Delete this brush", false),
     ];
     let mut request = None;
-    for (n, (icon, tip)) in marks.into_iter().enumerate() {
+    for (n, (icon, tip, always)) in marks.into_iter().enumerate() {
+        let live = user || always;
         let hit = Rect::from_center_size(
             pos2(
                 rect.right() - ROW_CONTROLS + 10.0 + n as f32 * 22.0,
@@ -885,22 +907,22 @@ fn row_controls(ui: &mut Ui, p: &Palette, rect: Rect, id: &str, user: bool) -> O
         let response = ui.interact(
             hit,
             ui.id().with(("brush-row-control", id, n)),
-            if user { Sense::click() } else { Sense::hover() },
+            if live { Sense::click() } else { Sense::hover() },
         );
-        let colour = match (user, response.hovered()) {
+        let colour = match (live, response.hovered()) {
             (false, _) => p.text_dim.gamma_multiply(0.35),
             (true, true) => p.text_strong,
             (true, false) => p.text_dim,
         };
         icons::draw(ui.painter(), hit.shrink(2.0), icon, colour);
         if response
-            .on_hover_text(if user { tip } else { READ_ONLY })
+            .on_hover_text(if live { tip } else { READ_ONLY })
             .clicked()
         {
-            request = Some(if n == 0 {
-                Request::Rename(id.to_owned())
-            } else {
-                Request::Confirm(id.to_owned())
+            request = Some(match n {
+                0 => Request::Edit(id.to_owned()),
+                1 => Request::Rename(id.to_owned()),
+                _ => Request::Confirm(id.to_owned()),
             });
         }
     }
@@ -2441,6 +2463,25 @@ fn browser_list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, he
 
     state.renaming = renaming;
     match out.request {
+        Some(Request::Edit(id)) => {
+            // Selected first, because the editor edits the brush *in your
+            // hand*: there is no second path that edits a preset in place, and
+            // there must not be — a change to a shipped brush cannot be written
+            // back to it, so what the editor changes is `Editor::brush` and
+            // what keeps the change is the footer's Save.
+            //
+            // By id and not by the row's index, for `resync`'s reason: the
+            // merged list is rebuilt under this module and a position does not
+            // survive it.
+            if let Some(index) = ed.presets.iter().position(|preset| preset.id == id) {
+                ed.apply_preset(index);
+            }
+            ed.ui.brush_editor_open = true;
+            // The browser is a modal and so is the editor, and two modals over
+            // each other leaves neither reachable — the same reason the
+            // browser's own "New brush" closes it.
+            close_browser(state);
+        }
         Some(Request::Rename(id)) => {
             let name = name_of(ed, &id);
             state.renaming = Some((id, Field::new(name)));

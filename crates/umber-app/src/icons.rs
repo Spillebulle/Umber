@@ -133,6 +133,15 @@ pub enum Icon {
     SelectSubtract,
     /// Two overlapping squares with only the overlap filled: the intersection.
     SelectIntersect,
+    // At the end for the reason the four above are: this enum is shared, and
+    // renumbering it would be a merge that compiles and draws the wrong marks.
+    /// A text caret standing on a rule: change what this is *called*.
+    ///
+    /// Deliberately not a second pencil. [`Icon::Pencil`] means "open the brush
+    /// editor" — in the Brushes panel header and on every row of the library
+    /// browser — and a row that drew a pencil for renaming and a pencil for
+    /// editing would be two marks with one meaning and two outcomes.
+    Rename,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -464,6 +473,16 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 at(5.0, 19.0),
             ]);
             line(at(14.5, 6.7), at(17.3, 9.5));
+        }
+
+        Icon::Rename => {
+            // An I-beam caret standing on a rule. The rule is what stops the
+            // caret alone reading as a divider at 18 px, and it is the line of
+            // text the name is being typed onto.
+            line(at(12.0, 5.0), at(12.0, 15.0));
+            line(at(9.0, 5.0), at(15.0, 5.0));
+            line(at(9.0, 15.0), at(15.0, 15.0));
+            line(at(5.0, 19.5), at(19.0, 19.5));
         }
 
         Icon::Gear => {
