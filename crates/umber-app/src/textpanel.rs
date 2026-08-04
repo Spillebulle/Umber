@@ -38,13 +38,14 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use egui::{Sense, Ui, vec2};
 
+use umber_core::Background;
 use umber_core::fonts::{self, Face, FontLibrary};
 use umber_core::text::{self, Align, TextBlock, TextError};
 
 use crate::controls;
 use crate::editor::Editor;
 use crate::icons::Icon;
-use crate::theme::{Palette, text as texttokens};
+use crate::theme::{Palette, metrics, text as texttokens};
 use crate::ui::UiActions;
 use crate::widgets::{self, DropdownWidth, NumberRow};
 
@@ -494,11 +495,9 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
                     pixels,
                     source_size: vec2(setting.width as f32, setting.height as f32),
                 };
-                let handle = ui.ctx().load_texture(
-                    "text-preview",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                );
+                let handle =
+                    ui.ctx()
+                        .load_texture("text-preview", image, egui::TextureOptions::LINEAR);
                 ed.text.preview = Some((key, handle));
             }
             _ => ed.text.preview = None,
@@ -517,11 +516,15 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     if let Some((_, handle)) = &ed.text.preview {
         let [w, h] = handle.size();
         let (w, h) = (w as f32, h as f32);
-        let scale = (ui.available_width() / w)
-            .min(PREVIEW_MAX_HEIGHT / h)
-            .min(1.0);
+        let full = ui.available_width();
+        let scale = (full / w).min(PREVIEW_MAX_HEIGHT / h).min(1.0);
         let size = vec2(w * scale, h * scale);
-        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        // The plate is the panel's full width whatever the text measures, so a
+        // long caption and a short one are the same control rather than a strip
+        // that changes size as somebody types.
+        let (behind, _) = ui.allocate_exact_size(vec2(full, size.y + 12.0), Sense::hover());
+        plate(ui, p, behind, ed.doc.background);
+        let rect = egui::Rect::from_center_size(behind.center(), size);
         ui.painter().image(
             handle.id(),
             rect,
@@ -543,13 +546,30 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // something says so, in a finished sentence, rather than leaving it to be
     // discovered on the canvas.
     if !missing.is_empty() {
-        let list: String = missing.iter().take(8).collect();
+        // **By codepoint, never by drawing the characters.** The interface is
+        // set in Archivo, so a character *this* face has no glyph for is one
+        // Archivo very likely has none for either — printing it here would draw
+        // the blank box the "no Unicode symbols in the UI" rule exists to
+        // prevent, in the one sentence whose whole job is to say which
+        // character is missing. `U+5B57` always renders and is what somebody
+        // would search for.
+        let list = missing
+            .iter()
+            .take(6)
+            .map(|c| format!("U+{:04X}", *c as u32))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if missing.len() > 6 {
+            format!(" and {} more", missing.len() - 6)
+        } else {
+            String::new()
+        };
         controls::note(
             ui,
             p,
             &format!(
-                "This face has no glyph for {list} — those characters will not \
-                 appear. Choose another font, or remove them."
+                "This face has no glyph for {list}{more} — they are left blank \
+                 rather than drawn as a box. Choose another font, or remove them."
             ),
         );
     }
@@ -561,6 +581,48 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
              does not reorder the two yet, so they may come out in the wrong \
              order.",
         );
+    }
+}
+
+/// What the preview sits on: **this document's own background**.
+///
+/// Not the panel's fill and not a plate chosen to make the preview legible.
+/// The question the preview answers is "what will this look like when I put it
+/// down", and the honest answer to that is the paint over the canvas it is
+/// going onto — so a white-backed document shows dark text on white, exactly
+/// as it will land, and a transparent one shows the checker, which is what the
+/// canvas itself draws and what a layer thumbnail draws.
+///
+/// The alternative — brightening the plate, or the ink, so that the preview
+/// always reads — would be showing a colour nobody chose. The Colour panel is
+/// where the colour is and where to change it.
+///
+/// The checker is drawn on the transparent case rather than a flat fill for the
+/// reason the layer thumbnail gives: what is being previewed is pixels *with
+/// alpha*, and a flat fill would say the text was opaque where it is
+/// antialiased.
+fn plate(ui: &Ui, p: &Palette, rect: egui::Rect, background: Background) {
+    const CELL: f32 = 6.0;
+    let painter = ui.painter();
+    if let Background::Colour(colour) = background {
+        let [r, g, b, _] = colour.to_srgb_u8();
+        painter.rect_filled(rect, metrics::RADIUS, egui::Color32::from_rgb(r, g, b));
+        return;
+    }
+    painter.rect_filled(rect, metrics::RADIUS, p.window);
+    let cols = (rect.width() / CELL).ceil() as usize;
+    let rows = (rect.height() / CELL).ceil() as usize;
+    for i in 0..cols {
+        for j in 0..rows {
+            if (i + j) % 2 == 0 {
+                continue;
+            }
+            let cell = egui::Rect::from_min_size(
+                rect.left_top() + vec2(i as f32 * CELL, j as f32 * CELL),
+                vec2(CELL, CELL),
+            );
+            painter.rect_filled(cell.intersect(rect), 0.0, p.control_hover);
+        }
     }
 }
 
@@ -601,4 +663,157 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
         "Text is painted into the layer when it is put down — it is pixels \
          afterwards, not something that can be re-typed.",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+
+    /// The panel is usable on the first frame and on a machine whose scan finds
+    /// nothing: the interface's own face is in the library before any thread
+    /// has run, and the default family and style name it.
+    #[test]
+    fn the_panel_can_set_text_before_any_scan_has_run() {
+        let ed = Editor::default();
+        assert!(!ed.text.fonts.scanning());
+        assert!(!ed.text.fonts.library().is_empty());
+        let face = ed.text.face().expect("a face before the scan");
+        assert_eq!(face.family, ed.text.family);
+    }
+
+    /// What Place puts down is an ordinary clip in the artist's own colour with
+    /// the coverage as its alpha — which is exactly what `float_a_clip` hands
+    /// to `Clip::place` for a paste, and the whole of why nothing new reaches
+    /// the GPU.
+    #[test]
+    fn what_place_would_put_down_is_an_ordinary_clip() {
+        let mut ed = Editor::default();
+        ed.text.block.text = "Umber".to_string();
+        ed.text.block.size = 64.0;
+        let setting = ed.text.set().expect("ink");
+        let clip = setting.clip(ed.color).expect("a clip");
+        assert_eq!(clip.size().x, setting.width);
+        assert_eq!(clip.size().y, setting.height);
+        assert!(clip.pixels().iter().skip(3).step_by(4).any(|&a| a > 200));
+    }
+
+    /// Nothing typed is refused rather than producing an empty float, and it is
+    /// told apart from a line of spaces — the notice has different sentences
+    /// for the two.
+    #[test]
+    fn an_empty_block_places_nothing() {
+        let mut ed = Editor::default();
+        assert_eq!(ed.text.set().err(), Some(TextError::Empty));
+        ed.text.block.text = "   ".to_string();
+        assert_eq!(ed.text.set().err(), Some(TextError::NoInk));
+    }
+
+    /// A family the machine does not have still resolves, because a preference
+    /// records names and the machine it is read back on may have neither. The
+    /// panel would otherwise be a picker that cannot draw anything until
+    /// somebody works out why.
+    #[test]
+    fn a_face_that_is_not_here_still_sets_something() {
+        let mut ed = Editor::default();
+        ed.text.family = "A Foundry Face Nobody Has".to_string();
+        ed.text.style = "Ultra Condensed Black Italic".to_string();
+        ed.text.block.text = "Umber".to_string();
+        assert!(ed.text.set().is_ok());
+    }
+
+    /// The preview is keyed by everything that changes the picture — including
+    /// the colour, which is the one to forget, because it is not in the block.
+    /// A key that missed one would draw a preview of a caption somebody had
+    /// already changed, which is the control that lies at its smallest.
+    #[test]
+    fn the_preview_key_moves_with_everything_that_changes_the_picture() {
+        let typed = |f: fn(&mut Editor)| {
+            let mut ed = Editor::default();
+            ed.text.block.text = "Umber".to_string();
+            f(&mut ed);
+            preview_key(&ed)
+        };
+        let base = typed(|_| {});
+        assert_eq!(base, typed(|_| {}), "the key is not stable");
+
+        for (what, f) in [
+            (
+                "text",
+                (|ed: &mut Editor| ed.text.block.text.push('s')) as fn(&mut Editor),
+            ),
+            ("size", |ed| ed.text.block.size += 1.0),
+            ("line spacing", |ed| ed.text.block.line_spacing += 0.1),
+            ("tracking", |ed| ed.text.block.tracking += 1.0),
+            ("align", |ed| ed.text.block.align = Align::Right),
+            ("family", |ed| ed.text.family = "Other".to_string()),
+            ("style", |ed| ed.text.style = "Bold".to_string()),
+            ("colour", |ed| {
+                ed.color = umber_core::Color::from_srgb_u8(200, 30, 30, 255)
+            }),
+        ] {
+            assert_ne!(typed(f), base, "changing the {what} did not move the key");
+        }
+    }
+
+    /// The Text module at the panel's real width, in the states it can be in.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is:
+    /// what goes wrong in a panel body is a *layout*, and no assertion about
+    /// widgets catches two controls drawn over each other at `metrics::PANEL`'s
+    /// real 264 points. This one has a preview image, three rails, two
+    /// dropdowns and a segmented picker to fit into that width, which is
+    /// exactly the shape that fits in the abstract and does not on screen.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app text_panel_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn text_panel_preview() {
+        use crate::dock::{Layout, PanelKind};
+        use crate::docshot;
+        use crate::theme::metrics;
+        use egui::{Pos2, Rect, vec2};
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/text-panel");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The fourth is the one worth looking at: two CJK ideographs Archivo
+        // has no glyph for, so the notice that names them is on screen beside
+        // the preview that does not show them.
+        for (name, text, align) in [
+            ("1-empty", "", Align::Left),
+            ("2-a-caption", "Umber", Align::Left),
+            (
+                "3-several-lines",
+                "Painted in Umber\non a Tuesday\nafternoon",
+                Align::Centre,
+            ),
+            (
+                "4-a-face-cannot-show-it",
+                "Umber \u{5b57}\u{4f53}",
+                Align::Left,
+            ),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = Layout::default();
+            ed.text.block.text = text.to_string();
+            ed.text.block.align = align;
+            let palette = crate::theme::Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(metrics::PANEL, 520.0);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                let mut actions = UiActions::default();
+                crate::panels::panel(root, &palette, &mut ed, &mut actions, PanelKind::Text, rect);
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 4 shots to {}", dir.display());
+    }
 }

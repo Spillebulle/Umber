@@ -2325,7 +2325,10 @@ fn module_preview(painter: &egui::Painter, p: &Palette, rect: Rect, kind: PanelK
         PanelKind::Text => {
             let y = body.top() + 9.0;
             painter.line_segment(
-                [pos2(body.left(), y + 3.0), pos2(body.left() + 34.0, y + 3.0)],
+                [
+                    pos2(body.left(), y + 3.0),
+                    pos2(body.left() + 34.0, y + 3.0),
+                ],
                 Stroke::new(1.0, ink),
             );
             for (x, w, h) in [(0.0, 7.0, 12.0), (9.0, 5.0, 9.0), (16.0, 6.0, 9.0)] {

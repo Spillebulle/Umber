@@ -291,6 +291,21 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
             };
         let baseline = pad + metrics.ascent;
         for glyph in &line.glyphs {
+            // `.notdef` is **skipped, not drawn**, and it keeps its advance.
+            //
+            // A face's `.notdef` is usually a crossed or hollow box, and
+            // stamping one onto somebody's canvas is exactly the blank-box
+            // failure the interface's "no Unicode symbols" rule exists to
+            // prevent — put in the picture rather than in a label, where it
+            // cannot be taken back out. It also has to agree with what the
+            // panel *says*: the missing characters are named in a notice, and a
+            // notice reading "those characters will not appear" beside a box
+            // that plainly did is the control that lies. The advance stays, so
+            // what is left is a gap where the character was, which is the same
+            // answer `cputext.rs` gives on the splash.
+            if glyph.id == 0 {
+                continue;
+            }
             let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
                 continue;
             };
@@ -638,11 +653,35 @@ mod tests {
     /// A character no face on earth carries is *named*, not silently dropped
     /// and not drawn as a box. Naming it is the whole of what this module does
     /// instead of font fallback.
+    ///
+    /// And it really is not drawn: a face's `.notdef` is a crossed or hollow
+    /// box, and stamping one onto somebody's canvas is the blank-box failure
+    /// the interface's "no Unicode symbols" rule exists to prevent, put into
+    /// the picture where it cannot be taken back out. A line of nothing but
+    /// missing characters therefore makes no mark at all.
     #[test]
     fn a_character_the_face_cannot_show_is_named_rather_than_hidden() {
         let lib = library();
         let s = set_with(&lib, "Regular", &block("Hi \u{E000}\u{E000} there")).expect("ink");
         assert_eq!(s.missing, vec!['\u{E000}'], "{:?}", s.missing);
+
+        // Nothing but missing characters is a block with no ink in it, which is
+        // the same answer a line of spaces gets — not a row of boxes.
+        assert_eq!(
+            set_with(&lib, "Regular", &block("\u{E000}\u{E001}\u{E002}")),
+            Err(TextError::NoInk)
+        );
+
+        // And the gap is kept: the characters do not appear, and what is on
+        // either side of them does not close up over where they were.
+        let with = set_with(&lib, "Regular", &block("A\u{E000}B")).unwrap();
+        let without = set_with(&lib, "Regular", &block("AB")).unwrap();
+        assert!(
+            with.width > without.width,
+            "{} is not wider than {}",
+            with.width,
+            without.width
+        );
     }
 
     /// A wholly right-to-left line is shaped as one and raises nothing; a line
