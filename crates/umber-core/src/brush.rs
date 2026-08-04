@@ -402,25 +402,42 @@ impl Brush {
     /// rather than what colour it is.
     ///
     /// The mix is the pickup's share of the two, `p / (p + d)`. **That is a
-    /// heuristic and not Krita's arithmetic**, and the distinction is worth
-    /// keeping: `KisColorSmudgeStrategyBase` composites the paint over the
-    /// smudged dab at `ColorRate` **squared**, which this expression is nowhere
-    /// in. What it is instead is monotone in both rates, scale-free, and exact
-    /// at both ends — a deposit of zero is a pure blender and a pickup of zero
-    /// an ordinary brush — which is as much as one number can promise about
-    /// two.
+    /// heuristic and not anybody's arithmetic**, and the honest reason is the
+    /// units: in Krita the two are not commensurable at all. `p` is the dab's
+    /// own opacity and `d` is a colour-mix weight that is then *squared* —
+    /// `KisColorSmudgeStrategyBase` composites the paint over the already
+    /// smudged dab at `d² × opacity`. A ratio of two quantities in different
+    /// units is a heuristic by construction. What it does promise is monotone
+    /// in both, scale-free, and exact at both ends — a deposit of zero is a
+    /// pure blender and a pickup of zero an ordinary brush — which is as much
+    /// as one number can say about two.
     ///
-    /// Reproducing the composite faithfully is the obvious alternative and is
-    /// worse *here*, for a reason that is about the file rather than the maths:
-    /// a colour rate is usually stated as a pressure curve, and the recorded
-    /// value is its height at full pressure. Taking the over-composite at that
-    /// height answers "no pickup at all" for every brush whose curve happens to
-    /// reach the top, which is the value at one end of the stroke rather than
-    /// the constant Umber needs for the whole of it.
+    /// Reproducing the composite faithfully is the obvious alternative. Written
+    /// out it is `p(1 − d²·op) / (p(1 − d²·op) + d²·op)`, and it is rejected
+    /// for two reasons rather than the one that first suggested itself. It
+    /// needs the stroke opacity, which is a *third* number and not this
+    /// function's to know. And it is a reading at full pressure: a colour rate
+    /// is usually stated as a pressure curve with the recorded value its peak,
+    /// so at `op = 1` it answers "no pickup at all" for every curve that
+    /// reaches the top — the value at one end of a stroke, offered as the
+    /// constant for the whole of it. The two do not merely differ near that
+    /// end: at `p = 0.38`, `d = 0.84`, `op = 1` the composite is 0.137 and this
+    /// is 0.311.
     ///
     /// Two zeroes mean a dab that puts nothing anywhere, which is not a state
     /// to carry into a mix: it answers `0.0`, the ordinary brush, rather than a
-    /// division by zero.
+    /// division by zero. That case is reachable rather than hypothetical — a
+    /// pickup rate of zero with the deposit switched off is exactly it — and
+    /// answering the ordinary brush is a choice: the source paints nothing at
+    /// all there, and Umber has no way to say "nothing" in a colour.
+    ///
+    /// **A rate that is not finite is read as absent**, i.e. as zero, because
+    /// these come from `str::parse` over somebody's file and `"nan"` and
+    /// `"inf"` both parse. It is stated because the direction is not obvious:
+    /// an infinite *pickup* therefore reads as an ordinary brush rather than as
+    /// a pure blender. Both readings are arbitrary for a value that cannot mean
+    /// anything; what matters is that the dab pass is never handed a NaN, which
+    /// would spread to every channel of every dab's colour.
     pub fn smudge_from_rates(pickup: f32, deposit: f32) -> f32 {
         let pickup = if pickup.is_finite() {
             pickup.max(0.0)
@@ -744,9 +761,12 @@ mod tests {
         assert_eq!(Brush::smudge_from_rates(f32::NAN, f32::NAN), 0.0);
         assert_eq!(Brush::smudge_from_rates(-1.0, -1.0), 0.0);
         // A file that states one of them as nonsense still has to give a
-        // number the dab pass can use.
-        assert!(Brush::smudge_from_rates(f32::INFINITY, 1.0).is_finite());
+        // number the dab pass can use, and the *direction* is pinned rather
+        // than merely its finiteness: a non-finite rate is read as absent, so
+        // an infinite pickup is an ordinary brush and not a pure blender.
+        assert_eq!(Brush::smudge_from_rates(f32::INFINITY, 1.0), 0.0);
         assert_eq!(Brush::smudge_from_rates(1.0, f32::NAN), 1.0);
+        assert_eq!(Brush::smudge_from_rates(f32::NEG_INFINITY, 0.0), 0.0);
     }
 
     #[test]

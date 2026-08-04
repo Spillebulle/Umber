@@ -160,10 +160,12 @@ better.
 ## Shipping a stamp
 
 Stamps ship now: **23 brushes carried by 18 masks, 649 kB of 8-bit greyscale
-PNG in `crates/umber-core/assets/tips/`**. The release binary was measured when
-the first fifteen of those masks landed — 664 kB, 17,162,752 bytes before and
-17,842,176 after — and the three added since have not been weighed again,
-because the delta is the PNG and nothing else. The generator writes the masks,
+PNG in `crates/umber-core/assets/tips/`** — counted from the directory and from
+the generator's own tally, which is the only way to quote either. The release
+binary was measured once, when this section was written and the count was 19
+brushes; it came to 664 kB, 17,162,752 bytes before and 17,842,176 after. It
+has not been weighed since, because the delta is the PNG and nothing else. The
+generator writes the masks,
 deduplicates them by content and rewrites the `include_bytes!` table;
 `preset::builtin()` resolves a shipped tip through `tip::builtin` before the
 user's library. `docs/brushes.md` has the mechanism.
@@ -178,11 +180,19 @@ else, so the other 298 were never candidates whatever the library could hold —
 stamps, mirrored dabs, brush-tip randomness or a rotation Umber cannot drive.
 Of the 40, 23 ship and 17 are rubberduck's.
 
-It was 37 and 19 until Krita's **paint-deposit rate** came off that list.
-That one was never a mask Umber could not paint: `Brush::smudge` is the mix
-between the palette colour and what a dab lifted, so `1 - smudge` already is a
-deposit rate, and what the reader was missing was the enable flag beside the
-value. `crates/umber-core/src/brushimport/kpp.rs` has the argument.
+It was **36 and 19**, and this paragraph said 37 — the candidate count was one
+out before any of this, which is why the two figures could not both be right.
+Read them off a run of the generator rather than by adding to what is written
+here: the ones above are 23 shipped stamps plus the 17 refused for their
+licence alone, and 40 = 23 + 17 is the check that they reconcile.
+
+Four brushes moved, and the deposit rate is only three of them. Krita's
+**paint-deposit rate** was never a mask Umber could not paint: `Brush::smudge`
+is the mix between the palette colour and what a dab lifted, so `1 - smudge`
+already is a deposit rate, and what the reader was missing was the enable flag
+beside the value. The fourth came off **brush-tip randomness**, which is now
+ignored below a hundredth rather than at any value at all.
+`crates/umber-core/src/brushimport/kpp.rs` has both arguments.
 
 ### How big the whole thing would have been
 

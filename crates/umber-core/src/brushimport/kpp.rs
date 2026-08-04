@@ -128,17 +128,27 @@
 //!   laying down as much paint as it lifts into a pure blender, *and* the
 //!   `dropped` entry then refused it from the shipped library — a brush kept
 //!   out for a defect the reader had introduced. [`Brush::smudge_from_rates`]
-//!   carries the ratio instead; what is lost is the pair's *magnitude*, which
-//!   is how faintly the dab lands rather than what colour it is.
+//!   carries the ratio instead. **Two things are discarded and neither is
+//!   named**, which is what makes this an approximation rather than a fix:
+//!   - `SmudgeRate`'s *magnitude*. It is the dab's own opacity in Krita
+//!     (`smearRateOpacity = s × opacity`), so it sits exactly where Umber's
+//!     stroke opacity does and there *is* a slot for it — the same slot
+//!     `FlowValue` is already folded into below. It is not folded in only
+//!     because Umber's pickup is a trailing average rather than Krita's offset
+//!     smear, so the two are not the same quantity to multiply; saying it has
+//!     nowhere to go would be false.
+//!   - `ColorRate`'s **pressure curve**, entirely. `has_foreign_sensor` is
+//!     asked only about Size, Opacity and Scatter, so a `ColorRateSensor` is
+//!     never examined at all. A brush whose author had it blending at a light
+//!     touch and laying down paint at full pressure arrives as one flat mix.
 //!
-//!   **The consequence is that three brushes now ship on an approximation**,
+//!   **The consequence is that three brushes now ship on that approximation**,
 //!   under Revoy's and GDquest's names, where `build-brush-library.rs` would
 //!   previously have refused them — and that generator's whole rule is that
 //!   nothing ships under an author's name that paints unlike their brush. It is
-//!   defensible on the same terms as fan corners below: the mark is right in
-//!   hue and in how much of the canvas it carries, and wrong only in a
-//!   dab-alpha term Umber has nowhere to put. But it is a deliberate exception
-//!   rather than a side effect, which is why it is written here.
+//!   defensible on the same terms as fan corners below, and the flattened curve
+//!   is the part to weigh rather than the ratio. But it is a deliberate
+//!   exception rather than a side effect, which is why it is written here.
 //! - **Fan corners.** Krita adds extra dabs through a sharp corner so that a
 //!   rake fans round it instead of jumping; Umber's dab turns with the heading
 //!   and the heading turns at the corner. Six presets in the fetched packs ask
@@ -426,13 +436,13 @@ pub fn from_kpp_in(
     // the ones their authors called Blend, Blender or Smear — nothing else is
     // in that group and none of them is outside it. (The converse is weaker and
     // is not claimed: the twelve with it set are mostly Paint and OilPaint, but
-    // Watercolour Sponge is among them.)
+    // "Watercolor Sponge" is among them — the author's own spelling, so that it
+    // can be searched for.)
     let (smudge, smudge_radius) = if smudging {
         let pickup = preset
             .number("SmudgeRateValue")
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
-        // Krita's own default for the rate, matching `SmudgeRateValue` above.
         let deposit = if preset.flag("PressureColorRate") {
             preset
                 .number("ColorRateValue")
@@ -1589,8 +1599,8 @@ mod tests {
         // No `PressureColorRate`, so Krita's Color Rate is off and its
         // `colorRate` is `0.0` — the dab carries only what it lifted. This
         // asserted `0.8`, the pickup rate, which read that field as though it
-        // were the mix; the rate governs how *faintly* the dab lands, which is
-        // the one thing about a colour-smudge brush Umber does not carry.
+        // were the mix; the rate governs how *faintly* the dab lands, which
+        // this import discards.
         assert_eq!(preset.brush.smudge, 1.0);
         assert!((preset.brush.smudge_radius - 1.5).abs() < 1e-5);
         assert_eq!(preset.brush.dab_ratio, 2.0);
@@ -1623,7 +1633,9 @@ mod tests {
         // nothing but what it lifted — a pure blender, *whatever* the pickup
         // rate reads. Answering the pickup instead was a real bug and this is
         // the guard: with 0.8 here it left the brush depositing a fifth of the
-        // palette colour where Krita deposits none.
+        // palette colour where Krita deposits none. What 0.8 does govern is how
+        // faintly the dab lands, which this import discards — see the module
+        // docs, which name the slot it would go in rather than claiming none.
         let off = brush(false);
         assert_eq!(off.brush.smudge, 1.0);
 
