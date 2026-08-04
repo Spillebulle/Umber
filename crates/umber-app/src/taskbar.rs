@@ -178,12 +178,19 @@ mod tests {
     #[test]
     fn the_start_menu_shortcut_declares_the_same_application_id() {
         let wxs = wxs();
-        // The attribute form, not the bare name: the comment above the element
-        // explains why it is there and would otherwise be what this matched.
+        // Sliced to the `<ShortcutProperty …/>` element itself rather than to a
+        // fixed run of bytes: the comment above the element mentions the key by
+        // name, and a fixed window would run on into the `RegistryValue` below
+        // and read *its* `Value` if the attributes were ever reordered.
         let at = wxs
-            .find("Key=\"System.AppUserModel.ID\"")
+            .find("<ShortcutProperty")
             .expect("the Start Menu shortcut must carry an AppUserModelID");
-        let element = &wxs[at..wxs.len().min(at + 200)];
+        let end = at + wxs[at..].find('>').expect("an unterminated element");
+        let element = &wxs[at..end];
+        assert!(
+            element.contains("Key=\"System.AppUserModel.ID\""),
+            "the only shortcut property is not the application id"
+        );
         assert!(
             attributes(element, "Value").first() == Some(&APP_ID),
             "the shortcut declares an application id this process never claims"
@@ -195,21 +202,42 @@ mod tests {
     /// takes its icon from the Icon table rather than from the executable,
     /// which is the other half of what shipped wrong. Both symptoms come back
     /// together the moment somebody sets this to yes.
+    ///
+    /// The three assertions are one claim in three parts, because the negative
+    /// on its own is satisfied by a file with no shortcut in it: there is a
+    /// shortcut, it points at the executable rather than at an icon of its
+    /// own, and nothing in the file is advertised.
     #[test]
     fn the_start_menu_shortcut_is_a_real_one() {
+        let wxs = wxs();
+        let at = wxs.find("<Shortcut ").expect("there is no Start Menu shortcut");
+        let end = at + wxs[at..].find('>').expect("an unterminated element");
+        let element = &wxs[at..end];
+
         assert!(
-            !wxs().contains("Advertise=\"yes\""),
+            element.contains("Target=\"[#UmberExe]\""),
+            "the shortcut does not point at the executable, so it cannot take \
+             the executable's icon"
+        );
+        assert!(
+            !element.contains("Icon="),
+            "a shortcut that names an Icon row takes it from the Icon table, \
+             which cannot serve a .ico to a shortcut at all"
+        );
+        assert!(
+            !wxs.contains("Advertise=\"yes\""),
             "an advertised shortcut can carry no AppUserModelID and takes its \
              icon from the Icon table"
         );
     }
 
     /// Windows Installer streams each Icon row out to a file named with its Id
-    /// and then asks the shell to identify that file by name. Its own
-    /// documentation is explicit that an icon used by a shortcut "must be named
-    /// such that their extension matches the extension of the target"; an Id
-    /// with no extension at all is what drew a blank page in Add/Remove
-    /// Programs and on the Start Menu.
+    /// and then asks the shell to identify that file by name, so an Id with no
+    /// extension is a file nothing can identify. WiX's own `Shortcut.xsd` says
+    /// the identifier "should have the same extension as the file that it
+    /// points at"; the Icon table's rule for shortcuts is stronger still. That
+    /// this is what drew the blank page in Add/Remove Programs is inference
+    /// rather than documented — but the extension costs nothing.
     #[test]
     fn every_installer_icon_is_named_with_a_file_extension() {
         let wxs = wxs();

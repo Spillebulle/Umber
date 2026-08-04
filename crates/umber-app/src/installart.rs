@@ -285,11 +285,14 @@ fn bmp(width: u32, height: u32, pixels: &[u32]) -> Vec<u8> {
 
 /// Read a committed bitmap back: `(width, height, 0RGB pixels, top-down)`.
 ///
-/// Deliberately its own parser rather than the `image` crate's. `image` is a
-/// dependency of `umber-core` with only the formats an export needs turned on,
-/// and BMP is not one of them; a header this short is not worth widening it
-/// for, and reading the file with a second implementation is what makes the
-/// checks below evidence about the *file* rather than about the writer.
+/// Its own parser rather than the `image` crate's, because `image` is built
+/// with only the formats an export needs and BMP is not one of them; a header
+/// this short is not worth widening it for. It is the writer's inverse in the
+/// same module and shares its stride expression, so it is **not** independent
+/// evidence about the format — a wrong stride would be wrong identically at
+/// both ends and every test below would still pass. What it buys is that the
+/// checks read the *committed file* rather than a buffer, which is the half
+/// that goes stale.
 fn read_bmp(bytes: &[u8]) -> Option<(u32, u32, Vec<u32>)> {
     if bytes.len() < 54 || &bytes[0..2] != b"BM" {
         return None;
@@ -398,6 +401,51 @@ mod tests {
                 "{name} has no block on this Graphite's backdrop"
             );
         }
+    }
+
+    /// Where the light meets the dark, to the pixel, in the committed files.
+    ///
+    /// The luminance check above measures *from* [`DIALOG_SIDEBAR`], so it
+    /// passes on any picture whose dark part stops at or before the constant —
+    /// including one drawn when the constant was something else. That is not
+    /// hypothetical: the sidebar was 176 first, and moving it to 168 without
+    /// redrawing would have left the committed bitmap unchanged and every test
+    /// green. This is the one that says the picture and the number agree.
+    ///
+    /// Byte-for-byte against the generator would say more and is deliberately
+    /// not what this does: the mark's coverage comes through `hypot` and the
+    /// wordmark through a font rasteriser, and neither is promised to give the
+    /// same last bit on all five machines CI runs on. An edge between two flat
+    /// fills has nothing to round.
+    #[test]
+    fn the_committed_art_changes_colour_exactly_where_the_constants_say() {
+        let (w, h, banner) = committed("banner.bmp");
+        let row = (h / 2) * w;
+        assert_eq!(
+            banner[(row + BANNER_SPLIT - 1) as usize],
+            pack(ground().chrome),
+            "the banner goes dark before {BANNER_SPLIT}"
+        );
+        assert_eq!(
+            banner[(row + BANNER_SPLIT) as usize],
+            pack(ink().backdrop),
+            "the banner is still light at {BANNER_SPLIT}"
+        );
+
+        // A row clear of the mark and the wordmark, so the only edge on it is
+        // the sidebar's own.
+        let (w, _, dialog) = committed("dialog.bmp");
+        let row = 8 * w;
+        assert_eq!(
+            dialog[(row + DIALOG_SIDEBAR - 1) as usize],
+            pack(ink().backdrop),
+            "the sidebar has already ended before {DIALOG_SIDEBAR}"
+        );
+        assert_eq!(
+            dialog[(row + DIALOG_SIDEBAR) as usize],
+            pack(ground().chrome),
+            "the sidebar runs past {DIALOG_SIDEBAR}, into the first page's title"
+        );
     }
 
     /// The generator has to satisfy the same rule the committed files are held
