@@ -845,16 +845,40 @@ one that would only show up when a release was cut, since the desktop build
 everybody develops against has a C compiler. Its module docs carry the argument
 and the list of what it deliberately will not do.
 
-**The tip comes out of a thumbnail, which is a limit and no longer a mystery.**
-`MaterialFile.FileData` is a USTAR tar. Beside the full-resolution pixels sits
-`thumbnail/thumbnail.png`, a real PNG of the real material with a longest side
-of 300 — plenty for a mask that is scaled to the dab anyway. Coverage is
-`alpha × (1 − luminance)` and has to be both terms: a brush tip is black on
-transparent, so its alpha is the mark, and a paper texture is opaque grey, so
-its luminance is. Either alone turns the other kind into a blank rectangle. The
-loss of resolution is named all the same. Build-up is then **measured** off the
-mask by `tip::stroke_coverage`, the same function that decides it for the
-shipped library — Clip Studio composites every dab as GIMP and Krita do.
+**The tip is the material's own pixels, and the thumbnail is the fallback.**
+`MaterialFile.FileData` is a USTAR tar holding both:
+`data/material_0.layer`, which is what the artist drew, and
+`thumbnail/thumbnail.png`, a PNG preview of it with a longest side of 300.
+`brushimport::csmaterial` reads the first — see below — and
+`brushimport::clipstudio`'s `tip_for` falls back to the second for a material
+Clip Studio left out of the file or a container shape the reader will not guess
+at. The fallback names itself; taking the material does not, because there is
+then nothing to apologise for.
+
+The thumbnail's coverage is `alpha × (1 − luminance)` and has to be both terms:
+a brush tip is black on transparent, so its alpha is the mark, and a paper
+texture is opaque grey, so its luminance is. Either alone turns the other kind
+into a blank rectangle. The material needs no such reading — its first channel
+*is* the coverage.
+
+Build-up is then **measured** off whichever mask was bound, by
+`tip::stroke_coverage`, the same function that decides it for the shipped
+library — Clip Studio composites every dab as GIMP and Krita do.
+
+A material larger than `TipMask::MAX_SIZE` is **reduced to it and said so**,
+rather than refused as `TipMask::from_picture` refuses an oversized picture.
+The difference is what refusing falls back to: there, the file on disk; here, a
+300-pixel preview. The cap cannot simply be raised — device limits are
+`downlevel_defaults`, which guarantees a `max_texture_dimension_2d` of exactly
+2048, so a wider mask is one the dab pass could not bind at all. Nothing in the
+sample files reaches it: the largest material is 1174 × 1120.
+
+**What that costs in memory**, measured on the sample files: the whole
+thirteen-brush `.sutg` carries four stamps totalling **1.44 MB** — 1.36 MB of
+coverage in RAM and 0.09 MB of PNG in `tips/` — of which the 1174 × 1120
+spatter brush is 1.25 MB and 0.05 MB on its own. The single-brush `.sut` is
+0.07 MB. Against the thumbnail route those four were 0.20 MB, so the picture
+costs about seven times what its preview did, per stamp brush.
 
 #### Where the full-resolution pixels actually are
 
@@ -866,32 +890,68 @@ payloads open with a `u16` flag. The one with flag 1 is a fixed 5128 bytes of
 something with no structure left in it. **The one with flag 0 is an ordinary
 SQLite database**, and everything is inside it:
 
-- Page size 1024, and **the file header and the first six pages are absent**:
-  the payload begins at page 7, so a page number `n` names the byte range
-  `(n − 6) × 1024`. Every page in it is a leaf, an interior node or an overflow
-  page, and overflow chains resolve exactly once that offset is applied.
-- One row carries the material's true size as plain integers — `501 × 501` for
-  a paper whose thumbnail is 300 × 300, `1174 × 1120` for a spatter brush whose
-  thumbnail is 300 × 286. That is the resolution actually being given up.
-- Another row's blob is the pixels, as a sequence introduced by the UTF-16BE
-  string `BlockDataBeginChunk` and then, per block, `u32 index`,
-  `u32 uncompressed bytes`, `u32 256`, `u32 256`, `u32 present`,
-  `u32 compressed bytes`, four more, and a **plain zlib stream** — `78 01`,
-  nothing exotic. Blocks are 256 × 256, laid out row-major over
-  `ceil(width / 256)` columns, and their channels are **planar**: channel 0 is
-  the first 65536 bytes and is the coverage, which is the only one a tip needs.
-- Round-tripped against all three materials in the sample files: decoded,
-  downscaled and compared with the shipped thumbnail, the mean absolute
-  difference is 0.0000, 0.0229 and 0.0428 on a 0..1 scale — the last two being
-  the resampling, since those two thumbnails are downscales and the first is
-  not.
+- Page size 1024, and **the file header and the first five pages are absent**:
+  the payload's first page is page **six**, so a page number `n` names the byte
+  range `(n − 6) × 1024`. This paragraph said *seven* until the reader was
+  built, and the number is not a matter of taste — an overflow chain names
+  absolute page numbers, and the picture is exactly the blob large enough to
+  need one, so at any other offset the largest blob the database yields is the
+  254 bytes of an *empty* mipmap level. Every other claim in this section was
+  re-derived from the sample files at the same time; this is the one that did
+  not survive.
+- There is **no `sqlite_master`**, because it lived on page 1. The way in is
+  `Database::scan`, which visits every page and decodes the table leaves, and a
+  row is recognised by what is in it rather than by a table name. Note that an
+  overflow page holds raw bytes, so one whose first byte happens to be `0x0d`
+  decodes as a leaf and yields a spurious row — which is why a caller must
+  identify what it wants by content and never by counting.
+- The table wanted is `Offscreen` — `_PW_ID`, `MainId`, `CanvasId`, `LayerId`,
+  `Attribute`, `BlockData` — and a material holds **three** of its rows: two
+  empty mipmap levels and one with the pixels. `MainId` is 3, 7 and 9 in one
+  file and 3, 8 and 10 in another, so it is not the key; having blocks is.
+- `Attribute` opens with a short header whose first word is its own length, and
+  then fields framed `[u32 name length][utf-16be name][payload]`. The first is
+  `Parameter`, and its payload opens with the material's true width and height
+  as plain integers, then the block columns and rows — `501 × 501` for a paper
+  whose thumbnail is 300 × 300, `1174 × 1120` for a spatter brush whose
+  thumbnail is 300 × 286. That is the resolution that was being given up.
+  (The row that carries the pixels states one pixel less on each axis than the
+  two empty levels do, in every material sampled.)
+- `BlockData` is framed differently — `[u32 size][u32 name length][utf-16be
+  name][payload]`, the size covering the whole record — and is one
+  `BlockDataBeginChunk` record per block, each closed by a nested
+  `BlockDataEndChunk` marker, then a `BlockStatus` record. A block's payload is
+  `u32 index`, `u32 uncompressed bytes`, `u32 256`, `u32 256`, `u32 present`,
+  and then, only where it is present, `u32 length + 4`, `u32` **little-endian**
+  `length`, and a **plain zlib stream** — `78 01`, nothing exotic. The reader
+  trusts neither length for the *end* of the stream: the record's own size
+  minus the closing marker is the one bound the container guarantees.
+- Blocks are 256 × 256, laid out row-major over `ceil(width / 256)` columns,
+  and their channels are **planar**. `uncompressed bytes` is `channels × 65536`
+  and says how many there are: 1 for a paper, 2 for a tip, 5 for a colour
+  material. **Channel 0 is the coverage** — `0` no paint, `255` full, which is
+  `TipMask`'s own convention — and where a second channel exists it is all
+  zeroes in every material sampled, so reading it as an alpha and multiplying
+  would give a mask that paints nothing.
+- Round-tripped against the sample files: decoded, downscaled and compared with
+  the shipped thumbnail's own coverage, the mean absolute difference is 0.0002,
+  0.0397, 0.0612 and 0.0680 on a 0..1 scale, which is the resampling and
+  nothing more.
+- **The five-channel shape is refused rather than guessed at.** It is an alpha
+  that is solid and four that look like colour; `alpha × (1 − luma)` over the
+  first three is the obvious reading, it was tried, and it lands 0.13 away from
+  that material's own thumbnail — twice the worst above, and unexplained. The
+  thumbnail is a smaller picture of the right thing; a mask that is *plausibly*
+  a paper is the quietly wrong picture this project refuses everywhere.
 
-What stands between that and this importer is not knowledge: it is a second
-SQLite entry point (`umber_core::sqlite` opens files that have a header and
-finds tables through `sqlite_master`, and this has neither), a `flate2`
-dependency `umber-core` does not yet take directly, and fixtures for all of it
-built by hand in the test module. Until that exists the thumbnail is what is
-used, and the loss is reported.
+Two of the six materials in the sample files take the fallback: that one, and
+one whose flag-0 payload is not a headerless database at any page size or first
+page the reader sweeps.
+
+`umber_core::sqlite::Database::headerless` and `::scan` are the second entry
+point this needed, and `flate2` — already in the tree behind `zip` and `png` —
+is now a direct dependency of `umber-core`, built `rust_backend` so no C
+toolchain enters the build.
 
 **Effect sources are read for pressure, speed and randomness.** Every setting
 carries a bitmask of which inputs drive it, a floor per input and a control-point
@@ -1053,6 +1113,24 @@ reference holding no materials is a texture that was never set and there is
 nothing to report, while one naming a material this reader cannot resolve is a
 paper the brush genuinely has, and it is named rather than passed over, which is
 the answer `UNUSABLE_TIP` already gives for the analogous tip.
+
+**What is named is the substitution, not only the loss**, and the wording earns
+its length. `brushimport::csmaterial` reads a paper's pixels exactly as it reads
+a tip's — it does so for the paper in one of the sample files, at 500 × 500 —
+so the picture is no longer out of reach. What is out of reach is somewhere to
+put it: `Brush::grain_pattern` is a closed enum resolved against a shipped
+table, so a brush cannot name a paper of its own; and a `.sut`'s paper is not
+guaranteed seamless, where the grain is anchored to the document and repeats
+across it, so an imported tile that did not join would draw a grid over every
+stroke. Until both are solved the *strength* and the *tile size* carry across
+onto one of Umber's three papers, and a reader told only that "the paper
+texture's own picture" was lost would not expect that. Measured: the `Sketch`
+brush in the sample file imports at `grain: 1.0` on `Tooth`, whose texels run
+0.569..0.988 with a mean of 0.775 — so a single stroke of it at full opacity
+cannot reach 1.0 anywhere, and a second pass over the first is darker. That is
+faithful to what Clip Studio's own texture density asks for and it is the first
+thing to look at when somebody reports an imported brush painting weaker than
+its opacity says.
 
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
@@ -1318,8 +1396,18 @@ per pack. See `docs/brush-sources.md`.
   full — and `angular`, the one rule that is not a shuffle, would be better
   served by a single stroke-following cell than by an array. Until then a pipe
   arrives as one preset per cell and says which rule it lost.
-- **A paper texture of your own.** Three ship; `GrainPattern` is a closed enum,
-  and reading a fourth off disk needs a variant that names a file.
+- **A paper texture of your own**, and it is now the *engine* that is missing
+  rather than the pixels. `brushimport::csmaterial` reads a Clip Studio paper at
+  full resolution exactly as it reads a tip. What it has nowhere to go: three
+  papers ship, `GrainPattern` is a closed enum resolved against a shipped table,
+  so carrying a fourth means a variant that names a file, a place in the user
+  library beside `tips/` for the tile, `CanvasRenderer::set_paper` taking an
+  arbitrary one, and a row in the brush editor's Texture section. There is one
+  extra rule a tip does not have to keep: the grain is anchored to the document
+  and **repeats**, and an imported tile is not guaranteed seamless, so anything
+  that carries one has to answer what happens at the join —
+  `every_shipped_pattern_tiles_without_a_seam` is the standard the shipped three
+  are held to, and an import cannot simply be exempted from it.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
   miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
   ellipticity is thrown per dab draws its row as though it were not. Fixing it

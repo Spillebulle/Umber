@@ -58,6 +58,13 @@ env_logger = "0.11"
 # *compressor* we would never call.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 png = "0.18"
+# Clip Studio's material pixels are plain zlib streams, one per 256x256 block,
+# inside a headerless SQLite database inside a C2F chunk stream — see
+# `brushimport::clipstudio`. `default-features = false` plus `rust_backend` is
+# `miniz_oxide` and no C toolchain, which is the rule `sqlite.rs` and `ureq`
+# already state; and it is the same crate `zip` and `png` already build, so a
+# direct dependency here adds nothing to the tree.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Flat image export (umber-core::export), and *only* the four formats the
 # export dialog offers on top of PNG. `default-features = false` matters here:
 # the default set drags in AVIF, EXR, HDR, DDS and half a dozen more decoders

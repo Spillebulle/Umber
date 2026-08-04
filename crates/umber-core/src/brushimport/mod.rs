@@ -26,6 +26,7 @@
 pub mod abr;
 pub mod bundle;
 pub mod clipstudio;
+pub mod csmaterial;
 pub mod gbr;
 pub mod gih;
 pub mod kpp;
