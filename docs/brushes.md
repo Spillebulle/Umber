@@ -955,6 +955,58 @@ and is named. The two apps' speed *scales* are not the same number of pixels per
 second, so the mark thins in the right direction over roughly the right stretch
 of hand movement rather than exactly Clip Studio's.
 
+**The dab's angle answers to a different list of sources in the same bits, and
+`1 << 6` on it is the stroke's own heading rather than velocity.** Clip Studio's
+*Direction* dynamic has its own dialog and the manual lists it as **None,
+direction of pen, pen tilt, direction of line, random** — no velocity anywhere in
+it. `BrushRotationEffector` is therefore the one column whose bitmask means
+something else, and putting it through the sweep's reading was wrong twice at
+once: every sketching pencil in both sample files imported as a **fixed nib**
+where its author had the tip following the mark, and each raised
+`SPEED_ELSEWHERE` about a setting Clip Studio cannot drive with speed at all —
+a wrong mark under a note pointing somewhere else, which is the worst shape this
+class of bug takes. It was also the *only* source of that sentence in either
+file. Direction of line is `Brush::dab_angle_follows_stroke` exactly, `dab_angle`
+becomes the lean on top of the heading — which is what a stated angle means in
+Clip Studio once a direction source is on, and one sample brush leans 45° off
+the line — and the flag is *assigned* rather than only set, because Umber's own
+default has to be switched off for a nib.
+
+**One bit is anchored and the rest follow the dialog's order, which is a weaker
+footing than the four ordinary sources have and is worth saying plainly.**
+`1 << 7` is random, and it is the bit that carries an amount: of the thirteen
+brushes, the eight without it hold `BrushRotationRandomScale` at its untouched
+100 and not one holds anything else, while four of the five with it hold a
+deliberate 45 or 10. The correlation runs one way — the fifth sets the bit and
+leaves the amount at 100, a full turn and a legitimate setting — so what it pins
+is that nobody sets the amount without the bit. That is also the one bit this
+reader already had right, so the imported jitter is unchanged.
+
+Random being last then puts the other three on bits 4, 5 and 6 in the dialog's
+own order, and that is the whole of the argument for `1 << 6`. It sits on four
+elongated, textured sketch pencils, one leaning 45° off the line — a reading a
+painter would recognise, and **not proof**: the same four are a plausible
+pen-tilt brush too, so if the manual's order is not the file's order, `1 << 6` is
+pen tilt and those four import as rakes that should be nibs. That is how this
+change can be wrong, and it is a wrong *mark* where the bug it replaces was only
+a wrong note. `1 << 5` then falls on the two flat brushes, both 30% thick and
+stated at 90°, and driving a flat marker's angle from pen tilt is a stock Clip
+Studio recipe; `1 << 4` falls on three round brushes, and "direction of pen" is
+the *azimuth* of the tilt rather than its amount, so it is still tilt. `1 << 8`
+is never set in either file and therefore keeps the unrecognised-source wording:
+a later Clip Studio adds "rotation of pen axis" to this dialog and appending it
+is the reading that fits, but that is an inference about a version and an
+insertion point stacked on the inference above, for a bit nobody has observed.
+
+**A direction source is only reported where the angle can be seen.** A round dab
+with no tip is the same picture at every angle, so a tilt-driven direction on one
+is a setting whose absence nobody can point at, and naming it is the cry-wolf
+failure `unreachable_inputs` spends two paragraphs refusing — two of the thirteen
+brushes are exactly that shape. `dab_has_angle` answers the elliptical half and
+the tip is the other, combined exactly as `Editor::tip` combines them for the
+brush editor, so a round *stamp* brush still says what it lost: a bitmap is not
+rotationally symmetric whatever the dab's roundness.
+
 **Pen tilt is dropped, and not for want of knowing which bit it is.** Umber has
 no tilt input on any platform it runs on — winit carries tilt only inside iOS's
 `Force::Calibrated`, and the `WM_POINTER` path a Windows pen arrives through
