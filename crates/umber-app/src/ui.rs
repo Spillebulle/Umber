@@ -1384,8 +1384,8 @@ fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui:
 /// The strip is a single unwrapped row, so a window narrow enough to overrun it
 /// does not reflow — the controls simply carry on past the right edge. These
 /// budgets decide which groups are drawn, in reverse order of how constantly a
-/// painter reaches for them: the stabiliser readout goes first, then opacity,
-/// then size.
+/// painter reaches for them: the stabiliser goes first, then opacity, then
+/// size.
 ///
 /// They are the design's own widths (a 90 point rail, a 24 point readout) plus
 /// the labels and egui's item spacing, rather than anything measured. Measuring
@@ -1399,7 +1399,11 @@ fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui:
 mod strip_budget {
     pub const SIZE: f32 = 160.0;
     pub const OPACITY: f32 = 185.0;
-    pub const STABILISER: f32 = 110.0;
+    /// The stabiliser rail. It used to be 110 for a `widgets::chip`, which is a
+    /// label and a small pill; it is a third [`crate::widgets::inline_slider`]
+    /// now, so it costs what one costs — the 90 point rail, the readout, and a
+    /// label two characters longer than "Opacity"'s.
+    pub const STABILISER: f32 = 190.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
     pub const COMBINE: f32 = 320.0;
@@ -1489,20 +1493,26 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 );
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY + strip_budget::STABILISER {
-                divider(ui, p);
-
-                // Read-only, unlike the design's, which has a chevron and opens
-                // a menu. Stabilisation is set in the brush editor; the tooltip
-                // says so rather than leaving a pill that looks like a control
-                // and answers to nothing.
-                widgets::chip(
+                // The third rail, and the same control as the two beside it.
+                // It used to be a `widgets::chip` — a reading, with a tooltip
+                // saying to go to the brush editor to change it — which put the
+                // one setting a painter adjusts *while* drawing a line behind
+                // two clicks and a tab. `metrics::OPTIONS_STRIP` is 36 points,
+                // so `widgets::number_row`'s two stacked rows do not fit here
+                // and this figure cannot be typed; that is the strip's own
+                // trade and is why `inline_slider` is what the strip uses.
+                //
+                // The range is the brush editor's own — 0.0..=0.95, where 1.0
+                // would be a stroke that never reaches the pen — so the two
+                // controls cannot disagree about what full stabilisation is.
+                widgets::inline_slider(
                     ui,
                     p,
                     "Stabiliser",
-                    &format!("{:.0}", ed.brush.stabilization * 100.0),
-                    "How much this brush smooths the stroke. Change it in the \
-                     brush editor — the pencil in the Brushes panel header — \
-                     on the Tip tab.",
+                    &mut ed.brush.stabilization,
+                    0.0..=Brush::MAX_STABILIZATION,
+                    false,
+                    |v| format!("{:.0}", v * 100.0),
                 );
             }
         } else if ed.ui.tool == Tool::Transform {
@@ -1608,12 +1618,13 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 ///
 /// [`widgets::dropdown`], like every other dropdown in the interface. It used
 /// to paint a filled `p.control` pill behind itself so it would read as a
-/// control against the strip, and it no longer does — deliberately. The strip
-/// already has a filled pill on it, [`widgets::chip`], and there the fill means
-/// the opposite: a chip is a *reading*, deliberately not a control, and says so
-/// in its tooltip. Two pills side by side, one of which opens and one of which
-/// does not, teaches nothing. What says this opens is the chevron, which is
-/// what says it everywhere else too.
+/// control against the strip, and it no longer does — deliberately. A fill on
+/// this strip meant the opposite of "a control": [`widgets::chip`] is a
+/// *reading*, and the stabiliser was one until it became a rail. That is why
+/// there is still no filled dropdown — the fill would have to be learnt as
+/// meaning one thing here and another in Settings, where the chips remain.
+/// What says this opens is the chevron, which is what says it everywhere else
+/// too.
 fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.selection_mode.label();
     widgets::dropdown(ui, p, widgets::Dropdown::new(label), |ui| {
@@ -2056,12 +2067,15 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 |v| format!("{v:.0}°"),
             );
         });
+        // The same range the tool options strip's rail uses, from the one
+        // constant, so the two controls cannot disagree about what full
+        // stabilisation is.
         widgets::slider_row(
             &mut c[1],
             p,
             "Stabilisation",
             &mut ed.brush.stabilization,
-            0.0..=0.95,
+            0.0..=Brush::MAX_STABILIZATION,
             false,
             percent,
         );

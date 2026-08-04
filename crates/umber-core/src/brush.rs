@@ -332,6 +332,16 @@ impl Brush {
     /// stops being a texture at all.
     pub const MIN_GRAIN_SCALE: f32 = 16.0;
     pub const MAX_GRAIN_SCALE: f32 = 2048.0;
+    /// The heaviest smoothing a control may ask for.
+    ///
+    /// Just under 1.0 rather than 1.0, because `StrokeBuilder`'s filter is
+    /// `1.0 - stabilization` and a stroke smoothed by the whole of it would
+    /// never reach the pen at all. `stroke.rs` clamps the coefficient anyway —
+    /// this is the number the *controls* are drawn against, and it is a
+    /// constant because there are now two of them: the brush editor's Tip
+    /// section and the tool options strip's rail. Two hand-typed 0.95s is how
+    /// the two come to disagree about what full stabilisation is.
+    pub const MAX_STABILIZATION: f32 = 0.95;
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {
