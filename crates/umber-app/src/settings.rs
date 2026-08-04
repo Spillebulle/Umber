@@ -323,8 +323,9 @@ fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
                 ui.label(
-                    // An em dash, not a middle dot: the workspace title already
-                    // proves Archivo carries this one.
+                    // A middle dot, which the workspace title and the tab strip
+                    // both already prove Archivo carries. It used to be an em
+                    // dash; nothing the interface draws uses one now.
                     egui::RichText::new(format!("v{} · GPL-3.0", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
                         .color(p.text_dim.gamma_multiply(0.7)),

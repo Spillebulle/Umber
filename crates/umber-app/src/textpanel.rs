@@ -119,6 +119,19 @@ impl Fonts {
         &self.library
     }
 
+    /// Hold the library at the built-in face, so [`Self::start`] never scans.
+    ///
+    /// For `docshot`, and the reason `brushlib::stage_library` exists: the shot
+    /// is committed, and a picture whose face count is the number of fonts
+    /// installed on a contributor's machine is a picture of that machine. The
+    /// scan lands on a *later* frame and `docshot` draws one, so the count was
+    /// already the built-in's own nine styles — but that is a race won rather
+    /// than a guarantee, and this makes it the second. It also stops the tool
+    /// spawning a several-hundred-file thread it has no use for.
+    pub fn hold_at_builtin(&mut self) {
+        self.started = true;
+    }
+
     pub fn scanning(&self) -> bool {
         self.pending.is_some()
     }

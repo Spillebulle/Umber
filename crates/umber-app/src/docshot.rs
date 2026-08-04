@@ -328,6 +328,36 @@ fn interface(stage: &mut Stage, dir: &Path) -> Result<Vec<(PathBuf, u64, u32, u3
         "layers.png",
     )?);
 
+    // The Brush tweaks module: six rails and a grip beside each. An elliptical
+    // dab so the Angle rail is live rather than greyed, which is the one row
+    // whose enablement is decided by another row.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Tweaks,
+        vec2(theme::metrics::PANEL, 420.0),
+        |ed| ed.brush.dab_ratio = 2.5,
+        "tweaks.png",
+    )?);
+
+    // The Text module, with something set in it.
+    //
+    // `hold_at_builtin` for the reason `stage_library` is staged above: the
+    // face count the dropdown draws would otherwise be the number of fonts
+    // installed on whichever machine regenerated this, published in the README.
+    out.push(panel_shot(
+        stage,
+        dir,
+        PanelKind::Text,
+        vec2(theme::metrics::PANEL, 545.0),
+        |ed| {
+            ed.text.fonts.hold_at_builtin();
+            ed.text.block.text = "Painted in Umber\non a Tuesday".to_string();
+            ed.text.block.align = umber_core::text::Align::Centre;
+        },
+        "text.png",
+    )?);
+
     Ok(out)
 }
 
@@ -351,15 +381,16 @@ fn panel_shot(
     // regenerating it happens to have saved — published in the README, and
     // disagreeing with the README's own figure for what ships.
     //
-    // An absent directory is an empty library, and reading one writes nothing:
-    // `load_from` writes only when it has migrated a flat `brushes.ron`, and
-    // there is none beside a path that does not exist. It can still fail on a
-    // temporary directory that cannot be read at all, and this is a developer
-    // tool, so that stops here with a sentence rather than producing a picture
-    // of a library Umber could not open.
-    let no_library = UserLibrary::load_from(std::env::temp_dir().join("umber-docshot-no-library"))
-        .map_err(|e| format!("the empty stand-in library would not load: {e}"))?;
-    crate::brushlib::stage_library(&stage.ctx, &mut ed, no_library);
+    // `UserLibrary::empty` rather than `load_from` on a path chosen to be
+    // absent. That reads no disk at all, so the guarantee is a property of the
+    // code rather than a claim about a directory anybody can write to: a stray
+    // `<dir>.ron` beside such a path is a *migration*, which `load_from` reads
+    // and then writes back out, and the picture would have been of that.
+    //
+    // It is staged for every panel rather than only for Brushes, because the
+    // rule is about the panel that reads a library and not about which shot is
+    // being taken.
+    crate::brushlib::stage_library(&stage.ctx, &mut ed, UserLibrary::empty(""));
     let palette = ed.palette();
     let rect = Rect::from_min_size(Pos2::ZERO, field);
     let image = stage

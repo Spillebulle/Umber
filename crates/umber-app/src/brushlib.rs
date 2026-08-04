@@ -1642,13 +1642,34 @@ fn import_notice(
             };
         }
         1 => failures[0].clone(),
-        n => format!("{} And {} more failed.", failures[0], n - 1),
+        // The first reason, then a count of the rest. It has to punctuate the
+        // join itself: `failures[0]` is either this module's own "… could not
+        // be read." or a `PresetError`, and none of that enum's sentences ends
+        // in a full stop — so a bare "And" ran the two together into "…Umber
+        // can read And 2 more failed."
+        n => format!("{} And {} more failed.", end_sentence(&failures[0]), n - 1),
     };
     Notice::bad(if summary.is_empty() {
         trailer
     } else {
         format!("{summary}{losses} {trailer}")
     })
+}
+
+/// The sentence with a full stop on the end, adding one only where there is
+/// not already terminal punctuation.
+///
+/// The reasons collected by an import come from two places with two
+/// conventions: this module writes "… could not be read." and `PresetError`'s
+/// `Display` writes a clause with nothing on the end. Anything joining them to
+/// a following sentence has to settle that itself.
+fn end_sentence(sentence: &str) -> String {
+    let trimmed = sentence.trim_end();
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}.")
+    }
 }
 
 /// `smudge`, `smudge and tilt`, `smudge, tilt and direction`.
@@ -3485,6 +3506,26 @@ mod tests {
         );
         assert!(notice.bad);
         assert!(notice.text.contains("2 more failed"), "{}", notice.text);
+        // The first reason and the count are two sentences, whichever
+        // convention the reason arrived under. `PresetError`'s `Display` ends
+        // in a clause with no full stop, and this module's own wording ends in
+        // one; running them together produced "…a failed And 2 more failed."
+        assert!(
+            notice.text.contains("a failed. And 2 more failed."),
+            "{}",
+            notice.text
+        );
+        let punctuated = import_notice(
+            &[PathBuf::from("a"), PathBuf::from("b")],
+            &[],
+            &["a failed.".to_owned(), "b failed.".to_owned()],
+            &[],
+        );
+        assert!(
+            punctuated.text.contains("a failed. And 1 more failed."),
+            "and a reason that already had one does not gain a second: {}",
+            punctuated.text
+        );
     }
 
     /// The brush arrives, and is *said* to be an approximation. Shipping it

@@ -212,10 +212,15 @@ impl OutlinePen for Pen<'_> {
 ///
 /// The interface's standing rule is that no Unicode symbol may be put in the UI,
 /// because Archivo carries none of the ones people reach for and they render as
-/// blank boxes. The splash uses two characters that are *not* obviously safe —
-/// a middle dot and an em dash — so this exists to let a test prove they are
-/// really in the font rather than assume it. That is its only caller, hence the
-/// gate: it is a proof obligation, not a runtime check.
+/// blank boxes. The splash uses one character that is *not* obviously safe, the
+/// middle dot, so this exists to let a test prove it is really in the font
+/// rather than assume it. That is its only caller, hence the gate: it is a
+/// proof obligation, not a runtime check.
+///
+/// It used to be two, the second being an em dash. Nothing the interface draws
+/// carries one now — the shader line joins with a colon — but the check still
+/// runs over the whole of every string the splash draws, so a character added
+/// to one of them is covered without this comment having to name it.
 #[cfg(test)]
 pub fn covers(text: &str) -> bool {
     let Ok(face) = FontRef::new(ARCHIVO) else {
@@ -271,8 +276,9 @@ mod tests {
 
     #[test]
     fn archivo_carries_every_character_the_splash_draws() {
-        // Including the two that are not plain ASCII. If either of these ever
-        // fails, the fix is to change the string, not to add a fallback font.
+        // Including the middle dot, which is the one character here that is not
+        // plain ASCII. If any of these ever fails, the fix is to change the
+        // string, not to add a fallback font.
         assert!(covers("UMBER"), "the wordmark");
         assert!(covers("GPU PAINTING · v0.1.0"), "the middle dot");
         assert!(covers("compiling shaders: dab.wgsl"), "the shader line");

@@ -111,12 +111,17 @@ hardness, scatter, ellipticity, angle and colour.
 
 ### Change one mid-painting
 
-**Brush tweaks** is a module for the settings you reach for while a picture is
-under way: size, opacity, hardness, spacing, roundness, airbrush rate, angle and
-colour pickup. Each has a rail, a keyboard pair and a hold-and-drag grip.
+<img src="docs/images/tweaks.png" alt="The Brush tweaks module: six rails, each
+with a hold-and-drag grip beside it" align="right" width="270">
 
-They change the brush in your hand and not the brush you saved. Picking any
-brush puts its own settings back.
+**Brush tweaks** puts six rails where you can reach them while a picture is
+under way. Each has a hold-and-drag grip beside it, and size and opacity have
+theirs above the canvas already.
+
+All eight take a keyboard pair too. They change the brush in your hand and not
+the brush you saved, so picking any brush puts its own settings back.
+
+<br clear="right">
 
 ## Layers
 
@@ -148,8 +153,8 @@ where it lands, and at what depth, before you let go.
 
 ## Colour
 
-Four ways to pick one. Either wheel can be turned to whatever angle you like to
-work at, and Umber remembers each shape's angle separately.
+Four ways to pick one. The triangle and the square inside the hue ring can each
+be turned to whatever angle you like to work at, and each keeps its own.
 
 | Wheel, triangle | Wheel, square | Saturation / value | Sliders |
 |---|---|---|---|
@@ -165,8 +170,11 @@ can read yours.
 
 ## Text
 
-Set a line of text in any font on this machine and place it on the canvas, where
-the transform tool moves, scales and turns it before it goes down.
+<img src="docs/images/text.png" alt="The Text module: what you have typed, the
+face and its size, and a preview of the setting" align="right" width="270">
+
+Type in any font on this machine and place what you set on the canvas, where the
+transform tool moves, scales and turns it before it goes down.
 
 | | |
 |---|---|
@@ -177,6 +185,8 @@ the transform tool moves, scales and turns it before it goes down.
 
 Placing it works exactly like a paste, so `Esc` abandons it and one undo takes
 it back off. It is pixels once it is down, not something that can be re-typed.
+
+<br clear="right">
 
 ## Selections and moving things
 
@@ -209,7 +219,9 @@ one step.
 
 Copy, cut and paste work across tabs, and with the rest of the machine. A
 screenshot pastes straight in, and a region copied out of Umber can be pasted
-anywhere else.
+anywhere else. On Linux that lasts only while Umber is running, unless your
+desktop has a clipboard manager, which is how X11 and Wayland work rather than
+anything Umber decides.
 
 ## Documents
 
@@ -242,17 +254,16 @@ tomorrow can still be stepped back through.
 pane" width="49%"> <img src="docs/images/settings-shortcuts.png" alt="The
 settings dialog, Shortcuts pane" width="49%">
 
-Panels are **locked while you paint** and rearranged in a mode of their own:
-**Window → Customise layout**. Drag any module by its header into a column, onto
-a column's edge to start a new one, or over the canvas to leave it floating. The
-tool rail is a module like any other. Your arrangement is saved between runs.
+Every panel is a module you drag where you want it, the tool rail included, and
+they are **locked while you paint**. **Window → Customise layout** unlocks them,
+and your arrangement is saved between runs.
 
-Two themes ship, and you can make your own from a copy of either. Shortcut
-labels follow your own keyboard, so a Nordic layout shows the key that actually
-zooms.
+Two themes ship, and you can make your own from a copy of either. There is an
+interface scale for a dense display, which leaves the canvas alone.
 
-**Settings → Input & pen** is the page to open when a pen feels wrong. It shows
-what your tablet is sending, beside what Umber made of it.
+Shortcut labels follow your own keyboard, so a Nordic layout shows the key that
+actually zooms. **Settings → Input & pen** is the page to open when a pen feels
+wrong.
 
 ## Your work is hard to lose
 
@@ -304,8 +315,7 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 
 ## What is not there yet
 
-- **Ten of the sixteen tools**, shapes among them. What is not built is not
-  drawn, rather than drawn and dead.
+- **Ten of the sixteen tools**, shapes among them.
 - **Three things about text**, each of which the panel tells you about rather
   than letting you find out later. Lines break where you break them and nothing
   wraps. A line mixing left-to-right and right-to-left writing is shaped but not
