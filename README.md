@@ -171,9 +171,9 @@ the transform tool moves, scales and turns it before it goes down.
 | | |
 |---|---|
 | Fonts | every one installed, plus a folder of your own if you point Umber at one |
-| Shaping | kerning, ligatures and mark positioning, so a word is a word in any script |
+| Shaping | kerning, ligatures and mark positioning, so a word joins up rather than coming out as loose letters |
 | Lines | break where you break them; nothing wraps on its own yet |
-| Alignment, size, line spacing, tracking | rails in the panel |
+| Set | family, style, size, line spacing, tracking and alignment |
 
 Placing it works exactly like a paste, so `Esc` abandons it and one undo takes
 it back off. It is pixels once it is down, not something that can be re-typed.
