@@ -1937,7 +1937,10 @@ fn a_coloured_stamp_stops_being_one_when_the_tip_is_taken_off() {
 
     h.set_tip(Some(TipMask::new(2, 1, vec![255, 255]).expect("tip")));
     assert!(!h.canvas.has_coloured_tip());
-    h.stamp_colored(&[coloured_dab(32.0, 32.0, 12.0, 1.0, [0.0, 1.0, 0.0])], true);
+    h.stamp_colored(
+        &[coloured_dab(32.0, 32.0, 12.0, 1.0, [0.0, 1.0, 0.0])],
+        true,
+    );
     h.commit(Color::BLACK, 1.0, BrushMode::Paint);
     assert_near(h.pixel(22, 32), [0, 255, 0], 4, "the stamp is still red");
 

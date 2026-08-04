@@ -327,7 +327,11 @@ impl TipMask {
                 let px = &buf[..texels * 4];
                 (
                     px.chunks_exact(4).map(|p| p[3]).collect(),
-                    Some(px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()),
+                    Some(
+                        px.chunks_exact(4)
+                            .flat_map(|p| [p[0], p[1], p[2]])
+                            .collect(),
+                    ),
                 )
             }
             other => {
