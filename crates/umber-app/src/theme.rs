@@ -309,11 +309,9 @@ impl Token {
                 TokenGroup::Surfaces
             }
             Self::Border | Self::PopoverBorder => TokenGroup::Lines,
-            Self::Control
-            | Self::ControlHover
-            | Self::ControlActive
-            | Self::Rail
-            | Self::Knob => TokenGroup::Controls,
+            Self::Control | Self::ControlHover | Self::ControlActive | Self::Rail | Self::Knob => {
+                TokenGroup::Controls
+            }
             Self::TextStrong | Self::Text | Self::TextMuted | Self::TextDim => TokenGroup::Type,
             Self::Accent | Self::AccentDim => TokenGroup::Accent,
             Self::Warning | Self::WarningBg | Self::WarningBorder => TokenGroup::Warnings,

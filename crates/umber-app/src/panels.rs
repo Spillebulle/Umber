@@ -2530,7 +2530,7 @@ mod tests {
         use crate::dock::{Layout, PanelKind};
         use crate::docshot;
         use crate::editor::Editor;
-        use crate::theme::{Palette, metrics};
+        use crate::theme::metrics;
         use egui::{Pos2, Rect, vec2};
 
         let Some(mut stage) = docshot::Stage::new() else {
@@ -2559,7 +2559,7 @@ mod tests {
             for index in ticks {
                 ed.layers.pick(*index, true);
             }
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let palette = ed.palette();
             let field = vec2(metrics::PANEL, 300.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
             let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
@@ -2596,7 +2596,7 @@ mod tests {
         use crate::docshot;
         use crate::editor::Editor;
         use crate::layerdrag::{Aim, Drag};
-        use crate::theme::{Palette, metrics};
+        use crate::theme::metrics;
         use egui::{Pos2, Rect, vec2};
 
         let Some(mut stage) = docshot::Stage::new() else {
@@ -2624,7 +2624,7 @@ mod tests {
             ed.layers.add();
             ed.layers.add();
             ed.layers.group(&[1, 2]);
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let palette = ed.palette();
             let field = vec2(metrics::PANEL, 300.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
             let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
@@ -2669,7 +2669,7 @@ mod tests {
         use crate::dock::{Layout, PanelKind, limits};
         use crate::docshot;
         use crate::editor::Editor;
-        use crate::theme::{Palette, metrics};
+        use crate::theme::metrics;
         use egui::{Pos2, Rect, vec2};
 
         let Some(mut stage) = docshot::Stage::new() else {
@@ -2700,7 +2700,7 @@ mod tests {
                     folder.locked = true;
                 }
             }
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let palette = ed.palette();
             let field = vec2(width, 300.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
             let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {

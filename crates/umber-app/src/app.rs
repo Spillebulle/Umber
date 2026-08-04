@@ -14,7 +14,7 @@ use crate::syscursor;
 use crate::tabs::{self, Notice};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 use crate::taskbar;
-use crate::theme::{self, Accent, ThemeKind};
+use crate::theme;
 use crate::thumbs;
 use crate::ui;
 use crate::update;
@@ -176,11 +176,17 @@ pub struct UmberApp {
     /// Theme currently pushed into egui's style, so restyling only happens on
     /// an actual change.
     ///
-    /// The accent is part of the key, not just the theme: it re-hues the
-    /// palette, and egui's own tokens — selection fill, hyperlink colour —
-    /// carry it too. Keyed on the theme alone, picking a new accent left those
-    /// on the old hue until something else happened to trigger a restyle.
-    applied_theme: Option<(ThemeKind, Accent)>,
+    /// The **resolved palette**, not the theme and accent it came from. The
+    /// accent had to be in the key because it re-hues the palette and egui's
+    /// own tokens carry it — keyed on the theme alone, picking a new accent
+    /// left the selection fill and the hyperlink colour on the old hue until
+    /// something else happened to trigger a restyle. A theme somebody is
+    /// *editing* is the same argument taken one step further: its name does not
+    /// change while its colours do, so anything short of the palette itself
+    /// would leave the settings dialog showing the old colours while the cards
+    /// beside it showed the new ones. It is 27 `Color32`s and it is compared
+    /// once a frame.
+    applied_theme: Option<theme::Palette>,
     bindings: Vec<shortcuts::Binding>,
     /// When egui next wants to be redrawn, if it does — a fading hover, a
     /// blinking caret. `None` means "sleep until something happens".
@@ -1989,12 +1995,9 @@ impl UmberApp {
 
         // Restyling walks the whole style struct, so only do it when the theme
         // actually changed rather than every frame.
-        let wanted = (self.editor.ui.theme, self.editor.ui.accent);
+        let wanted = self.editor.palette();
         if self.applied_theme != Some(wanted) {
-            theme::apply(
-                &gfx.egui_ctx,
-                &theme::Palette::with_accent(wanted.0, wanted.1),
-            );
+            theme::apply(&gfx.egui_ctx, &wanted);
             self.applied_theme = Some(wanted);
         }
 
@@ -2259,8 +2262,7 @@ impl UmberApp {
                 layers: &layer_draws,
                 active_index: self.editor.active_draw_index(),
                 stroke: self.editor.stroke_style,
-                backdrop: theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent)
-                    .backdrop_display(),
+                backdrop: self.editor.palette().backdrop_display(),
                 export: false,
             },
         );
@@ -3240,10 +3242,7 @@ impl ApplicationHandler<Wake> for UmberApp {
         // splash paints it from the CPU — the only way to reach a window that
         // has no GPU surface yet. Each stage is shown *before* the work it
         // names, so the bar never claims progress that has not happened.
-        let mut splash = Splash::new(
-            window.clone(),
-            theme::Palette::with_accent(self.editor.ui.theme, self.editor.ui.accent),
-        );
+        let mut splash = Splash::new(window.clone(), self.editor.palette());
         splash.show(splash::Stage::Adapter);
 
         let instance = Gpu::create_instance();

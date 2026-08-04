@@ -1174,7 +1174,7 @@ mod tests {
     fn palette_module_preview() {
         use crate::dock::{Layout, PanelKind};
         use crate::docshot;
-        use crate::theme::Palette as Theme;
+
         use egui::{Pos2, Rect, vec2};
 
         let Some(mut stage) = docshot::Stage::new() else {
@@ -1218,7 +1218,7 @@ mod tests {
                     .map(|q| q.id.clone());
             }
 
-            let palette = Theme::with_accent(ed.ui.theme, ed.ui.accent);
+            let palette = ed.palette();
             let field = if open {
                 vec2(metrics::PALETTE_LIBRARY[0] + 80.0, 560.0)
             } else {

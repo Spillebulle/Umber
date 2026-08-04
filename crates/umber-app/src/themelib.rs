@@ -100,11 +100,16 @@ pub enum ThemeError {
     /// The file does not begin with [`HEADER`].
     NotATheme(PathBuf),
     /// The library already holds as many themes as it will read back.
-    Full { max: usize },
+    Full {
+        max: usize,
+    },
     /// No id in this library matches.
     Unknown(String),
     NoDataDirectory,
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ThemeError {
@@ -203,11 +208,7 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
         .map(|c| c.to_digit(16).map(|d| d as u8))
         .collect::<Option<Vec<u8>>>()?;
     let [r, g, b] = match digits.len() {
-        3 => [
-            digits[0] * 17,
-            digits[1] * 17,
-            digits[2] * 17,
-        ],
+        3 => [digits[0] * 17, digits[1] * 17, digits[2] * 17],
         6 => [
             digits[0] * 16 + digits[1],
             digits[2] * 16 + digits[3],
@@ -343,6 +344,25 @@ pub struct ThemeLibrary {
     warnings: Vec<String>,
 }
 
+/// Where [`ThemeLibrary::load`] reads from, when something has said.
+///
+/// The same shape as `prefs::LABEL`, and it exists for a related reason: a
+/// preview shot of the Themes pane has to have a theme in the library to show
+/// the editable half of it, and the only library there is belongs to whoever is
+/// running the tests. Writing into somebody's real data directory to take a
+/// picture is not something a test may do; taking the picture at all is the
+/// only way the pane's *layout* is ever looked at, which is the failure both
+/// bugs on this page were. Set once, by `settings`' preview alone. Nothing in
+/// the application calls it, and [`stage_dir`] is the only way in.
+static STAGED_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Read themes from `dir` instead of the user's own directory. Takes effect
+/// once and cannot be undone.
+#[cfg(test)]
+pub fn stage_dir(dir: PathBuf) {
+    let _ = STAGED_DIR.set(dir);
+}
+
 impl ThemeLibrary {
     /// Directory name under the platform's user-data directory, beside
     /// `umber_core::preset::UserLibrary::DIR_NAME` and the palettes'.
@@ -357,6 +377,9 @@ impl ThemeLibrary {
     /// reason `Library::collections` exists, and the reason a theme cannot live
     /// beside the two that are compiled in.
     pub fn default_dir() -> Option<PathBuf> {
+        if let Some(dir) = STAGED_DIR.get() {
+            return Some(dir.clone());
+        }
         directories::ProjectDirs::from("", "", "Umber")
             .map(|dirs| dirs.data_dir().join(Self::DIR_NAME))
     }
@@ -449,9 +472,13 @@ impl ThemeLibrary {
         });
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
+    // There is deliberately no `dir()` accessor, unlike `PaletteLibrary`'s.
+    // The one thing it would be for is a "Show the folder" control beside the
+    // editor, and the Themes pane is the one page `docshot` photographs for the
+    // README — a path on it would carry a contributor's home directory into a
+    // committed picture, which is exactly what `prefs::set_config_path_label`
+    // exists to stop. The warnings below already name the file when one will
+    // not read, which is when somebody actually needs to find the folder.
 
     /// Anything that could not be read but did not stop the library loading.
     pub fn warnings(&self) -> &[String] {
@@ -464,10 +491,6 @@ impl ThemeLibrary {
 
     pub fn get(&self, id: &str) -> Option<&CustomTheme> {
         self.themes.iter().find(|t| t.id == id)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.themes.is_empty()
     }
 
     /// Whether another theme will fit. The New control reads this and is
@@ -603,10 +626,7 @@ impl ThemeLibrary {
         umber_core::preset::unique_name(
             desired,
             UNTITLED,
-            self.themes
-                .iter()
-                .map(|t| t.name.as_str())
-                .chain(built_in.into_iter()),
+            self.themes.iter().map(|t| t.name.as_str()).chain(built_in),
         )
     }
 
@@ -829,7 +849,10 @@ mod tests {
             "accent = #123456\n",
         );
         let read = read_theme(text, &here()).expect("a header and two lines");
-        assert_eq!(read.theme.palette.accent, Color32::from_rgb(0x12, 0x34, 0x56));
+        assert_eq!(
+            read.theme.palette.accent,
+            Color32::from_rgb(0x12, 0x34, 0x56)
+        );
         assert_eq!(read.theme.palette.window, Palette::paper().window);
         assert_eq!(read.theme.palette.text, Palette::paper().text);
         assert_eq!(read.skipped, 0, "an absent token is not a loss");
@@ -858,7 +881,10 @@ mod tests {
             "\u{0}\u{0} binary rubbish from a truncated write\n",
         );
         let read = read_theme(text, &here()).expect("the header is intact");
-        assert_eq!(read.theme.palette.window, Color32::from_rgb(0x10, 0x11, 0x12));
+        assert_eq!(
+            read.theme.palette.window,
+            Color32::from_rgb(0x10, 0x11, 0x12)
+        );
         assert_eq!(
             read.theme.palette.accent,
             Palette::graphite().accent,
@@ -880,11 +906,25 @@ mod tests {
 
     #[test]
     fn a_hex_is_read_in_every_form_a_person_types_and_no_other() {
-        assert_eq!(parse_hex("#C08A4E"), Some(Color32::from_rgb(0xC0, 0x8A, 0x4E)));
-        assert_eq!(parse_hex("c08a4e"), Some(Color32::from_rgb(0xC0, 0x8A, 0x4E)));
+        assert_eq!(
+            parse_hex("#C08A4E"),
+            Some(Color32::from_rgb(0xC0, 0x8A, 0x4E))
+        );
+        assert_eq!(
+            parse_hex("c08a4e"),
+            Some(Color32::from_rgb(0xC0, 0x8A, 0x4E))
+        );
         assert_eq!(parse_hex("  #FFF  "), Some(Color32::WHITE));
         assert_eq!(parse_hex("#012"), Some(Color32::from_rgb(0x00, 0x11, 0x22)));
-        for bad in ["", "#", "#12", "#12345", "#12345678", "rebeccapurple", "#GGGGGG"] {
+        for bad in [
+            "",
+            "#",
+            "#12",
+            "#12345",
+            "#12345678",
+            "rebeccapurple",
+            "#GGGGGG",
+        ] {
             assert_eq!(parse_hex(bad), None, "{bad} was read as a colour");
         }
         // The pair has to be an exact inverse, or a theme moves a level every
@@ -904,11 +944,15 @@ mod tests {
             ThemeKind::Graphite,
             Palette::of(ThemeKind::Graphite),
         );
-        let back = read_theme(&theme.to_text(), &here()).expect("written by us").theme;
+        let back = read_theme(&theme.to_text(), &here())
+            .expect("written by us")
+            .theme;
         assert_eq!(back.name, "Two lines");
 
         let blank = CustomTheme::new("   ", ThemeKind::Graphite, Palette::of(ThemeKind::Graphite));
-        let back = read_theme(&blank.to_text(), &here()).expect("written by us").theme;
+        let back = read_theme(&blank.to_text(), &here())
+            .expect("written by us")
+            .theme;
         assert_eq!(back.name, UNTITLED);
     }
 
@@ -916,7 +960,7 @@ mod tests {
     fn a_theme_survives_the_library_being_written_and_read_back() {
         let dir = temp_dir("roundtrip");
         let mut library = ThemeLibrary::load_from(&dir);
-        assert!(library.is_empty());
+        assert!(library.themes().is_empty());
 
         let mut palette = Palette::of(ThemeKind::Graphite);
         palette.set_token(Token::Accent, Color32::from_rgb(0x11, 0x22, 0x33));
@@ -952,7 +996,11 @@ mod tests {
             !names.contains(&"Graphite"),
             "a custom theme took a built-in's name: {names:?}"
         );
-        assert_eq!(names.len(), 2, "the two must not be the same name: {names:?}");
+        assert_eq!(
+            names.len(),
+            2,
+            "the two must not be the same name: {names:?}"
+        );
         assert_ne!(names[0], names[1]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -968,11 +1016,15 @@ mod tests {
         fs::write(&squatter, "this is not a theme at all\n").expect("temp");
 
         let mut library = ThemeLibrary::load_from(&dir);
-        assert!(library.is_empty());
+        assert!(library.themes().is_empty());
         assert_eq!(library.warnings().len(), 1);
 
         let id = library
-            .duplicate("Midnight", ThemeKind::Graphite, Palette::of(ThemeKind::Graphite))
+            .duplicate(
+                "Midnight",
+                ThemeKind::Graphite,
+                Palette::of(ThemeKind::Graphite),
+            )
             .expect("room");
         assert_ne!(id, "midnight", "the unreadable file's name was handed out");
         assert_eq!(
@@ -1012,7 +1064,11 @@ mod tests {
         let dir = temp_dir("delete");
         let mut library = ThemeLibrary::load_from(&dir);
         let id = library
-            .duplicate("Gone", ThemeKind::Graphite, Palette::of(ThemeKind::Graphite))
+            .duplicate(
+                "Gone",
+                ThemeKind::Graphite,
+                Palette::of(ThemeKind::Graphite),
+            )
             .expect("room");
         assert!(library.remove(&id).expect("it is there"));
         assert!(library.get(&id).is_none());

@@ -46,7 +46,9 @@ use crate::icons::{self, Icon};
 use crate::inputlog;
 use crate::prefs;
 use crate::shortcuts::{self, Action, Binding};
-use crate::theme::{Accent, Palette, ThemeKind, metrics, text};
+use crate::tabs::Notice;
+use crate::theme::{Accent, Palette, ThemeKind, Token, TokenGroup, metrics, text};
+use crate::themelib::{self, ThemeLibrary};
 use crate::ui::UiActions;
 use crate::widgets;
 use egui::{Align2, Color32, FontId, Frame, Margin, Rect, Sense, Stroke, vec2};
@@ -177,19 +179,82 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
     }
 }
 
+/// Gap between the footer's hairline and the row under it.
+const FOOTER_GAP: f32 = 8.0;
+
 /// Height the footer — the hairline, the path and the reset button — claims at
 /// the bottom of every pane.
 ///
 /// Named because two places have to agree on it: the pane, which pushes the
 /// footer down by whatever is left, and the Shortcuts list, which grows to fill
 /// that same space and would otherwise slide underneath it.
-const FOOTER_RESERVE: f32 = 34.0;
+///
+/// **Added up from its parts rather than estimated**, and that is the fix for a
+/// real bug. It was 34 while the footer actually cost 47 — a hairline, two
+/// inherited eight-point item gaps, the eight-point gap of its own and a
+/// 22-point button — so the pane came out thirteen points taller than the
+/// height it had been handed. The rail beside it is exactly that height, the
+/// modal grows to the taller of the two, and the result was a left sidebar that
+/// stopped short of the bottom of the dialog with the version and licence
+/// floating above it. `storage_footer` takes its own vertical spacing to zero
+/// so the three parts here are all it costs.
+const FOOTER_RESERVE: f32 = 1.0 + FOOTER_GAP + metrics::TEXT_BUTTON;
 
 /// Breathing space between a pane's last control and the footer's hairline.
 const LIST_GAP: f32 = 12.0;
 
 /// Gap between the theme cards.
 const CARD_GAP: f32 = 12.0;
+
+/// One theme card: the miniature workspace and the name strip under it.
+const CARD: [f32; 2] = [150.0, 104.0];
+
+/// Between the theme editor's two columns of tokens.
+///
+/// Named because the columns are sized from what is left once it has been taken
+/// off, and the two figures have to be the same one — see `theme_editor`.
+const TOKEN_GAP: f32 = 24.0;
+
+/// The hex field on a token row. Wide enough for `#RRGGBB` in the monospace
+/// face with room for a caret at the end of it.
+const HEX_FIELD: f32 = 56.0;
+
+/// The name field in the theme editor's heading.
+const NAME_FIELD: f32 = 160.0;
+
+/// A text field dressed as the readout it stands in for.
+///
+/// A bare `egui::TextEdit` is invisible here: its fill is `extreme_bg_color`,
+/// which `theme::apply` sets to `Palette::window`, which is exactly what the
+/// theme editor's box is filled with — so the field read as a label and the one
+/// editable thing on the page looked like the read-only inspector it replaced.
+/// A well of its own, in the same shapes `controls::search_field` uses.
+fn inset_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    buffer: &mut String,
+    width: f32,
+    font: FontId,
+) -> egui::Response {
+    let mut response = None;
+    Frame::NONE
+        .fill(p.control)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(metrics::RADIUS)
+        .inner_margin(Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            response = Some(
+                ui.add(
+                    egui::TextEdit::singleline(buffer)
+                        .frame(egui::Frame::NONE)
+                        .desired_width(width)
+                        .font(font)
+                        .text_color(p.text_strong),
+                ),
+            );
+        });
+    response.expect("a frame always runs its body")
+}
 
 /// The design's left rail: title, tabs, then the version at the foot.
 fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
@@ -303,9 +368,29 @@ fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions
                     }
                 });
 
-            let left = (ui.available_height() - FOOTER_RESERVE).max(0.0);
-            ui.allocate_space(vec2(0.0, left));
-            storage_footer(ui, p, ed);
+            // The footer goes in the bottom `FOOTER_RESERVE` points of whatever
+            // is left, and the pane consumes *exactly* what it was handed. It
+            // used to `allocate_space` a gap and then let the footer size
+            // itself, which came out thirteen points over — and since the rail
+            // is exactly the dialog's height, the modal grew to the taller of
+            // the two and the rail stopped short of the bottom. The spacing is
+            // taken to zero first because an item gap between the last two
+            // widgets is the sort of thing that puts an exact figure out by
+            // eight; `new_child` does not advance this `Ui`, so the footer
+            // cannot grow it whatever ends up in it.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let rest = (ui.available_height()).max(0.0);
+            let (region, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), rest), Sense::hover());
+            let mut footer = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(Rect::from_min_size(
+                        egui::pos2(region.left(), region.bottom() - FOOTER_RESERVE),
+                        vec2(region.width(), FOOTER_RESERVE),
+                    ))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            storage_footer(&mut footer, p, ed);
         });
 }
 
@@ -1280,24 +1365,204 @@ fn test_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 // Themes
 // ---------------------------------------------------------------------------
 
+/// What the Themes pane is holding between frames: the library, the fields
+/// being typed into, and a Delete that has been pressed once.
+///
+/// In egui's temporary store rather than on [`Editor`] for the reason
+/// `palettelib`'s state is: it is interaction state of one pane, nothing
+/// outside this file has any use for it, and reading the library at launch for
+/// somebody who has never opened this page would be a directory read — and
+/// possibly a notice about a file that would not parse — for a feature they
+/// have not asked for.
+#[derive(Clone)]
+struct Themes {
+    /// The library, or why there is none. Two states rather than an `Option`,
+    /// because "there is nowhere to keep themes on this system" is a sentence
+    /// the controls have to be able to show instead of simply being dead —
+    /// `brushlib::Store`'s and `palettelib::Store`'s arrangement.
+    store: Result<std::sync::Arc<ThemeLibrary>, String>,
+    /// Which theme [`Themes::hex`] and [`Themes::name`] were filled from, so a
+    /// different theme being picked refills them.
+    ///
+    /// The empty string is a built-in, which has no fields.
+    filled_from: String,
+    /// One typed hex per token, in [`Token::ALL`] order.
+    ///
+    /// The buffer is the state's own and is edited in place: a `TextEdit`'s
+    /// text belongs to the caller and the pane is rebuilt every frame, so a
+    /// local copy would lose a character per frame.
+    hex: Vec<String>,
+    name: String,
+    /// The id of the theme whose Delete has been pressed once. Deleting a theme
+    /// cannot be undone — the history covers painting only — so it asks.
+    confirming: Option<String>,
+}
+
+impl Themes {
+    fn library(&self) -> Option<&std::sync::Arc<ThemeLibrary>> {
+        self.store.as_ref().ok()
+    }
+
+    fn writable(&self) -> bool {
+        self.store.is_ok()
+    }
+
+    /// The tooltip for a control that writes when there is nothing to write to.
+    /// Never invented wording: it is what the library itself reported.
+    fn why_not(&self) -> &str {
+        match &self.store {
+            Ok(_) => "",
+            Err(why) => why,
+        }
+    }
+
+    /// Refill the typed fields from the theme in hand, when it is not the one
+    /// they already hold.
+    fn refill(&mut self, ed: &Editor) {
+        let id = ed.custom_theme.as_ref().map_or("", |t| t.id.as_str());
+        if self.filled_from == id && self.hex.len() == Token::ALL.len() {
+            return;
+        }
+        self.filled_from = id.to_owned();
+        let palette = ed.palette();
+        self.hex = Token::ALL
+            .into_iter()
+            .map(|token| themelib::hex(palette.token(token)))
+            .collect();
+        self.name = ed
+            .custom_theme
+            .as_ref()
+            .map_or(String::new(), |t| t.name.clone());
+        self.confirming = None;
+    }
+}
+
+fn themes_id() -> egui::Id {
+    egui::Id::new("settings-themes")
+}
+
+/// Read the pane's state back, reading the library off disk on the first frame.
+fn load_themes(ctx: &egui::Context, ed: &mut Editor) -> Themes {
+    let mut state = ctx
+        .data(|d| d.get_temp::<Themes>(themes_id()))
+        .unwrap_or_else(|| {
+            let store = match ThemeLibrary::load() {
+                Ok(library) => {
+                    // A file that would not read means a theme somebody made is not
+                    // in the row, which is worth one dialog on the first frame the
+                    // pane is drawn. The editor's own notice rather than a strip of
+                    // this page's, so there is one way a message reaches the user.
+                    if !library.warnings().is_empty() {
+                        ed.notice = Some(Notice {
+                            title: "Some themes could not be read".to_owned(),
+                            lines: library.warnings().to_vec(),
+                        });
+                    }
+                    Ok(std::sync::Arc::new(library))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            Themes {
+                store,
+                filled_from: String::new(),
+                hex: Vec::new(),
+                name: String::new(),
+                confirming: None,
+            }
+        });
+    // The theme in hand may have gone — deleted in another window, or its file
+    // removed between sessions — in which case `Editor::palette` is already
+    // falling back to the built-in and the row must not draw it as selected.
+    if let (Some(theme), Some(library)) = (&ed.custom_theme, state.library())
+        && library.get(&theme.id).is_none()
+    {
+        ed.custom_theme = None;
+        prefs::mark_dirty();
+    }
+    state.refill(ed);
+    state
+}
+
+fn store_themes(ctx: &egui::Context, state: Themes) {
+    ctx.data_mut(|d| d.insert_temp(themes_id(), state));
+}
+
+/// Run a write against the library and turn a failure into something the user
+/// can read rather than a log line nobody sees.
+///
+/// Every [`ThemeLibrary`] write reaches the disk immediately — see
+/// `themes_pane`'s note on why there is no Save button — so this is also where
+/// "it did not get written" becomes visible. `None` means it did not happen.
+fn write_theme<T>(
+    state: &mut Themes,
+    ed: &mut Editor,
+    what: &str,
+    op: impl FnOnce(&mut ThemeLibrary) -> Result<T, themelib::ThemeError>,
+) -> Option<T> {
+    let Ok(library) = &mut state.store else {
+        return None;
+    };
+    match op(std::sync::Arc::make_mut(library)) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            ed.notice = Some(Notice {
+                title: what.to_owned(),
+                lines: vec![e.to_string()],
+            });
+            None
+        }
+    }
+}
+
+/// Put a theme from the library in hand, and keep the fallback beside it.
+///
+/// `UiState::theme` stays a *built-in*, always: it is what `Editor::palette`
+/// falls back to when the file has gone, so it has to be the one this theme was
+/// made from rather than left on whatever was showing before.
+fn use_custom(ed: &mut Editor, theme: &themelib::CustomTheme) {
+    ed.ui.theme = theme.base;
+    ed.custom_theme = Some(theme.clone());
+    prefs::mark_dirty();
+}
+
 fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
-    ui.horizontal(|ui| {
-        // The dialog butts its rail against its pane with no gutter, and that
-        // zero horizontal spacing is inherited all the way down here — which
-        // left the theme cards touching. Set rather than left to the default,
-        // because the default is whatever the enclosing layout last said.
-        ui.spacing_mut().item_spacing.x = CARD_GAP;
+    let mut state = load_themes(ui.ctx(), ed);
+
+    // Wrapped, because the row grows by a card for every theme somebody makes
+    // and the pane is one fixed width — see the note on [`WIDTH`]. The dialog
+    // butts its rail against its pane with no gutter, and that zero horizontal
+    // spacing is inherited all the way down here, which left the cards
+    // touching; set rather than left to the default, because the default is
+    // whatever the enclosing layout last said.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(CARD_GAP, CARD_GAP);
         for kind in ThemeKind::ALL {
-            if theme_card(ui, p, kind, ed.ui.theme == kind) {
+            let selected = ed.custom_theme.is_none() && ed.ui.theme == kind;
+            if theme_card(ui, p, &Palette::of(kind), kind.label(), selected) {
                 ed.ui.theme = kind;
+                ed.custom_theme = None;
                 prefs::mark_dirty();
             }
         }
-        new_theme_card(ui, p);
+        let mine: Vec<themelib::CustomTheme> = state
+            .library()
+            .map(|library| library.themes().to_vec())
+            .unwrap_or_default();
+        for theme in &mine {
+            let selected = ed.custom_theme.as_ref().is_some_and(|t| t.id == theme.id);
+            if theme_card(ui, p, &theme.palette, &theme.name, selected) {
+                use_custom(ed, theme);
+            }
+        }
+        if new_theme_card(ui, p, &state) {
+            new_theme(&mut state, ed);
+        }
     });
 
     ui.add_space(14.0);
-    theme_editor(ui, p, ed);
+    theme_editor(ui, p, ed, &mut state);
+
+    store_themes(ui.ctx(), state);
 
     ui.add_space(16.0);
     ui.label(
@@ -1323,9 +1588,19 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 
 /// A miniature of the workspace in that theme, so the choice is visual rather
 /// than a name you have to try to remember the look of.
-fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -> bool {
-    let swatch = Palette::of(kind);
-    let (rect, response) = ui.allocate_exact_size(vec2(150.0, 104.0), Sense::click());
+///
+/// Takes the palette rather than a [`ThemeKind`], because a theme somebody made
+/// is a palette and has no kind — and drawing both from one function is what
+/// makes a custom theme's card the same card, rather than a second one that has
+/// to be kept looking like this one.
+fn theme_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    swatch: &Palette,
+    name: &str,
+    selected: bool,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(CARD[0], CARD[1]), Sense::click());
 
     let painter = ui.painter();
     let body = Rect::from_min_size(rect.min, vec2(rect.width(), 74.0));
@@ -1398,10 +1673,14 @@ fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -
         vec2(rect.width(), rect.height() - body.height()),
     );
     painter.rect_filled(strip, bottom, swatch.chrome);
+    // Truncated to the strip rather than allowed to run off it: a name is
+    // something somebody typed, and a card whose label overran would paint over
+    // the card beside it.
+    let room = strip.width() - if selected { 56.0 } else { 20.0 };
     painter.text(
         strip.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
-        kind.label(),
+        elide(&painter.clone(), name, room.max(20.0)),
         FontId::proportional(text::SMALL),
         swatch.text_strong,
     );
@@ -1428,15 +1707,62 @@ fn theme_card(ui: &mut egui::Ui, p: &Palette, kind: ThemeKind, selected: bool) -
     response.clicked()
 }
 
-/// The design's dashed "New theme" card, drawn dead.
+/// `text`, cut with an ellipsis to fit `room` points.
 ///
-/// Themes are a compiled table of values, not a document — there is nothing to
-/// create yet. Shown rather than dropped so the row matches the design and the
-/// tooltip can say what is missing.
-fn new_theme_card(ui: &mut egui::Ui, p: &Palette) {
-    let (rect, response) = ui.allocate_exact_size(vec2(150.0, 104.0), Sense::hover());
+/// Painted text, not a `Label`, so egui's own truncation is not available: the
+/// card is drawn into a rectangle it allocated, and a label in it would be a
+/// second widget in the middle of a painted one.
+fn elide(painter: &egui::Painter, text: &str, room: f32) -> String {
+    let font = FontId::proportional(text::SMALL);
+    let width = |s: &str| {
+        painter
+            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(text) <= room {
+        return text.to_owned();
+    }
+    let mut cut = text.to_owned();
+    while !cut.is_empty() {
+        cut.pop();
+        // Measured with the ellipsis on, or the result is one character too
+        // wide exactly when the name is one character too long.
+        let candidate = format!("{}…", cut.trim_end());
+        if width(&candidate) <= room {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+/// The design's dashed "New theme" card.
+///
+/// Live: it copies the theme in front of the user into their own library. That
+/// is what "new" has to mean here — a theme built from nothing is a palette of
+/// transparent black, which is an interface nobody can see well enough to fix —
+/// and it is what every application that has this feature means by it.
+///
+/// Returns whether it was clicked. Disabled — with the library's own wording,
+/// never invented — where there is nowhere to write or no room left, because a
+/// control that is live and then refuses is the one this project keeps
+/// refusing.
+fn new_theme_card(ui: &mut egui::Ui, p: &Palette, state: &Themes) -> bool {
+    let room = state.library().is_some_and(|library| library.has_room());
+    let live = state.writable() && room;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(CARD[0], CARD[1]),
+        // A dead card still senses hover, because the tooltip explaining why it
+        // is dead is the whole reason to draw it rather than hide it —
+        // `controls::text_button`'s rule.
+        if live { Sense::click() } else { Sense::hover() },
+    );
     let painter = ui.painter();
-    let dim = p.border;
+    let dim = if live && response.hovered() {
+        p.accent
+    } else {
+        p.border
+    };
 
     // A dashed rounded rect: egui has no dash pattern, so the border is drawn
     // as short segments along each edge.
@@ -1465,18 +1791,58 @@ fn new_theme_card(ui: &mut egui::Ui, p: &Palette) {
         p.text_dim.gamma_multiply(0.5),
     );
 
-    response.on_hover_text(
-        "A theme is a table of values compiled into Umber, not a file. Making and \
-         saving your own needs a theme format, which is not built.",
-    );
+    let tip = if live {
+        "Copy the theme in use into your own library, and edit the copy"
+    } else if !state.writable() {
+        state.why_not()
+    } else {
+        "Your library already holds as many themes as Umber reads back"
+    };
+    response.on_hover_text(tip).clicked()
 }
 
-/// The design's theme editor, as a read-only inspector.
+/// Copy the theme in front of the user into their library, and put it in hand.
+fn new_theme(state: &mut Themes, ed: &mut Editor) {
+    let from = ed
+        .custom_theme
+        .as_ref()
+        .map_or_else(|| ed.ui.theme.label().to_owned(), |t| t.name.clone());
+    let palette = ed.palette();
+    let base = ed.ui.theme;
+    let Some(id) = write_theme(state, ed, "Could not make a theme", |library| {
+        library.duplicate(&from, base, palette)
+    }) else {
+        return;
+    };
+    let Some(made) = state
+        .library()
+        .and_then(|library| library.get(&id).cloned())
+    else {
+        return;
+    };
+    use_custom(ed, &made);
+    // The fields are filled from the theme in hand, and the theme in hand has
+    // just changed.
+    state.refill(ed);
+}
+
+/// The design's theme editor.
 ///
-/// Every row is a real token out of the palette in use, so it tells the truth
-/// about the running theme; none of them can be edited, because a palette is
-/// compiled in and there is nowhere to put a change.
-fn theme_editor(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+/// A built-in is an *inspector*: every row is a real token out of the palette
+/// in use, so it tells the truth about the running theme, and none of them can
+/// be typed into, because a built-in is compiled into the binary and a change
+/// written there would survive until the next release and then vanish —
+/// `Library::collections`' argument. A theme out of the user's own library is
+/// the same rows, editable.
+///
+/// **There is no Save button, and that is decided rather than overlooked.**
+/// Every other control on this page writes itself out — `prefs::mark_dirty` and
+/// `flush_if_idle` — and a `ThemeLibrary` write reaches the disk immediately,
+/// as `PaletteLibrary`'s do. So a change here is already saved by the time a
+/// Save could be clicked, and a button that did nothing new would be exactly
+/// the control this project refuses everywhere else. The line under the heading
+/// says so, because "where did my Save go" is a real question.
+fn theme_editor(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut Themes) {
     Frame::NONE
         .fill(p.window)
         .stroke(Stroke::new(1.0, p.border))
@@ -1485,29 +1851,7 @@ fn theme_editor(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Frame::NONE
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Theme editor")
-                                .size(text::CONTROL)
-                                .color(p.text_strong)
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new("— read-only")
-                                .size(10.0)
-                                .color(p.text_dim),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let _ = controls::text_button(ui, p, "Save", false, false)
-                                .on_hover_text(
-                                    "Editing a palette needs somewhere to keep the result. \
-                                     There is no theme format yet.",
-                                );
-                            let _ =
-                                controls::text_button(ui, p, "Export .umbertheme", false, false)
-                                    .on_hover_text("No theme format exists to export to.");
-                        });
-                    });
+                    theme_editor_header(ui, p, ed, state);
                 });
 
             let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
@@ -1516,36 +1860,340 @@ fn theme_editor(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             Frame::NONE
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
-                    let rows = [
-                        ("Background", p.window),
-                        ("Panel", p.chrome),
-                        ("Canvas pit", p.backdrop),
-                        ("Text", p.text),
-                        ("Accent", p.accent),
-                        ("Hairline", p.border),
-                    ];
-                    // Two columns, as the design lays them out.
-                    let column = (ui.available_width() - 24.0) * 0.5;
-                    for pair in rows.chunks(2) {
-                        ui.horizontal(|ui| {
-                            for (name, colour) in pair {
-                                ui.scope(|ui| {
-                                    ui.set_width(column);
-                                    swatch_row(ui, p, name, *colour);
-                                });
-                                ui.add_space(24.0);
-                            }
-                        });
+                    // Two columns, as the design lays them out. The gap goes
+                    // *between* the pair and not after it, and the columns are
+                    // sized from what is left over once it has been taken off —
+                    // it used to be `(available - GAP) * 0.5` with a `GAP` after
+                    // every row, so each line was one gap wider than the box it
+                    // was in. The box grew, the pane grew, and the Themes page
+                    // came out forty points wider than every other page of a
+                    // dialog whose whole point is being one size.
+                    let column = ((ui.available_width() - TOKEN_GAP) * 0.5).max(1.0);
+                    let editable = ed.custom_theme.is_some();
+                    for group in TokenGroup::ALL {
+                        token_heading(ui, p, group.label());
+                        for pair in group.tokens().chunks(2) {
+                            ui.horizontal(|ui| {
+                                // Stated rather than inherited. The gap between
+                                // the columns is `TOKEN_GAP` and the columns are
+                                // sized from what is left after it, so a line
+                                // that also paid whatever horizontal spacing the
+                                // enclosing layout happened to be using would be
+                                // wider than the box by exactly that. It is zero
+                                // in the dialog today — the rail butts against
+                                // the pane — which is precisely the kind of
+                                // thing that fits until somebody changes it
+                                // three files away.
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (n, token) in pair.iter().enumerate() {
+                                    if n > 0 {
+                                        ui.add_space(TOKEN_GAP);
+                                    }
+                                    ui.scope(|ui| {
+                                        ui.set_width(column);
+                                        token_row(ui, p, ed, state, *token, editable);
+                                    });
+                                }
+                            });
+                        }
+                        ui.add_space(6.0);
                     }
 
-                    ui.add_space(8.0);
-                    accent_choice(ui, p, ed);
+                    // Only for a built-in: the four accents are a shortcut for
+                    // re-hueing a compiled-in palette, and a theme somebody made
+                    // carries its accent as two of its own rows above. Drawing
+                    // it here anyway would be a control that overwrote one of
+                    // the colours they had just chosen — so it is not drawn,
+                    // rather than drawn disabled.
+                    if ed.custom_theme.is_none() {
+                        accent_choice(ui, p, ed);
+                    }
                 });
         });
 }
 
-/// One palette entry: a chip of the colour, its name, and its hex.
-fn swatch_row(ui: &mut egui::Ui, p: &Palette, name: &str, colour: Color32) {
+/// The editor's heading line: what is being edited, and what can be done with
+/// it.
+fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &mut Themes) {
+    ui.horizontal(|ui| {
+        // The dialog sets the horizontal spacing to zero so the rail can butt
+        // against the pane, and that zero is inherited all the way down here —
+        // which is what left the Export and Save buttons touching. See
+        // `metrics::BUTTON_GAP`.
+        ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+        ui.label(
+            egui::RichText::new("Theme editor")
+                .size(text::CONTROL)
+                .color(p.text_strong)
+                .strong(),
+        );
+
+        // Collected and applied after the line, so the row has one writer per
+        // frame: the buttons are drawn from what the theme was at the top of
+        // the line, and a delete landing half way through would leave the rest
+        // of the row naming a theme that had gone. The rule the layer panel's
+        // "All" box already follows.
+        let mut request: Option<Request> = None;
+        let mine = ed.custom_theme.clone();
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+            if let Some(theme) = &mine {
+                let confirming = state.confirming.as_deref() == Some(theme.id.as_str());
+                let label = if confirming { "Delete?" } else { "Delete" };
+                if controls::text_button(ui, p, label, confirming, true)
+                    .on_hover_text(if confirming {
+                        "Click again to delete this theme. It cannot be undone — the \
+                         history covers painting only."
+                    } else {
+                        "Delete this theme"
+                    })
+                    .clicked()
+                {
+                    request = Some(if confirming {
+                        Request::Delete
+                    } else {
+                        Request::Confirm
+                    });
+                }
+                if controls::text_button(ui, p, "Export…", false, true)
+                    .on_hover_text("Write this theme out as a file you can keep or pass on")
+                    .clicked()
+                {
+                    request = Some(Request::Export);
+                }
+            }
+            let room = state.library().is_some_and(|library| library.has_room());
+            let can_import = state.writable() && room;
+            if controls::text_button(ui, p, "Import…", false, can_import)
+                .on_hover_text(if can_import {
+                    "Bring an .umbertheme file into your library"
+                } else if !state.writable() {
+                    state.why_not()
+                } else {
+                    "Your library already holds as many themes as Umber reads back"
+                })
+                .clicked()
+            {
+                request = Some(Request::Import);
+            }
+
+            // The name, filling whatever the buttons left. A real `TextEdit`,
+            // so `ui::draw`'s one `set_typing` call already stops the canvas
+            // hearing every keystroke — see the rule under Interface.
+            match &mine {
+                Some(_) => {
+                    let width = NAME_FIELD.min(ui.available_width() - 16.0).max(40.0);
+                    let field = inset_field(
+                        ui,
+                        p,
+                        &mut state.name,
+                        width,
+                        FontId::proportional(text::SMALL),
+                    );
+                    // On losing focus rather than on every keystroke, unlike
+                    // the colours: a rename moves the card in a list sorted by
+                    // name, and a row that jumped under the pointer on every
+                    // letter would be unusable. Escape abandons; anything else
+                    // keeps what was typed, and an emptied field is not a
+                    // nameless theme — the model substitutes "Untitled theme".
+                    if field.lost_focus() {
+                        request = Some(Request::Rename);
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "— {} is built in, so these are read-only",
+                            ed.ui.theme.label()
+                        ))
+                        .size(10.0)
+                        .color(p.text_dim),
+                    );
+                }
+            }
+        });
+
+        if let Some(request) = request {
+            act_on(request, state, ed);
+        }
+    });
+
+    controls::note(
+        ui,
+        p,
+        if ed.custom_theme.is_some() {
+            "Type a colour as six hex digits. Changes are saved as you make them, \
+             in a file of their own — there is nothing to click."
+        } else {
+            "Pick New theme above to make a copy you can edit. The two that ship \
+             with Umber are compiled into it, so a change written here would \
+             vanish at the next update."
+        },
+    );
+}
+
+/// What the editor's heading line asked for. At most one per frame, since
+/// acting on any of them changes what the rest of the line was drawn from.
+enum Request {
+    Confirm,
+    Delete,
+    Export,
+    Import,
+    Rename,
+}
+
+fn act_on(request: Request, state: &mut Themes, ed: &mut Editor) {
+    match request {
+        Request::Confirm => state.confirming = ed.custom_theme.as_ref().map(|t| t.id.clone()),
+        Request::Delete => delete_theme(state, ed),
+        Request::Export => export_theme(state, ed),
+        Request::Import => import_theme(state, ed),
+        Request::Rename => rename_theme(state, ed),
+    }
+}
+
+fn delete_theme(state: &mut Themes, ed: &mut Editor) {
+    let Some(id) = ed.custom_theme.as_ref().map(|t| t.id.clone()) else {
+        return;
+    };
+    if write_theme(state, ed, "Could not delete the theme", |library| {
+        library.remove(&id)
+    })
+    .is_none()
+    {
+        return;
+    }
+    // Back to the built-in it was made from, which is what `UiState::theme`
+    // has been holding all along.
+    ed.custom_theme = None;
+    state.confirming = None;
+    prefs::mark_dirty();
+    state.refill(ed);
+}
+
+fn export_theme(state: &mut Themes, ed: &mut Editor) {
+    let (Some(library), Some(theme)) = (state.library().cloned(), ed.custom_theme.clone()) else {
+        return;
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export theme")
+        .add_filter("Umber theme", &[themelib::EXTENSION])
+        // The *id*, not the display name: an id is already a filename, and a
+        // name may hold a separator or a colon, which is a file dialog opened
+        // on a path nobody meant. `palettelib::export`'s rule.
+        .set_file_name(format!("{}.{}", theme.id, themelib::EXTENSION))
+        .save_file()
+    else {
+        return;
+    };
+    if let Err(e) = library.export(&theme.id, &path) {
+        ed.notice = Some(Notice {
+            title: "Could not export the theme".to_owned(),
+            lines: vec![e.to_string()],
+        });
+    }
+}
+
+fn import_theme(state: &mut Themes, ed: &mut Editor) {
+    let Some(paths) = rfd::FileDialog::new()
+        .set_title("Import themes")
+        .add_filter("Umber theme", &[themelib::EXTENSION])
+        .pick_files()
+    else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let mut added = None;
+    for path in &paths {
+        match write_theme(state, ed, "Could not import", |library| {
+            library.import(path)
+        }) {
+            Some((id, skipped)) => {
+                if skipped > 0 {
+                    // An import that loses something must say so —
+                    // `docimport`'s rule. A line Umber could not read is a
+                    // colour that came out of the base theme instead.
+                    lines.push(format!(
+                        "{}: {skipped} line(s) could not be read, so those colours \
+                         came from the theme it names as its base.",
+                        path.display()
+                    ));
+                }
+                added = Some(id);
+            }
+            // `write_theme` has already raised the notice; the loop carries on
+            // because a folder of themes may hold one that reads and one that
+            // does not.
+            None => continue,
+        }
+    }
+    if let Some(id) = added
+        && let Some(theme) = state
+            .library()
+            .and_then(|library| library.get(&id).cloned())
+    {
+        use_custom(ed, &theme);
+        state.refill(ed);
+    }
+    if !lines.is_empty() {
+        ed.notice = Some(Notice {
+            title: "Imported, with notes".to_owned(),
+            lines,
+        });
+    }
+}
+
+fn rename_theme(state: &mut Themes, ed: &mut Editor) {
+    let Some(mut theme) = ed.custom_theme.clone() else {
+        return;
+    };
+    let typed = state.name.trim().to_owned();
+    if typed == theme.name {
+        return;
+    }
+    theme.name = typed;
+    if write_theme(state, ed, "Could not rename the theme", |library| {
+        library.save(theme.clone())
+    })
+    .is_none()
+    {
+        return;
+    }
+    // Back out of the library rather than out of `theme`: the model may have
+    // numbered the name to keep it distinct from another theme's, and the field
+    // has to show what was actually stored rather than what was typed.
+    if let Some(stored) = state
+        .library()
+        .and_then(|library| library.get(&theme.id).cloned())
+    {
+        ed.custom_theme = Some(stored.clone());
+        state.name = stored.name;
+    }
+}
+
+/// A heading over a group of tokens.
+fn token_heading(ui: &mut egui::Ui, p: &Palette, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(9.5)
+            .color(p.text_dim.gamma_multiply(0.8))
+            .strong(),
+    );
+}
+
+/// One palette entry: a chip of the colour, its name, and its hex — typed into
+/// where the theme is the user's own, read where it is built in.
+fn token_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ed: &mut Editor,
+    state: &mut Themes,
+    token: Token,
+    editable: bool,
+) {
+    let at = Token::ALL.iter().position(|t| *t == token).unwrap_or(0);
+    let colour = ed.palette().token(token);
     ui.horizontal(|ui| {
         let (chip, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), Sense::hover());
         let painter = ui.painter();
@@ -1556,24 +2204,69 @@ fn swatch_row(ui: &mut egui::Ui, p: &Palette, name: &str, colour: Color32) {
             Stroke::new(1.0, p.popover_border),
             egui::StrokeKind::Inside,
         );
+        ui.add_space(metrics::BUTTON_GAP);
         ui.label(
-            egui::RichText::new(name)
+            egui::RichText::new(token.label())
                 .size(text::SMALL)
                 .color(p.text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "#{:02X}{:02X}{:02X}",
-                    colour.r(),
-                    colour.g(),
-                    colour.b()
-                ))
-                .monospace()
-                .size(text::TINY)
-                .color(p.text),
+            if !editable || state.hex.len() != Token::ALL.len() {
+                ui.label(
+                    egui::RichText::new(themelib::hex(colour))
+                        .monospace()
+                        .size(text::TINY)
+                        .color(p.text),
+                );
+                return;
+            }
+            let field = inset_field(
+                ui,
+                p,
+                &mut state.hex[at],
+                HEX_FIELD,
+                FontId::monospace(text::TINY),
             );
+            // Applied live once six digits are in, and on losing focus for any
+            // form the parser takes. Both halves are wanted and neither alone
+            // does: applying on every keystroke would paint the interface in
+            // `#CC0088` on the way to `#C08A4E`, because three digits are a
+            // legal short hex; applying only on blur would mean a colour cannot
+            // be judged against the interface it is for while it is being
+            // typed, which is the whole point of a theme editor.
+            let body = state.hex[at].trim().trim_start_matches('#');
+            if (field.changed() && body.len() == 6) || field.lost_focus() {
+                set_token(ed, state, token, at);
+            }
         });
+    });
+}
+
+/// Put what was typed into the theme in hand, and write it out.
+fn set_token(ed: &mut Editor, state: &mut Themes, token: Token, at: usize) {
+    let Some(colour) = themelib::parse_hex(&state.hex[at]) else {
+        // Nothing is applied and nothing is refused: the field keeps what was
+        // typed so it can be corrected, and the palette keeps the colour it
+        // had. A theme that quietly took black for a misread line would be a
+        // theme with an invisible interface in it.
+        return;
+    };
+    let Some(theme) = ed.custom_theme.as_mut() else {
+        return;
+    };
+    if theme.palette.token(token) == colour {
+        // The blur after a keystroke that already landed. Writing the file
+        // again would be a second write for no change.
+        state.hex[at] = themelib::hex(colour);
+        return;
+    }
+    theme.palette.set_token(token, colour);
+    // Normalised back into the field, so `#fff` becomes `#FFFFFF` once it has
+    // been taken — which is also what says it was taken.
+    state.hex[at] = themelib::hex(colour);
+    let stored = theme.clone();
+    write_theme(state, ed, "Could not save the theme", |library| {
+        library.save(stored)
     });
 }
 
@@ -2020,9 +2713,13 @@ fn shortcut_row(
 // ---------------------------------------------------------------------------
 
 fn storage_footer(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    // Its own vertical spacing, so what it costs is the three parts
+    // `FOOTER_RESERVE` adds up and not those plus whatever gap the enclosing
+    // layout happened to be using.
+    ui.spacing_mut().item_spacing.y = 0.0;
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(line, 0.0, p.border);
-    ui.add_space(8.0);
+    ui.add_space(FOOTER_GAP);
 
     let path = prefs::config_path_label();
     ui.horizontal(|ui| {
@@ -2048,4 +2745,253 @@ fn storage_footer(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+    use crate::theme::ThemeKind;
+    use egui::{Rect, pos2};
+
+    /// The panes and the rail, measured in the rectangles the dialog hands
+    /// them.
+    ///
+    /// CPU tests, because this is geometry and needs no device — the preview
+    /// below is what says whether the result *looks* right, and these are what
+    /// fail the build when it stops being true. Same idiom as
+    /// `panels`' `ticking_a_layer_does_not_move_the_layer_list`.
+    fn measure(tab: Option<SettingsTab>) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIDTH, HEIGHT))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = Editor::default();
+        if let Some(tab) = tab {
+            ed.ui.settings_tab = tab;
+        }
+        let given = match tab {
+            Some(_) => vec2(WIDTH - RAIL_WIDTH, HEIGHT),
+            None => vec2(RAIL_WIDTH, HEIGHT),
+        };
+        // Three passes and the last is the one read: the first through a fresh
+        // context builds the font atlas, and text laid out against a half-built
+        // one is not the size it will settle at.
+        let mut measured = egui::Vec2::ZERO;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_size(pos2(0.0, 0.0), given))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                match tab {
+                    Some(_) => {
+                        let mut actions = crate::ui::UiActions::default();
+                        pane(&mut child, &palette, &mut ed, &mut actions);
+                    }
+                    None => rail(&mut child, &palette, &mut ed),
+                }
+                measured = child.min_rect().size();
+            });
+        }
+        measured
+    }
+
+    /// Every pane is the width the dialog handed it, so the dialog is one size
+    /// whatever page is in front.
+    ///
+    /// This was a real bug and the Themes page was the one with it: its token
+    /// columns were `(available - GAP) * 0.5` with a `GAP` added after *every*
+    /// one instead of between the two, so each line was one gap wider than the
+    /// box it was in — and the box, the pane and the modal all grew with it.
+    /// The page came out forty points wider than the other three, in a dialog
+    /// whose whole point is not changing size as you move between them.
+    #[test]
+    fn every_settings_pane_is_the_width_it_was_given() {
+        let given = WIDTH - RAIL_WIDTH;
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::InputAndPen,
+            SettingsTab::Themes,
+            SettingsTab::Shortcuts,
+        ] {
+            let width = measure(Some(tab)).x;
+            assert!(
+                width <= given,
+                "the {tab:?} pane reported {width} points in a {given}-point column",
+            );
+        }
+    }
+
+    /// And every pane is the *height* it was given, which is what makes the
+    /// rail beside it reach the bottom of the dialog.
+    ///
+    /// The rail is exactly the dialog's height by construction. The modal is as
+    /// tall as the taller of the two, so a pane that overran left the rail —
+    /// with the version and the licence at its foot — stopping short of the
+    /// bottom edge. It overran by thirteen points, which is `FOOTER_RESERVE`
+    /// having been estimated at 34 while the footer cost 47.
+    #[test]
+    fn the_rail_reaches_the_bottom_of_every_settings_pane() {
+        let rail = measure(None).y;
+        assert_eq!(rail, HEIGHT, "the rail is not the dialog's height");
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::InputAndPen,
+            SettingsTab::Themes,
+            SettingsTab::Shortcuts,
+        ] {
+            let height = measure(Some(tab)).y;
+            assert!(
+                height <= rail,
+                "the {tab:?} pane is {height} points tall beside a {rail}-point rail, \
+                 so the modal grows and the rail stops short",
+            );
+        }
+    }
+
+    /// A theme in a directory of the test's own, in hand, with the editor's
+    /// fields filled from it.
+    fn staged(tag: &str) -> (std::path::PathBuf, Editor, Themes) {
+        let dir = std::env::temp_dir().join(format!("umber-themes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = ThemeLibrary::load_from(&dir);
+        let id = library
+            .duplicate(
+                "Mine",
+                ThemeKind::Graphite,
+                Palette::of(ThemeKind::Graphite),
+            )
+            .expect("a fresh directory");
+        let mut state = Themes {
+            store: Ok(std::sync::Arc::new(library)),
+            filled_from: String::new(),
+            hex: Vec::new(),
+            name: String::new(),
+            confirming: None,
+        };
+        let mut ed = Editor::default();
+        ed.custom_theme = state.library().and_then(|l| l.get(&id).cloned());
+        state.refill(&ed);
+        (dir, ed, state)
+    }
+
+    /// The whole of what "make a theme, edit it, and have it survive a restart"
+    /// comes down to, without a window: a colour typed into the editor reaches
+    /// the palette the interface is drawn in **and** the file on disk, in the
+    /// same gesture.
+    ///
+    /// There is no Save button, so this is the only thing standing between the
+    /// page and the state it was in before — a theme editor that saved nothing.
+    #[test]
+    fn a_colour_typed_into_the_editor_reaches_the_file_it_came_from() {
+        let (dir, mut ed, mut state) = staged("typed");
+        let id = ed.custom_theme.as_ref().expect("in hand").id.clone();
+        let at = Token::ALL
+            .iter()
+            .position(|t| *t == Token::Accent)
+            .expect("the accent is a token");
+
+        state.hex[at] = "#123456".to_owned();
+        set_token(&mut ed, &mut state, Token::Accent, at);
+
+        let wanted = Color32::from_rgb(0x12, 0x34, 0x56);
+        assert_eq!(ed.palette().accent, wanted, "the interface did not follow");
+        assert_eq!(state.hex[at], "#123456", "the field was not normalised");
+        // Reopened from the directory, which is exactly what the next launch
+        // does.
+        let reopened = ThemeLibrary::load_from(&dir);
+        assert_eq!(
+            reopened.get(&id).expect("still there").palette.accent,
+            wanted,
+            "the edit did not reach the file, so a restart would lose it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hex that will not read leaves the palette exactly as it was, and the
+    /// field keeps what was typed so it can be corrected. A theme that quietly
+    /// took black for a misread line would be a theme with an invisible
+    /// interface in it.
+    #[test]
+    fn a_colour_that_will_not_read_changes_nothing() {
+        let (dir, mut ed, mut state) = staged("bad");
+        let before = ed.palette();
+        let at = Token::ALL
+            .iter()
+            .position(|t| *t == Token::Window)
+            .expect("a token");
+
+        for bad in ["", "#12345", "rebeccapurple"] {
+            state.hex[at] = bad.to_owned();
+            set_token(&mut ed, &mut state, Token::Window, at);
+            assert_eq!(ed.palette(), before, "{bad} moved the palette");
+            assert_eq!(state.hex[at], bad, "{bad} was taken out of the field");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Themes page, in front of a built-in and in front of a theme somebody
+    /// made.
+    ///
+    /// Written rather than asserted, for the reason `layers_panel_preview` is:
+    /// the two things that went wrong here were a *layout* — a box wider than
+    /// the pane, and two buttons drawn with no gap between them — and no
+    /// assertion about widgets catches "these look like one control".
+    /// `docshot::Stage` is the only thing in the crate that can look at a piece
+    /// of interface.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app themes_pane_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn themes_pane_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/themes-pane");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // A library of this test's own, so the picture does not depend on —
+        // and cannot write into — whatever themes the machine running it has.
+        let staged = dir.join("library");
+        let _ = std::fs::remove_dir_all(&staged);
+        themelib::stage_dir(staged.clone());
+        let mut library = ThemeLibrary::load_from(&staged);
+        let mut palette = Palette::of(ThemeKind::Graphite);
+        palette.set_token(Token::Accent, egui::Color32::from_rgb(0x6E, 0x9E, 0xC8));
+        let made = library
+            .duplicate("Midnight oil", ThemeKind::Graphite, palette)
+            .expect("a fresh directory");
+
+        for (name, mine) in [
+            ("1-built-in", None),
+            (
+                "2-custom",
+                ThemeLibrary::load_from(&staged).get(&made).cloned(),
+            ),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            ed.ui.settings_open = true;
+            ed.ui.settings_tab = SettingsTab::Themes;
+            ed.custom_theme = mine;
+            let palette = ed.palette();
+            let field = vec2(1048.0, 688.0);
+            let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |ui| {
+                show(ui, &palette, &mut ed, &mut crate::ui::UiActions::default())
+            });
+            let written = docshot::write_png(&dir.join(format!("{name}.png")), &image)
+                .expect("write the preview");
+            println!("{}", written.0.display());
+        }
+    }
 }

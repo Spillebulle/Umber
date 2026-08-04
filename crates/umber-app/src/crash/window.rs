@@ -141,7 +141,15 @@ impl<'a> Reporter<'a> {
             report,
             details: report.details(),
             report_path: path.to_path_buf(),
-            palette: Palette::with_accent(prefs.theme, prefs.accent),
+            // Through `themelib::resolve` rather than straight to
+            // `Palette::with_accent`, so a theme the user made reaches the
+            // crash box too. It is the same door `prefs::apply` goes through
+            // and it reads the library only when one is named.
+            palette: crate::themelib::resolve(
+                prefs.theme,
+                prefs.accent,
+                prefs.custom_theme.as_deref(),
+            ),
             gfx: None,
             expanded: false,
             copied: false,

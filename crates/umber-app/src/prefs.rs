@@ -75,6 +75,16 @@ pub fn undo_budget_bytes(megabytes: u32) -> usize {
 pub struct Prefs {
     pub theme: ThemeKind,
     pub accent: Accent,
+    /// The id of a theme in the user's own library, when one is in use.
+    ///
+    /// Kept *beside* `theme` rather than instead of it, and both are always
+    /// written. A custom theme is a file in a directory an update never
+    /// touches, but it is also a file somebody can delete, move or fail to
+    /// copy onto their next machine — and a preferences file that named only a
+    /// theme that has gone would leave the interface with no colours at all.
+    /// `theme` is what it falls back to, which is the built-in the custom one
+    /// was made from.
+    pub custom_theme: Option<String>,
     /// egui's zoom factor: everything drawn in points scales by this.
     pub interface_scale: f32,
     pub pressure_source: PressureSource,
@@ -150,6 +160,7 @@ impl Default for Prefs {
         Self {
             theme: ThemeKind::Graphite,
             accent: Accent::Umber,
+            custom_theme: None,
             interface_scale: 1.0,
             pressure_source: pressure.source,
             pressure_max_speed: pressure.max_speed,
@@ -323,6 +334,12 @@ pub fn to_text(prefs: &Prefs) -> String {
     out.push_str(&format!("version = {VERSION}\n"));
     out.push_str(&format!("theme = {}\n", theme_id(prefs.theme)));
     out.push_str(&format!("accent = {}\n", accent_id(prefs.accent)));
+    // Absent rather than empty when there is none: an empty value would be a
+    // theme whose id is the empty string, which `ThemeLibrary::path_of` would
+    // slug into a file called `theme`.
+    if let Some(id) = &prefs.custom_theme {
+        out.push_str(&format!("custom_theme = {id}\n"));
+    }
     out.push_str(&format!("interface_scale = {:.3}\n", prefs.interface_scale));
     out.push_str(&format!(
         "pressure_source = {}\n",
@@ -415,6 +432,18 @@ pub fn from_text(text: &str) -> Prefs {
             "theme" => {
                 if let Some(t) = theme_from_id(value) {
                     prefs.theme = t;
+                }
+            }
+            // Kept as written, with no check that it names anything: the
+            // library is a directory this module does not read, and a theme
+            // temporarily out of reach — a data directory on a drive that is
+            // not mounted yet — must not have its name struck from the file.
+            // `Editor::palette` is where an id that names nothing falls back to
+            // the built-in beside it.
+            "custom_theme" => {
+                let id = value.trim();
+                if !id.is_empty() {
+                    prefs.custom_theme = Some(id.to_owned());
                 }
             }
             "interface_scale" => {
@@ -746,6 +775,7 @@ pub fn capture(ctx: &egui::Context, ed: &Editor) -> Prefs {
     Prefs {
         theme: ed.ui.theme,
         accent: ed.ui.accent,
+        custom_theme: ed.custom_theme.as_ref().map(|t| t.id.clone()),
         interface_scale: ctx.zoom_factor(),
         pressure_source: ed.pressure.source,
         pressure_max_speed: ed.pressure.max_speed,
@@ -801,6 +831,15 @@ pub fn set_undo_budget(ed: &mut Editor, megabytes: u32) {
 pub fn apply(prefs: &Prefs, ctx: &egui::Context, ed: &mut Editor) {
     ed.ui.theme = prefs.theme;
     ed.ui.accent = prefs.accent;
+    // The library is only read when a custom theme is actually named, so the
+    // ordinary path — and every test in this file — touches no disk. An id that
+    // names nothing leaves `custom_theme` empty, which is `Editor::palette`'s
+    // fallback to the built-in `theme` also names.
+    ed.custom_theme = prefs.custom_theme.as_deref().and_then(|id| {
+        crate::themelib::ThemeLibrary::load()
+            .ok()
+            .and_then(|library| library.get(id).cloned())
+    });
     ed.pressure.source = prefs.pressure_source;
     ed.pressure.max_speed = prefs.pressure_max_speed;
     ed.pressure.responsiveness = prefs.pressure_response;
@@ -1064,6 +1103,34 @@ mod tests {
         assert_eq!(prefs.wheel_angles.of(WheelShape::Square), 0.0);
     }
 
+    /// A theme somebody made is named by id, and the built-in it was made from
+    /// is written *beside* it rather than instead of it — the file that names a
+    /// theme which has since been deleted must still say what to fall back to,
+    /// or the interface has no colours at all.
+    #[test]
+    fn a_theme_somebody_made_survives_a_restart_and_keeps_its_fallback() {
+        let prefs = Prefs {
+            theme: ThemeKind::Paper,
+            custom_theme: Some("midnight-oil".to_owned()),
+            ..Prefs::default()
+        };
+        let text = to_text(&prefs);
+        assert!(text.contains("custom_theme = midnight-oil\n"));
+        assert!(text.contains("theme = paper\n"), "the fallback goes too");
+        let back = from_text(&text);
+        assert_eq!(back.custom_theme.as_deref(), Some("midnight-oil"));
+        assert_eq!(back.theme, ThemeKind::Paper);
+
+        // Nothing written at all with no custom theme, so a file from a build
+        // before this existed and a file written by this one are the same file.
+        let plain = to_text(&Prefs::default());
+        assert!(!plain.contains("custom_theme"));
+        assert_eq!(from_text(&plain).custom_theme, None);
+        // And an empty value is not an id: `ThemeLibrary::path_of` would slug
+        // the empty string into a file called `theme`.
+        assert_eq!(from_text("custom_theme =   \n").custom_theme, None);
+    }
+
     #[test]
     fn the_update_check_defaults_to_on_and_unannounced() {
         // The pair that makes "on by default" defensible: the check is wanted,
@@ -1257,6 +1324,7 @@ mod tests {
         let mut prefs = Prefs {
             theme: ThemeKind::Paper,
             accent: Accent::Clay,
+            custom_theme: Some("midnight-oil".to_owned()),
             interface_scale: 1.25,
             pressure_source: PressureSource::Simulated,
             pressure_max_speed: 1800.0,
@@ -1287,6 +1355,7 @@ mod tests {
         let back = from_text(&to_text(&prefs));
         assert_eq!(back.theme, prefs.theme);
         assert_eq!(back.accent, prefs.accent);
+        assert_eq!(back.custom_theme, prefs.custom_theme);
         assert_eq!(back.interface_scale, prefs.interface_scale);
         assert_eq!(back.pressure_source, prefs.pressure_source);
         assert_eq!(back.pressure_max_speed, prefs.pressure_max_speed);
