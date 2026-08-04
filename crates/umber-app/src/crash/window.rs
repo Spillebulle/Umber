@@ -41,6 +41,7 @@
 use crate::icons::{self, Icon};
 use crate::logo;
 use crate::prefs;
+use crate::swapchain;
 use crate::tabs;
 use crate::theme::{self, Palette, metrics, text};
 use egui::{Sense, vec2};
@@ -184,11 +185,19 @@ impl ApplicationHandler for Reporter<'_> {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // A zero on either axis skips the handler, as `app.rs`'s does, so
+            // the surface keeps the configuration it had. Clamping to 1 was
+            // enough to satisfy wgpu, which refuses a zero-area configure —
+            // but `config` also sizes the `ScreenDescriptor`, so a zero
+            // reported while a Wayland window is being mapped drew the whole
+            // box into one pixel until the next real `Resized`.
             WindowEvent::Resized(size) => {
-                gfx.config.width = size.width.max(1);
-                gfx.config.height = size.height.max(1);
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                gfx.window.request_redraw();
+                if size.width > 0 && size.height > 0 {
+                    gfx.config.width = size.width;
+                    gfx.config.height = size.height;
+                    gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+                    gfx.window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Named rather than tested inline. Clippy would rather this
@@ -321,19 +330,67 @@ impl Reporter<'_> {
         let pixels_per_point = gfx.egui_ctx.pixels_per_point();
         let paint_jobs = gfx.egui_ctx.tessellate(output.shapes, pixels_per_point);
 
-        // The same arms `app::render` takes, minus the logging: a box that
-        // misses one frame is redrawn by the next event and nothing is lost in
-        // the meantime, so anything but a usable texture simply skips.
-        let acquired = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                None
+        // Uploaded before the surface is acquired, for the reason `app::render`
+        // states at the same point and which applies here with more force: the
+        // acquisition below can decide not to draw, and a skipped frame that
+        // dropped `textures_delta.set` would leave `egui_wgpu` holding a
+        // partial update for a texture it never allocated — met with
+        // `.expect("Tried to update a texture that has not been allocated
+        // yet.")`. That is a panic inside the process whose whole job is to
+        // survive one, which is the double fault this window exists to avoid.
+        for (id, delta) in &output.textures_delta.set {
+            gfx.egui_renderer
+                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
+        }
+
+        // The same decision `app::render` makes, through the same model rather
+        // than through a second copy of its arms — which is what this was, and
+        // sat fifteen lines above a fix whose whole argument is that a second
+        // copy is how the two get out of step. `swapchain` has no wgpu
+        // lifetime state in it, so it is the cheapest thing in the application
+        // to share, and sharing it puts the second surface in Umber under the
+        // one tested rule.
+        //
+        // The reporter takes `reconfigure_now` and deliberately ignores
+        // `reconfigure_later`: it keeps no state between frames, and a
+        // suboptimal swapchain here is a box drawn slightly the wrong size for
+        // one frame rather than a canvas mid-resize. `Resized` reconfigures,
+        // and for this window that is enough.
+        let (acquisition, texture) = match gfx.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (swapchain::Acquisition::Fresh, Some(t)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                (swapchain::Acquisition::Suboptimal, Some(t))
             }
-            _ => None,
+            wgpu::CurrentSurfaceTexture::Outdated => (swapchain::Acquisition::Outdated, None),
+            wgpu::CurrentSurfaceTexture::Lost => (swapchain::Acquisition::Lost, None),
+            wgpu::CurrentSurfaceTexture::Occluded => (swapchain::Acquisition::Occluded, None),
+            wgpu::CurrentSurfaceTexture::Timeout => (swapchain::Acquisition::Timeout, None),
+            _ => (swapchain::Acquisition::Failed, None),
         };
+        debug_assert_eq!(acquisition.carries_texture(), texture.is_some());
+        let plan = swapchain::plan(acquisition);
+        // Let go of anything not being drawn into before touching the surface,
+        // in that order and for the reason `app::render` gives at the same
+        // point.
+        let acquired = texture.filter(|_| plan.draws());
+        if plan.reconfigure_now() {
+            gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+        }
         let Some(frame) = acquired else {
+            // Nothing was recorded, so the frees may be applied at once — the
+            // one case where that is true, exactly as in `app::render`.
+            crate::app::release_finished_textures(
+                &mut gfx.egui_renderer,
+                &output.textures_delta.free,
+            );
+            // And ask for the frame that will draw on whatever was just put
+            // right. `app::render` needs no such line because a canvas gives
+            // itself redraws for other reasons; this window gives itself none
+            // and sits under `ControlFlow::Wait`, so a skipped frame would
+            // leave the box unpainted until the user happened to move the
+            // mouse — on the one window where nothing on screen is the whole
+            // failure. Costs one frame, and only on a skip.
+            gfx.window.request_redraw();
             return close;
         };
         let view = frame
@@ -346,10 +403,6 @@ impl Reporter<'_> {
                 label: Some("crash-report"),
             });
 
-        for (id, delta) in &output.textures_delta.set {
-            gfx.egui_renderer
-                .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
-        }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gfx.config.width, gfx.config.height],
             pixels_per_point,
@@ -384,10 +437,21 @@ impl Reporter<'_> {
             gfx.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
         }
-        for id in &output.textures_delta.free {
-            gfx.egui_renderer.free_texture(id);
-        }
-        gfx.gpu.queue.submit(Some(encoder.finish()));
+        // Submit, and only then give egui's finished textures back — through
+        // `app::submit_frame`, which is the one place that does both so the two
+        // cannot be put the wrong way round. This file used to free first,
+        // which is the ordering that makes a same-frame free a wgpu validation
+        // error at submit: `free_texture` calls `Texture::destroy`, and that
+        // takes effect immediately rather than when the last reference goes.
+        // wgpu's default handler turns it into a panic, and this process
+        // installs no `on_uncaptured_error` — so it would have been a panic
+        // while reporting a panic.
+        crate::app::submit_frame(
+            &gfx.gpu,
+            &mut gfx.egui_renderer,
+            encoder,
+            &output.textures_delta.free,
+        );
         frame.present();
 
         if output

@@ -9,6 +9,7 @@ use crate::logo;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
+use crate::swapchain;
 use crate::sysclip::{self, Paste};
 use crate::syscursor;
 use crate::tabs::{self, Notice};
@@ -119,9 +120,27 @@ struct Graphics {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// A reconfigure a frame asked for and could not carry out itself.
+    ///
+    /// Only ever set by a frame that kept its surface texture — a `Suboptimal`
+    /// acquisition — because configuring while one is alive is refused by
+    /// wgpu, fatally. See [`crate::swapchain`]; it is applied by
+    /// [`Graphics::reconfigure_surface`] before the next acquisition.
+    reconfigure_pending: bool,
 }
 
 impl Graphics {
+    /// Configure the surface from `config`, and clear any pending request.
+    ///
+    /// The one route to `Surface::configure` after start-up, so "no surface
+    /// texture may be alive here" is a property of one call site rather than
+    /// of three. It also means a resize does not leave a deferred reconfigure
+    /// behind it to be paid for a second time on the next frame.
+    fn reconfigure_surface(&mut self) {
+        self.surface.configure(&self.gpu.device, &self.config);
+        self.reconfigure_pending = false;
+    }
+
     /// Give a document its own layer storage, cleared and ready to paint on.
     ///
     /// Built from an existing renderer where there is one: pipelines and
@@ -249,7 +268,15 @@ const PUT_DOWN_SLOP: f32 = 4.0;
 /// the underlying resource alive for as long as the submission using it. This
 /// is what `egui_wgpu`'s own painter does, for the same reason, stated in the
 /// same place.
-fn submit_frame(
+///
+/// **`crash::window` calls this too**, which is why it is `pub(crate)` and free
+/// rather than a method: the crash reporter is a second process drawing a
+/// second egui pass, it had its own copy of the ordering, and its copy was the
+/// wrong way round. Anything given to this function must stay reachable from a
+/// process with no `Editor`, no document and no `CanvasRenderer` — a `Graphics`
+/// parameter, or anything that reads editor state, breaks the window whose
+/// whole job is to survive Umber having stopped.
+pub(crate) fn submit_frame(
     gpu: &Gpu,
     renderer: &mut egui_wgpu::Renderer,
     encoder: wgpu::CommandEncoder,
@@ -261,9 +288,16 @@ fn submit_frame(
 
 /// Hand egui's finished textures back.
 ///
-/// Only ever called with nothing recorded and unsubmitted: [`submit_frame`] is
-/// the one caller that has a command buffer, and it submits first.
-fn release_finished_textures(renderer: &mut egui_wgpu::Renderer, finished: &[egui::TextureId]) {
+/// Only ever called with nothing recorded and unsubmitted. [`submit_frame`] is
+/// the one caller that has a command buffer, and it submits first; the two
+/// direct callers — `UmberApp::render` and `crash::window`, each on the path
+/// where the surface gave them nothing to draw into — have not created an
+/// encoder yet. Calling it anywhere a frame's commands are recorded and
+/// unsubmitted is the crash [`submit_frame`] describes.
+pub(crate) fn release_finished_textures(
+    renderer: &mut egui_wgpu::Renderer,
+    finished: &[egui::TextureId],
+) {
     for id in finished {
         renderer.free_texture(id);
     }
@@ -2105,25 +2139,72 @@ impl UmberApp {
                 .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
         }
 
-        let acquired = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
-            // Suboptimal still gives a usable texture; reconfiguring is a
-            // next-frame concern, so draw this one rather than dropping it.
+        // A reconfigure an earlier frame asked for and could not do itself,
+        // paid here — before anything is acquired, which is the whole point of
+        // deferring it. See `swapchain`.
+        if gfx.reconfigure_pending {
+            gfx.reconfigure_surface();
+        }
+
+        // What wgpu answered, reduced to something `swapchain::plan` can
+        // decide on. Nothing is decided in these arms: which of them keeps its
+        // texture and which of them reconfigures — and, the part that was a
+        // crash, *when* — is the model's, so it can be tested without a
+        // surface. The harness has none.
+        let (acquisition, texture) = match gfx.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (swapchain::Acquisition::Fresh, Some(t)),
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                Some(t)
+                (swapchain::Acquisition::Suboptimal, Some(t))
             }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                None
-            }
-            // Minimised or hidden — skip the frame entirely.
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => None,
+            wgpu::CurrentSurfaceTexture::Outdated => (swapchain::Acquisition::Outdated, None),
+            wgpu::CurrentSurfaceTexture::Lost => (swapchain::Acquisition::Lost, None),
+            wgpu::CurrentSurfaceTexture::Occluded => (swapchain::Acquisition::Occluded, None),
+            wgpu::CurrentSurfaceTexture::Timeout => (swapchain::Acquisition::Timeout, None),
             other => {
                 log::warn!("could not acquire surface texture: {other:?}");
-                None
+                (swapchain::Acquisition::Failed, None)
             }
         };
+        // The one line where wgpu's answer and the model's meet, and therefore
+        // the one place they can disagree. Everything `swapchain` proves is
+        // about answers it was *shown*: map a texture-carrying acquisition
+        // onto `Outdated` here and the Wayland crash comes back with every
+        // test in that module still passing, because the plan would not be
+        // wrong — this translation would. Debug-only: it is a statement about
+        // the two arms above, which cannot change at runtime.
+        debug_assert_eq!(
+            acquisition.carries_texture(),
+            texture.is_some(),
+            "{acquisition:?} was translated from an answer that disagrees with it"
+        );
+        let frame = swapchain::plan(acquisition);
+        // A texture this frame is not going to draw into is let go of *before*
+        // the surface is touched, and this is the order rather than the
+        // reverse: a reconfigure is refused while any acquired texture is
+        // alive, whether or not the frame holding it meant to use it.
+        let acquired = texture.filter(|_| frame.draws());
+        if frame.reconfigure_now() {
+            gfx.reconfigure_surface();
+        }
+        // Where a texture *is* being drawn into, the reconfigure waits for the
+        // frame after this one. Doing it here — which is what this code used
+        // to do on `Suboptimal` — is the validation error "`SurfaceOutput`
+        // must be dropped before a new `Surface` is made", and
+        // `crash::device_error` makes that fatal, as it must.
+        //
+        // No redraw is asked for to carry it out, deliberately. This frame was
+        // drawn and is correct — a suboptimal swapchain is the wrong size or
+        // scale for the window, not the wrong picture — and asking for a frame
+        // whose only purpose is to reconfigure is the shape that burned a
+        // fifth of a core before `repaint_at` existed, since a driver that
+        // keeps answering `Suboptimal` would keep asking. On the desktop what
+        // makes a surface suboptimal is a resize or a scale change, and winit
+        // emits `Resized` for both — including on Wayland, where a scale
+        // change queues one — which requests a redraw and reconfigures on the
+        // spot. Vulkan also reports it for a surface *transform* change, which
+        // is a device rotation: no desktop produces one, and it is the case to
+        // re-examine if Android is ever built.
+        gfx.reconfigure_pending |= frame.reconfigure_later();
 
         // The renderer of the document in front. Every other open document has
         // one of its own, holding its pixels, untouched until it is switched to.
@@ -3358,6 +3439,9 @@ impl ApplicationHandler<Wake> for UmberApp {
             egui_ctx,
             egui_state,
             egui_renderer,
+            // The surface was configured a few lines above, with the size the
+            // window reported, so nothing is owed.
+            reconfigure_pending: false,
         });
 
         // Normally there is exactly one document here, this being start-up.
@@ -3507,11 +3591,21 @@ impl ApplicationHandler<Wake> for UmberApp {
                 }
             }
 
+            // A zero on either axis skips the whole handler: wgpu refuses a
+            // zero-area configure outright, and a window with no area is one
+            // there is nothing to draw on anyway, so the surface keeps the
+            // configuration it had. Wayland reports one while a window is
+            // being mapped.
+            //
+            // No surface texture can be alive here — `render` presents or
+            // drops its own before returning — so this may configure at once,
+            // and going through `reconfigure_surface` also drops any request a
+            // suboptimal frame left behind. That request named the *old* size.
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
                     gfx.config.width = size.width;
                     gfx.config.height = size.height;
-                    gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+                    gfx.reconfigure_surface();
                     gfx.window.request_redraw();
                 }
             }
