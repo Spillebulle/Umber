@@ -1057,8 +1057,17 @@ impl Editor {
     ///
     /// Returns true when the *geometry* changed, which is the caller's cue to
     /// resize the document's textures and throw the undo history away — every
-    /// patch in it is a rectangle of the old canvas, and the same reasoning
-    /// applies as when a layer is deleted.
+    /// patch in it is a rectangle of the old canvas, so not one of them still
+    /// names the pixels it was captured from.
+    ///
+    /// **This is the one clearing structural undo cannot fix**, and the reason
+    /// is worth having here rather than being rediscovered: parking a slice
+    /// keeps a patch valid because the slice still holds those pixels, and
+    /// `CanvasRenderer::resize` reallocates the whole layer array — so there is
+    /// nothing to park, and a crop destroys pixels outside the new canvas that
+    /// only a full copy of the old document would hold. Clearing here also
+    /// releases every slice a parked layer was holding, which is correct: those
+    /// layers were of a canvas that no longer exists.
     ///
     /// The history is cleared here rather than left to the caller so it cannot
     /// be forgotten by one of two call sites.

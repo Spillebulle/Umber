@@ -13,10 +13,11 @@
 //! # Slots are not layer identities
 //!
 //! [`crate::history::PixelPatch::slot`] is a texture-array slice, handed out by
-//! [`LayerStack`] and **recycled** when a layer is deleted. That is why
-//! deleting a layer clears the history: a patch replayed into a layer that
-//! merely inherited a slot corrupts it. A slot written into a file and read
-//! back into a different session's allocation is that same bug, made permanent.
+//! [`LayerStack`] and **recycled** — a patch replayed into a layer that merely
+//! inherited a slot corrupts it, which is why a deleted layer's slice is parked
+//! in the undo entry rather than returned. A slot written into a file and read
+//! back into a *different session's* allocation is that same bug with no such
+//! defence, and permanent.
 //!
 //! So a slot is never written. Every entry names a **stack position** instead —
 //! an index into [`super::SaveDocument::layers`], bottom first, which is the
@@ -165,6 +166,16 @@ pub const MANIFEST: &str = "umber/history/index.json";
 /// reports the true one.
 ///
 /// This build still reads revisions 1 and 2. Nothing about them changed.
+///
+/// **Structural entries did not raise it, because none is written.** An entry
+/// that restores a deleted layer needs that layer's pixels, and they live in a
+/// parked slice which is deliberately not part of the saved picture; so
+/// [`SaveHistory::new`] cuts the timeline at the newest structural entry rather
+/// than describing one. Writing them is what would earn revision 4, on the
+/// flip's grounds and more sharply: the entries around a structural one are not
+/// independently valid, because a patch recorded before a delete was recorded
+/// against a stack of a different shape, so the degradation would have to be a
+/// whole-history discard rather than a shorter history.
 pub const VERSION: u32 = 3;
 
 /// How much encoded patch data a document will carry.
@@ -240,28 +251,93 @@ pub struct SaveHistory<'a> {
 impl<'a> SaveHistory<'a> {
     /// Resolve every patch in `history` against `layers`.
     ///
-    /// `None` when any patch names a slot no layer in the stack holds. That
-    /// cannot arise from the editor — deleting a layer clears the history for
-    /// exactly this reason — but it is the one check that stands between a
-    /// saved history and a patch replayed into a layer that merely inherited a
-    /// slot, so it is made here rather than assumed, and it refuses the *whole*
-    /// history: the entries are a sequence, each restoring the pixels the next
-    /// one expects, and one missing from the middle is not a shorter history
-    /// but a wrong one.
+    /// `None` when any patch names a slot no layer in the stack holds. It is
+    /// the one check that stands between a saved history and a patch replayed
+    /// into a layer that merely inherited a slot, so it is made here rather
+    /// than assumed, and it refuses the *whole* history: the entries are a
+    /// sequence, each restoring the pixels the next one expects, and one
+    /// missing from the middle is not a shorter history but a wrong one.
+    ///
+    /// # Structural entries, which this revision cannot write
+    ///
+    /// The file can carry a patch and a canvas flip. It cannot yet carry an
+    /// entry that restores a *deleted layer* — that layer's pixels are in a
+    /// parked slice, and a parked slice is deliberately not written to the
+    /// document, since it is not part of the picture.
+    ///
+    /// So no structural entry is written, and the six divide into two groups
+    /// that are treated very differently — see [`EditKind::resurrects_pixels`].
+    ///
+    /// * A **delete** or a **mask removal** makes every entry older than it
+    ///   unwritable too: a patch recorded before one names a slice no layer in
+    ///   the saved stack holds, so it cannot be placed at all. The save keeps
+    ///   the newest run of the timeline containing neither, exactly as `write`
+    ///   already truncates when the file's budget bites — `position` moves back
+    ///   by however much was dropped and `dropped` moves forward by it. What
+    ///   makes the cut sufficient rather than arbitrary is the theorem the
+    ///   stepped timeline gives: *a patch on a deleted layer is necessarily
+    ///   older than the delete*, because you cannot paint on a layer you have
+    ///   already deleted.
+    /// * An **add**, a **move**, a **group** or a **new mask** is simply left
+    ///   out, and everything around it is saved whole. None of them frees a
+    ///   slice, so every patch either side still names the layer it was
+    ///   captured from and still resolves. Cutting at these instead would mean
+    ///   that dragging one layer in the panel and then saving discarded the
+    ///   whole morning — silently, for an edit that changed no pixel.
+    ///
+    /// What a reopened document therefore loses is the *structure* half of its
+    /// history: the rows are not there and the stack does not step back through
+    /// them, which is exactly what every build before this did. What it keeps
+    /// is every patch, which is the half that holds the painting.
+    ///
+    /// The truncation is still a real loss and worth saying plainly: a session
+    /// with one deletion near the start saves only the run after it. Writing
+    /// the removed layers' images under `umber/history/` beside the patch PNGs
+    /// is what would fix it, and it needs a measurement nobody has taken — see
+    /// `docs/structural-undo.md` §8.
     pub fn new(history: &'a History, layers: &LayerStack) -> Option<Self> {
-        let mut entries = Vec::with_capacity(history.len());
-        for i in 0..history.len() {
+        // One past the newest **applied** entry that puts pixels back into the
+        // stack, or 0 where there is none.
+        //
+        // Applied, not merely present, and that is the difference between
+        // cutting where it is needed and cutting away somebody's morning.
+        // `resurrects_pixels` is a property of the kind; whether the entry has
+        // actually taken a layer out of the stack is a property of which side
+        // of the cursor it is on. A delete that has been **undone** sits at or
+        // beyond `position`, its layer is back in the stack holding its own
+        // slice, and every patch older than it therefore resolves. Cutting
+        // there would make "delete the wrong layer, Ctrl+Z, Ctrl+S" discard the
+        // whole earlier history, silently, for an edit that was taken back.
+        let cut = (0..history.position())
+            .rev()
+            .find(|i| history.kind_at(*i).is_some_and(EditKind::resurrects_pixels))
+            .map_or(0, |i| i + 1);
+        let mut entries = Vec::with_capacity(history.len() - cut);
+        // Structural entries left out from *before* the cursor move it back, on
+        // top of the cut. They are not counted in `dropped`, which says how far
+        // short of the document's **beginning** the list stops — an entry
+        // missing from the middle is a different thing and the reopened list
+        // should not claim otherwise.
+        let mut skipped = 0usize;
+        for i in cut..history.len() {
             let edit = history.entry_at(i)?;
+            if edit.kind.is_structural() {
+                skipped += usize::from(i < history.position());
+                continue;
+            }
             // An entry with no patch names no layer, so there is nothing to
             // resolve and nothing that could fail to. A flip belongs to the
             // document rather than to one slice of it.
-            let body = match edit.patch() {
+            let body = match edit.patches().first() {
                 Some(patch) => {
                     // Either of the layer's two slices. A patch that matches
-                    // neither is one whose slot has been freed — a deleted
-                    // layer or a removed mask — and both of those clear the
-                    // history, so reaching here at all means something went
-                    // wrong and the whole history is refused.
+                    // neither is one whose slot is parked in an undo entry — a
+                    // deleted layer, or a removed mask — and the cut above
+                    // removes every entry that could be in that position, so
+                    // reaching here at all means something went wrong and the
+                    // whole history is refused. It used to be that both of
+                    // those cleared the history outright; the guard is the same
+                    // one and it now guards the cut instead.
                     //
                     // The position counts **every stack entry, folders
                     // included**, and the manifest's name fingerprint is built
@@ -295,8 +371,11 @@ impl<'a> SaveHistory<'a> {
         }
         Some(Self {
             entries,
-            position: history.position(),
-            dropped: history.dropped(),
+            position: history
+                .position()
+                .saturating_sub(cut)
+                .saturating_sub(skipped),
+            dropped: history.dropped() + cut,
         })
     }
 
@@ -567,6 +646,9 @@ mod tests {
     use crate::layer::BlendMode;
 
     const CANVAS: UVec2 = UVec2::new(64, 64);
+    /// What one slice of that canvas costs, which is what a recorded shape
+    /// charges the undo budget per parked layer.
+    const SLICE_BYTES: u64 = CANVAS.x as u64 * CANVAS.y as u64 * 4;
 
     fn blank() -> Vec<u8> {
         vec![0; CANVAS.x as usize * CANVAS.y as usize * 4]
@@ -699,13 +781,13 @@ mod tests {
             assert_eq!(after.kind, before.kind, "entry {i}");
             assert_eq!(after.at, before.at, "entry {i} lost the moment it was made");
             assert_eq!(
-                after.patch().unwrap().rect,
-                before.patch().unwrap().rect,
+                after.patches()[0].rect,
+                before.patches()[0].rect,
                 "entry {i}"
             );
             assert_eq!(
-                patch_pixels(after.patch().unwrap()),
-                patch_pixels(before.patch().unwrap()),
+                patch_pixels(&after.patches()[0]),
+                patch_pixels(&before.patches()[0]),
                 "entry {i}"
             );
             // The same *layer*, which is what the slot has to mean again.
@@ -713,11 +795,11 @@ mod tests {
                 .stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == Some(after.patch().unwrap().slot));
+                .position(|l| l.slot() == Some(after.patches()[0].slot));
             let was = stack
                 .layers()
                 .iter()
-                .position(|l| l.slot() == Some(before.patch().unwrap().slot));
+                .position(|l| l.slot() == Some(before.patches()[0].slot));
             assert_eq!(slot, was, "entry {i} came back on a different layer");
         }
         assert!(back.can_undo() && back.can_redo());
@@ -726,8 +808,7 @@ mod tests {
     /// A patch belongs to a *layer*, and a texture slot is not one — slots are
     /// recycled, so a stack whose order no longer matches its slot numbers is
     /// exactly where writing a slot down would corrupt a document. Reordered
-    /// here, which is the cheap way to produce that state; deleting a layer
-    /// clears the history and so cannot.
+    /// here, which is the cheap way to produce that state.
     #[test]
     fn a_patch_finds_its_layer_again_however_the_slots_fell_out() {
         let mut stack = stack(&["Paper", "Ink", "Wash"]);
@@ -744,7 +825,7 @@ mod tests {
         let opened = doc.open();
         assert_eq!(opened.history.len(), 1);
 
-        let slot = opened.history.entry_at(0).unwrap().patch().unwrap().slot;
+        let slot = opened.history.entry_at(0).unwrap().patches()[0].slot;
         let landed = opened
             .stack
             .layers()
@@ -891,7 +972,7 @@ mod tests {
         }
         // Well past the file's budget, and comfortably inside memory's.
         assert!(history.used_bytes() > BUDGET_BYTES * 2);
-        let last = patch_pixels(history.entry_at(count - 1).unwrap().patch().unwrap());
+        let last = patch_pixels(&history.entry_at(count - 1).unwrap().patches()[0]);
 
         let pixels = vec![0u8; (side * side * 4) as usize];
         let layers = vec![SaveLayer {
@@ -928,7 +1009,7 @@ mod tests {
             "an eviction that is not counted is one the list cannot admit to"
         );
         assert_eq!(
-            patch_pixels(back.entry_at(back.len() - 1).unwrap().patch().unwrap()),
+            patch_pixels(&back.entry_at(back.len() - 1).unwrap().patches()[0]),
             last,
             "the newest entry is the one that must survive"
         );
@@ -1008,7 +1089,7 @@ mod tests {
             "the timeline came back in a different order"
         );
         assert!(
-            back.entry_at(1).unwrap().patch().is_none(),
+            back.entry_at(1).unwrap().patches().is_empty(),
             "a flip came back holding pixels"
         );
         assert_eq!(back.time_at(2), at(1_785_542_420));
@@ -1057,7 +1138,7 @@ mod tests {
         let opened = doc.open();
         assert_eq!(opened.history.len(), 2);
 
-        let slot_of = |i: usize| opened.history.entry_at(i).unwrap().patch().unwrap().slot;
+        let slot_of = |i: usize| opened.history.entry_at(i).unwrap().patches()[0].slot;
         let layer = opened.stack.get(1).unwrap();
         assert_eq!(Some(slot_of(0)), layer.slot(), "the layer entry moved");
         assert_eq!(
@@ -1158,6 +1239,158 @@ mod tests {
                 Some(body.to_vec())
             }
         })
+    }
+
+    /// A saved history stops at the newest structural entry rather than being
+    /// refused whole.
+    ///
+    /// This revision cannot write an entry that restores a deleted layer — the
+    /// pixels are in a parked slice, which is deliberately not part of the
+    /// picture — and it must not therefore lose the entries *after* one. What
+    /// makes the cut sound rather than arbitrary is the theorem the stepped
+    /// timeline gives: a patch on a deleted layer is necessarily older than the
+    /// delete, so everything newer resolves against the stack as it stands.
+    ///
+    /// `dropped` has to move forward by what was cut, or a reopened list would
+    /// draw its oldest surviving entry as though it were the beginning of the
+    /// document.
+    #[test]
+    fn a_history_with_a_delete_in_it_is_truncated_rather_than_refused() {
+        let stack = stack(&["Paper", "Ink"]);
+        let b = stack.get(1).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 11)));
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 12)));
+        // A structural entry. Its shape names the stack as it stands, which is
+        // all this test needs: what the writer must do with it is refuse to
+        // describe it, whatever it holds.
+        history.record(Edit::new(
+            EditKind::DeleteLayer,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
+        assert_eq!((history.len(), history.dropped()), (4, 0));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(back.len(), 1, "the run after the delete is what survives");
+        assert_eq!(back.kind_at(0), Some(EditKind::Erase));
+        assert_eq!(back.position(), 1);
+        assert_eq!(
+            back.dropped(),
+            3,
+            "the list must be able to say it no longer reaches the beginning"
+        );
+    }
+
+    /// **Dragging a layer in the panel must not cost the morning's history.**
+    ///
+    /// A move, an add, a group and a new mask cannot be written either — no
+    /// manifest shape describes them — but unlike a delete they free no slice,
+    /// so every patch either side still names the layer it was captured from
+    /// and still resolves. They are left out and everything around them is
+    /// saved whole. Cutting at them, which is what the first draft of this did,
+    /// meant that reordering a layer and then saving discarded every earlier
+    /// entry silently, for an edit that changed no pixel — and reordering is
+    /// one of the commonest things an artist does.
+    #[test]
+    fn a_reorder_costs_the_saved_history_nothing_but_its_own_row() {
+        let stack = stack(&["Paper", "Ink"]);
+        let b = stack.get(1).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 11)));
+        for kind in [
+            EditKind::MoveLayer,
+            EditKind::AddLayer,
+            EditKind::Group,
+            EditKind::AddMask,
+        ] {
+            history.record(Edit::new(
+                kind,
+                EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+            ));
+        }
+        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(
+            (0..back.len()).map(|i| back.kind_at(i)).collect::<Vec<_>>(),
+            vec![Some(EditKind::Paint), Some(EditKind::Erase)],
+            "the patch before the move was thrown away"
+        );
+        assert_eq!(back.position(), 2, "the cursor moved by the rows left out");
+        assert_eq!(
+            back.dropped(),
+            0,
+            "nothing was dropped from the beginning, so the list must not say so"
+        );
+    }
+
+    /// **An undone delete is not a delete**, so it must not cut the history.
+    ///
+    /// "Delete the wrong layer, Ctrl+Z, Ctrl+S" is an ordinary sequence.
+    /// `resurrects_pixels` is a property of the *kind*, so a cut that looked at
+    /// the whole timeline found the undone entry, cut at it, and discarded
+    /// every earlier patch — silently, for an edit that had been taken back.
+    /// The layer is in the saved stack holding its own slice, so all of those
+    /// entries resolve perfectly.
+    #[test]
+    fn a_delete_that_has_been_undone_does_not_cut_the_saved_history() {
+        let stack = stack(&["Paper", "Ink"]);
+        let b = stack.get(1).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 11)));
+        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
+        history.record(Edit::new(
+            EditKind::DeleteLayer,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+        // Taken back: the entry moves onto the redo stack, and the layer it
+        // named is back in the stack the save is written from.
+        let undone = history.take_undo().expect("the delete");
+        history.push_redo(Edit::made_at(
+            undone.kind,
+            undone.at,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+        assert_eq!((history.len(), history.position()), (3, 2));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(
+            (0..back.len()).map(|i| back.kind_at(i)).collect::<Vec<_>>(),
+            vec![Some(EditKind::Paint), Some(EditKind::Erase)],
+            "an undone delete cut the history behind it"
+        );
+        assert_eq!(back.position(), 2);
+        assert_eq!(back.dropped(), 0, "nothing was dropped from the beginning");
+    }
+
+    /// A history whose *newest* entry is structural writes nothing at all,
+    /// which is what every build before saved histories did — and it must be a
+    /// quiet absence rather than a warning, because nothing went wrong.
+    #[test]
+    fn a_history_of_nothing_but_structure_saves_none_and_says_nothing() {
+        let stack = stack(&["Paper"]);
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::AddLayer,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.open().history.len(), 0);
     }
 
     fn without_entry(bytes: &[u8], name: &str) -> Vec<u8> {

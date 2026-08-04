@@ -133,11 +133,15 @@ opacity and blend applying to its contents do not exist.
   mark can never cost more than it used to — 6.8 MB for that diagonal, and a
   depth of 75 strokes rather than one. It is not unlimited: a wash that really
   does cover a 10000² canvas is 381 MB of pixels however it is described.
-  Undo covers painting only — adding, deleting or reordering a layer is *not*
-  undoable yet, and deleting one clears the history, because slots are recycled
-  and a stale entry would otherwise be replayed into the wrong layer. Resizing
-  the canvas clears it for the same kind of reason: a rectangle of the old
-  canvas means different pixels on the new one. Every entry carries what it
+  Undo covers painting, transforms, canvas flips and the six edits to the
+  layer stack — adding a layer, deleting one, moving one, grouping, and adding
+  or removing a mask. A structural entry stores no pixels: it holds the shape
+  the stack had, and the deleted layer itself, which owns its texture slice —
+  so the slice cannot be handed to another layer and every recorded patch goes
+  on meaning the pixels it was captured from. Clearing a layer and resizing the
+  canvas still clear the history, the second permanently: a rectangle of the
+  old canvas means different pixels on the new one, and there is nothing to
+  park because the whole array is reallocated. Every entry carries what it
   was and when it happened, and the two stacks read as one timeline, which is
   what the History module lists; a jump to a point in it is that many single
   steps, because there are no snapshots to jump to. A save writes the newest
@@ -232,8 +236,19 @@ Next, roughly in order:
   larger one — a layer kind, with a paint gate, a row mark and an answer for
   masks, clipping and folders. `docs/text-tool.md` is the design and
   `docs/roadmap-review.md` §6 is the argument for stopping where this stops.
-- Structural undo, so layer add/delete/reorder joins the history — and stops
-  the History module having to explain that it lists strokes and not layers
+- Clearing a layer as an undoable edit, which is the last command that still
+  clears the history and needs none of structural undo's machinery: record it
+  as an `Erase` with a full-canvas patch, which is what an eraser stroke is and
+  undoes as. `docs/structural-undo.md` §9 has the cost
+- Carrying a deleted layer's *pixels* into the saved history, so a document
+  with a deletion early in the session saves more than the run after it.
+  `docs/structural-undo.md` §8 has the shape and the measurement it needs
+  first; the truncation it replaces is a perfectly good answer until somebody
+  complains
+- Putting a **link group** back when an undone delete restores its last
+  survivor. Deleting one of a linked pair dissolves the group, correctly, and
+  the undo cannot currently rebuild it, so the pair returns unlinked.
+  `LayerStack::restore_shape` has the shape of the repair
 - Getting the *explicit* save off the drawing thread. It still reads every
   layer back with a blocking call, so a large document pauses for a moment —
   the one place left where Umber does the thing it exists not to do. The

@@ -3261,12 +3261,18 @@ impl CanvasRenderer {
         self.end_float();
         // Against [`MAX_SLOTS`], not [`MAX_LAYERS`]: `reserved` counts *slices*
         // — a layer, a layer's mask — and the array holds twice the stack's
-        // positions plus one. That `+ 1` is this preview's spare, so the
-        // refusal is unreachable for any legal stack and exists only so a
-        // future ceiling cannot silently preview into a layer. Comparing
+        // positions plus one. That `+ 1` is this preview's spare. Comparing
         // against 64 refused every document past its 64th slice: 33 masked
         // layers could not be transformed at all, with 63 slices free, under a
         // notice that said Umber had run out.
+        //
+        // **This is reachable**, and used not to be. `reserved` is one past the
+        // highest slice *claimed*, and structural undo parks a deleted layer's
+        // slice in the entry that could put it back — so a history competes for
+        // the range. The caller gives entries up before asking; `App::
+        // free_headroom` is that release, and it declines to spend the history
+        // where the live stack itself reaches the ceiling, because no eviction
+        // can help there. 64 layers each with a mask is that state.
         if reserved as usize >= MAX_SLOTS {
             log::error!("no room for a transform preview beside {reserved} layer slices");
             return None;

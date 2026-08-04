@@ -149,9 +149,10 @@ straight past all of it, which is what keeps the file a plain `.ora`.
 Three things had to be got right.
 
 **A texture slot is not a layer.** `PixelPatch::slot` is a slice of the layer
-texture array, and slots are **recycled** when a layer is deleted — which is
-exactly why deleting one clears the history. A slot written into a file and read
-back into a different session's allocation is that same bug, made permanent. So
+texture array, and slots are **recycled** — which is why a deleted layer's
+slice is parked inside the undo entry that could put it back rather than
+returned to the pool. A slot written into a file and read back into a
+*different session's* allocation is that same bug with no such defence. So
 a slot is never written: each entry names a **stack position**, bottom first,
 which is the order the file itself is in and the order the reader rebuilds.
 `SaveHistory::new` makes that mapping once, at save time, and refuses the whole
@@ -510,8 +511,17 @@ See its own documentation.
 - **`.ora` is the only extension offered.** Krita's `.kra` and Photoshop's
   `.psd` are read but not written, and there is no reason to write them: both
   applications read ORA.
-- **A saved history does not survive a layer being added, deleted or reordered
-  after it was written.** The manifest fingerprints the stack by name and order,
-  so a document whose layers have moved drops its history on the way in — which
-  is the safe direction, and the same limitation the in-memory history already
-  has, for the same reason. Structural undo is what fixes both.
+- **A saved history does not survive the stack being changed *after* it was
+  written** — by another application, or by an Umber that saved and then had
+  its layers rearranged by something else. The manifest fingerprints the stack
+  by name and order, so a document whose layers have moved drops its history on
+  the way in, which is the safe direction. Changes made *before* the save are
+  fine: the fingerprint is taken from the stack being written.
+- **No structural entry is written**, because the layer an undo would put back
+  lives in a parked texture slice and a parked slice is not part of the picture.
+  A move, an add, a group and a new mask are simply left out and everything
+  around them is saved whole; a **delete** or a **mask removal** makes every
+  entry older than it unplaceable as well, so the save keeps the newest run
+  containing neither. Writing the removed layers' images beside the patch PNGs
+  is what would lift that, and it needs a measurement nobody has taken —
+  `docs/structural-undo.md` §8.

@@ -161,6 +161,18 @@ pub enum Icon {
     /// from the font rather than from the stroke weight beside it, and it would
     /// change shape the day the interface changed typeface.
     Text,
+    // Structural undo's two rows. At the end for the reason every group above
+    // is: this enum is shared, and renumbering it would be a merge that
+    // compiles and draws the wrong marks.
+    /// Two chevrons back to back, pointing apart: an entry moved in the stack.
+    /// [`Icon::ChevronUp`] alone would say "moved up" on a row that may have
+    /// moved down, and [`Icon::Grip`] is the drag *handle* rather than the act.
+    MoveLayer,
+    /// [`Icon::Mask`] with a stroke through it — the relationship
+    /// [`Icon::Deselect`] already has to [`Icon::Select`], and for the same
+    /// reason: this takes one specific thing off, and the mark has to say
+    /// which.
+    MaskOff,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -433,6 +445,27 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 at(4.0, 5.0),
             ]);
             painter.circle_filled(at(12.0, 12.0), 4.2 * scale, colour);
+        }
+
+        Icon::MaskOff => {
+            // `Mask`, a size smaller to leave room for the stroke, so the two
+            // read as the same object with something done to it.
+            path(vec![
+                at(5.5, 6.5),
+                at(18.5, 6.5),
+                at(18.5, 17.5),
+                at(5.5, 17.5),
+                at(5.5, 6.5),
+            ]);
+            painter.circle_filled(at(12.0, 12.0), 3.4 * scale, colour);
+            line(at(4.0, 20.0), at(20.0, 4.0));
+        }
+
+        Icon::MoveLayer => {
+            // Back to back, pointing apart, with a gap between them: one
+            // chevron means a direction, two mean the axis.
+            path(vec![at(7.0, 10.0), at(12.0, 5.0), at(17.0, 10.0)]);
+            path(vec![at(7.0, 14.0), at(12.0, 19.0), at(17.0, 14.0)]);
         }
 
         Icon::Clip => {

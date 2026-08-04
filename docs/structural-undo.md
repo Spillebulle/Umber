@@ -20,7 +20,82 @@ one of the two mistakes a layers panel makes easy — the other, `remove_many`'s
 reverse loop, has already deleted a layer nobody ticked, and cleared the history
 on the way out so it could not be taken back.
 
-This document is the design. Nothing in it is built.
+This document is the design. **Pieces 1 to 4 of §11 are built**, and the two
+`history.clear()` calls above are gone. What is not:
+
+- **§11.5, the file.** A structural entry is not written. `SaveHistory::new`
+  cuts the timeline at the newest structural entry instead — the machinery
+  `write` already uses when the file's budget bites — so a session with one
+  deletion near the start saves only the run after it. §8 has the argument for
+  why the cut is *sufficient* rather than arbitrary, and §8's open question,
+  what a deleted layer costs as a PNG, is still open. `history::VERSION` did
+  not move and neither did `umber-version`.
+- **§11.6, Clear layer as an `Erase` entry.** Independent of everything here
+  and still the last command that clears the history.
+- **The GPU test in §12.** The parked-slice guarantee is asserted on the CPU —
+  a slice claimed by an entry is never handed to another layer, which is the
+  thing that could go wrong — and nothing in the change touches a shader.
+- **§10 stands** for renaming, opacity, visibility, blend, lock and clipping:
+  they are still not undoable, and §4's `Kept`-restores-shape-not-values rule is
+  what keeps deferring them safe. **`link` is the exception and is a known
+  defect**: deleting one of a linked pair dissolves the group — correctly, or
+  the survivor draws a chain meaning "moves together with nothing" — and undoing
+  the delete cannot put it back, so an undone delete silently unlinks the pair.
+  It is the *mask's* case rather than the opacity's, because the edit changes
+  the value rather than the artist, so the repair is to record what the removal
+  dissolved and swap it back beside `masks`; that needs
+  `dissolve_lone_groups` to report what it cleared and `remove_many` to hand it
+  over. Putting links on every `Kept` row is the shortcut and is what §4 and §10
+  between them refuse. Written up at `LayerStack::restore_shape`.
+
+**§7 is wrong about the cost, and that is the correction to read before
+anything else here.** It says a parked slot "costs no *new* allocation; what it
+costs is the chance to reuse one", and §13 repeats it. That is false.
+`slot_capacity_needed` is one past the highest slice **claimed**, a parked slice
+is claimed, and `CanvasRenderer::ensure_slots` doubles and never shrinks — so
+128 ordinary delete-then-add cycles take the layer array to its 129-slice
+ceiling and leave it there: 2.16 GB at 2048², 51.6 GB at 10000². A budget that
+counted only the rows of a shape (tens of bytes) could not see any of it, and an
+allocation failure in `ensure_slots` is an uncaptured device error, which
+`crash::device_error` makes fatal.
+
+So **`StackShape::byte_len` charges for the slices a shape is holding**, in the
+same currency and against the same figure as a patch. On a 10000² canvas the
+512 MB budget then holds one parked layer exactly as it holds one full-canvas
+stroke, and `evict_to_budget` gives the slice back on the second. The slice
+ceiling stays as the hard backstop it always was; what this stops is the ceiling
+being the *only* bound. `a_parked_layer_costs_the_budget_the_slice_it_is_
+holding` is the guard.
+
+Three smaller things the design left implicit:
+
+- **`SlotPool::give_back` compacts the tail**, so a released slice at the top of
+  the range lowers `slot_capacity_needed` again. Necessary and not sufficient:
+  compaction only fires on the *highest* claim, which is why the budget above is
+  what actually bounds parking.
+- **A pool with a gap in the middle can hand a slice out and still have nothing
+  above the top.** `has_room` and `has_headroom` are two questions, and a
+  release valve asking the first on the float's behalf never opens — the history
+  answers "there is already room", gives nothing up, and `begin_float` goes on
+  refusing for ever. `a_float_needs_a_slice_above_everything_and_not_merely_a_
+  spare_one` pins it.
+- **The release is `App::free_a_slot` / `free_headroom`**, in front of `add`,
+  `add_mask` and `begin_float` — the three gates §7 and the review between them
+  name, and the one nobody owned. The first two release only **after** a
+  refusal: a layer can be refused for reasons a slice would not mend, and
+  freeing first spends an artist's oldest edits on something that was never
+  going to happen.
+
+**§8's cut is narrower than it says**, and had to be. It proposes cutting at the
+newest entry that resurrects pixels and asserts that "adds, moves and groups save
+whole" — but *none* of the six can be written, so the first draft of this cut at
+all of them, and dragging one layer in the panel then discarded the whole
+morning's history at the next save, silently, for an edit that changed no pixel.
+The four that free no slice are **left out individually** instead, with
+everything around them saved whole: every patch either side still names the
+layer it was captured from, so it still resolves. What a reopened document loses
+is the *structure* half of its history, which is what every build before this
+had. `a_reorder_costs_the_saved_history_nothing_but_its_own_row` is the guard.
 
 ---
 
@@ -245,11 +320,15 @@ Four things follow, and each of them is a bug that does not have to be written:
   gains one arm and nothing else changes.
 
 Size: `size_of::<Layer>()` is about 56 bytes with padding, so a 64-entry stack is
-under 4 kB plus the names of whatever was removed. Against a 512 MB budget that
-is on the order of a hundred and thirty thousand entries — which is to say the
-budget is not what bounds these, the slot ceiling is. **That figure is arithmetic
+under 4 kB plus the names of whatever was removed. **That figure is arithmetic
 from the struct, not a measurement**; if it is ever worth pinning,
 `examples/measure-undo.rs` is where it goes.
+
+> **This paragraph used to conclude "the budget is not what bounds these, the
+> slot ceiling is", and that was wrong** — the same error as §7's, from the same
+> place. What a `Gone` row *holds* is a claim on a canvas-sized texture slice,
+> which is 16 MB at 2048² and 400 MB at 10000², and it is the dominant cost by
+> four orders of magnitude. See the note at the head of this document.
 
 ---
 

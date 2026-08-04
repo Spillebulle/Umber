@@ -55,7 +55,7 @@ pub use geom::{FlipAxis, PixelRect, Rect};
 pub use harmony::Harmony;
 pub use history::{Edit, EditBody, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
-pub use layer::{BlendMode, EditTarget, Layer, LayerStack};
+pub use layer::{BlendMode, EditTarget, Layer, LayerStack, SlotRoom, StackShape};
 pub use overlay::{Side, Strip};
 // `palette::Palette` is deliberately **not** re-exported at the root. The app
 // crate's own `theme::Palette` is the interface's colour tokens and is in scope

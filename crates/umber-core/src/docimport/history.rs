@@ -146,6 +146,22 @@ fn load(
     for entry in &manifest.entries {
         let kind = fmt::kind_from_id(&entry.kind)
             .ok_or("one of its entries records something this build cannot undo")?;
+        // **No build writes a structural entry**, so one in a manifest is not
+        // something this reader can place: the layer an undo would put back is
+        // not in the file, because a parked slice is not part of the picture.
+        //
+        // Named rather than left to fall through, and that is not tidiness.
+        // Without it the entry takes the pixel path, fails the `w == 0` bound
+        // check and drops the whole history reporting "covers an area outside
+        // the canvas" — a corruption diagnosis for a file that is merely newer
+        // than this reader. The `VERSION` comment used to be able to say
+        // `kind_from_id` answered `None` for these; it no longer does, because
+        // the kinds now exist.
+        if kind.is_structural() {
+            return Err(
+                "one of its entries restores a layer, which no build writes into a document".into(),
+            );
+        }
         // The kind decides the shape of the entry, so it is read before any of
         // the fields that only a pixel entry has. A flip names no layer and no
         // rectangle — the zeroes the writer put there are not a rectangle of

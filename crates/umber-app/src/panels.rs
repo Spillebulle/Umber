@@ -29,7 +29,7 @@ use egui::{
 };
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
-use umber_core::{BlendMode, EditKind, EditTarget, LayerStack, Timestamp};
+use umber_core::{BlendMode, Edit, EditKind, EditTarget, LayerStack, Timestamp};
 
 /// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
 /// target is not something anyone can hit.
@@ -999,8 +999,8 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 ) {
                     (_, true, _) => "The layer is locked — unlock it to delete it",
                     (false, _, _) => "A document needs a layer to paint on",
-                    (_, _, true) => "Delete the group and everything in it — clears undo history",
-                    _ => "Delete layer — clears undo history",
+                    (_, _, true) => "Delete the group and everything in it",
+                    _ => "Delete layer",
                 },
             ) {
                 actions.delete_layer = Some(active);
@@ -1136,7 +1136,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 !locked,
                 match (has_mask, locked) {
                     (_, true) => "The layer is locked — unlock it to change its mask",
-                    (true, _) => "Remove the layer mask — clears undo history",
+                    (true, _) => "Remove the layer mask",
                     (false, _) => "Add a layer mask, revealing everything",
                 },
             ) {
@@ -1403,7 +1403,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     match (can_delete, any_locked) {
                         (false, _) => "A document needs a layer to paint on",
                         (_, true) => "One of them is locked — unlock it to delete it",
-                        _ => "Delete the ticked layers — clears undo history",
+                        _ => "Delete the ticked layers",
                     },
                 ) {
                     act = Some(Bulk::Delete);
@@ -1478,10 +1478,10 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             ed.layers.unlink(&ed.layers.targets());
             changed = true;
         }
-        // Slots go back on the free list, so this clears the undo history and
-        // has to happen where the GPU is. `UiActions` is `Copy` and cannot
-        // carry the list; the caller reads the ticks off the editor in the
-        // frame the flag was set, exactly as `new_tip` does.
+        // The float has to be put down and the lock gate asked, both of which
+        // are the caller's. `UiActions` is `Copy` and cannot carry the list; the
+        // caller reads the ticks off the editor in the frame the flag was set,
+        // exactly as `new_tip` does.
         Some(Bulk::Delete) => actions.delete_picked = true,
         None => {}
     }
@@ -1618,18 +1618,17 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         // left in the store by a panel that stopped being drawn mid-gesture.
         // Without it, reopening the module with the pointer over the list would
         // resolve a drop nobody was making.
-        if released
-            && let Some(to) = carried.destination()
-            // Reordering does not clear the undo history, and deleting a layer
-            // does. The difference is `LayerStack::reorder`'s to state and it
-            // states it: a `PixelPatch` names a *slot*, deleting frees one for
-            // the next layer to inherit, and nothing here frees or reassigns
-            // one. Stack order is the `Vec` order, so this moved no pixels —
-            // and a folder holds no slot at all, so re-nesting frees none
-            // either.
-            && ed.layers.reorder_to(carried.from, to.index, to.depth)
-        {
-            changed = true;
+        if released && let Some(to) = carried.destination() {
+            // Snapshotted before the move and recorded only where one happened,
+            // exactly as `App::record_move` does it for the chevrons — here
+            // rather than there because this holds the `Editor` and not the
+            // `App`. The entry costs nothing to hold: no slot changes hands, so
+            // it is a shape and no pixels at all.
+            let before = ed.layers.shape(ed.doc.layer_bytes());
+            if ed.layers.reorder_to(carried.from, to.index, to.depth) {
+                ed.history.record(Edit::new(EditKind::MoveLayer, before));
+                changed = true;
+            }
         }
     }
     ui.ctx().data_mut(|d| match drag {
@@ -1769,14 +1768,14 @@ struct HistoryRow {
 /// click to go back to any point in it.
 ///
 /// What it deliberately does *not* show is anything it cannot restore. Umber's
-/// history covers painting, transforms and canvas flips — adding, deleting or
-/// reordering a layer is not recorded, and deleting one clears the list
-/// outright — so a row appears only where the engine can actually step back
-/// over the edit, and the note at the foot says so rather than leaving the gap
-/// to be discovered. A list that named a structural action it could not undo
-/// would be worse than one that admits its own edges. That is also why there is
-/// exactly one edit icon per `EditKind` and no more: an icon set richer than
-/// the enum would be a promise about what the engine records.
+/// history covers painting, transforms, canvas flips and the six edits to the
+/// layer stack — clearing a layer and resizing the canvas are still outside it,
+/// and both still clear the list — so a row appears only where the engine can
+/// actually step back over the edit, and the note at the foot says so rather
+/// than leaving the gap to be discovered. A list that named an action it could
+/// not undo would be worse than one that admits its own edges. That is also why
+/// there is exactly one edit icon per `EditKind` and no more: an icon set
+/// richer than the enum would be a promise about what the engine records.
 fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let position = ed.history.position();
     let count = ed.history.len();
@@ -1847,12 +1846,12 @@ fn history_body(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) 
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(if count == 0 {
-            "Nothing done to this document yet. Strokes, transforms and canvas \
-             flips are recorded here; layers are not."
+            "Nothing done to this document yet. Strokes, transforms, canvas \
+             flips and changes to the layer stack are recorded here."
         } else {
-            "Strokes, transforms and canvas flips. Adding, deleting or \
-             reordering a layer is not recorded, and deleting one clears this \
-             list."
+            "Strokes, transforms, canvas flips and changes to the layer stack. \
+             Clearing a layer and resizing the canvas are not recorded, and \
+             both clear this list."
         })
         .size(9.5)
         .color(p.text_dim)
@@ -1899,6 +1898,14 @@ fn edit_icon(kind: EditKind) -> Icon {
         // so a row and the control that could have produced it agree.
         EditKind::FlipHorizontal => Icon::FlipHorizontal,
         EditKind::FlipVertical => Icon::FlipVertical,
+        // The layers panel's own buttons, for the same reason: a row shows the
+        // mark on the control that could have produced it.
+        EditKind::AddLayer => Icon::Plus,
+        EditKind::DeleteLayer => Icon::Trash,
+        EditKind::MoveLayer => Icon::MoveLayer,
+        EditKind::Group => Icon::Folder,
+        EditKind::AddMask => Icon::Mask,
+        EditKind::RemoveMask => Icon::MaskOff,
     }
 }
 
