@@ -1066,6 +1066,12 @@ spatter brush is 1.25 MB and 0.05 MB on its own. The single-brush `.sut` is
 0.07 MB. Against the thumbnail route those four were 0.20 MB, so the picture
 costs about seven times what its preview did, per stamp brush.
 
+A **paper** costs far less than that, and not because the pictures are smaller:
+`UserLibrary::store_paper` shares a tile equal to one already held, where
+`store_tip` deliberately does not. The `.sutg`'s six textured sub-tools name two
+papers between them, so what is written is one 500 × 500 tile (0.24 MB of
+coverage) and one 300 × 300 (0.09 MB, the thumbnail fallback) — not six.
+
 #### Where the full-resolution pixels actually are
 
 Recorded here because it took a day to find and because nothing else writes it
