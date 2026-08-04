@@ -1460,15 +1460,16 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
     // four big-endian words. The two are told apart by whether the first bytes
     // are a plausible header size, which for text they never are.
     if let Ok(pipe) = gih::from_gih(raw) {
-        let mut dropped = Vec::new();
-        if pipe.angular {
-            dropped.push(gih::ANGULAR);
-        } else if pipe.animated {
-            dropped.push(gih::ANIMATION);
-        }
-        // A coloured cell is no longer a loss: `gih` and `gbr` go through the
-        // same decoder, and a `TipMask` carries a colour plane now. What a pipe
-        // still loses is its *sequencing*, reported above.
+        // The pipe's own list, so a preset whose tip is a `.gih` reports what a
+        // loose `.gih` would: both losses where a pipe turns *and* shuffles,
+        // which naming one of the two could not — and, the half that actually
+        // moves brushes, *nothing* where the pipe collapsed. Four of David
+        // Revoy's presets stamp a pipe of four copies of one bitmap and used to
+        // be told they had lost a sequence.
+        //
+        // A coloured cell is not among them: `gih` and `gbr` go through the same
+        // decoder and a `TipMask` carries a colour plane now.
+        let dropped = pipe.sequence_losses();
         let cell = pipe
             .cells
             .into_iter()

@@ -118,8 +118,11 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let pipe = gih::from_gih(&bytes).map_err(|e| e.at(path))?;
             let base = embedded_name(&pipe.name, &stem);
             let many = pipe.cells.len() > 1;
-            let animated = pipe.animated;
-            let angular = pipe.angular;
+            // One list for the whole pipe, from the one place that knows what
+            // its rules mean — a pipe that both turns and shuffles loses both,
+            // which the `if angular … else if animated` this replaced could
+            // never say. The colour is still per cell, below.
+            let sequence = pipe.sequence_losses();
             Ok(pipe
                 .cells
                 .into_iter()
@@ -132,15 +135,10 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     } else {
                         base.clone()
                     };
-                    let mut dropped = Vec::new();
-                    if angular {
-                        dropped.push(gih::ANGULAR);
-                    } else if animated {
-                        dropped.push(gih::ANIMATION);
-                    }
                     // A coloured cell no longer loses anything: the same `.gbr`
                     // reader carries the colour across, so the only thing a pipe
-                    // drops is the sequence itself.
+                    // drops is its sequencing.
+                    let dropped = sequence.clone();
                     let (parameters, tip) = gbr::to_brush(cell);
                     Imported {
                         preset: preset_for("gih", name, parameters),
@@ -598,6 +596,54 @@ mod tests {
         // on twice, and a file that fails whole fails through `read_file`.
         assert!(refusals(Path::new("definitely/not/here.bundle")).is_empty());
         assert!(refusals(Path::new("somewhere/nice.kpp")).is_empty());
+    }
+
+    /// A pipe becomes one preset per cell, numbered — and **one preset, not
+    /// numbered, where the cells cannot make different marks**. Both halves are
+    /// this function's rather than `gih`'s: `many` is read off the cells the
+    /// pipe can reach, so a collapse changes the name as well as the notice,
+    /// and a pipe of four copies of one stamp arrives as `Copies` rather than
+    /// as `Copies 1`.
+    #[test]
+    fn a_pipe_arrives_as_one_preset_per_cell_it_can_reach() {
+        let dir = std::env::temp_dir().join(format!("umber-gih-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        // A 1x1 version 2 mask, whole, so a pipe is these end to end.
+        let cell = |coverage: u8| {
+            let mut out = Vec::new();
+            for field in [29u32, 2, 1, 1, 1] {
+                out.extend_from_slice(&field.to_be_bytes());
+            }
+            out.extend_from_slice(b"GIMP");
+            out.extend_from_slice(&25u32.to_be_bytes());
+            out.push(0);
+            out.push(coverage);
+            out
+        };
+        let pipe = |name: &str, cells: &[Vec<u8>]| {
+            let mut out = format!("{name}\n{} dim:1 sel0:random\n", cells.len()).into_bytes();
+            for cell in cells {
+                out.extend_from_slice(cell);
+            }
+            out
+        };
+
+        let shuffled = dir.join("bark.gih");
+        std::fs::write(&shuffled, pipe("Bark", &[cell(10), cell(20), cell(30)])).expect("write");
+        let found = read_file(&shuffled).expect("read");
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].preset.name, "Bark 1");
+        assert_eq!(found[2].preset.name, "Bark 3");
+        assert_eq!(found[0].dropped, [gih::ANIMATION]);
+
+        let copies = dir.join("copies.gih");
+        std::fs::write(&copies, pipe("Copies", &[cell(7), cell(7), cell(7)])).expect("write");
+        let found = read_file(&copies).expect("read");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(found.len(), 1, "three copies of one stamp are one brush");
+        assert_eq!(found[0].preset.name, "Copies");
+        assert!(found[0].dropped.is_empty(), "{:?}", found[0].dropped);
     }
 
     /// The point of the whole exercise: a GIMP brush picked in the file dialog

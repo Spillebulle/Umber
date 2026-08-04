@@ -767,23 +767,47 @@ drew arrives, named `Bark 1` … `Bark 5`, and can be painted with. What it lose
 is the **sequencing**, and the import says so.
 
 Choosing per dab is the better answer and needs the dab pass to hold an array of
-tips and an index per instance — see "Not done yet".
+tips and an index per instance. **`docs/brush-pipes.md` is the design**, and it
+is where the figures below have to be re-checked; `cargo run --release -p
+umber-core --example measure-pipes` is what produces them.
+
+A rule is read **per dimension**, not once. Every pipe in every fetched pack is
+`dim:1`, so `sel0:` alone is right for all 55 of them and is not right in
+general: a `dim:2` pipe that turns with the stroke along one axis and shuffles
+along the other loses two different things, and naming one of them sends
+somebody looking for a rotating stamp when half the mark is a shuffle.
+
+**Two collapses turn a pipe into one brush losing nothing**, and both are
+decided from the file rather than from a judgement about what the stamps
+depict:
+
+| | |
+|---|---|
+| nothing walks | every dimension states `constant`, so GIMP paints the first cell for ever and the rest are unreachable — read off the header |
+| the cells cannot differ | every cell is the same brush, so choosing between them makes exactly the mark one of them repeated makes — compared byte for byte, over the mask, its spacing and whether it carried a colour |
+
+Two of the 55 are the second, both of them tips inside David Revoy's bundle. A
+one-cell pipe is the degenerate case of it: a sequence of one has no sequencing,
+so `ncells:1 sel0:incremental` is not a loss.
 
 **`sel0:angular` is the exception, and it is named separately.** Of GIMP's eight
 selection rules that one is not a shuffle: it picks the cell by the *direction
-of the stroke*, so the cells are one mark drawn at `ncells` rotations and
-painting a curve turns the stamp through them. Umber's dab does exactly that
-natively — `dab_angle_follows_stroke` turns the quad and its tip with it — so
-one cell plus that flag would reproduce such a pipe rather than approximate it.
+of the stroke*, so the cells are one mark drawn at `rank` rotations and painting
+a curve turns the stamp through them. Umber's dab does exactly that natively —
+`dab_angle_follows_stroke` turns the quad and its tip with it, continuously
+rather than in `rank` steps — so one cell plus that flag would reproduce such a
+pipe rather than approximate it.
 
-It is deliberately not done. Collapsing to the first cell is right only if the
-other cells really are that cell rotated, which is what `angular` *means* but
-not what the file *says*, and a pipe of unrelated pictures walked angularly
-would lose every stamp but one in silence. **No `.gih` in any fetched pack is
-angular** — all 43 of rubberduck's are `sel0:random` — so there is nothing to
-check such a collapse against. Until there is, an angular pipe arrives as one
-preset per cell and the import names the rule that was lost rather than the
-general one.
+It is deliberately not done, and the difference from the two above is the whole
+reason. Collapsing to the first cell is right only if the other cells really are
+that cell rotated, which is what `angular` *means* but not what the file *says*,
+and a pipe of unrelated pictures walked angularly would lose every stamp but one
+in silence. Deciding it from the pixels needs a resampler this crate does not
+have and a threshold nobody could calibrate, because **not one pipe in any
+fetched pack is angular**: 44 loose files and 11 inside the two Krita bundles,
+51 `random` and 4 `incremental`. There is nothing to check such a collapse
+against. Until there is, an angular pipe arrives as one preset per cell and the
+import names the rule that was lost rather than the general one.
 
 ### Importing a GIMP parametric brush (`.vbr`)
 
@@ -1904,14 +1928,28 @@ per pack. See `docs/brush-sources.md`.
   `docs/brush-sources.md`, which has the measurement and the one line that
   reverses it.
 - **Picking a cell per dab**, which is what would make a `.gih` a brush rather
-  than five. The dab pass binds one tip per pass — that is what keeps a thousand
-  tipped dabs a single draw call — so it would need the tip binding to become a
-  small array and the dab instance to carry an index into it, chosen by the same
-  seeded RNG that already drives scatter and angle jitter. Every pipe in the
-  fetched packs picks at random, so `sel0:` would not have to be honoured in
-  full — and `angular`, the one rule that is not a shuffle, would be better
-  served by a single stroke-following cell than by an array. Until then a pipe
-  arrives as one preset per cell and says which rule it lost.
+  than five. **`docs/brush-pipes.md` is the design, the measurements and the
+  order to build it in.** The short version: the tip binding becomes a
+  `texture_2d_array` and the dab instance carries an index, chosen by the same
+  seeded RNG that already drives scatter and angle jitter — and the thing that
+  actually stands in the way is neither memory (the largest cell array in the
+  packs is 1221 kB against a canvas-sized scratch) nor the shader (a cell index
+  is a third coordinate on one `textureSample`), but what a `TipMask` *is*. A
+  pipe has to be one mask of several cells, because `Brush` is `Copy` and
+  `BrushPreset::tip` holding one name is what lets two brushes share one upload
+  — and that changes the meaning of "the mask" for the tip canvas, the library
+  writer, the shipped table, `stroke_coverage` and the row preview. It should
+  follow the colour plane through that file rather than race it. The prize is
+  the *import* rather than the shipped count: 252 of the 257 presets refused for
+  sequencing alone are rubberduck's, whose masks are not redistributed either
+  way, so the library gains about five and somebody who owns that pack gains 252
+  faithful stamps.
+
+  **`angular` stays unbuilt on purpose**, and the measurement is why: not one
+  pipe in any fetched pack is angular — 55 pipes, 51 `random`, 4 `incremental`.
+  A single cell plus `dab_angle_follows_stroke` would reproduce one *better*
+  than the file describes it, continuously rather than in `rank` steps, and
+  there is nothing to check that against.
 - **A wider grain model, and the papers the packs actually ask for.** A paper of
   your own now exists — `BrushPreset::paper` names a tile in the user library —
   so this is no longer about somewhere to put a picture. One gap remains:
