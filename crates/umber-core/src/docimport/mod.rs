@@ -552,7 +552,7 @@ impl fmt::Display for ImportWarning {
             Self::GroupFlattened { group } => {
                 write!(
                     f,
-                    "Group “{group}” was flattened — Umber has no layer groups."
+                    "Group “{group}” was flattened. Its layers are all here, side by side in the stack."
                 )
             }
             Self::GroupOpacityFolded { group } => write!(
@@ -561,7 +561,7 @@ impl fmt::Display for ImportWarning {
             ),
             Self::MaskIgnored { layer } => write!(
                 f,
-                "Layer “{layer}” has a mask, which was ignored — the layer covers more than it did."
+                "Layer “{layer}” has a mask, which was ignored. The layer covers more than it did."
             ),
             Self::MaskUnsupported { layer, what } => {
                 write!(f, "Layer “{layer}”: {what} was not imported.")

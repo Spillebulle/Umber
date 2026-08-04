@@ -506,10 +506,10 @@ fn detail(entry: &Entry, joins: Option<bool>) -> String {
         // The one row that has to explain itself: it is drawn so that a shipped
         // picture is never simply missing, and it cannot be chosen because a
         // name resolves to the user's copy first.
-        Source::Hidden => "shipped — hidden by one of yours with the same name",
+        Source::Hidden => "shipped, hidden by one of yours with the same name",
     };
     match joins {
-        Some(false) => format!("{size} · {source} · does not tile — shows a grid"),
+        Some(false) => format!("{size} · {source} · does not tile, so it draws a grid"),
         _ => format!("{size} · {source}"),
     }
 }
@@ -709,7 +709,7 @@ fn choose(ed: &mut Editor, state: &mut State, kind: Kind, name: String) {
             } else {
                 format!(
                     "The brush in your hand now names \"{name}\", but its Paper \
-                     setting is at zero — raise it in the brush editor's Texture \
+                     setting is at zero. Raise it in the brush editor's Texture \
                      section to let the grain bite."
                 )
             }));
@@ -874,7 +874,7 @@ fn import(ctx: &egui::Context, ed: &mut Editor, state: &mut State, kind: Kind) {
                             "Added \"{name}\" ({w} × {h}) to your papers, but its edges \
                              do not meet. The grain is anchored to the document and \
                              repeats across it, so this one will draw a grid over the \
-                             canvas — one line every tile."
+                             canvas, one line every tile."
                         ))
                     });
                 }

@@ -105,7 +105,7 @@ pub fn from_abr(bytes: &[u8]) -> Result<AbrFile, PresetError> {
             if file.computed > 0 {
                 format!(
                     "all {} of its brushes are Photoshop's *computed* kind, which is a \
-                     description rather than a stamp — Umber has no equivalent",
+                     description rather than a stamp, and Umber has no equivalent",
                     file.computed
                 )
             } else {
@@ -478,7 +478,7 @@ impl<'a> Reader<'a> {
 fn truncated() -> PresetError {
     PresetError::Malformed(
         None,
-        "the .abr ends in the middle of a brush — is it truncated?".to_string(),
+        "the .abr ends in the middle of a brush. Is it truncated?".to_string(),
     )
 }
 

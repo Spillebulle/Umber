@@ -179,7 +179,7 @@ impl PanelKind {
                  swap between them."
             }
             Self::Colour => {
-                "Choose the painting colour — a hue ring, a saturation square, \
+                "Choose the painting colour: a hue ring, a saturation square, \
                  RGB sliders or a harmony wheel."
             }
             Self::Palette => {
@@ -192,7 +192,7 @@ impl PanelKind {
             }
             Self::Tweaks => {
                 "Hardness, spacing, roundness and three more, for the brush in \
-                 hand — changed without changing the brush you saved."
+                 hand. The brush you saved stays as it was."
             }
             Self::Layers => "The layer stack: order, visibility, opacity and blend mode.",
             Self::History => {

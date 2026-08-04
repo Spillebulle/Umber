@@ -337,7 +337,7 @@ pub fn from_sut(bytes: &[u8]) -> Result<SutFile, PresetError> {
 
     if file.tools.is_empty() {
         return Err(malformed(
-            "it holds no brushes — every sub-tool in it is a fill, selection or shape tool"
+            "it holds no brushes. Every sub-tool in it is a fill, selection or shape tool"
                 .to_string(),
         ));
     }

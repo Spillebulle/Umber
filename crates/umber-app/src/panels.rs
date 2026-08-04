@@ -529,7 +529,7 @@ fn remove_button(ui: &mut Ui, p: &Palette) -> bool {
     // No arrow glyph in the tooltip: Archivo carries none, and a blank box
     // pointing at the way back would be worse than spelling out the menu.
     response
-        .on_hover_text("Remove this module from the layout — Window, Modules puts it back")
+        .on_hover_text("Remove this module. Window, Modules puts it back.")
         .clicked()
 }
 
@@ -997,7 +997,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     locked,
                     ed.layers.active_is_folder(),
                 ) {
-                    (_, true, _) => "The layer is locked — unlock it to delete it",
+                    (_, true, _) => "Unlock the layer to delete it",
                     (false, _, _) => "A document needs a layer to paint on",
                     (_, _, true) => "Delete the group and everything in it",
                     _ => "Delete layer",
@@ -1024,7 +1024,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                         "Move layer down"
                     }
                 } else if depth > 0 {
-                    "Nowhere to step inside this group — drag it sideways to leave"
+                    "Nowhere to go inside this group. Drag it sideways to leave."
                 } else {
                     "Already at the end of the stack"
                 }
@@ -1070,9 +1070,9 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 Icon::Folder,
                 can_group,
                 if can_group {
-                    "Put the ticked layers — or the selected one — in a group"
+                    "Group the ticked layers, or the selected one"
                 } else if count >= LayerStack::MAX {
-                    "The stack is full — a group is an entry too"
+                    "The stack is full. A group counts as an entry too."
                 } else {
                     "That would nest deeper than Umber can hold"
                 },
@@ -1135,7 +1135,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 has_mask,
                 !locked,
                 match (has_mask, locked) {
-                    (_, true) => "The layer is locked — unlock it to change its mask",
+                    (_, true) => "Unlock the layer to change its mask",
                     (true, _) => "Remove the layer mask",
                     (false, _) => "Add a layer mask, revealing everything",
                 },
@@ -1154,7 +1154,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 Icon::Clip,
                 layer.clipped,
                 true,
-                "Clip to the layer below — the layer only shows where that one does",
+                "Clip to the layer below. This one then shows only where that one does.",
             ) {
                 layer.clipped = !layer.clipped;
                 changed = true;
@@ -1169,7 +1169,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 if is_locked {
                     "Unlock the layer"
                 } else {
-                    "Lock the layer — no strokes, transforms, clearing or flipping"
+                    "Lock the layer against strokes, transforms, clearing and flipping"
                 },
             ) {
                 layer.locked = !is_locked;
@@ -1228,7 +1228,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                 if is_locked {
                     "Unlock the group"
                 } else {
-                    "Lock the group — nothing in it can be painted on or cleared"
+                    "Lock the group. Nothing in it can be painted on or cleared."
                 },
             ) {
                 layer.locked = !is_locked;
@@ -1248,8 +1248,8 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     .color(p.text_muted),
             )
             .on_hover_text(
-                "A group has no blend mode and no opacity of its own — its \
-                 layers composite in place. Its eye and its lock reach \
+                "A group has no blend mode and no opacity of its own. Its \
+                 layers composite in place, and its eye and its lock reach \
                  everything inside it.",
             );
         });
@@ -1402,7 +1402,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     can_delete && !any_locked,
                     match (can_delete, any_locked) {
                         (false, _) => "A document needs a layer to paint on",
-                        (_, true) => "One of them is locked — unlock it to delete it",
+                        (_, true) => "One of them is locked. Unlock it to delete them.",
                         _ => "Delete the ticked layers",
                     },
                 ) {
@@ -1424,10 +1424,10 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
                     already.is_some(),
                     already.is_some() || (picked > 1 && room),
                     match (already.is_some(), picked > 1, room) {
-                        (true, _, _) => "Unlink them — they stop moving together",
+                        (true, _, _) => "Unlink them, so they stop moving together",
                         (_, false, _) => "Tick two or more layers to link them",
-                        (_, _, false) => "Every link group is in use — unlink one first",
-                        _ => "Link them — they move through the stack together",
+                        (_, _, false) => "Every link group is in use. Unlink one first.",
+                        _ => "Link them, so they move through the stack together",
                     },
                 ) {
                     act = Some(match already {
@@ -2101,7 +2101,7 @@ fn module_library(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui,
                 p,
                 "The panels the workspace is made of. Adding one hands it to \
-                 the pointer — drop it in a sidebar to dock it, or anywhere \
+                 the pointer. Drop it in a sidebar to dock it, or anywhere \
                  else to leave it floating over the canvas.",
             );
             ui.add_space(10.0);
@@ -2434,7 +2434,7 @@ pub fn edit_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "drag a panel by its header — a column re-docks it, a column's \
+                        "drag a panel by its header: a column re-docks it, a column's \
                          edge starts a new one, anywhere else floats · drag an edge to \
                          resize · the cross removes",
                     )

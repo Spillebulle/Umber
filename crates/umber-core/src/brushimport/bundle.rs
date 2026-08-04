@@ -176,7 +176,7 @@ pub fn from_bundle(bytes: &[u8]) -> Result<BundleContents, PresetError> {
         return Err(PresetError::Malformed(
             None,
             format!(
-                "none of its {} brushes could be read — {}",
+                "none of its {} brushes could be read: {}",
                 presets.len(),
                 out.refused
                     .first()

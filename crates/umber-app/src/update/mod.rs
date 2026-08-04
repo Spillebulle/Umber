@@ -225,7 +225,7 @@ impl Updates {
     /// trade.
     pub fn check_unavailable(&self) -> Option<&'static str> {
         matches!(self.kind, InstallKind::Managed(install::Manager::Flatpak)).then_some(
-            "Flatpak keeps this copy up to date — run `flatpak update \
+            "Flatpak keeps this copy up to date. Run `flatpak update \
              io.github.spillebulle.umber`, or leave it to your software centre. \
              Umber's sandbox is granted no network access, so it does not check \
              for itself.",

@@ -1242,7 +1242,7 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                         .on_hover_text(hint)
                         .on_disabled_hover_text(
                             "A layer is locked. A flip mirrors every layer at once, so it \
-                             cannot skip one — unlock it first.",
+                             cannot skip one. Unlock it first.",
                         )
                         .clicked()
                     {
@@ -1284,7 +1284,7 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                         !ed.layers.active_is_locked(),
                         egui::Button::new("Clear layer"),
                     )
-                    .on_disabled_hover_text("The layer is locked — unlock it to clear it.")
+                    .on_disabled_hover_text("Unlock the layer to clear it.")
                     .clicked()
                 {
                     actions.clear = true;
@@ -1292,8 +1292,8 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
                 }
                 if menu_item(ui, "Export image…", Action::Export)
                     .on_hover_text(
-                        "One flattened image — PNG, JPEG, TIFF, GIF or BMP — for showing \
-                         people. Save keeps the layers.",
+                        "One flattened image for showing people: PNG, JPEG, TIFF, GIF or \
+                         BMP. Save keeps the layers.",
                     )
                     .clicked()
                 {
@@ -1395,7 +1395,7 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         );
         if band.width() >= 40.0 {
             let title = format!(
-                "{} — {} × {}",
+                "{} · {} × {}",
                 ed.session.active_title(),
                 ed.doc.size.x,
                 ed.doc.size.y
@@ -1440,16 +1440,16 @@ fn update_rehearsal(ui: &mut egui::Ui, ed: &mut Editor) {
                 }),
             ),
             ("Unpacking", Phase::Working(Stage::Unpacking)),
-            ("Installing — Windows", Phase::Working(Stage::HandingOver)),
+            ("Installing on Windows", Phase::Working(Stage::HandingOver)),
             (
-                "Done — restart",
+                "Done, restart",
                 Phase::Done {
                     outcome: Applied::Restart,
                     countdown: Countdown::stopped(),
                 },
             ),
             (
-                "Done — installer",
+                "Done, installer",
                 Phase::Done {
                     outcome: Applied::Installer,
                     countdown: Countdown::stopped(),
@@ -1786,7 +1786,7 @@ fn selection_op_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         // The tooltip carries the name as well as what it does: the mark is a
         // picture of the *result*, which is legible once you know the four and
         // guessable at best before that.
-        let tip = format!("{} — {}", op.label(), op.hint());
+        let tip = format!("{} · {}", op.label(), op.hint());
         if widgets::icon_toggle(ui, p, mark, ed.ui.selection_op == op, true, &tip) {
             ed.ui.selection_op = op;
         }
@@ -1912,7 +1912,7 @@ fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
         // than a bug.
         let (line, ink) = if ed.layout.edit_mode() {
             (
-                "layout edit — nothing you draw changes; panels are the only \
+                "layout edit · nothing you draw changes; panels are the only \
                  thing that moves"
                     .to_string(),
                 p.accent,
@@ -1929,7 +1929,7 @@ fn status_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
             };
             (
                 format!(
-                    "{where_it_lives}{} · panels locked — Window, Customise layout",
+                    "{where_it_lives}{} · panels locked · Window, Customise layout",
                     if tab.modified { " · unsaved" } else { "" },
                 ),
                 p.text_dim,
@@ -2078,7 +2078,7 @@ pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     Align2::LEFT_CENTER,
                     widgets::elide(
                         painter,
-                        &format!("Edit brush — {name}"),
+                        &format!("Edit brush · {name}"),
                         text::CONTROL,
                         used - band.left() - 8.0,
                     ),
@@ -2312,7 +2312,7 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             "A rake keeps its bristles across the line of travel; a broad nib \
              holds one angle through a curve."
         } else {
-            "Angle needs an elliptical dab or a bitmap tip — lower Roundness \
+            "Angle needs an elliptical dab or a bitmap tip. Lower Roundness \
              first."
         },
     );
@@ -2490,7 +2490,7 @@ fn brush_editor_inputs(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         caption(
             ui,
             p,
-            "Nothing but pressure drives this brush. That is the fast path — no \
+            "Nothing but pressure drives this brush. That is the fast path: no \
              per-dab evaluation and no random draws at all.",
         );
         return;
@@ -2671,7 +2671,7 @@ fn input_note(input: DabInput) -> &'static str {
              use this for the rest."
         }
         DabInput::Speed => {
-            "How fast the pointer is moving right now — it reacts within a \
+            "How fast the pointer is moving right now. It reacts within a \
              flick, so it is the one that makes a stroke thin as it is thrown."
         }
         DabInput::SlowSpeed => {
@@ -2683,7 +2683,7 @@ fn input_note(input: DabInput) -> &'static str {
              running out, or colour drifting along a stroke."
         }
         DabInput::Direction => {
-            "Which way the stroke is heading, over half a turn — a line pulled \
+            "Which way the stroke is heading, over half a turn. A line pulled \
              left and the same line pulled right read the same."
         }
         DabInput::Random => {
@@ -2766,10 +2766,10 @@ fn brush_editor_scatter(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         ui,
         p,
         "Scatter is measured in dab radii, so a spray looks like itself at any \
-         size. Angle jitter needs an elliptical dab to show. Speed lead throws \
-         each dab along the direction of travel — a tenth of a second's worth \
-         of it per unit — so a fast stroke runs ahead of the cursor and a slow \
-         one sits on it.",
+         size. Angle jitter needs an elliptical dab to show.\n\nSpeed lead \
+         throws each dab along the direction of travel, a tenth of a second's \
+         worth of it per unit, so a fast stroke runs ahead of the cursor and a \
+         slow one sits on it.",
     );
 }
 
@@ -2912,12 +2912,12 @@ fn paper_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 let _ = match ed.paper_tile() {
                     // One Umber ships, named rather than chosen through the
                     // enum — an imported preset can do that.
-                    Some(_) => ui.selectable_label(true, format!("{name} — shipped with Umber")),
+                    Some(_) => ui.selectable_label(true, format!("{name} · shipped with Umber")),
                     // Nothing behind it at all: a library copied without its
                     // `papers/` directory. Said out loud rather than left out,
                     // or the picker would name one of Umber's three for a brush
                     // that is painting flat. See `BrushPreset::paper`.
-                    None => ui.selectable_label(true, format!("{name} — not in your library")),
+                    None => ui.selectable_label(true, format!("{name} · not in your library")),
                 };
             }
             ui.separator();
@@ -3024,7 +3024,7 @@ fn brush_editor_blending(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         caption(
             ui,
             p,
-            "How the finished stroke combines with the layer under it — the \
+            "How the finished stroke combines with the layer under it: the \
              same five modes a layer has, and the same maths. Applied once, \
              when the stroke is put down, so a mark that crosses itself \
              multiplies with the paint beneath it rather than with itself.",

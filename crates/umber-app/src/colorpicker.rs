@@ -764,7 +764,7 @@ fn wheel(
     }
     if following {
         row.response
-            .on_hover_text("The hue is setting the angle — turn Rotate with hue off to set it.");
+            .on_hover_text("The hue is setting the angle. Turn Rotate with hue off to set it.");
     }
 
     changed
@@ -1493,7 +1493,7 @@ fn harmony_swatches(ui: &mut Ui, p: &Palette, hues: &[f32], hsv: &mut Hsv) -> bo
             "Take this colour"
         };
         if response
-            .on_hover_text(format!("{hint} — #{r:02X}{g:02X}{b:02X}"))
+            .on_hover_text(format!("{hint} · #{r:02X}{g:02X}{b:02X}"))
             .clicked()
         {
             taken = Some(*hue);

@@ -231,7 +231,7 @@ impl Reporter<'_> {
     /// on stderr, but the last thing a person needs to read.
     fn build(&self, event_loop: &ActiveEventLoop) -> Result<Gfx, String> {
         let attrs = Window::default_attributes()
-            .with_title("Umber — crash report")
+            .with_title("Umber crash report")
             .with_window_icon(logo::window_icon())
             .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW[0], WINDOW[1]));
@@ -719,7 +719,7 @@ fn technical(
             // path to the file is printed below and why the text stays
             // selectable.
             ui.label(
-                egui::RichText::new("Copied — paste it before closing this window.")
+                egui::RichText::new("Copied. Paste it before closing this window.")
                     .size(text::SMALL)
                     .color(p.text_dim),
             );

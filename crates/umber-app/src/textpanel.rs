@@ -756,7 +756,7 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             ui,
             p,
             &format!(
-                "This face has no glyph for {list}{more} — they are left blank \
+                "This face has no glyph for {list}{more}. They are left blank \
                  rather than drawn as a box. Choose another font, or remove them."
             ),
         );
@@ -828,7 +828,7 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let tooltip = if locked {
         "The layer is locked. Unlock it in the Layers panel, or select another."
     } else if folder {
-        "A folder is selected. A folder holds no pixels — select a layer."
+        "A folder is selected. A folder holds no pixels, so select a layer."
     } else if empty {
         "Type something first."
     } else {
@@ -848,7 +848,7 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     controls::note(
         ui,
         p,
-        "Text is painted into the layer when it is put down — it is pixels \
+        "Text is painted into the layer when it is put down. It is pixels \
          afterwards, not something that can be re-typed.",
     );
 }

@@ -985,9 +985,9 @@ fn empty_message(state: &State) -> &'static str {
 /// as "you may not edit this".
 fn row_controls(ui: &mut Ui, p: &Palette, rect: Rect, id: &str, user: bool) -> Option<Request> {
     const READ_ONLY: &str = "Brushes that ship with Umber are part of the application, so there \
-                             is nothing here to rename or delete — an update replaces the \
-                             shipped library wholesale. Edit this one and save it as your own; \
-                             that copy is yours to rename and delete.";
+                             is nothing here to rename or delete. An update replaces the \
+                             shipped library wholesale. Edit this one and save it as your \
+                             own; that copy is yours to rename and delete.";
     let marks = [
         (Icon::Pencil, "Edit this brush in the brush editor", true),
         (Icon::Rename, "Rename this brush", false),
@@ -1035,7 +1035,7 @@ fn attribution(ui: &mut Ui, preset: &BrushPreset) {
     let Some(credit) = &preset.credit else {
         return;
     };
-    ui.label(RichText::new(format!("{} — {}", credit.author, credit.licence)).small());
+    ui.label(RichText::new(format!("{} · {}", credit.author, credit.licence)).small());
     if !credit.source.is_empty() {
         ui.label(RichText::new(&credit.source).small().weak());
     }
@@ -1474,8 +1474,8 @@ fn new_brush(state: &mut State, ed: &mut Editor) {
     state.scope = Scope::All;
     state.query.clear();
     state.notice = Some(Notice::good(format!(
-        "Made \"{label}\" and put it in your hand. It is saved in your library — \
-         change it here, then press Update."
+        "Made \"{label}\" and put it in your hand. It is saved in your library. \
+         Change it here, then press Update."
     )));
 }
 
@@ -1613,7 +1613,7 @@ fn import_notice(
             };
         }
         1 => failures[0].clone(),
-        n => format!("{} — and {} more failed.", failures[0], n - 1),
+        n => format!("{} And {} more failed.", failures[0], n - 1),
     };
     Notice::bad(if summary.is_empty() {
         trailer
@@ -1770,7 +1770,7 @@ fn tip_labels(ed: &Editor) -> (&'static str, String) {
         // more than the symptom: the library was copied without its pictures.
         (None, Some(name)) => (
             "Bitmap tip missing",
-            format!("\"{name}\" is not in your library — painting round"),
+            format!("\"{name}\" is not in your library, so this brush paints round"),
         ),
         (None, None) => (
             "Round tip",
@@ -1800,7 +1800,7 @@ fn tip_picker(ui: &mut Ui, p: &Palette, ed: &Editor) -> Option<Option<String>> {
         widgets::Dropdown::new(label).width(widgets::DropdownWidth::Exact(132.0)),
         |ui| {
             if ui
-                .selectable_label(current.is_none(), "Round — no stamp")
+                .selectable_label(current.is_none(), "Round, no stamp")
                 .clicked()
             {
                 chosen = Some(None);
@@ -2013,13 +2013,13 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                     RichText::new(if gone {
                         format!(
                             "for \"{}\", which is no longer in your library · \
-                             what you paint becomes coverage — colour is ignored, \
+                             what you paint becomes coverage: colour is ignored, \
                              opacity is the strength",
                             target.name
                         )
                     } else {
                         format!(
-                            "for \"{}\" · what you paint becomes coverage — colour is \
+                            "for \"{}\" · what you paint becomes coverage: colour is \
                              ignored, opacity is the strength, and the eraser takes it \
                              back off",
                             target.name
@@ -2031,8 +2031,8 @@ pub fn tip_bar(root: &mut Ui, p: &Palette, ed: &mut Editor) -> bool {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controls::text_button(ui, p, "Use as tip", true, true)
                         .on_hover_text(if gone {
-                            "Put the stamp in the brush you are holding — the brush this \
-                             canvas was for has gone"
+                            "Put the stamp in the brush you are holding. The brush this \
+                             canvas was for has gone."
                         } else {
                             "Write this canvas into your brush library as that brush's stamp"
                         })
@@ -2109,7 +2109,7 @@ pub fn commit_tip(
                 TipCommit {
                     title: format!("\"{}\" now stamps what you drew", target.name),
                     detail: "The picture is in your brush library's tips folder, and the \
-                             brush is in your hand. This canvas is still open — paint on \
+                             brush is in your hand. This canvas is still open. Paint on \
                              it again and press Use as tip to replace the stamp."
                         .to_owned(),
                 }
@@ -2130,7 +2130,7 @@ pub fn commit_tip(
         TipCommit {
             title: format!("The stamp is in your hand, not on \"{}\"", target.name),
             detail: format!(
-                "\"{}\" is not a brush Umber can write to — it has been deleted, or it is \
+                "\"{}\" is not a brush Umber can write to. It has been deleted, or it is \
                  one Umber ships and those are read-only. Nothing is lost: you are \
                  painting with the stamp now, and \"Save as new…\" in the brush editor \
                  keeps it.",
@@ -2227,11 +2227,12 @@ fn drag_ghost(ctx: &egui::Context, p: &Palette, drag: &brushdrag::Drag) {
         egui::Order::Tooltip,
         Id::new("brush-library-drag"),
     ));
-    // An em dash rather than an arrow. Archivo carries no arrow glyph and would
-    // draw a blank box; the dash is ordinary punctuation and is already how the
-    // attribution tooltip joins two things together.
+    // The word "to" rather than an arrow. Archivo carries no arrow glyph and
+    // would draw a blank box, and a dash would have to be read as one anyway —
+    // this label is the one place in the interface that has a *direction* to
+    // say, so it says it.
     let label = match drag.destination() {
-        Some(to) => format!("{} — {to}", drag.name),
+        Some(to) => format!("{} to {to}", drag.name),
         None => drag.name.clone(),
     };
     let galley = painter.layout_no_wrap(label, FontId::proportional(text::TINY), p.text_strong);
@@ -2389,7 +2390,7 @@ fn create_collection(state: &mut State, ed: &mut Editor, name: String) {
                 .map(|group| group.name.clone());
             state.notice = Some(Notice::bad(match &found {
                 Some(name) => {
-                    format!("\"{name}\" is already a collection — showing that one instead.")
+                    format!("\"{name}\" is already a collection. Showing that one instead.")
                 }
                 // Only reachable for a collection that exists as a rule rather
                 // than as a row: `preset::IMPORTED` is where every import

@@ -275,7 +275,7 @@ mod tests {
         // fails, the fix is to change the string, not to add a fallback font.
         assert!(covers("UMBER"), "the wordmark");
         assert!(covers("GPU PAINTING · v0.1.0"), "the middle dot");
-        assert!(covers("compiling shaders — dab.wgsl"), "the em dash");
+        assert!(covers("compiling shaders: dab.wgsl"), "the shader line");
         assert!(covers("D3D12 · NVIDIA GeForce RTX 4070"), "an adapter line");
     }
 

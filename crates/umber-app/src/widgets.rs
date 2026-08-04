@@ -2567,7 +2567,7 @@ pub fn pressure_graph(
         painter.text(
             field.center(),
             Align2::CENTER_CENTER,
-            "Nothing yet — move the pointer over the window.",
+            "Nothing yet. Move the pointer over the window.",
             FontId::proportional(text::TINY),
             p.text_dim,
         );

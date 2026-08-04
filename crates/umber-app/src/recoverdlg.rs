@@ -244,7 +244,7 @@ fn body(
     // discovered after it.
     ui.label(
         egui::RichText::new(
-            "Nothing here is deleted either way — Umber keeps its copies in the \
+            "Nothing here is deleted either way. Umber keeps its copies in the \
              autosave folder until they expire. This offer is only made once.",
         )
         .size(text::TINY)

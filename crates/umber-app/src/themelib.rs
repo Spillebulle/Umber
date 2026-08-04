@@ -130,7 +130,7 @@ impl fmt::Display for ThemeError {
         match self {
             Self::NotATheme(path) => write!(
                 f,
-                "{} is not an Umber theme — the first line has to be “{HEADER}”",
+                "{} is not an Umber theme. The first line has to be “{HEADER}”.",
                 path.display()
             ),
             Self::Full { max } => write!(

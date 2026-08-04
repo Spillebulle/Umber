@@ -1188,7 +1188,7 @@ mod tests {
         for (name, mask) in builtin_tips() {
             assert!(
                 stroke_coverage(mask, 0.1).is_usable(),
-                "{name} is too faint to accumulate — it would paint nothing"
+                "{name} is too faint to accumulate, so it would paint nothing"
             );
         }
     }
