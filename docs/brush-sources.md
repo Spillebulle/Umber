@@ -159,9 +159,11 @@ better.
 
 ## Shipping a stamp
 
-Stamps ship now: **19 brushes carried by 15 masks, 624 kB of 8-bit greyscale
-PNG in `crates/umber-core/assets/tips/`, 664 kB of release binary** — measured,
-17,162,752 bytes before and 17,842,176 after. The generator writes the masks,
+Stamps ship now: **23 brushes carried by 18 masks, 649 kB of 8-bit greyscale
+PNG in `crates/umber-core/assets/tips/`**. The release binary was measured when
+the first fifteen of those masks landed — 664 kB, 17,162,752 bytes before and
+17,842,176 after — and the three added since have not been weighed again,
+because the delta is the PNG and nothing else. The generator writes the masks,
 deduplicates them by content and rewrites the `include_bytes!` table;
 `preset::builtin()` resolves a shipped tip through `tip::builtin` before the
 user's library. `docs/brushes.md` has the mechanism.
@@ -170,11 +172,17 @@ What decided the shape of it, in the order the questions were asked.
 
 ### How many brushes is this actually about
 
-**338** across the five packs carry a mask. Only **37** of them drop nothing
-else, so the other 301 were never candidates whatever the library could hold —
+**338** across the five packs carry a mask. Only **40** of them drop nothing
+else, so the other 298 were never candidates whatever the library could hold —
 257 are refused for a `.gih` pipe's sequencing alone, and the rest for coloured
-stamps, mirrored dabs, brush-tip randomness, a separate paint-deposit rate or a
-rotation Umber cannot drive. Of the 37, 19 ship and 17 are rubberduck's.
+stamps, mirrored dabs, brush-tip randomness or a rotation Umber cannot drive.
+Of the 40, 23 ship and 17 are rubberduck's.
+
+It was 37 and 19 until Krita's **paint-deposit rate** came off that list.
+That one was never a mask Umber could not paint: `Brush::smudge` is the mix
+between the palette colour and what a dab lifted, so `1 - smudge` already is a
+deposit rate, and what the reader was missing was the enable flag beside the
+value. `crates/umber-core/src/brushimport/kpp.rs` has the argument.
 
 ### How big the whole thing would have been
 
