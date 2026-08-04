@@ -369,7 +369,8 @@ pub struct Editor {
     /// Size of that region, for fit-to-view.
     pub canvas_size: Vec2,
     /// The canvas scrollbars as they were last drawn, in points: horizontal
-    /// then vertical, `None` where the document does not run off that edge.
+    /// then vertical, `None` only where there is no document on that axis or
+    /// the region is too short to hold a thumb.
     ///
     /// Recorded because a press on a bar must not also start a stroke, and the
     /// usual test cannot answer it: these sit *inside* the canvas region and are
@@ -377,6 +378,11 @@ pub struct Editor {
     /// the `layer_id_at` check in `app.rs` sees them. Set every frame by
     /// `ui::draw`, and an array rather than a `Vec` because it is written on the
     /// drawing path.
+    ///
+    /// This is load-bearing on every frame rather than only where the picture
+    /// runs off the view: the bars are drawn whenever there is a document to
+    /// move, so they are a permanent live target over two edges of the canvas.
+    /// `ScrollSpan`'s docs have why they are drawn there.
     pub scroll_bars: [Option<egui::Rect>; 2],
     /// The floating transform's two flip buttons as they were last drawn, in
     /// points: horizontal then vertical, `None` when no transform is up.

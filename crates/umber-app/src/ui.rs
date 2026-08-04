@@ -658,7 +658,14 @@ fn flip_buttons(
     // Deliberately *not* the selection strip's rule, which pulls itself back on
     // screen instead: a floating transform can be moved and a selection cannot,
     // so there the artist would have no way of reaching the controls at all.
-    if !rect.contains_rect(strip) {
+    //
+    // Against what the scrollbars have left rather than the whole region, for
+    // the reason the selection strip is placed there: the bars are drawn after
+    // this and win a tie, so a flip button in the strip would be a button that
+    // scrolls. Here that means declining a fraction earlier, which is the rule
+    // this already follows.
+    let free = canvas_free_of_scrollbars(ed, rect);
+    if !free.contains_rect(strip) {
         return;
     }
 
@@ -687,7 +694,7 @@ fn flip_buttons(
         ed.transform_buttons[i] = Some(at);
         let button = CanvasButton {
             at,
-            clip: rect,
+            clip: free,
             id: ("float-flip", i),
             icon,
             enabled: true,
@@ -758,12 +765,33 @@ fn selection_buttons(
             (bounds.y + bounds.height) as f32,
         )),
     );
-    let view = umber_core::Rect::new(
-        glam::Vec2::new(rect.left(), rect.top()),
-        glam::Vec2::new(rect.right(), rect.bottom()),
-    );
+    // Placed inside what the scrollbars have left, not the whole region: they
+    // are drawn after this and win a tie, so a Cut button flush against the
+    // bottom edge would be a button that scrolls. `canvas_free_of_scrollbars`
+    // has the argument. The *pivot* above is still the full rect's centre,
+    // because that is where the picture is.
+    //
+    // With the whole region as the fallback, and that is not belt and braces.
+    // `place_strip` begins by intersecting the marquee with the view, so a
+    // selection whose visible sliver lies *entirely* inside the eleven-point
+    // band has no overlap with the inset region and gets no strip at all —
+    // Deselect, Copy and Cut simply gone, for a selection with a perfectly good
+    // place above it. Losing the commands is far worse than a button sharing an
+    // edge with a scrollbar, and "the strip comes to the pointer rather than
+    // declining to appear" is the rule that module exists to hold.
+    let free = canvas_free_of_scrollbars(ed, rect);
+    let as_view = |r: Rect| {
+        umber_core::Rect::new(
+            glam::Vec2::new(r.left(), r.top()),
+            glam::Vec2::new(r.right(), r.bottom()),
+        )
+    };
     let size = glam::Vec2::new(strip_width(3), CANVAS_BUTTON);
-    let Some(strip) = umber_core::overlay::place_strip(anchor, view, size, CANVAS_BUTTON_GAP)
+    let place =
+        |r: Rect| umber_core::overlay::place_strip(anchor, as_view(r), size, CANVAS_BUTTON_GAP);
+    let Some((clip, strip)) = place(free)
+        .map(|s| (free, s))
+        .or_else(|| place(rect).map(|s| (rect, s)))
     else {
         return;
     };
@@ -799,7 +827,7 @@ fn selection_buttons(
         // reason `Editor::selection_screen` exists.
         let button = CanvasButton {
             at,
-            clip: rect,
+            clip,
             id: ("selection-strip", i),
             icon,
             enabled,
@@ -916,15 +944,66 @@ fn canvas_button(
 /// The canvas scrollbars, along the bottom and the right of the document
 /// region — the right being the left edge of whatever is docked there.
 ///
-/// Drawn only where the document actually runs off the view, on the axis it
-/// runs off. That covers both "larger than the window" and "small enough to
-/// fit, but pushed under a panel", which are the same complaint: part of the
-/// picture is somewhere the artist cannot see it.
+/// Drawn on both axes of every document, and [`ScrollSpan`]'s own docs have the
+/// argument. Short version: these used to be drawn only where part of the
+/// picture was off the view, which reads as the honest rule and hid travel the
+/// camera already had — zoom out until the whole canvas fits and the only way
+/// to shift it off centre was to zoom back in. The tell, from a running window,
+/// was that a single notch of the wheel made both bars appear.
 ///
 /// The geometry is [`ScrollSpan`]'s, in `umber-core`, so what the thumb says
 /// and where the camera is cannot drift apart — the same division `dock.rs` and
 /// `panels.rs` keep.
+///
+/// Recording the rectangles in [`Editor::scroll_bars`] carries more weight than
+/// it used to rather than less: the bars are now a live target over the canvas
+/// on *every* frame, and that record is the only thing between a press on one
+/// and a dab under it. Both pointers reach it through
+/// `Editor::pointer_over_canvas`, so a pen cannot paint through a bar a mouse
+/// is refused by.
 fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect) {
+    let bars = scrollbars(ed, rect);
+    ed.scroll_bars = bars.at;
+
+    // Space is the pan gesture, and `gesture::press` gives it the canvas
+    // *before* the interface is consulted — "a space-drag pans whatever it
+    // started over" is the rule, and it deliberately does not read
+    // `Editor::scroll_bars`. So while space is held the bar must not take a
+    // drag of its own, or a press in the strip drives the camera twice: the pan
+    // moves the picture with the hand and the bar moves it against, and the
+    // second is the larger, so the canvas slides *backwards* under the pointer.
+    // Painting the thumbs is still right — they go on reporting where the
+    // picture is while it is dragged.
+    let live = !ed.space_down;
+
+    if let Some(at) = bars.at[1]
+        && let Some(by) = widgets::canvas_scrollbar(ui, p, at, bars.down, true, live)
+    {
+        ed.camera.center.y += by;
+    }
+    if let Some(at) = bars.at[0]
+        && let Some(by) = widgets::canvas_scrollbar(ui, p, at, bars.across, false, live)
+    {
+        ed.camera.center.x += by;
+    }
+}
+
+/// Where the two bars go and what they are showing.
+///
+/// Separated from the painting because two other things need the answer before
+/// the bars are drawn: the selection strip and the transform's flip pair are
+/// placed inside what is *left* of the canvas region. See
+/// [`canvas_free_of_scrollbars`].
+struct Scrollbars {
+    across: ScrollSpan,
+    down: ScrollSpan,
+    /// Horizontal then vertical, matching [`Editor::scroll_bars`].
+    at: [Option<Rect>; 2],
+}
+
+/// A pure function of the editor and this frame's canvas rect, so the geometry
+/// is stated once however many callers want it.
+fn scrollbars(ed: &Editor, rect: Rect) -> Scrollbars {
     // The viewport in *document* units, so the spans are worked out from the
     // region actually being laid out this frame rather than from last frame's
     // `canvas_size`.
@@ -934,38 +1013,63 @@ fn canvas_scrollbars(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, rect: Rect
     let across = ScrollSpan::new(doc.x, rect.width() * scale, zoom, ed.camera.center.x);
     let down = ScrollSpan::new(doc.y, rect.height() * scale, zoom, ed.camera.center.y);
 
-    let (show_x, show_y) = (across.overflows(), down.overflows());
-    ed.scroll_bars = [None, None];
-    if !show_x && !show_y {
-        return;
-    }
+    let bar = metrics::SCROLLBAR;
+    // A track too short to hold a thumb is refused outright rather than drawn
+    // and left undraggable — it would be a strip of canvas that swallows every
+    // press for nothing, which is worse than no bar. Tested against the length
+    // the bar gets when the *other* one is also drawn, which is the shorter of
+    // the two cases and therefore the safe one to judge on.
+    let show_x = across.scrollable() && rect.width() - bar > widgets::MIN_TRACK;
+    let show_y = down.scrollable() && rect.height() - bar > widgets::MIN_TRACK;
 
     // Neither bar runs under the other: a thumb sliding into the corner where
     // they cross would be under the one on top of it for its last few pixels.
-    let bar = metrics::SCROLLBAR;
     let corner_x = rect.right() - if show_y { bar } else { 0.0 };
     let corner_y = rect.bottom() - if show_x { bar } else { 0.0 };
 
-    if show_y {
-        let at = Rect::from_min_max(
-            pos2(rect.right() - bar, rect.top()),
-            pos2(rect.right(), corner_y),
-        );
-        ed.scroll_bars[1] = Some(at);
-        if let Some(by) = widgets::canvas_scrollbar(ui, p, at, down, true) {
-            ed.camera.center.y += by;
-        }
+    let at = [
+        show_x.then(|| {
+            Rect::from_min_max(
+                pos2(rect.left(), rect.bottom() - bar),
+                pos2(corner_x, rect.bottom()),
+            )
+        }),
+        show_y.then(|| {
+            Rect::from_min_max(
+                pos2(rect.right() - bar, rect.top()),
+                pos2(rect.right(), corner_y),
+            )
+        }),
+    ];
+    Scrollbars { across, down, at }
+}
+
+/// The part of the canvas region a control may be placed in.
+///
+/// The bars occupy a strip along the bottom and the right of *every* frame now,
+/// and they are drawn **after** the selection strip and the flip pair — so
+/// egui breaks a tie in the bar's favour, and a Cut button half under a
+/// scrollbar is a button that scrolls when it is clicked. Placing those two
+/// inside what is left is the fix rather than reordering the draws: reordering
+/// only swaps which of the two controls is unreachable.
+///
+/// It was already possible before the bars became permanent, on any document
+/// larger than its view, which is most of a painting session — so this is a
+/// standing bug the change made universal rather than one it introduced.
+///
+/// Only for *placing*. The marquee and the transform box are drawn over the
+/// whole region, because they are pictures of where the pixels are rather than
+/// things to press, and the camera pivot is the full rect's centre.
+fn canvas_free_of_scrollbars(ed: &Editor, rect: Rect) -> Rect {
+    let at = scrollbars(ed, rect).at;
+    let mut free = rect;
+    if at[0].is_some() {
+        free.max.y -= metrics::SCROLLBAR;
     }
-    if show_x {
-        let at = Rect::from_min_max(
-            pos2(rect.left(), rect.bottom() - bar),
-            pos2(corner_x, rect.bottom()),
-        );
-        ed.scroll_bars[0] = Some(at);
-        if let Some(by) = widgets::canvas_scrollbar(ui, p, at, across, false) {
-            ed.camera.center.x += by;
-        }
+    if at[1].is_some() {
+        free.max.x -= metrics::SCROLLBAR;
     }
+    free
 }
 
 /// The circle the Alt-held resize draws, showing the size the brush has been
@@ -2915,4 +3019,101 @@ fn curve_column(
             widgets::slider_row(ui, p, label, value, 0.0..=1.0, false, percent);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// The canvas scrollbars in the three states that matter, over a canvas
+    /// region the size a real one is.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is.
+    /// The question drawing the bars always raises is not a geometry one —
+    /// [`ScrollSpan`]'s own tests settle that — it is whether two thumbs sitting
+    /// permanently along the edges of somebody's picture read as furniture, and
+    /// no assertion about widgets can answer that. `docshot::Stage` is the only
+    /// thing in the crate that can look at a piece of interface.
+    ///
+    /// The middle shot is the one to judge: that is the fitted document, which
+    /// used to draw no bars at all and is the whole of what changed.
+    ///
+    /// **Both themes, on `backdrop`.** Not one of the two, and not on `chrome`,
+    /// and both of those were wrong here rather than approximations: the thumb
+    /// lies over the *canvas*, which is what the composite pass paints
+    /// `backdrop` with, and the surfaces invert between Graphite and Paper so a
+    /// shot of one says nothing about the other. Shooting the idle thumb on
+    /// `chrome` in Graphite alone is how an ink at 1.07:1 in Paper survived
+    /// being looked at.
+    ///
+    /// It takes **no `gputest::lock()`**, and that is decided rather than
+    /// skipped — see the note in the body.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app canvas_scrollbar_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn canvas_scrollbar_preview() {
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind};
+        use egui::{Pos2, Rect, vec2};
+        use glam::Vec2;
+
+        // No `gputest::lock()`, against this crate's stated rule, and the
+        // reason is that taking it here would make the thing the rule guards
+        // *worse*. `lock` builds the shared device on the way past, and
+        // `docshot::Stage` builds one of its own regardless — so the guard buys
+        // two live devices where there was one, which is the configuration
+        // blamed for the `STATUS_ACCESS_VIOLATION` at process exit on the ARM64
+        // runner. The six other `#[ignore]`d previews take no guard either, so
+        // it would not serialise them; the faithful fix is for `Stage` to take
+        // the shared device, and it belongs in `docshot` rather than here.
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/canvas-scrollbars");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The zoom at which the whole document just fits: 720x480 points at two
+        // pixels a point is 1440x960 physical, and what bounds it is the
+        // smaller *ratio* rather than the shorter side — the same rule
+        // `Camera::fit` keeps, minus its margin. Restating the document's own
+        // size would make the middle shot quietly stop being the fitted case
+        // the moment `Document::default` moved.
+        let field = vec2(720.0, 480.0);
+        let doc = Editor::default().doc.size_vec2();
+        let fits = (1440.0 / doc.x).min(960.0 / doc.y);
+        let middle = doc * 0.5;
+        let mut written = 0;
+        for (theme, ink) in [
+            (ThemeKind::Graphite, "graphite"),
+            (ThemeKind::Paper, "paper"),
+        ] {
+            for (name, zoom, centre) in [
+                ("1-zoomed-in", 1.0, middle),
+                ("2-fits", fits, middle),
+                // Pushed towards the bottom-right corner, so both thumbs are
+                // off their middles and in opposite directions.
+                ("3-pushed-off", fits, doc * Vec2::new(0.88, 0.15)),
+            ] {
+                let mut ed = Editor::default();
+                ed.ui.theme = theme;
+                ed.pixels_per_point = 2.0;
+                ed.camera.zoom = zoom;
+                ed.camera.center = centre;
+                let palette = Palette::with_accent(theme, ed.ui.accent);
+                let rect = Rect::from_min_size(Pos2::ZERO, field);
+                let image = stage.shoot(field, 2.0, &palette, palette.backdrop, |ui| {
+                    super::canvas_scrollbars(ui, &palette, &mut ed, rect);
+                });
+                docshot::write_png(&dir.join(format!("{ink}-{name}.png")), &image)
+                    .expect("write the png");
+                written += 1;
+            }
+        }
+        println!("wrote {written} shots to {}", dir.display());
+    }
 }

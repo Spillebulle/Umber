@@ -22,7 +22,11 @@ use umber_core::{
 /// its min, which does not panic — it paints somewhere unrelated, or fills the
 /// whole panel. Clamping here means a squeezed control is merely useless rather
 /// than wrong.
-const MIN_TRACK: f32 = 8.0;
+/// The shortest track worth drawing a thumb on. `pub(crate)` because
+/// `ui::canvas_scrollbars` has to ask before it *records* a canvas scrollbar as
+/// a live target: a bar refused here for being too short would otherwise be a
+/// strip of canvas that swallows presses and cannot be dragged.
+pub(crate) const MIN_TRACK: f32 = 8.0;
 
 /// Label on the left, monospace readout on the right, thin rail beneath.
 ///
@@ -580,17 +584,36 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// Unlike the sliders above there is no track fill and no round knob: a
 /// scrollbar's thumb *is* the value, and an accent-coloured bar down the side of
 /// the canvas would read as something selected rather than as somewhere to be.
+///
+/// These are on screen on every frame of every document — see
+/// `ui::canvas_scrollbars` — so the track is left unpainted altogether: two
+/// permanent filled strips down the edges of a picture is the furniture that
+/// decision is against. The thumb's own ink went the other way for the same
+/// reason; see the note beside it.
+///
+/// `live` is the caller's "a press in this strip is not mine" — the space-held
+/// canvas pan. The thumb is still painted and still lights under the pointer,
+/// because it goes on reporting where the picture is while somebody drags it
+/// about by other means.
 pub fn canvas_scrollbar(
     ui: &mut Ui,
     p: &Palette,
     rect: Rect,
     span: ScrollSpan,
     vertical: bool,
+    live: bool,
 ) -> Option<f32> {
     let response = ui.interact(
         rect,
         ui.id().with(("canvas-scroll", vertical)),
-        Sense::click_and_drag(),
+        // `hover` rather than nothing when the bar is not live: the thumb still
+        // has to be *drawn*, and it still lights under the pointer, but a press
+        // in the strip belongs to whatever the caller has decided owns it.
+        if live {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
     );
 
     let length = if vertical {
@@ -617,20 +640,52 @@ pub fn canvas_scrollbar(
 
     // The track is left unpainted. The canvas is behind it and the document may
     // be too, and a filled strip along two edges of the picture is exactly the
-    // furniture a paint application is trying not to put there. Only the thumb
-    // is drawn, and only while it is needed.
-    let ink = if response.dragged() {
-        p.text_muted
+    // furniture a paint application is trying not to put there — the more so
+    // now that the bars are drawn on every frame rather than only where the
+    // picture runs off the view. Only the thumb is drawn.
+
+    // Three conditions, and each is a way the canvas pan and this bar can end
+    // up driving the camera in the same frame with opposite signs — which
+    // slides the picture *backwards* under the hand, since the bar's gain is
+    // the larger. `gesture::press` hands a pan the canvas before the interface
+    // is consulted at all ("a space-drag pans whatever it started over"), so
+    // it never learns about `Editor::scroll_bars` and cannot be the place this
+    // is settled.
+    //
+    // `live` is the caller's answer and is not enough on its own: egui latches
+    // a drag at the press and never re-reads the `Sense`, so a bar already
+    // being dragged when space goes down goes on being dragged. The delta has
+    // to be gated too, not only the sense.
+    //
+    // The middle button is the other pan, and `dragged_by` reads "a drag is
+    // live and this button is down" rather than "this button began it" — so a
+    // middle press *during* a thumb drag starts a pan beside it and neither
+    // stops. Refusing while it is down is the whole of that case.
+    let panning = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+    let dragging = live && !panning && response.dragged_by(egui::PointerButton::Primary);
+
+    // `text_dim` idle, for `pen_cursor`'s reason and it is the same problem:
+    // this is a mark drawn over *artwork*, and `text_dim` is the one token
+    // that is a mid-grey in both themes, where the surfaces invert and most of
+    // the ink with them. `rail` was the obvious choice and is the slider
+    // *track* colour — a hair off the surface it sits on by design, which on
+    // the canvas backdrop is 1.31:1 in Graphite and 1.07:1 in Paper. Six levels
+    // per channel. That was survivable while a bar only appeared when the
+    // picture ran off the view, because its appearing was itself the signal;
+    // now that it is the standing answer to "can this be moved", a control
+    // nobody can see is the same lie as a control that does nothing.
+    let ink = if dragging {
+        p.text_strong
     } else if response.hovered() {
-        p.knob
+        p.text_muted
     } else {
-        p.rail
+        p.text_dim
     };
     let inset = thumb_rect.shrink(2.0);
     ui.painter()
         .rect_filled(inset, inset.width().min(inset.height()) * 0.5, ink);
 
-    if response.dragged() {
+    if dragging {
         let moved = response.drag_delta();
         let along = if vertical { moved.y } else { moved.x };
         // A fraction of the bar, so the thumb keeps up with the pointer exactly.
