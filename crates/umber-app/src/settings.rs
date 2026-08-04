@@ -131,6 +131,14 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
     if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::InputAndPen {
         ed.input.end_probe();
     }
+    // Delete asks once before it acts, and the answer must not outlive the page
+    // it was asked on: a "Delete?" still armed when somebody walks away to
+    // Shortcuts and back is a control that takes a theme on the next click,
+    // for a question they answered a page ago. Same rule, and the same place,
+    // as ending the pressure probe above.
+    if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::Themes {
+        disarm_delete(&ctx);
+    }
 
     if !ed.ui.settings_open {
         // Closing the dialog while a field was listening would otherwise leave
@@ -1485,6 +1493,22 @@ fn load_themes(ctx: &egui::Context, ed: &mut Editor) -> Themes {
 
 fn store_themes(ctx: &egui::Context, state: Themes) {
     ctx.data_mut(|d| d.insert_temp(themes_id(), state));
+}
+
+/// Forget a Delete that has been pressed once.
+///
+/// Called on every frame the Themes pane is not in front, including every frame
+/// the dialog is shut — so it returns as early as it can rather than taking
+/// egui's data lock twice for nothing, exactly as [`stop_listening`] does.
+fn disarm_delete(ctx: &egui::Context) {
+    let Some(mut state) = ctx.data(|d| d.get_temp::<Themes>(themes_id())) else {
+        return;
+    };
+    if state.confirming.is_none() {
+        return;
+    }
+    state.confirming = None;
+    store_themes(ctx, state);
 }
 
 /// Run a write against the library and turn a failure into something the user
