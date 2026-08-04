@@ -419,7 +419,7 @@ fn main() {
 /// Kept beside `skipped` rather than derived from it because that map is keyed
 /// by the *combination* of reasons — which is what makes its listing checkable
 /// against a single brush, and useless for "how many would this fix unlock".
-/// Forty-two combinations of eleven reasons is not a number anybody can add up
+/// Fifty-two combinations of fifteen reasons is not a table anybody can add up
 /// by eye, and both figures this file's callers want are per **reason**.
 struct Refusal {
     pack: &'static str,
@@ -435,8 +435,8 @@ const NOT_REDISTRIBUTED: &str = "a mask this project does not redistribute";
 /// The **alone** column is the one to read: a brush refused for one reason is a
 /// brush that ships the day that reason goes away, where one naming three is
 /// three pieces of work. Without it the totals mislead badly in both
-/// directions — 262 brushes name a `.gih` pipe's sequencing and 257 of them
-/// need nothing else, while every one of the twenty naming mirrored dabs names
+/// directions — 267 brushes name a `.gih` pipe's sequencing and 257 of them
+/// need nothing else, while eighteen of the twenty naming mirrored dabs name
 /// something else as well.
 ///
 /// Printed on every run for the reason the classification table is: a count
