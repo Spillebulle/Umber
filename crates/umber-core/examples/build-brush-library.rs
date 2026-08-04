@@ -311,22 +311,26 @@ fn main() {
                 // A stamp too faint for eight-bit coverage to accumulate is a
                 // brush that paints nothing however hard it is pressed, and
                 // `tip::stroke_coverage` is the same measurement `build_up` is
-                // decided by four lines further down every reader. Measured at
-                // the densest spacing the engine is ever asked for rather than
-                // at this brush's own, because that is the *loosest* reading —
-                // closer dabs build higher — so a mask refused here could not
-                // have made a mark at any spacing.
+                // decided by a few lines further down every reader.
                 //
-                // It is `every_shipped_tip_decodes_and_makes_a_mark`'s rule,
-                // applied where the file is written instead of only where it is
-                // read: that test fails the build on a mask this generator has
-                // already committed, which is a red suite pointing at an asset
-                // rather than at the decision that produced it. Reached first
-                // by Raghukamath's "Pack01 Clouds", whose stamp peaks at an
-                // alpha of 67 and which only became eligible at all once a
-                // coloured `.gih` cell stopped being refused for its colour.
+                // **Measured twice, at this brush's own spacing and at the 0.1
+                // the shipped-tip test uses**, and the two are different
+                // questions. The brush's own is the honest reading of *this*
+                // brush; 0.1 is the bar `every_shipped_tip_decodes_and_makes_a_
+                // mark` holds the shared table to, and a mask can pass one and
+                // fail the other in either direction, because closer dabs build
+                // higher and a third of Revoy's definitions space below 0.1.
+                // Taking only the brush's own would let this generator commit
+                // an asset that then fails the suite — a red run pointing at a
+                // file rather than at the decision that wrote it, which is the
+                // failure this gate exists to stop. Reached first by
+                // Raghukamath's "Pack01 Clouds", whose stamp peaks at an alpha
+                // of 67 and which only became eligible at all once a coloured
+                // `.gih` cell stopped being refused for its colour.
                 if let Some(mask) = &tip
-                    && !umber_core::tip::stroke_coverage(mask, 0.1).is_usable()
+                    && [preset.brush.spacing, 0.1]
+                        .into_iter()
+                        .any(|spacing| !umber_core::tip::stroke_coverage(mask, spacing).is_usable())
                 {
                     skipped
                         .entry(TOO_FAINT.to_string())
@@ -604,16 +608,21 @@ fn report_refusals(refusals: &[Refusal]) {
     println!("  {} brushes refused in all", refusals.len());
 }
 
-/// The shipped masks, collected as the packs are read and written out at the
-/// end.
+/// The shipped bitmaps of one kind — the masks, or the papers — collected as
+/// the packs are read and written out at the end.
 ///
-/// It owns exactly the files in `assets/tips/` that a *pack* put there —
-/// anything whose name starts with a pack's id prefix. Umber's own stamps are
-/// `build-bitmaps.rs`'s and are left alone. Owning them means **deleting the
-/// stale ones**: a brush that stops shipping, or a mask that changes name,
-/// would otherwise leave a file behind that the table would go on embedding
-/// for ever, and megabytes of binary nobody could account for is exactly the
-/// kind of rot a generated directory invites.
+/// One structure and two instances, because a tip and a paper differ in
+/// nothing this has to know: both are a `TipMask`, both are named from the
+/// first preset to use them, both are deduplicated by content, and both go
+/// into a directory that also holds Umber's own.
+///
+/// It owns exactly the files in its directory that a *pack* put there —
+/// anything whose name starts with a pack's id prefix. Umber's own stamps and
+/// its three papers are `build-bitmaps.rs`'s and are left alone. Owning them
+/// means **deleting the stale ones**: a brush that stops shipping, or a mask
+/// that changes name, would otherwise leave a file behind that the table would
+/// go on embedding for ever, and megabytes of binary nobody could account for
+/// is exactly the kind of rot a generated directory invites.
 struct BitmapLibrary {
     dir: PathBuf,
     /// Mask contents to the name allotted to it. Deduplication is by the whole
@@ -634,7 +643,7 @@ struct BitmapsWritten {
 
 impl BitmapLibrary {
     fn open(dir: &Path) -> Self {
-        fs::create_dir_all(dir).expect("create the tips directory");
+        fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
         Self {
             dir: dir.to_path_buf(),
             by_content: BTreeMap::new(),
@@ -670,11 +679,11 @@ impl BitmapLibrary {
         name
     }
 
-    /// Delete the masks a previous run left, write this run's, and report.
+    /// Delete the bitmaps a previous run left, write this run's, and report.
     fn finish(self) -> BitmapsWritten {
         let owned = |name: &str| PACKS.iter().any(|p| name.starts_with(p.id_prefix));
         for entry in fs::read_dir(&self.dir)
-            .expect("read the tips directory")
+            .unwrap_or_else(|e| panic!("read {}: {e}", self.dir.display()))
             .flatten()
         {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -682,7 +691,8 @@ impl BitmapLibrary {
                 continue;
             };
             if owned(stem) && !self.files.contains_key(stem) {
-                fs::remove_file(entry.path()).expect("remove a stale mask");
+                fs::remove_file(entry.path())
+                    .unwrap_or_else(|e| panic!("remove {}: {e}", entry.path().display()));
             }
         }
 

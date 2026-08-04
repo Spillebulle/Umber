@@ -151,7 +151,7 @@ else, which is what a fix aimed at that reason would actually ship.
 | dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 2 |
 | bitmap tips stored outside the file | 0 | 0 | 0 | 10 | 0 | 10 | 3 |
 | square brush shapes | 0 | 0 | 5 | 2 | 0 | 7 | 0 |
-| a paper texture whose strength follows pressure | 0 | 1 | 5 | 0 | 0 | 6 | 4 |
+| a paper texture whose strength varies over the stroke | 0 | 1 | 5 | 0 | 0 | 6 | 4 |
 | brush-tip density | 0 | 0 | 5 | 0 | 0 | 5 | 1 |
 | brush-tip randomness | 0 | 0 | 4 | 0 | 0 | 4 | 0 |
 | edge sharpening | 0 | 1 | 1 | 2 | 0 | 4 | 1 |
@@ -941,11 +941,21 @@ texel's grey**, not which of them is small.
   approximation and it costs the engine nothing: a tile is stored once and
   sampled for ever, `Brush` gains no field, the brush editor gains no control,
   and `mix(1.0, tile, strength)` is still the exact identity at strength zero.
-- The mode is **not**. Krita's Multiply against the dab's alpha is
+- The mode is **not**. Subtract is `max(0, alpha − mask)` and no tile makes a
+  multiply do that — at half coverage through a half-lit texel the two differ
+  by a quarter of the mark.
+- **Multiply is two arithmetics and both come across**, which is the one thing
+  here that was got wrong and then corrected. `KisMaskingBrushCompositeOp`
+  specialises on `use_soft_texturing`: with it on, Multiply is
   `alpha × (mask × strength + (1 − strength))`, which is Umber's grain written
-  out, so those come across exactly. Subtract is `alpha − mask` and no tile
-  makes a multiply do that — at half coverage through a half-lit texel the two
-  differ by a quarter of the mark.
+  out; with it **off**, which is Krita's default and what all 31 presets use,
+  it is `mul(src, dst, strength)` — a three-way product whose strength dims
+  every dab whether or not the paper bites there. The two coincide at strength
+  1.0, which is where all thirteen Multiply presets sit, so reading only the
+  first was right about every brush that exists and wrong about the maths. The
+  plain form's constant *is* a stroke opacity, so `TextureSpec::bite` folds it
+  into `Brush::opacity` — the slot `FlowValue` already folds into — and both
+  are exact.
 - The strength's pressure curve is not either, and for a different reason: the
   grain strength is a *per-pass uniform*, so following pressure means moving it
   into the per-dab instance data.
