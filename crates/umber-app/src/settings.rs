@@ -2912,6 +2912,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// New theme copies what is in front of you, puts it in hand, and writes
+    /// it — and Delete takes it and its file away and falls back to the
+    /// built-in it was made from.
+    ///
+    /// The two ends of the path the design drew and the code did not have: the
+    /// card used to be dashed and dead with a tooltip saying so.
+    #[test]
+    fn new_theme_makes_one_that_is_in_hand_and_on_disk_and_delete_takes_it_back() {
+        let dir = std::env::temp_dir().join(format!("umber-themes-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = Themes {
+            store: Ok(std::sync::Arc::new(ThemeLibrary::load_from(&dir))),
+            filled_from: String::new(),
+            hex: Vec::new(),
+            name: String::new(),
+            confirming: None,
+        };
+        let mut ed = Editor::default();
+        ed.ui.theme = ThemeKind::Paper;
+        assert!(ed.custom_theme.is_none());
+
+        new_theme(&mut state, &mut ed);
+        let made = ed.custom_theme.clone().expect("New theme put one in hand");
+        assert_eq!(made.base, ThemeKind::Paper, "it copied what was in front");
+        assert_eq!(ed.palette(), Palette::of(ThemeKind::Paper));
+        assert_ne!(made.name, "Paper", "and did not take the built-in's name");
+        assert_eq!(
+            ThemeLibrary::load_from(&dir)
+                .get(&made.id)
+                .map(|t| t.name.clone()),
+            Some(made.name.clone()),
+            "a theme that is only in memory is one a closed window loses"
+        );
+        assert_eq!(state.hex.len(), Token::ALL.len(), "the fields were filled");
+
+        delete_theme(&mut state, &mut ed);
+        assert!(ed.custom_theme.is_none());
+        assert_eq!(
+            ed.ui.theme,
+            ThemeKind::Paper,
+            "it must fall back to the built-in it was made from"
+        );
+        assert!(ThemeLibrary::load_from(&dir).themes().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A hex that will not read leaves the palette exactly as it was, and the
     /// field keeps what was typed so it can be corrected. A theme that quietly
     /// took black for a misread line would be a theme with an invisible
