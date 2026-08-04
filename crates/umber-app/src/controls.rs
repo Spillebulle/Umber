@@ -185,7 +185,7 @@ pub fn text_button(
         .x
         + 18.0;
     let (rect, response) = ui.allocate_exact_size(
-        vec2(width, 22.0),
+        vec2(width, metrics::TEXT_BUTTON),
         if enabled {
             Sense::click()
         } else {

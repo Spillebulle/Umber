@@ -100,7 +100,232 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A named colour in a [`Palette`] — one row of the theme editor, and one line
+/// of a `.umbertheme` file.
+///
+/// An enum with exhaustive `match`es in [`Palette::token`] and
+/// [`Palette::set_token`] rather than a table of names beside the struct,
+/// because the point of it is that adding a field to `Palette` stops compiling
+/// until somebody has decided what the editor calls it and what a file stores
+/// it under. That is the rule the brush editor already lives by — "between them
+/// they expose every field of `Brush`; adding one means adding a control, or
+/// the library can use a brush nobody can make" — and it matters more here,
+/// because a token nobody exposed is one a hand-written theme can set and the
+/// editor silently reverts.
+///
+/// [`Token::id`] is what a file says and must never be reworded; [`Token::label`]
+/// is what the interface shows and is free to be. The same division
+/// `prefs::theme_id` keeps against [`ThemeKind::label`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Token {
+    Backdrop,
+    Window,
+    Dock,
+    Chrome,
+    Popover,
+    Border,
+    PopoverBorder,
+    Control,
+    ControlHover,
+    ControlActive,
+    Rail,
+    Knob,
+    TextStrong,
+    Text,
+    TextMuted,
+    TextDim,
+    Accent,
+    AccentDim,
+    Warning,
+    WarningBg,
+    WarningBorder,
+    /// One of [`Palette::link_colours`], numbered from zero.
+    Link(u8),
+}
+
+/// A heading in the theme editor, and nothing else — the file is a flat list of
+/// tokens, so a group renamed changes no stored byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenGroup {
+    Surfaces,
+    Lines,
+    Controls,
+    Type,
+    Accent,
+    Warnings,
+    Links,
+}
+
+impl TokenGroup {
+    pub const ALL: [TokenGroup; 7] = [
+        Self::Surfaces,
+        Self::Lines,
+        Self::Controls,
+        Self::Type,
+        Self::Accent,
+        Self::Warnings,
+        Self::Links,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Surfaces => "Surfaces",
+            Self::Lines => "Lines",
+            Self::Controls => "Controls",
+            Self::Type => "Type",
+            Self::Accent => "Accent",
+            Self::Warnings => "Warnings",
+            Self::Links => "Link colours",
+        }
+    }
+
+    /// The tokens under this heading, in the order the editor draws them.
+    pub fn tokens(self) -> Vec<Token> {
+        Token::ALL
+            .into_iter()
+            .filter(|t| t.group() == self)
+            .collect()
+    }
+}
+
+impl Token {
+    /// Every token, in the order the editor draws them — which is also the
+    /// order they are written to a file, so a `.umbertheme` reads top to bottom
+    /// like the pane it came from.
+    pub const ALL: [Token; 21 + umber_core::LayerStack::LINK_GROUPS] = [
+        Self::Backdrop,
+        Self::Window,
+        Self::Dock,
+        Self::Chrome,
+        Self::Popover,
+        Self::Border,
+        Self::PopoverBorder,
+        Self::Control,
+        Self::ControlHover,
+        Self::ControlActive,
+        Self::Rail,
+        Self::Knob,
+        Self::TextStrong,
+        Self::Text,
+        Self::TextMuted,
+        Self::TextDim,
+        Self::Accent,
+        Self::AccentDim,
+        Self::Warning,
+        Self::WarningBg,
+        Self::WarningBorder,
+        Self::Link(0),
+        Self::Link(1),
+        Self::Link(2),
+        Self::Link(3),
+        Self::Link(4),
+        Self::Link(5),
+    ];
+
+    /// What a `.umbertheme` calls this token.
+    ///
+    /// Stable for ever, like `prefs`'s own ids and for the same reason: the
+    /// file has to parse in next year's build. Deliberately **not** the label
+    /// lower-cased — a label is what the interface shows and is free to be
+    /// reworded.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Backdrop => "backdrop",
+            Self::Window => "window",
+            Self::Dock => "dock",
+            Self::Chrome => "chrome",
+            Self::Popover => "popover",
+            Self::Border => "border",
+            Self::PopoverBorder => "popover_border",
+            Self::Control => "control",
+            Self::ControlHover => "control_hover",
+            Self::ControlActive => "control_active",
+            Self::Rail => "rail",
+            Self::Knob => "knob",
+            Self::TextStrong => "text_strong",
+            Self::Text => "text",
+            Self::TextMuted => "text_muted",
+            Self::TextDim => "text_dim",
+            Self::Accent => "accent",
+            Self::AccentDim => "accent_dim",
+            Self::Warning => "warning",
+            Self::WarningBg => "warning_bg",
+            Self::WarningBorder => "warning_border",
+            // Numbered from one, because they are numbered from one everywhere
+            // a person sees them.
+            Self::Link(0) => "link_1",
+            Self::Link(1) => "link_2",
+            Self::Link(2) => "link_3",
+            Self::Link(3) => "link_4",
+            Self::Link(4) => "link_5",
+            Self::Link(_) => "link_6",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.id() == id)
+    }
+
+    /// What the theme editor calls this token.
+    ///
+    /// The six the design draws keep the design's own words — Background,
+    /// Panel, Canvas pit, Text, Accent, Hairline — rather than the field's
+    /// name, because those are what the page has always said.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Backdrop => "Canvas pit",
+            Self::Window => "Background",
+            Self::Dock => "Dock column",
+            Self::Chrome => "Panel",
+            Self::Popover => "Menu",
+            Self::Border => "Hairline",
+            Self::PopoverBorder => "Menu edge",
+            Self::Control => "Button",
+            Self::ControlHover => "Button, hovered",
+            Self::ControlActive => "Button, selected",
+            Self::Rail => "Slider track",
+            Self::Knob => "Slider knob",
+            Self::TextStrong => "Text, strong",
+            Self::Text => "Text",
+            Self::TextMuted => "Text, muted",
+            Self::TextDim => "Text, dim",
+            Self::Accent => "Accent",
+            Self::AccentDim => "Accent, muted",
+            Self::Warning => "Warning ink",
+            Self::WarningBg => "Warning fill",
+            Self::WarningBorder => "Warning edge",
+            Self::Link(0) => "Link 1",
+            Self::Link(1) => "Link 2",
+            Self::Link(2) => "Link 3",
+            Self::Link(3) => "Link 4",
+            Self::Link(4) => "Link 5",
+            Self::Link(_) => "Link 6",
+        }
+    }
+
+    pub fn group(self) -> TokenGroup {
+        match self {
+            Self::Backdrop | Self::Window | Self::Dock | Self::Chrome | Self::Popover => {
+                TokenGroup::Surfaces
+            }
+            Self::Border | Self::PopoverBorder => TokenGroup::Lines,
+            Self::Control
+            | Self::ControlHover
+            | Self::ControlActive
+            | Self::Rail
+            | Self::Knob => TokenGroup::Controls,
+            Self::TextStrong | Self::Text | Self::TextMuted | Self::TextDim => TokenGroup::Type,
+            Self::Accent | Self::AccentDim => TokenGroup::Accent,
+            Self::Warning | Self::WarningBg | Self::WarningBorder => TokenGroup::Warnings,
+            Self::Link(_) => TokenGroup::Links,
+        }
+    }
+}
+
+/// `PartialEq` because a theme somebody is editing has to be comparable with
+/// the one on disk — every field is a `Color32`, so it is a field-by-field byte
+/// comparison and there is no tolerance to get wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
     pub accent: Color32,
     /// Muted accent — dashed outlines, subtle tints.
@@ -228,6 +453,67 @@ impl Palette {
                 Color32::from_rgb(0x7E, 0x76, 0x0A),
             ],
         }
+    }
+
+    /// One token, by name.
+    ///
+    /// The exhaustive `match` is the point — see [`Token`].
+    pub fn token(&self, token: Token) -> Color32 {
+        match token {
+            Token::Backdrop => self.backdrop,
+            Token::Window => self.window,
+            Token::Dock => self.dock,
+            Token::Chrome => self.chrome,
+            Token::Popover => self.popover,
+            Token::Border => self.border,
+            Token::PopoverBorder => self.popover_border,
+            Token::Control => self.control,
+            Token::ControlHover => self.control_hover,
+            Token::ControlActive => self.control_active,
+            Token::Rail => self.rail,
+            Token::Knob => self.knob,
+            Token::TextStrong => self.text_strong,
+            Token::Text => self.text,
+            Token::TextMuted => self.text_muted,
+            Token::TextDim => self.text_dim,
+            Token::Accent => self.accent,
+            Token::AccentDim => self.accent_dim,
+            Token::Warning => self.warning,
+            Token::WarningBg => self.warning_bg,
+            Token::WarningBorder => self.warning_border,
+            Token::Link(n) => self.link_colours[n as usize % self.link_colours.len()],
+        }
+    }
+
+    pub fn set_token(&mut self, token: Token, colour: Color32) {
+        let slot = match token {
+            Token::Backdrop => &mut self.backdrop,
+            Token::Window => &mut self.window,
+            Token::Dock => &mut self.dock,
+            Token::Chrome => &mut self.chrome,
+            Token::Popover => &mut self.popover,
+            Token::Border => &mut self.border,
+            Token::PopoverBorder => &mut self.popover_border,
+            Token::Control => &mut self.control,
+            Token::ControlHover => &mut self.control_hover,
+            Token::ControlActive => &mut self.control_active,
+            Token::Rail => &mut self.rail,
+            Token::Knob => &mut self.knob,
+            Token::TextStrong => &mut self.text_strong,
+            Token::Text => &mut self.text,
+            Token::TextMuted => &mut self.text_muted,
+            Token::TextDim => &mut self.text_dim,
+            Token::Accent => &mut self.accent,
+            Token::AccentDim => &mut self.accent_dim,
+            Token::Warning => &mut self.warning,
+            Token::WarningBg => &mut self.warning_bg,
+            Token::WarningBorder => &mut self.warning_border,
+            Token::Link(n) => {
+                let at = n as usize % self.link_colours.len();
+                &mut self.link_colours[at]
+            }
+        };
+        *slot = colour;
     }
 
     /// The colour that says which link group a row belongs to.
@@ -462,6 +748,22 @@ pub mod metrics {
     /// the two buttons above it claim their own room first, and a scroll area
     /// given the whole height would push them off the bottom on a short window.
     pub const PALETTE_LIBRARY: [f32; 2] = [560.0, 380.0];
+    /// A pill button — `crate::controls::text_button`'s height, wherever one is
+    /// drawn.
+    ///
+    /// Here rather than at the call site because anything *reserving* room for
+    /// a strip of them has to agree with what they cost: the settings dialog's
+    /// footer is a hairline, a gap and one of these, and a reserve that guessed
+    /// made the pane taller than the rail beside it.
+    pub const TEXT_BUTTON: f32 = 22.0;
+    /// Between two buttons that sit side by side.
+    ///
+    /// egui's own default item spacing, named — which is the point: the
+    /// settings dialog butts its rail against its pane by setting the
+    /// horizontal spacing to zero, and that zero is inherited all the way down
+    /// into every row of every pane. Anything on such a row that wants a gap
+    /// has to say so, and this is the gap it says.
+    pub const BUTTON_GAP: f32 = 6.0;
     /// The tallest a dropdown's menu grows before it scrolls.
     ///
     /// Some of the lists are long — thirteen dab inputs, ten blend modes, a
