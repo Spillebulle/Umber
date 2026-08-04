@@ -1031,15 +1031,15 @@ one that would only show up when a release was cut, since the desktop build
 everybody develops against has a C compiler. Its module docs carry the argument
 and the list of what it deliberately will not do.
 
-**The tip is the material's own pixels, and the thumbnail is the fallback.**
-`MaterialFile.FileData` is a USTAR tar holding both:
+**A tip and a paper are both the material's own pixels, and the thumbnail is the
+fallback.** `MaterialFile.FileData` is a USTAR tar holding both:
 `data/material_0.layer`, which is what the artist drew, and
 `thumbnail/thumbnail.png`, a PNG preview of it with a longest side of 300.
 `brushimport::csmaterial` reads the first — see below — and
-`brushimport::clipstudio`'s `tip_for` falls back to the second for a material
-Clip Studio left out of the file or a container shape the reader will not guess
-at. The fallback names itself; taking the material does not, because there is
-then nothing to apologise for.
+`brushimport::clipstudio`'s `tip_for` and `paper_for` fall back to the second
+for a material Clip Studio left out of the file or a container shape the reader
+will not guess at. The fallback names itself; taking the material does not,
+because there is then nothing to apologise for.
 
 The thumbnail's coverage is `alpha × (1 − luminance)` and has to be both terms:
 a brush tip is black on transparent, so its alpha is the mark, and a paper
@@ -1065,6 +1065,12 @@ coverage in RAM and 0.09 MB of PNG in `tips/` — of which the 1174 × 1120
 spatter brush is 1.25 MB and 0.05 MB on its own. The single-brush `.sut` is
 0.07 MB. Against the thumbnail route those four were 0.20 MB, so the picture
 costs about seven times what its preview did, per stamp brush.
+
+A **paper** costs far less than that, and not because the pictures are smaller:
+`UserLibrary::store_paper` shares a tile equal to one already held, where
+`store_tip` deliberately does not. The `.sutg`'s six textured sub-tools name two
+papers between them, so what is written is one 500 × 500 tile (0.24 MB of
+coverage) and one 300 × 300 (0.09 MB, the thumbnail fallback) — not six.
 
 #### Where the full-resolution pixels actually are
 
@@ -1313,12 +1319,101 @@ which is the threshold the renderer binds a tile at — a strength left in the
 file at zero is a setting that was switched off, and a tile stored for it is a
 file per sub-tool that nothing samples.
 
+**The paper is the material's own pixels, on the tip's terms**, through the same
+`csmaterial` reader and with `thumbnail.png` as the same fallback; the fallback
+is named and taking the material is not. Three things ride on the route and only
+the first is the one anybody expects.
+
+- **Resolution.** The 500 × 500 paper in the sample files was arriving as its
+  300 × 300 preview.
+- **Polarity.** `csmaterial` hands back *ink* and a grain texel is the fraction
+  of the dab that **stays**, so the plane is complemented. It is an exact
+  complement rather than an approximate one: for straight-alpha pixels,
+  `1 − a(1 − L)` is `(1 − a) + aL`, which is `tip::grain_of` written out — so
+  the composite-over-white that rule insists on comes across for free, and on
+  the neutral grey a paper is, Rec. 601 and Rec. 709 agree exactly, so the two
+  routes into a tile cannot disagree about a texel. Measured over the four
+  readable materials, the complement of plane 0 lands 0.0397..0.0987 of a level
+  from `grain_of` of the thumbnail — the resampling — against 0.53..0.93 the
+  other way round.
+- **Whether it tiles at all.** A preview render is under no obligation to, and
+  the browser's seam check judges whatever it is given. The 500 × 500 paper's
+  material declares `isTiling` in `icedata/layerData.xml` and joins to itself
+  within its own noise (a signed step of 2.4 levels across the join against an
+  interior figure of 2.0); its thumbnail steps by **62** against an interior
+  figure of 2.9, and by 54 on the other axis. Every brush carrying that paper
+  was being reported as drawing a grid over the canvas, and the grid was the
+  preview's.
+
+**The tile size is the material's own size times `TextureScale2`**, which is
+what that percentage means and what could not be worked out while the picture
+was a preview capped at 300. `GRAIN_TILE_AT_FULL_SCALE` (256) still stands in
+where the material could not be read — and it used to stand in for every case,
+which put the sample file's Sketch brushes on a 256 × 0.19 ≈ 49-pixel tile where
+their 500 × 500 material at 19% is 95: a paper twice as fine as its author's,
+under a 6-pixel pencil. A material larger than `TipMask::MAX_SIZE` is reduced
+and named, as a tip is, and the tile size is taken from the size **before** the
+reduction — a reduced tile has to cover the same document ground as the picture
+it came from, or the grain changes frequency to fit Umber's texture budget.
+
+**Where it cannot cover that ground, `dropped::PAPER_SPACING` says so.**
+`Brush::MAX_GRAIN_SCALE` is 2048, and the clamp was unreachable while the tile
+was always 256 — it needed a `TextureScale2` of 800%. Reading the material's own
+size makes it overlap `REDUCED_PAPER` *exactly*: both fire above
+`TipMask::MAX_SIZE`, and at the default 100% a 4096-texel paper asks for a
+4096-pixel tile and gets 2048, so the grain recurs twice as often as its author
+set. The two are separate notices deliberately — one is a picture coarser than
+it was drawn, the other is that picture repeated at a finer pitch, and folding
+the second into the first would put a sentence about softening over a change of
+spatial frequency.
+
+**And a paper that cannot be resolved at all paints flat in *both* halves.**
+The strength is read from `TextureDensity` before the picture is looked for, so
+leaving it behind when the picture fails is not "no paper": `paper` unset means
+`BrushPreset::paper` unset, which sends `Editor::paper_tile` to
+`brush.grain_pattern` — never written by this converter, and `Brush::default()`'s
+`Tooth`. That is the 78% substitution above, arriving by the back door on
+exactly the brushes whose material Clip Studio left out of the file. The failure
+arm zeroes the strength, which is the dab pass's exact identity, and
+`a_paper_the_reader_cannot_resolve_is_named_and_paints_flat` asserts the brush
+rather than the loss string — it passed for as long as it did not.
+
 Measured, because it is the first thing to look at if an imported brush is ever
 reported painting weaker than its opacity says: the `Sketch` brush in the sample
 file used to import at `grain: 1.0` on `Tooth`, whose texels run 0.569..0.988
 with a mean of 0.775 — so a single stroke at full opacity could not reach 1.0
 anywhere, and a second pass over the first was darker, because the pits are
 anchored to the document and the second stroke fell into the same ones.
+
+**The `Dual*` columns are a second whole brush, and `UseDualBrush` is the only
+field that says whether it is live.** Clip Studio's dual brush stamps a second
+brush on top of the first at the same time: `Variant` carries a parallel copy of
+everything — `DualSize`, `DualFlow`, `DualHardness`, `DualInterval`,
+`DualRotation`, `DualPatternImageArray`, a complete `DualTexture*` block and a
+complete `DualSpray*` one — which is `2-Brush tip`, `2-Spray effect`,
+`2-Stroke` and `2-Paper quality` under `2-Brush shape` in the interface. Four
+columns are about the pairing rather than copies of it: `UseDualBrush`,
+`DualBrushCompositeMode` (thirteen modes, of which "Height (Linear)" exists
+nowhere else in Clip Studio), `SyncDualBrushSize` ("Link to main brush size")
+and `ChangeRGBByDual` ("Apply RGB value" — whether the second tip's colour is
+applied or only its alpha).
+
+Umber binds one tip and one paper per brush, so there is no half of this worth
+painting and `dropped::DUAL_BRUSH` names it. What matters is the gate. **All
+thirty variants across the two sample files have `UseDualBrush = 0`**, and every
+one has residue beside it — and not the same residue: the `.sut` leaves
+`DualSize = 30` where the `.sutg` leaves that column null and
+`DualTextureDensity = 50` instead, with `DualBrushCompositeMode = 1` and a
+`DualTextureDensityEffector` blob in both. So no neighbour of the flag can stand
+in for it, and reading one would put "dual brushes" on the notice of every Clip
+Studio brush anybody has ever imported, over a feature none of them uses. That
+is the same trap `BrushUseIn`, `BrushAutoIntervalType`, the rotation effector and
+the texture reference are each read to avoid;
+`a_dual_brush_that_is_switched_off_is_not_reported_from_the_values_left_beside_it`
+is what pins it, and the fixture's `VARIANT_COLUMNS` carries those five unread
+columns for no other purpose. No `Dual*Effector` has an enabled bit set in
+either file, which is why `unreachable_inputs` skipping that whole prefix costs
+nothing today.
 
 An automatic dab interval is the one thing deliberately **not** reported. Umber
 picks a spacing too, so an automatic one arrives as an automatic one; and every
@@ -1627,13 +1722,12 @@ per pack. See `docs/brush-sources.md`.
   arrives as one preset per cell and says which rule it lost.
 - **A wider grain model, and the papers the packs actually ask for.** A paper of
   your own now exists — `BrushPreset::paper` names a tile in the user library —
-  so this is no longer about somewhere to put a picture. Two gaps remain. A
-  Clip Studio paper arrives as the material's **thumbnail** rather than its own
-  pixels, which is a wiring gap and not a limit of the format:
-  `brushimport::csmaterial` reads a paper at full resolution exactly as it reads
-  a tip. And Krita's `.kpp` papers are not resolved at all — what a `.kpp` names
-  is a pattern resource in a sibling bundle, the shape `.kpp`'s tips already
-  solved.
+  so this is no longer about somewhere to put a picture. One gap remains:
+  Krita's `.kpp` papers are not resolved at all — what a `.kpp` names is a
+  pattern resource in a sibling bundle, the shape `.kpp`'s tips already solved.
+  (A Clip Studio paper used to arrive as the material's **thumbnail** rather
+  than its own pixels; `paper_for` now takes the same `csmaterial` route
+  `tip_for` does.)
 
   The shipped library is what makes it worth doing: 31 Krita presets ask for a
   paper and 11 of them would otherwise ship. The store was **necessary and not
