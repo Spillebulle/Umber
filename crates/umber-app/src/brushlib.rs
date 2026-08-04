@@ -266,6 +266,38 @@ fn store(ctx: &egui::Context, state: State) {
     ctx.data_mut(|d| d.insert_temp(state_id(), state));
 }
 
+/// Put an empty user library in front of [`load`], so nothing reads the disk.
+///
+/// For `docshot`, and the same door `settings::stage_themes` opens for the
+/// Themes pane. `load` would otherwise read the *user's* own `brushes.ron`, and
+/// this picture is committed: the count in the collection row would be however
+/// many brushes the person regenerating it happens to have saved, which
+/// publishes a contributor's collection in the README and makes the shot
+/// disagree with the README's own figure for what ships. It is the leak
+/// `prefs::set_config_path_label` exists to stop, two doors over.
+pub(crate) fn stage_empty_library(ctx: &egui::Context, ed: &mut Editor) {
+    // A directory that is not there reads as a library with nothing in it, and
+    // writes nothing: `load_from` only writes when it has migrated a flat file,
+    // and there is none to migrate.
+    let empty = UserLibrary::load_from(std::env::temp_dir().join("umber-docshot-no-library"))
+        .expect("an absent directory is an empty library");
+    let held = Store::Ready(Arc::new(empty));
+    let state = State {
+        index: Arc::new(Index::build(&ed.presets, made_of(&held))),
+        store: held,
+        query: String::new(),
+        scope: Scope::All,
+        browser_open: false,
+        saving: None,
+        renaming: None,
+        confirming: None,
+        creating: None,
+        drag: None,
+        notice: None,
+    };
+    store(ctx, state);
+}
+
 // ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------

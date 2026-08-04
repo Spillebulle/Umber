@@ -344,6 +344,12 @@ fn panel_shot(
 ) -> Result<(PathBuf, u64, u32, u32), String> {
     let mut ed = editor();
     setup(&mut ed);
+    // The same door `settings_shot` opens for the Themes pane, and for the same
+    // reason: the Brushes module reads the *user's* own library on its first
+    // frame, so this picture would carry however many brushes the person
+    // regenerating it happens to have saved — published in the README, and
+    // disagreeing with the README's own figure for what ships.
+    crate::brushlib::stage_empty_library(&stage.ctx, &mut ed);
     let palette = ed.palette();
     let rect = Rect::from_min_size(Pos2::ZERO, field);
     let image = stage
