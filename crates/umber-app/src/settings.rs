@@ -1563,7 +1563,13 @@ fn themes_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         let mut built_in = None;
         for kind in ThemeKind::ALL {
             let selected = ed.custom_theme.is_none() && ed.ui.theme == kind;
-            if theme_card(ui, p, &Palette::of(kind), kind.label(), selected) {
+            // In the accent that is chosen, not the design's authored Umber:
+            // the card's one coloured mark is the accent bar, and drawn from
+            // `Palette::of` it advertised a colour the interface would not
+            // show. The same argument `accent_choice`'s own swatches already
+            // make for reading `accent.ink` rather than `Accent::swatch`.
+            let swatch = Palette::with_accent(kind, ed.ui.accent);
+            if theme_card(ui, p, &swatch, kind.label(), selected) {
                 built_in = Some(kind);
             }
         }
