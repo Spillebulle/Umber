@@ -57,6 +57,7 @@ use crate::{panels, prefs, settings, shortcuts, splash, ui};
 use egui::{Color32, Pos2, Rect, Vec2, vec2};
 use std::path::{Path, PathBuf};
 use umber_core::Color;
+use umber_core::preset::UserLibrary;
 use umber_render::Gpu;
 
 /// Must match the real surface: non-sRGB, so egui's gamma-space output is
@@ -349,7 +350,16 @@ fn panel_shot(
     // frame, so this picture would carry however many brushes the person
     // regenerating it happens to have saved — published in the README, and
     // disagreeing with the README's own figure for what ships.
-    crate::brushlib::stage_empty_library(&stage.ctx, &mut ed);
+    //
+    // An absent directory is an empty library, and reading one writes nothing:
+    // `load_from` writes only when it has migrated a flat `brushes.ron`, and
+    // there is none beside a path that does not exist. It can still fail on a
+    // temporary directory that cannot be read at all, and this is a developer
+    // tool, so that stops here with a sentence rather than producing a picture
+    // of a library Umber could not open.
+    let no_library = UserLibrary::load_from(std::env::temp_dir().join("umber-docshot-no-library"))
+        .map_err(|e| format!("the empty stand-in library would not load: {e}"))?;
+    crate::brushlib::stage_library(&stage.ctx, &mut ed, no_library);
     let palette = ed.palette();
     let rect = Rect::from_min_size(Pos2::ZERO, field);
     let image = stage
