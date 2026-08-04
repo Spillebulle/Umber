@@ -161,28 +161,46 @@ better.
 
 ## Shipping a stamp
 
-Stamps ship now: **11 brushes carried by 10 masks, 295 kB of 8-bit greyscale
-PNG in `crates/umber-core/assets/tips/`**. It was 19 brushes and 624 kB, which
-was 664 kB of release binary — measured, 17,162,752 bytes before and 17,842,176
-after — so a mask costs the binary about what it costs the directory. Eight of
-those nineteen have since been refused for a **paper texture** the Krita reader
-had never noticed; see "The paper texture, and what a texture library would
-buy" in `docs/brushes.md`. The generator writes the masks, deduplicates them by
-content and rewrites the `include_bytes!` table; `preset::builtin()` resolves a
-shipped tip through `tip::builtin` before the user's library. `docs/brushes.md`
-has the mechanism.
+Stamps ship now. **Read the count off a run of the generator, not off this
+page** — it prints the shipped total and the refusal table on every run, and
+this section has been wrong twice by being added to rather than re-measured.
+The masks are 8-bit greyscale PNG in `crates/umber-core/assets/tips/`.
+
+The release binary was weighed once, when the count was 19 brushes and 624 kB
+of PNG: 664 kB of binary, 17,162,752 bytes before and 17,842,176 after. So a
+mask costs the binary about what it costs the directory, and it has not been
+weighed since because the delta is the PNG and nothing else.
+
+The generator writes the masks, deduplicates them by content and rewrites the
+`include_bytes!` table; `preset::builtin()` resolves a shipped tip through
+`tip::builtin` before the user's library. `docs/brushes.md` has the mechanism.
 
 What decided the shape of it, in the order the questions were asked.
 
 ### How many brushes is this actually about
 
-**338** across the five packs carry a mask. Only **28** of them drop nothing
-else, so the other 310 were never candidates whatever the library could hold —
-257 are refused for a `.gih` pipe's sequencing alone, and the rest for coloured
-stamps, a paper texture, mirrored dabs, brush-tip randomness, a separate
-paint-deposit rate or a rotation Umber cannot drive. Of the 28, 11 ship and 17
-are rubberduck's. `docs/brushes.md` has the whole table, reason by reason and
+**338** across the five packs carry a mask, and most were never candidates: 257
+are refused for a `.gih` pipe's sequencing alone, and the rest for coloured
+stamps, a paper texture, mirrored dabs, brush-tip randomness or a rotation
+Umber cannot drive. `docs/brushes.md` has the whole table, reason by reason and
 pack by pack, and the generator prints it on every run.
+
+**Take the shipped and candidate counts from that run rather than from here.**
+This paragraph has been one out at least once, before any of the recent work,
+which is how two figures written months apart could both look right and not
+reconcile. The check that they do: shipped stamps plus the 17 refused for their
+licence alone should equal the candidates that drop nothing else.
+
+Three things have moved brushes across that line lately, and the reasoning
+matters more than the arithmetic. Krita's **paint-deposit rate** was never a
+mask Umber could not paint: `Brush::smudge` is the mix between the palette
+colour and what a dab lifted, so `1 - smudge` already is a deposit rate, and
+what the reader was missing was the enable flag beside the value. **Brush-tip
+randomness** is now ignored below a hundredth rather than at any value at all.
+And a **paper texture** the Krita reader had never noticed went the other way,
+refusing brushes that had been shipping without their grain.
+`crates/umber-core/src/brushimport/kpp.rs` has the first two arguments and
+`docs/brushes.md` the third.
 
 ### How big the whole thing would have been
 

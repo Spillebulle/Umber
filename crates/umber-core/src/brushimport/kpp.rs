@@ -94,10 +94,14 @@
 //!   hard, aliased edge; `dab.wgsl` antialiases unconditionally and has nothing
 //!   to switch off. It is the whole of a pixel-art brush, so it is named rather
 //!   than ignored.
-//! - **Paper texture**, **mirrored dabs**, **paint thickness (impasto)**.
+//! - **Paper texture**, **paint thickness (impasto)**.
+//! - **Mirrored dabs**, where Krita is actually asked for one: the option has
+//!   an enable flag *and* a checkbox per axis, and with neither axis ticked it
+//!   mirrors nothing however the sensor reads.
 //! - **Square and star mask generators**, exactly as [`super::vbr`] drops them.
 //! - **Brush-tip randomness and density**, which perturb the generated mask
-//!   rather than the dab.
+//!   rather than the dab — above [`NEGLIGIBLE_MASK_NOISE`], below which they
+//!   are a difference of two or three levels of alpha.
 //! - **Flow build-up.** Krita composites each dab, so flow below 1 darkens
 //!   where a stroke crosses itself. Umber takes a `max` of coverage and applies
 //!   opacity once at commit — the wet-layer design in `CLAUDE.md` — so flow is
@@ -143,6 +147,35 @@
 //!
 //! # Approximated rather than dropped
 //!
+//! - **The paint-deposit rate**, and it belongs in *this* section rather than
+//!   the one above, which is a decision and not a bookkeeping detail. Krita's
+//!   colour-smudge engine states the pickup and the deposit as two knobs
+//!   (`SmudgeRate`, `ColorRate`) where Umber has one mix. Reading the pickup
+//!   alone and naming the rest as a loss was wrong twice: it turned a brush
+//!   laying down as much paint as it lifts into a pure blender, *and* the
+//!   `dropped` entry then refused it from the shipped library — a brush kept
+//!   out for a defect the reader had introduced. [`Brush::smudge_from_rates`]
+//!   carries the ratio instead. **Two things are discarded and neither is
+//!   named**, which is what makes this an approximation rather than a fix:
+//!   - `SmudgeRate`'s *magnitude*. It is the dab's own opacity in Krita
+//!     (`smearRateOpacity = s × opacity`), so it sits exactly where Umber's
+//!     stroke opacity does and there *is* a slot for it — the same slot
+//!     `FlowValue` is already folded into below. It is not folded in only
+//!     because Umber's pickup is a trailing average rather than Krita's offset
+//!     smear, so the two are not the same quantity to multiply; saying it has
+//!     nowhere to go would be false.
+//!   - `ColorRate`'s **pressure curve**, entirely. `has_foreign_sensor` is
+//!     asked only about Size, Opacity and Scatter, so a `ColorRateSensor` is
+//!     never examined at all. A brush whose author had it blending at a light
+//!     touch and laying down paint at full pressure arrives as one flat mix.
+//!
+//!   **The consequence is that three brushes now ship on that approximation**,
+//!   under Revoy's and GDquest's names, where `build-brush-library.rs` would
+//!   previously have refused them — and that generator's whole rule is that
+//!   nothing ships under an author's name that paints unlike their brush. It is
+//!   defensible on the same terms as fan corners below, and the flattened curve
+//!   is the part to weigh rather than the ratio. But it is a deliberate
+//!   exception rather than a side effect, which is why it is written here.
 //! - **Fan corners.** Krita adds extra dabs through a sharp corner so that a
 //!   rake fans round it instead of jumping; Umber's dab turns with the heading
 //!   and the heading turns at the corner. Six presets in the fetched packs ask
@@ -183,6 +216,21 @@ const SUPPORTED_PAINTOPS: [&str; 2] = ["paintbrush", "colorsmudge"];
 /// "Bristle Thick Textured" inflates past two. Sixteen leaves room for a brush
 /// built out of several while still refusing a decompression bomb.
 const MAX_PRESET_BYTES: usize = 16 << 20;
+
+/// How much of Krita's per-dab mask noise counts as none.
+///
+/// One part in a hundred, and it is a threshold rather than a zero for the
+/// reason [`Brush::has_grain`]'s is: naming a difference nobody can see spends
+/// the credibility of the list that names the ones they can, and — because the
+/// shipped-library generator refuses anything that lost something — it keeps
+/// out brushes that paint exactly like their originals.
+///
+/// A hundredth rather than a rounder fiftieth because the figure has to match
+/// the argument it is made from: randomness scales a mask texel by a draw from
+/// `1 - r ..= 1`, so a hundredth is at most 2.6 levels of 255 and a fiftieth is
+/// 5.1 — and 5 levels is a difference somebody could find. Both presets in the
+/// fetched packs that this admits state exactly `0.01`. See [`TipSpec::parse`].
+const NEGLIGIBLE_MASK_NOISE: f32 = 0.01;
 
 /// A decoded Krita preset.
 #[derive(Clone, Debug)]
@@ -272,7 +320,16 @@ pub fn from_kpp_in(
     if preset.flag("Texture/Pattern/Enabled") && texture_strength > 0.0 {
         dropped.push("paper texture");
     }
-    if preset.flag("PressureMirror") {
+    // Mirroring has an enable flag *and* a checkbox per axis: Krita's
+    // `KisMirrorOption::apply` guards the whole of its work on
+    // `isChecked() && (horizontal || vertical)`, so with neither axis ticked
+    // the option is on and mirrors nothing however the sensor reads. This is
+    // therefore not one flag but three, and reading only the first names a loss
+    // that did not happen. Same shape as `ScatterValue` above, and worth the
+    // two extra reads: an import that cries wolf costs the losses that matter.
+    let mirrors = preset.flag("PressureMirror")
+        && (preset.flag("HorizontalMirrorEnabled") || preset.flag("VerticalMirrorEnabled"));
+    if mirrors {
         dropped.push("mirrored dabs");
     }
     if preset.flag("PressurePaintThickness") {
@@ -425,14 +482,78 @@ pub fn from_kpp_in(
     }
 
     // A smudging brush picks colour up off the canvas. Krita states the pickup
-    // and the deposit separately (`SmudgeRate` and `ColorRate`); Umber has one
-    // mix, so the pickup is the one that carries across.
+    // and the deposit separately — `SmudgeRate` is how much of the canvas a dab
+    // lifts, `ColorRate` how much fresh paint it lays down — and Umber has one
+    // mix between the palette and what was found. That is not a feature it
+    // lacks: `1 - Brush::smudge` *is* a deposit rate, so what carries across is
+    // the ratio of the two, through `Brush::smudge_from_rates`.
+    //
+    // **`PressureColorRate` is the enable flag**, the rule the module docs open
+    // with, and reading the value without it is the `ScatterValue` bug again.
+    // Krita leaves `ColorRateValue` in the file with Color Rate switched off,
+    // and `kis_colorsmudgeop.cpp`'s `paintAt` is explicit about what that means:
+    //
+    //     colorRate = m_colorRateOption.isChecked() ? …value… : 0.0;
+    //
+    // so a clear flag is a deposit of **exactly zero** — a pure blender,
+    // whatever the pickup rate says. Hence one rule and not two: the flag
+    // decides the deposit, and the deposit and the pickup then go through the
+    // same reduction. Branching on the flag *around* the reduction is the same
+    // bug in a new place, and it shipped once: it left `smudge` at the pickup
+    // rate, so "Blend Smoky" (0.57) deposited 43% palette colour where Krita
+    // deposits none.
+    //
+    // The seven presets in the fetched packs with the flag clear are exactly
+    // the ones their authors called Blend, Blender or Smear — nothing else is
+    // in that group and none of them is outside it. (The converse is weaker and
+    // is not claimed: the twelve with it set are mostly Paint and OilPaint, but
+    // "Watercolor Sponge" is among them — the author's own spelling, so that it
+    // can be searched for.)
     let (smudge, smudge_radius) = if smudging {
-        (
+        // The same `paintAt` gives the pickup its own flag and its own
+        // fallback, and it is *not* the deposit's:
+        //
+        //     smudgeRate = m_smudgeRateOption.isChecked() ? …value… : 1.0;
+        //
+        // — a brush with the option off lifts the canvas whole rather than not
+        // at all. No preset in the fetched packs has it clear, so this changes
+        // nothing shipped; it is here because the rule this module opens with
+        // is that a value is read through the flag beside it, and a reader that
+        // applies it to one of three neighbouring settings has not applied it.
+        let pickup = if preset.flag("PressureSmudgeRate") {
             preset
                 .number("SmudgeRateValue")
                 .unwrap_or(1.0)
-                .clamp(0.0, 1.0),
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let deposit = if preset.flag("PressureColorRate") {
+            preset
+                .number("ColorRateValue")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // KNOWN WRONG, and left alone deliberately rather than overlooked.
+        // `SmudgeRadiusValue` has an enable flag too — `smudgeRadiusPortion =
+        // isChecked() ? …value… : 0.0` — and **14 of the 19 colour-smudge
+        // presets in the fetched packs have it clear**, carrying leftovers of
+        // 297.82, 3, 0.41 and 0.0041 that this clamp turns into live radii of
+        // 8.0, 3.0, 0.41 and 0.25. That is the `ScatterValue` bug at scale.
+        //
+        // It is not repaired here because the repair needs a number this cannot
+        // supply honestly: Krita's portion is a fraction of the brush size and
+        // Umber's `smudge_radius` a multiple of the dab radius, so what a
+        // portion of zero maps to — the dab itself, most likely `1.0`, which is
+        // `Brush::default().smudge_radius` — is a reading of Krita's sampling
+        // geometry that nobody here has checked against a running Krita. Fixing
+        // it changes the pickup radius of fourteen brushes, several of them
+        // shipped, so it wants that check first. Guessing would be the thing
+        // this module refuses everywhere else.
+        (
+            Brush::smudge_from_rates(pickup, deposit),
             preset
                 .number("SmudgeRadiusValue")
                 .unwrap_or(1.0)
@@ -441,9 +562,6 @@ pub fn from_kpp_in(
     } else {
         (0.0, default.smudge_radius)
     };
-    if smudging && preset.number("ColorRateValue").is_some_and(|r| r > 0.0) {
-        dropped.push("a separate paint-deposit rate");
-    }
 
     let (min_scatter_ratio, scatter_curve, pressure_scatter) = scatter.split(0.0);
     let (_, opacity_curve, pressure_opacity) = opacity.split(0.0);
@@ -1238,10 +1356,33 @@ impl TipSpec {
                         .unwrap_or(0.0)
                         .to_degrees()
                         .rem_euclid(360.0);
-                    if attrs.number("randomness").is_some_and(|r| r > 0.0) {
+                    // Both perturb the generated mask per dab and Umber has
+                    // nothing that does — but neither threshold is zero, for
+                    // the reason `Brush::has_grain`'s and `Brush::smudges`'
+                    // are not. Krita's randomness multiplies each mask texel by
+                    // a draw from `1 - randomness ..= 1`, so a hundredth is at
+                    // most 2.6 levels of 255 at the darkest point of a dab and
+                    // less everywhere else; two brushes that differ by that are
+                    // not two brushes, and naming it refuses them from the
+                    // shipped library for a difference nobody can see.
+                    //
+                    // Density drops that fraction of the texels at random, and
+                    // the same reasoning applies to it — a hundredth is a
+                    // speckle the next dab of the stroke covers. **Nothing in
+                    // the fetched packs exercises that arm**, though: their
+                    // densities are 0.15 to 0.97, all far below the threshold.
+                    // It is here so the two settings answer one rule rather
+                    // than because a brush was measured through it.
+                    if attrs
+                        .number("randomness")
+                        .is_some_and(|r| r > NEGLIGIBLE_MASK_NOISE)
+                    {
                         out.dropped.push("brush-tip randomness");
                     }
-                    if attrs.number("density").is_some_and(|d| d < 1.0) {
+                    if attrs
+                        .number("density")
+                        .is_some_and(|d| d < 1.0 - NEGLIGIBLE_MASK_NOISE)
+                    {
                         out.dropped.push("brush-tip density");
                     }
                 }
@@ -2081,9 +2222,68 @@ mod tests {
         );
         let preset = from_kpp(&kpp(&xml)).expect("decode");
         assert!(preset.brush.smudges());
-        assert!((preset.brush.smudge - 0.8).abs() < 1e-5);
+        // No `PressureColorRate`, so Krita's Color Rate is off and its
+        // `colorRate` is `0.0` — the dab carries only what it lifted. This
+        // asserted `0.8`, the pickup rate, which read that field as though it
+        // were the mix; the rate governs how *faintly* the dab lands, which
+        // this import discards.
+        assert_eq!(preset.brush.smudge, 1.0);
         assert!((preset.brush.smudge_radius - 1.5).abs() < 1e-5);
         assert_eq!(preset.brush.dab_ratio, 2.0);
+    }
+
+    /// Krita's deposit rate is a second knob on the one mix Umber has, and
+    /// `PressureColorRate` is its enable flag — the rule the module docs open
+    /// with, and the `ScatterValue` bug again if it is not read. With the flag
+    /// clear the value is a leftover and the brush is a pure blender; with it
+    /// set the ratio decides the mix, and neither case loses anything to name.
+    #[test]
+    fn the_deposit_rate_is_the_other_half_of_the_mix_and_only_counts_when_it_is_on() {
+        let brush = |deposit_on: bool| {
+            let xml = format!(
+                "<Preset name=\"Mix\" paintopid=\"colorsmudge\">{}{}{}\
+                 <param type=\"internal\" name=\"PressureSmudgeRate\">true</param>\
+                 <param type=\"internal\" name=\"PressureColorRate\">{deposit_on}</param>\
+                 </Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                param("SmudgeRateValue", "0.8"),
+                param("ColorRateValue", "0.6"),
+            );
+            from_kpp(&kpp(&xml)).expect("decode")
+        };
+
+        // Off: Krita's `colorRate` is literally `0.0` there, so the dab carries
+        // nothing but what it lifted — a pure blender, *whatever* the pickup
+        // rate reads. Answering the pickup instead was a real bug and this is
+        // the guard: with 0.8 here it left the brush depositing a fifth of the
+        // palette colour where Krita deposits none. What 0.8 does govern is how
+        // faintly the dab lands, which this import discards — see the module
+        // docs, which name the slot it would go in rather than claiming none.
+        let off = brush(false);
+        assert_eq!(off.brush.smudge, 1.0);
+
+        // On: 0.8 lifted against 0.6 laid down, so four sevenths of a dab's
+        // colour came off the canvas — less pickup than the rate alone says,
+        // which is the whole correction.
+        let on = brush(true);
+        assert!(
+            (on.brush.smudge - 4.0 / 7.0).abs() < 1e-5,
+            "{}",
+            on.brush.smudge
+        );
+
+        // Neither reading has anything left over to apologise for.
+        for preset in [&off, &on] {
+            assert!(
+                !preset.dropped.iter().any(|d| d.contains("deposit")),
+                "{:?}",
+                preset.dropped
+            );
+        }
     }
 
     #[test]
@@ -2132,6 +2332,42 @@ mod tests {
                 "{expected} missing: {dropped:?}"
             );
         }
+    }
+
+    /// Three settings that are switched on and do nothing, and a reader that
+    /// takes any of them at face value apologises for a loss that did not
+    /// happen. Krita mirrors nothing with neither axis ticked; a hundredth of
+    /// mask randomness and a fiftieth of density are below what the alpha they
+    /// perturb can even hold.
+    #[test]
+    fn a_setting_switched_on_and_doing_nothing_is_not_a_loss() {
+        let xml = format!(
+            "<Preset name=\"Quiet\" paintopid=\"paintbrush\">{}{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\" randomness=\"0.01\" \
+                 density=\"0.99\"><MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" \
+                 hfade=\"0.5\"/></Brush>"
+            ),
+            "<param type=\"internal\" name=\"PressureMirror\">true</param>",
+            "<param type=\"internal\" name=\"HorizontalMirrorEnabled\">false</param>",
+            "<param type=\"internal\" name=\"VerticalMirrorEnabled\">false</param>",
+        );
+        assert!(
+            from_kpp(&kpp(&xml)).expect("decode").dropped.is_empty(),
+            "{:?}",
+            from_kpp(&kpp(&xml)).unwrap().dropped
+        );
+
+        // One axis ticked is a real mirror, and it is still named.
+        let mirrored = xml.replace(
+            "name=\"HorizontalMirrorEnabled\">false",
+            "name=\"HorizontalMirrorEnabled\">true",
+        );
+        assert_eq!(
+            from_kpp(&kpp(&mirrored)).expect("decode").dropped,
+            ["mirrored dabs"]
+        );
     }
 
     #[test]
