@@ -1993,11 +1993,10 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
         // name typed and then Deleted would spend the click on the rename and
         // need a second one.
         let mut renamed = false;
-        let mine = ed.custom_theme.clone();
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
-            if let Some(theme) = &mine {
+            if let Some(theme) = &ed.custom_theme {
                 let confirming = state.confirming.as_deref() == Some(theme.id.as_str());
                 let label = if confirming { "Delete?" } else { "Delete" };
                 if controls::text_button(ui, p, label, confirming, true)
@@ -2040,7 +2039,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
             // The name, filling whatever the buttons left. A real `TextEdit`,
             // so `ui::draw`'s one `set_typing` call already stops the canvas
             // hearing every keystroke — see the rule under Interface.
-            match &mine {
+            match &ed.custom_theme {
                 Some(_) => {
                     let width = NAME_FIELD.min(ui.available_width() - 16.0).max(40.0);
                     let field = inset_field(
@@ -2269,6 +2268,12 @@ fn token_row(
                 .color(p.text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The length check is a third line of defence, after `refill`
+            // always filling the whole table and `Token::ALL` being what this
+            // loop walks — it is here because the alternative failure is an
+            // index panic on the *drawing path*, which is the worst place in
+            // the application to put one. `Palette::link_colour`'s modulo is
+            // the same argument.
             if !editable || state.hex.len() != Token::ALL.len() {
                 ui.label(
                     egui::RichText::new(themelib::hex(colour))
