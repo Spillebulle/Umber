@@ -1773,6 +1773,14 @@ impl TextureSpec {
         // `side × scale` document pixels by the sampler that was going to run
         // anyway — which is the picture Krita's pre-resample makes, without a
         // second resampler in `umber-core` to keep in step with the hardware's.
+        //
+        // The longer side, because `Brush::grain_scale` is one number and the
+        // shader stretches the tile square over it. That squashes a non-square
+        // pattern, which is not something the packs can be used to justify —
+        // every one of the thirty-one is square — and is the same trade the
+        // Clip Studio reader already makes for the same reason. A tip escapes
+        // it through `TipMask::aspect`; a paper has no equivalent, because the
+        // grain is anchored to the document rather than shaped to a dab.
         let side = width.max(height) as f32;
         let scale = (side * self.scale).clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
 
@@ -1796,19 +1804,23 @@ impl TextureSpec {
     /// that string in turn, so one decode hands back text beginning `iVBORw0K`.
     /// Sniffing the result rather than decoding a fixed number of times is what
     /// keeps this right for a writer that only does it once.
+    ///
+    /// An embedded blob that will not decode **falls through to the file**
+    /// rather than ending the lookup. A preset routinely carries both — every
+    /// one of the twenty embedded patterns also names its author's own path —
+    /// so a `?` inside the first branch would turn one unreadable blob into a
+    /// brush painting flat beside a bundle that holds the picture.
     fn pattern(&self, patterns: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
         const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-        if let Some(text) = &self.embedded {
-            let mut raw = base64(text)?;
+        let embedded = || {
+            let mut raw = base64(self.embedded.as_ref()?)?;
             if !raw.starts_with(PNG_MAGIC) {
                 raw = base64(std::str::from_utf8(&raw).ok()?)?;
             }
-            if raw.starts_with(PNG_MAGIC) {
-                return Some(raw);
-            }
-        }
-        self.file.as_ref().and_then(|name| patterns(name))
+            raw.starts_with(PNG_MAGIC).then_some(raw)
+        };
+        embedded().or_else(|| self.file.as_ref().and_then(|name| patterns(name)))
     }
 }
 
