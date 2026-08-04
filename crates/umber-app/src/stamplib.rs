@@ -312,11 +312,18 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
         state.notice = None;
     }
 
+    // The library **before** the list is built from it, and the order matters
+    // exactly once: on the first frame of a fresh context this is what reads
+    // the collection off disk, and `resync` is what fills `Editor::tips` and
+    // `Editor::papers` from it. Built the other way round, the browser's first
+    // frame showed the shipped pictures alone and the user's appeared on the
+    // second — a flash nobody could account for.
+    let held = brushlib::library(ui.ctx(), ed).ok();
     let mut rows = entries(ed, state, kind);
     // Who is using each of the user's own, which is what decides whether Remove
     // may be offered. Asked once per frame rather than once per row, and only
     // of the rows that can be removed at all.
-    if let Ok(library) = brushlib::library(ui.ctx(), ed) {
+    if let Some(library) = &held {
         for row in rows.iter_mut().filter(|r| r.source == Source::Yours) {
             row.users = match kind {
                 Kind::Stamps => library.tip_users(&row.name),
@@ -332,6 +339,10 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
         .max_height(height)
         .show(ui, |ui| {
             if rows.is_empty() {
+                // The first of these is reachable only where every shipped
+                // picture failed to decode, which is exactly when a blank box
+                // would be least informative — the library says so in a
+                // warning at load, and this is what the browser shows for it.
                 controls::note(
                     ui,
                     p,
