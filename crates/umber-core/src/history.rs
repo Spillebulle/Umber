@@ -1727,6 +1727,65 @@ mod tests {
         assert!(stack.add().is_some(), "the released slice was not usable");
     }
 
+    /// A floating transform needs a slice **above everything claimed**, and a
+    /// pool holding a gap in the middle does not have one even though it can
+    /// hand a slice out.
+    ///
+    /// The two questions look interchangeable and the release valve breaks if
+    /// they are confused: a history asked to give entries up "until there is
+    /// room" would answer at once that there already is, give nothing up, and
+    /// leave `CanvasRenderer::begin_float` refusing on a document with a
+    /// handful of layers — a transform tool that has silently stopped working,
+    /// with no way back inside the session.
+    #[test]
+    fn a_float_needs_a_slice_above_everything_and_not_merely_a_spare_one() {
+        let mut stack = LayerStack::new();
+        let mut h = History::default();
+        let room = stack.room();
+
+        // Claim every slice, parking each deleted layer in the history so the
+        // top of the range stays claimed.
+        while room.has_headroom() {
+            if stack.add().is_none() {
+                break;
+            }
+            let before = stack.shape();
+            let gone = stack
+                .remove_many(&[stack.active_index()])
+                .expect("the bottom layer stays");
+            h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+        }
+        assert_eq!(stack.slot_capacity_needed(), LayerStack::MAX_SLOTS);
+
+        // Ask for a slice to *hand out* and the oldest entry goes, which opens
+        // a gap in the middle of the range: eviction is oldest first, and the
+        // oldest entry parks the lowest slice. The pool can hand a slice out
+        // again — and a float still cannot be reserved, which is the whole
+        // distinction.
+        assert!(h.free_until(|| room.has_room()), "nothing came free");
+        assert!(room.has_room());
+        assert!(
+            !room.has_headroom(),
+            "the gap was at the top, not the middle"
+        );
+        assert_eq!(
+            stack.slot_capacity_needed(),
+            LayerStack::MAX_SLOTS,
+            "a float would be refused here"
+        );
+
+        // Asking that question again gives nothing up at all, which is the bug:
+        // a release valve that answers "there is already room" and stops.
+        let held = h.len();
+        assert!(h.free_until(|| room.has_room()));
+        assert_eq!(h.len(), held, "the fixture stopped testing anything");
+        assert!(!room.has_headroom());
+
+        // Asking the right one keeps going until the top of the range is free.
+        assert!(h.free_until(|| room.has_headroom()));
+        assert!(stack.slot_capacity_needed() < LayerStack::MAX_SLOTS);
+    }
+
     /// A slice is freed exactly once, when the last holder lets go — so an
     /// entry cloned for inspection cannot hand the number back twice, and a
     /// mask parked in an entry outlives the layer's own copy of the claim.

@@ -735,10 +735,17 @@ impl UmberApp {
         // The preview takes the slice one past the highest one claimed, which
         // is above every parked slice by construction — so a float can never be
         // rendered into a deleted layer's pixels. That also means a history
-        // holding parked layers pushes the number up, and the release below is
-        // what stops an ordinary session of adding and deleting walking it to
-        // the ceiling and refusing every transform from then on.
-        self.free_a_slot();
+        // holding parked layers pushes the number up, and this release is what
+        // stops an ordinary session of adding and deleting walking it to the
+        // ceiling and refusing every transform from then on.
+        //
+        // `free_headroom` and not `free_a_slot`: what a preview needs is a
+        // slice *above everything*, which a pool holding a gap in the middle
+        // does not have even though it can hand one out. Eager rather than
+        // after a refusal, unlike the two above, because the refusal it exists
+        // to prevent is the only one left by this point — the lock and the
+        // folder are already answered above.
+        self.free_headroom();
         let reserved = self.editor.layers.slot_capacity_needed();
         // A lift is clipped by the selection; a paste puts down exactly what it
         // was given, having been masked when it was copied.
@@ -1295,24 +1302,61 @@ impl UmberApp {
     ///
     /// A `SlotRoom` rather than the stack itself, because the history is being
     /// mutated while the question is asked and the two are separate fields.
+    ///
+    /// **Called after the operation has been refused, never before it.**
+    /// `free_until` gives nothing up while there is already room, so in the
+    /// ordinary case this costs one lock and nothing else — but a layer can
+    /// also be refused for reasons a released slice would not mend, a full
+    /// stack most of all, and freeing first would throw an artist's oldest
+    /// edits away to make room for something that was never going to happen.
     fn free_a_slot(&mut self) -> bool {
         let room = self.editor.layers.room();
         self.editor.history.free_until(move || room.has_room())
+    }
+
+    /// The same, for the one caller that needs a slice **above everything
+    /// claimed** rather than merely a spare one.
+    ///
+    /// `CanvasRenderer::begin_float` takes its preview at
+    /// `slot_capacity_needed`, which is what stops it rendering into a parked
+    /// layer's pixels — so a pool holding a gap in the middle can satisfy
+    /// `has_room` and still refuse the float. Asking the wrong question here is
+    /// a valve that never opens: the history would answer "there is room" and
+    /// give nothing up, and the transform tool would stay refused.
+    fn free_headroom(&mut self) -> bool {
+        let room = self.editor.layers.room();
+        self.editor.history.free_until(move || room.has_headroom())
     }
 
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
         self.finish_transform();
-        self.free_a_slot();
         // Before the add, so a refusal records nothing. Every entry is `Kept`;
         // what makes this an undoable *add* is that the new layer is not among
         // them, so restoring this shape takes it back out — and the entry that
         // goes on the redo stack is the one that then holds it.
-        let before = self.editor.layers.shape();
-        let Some(slot) = self.editor.layers.add() else {
-            log::warn!("layer limit reached");
-            return;
+        let mut before = self.editor.layers.shape();
+        let slot = match self.editor.layers.add() {
+            Some(slot) => slot,
+            // A parked layer may be holding the last slice. Give the oldest
+            // entries up and try once more — and only here, so a refusal for
+            // any *other* reason costs the history nothing. `free_a_slot`
+            // answers false when the release could not help, which is when the
+            // live stack really is using every slice there is: exactly the
+            // condition that refused this before parking existed.
+            None if self.free_a_slot() => {
+                before = self.editor.layers.shape();
+                let Some(slot) = self.editor.layers.add() else {
+                    log::warn!("layer limit reached");
+                    return;
+                };
+                slot
+            }
+            None => {
+                log::warn!("layer limit reached");
+                return;
+            }
         };
         let needed = self.editor.layers.slot_capacity_needed();
         self.editor
@@ -1458,13 +1502,23 @@ impl UmberApp {
         if self.editor.layers.locked_at(index) {
             return;
         }
-        self.free_a_slot();
         // The mask this layer has *now* — none — so restoring this shape takes
         // the new one off again and parks its slice in the entry that would put
         // it back.
-        let before = self.editor.layers.shape_with_mask(index);
-        let Some(slot) = self.editor.layers.add_mask(index) else {
-            return;
+        let mut before = self.editor.layers.shape_with_mask(index);
+        let slot = match self.editor.layers.add_mask(index) {
+            Some(slot) => slot,
+            // Retried after a release, never before one, for the reason
+            // `free_a_slot` gives: the other refusal here is "this layer
+            // already has a mask", which no released slice would mend.
+            None if self.free_a_slot() => {
+                before = self.editor.layers.shape_with_mask(index);
+                let Some(slot) = self.editor.layers.add_mask(index) else {
+                    return;
+                };
+                slot
+            }
+            None => return,
         };
         let needed = self.editor.layers.slot_capacity_needed();
         self.editor

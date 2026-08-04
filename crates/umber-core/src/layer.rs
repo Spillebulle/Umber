@@ -121,7 +121,20 @@ struct SlotPool {
 impl SlotPool {
     /// Could this pool hand a slice out?
     fn has_room(&self) -> bool {
-        !self.free.is_empty() || self.next < LayerStack::MAX_SLOTS
+        !self.free.is_empty() || self.has_headroom()
+    }
+
+    /// Is there a slice number *above everything claimed*?
+    ///
+    /// A different question from [`SlotPool::has_room`], and the two genuinely
+    /// diverge: a pool holding a gap in the middle can hand a slice out and
+    /// still have nothing above the top. That is exactly what a floating
+    /// transform needs, because `CanvasRenderer::begin_float` reserves its
+    /// preview at [`LayerStack::slot_capacity_needed`] — above every claim by
+    /// construction, which is what stops a float rendering into a deleted
+    /// layer's parked pixels.
+    fn has_headroom(&self) -> bool {
+        self.next < LayerStack::MAX_SLOTS
     }
 
     fn take(&mut self) -> Option<u32> {
@@ -217,8 +230,21 @@ impl Drop for Claim {
 pub struct SlotRoom(Arc<Mutex<SlotPool>>);
 
 impl SlotRoom {
+    /// Could the document hand a slice out — to a layer, or to a mask?
     pub fn has_room(&self) -> bool {
         self.0.lock().is_ok_and(|pool| pool.has_room())
+    }
+
+    /// Is there a slice above everything claimed, which is what a floating
+    /// transform's preview takes?
+    ///
+    /// **Not the same question as [`SlotRoom::has_room`]**, and asking the
+    /// wrong one is a release valve that never opens: a pool with a gap in the
+    /// middle answers yes to that and no to this, so a history giving entries
+    /// up "until there is room" would stop at once and leave the transform tool
+    /// refusing on a document with a handful of layers.
+    pub fn has_headroom(&self) -> bool {
+        self.0.lock().is_ok_and(|pool| pool.has_headroom())
     }
 }
 
