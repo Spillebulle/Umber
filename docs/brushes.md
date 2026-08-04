@@ -107,25 +107,25 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-**239 presets**: Umber's own six, all 196 MyPaint brushes, and 37 out of four
-more packs — David Revoy's 2025-01 Krita bundle (18), Raghavendra Kamath's v2.1
+**241 presets**: Umber's own six, all 196 MyPaint brushes, and 39 out of four
+more packs — David Revoy's 2025-01 Krita bundle (20), Raghavendra Kamath's v2.1
 (8), GDQuest's (11), and rubberduck's 60 GIMP stamps (none). All CC0 except
 GDQuest's, which is CC-BY and therefore carries its credit.
 
-Eighteen of those 37 are Krita brushes whose dab is *generated* rather than
-stamped, so they convert exactly. **The other nineteen stamp a bitmap tip**,
-which the shipped library carries now: 15 masks, 624 kB of 8-bit greyscale PNG
-in `crates/umber-core/assets/tips/`, 664 kB of release binary. See "Tips in the
-shipped library" below.
+Nineteen of those 39 are Krita brushes whose dab is *generated* rather than
+stamped, so they convert exactly. **The other twenty stamp a bitmap tip**,
+which the shipped library carries now: 16 masks, 625 kB of 8-bit greyscale PNG
+in `crates/umber-core/assets/tips/`, embedded whole in the release binary. See
+"Tips in the shipped library" below.
 
 The rest of what those packs hold needs a mask too and still does not ship. 338
 brushes across the five packs carry one, and the numbers say where they went:
 
 | | |
 |---:|---|
-| 19 | ship |
+| 20 | ship |
 | 17 | are rubberduck's, whose masks this project does not redistribute — a licence decision, in `docs/brush-sources.md` |
-| 302 | lost something else on the way in and would have been refused whatever happened to their masks; 257 of them for one reason alone — a `.gih` pipe's sequencing, which Umber cannot reproduce |
+| 301 | lost something else on the way in and would have been refused whatever happened to their masks; 257 of them for one reason alone — a `.gih` pipe's sequencing, which Umber cannot reproduce |
 
 Every one of the 338 imports.
 
@@ -169,7 +169,7 @@ pack ever need it.
 
 Twelve collections, in the order the picker lists them:
 
-Counted over the 233 the generator converts; Umber's own six are on top of
+Counted over the 235 the generator converts; Umber's own six are on top of
 these and sort the same way.
 
 | Collection | Count |
@@ -180,10 +180,10 @@ these and sort the same way.
 | Charcoal, chalk & pastel | 6 |
 | Paint & brushes | 61 |
 | Watercolour & wet media | 22 |
-| Airbrush & spray | 13 |
+| Airbrush & spray | 14 |
 | Blenders & smudge | 22 |
 | Erasers | 9 |
-| Texture & grain | 19 |
+| Texture & grain | 20 |
 | Foliage & fur | 9 |
 | Effects & experimental | 20 |
 
@@ -475,19 +475,19 @@ of them are:
 
 | Field | Default in | Live in | Verdict |
 |---|---|---|---|
-| `min_size_ratio` | 95 of 233 | the other 138, all of which set `pressure_size` | dead where defaulted |
-| `min_hardness_ratio` | 165 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
-| `grain`, `grain_scale`, `grain_pattern` | 233 | none | nothing in any pack asks for paper |
-| `build_up` | 232 | 1 — Raghukamath's "Drybrush", measured | see below |
-| `stroke_span` | 177 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
-| `stabilization` | 37 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
+| `min_size_ratio` | 96 of 235 | the other 139, all of which set `pressure_size` | dead where defaulted |
+| `min_hardness_ratio` | 167 | the other 68, all of which set `pressure_hardness` | dead where defaulted |
+| `grain`, `grain_scale`, `grain_pattern` | 235 | none | nothing in any pack asks for paper |
+| `build_up` | 234 | 1 — Raghukamath's "Drybrush", measured | see below |
+| `stroke_span` | 179 | 37 read the `Stroke` input | 27 carry a span nothing reads; the editor draws it dead |
+| `stabilization` | 39 (every Krita preset) | 51 MyPaint brushes set `slow_tracking` | Krita stores stabilisation on the *tool*, not the brush |
 
-The two ratios are the useful result: the counts add up to 233 exactly, so no
+The two ratios are the useful result: the counts add up to 235 exactly, so no
 brush that varies with pressure is falling back on a default, and the ones that
 do not vary are carrying a number nothing reads. `build_up` stopped being all
 default when the stamps arrived, and it is the one row here that is *measured*
 per brush rather than defaulted: `stroke_coverage` decides it, and it comes out
-true for exactly one of the nineteen shipped stamps. `smudge_length` and
+true for exactly one of the twenty shipped stamps. `smudge_length` and
 `smudge_radius` look like the same case at a glance — 153 and 195 presets sit on
 Umber's default — and are not: those *are* MyPaint's defaults, read out of the
 file through the same evaluation as everything else.
@@ -696,7 +696,8 @@ wrong, and all three were got wrong first:
 | `Brush@angle`, in **radians** | `dab_angle` |
 | `Brush@spacing` | `spacing` |
 | `OpacityValue` × `FlowValue` × the opacity curve's peak | `opacity` |
-| `Pressure<X>` + `<X>Sensor` + `<X>commonCurve` | `pressure_*`, `min_*_ratio`, `*_curve` |
+| `Pressure<X>` + a `pressure` sensor + its curve | `pressure_*`, `min_*_ratio`, `*_curve` |
+| the same option's `fuzzy` sensor | a `Modulation` on `DabInput::Random`; its peak scales the setting |
 | `RotationSensor` `id="drawingangle"` / `"fuzzy"`, including inside a `sensorslist` | `dab_angle_follows_stroke` / `dab_angle_jitter` |
 | `RotationSensor@angleOffset`, degrees | added to `dab_angle` — the rake's lean |
 | a bitmap tip's measured stroke coverage | `build_up` |
@@ -771,12 +772,73 @@ Krita adds dabs through a sharp corner so a rake fans round it; Umber's dab
 turns with the heading and the heading turns at the corner, so a stroke differs
 only where it changes direction abruptly. Six presets ask for it.
 
+#### A dynamic is a *set* of sensors, and only one of them was being read
+
+The rotation fix above stopped at rotation, and the same fault was sitting on
+Size, Opacity and Scatter — where it cost both halves of the dynamic rather
+than one. Krita states an option as a set of sensors and **multiplies** their
+outputs together; `sensor_id` took the first id in the blob, which for a
+compound `<params id="sensorslist">` is the wrapper's own name. So a preset
+driven by pressure *and* something else lost its pressure curve entirely, and
+was then refused for a foreign sensor it had never actually been tested for.
+Eleven presets in the fetched packs drive one of the three that way. The only
+reason none of them shipped painting wrongly is that the same fault refused all
+eleven.
+
+Both halves now go through `sensor_ids`. Pressure stays the curve on the brush;
+the rest become modulation-table entries where Umber has the input, which
+today means `fuzzy` — Krita's fresh uniform draw per dab, exactly
+`DabInput::Random`. Because Krita multiplies, each sensor's **peak** lands on
+the setting's own value and the entry carries the fraction of that peak the
+draw asks for, which is the arrangement `mypaint`'s opacity path already uses
+and the reason `Brush::size` and `Brush::opacity` stay "the value at the peak".
+The units are the target's own, and all three differ: a log offset for size,
+a factor for opacity, and `scatter × (factor − 1)` for scatter, because Umber
+adds where Krita multiplies. That last is the one approximation — exact for a
+brush whose scatter has no pressure sensor beside it, which is seven of the
+nine in the packs, and at light pressure an under-estimate rather than a spray
+nobody asked for.
+
+**Two sensors stay named rather than approximated.** Krita's `speed` is a
+fraction of a fixed maximum drawing speed and `DabInput::Speed` is MyPaint's
+log-speed axis, on which 45 px/s reads 0.5; nothing in the preset says where
+the other's axis begins, so a curve written for one cannot be placed on the
+other from what is in the file, and a guess is a brush that thins at a speed
+nobody draws at. `fuzzystroke` is one draw for a whole stroke where Umber's
+random is one per dab, which would turn a single splash into confetti. One
+preset in the packs asks for each.
+
+Two more things fell out of reading the sensors properly:
+
+- **`<Name>UseSameCurve` decides which of the two curves in the file is in
+  force**, and Krita's editor leaves the other behind either way. Six presets
+  carry both. Deevad's "Eraser Kneaded Soft" states the flag false and a bare
+  pressure sensor with no curve of its own, so Krita gives it a linear ramp
+  where Umber was giving it the shared curve sitting unused beside it — the one
+  brush already in the library that this changed.
+- **A sensor that states no curve is the identity**, not a dynamic that does
+  nothing: Krita's curve object is constructed as the diagonal and only a
+  `<curve>` child replaces it.
+
+The net is 233 presets to 235: "C3) Thin Brush Textured" arrives with both its
+pressure ramp and an Opacity/Random entry running 0.42 to 1, and "Y) Splatters
+Light" varies each stamp between a sixth and all of its 230 px, which is what
+makes it splatter. A third, "X) Textured Chaotic Irregular", is still refused
+and correctly: it switches its scatter curve *off*, and this reader reads that
+as no dynamic where Krita reads it as the sensor applied straight — a separate
+question, left alone, and named rather than silently half-carried.
+
 **Only two of Krita's paint engines are accepted**: `paintbrush` and
 `colorsmudge`. `deformbrush` moves pixels around, `experimentbrush` fills an
 outline, `hairybrush` simulates bristles, `spraybrush` scatters particles — they
 are *different programs*, not settings, and a round dab wearing their name would
 be pure invention. They are refused by name, and inside a bundle one refusal
-does not take the other forty-five with it.
+does not take the other forty-five with it — which is why
+`brushimport::refusals` exists beside `read_file`: the brushes come back as the
+`Ok`, so a preset that is not a brush has nowhere in that answer to go, and six
+of the thirteen such presets in the packs are inside an archive. The generator's
+refusal table was counting the seven loose ones and reading as though the rest
+did not exist.
 
 The tip is either a generated ellipse — which Umber draws exactly — or a
 predefined brush naming a file. A preset with `embedded_resources` carries that
