@@ -719,7 +719,7 @@ the brush name and the spacing the format carries. Everything in it is
 big-endian; a little-endian read reports a billion-pixel brush and is caught by
 the length check rather than producing garbage.
 
-**Import brushes…** in the Brushes panel reads one, saves the mask into `tips/`,
+**Import…** in the brush library browser reads one, saves the mask into `tips/`,
 and selects the brush — importing a brush is asking to paint with it, and a
 stamp is unrecognisable in a list and obvious the moment it makes a mark.
 
@@ -2005,7 +2005,9 @@ pairing avoids.
 
 **Wet edges** is the one section of the design's six still not drawn at all
 rather than drawn empty; it has no engine behind it. **Stabiliser** is one
-slider and rides on Tip. Two of the six names are our own, and both were needed
+slider and rides on Tip — and is on the tool options strip as well, as a third
+rail beside size and opacity, because it is the one brush setting a painter
+adjusts while a line is being drawn. Two of the six names are our own, and both were needed
 because the design has no word for the thing:
 
 - **Blending**, for colour pickup and the brush's blend mode. Filing it under

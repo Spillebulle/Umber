@@ -332,6 +332,20 @@ impl Brush {
     /// stops being a texture at all.
     pub const MIN_GRAIN_SCALE: f32 = 16.0;
     pub const MAX_GRAIN_SCALE: f32 = 2048.0;
+    /// The heaviest smoothing anything may ask for.
+    ///
+    /// A **user-interface** bound and not a mathematical one, and saying which
+    /// matters: `StrokeBuilder`'s filter is `(1.0 - stabilization)` clamped to
+    /// at least 0.02, so even a stabilisation of 1.0 still converges on the
+    /// pointer — slowly enough to feel broken, which is what this is for and is
+    /// all it is for.
+    ///
+    /// It is a constant because three places had typed 0.95 by hand: the brush
+    /// editor's Tip section, the tool options strip's rail, and the MyPaint
+    /// importer's ceiling. Three copies is how a rail comes to disagree with
+    /// what an import can produce, and an imported brush above the rail's top
+    /// is one whose setting cannot be put back where it was found.
+    pub const MAX_STABILIZATION: f32 = 0.95;
 
     /// Dab radius for a given pressure, in document pixels.
     pub fn radius_at(&self, pressure: f32) -> f32 {

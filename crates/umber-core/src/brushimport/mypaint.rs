@@ -524,10 +524,12 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     // stabilisation is a per-sample exponential factor in 0..1. `s / (s + 1)`
     // is the fixed point of "one sample of smoothing at strength s", which
     // preserves the ordering of the brushes even though the damping cannot be
-    // identical. A stabilisation of 1.0 would never reach the pointer, hence
-    // the ceiling — which matches the app's own slider range.
+    // identical. The ceiling is [`Brush::MAX_STABILIZATION`] rather than a
+    // fourth hand-typed 0.95: an imported brush that landed above what the two
+    // controls can express would be one whose rail could not be put back where
+    // it was found.
     let slow = file.eval("slow_tracking", &env).max(0.0);
-    let stabilization = (slow / (slow + 1.0)).clamp(0.0, 0.95);
+    let stabilization = (slow / (slow + 1.0)).clamp(0.0, Brush::MAX_STABILIZATION);
 
     // The `stroke` input's ramp: `exp(stroke_duration_logarithmic)` radii of
     // travel to reach 1, then `stroke_holdtime` more before it wraps.

@@ -983,7 +983,7 @@ mod tests {
             let field = match (kind, panel_shot) {
                 (Some(_), _) => vec2(metrics::STAMP_LIBRARY[0] + 80.0, 560.0),
                 (None, true) => vec2(metrics::PANEL, 360.0),
-                (None, false) => vec2(metrics::BRUSH_EDITOR_WIDTH + 120.0, 560.0),
+                (None, false) => vec2(metrics::BRUSH_EDITOR[0] + 120.0, 560.0),
             };
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, field);
             let staged = staged.clone();

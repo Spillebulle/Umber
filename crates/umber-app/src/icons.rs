@@ -81,11 +81,15 @@ pub enum Icon {
     /// A sheet with its corner turned down: the document itself, as opposed to
     /// something done to it.
     Document,
-    // Making a brush. Added at the end deliberately — this enum is shared, and
-    // renumbering it would be a merge that compiles and draws the wrong marks.
-    /// A brush with a plus beside it: make a brush from nothing, as against
-    /// `Plus` alone, which everywhere else means "save what is in your hand".
-    BrushNew,
+    // Added at the end deliberately — this enum is shared, and renumbering it
+    // would be a merge that compiles and draws the wrong marks.
+    //
+    // There used to be a `BrushNew` here, a brush with a plus beside it,
+    // because `Plus` alone meant "save what is in your hand" in the Brushes
+    // panel's header and nowhere else in the interface. That header's `＋` makes
+    // a brush now, which is what `Plus` means on the Layers header, the Palette
+    // header and the tab strip, so the mark that existed to tell the two apart
+    // had nothing left to say and is gone rather than left undrawn.
     /// A triangle with a bar and a dot in it — the crash box's mark, and the
     /// only place in the interface that something has gone irrecoverably wrong.
     /// A triangle rather than a circle: a circled `i` is information and a
@@ -93,7 +97,7 @@ pub enum Icon {
     /// neither.
     Alert,
     // The selection's own strip of controls, drawn over the canvas beside a
-    // marquee. Added at the end for the reason `BrushNew` was.
+    // marquee. Added at the end for the reason the marks above were.
     /// Two sheets, one behind the other: take a copy and leave the original.
     Copy,
     /// A pair of scissors: take it and leave nothing.
@@ -141,6 +145,13 @@ pub enum Icon {
     /// "the whole set of brushes"; this one is the set of pictures. Four dots
     /// rather than a real texture, because a texture at 16 px is mud.
     Stamps,
+    /// A text caret standing on a rule: change what this is *called*.
+    ///
+    /// Deliberately not a second pencil. [`Icon::Pencil`] means "open the brush
+    /// editor" — in the Brushes panel header and on every row of the library
+    /// browser — and a row that drew a pencil for renaming and a pencil for
+    /// editing would be two marks with one meaning and two outcomes.
+    Rename,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -474,6 +485,16 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(at(14.5, 6.7), at(17.3, 9.5));
         }
 
+        Icon::Rename => {
+            // An I-beam caret standing on a rule. The rule is what stops the
+            // caret alone reading as a divider at 18 px, and it is the line of
+            // text the name is being typed onto.
+            line(at(12.0, 5.0), at(12.0, 15.0));
+            line(at(9.0, 5.0), at(15.0, 5.0));
+            line(at(9.0, 15.0), at(15.0, 15.0));
+            line(at(5.0, 19.5), at(19.0, 19.5));
+        }
+
         Icon::Gear => {
             painter.circle_stroke(at(12.0, 12.0), 4.0 * scale, stroke);
             for k in 0..8 {
@@ -586,17 +607,6 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 at(6.0, 3.5),
             ]);
             path(vec![at(14.0, 3.5), at(14.0, 8.0), at(18.5, 8.0)]);
-        }
-
-        Icon::BrushNew => {
-            // `Brush`'s stroke, shortened and moved down-left to leave the
-            // top-right corner for the plus. Drawn from the same two primitives
-            // so the pair read as one family at 14 px, where a second brush
-            // shape would just look like a wobble.
-            line(at(5.0, 19.0), at(13.0, 11.0));
-            painter.circle_filled(at(5.0, 19.0), 2.6 * scale, colour);
-            line(at(17.5, 3.5), at(17.5, 11.5));
-            line(at(13.5, 7.5), at(21.5, 7.5));
         }
 
         Icon::Alert => {

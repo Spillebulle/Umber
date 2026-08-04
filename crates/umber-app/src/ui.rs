@@ -1489,8 +1489,8 @@ fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui:
 /// The strip is a single unwrapped row, so a window narrow enough to overrun it
 /// does not reflow — the controls simply carry on past the right edge. These
 /// budgets decide which groups are drawn, in reverse order of how constantly a
-/// painter reaches for them: the stabiliser readout goes first, then opacity,
-/// then size.
+/// painter reaches for them: the stabiliser goes first, then opacity, then
+/// size.
 ///
 /// They are the design's own widths (a 90 point rail, a 24 point readout) plus
 /// the labels and egui's item spacing, rather than anything measured. Measuring
@@ -1504,7 +1504,11 @@ fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui:
 mod strip_budget {
     pub const SIZE: f32 = 160.0;
     pub const OPACITY: f32 = 185.0;
-    pub const STABILISER: f32 = 110.0;
+    /// The stabiliser rail. It used to be 110 for a `widgets::chip`, which is a
+    /// label and a small pill; it is a third [`crate::widgets::inline_slider`]
+    /// now, so it costs what one costs — the 90 point rail, the readout, and a
+    /// label three characters longer than "Opacity"'s.
+    pub const STABILISER: f32 = 190.0;
     /// The line naming the modifiers that add to, subtract from and intersect a
     /// selection, and say what the feather applies to.
     pub const COMBINE: f32 = 320.0;
@@ -1594,20 +1598,26 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 );
             }
             if room >= strip_budget::SIZE + strip_budget::OPACITY + strip_budget::STABILISER {
-                divider(ui, p);
-
-                // Read-only, unlike the design's, which has a chevron and opens
-                // a menu. Stabilisation is set in the brush editor; the tooltip
-                // says so rather than leaving a pill that looks like a control
-                // and answers to nothing.
-                widgets::chip(
+                // The third rail, and the same control as the two beside it.
+                // It used to be a `widgets::chip` — a reading, with a tooltip
+                // saying to go to the brush editor to change it — which put the
+                // one setting a painter adjusts *while* drawing a line behind
+                // two clicks and a tab. `metrics::OPTIONS_STRIP` is 36 points,
+                // so `widgets::number_row`'s two stacked rows do not fit here
+                // and this figure cannot be typed; that is the strip's own
+                // trade and is why `inline_slider` is what the strip uses.
+                //
+                // The range is the brush editor's own — 0.0..=0.95, where 1.0
+                // would be a stroke that never reaches the pen — so the two
+                // controls cannot disagree about what full stabilisation is.
+                widgets::inline_slider(
                     ui,
                     p,
                     "Stabiliser",
-                    &format!("{:.0}", ed.brush.stabilization * 100.0),
-                    "How much this brush smooths the stroke. Change it in the \
-                     brush editor — the pencil in the Brushes panel header — \
-                     on the Tip tab.",
+                    &mut ed.brush.stabilization,
+                    0.0..=Brush::MAX_STABILIZATION,
+                    false,
+                    |v| format!("{:.0}", v * 100.0),
                 );
             }
         } else if ed.ui.tool == Tool::Transform {
@@ -1713,12 +1723,13 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 ///
 /// [`widgets::dropdown`], like every other dropdown in the interface. It used
 /// to paint a filled `p.control` pill behind itself so it would read as a
-/// control against the strip, and it no longer does — deliberately. The strip
-/// already has a filled pill on it, [`widgets::chip`], and there the fill means
-/// the opposite: a chip is a *reading*, deliberately not a control, and says so
-/// in its tooltip. Two pills side by side, one of which opens and one of which
-/// does not, teaches nothing. What says this opens is the chevron, which is
-/// what says it everywhere else too.
+/// control against the strip, and it no longer does — deliberately. A fill on
+/// this strip meant the opposite of "a control": [`widgets::chip`] is a
+/// *reading*, and the stabiliser was one until it became a rail. That is why
+/// there is still no filled dropdown — the fill would have to be learnt as
+/// meaning one thing here and another in Settings, where the chips remain.
+/// What says this opens is the chevron, which is what says it everywhere else
+/// too.
 fn selection_mode_switch(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.selection_mode.label();
     widgets::dropdown(ui, p, widgets::Dropdown::new(label), |ui| {
@@ -1946,11 +1957,54 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
     .clicked()
 }
 
+/// Height the brush editor's footer claims at the bottom of the dialog.
+///
+/// Named because two places have to agree on it: [`brush_editor`], which hands
+/// the body whatever is left over, and `brushlib::save_row`, which must not
+/// draw more than this — the two transient things that used to make it taller,
+/// the notice and the "Save this brush as" field, are `brushlib::save_bar`'s
+/// now and sit above the body instead.
+///
+/// **Two** of `theme::apply`'s 6 points of item spacing — egui appends one
+/// after every allocated rect, including the zero-height one that pushes the
+/// footer down and the one-point hairline — plus that hairline, the ten points
+/// under it, and one 22-point line of buttons. 12 + 1 + 10 + 22.
+///
+/// `the_brush_editor_is_one_size_whatever_section_is_in_front` is what holds
+/// this to what the footer actually costs, which is the half of this that is
+/// easy to get wrong: a reserve one point short is a footer that overruns the
+/// frame, and the dialog grows by that point rather than the row being clipped.
+/// That test therefore has to install Umber's **own** style — this was 39 while
+/// it did not, because egui's default `item_spacing.y` is 3 where Umber's is 6,
+/// and the dialog was six points taller in a running window than in the test
+/// that was supposed to be pinning it.
+const BRUSH_EDITOR_FOOTER: f32 = 45.0;
+
+/// Breathing space between the body and the footer's hairline.
+const BRUSH_EDITOR_GAP: f32 = 14.0;
+
 /// The brush editor, matching the design's dialog.
 ///
 /// Holds every brush parameter that is not on the options strip, so the strip
 /// can stay short. Edits apply live — there is no OK or Cancel, because a paint
 /// app should let you see a change as you make it.
+///
+/// **One size, whatever section is in front**, which is the settings dialog's
+/// rule and was arrived at the same way: each section used to size the modal,
+/// so moving from Tip to Inputs grew it by a third and moving back shrank it —
+/// with the tab strip you had just clicked sliding out from under the pointer,
+/// because a modal is centred and a modal that changes height moves both edges.
+/// A header, one vertical `ScrollArea` with `auto_shrink([false, false])` and
+/// an explicit max height, a footer. The scroll area claiming its space
+/// whatever is in it is the whole of the fix; being vertical, it also cannot
+/// grow a horizontal bar out of a section that overruns.
+///
+/// **Sections must not add scroll areas of their own** — nested scrolling makes
+/// the wheel mean two things — and must not be given the dialog's height to
+/// size themselves against, or this comes straight back.
+///
+/// `pub(crate)` because `stamplib` opens it: a stamp imported into the library
+/// is one somebody is about to put on a brush.
 pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if !ed.ui.brush_editor_open {
         return;
@@ -1961,6 +2015,15 @@ pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         .and_then(|i| ed.presets.get(i))
         .map(|preset| preset.name.clone())
         .unwrap_or_else(|| "Brush".to_string());
+
+    // Clamped to the window, because a modal taller than the screen has its
+    // footer — the only way to keep an edit — off the bottom of it. The clamp
+    // reads the window and never the section, so it cannot reintroduce the
+    // thing above.
+    let available = root.ctx().content_rect().size();
+    let [full_width, full_height] = metrics::BRUSH_EDITOR;
+    let width = full_width.min(available.x - 48.0).max(420.0);
+    let height = full_height.min(available.y - 48.0).max(320.0);
 
     let response = egui::Modal::new(egui::Id::new("brush-editor"))
         .frame(
@@ -1975,20 +2038,43 @@ pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // design's two-column grid and the Dynamics section is three curves
             // side by side. At 430 px either would have to stack, and a brush
             // editor you have to scroll is one you stop reaching for.
-            ui.set_width(metrics::BRUSH_EDITOR_WIDTH);
+            ui.set_width(width);
+            ui.set_height(height);
 
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Edit brush — {name}"))
-                        .size(text::CONTROL)
-                        .color(p.text_strong)
-                        .strong(),
+                // The close mark first, then the title painted into what it
+                // leaves — `status_bar`'s order, and the same reason the
+                // footer's is that way round. The title carries the brush's
+                // *name*, which is text somebody else typed and therefore the
+                // one thing on this line with no length anybody can promise; as
+                // a label it would extend, and a long enough name would be
+                // drawn straight over the close mark.
+                let band = ui.max_rect();
+                // The close mark's own height, so the row is the same whatever
+                // the title elides to.
+                ui.allocate_exact_size(vec2(0.0, 18.0), Sense::hover());
+                let used = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, p, Icon::Close, true, "Close") {
+                            ed.ui.brush_editor_open = false;
+                        }
+                    })
+                    .response
+                    .rect
+                    .left();
+                let painter = ui.painter();
+                painter.text(
+                    pos2(band.left(), band.top() + 9.0),
+                    Align2::LEFT_CENTER,
+                    widgets::elide(
+                        painter,
+                        &format!("Edit brush — {name}"),
+                        text::CONTROL,
+                        used - band.left() - 8.0,
+                    ),
+                    FontId::proportional(text::CONTROL),
+                    p.text_strong,
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, p, Icon::Close, true, "Close") {
-                        ed.ui.brush_editor_open = false;
-                    }
-                });
             });
 
             ui.add_space(10.0);
@@ -2007,17 +2093,32 @@ pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             );
             ui.add_space(12.0);
 
-            match ed.ui.brush_tab {
-                BrushTab::Tip => brush_editor_tip(ui, p, ed),
-                BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
-                BrushTab::Inputs => brush_editor_inputs(ui, p, ed),
-                BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
-                BrushTab::Texture => brush_editor_texture(ui, p, ed),
-                BrushTab::Blending => brush_editor_blending(ui, p, ed),
-            }
+            // Above the body, so the space they take comes off what scrolls
+            // rather than off the dialog's height. See `brushlib::save_bar`.
+            crate::brushlib::save_bar(ui, p, ed);
+
+            let body = (ui.available_height() - BRUSH_EDITOR_FOOTER - BRUSH_EDITOR_GAP).max(0.0);
+            egui::ScrollArea::vertical()
+                // A scroll position per section. One shared position would
+                // carry Inputs' offset onto Tip, which is short enough to be
+                // left showing nothing.
+                .id_salt(("brush-editor", ed.ui.brush_tab))
+                .max_height(body)
+                .auto_shrink([false, false])
+                .show(ui, |ui| match ed.ui.brush_tab {
+                    BrushTab::Tip => brush_editor_tip(ui, p, ed),
+                    BrushTab::Dynamics => brush_editor_dynamics(ui, p, ed),
+                    BrushTab::Inputs => brush_editor_inputs(ui, p, ed),
+                    BrushTab::Scatter => brush_editor_scatter(ui, p, ed),
+                    BrushTab::Texture => brush_editor_texture(ui, p, ed),
+                    BrushTab::Blending => brush_editor_blending(ui, p, ed),
+                });
 
             // The design's footer: name what you have made, or write it back
-            // over the brush you started from.
+            // over the brush you started from. Pushed to the bottom by whatever
+            // is left, exactly as the settings dialog's is.
+            let left = (ui.available_height() - BRUSH_EDITOR_FOOTER).max(0.0);
+            ui.allocate_space(vec2(0.0, left));
             crate::brushlib::save_row(ui, p, ed);
         });
 
@@ -2161,12 +2262,15 @@ fn brush_editor_tip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 |v| format!("{v:.0}°"),
             );
         });
+        // The same range the tool options strip's rail uses, from the one
+        // constant, so the two controls cannot disagree about what full
+        // stabilisation is.
         widgets::slider_row(
             &mut c[1],
             p,
             "Stabilisation",
             &mut ed.brush.stabilization,
-            0.0..=0.95,
+            0.0..=Brush::MAX_STABILIZATION,
             false,
             percent,
         );
@@ -3023,6 +3127,267 @@ fn curve_column(
 
 #[cfg(test)]
 mod tests {
+    use crate::brushlib;
+    use crate::editor::{BrushTab, Editor};
+    use crate::theme::{Palette, ThemeKind, metrics};
+    use egui::{Rect, pos2, vec2};
+
+    /// What the footer is asked to hold, beyond the six sections.
+    ///
+    /// The two that are not the ordinary case are the ones that used to make it
+    /// taller or wider: a name field armed takes the buttons off the row, and a
+    /// brush of the user's own replaces one button with two — the second
+    /// carrying a name somebody else chose, which is the width nobody here can
+    /// bound.
+    #[derive(Clone, Copy, Debug)]
+    enum Footer {
+        /// A shipped brush in hand: one "Save brush…" button.
+        Shipped,
+        /// One of the user's own, with a name long enough to be a problem:
+        /// `Update "<name>"` and `Save as new…` on one line.
+        Yours,
+        /// The "Save this brush as" field up, which takes the buttons away.
+        Naming,
+    }
+
+    /// Every section of the brush editor in every footer state, and how big the
+    /// dialog came out.
+    fn section_sizes() -> Vec<(BrushTab, Footer, egui::Vec2)> {
+        let input = egui::RawInput {
+            // Comfortably larger than the dialog in both directions, so the
+            // clamp to the window is not what is being measured.
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+
+        let mut out = Vec::new();
+        for tab in [
+            BrushTab::Tip,
+            BrushTab::Dynamics,
+            BrushTab::Inputs,
+            BrushTab::Scatter,
+            BrushTab::Texture,
+            BrushTab::Blending,
+        ] {
+            for footer in [Footer::Shipped, Footer::Yours, Footer::Naming] {
+                // A context per measurement, not one shared. egui remembers an
+                // area's rect between frames, and a modal that has already been
+                // laid out taller stays taller — so a shared context can report
+                // every case agreeing when what they agree on is the largest.
+                let ctx = egui::Context::default();
+                // Umber's own font and spacing, not egui's defaults. This is
+                // what `docshot::Stage::shoot` does and what `ui::draw` does,
+                // and without it the whole measurement is of a style Umber
+                // never draws with: egui's `item_spacing.y` is 3 where
+                // `theme::apply` sets 6, so a footer reserve calibrated here
+                // would be six points short in a running window — which is
+                // exactly the "reserve that does not match what the footer
+                // costs" this test exists to prevent.
+                crate::theme::install_fonts(&ctx);
+                crate::theme::apply(&ctx, &palette);
+                let mut ed = Editor::default();
+                ed.ui.brush_editor_open = true;
+                ed.ui.brush_tab = tab;
+                if matches!(footer, Footer::Yours) {
+                    // Past the shipped library, which is what `Index::is_user`
+                    // reads — so the footer offers Update as well as Save as
+                    // new. The name is deliberately absurd: it is the one piece
+                    // of text in this dialog that Umber did not write.
+                    let mut mine = ed.presets[0].clone();
+                    mine.id = "user/long".to_owned();
+                    mine.name = "A stupendously long name somebody typed into the field".to_owned();
+                    ed.presets.push(mine);
+                    ed.active_preset = Some(ed.presets.len() - 1);
+                }
+                let naming = matches!(footer, Footer::Naming)
+                    .then_some("Another name of quite unreasonable length");
+                let mut size = egui::Vec2::ZERO;
+                // Three passes and the last is the one read: the first through
+                // a fresh context builds the font atlas, and a modal lays
+                // itself out against the previous frame's screen — text
+                // measured against a half-built atlas is not the height it
+                // settles at.
+                for _ in 0..3 {
+                    // Seeded rather than loaded, so this never touches the
+                    // brush library of whoever is running it.
+                    brushlib::seed_broken_library(&ctx, &ed, "no library", naming);
+                    let _ = ctx.run_ui(input.clone(), |ui| {
+                        super::brush_editor(ui, &palette, &mut ed);
+                    });
+                    size = ctx
+                        .memory(|m| m.area_rect(egui::Id::new("brush-editor")))
+                        .expect("the brush editor draws an area")
+                        .size();
+                }
+                out.push((tab, footer, size));
+            }
+        }
+        out
+    }
+
+    /// The brush editor is one size, whatever section is in front.
+    ///
+    /// Each section used to size the modal: Inputs is a list of arbitrary
+    /// length where Tip is a fixed grid, so moving between them grew and shrank
+    /// the dialog — and a modal is centred, so a change of height moves *both*
+    /// edges and takes the tab strip out from under the pointer that has just
+    /// clicked it. It is now a header, one vertical `ScrollArea` with
+    /// `auto_shrink([false, false])` and an explicit max height, and a footer,
+    /// which is the settings dialog's rule applied here.
+    ///
+    /// The absolute size is asserted as well as the agreement between the six,
+    /// because the two are different failures: six sections that agree on the
+    /// wrong number is a header or a footer overrunning what the frame reserved
+    /// for it, and that is the same on every tab — so equality alone would pass
+    /// straight over it.
+    #[test]
+    fn the_brush_editor_is_one_size_whatever_section_is_in_front() {
+        let sizes = section_sizes();
+        let [width, height] = metrics::BRUSH_EDITOR;
+        // The frame's `Margin::same(18)` and its one-point border, on all four
+        // sides: 18 + 1 either way.
+        let expected = vec2(width + 38.0, height + 38.0);
+        for (tab, footer, size) in &sizes {
+            // Within a tenth of a point rather than exactly. The height is the
+            // frame's own arithmetic over a sum of `add_space`s and row
+            // heights, so the last bit of the f32 differs between sections; a
+            // tenth of a point is far below anything that could be a layout
+            // changing size and far above that.
+            let off = (*size - expected).abs();
+            assert!(
+                off.x < 0.1 && off.y < 0.1,
+                "the brush editor is {:.4} × {:.4} on {tab:?} with {footer:?}, \
+                 not {:.4} × {:.4}",
+                size.x,
+                size.y,
+                expected.x,
+                expected.y
+            );
+        }
+    }
+
+    /// The brush editor, on each of its six sections.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is:
+    /// the test above says the frame is one size, and only a picture says
+    /// whether the section inside it is laid out sensibly at that size — how
+    /// much of the frame a short section leaves empty, and whether a long one
+    /// scrolls where it should.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app brush_editor_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn brush_editor_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The dialog is 560 × 600 and clamps to `available - 48`, so a field 48
+        // larger either way holds it at full size with an even margin of dimmed
+        // backdrop around it.
+        let [w, h] = metrics::BRUSH_EDITOR;
+        let field = vec2(w + 48.0, h + 48.0);
+        // The six sections, then the footer state the assertion above cannot
+        // speak for. `ui.set_width` bounds the dialog, so a footer whose
+        // buttons are wider than the room left beside the note does not grow
+        // the modal — it is drawn over the note, and only a picture says so.
+        // A brush of the user's own is the case: it replaces one button with
+        // two, and the second carries a name Umber did not write.
+        let sections = [
+            BrushTab::Tip,
+            BrushTab::Dynamics,
+            BrushTab::Inputs,
+            BrushTab::Scatter,
+            BrushTab::Texture,
+            BrushTab::Blending,
+        ];
+        for (n, (tab, long_name)) in sections
+            .into_iter()
+            .map(|tab| (tab, false))
+            .chain(std::iter::once((BrushTab::Tip, true)))
+            .enumerate()
+        {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            ed.ui.brush_editor_open = true;
+            ed.ui.brush_tab = tab;
+            if long_name {
+                let mut mine = ed.presets[0].clone();
+                mine.id = "user/long".to_owned();
+                mine.name = "A stupendously long name somebody typed into the field".to_owned();
+                ed.presets.push(mine);
+                ed.active_preset = Some(ed.presets.len() - 1);
+            }
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |root| {
+                brushlib::seed_broken_library(root.ctx(), &ed, "no library", None);
+                super::brush_editor(root, &palette, &mut ed);
+            });
+            let name = if long_name {
+                "7-footer-long-name.png".to_owned()
+            } else {
+                format!("{}-{tab:?}.png", n + 1).to_lowercase()
+            };
+            docshot::write_png(&dir.join(name), &image).expect("write the png");
+        }
+        println!("wrote 7 shots to {}", dir.display());
+    }
+
+    /// The tool options strip, with the brush in hand and at three widths.
+    ///
+    /// The stabiliser is a third `widgets::inline_slider` beside size and
+    /// opacity rather than the `widgets::chip` it was, and the two things worth
+    /// looking at are whether three rails on a 36-point strip read as three
+    /// controls and whether the budget that drops them one at a time drops them
+    /// where it says it does.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app options_strip_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn options_strip_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // Wide enough for all three, for two of them, and for one.
+        for (n, width) in [900.0_f32, 560.0, 380.0].into_iter().enumerate() {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(width, metrics::OPTIONS_STRIP);
+            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                    .show(root, |ui| {
+                        ui.set_height(metrics::OPTIONS_STRIP);
+                        super::options_strip(ui, &palette, &mut ed);
+                    });
+            });
+            let name = format!("strip-{}-{width:.0}.png", n + 1);
+            docshot::write_png(&dir.join(name), &image).expect("write the png");
+        }
+        println!("wrote 3 strips to {}", dir.display());
+    }
+
     /// The canvas scrollbars in the three states that matter, over a canvas
     /// region the size a real one is.
     ///

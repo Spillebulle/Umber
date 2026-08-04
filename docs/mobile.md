@@ -767,7 +767,7 @@ and, read carelessly, sounds like Android is already covered. It is covered for
 ## 5. The interface on a tablet
 
 The design is a desktop design and its numbers are in `theme::metrics`:
-`PANEL` 264, `TOOL_RAIL` 100, `BRUSH_LIBRARY` 780×540, `BRUSH_EDITOR_WIDTH` 560,
+`PANEL` 264, `TOOL_RAIL` 100, `BRUSH_LIBRARY` 780×540, `BRUSH_EDITOR` 560×600,
 `MODULE_LIBRARY_WIDTH` 470, `UPDATE_DIALOG_WIDTH` 560, and rows measured in
 tens of pixels. Two separate problems, and only one of them is hard.
 

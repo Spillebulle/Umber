@@ -705,7 +705,33 @@ pub mod metrics {
     /// The brush editor dialog. Wider than the other modals because the design
     /// lays its Tip section out as two columns and its Dynamics section as a
     /// row of curve panels, and neither survives being narrowed.
-    pub const BRUSH_EDITOR_WIDTH: f32 = 560.0;
+    ///
+    /// A *fixed* size, for the reason [`BRUSH_LIBRARY`] is one and then some:
+    /// its six sections are different lengths — Inputs is a list of arbitrary
+    /// length and Tip is a fixed grid — so a dialog sized by its content was a
+    /// different dialog on every tab, and a modal is centred, so changing
+    /// height moves both of its edges and takes the tab strip out from under
+    /// the pointer that had just clicked it.
+    ///
+    /// The height is measured rather than chosen, and the measurement is
+    /// `brush_editor_preview` — a picture drawn through Umber's own style,
+    /// which is the only reading worth taking. (A first attempt measured the
+    /// six sections through a bare egui context and every gap in it was half
+    /// the one on screen. See `ui::BRUSH_EDITOR_FOOTER`, which was six points
+    /// short for the same reason.)
+    ///
+    /// Of the 600, `ui::BRUSH_EDITOR_FOOTER` and `ui::BRUSH_EDITOR_GAP` take an
+    /// exact 59 at the bottom and the header and tab strip about 83 at the top,
+    /// leaving a body of roughly 458. The tallest section that cannot grow is
+    /// Scatter, at about 444 — so it clears by a little over ten points, and a
+    /// caption that wrapped one more line would scroll rather than move the
+    /// frame. The shortest, Texture and Blending, leave a good deal of it
+    /// empty, and that is the price of one size, paid deliberately: what it
+    /// buys is a tab strip that stays where it was clicked. Inputs is the one
+    /// section with no ceiling — the shortest of the six until a brush has a
+    /// modulation on it and by far the tallest afterwards. See
+    /// `ui::brush_editor`.
+    pub const BRUSH_EDITOR: [f32; 2] = [560.0, 600.0];
     /// One dynamics curve panel, square.
     pub const CURVE_PANEL: f32 = 150.0;
     /// A dropdown trigger — [`crate::widgets::dropdown`], which is every
