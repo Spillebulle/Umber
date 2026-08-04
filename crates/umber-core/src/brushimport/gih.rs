@@ -66,19 +66,38 @@
 //! fails safely: naming a loss that may not be there costs a sentence, where
 //! assuming a rule that is not stated loses stamps in silence.
 //!
-//! # `constant` is the one lossless collapse, and it is read rather than guessed
+//! # Two collapses that are exact, and one that is not
 //!
-//! `constant` names a dimension whose index never leaves where it started, so a
-//! pipe whose every dimension is constant paints its **first cell for ever** and
-//! the others are cells GIMP would never reach. Trimming them loses nothing at
-//! all, and it is decided off the header rather than off the pixels.
+//! A pipe becomes one brush, losing nothing, in exactly two cases, and both are
+//! decided from the file rather than from a judgement about what the stamps
+//! depict. They are in [`from_gih`] and they are why `animated` is not simply
+//! `count > 1`.
 //!
-//! This used to read `count > 1` as animation on its own, which got both halves
-//! wrong at once for such a file: a five-cell constant pipe arrived as five
-//! brushes, four of which GIMP would never paint, and each of the five claimed
-//! a sequencing loss that had not happened. No pipe in any fetched pack is
-//! constant, so nothing shipped moved — but a rule that is wrong only for files
-//! nobody has sent yet is still wrong.
+//! **Nothing walks.** `constant` names a dimension whose index never leaves
+//! where it started, so a pipe whose every dimension is constant paints its
+//! first cell for ever and the others are cells GIMP would never reach. Read
+//! off the header. `count > 1` on its own got both halves wrong at once for
+//! such a file: a five-cell constant pipe arrived as five brushes, four of
+//! which GIMP would never paint, and each of the five claimed a sequencing
+//! loss that had not happened.
+//!
+//! **The cells cannot differ.** Where every cell is the same brush, choosing
+//! between them — at random, by direction, by anything — makes exactly the mark
+//! one of them repeated makes. Compared byte for byte, so there is no threshold
+//! to get wrong; and over everything the import reads off a cell rather than
+//! over its coverage alone, so a `.gpb` whose colour differs is not "the same".
+//! **Two of the 55 pipes in the fetched packs are this**, both tips inside
+//! David Revoy's Krita bundle, and they are the only brushes anywhere in the
+//! packs that this module's own work moves into the shipped library. A one-cell
+//! pipe is the degenerate case of the same rule: a sequence of one has no
+//! sequencing, so `ncells:1 sel0:incremental` used to name a loss that had not
+//! happened.
+//!
+//! The third case is [`Selection::Angular`], and it is *not* exact — see below.
+//! The difference is the whole reason two of these are built and one is not:
+//! these two ask whether the other cells can ever be reached or ever differ,
+//! which the file answers, where that one asks whether they are rotations of
+//! each other, which only a resampler and a threshold could answer.
 //!
 //! # What is dropped
 //!
@@ -205,11 +224,19 @@ pub struct GihPipe {
     pub name: String,
     /// Every cell the pipe can actually reach, in file order.
     ///
-    /// That is every cell in the file, except for a pipe whose every dimension
-    /// is [`Selection::Constant`] — which paints its first for ever, so the
-    /// rest are trimmed. The whole file is still walked and validated first:
-    /// a truncated pipe is an error whichever rule it states.
+    /// Usually every cell in the file. It is one cell where the file's own
+    /// header or its own pixels say the others can never make a different
+    /// mark — see the two collapses in [`from_gih`]. The whole file is walked
+    /// and validated first either way: a truncated pipe is an error whichever
+    /// rule it states.
     pub cells: Vec<GbrBrush>,
+    /// How many cells the file held, before either collapse.
+    ///
+    /// `written > cells.len()` is the whole of "this pipe was collapsed", and
+    /// it is what `examples/measure-pipes.rs` counts. Kept because the two are
+    /// different questions: the cell count is what a pipe *is*, and the reach
+    /// is what it can paint.
+    pub written: usize,
     /// The rule for each of the pipe's `dim` dimensions, in order.
     ///
     /// `None` where the file states no `selN:` for that dimension, which is
@@ -317,7 +344,7 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
     let animated = rules
         .iter()
         .any(|rule| rule.is_none_or(Selection::walks) && (rule.is_some() || count > 1));
-    let angular = rules.iter().any(|rule| *rule == Some(Selection::Angular));
+    let angular = rules.contains(&Some(Selection::Angular));
 
     let mut cells = Vec::with_capacity(count.min(64));
     for index in 0..count {
@@ -343,20 +370,54 @@ pub fn from_gih(bytes: &[u8]) -> Result<GihPipe, PresetError> {
     // Every cell is read before this, whatever the rules say, so a truncated
     // file is still an error naming the cell it stopped at rather than a pipe
     // that quietly claims to hold one.
-    if !animated {
-        // Nothing walks, so the index sits where it started and the rest of the
-        // file is cells GIMP would never reach. The only collapse a pipe admits
-        // that loses no pixels at all.
+    //
+    // Two collapses, and both are *exact* — which is what separates them from
+    // the angular one the module docs decline. Neither has a threshold in it
+    // and neither looks at what the stamps depict:
+    //
+    // - **Nothing walks.** Every dimension states `constant`, so the index sits
+    //   where it started and the rest of the file is cells GIMP would never
+    //   reach. Read off the header.
+    // - **The cells cannot differ.** Every one of them is the same brush, so
+    //   choosing between them — by chance, by direction, by anything — makes
+    //   exactly the mark one of them repeated makes. Compared byte for byte
+    //   over everything the import reads off a cell, so a `.gpb` whose colour
+    //   differs is not "the same" and neither is a cell at another spacing.
+    //   Two of the 55 pipes in the fetched packs are this, both of them tips
+    //   inside David Revoy's Krita bundle. A one-cell pipe is the degenerate
+    //   case and falls out of the same line: a sequence of one has no
+    //   sequencing, so `sel0:incremental` on it names a loss that did not
+    //   happen.
+    let written = cells.len();
+    let uniform = cells.iter().all(|cell| same_brush(cell, &cells[0]));
+    if !animated || uniform {
         cells.truncate(1);
     }
+    let collapsed = cells.len() < written || uniform;
 
     Ok(GihPipe {
         name,
         cells,
+        written,
         rules,
-        animated,
-        angular,
+        // Nothing was lost where the pipe collapsed, so nothing may be
+        // reported. Claiming a loss that did not happen is the failure the
+        // whole of `dropped_features` exists to avoid — a list that cries wolf
+        // costs the losses that matter.
+        animated: animated && !collapsed,
+        angular: angular && !collapsed,
     })
+}
+
+/// Whether two cells are the same brush in everything the import keeps.
+///
+/// Not `==` on the whole [`GbrBrush`]: the **name** is a label rather than part
+/// of the mark, and cells routinely carry different ones. Everything else is
+/// compared, and comparing [`crate::tip::TipMask`] whole rather than its
+/// coverage bytes is deliberate — it is what makes this stay right on the day a
+/// mask carries more than coverage.
+fn same_brush(a: &GbrBrush, b: &GbrBrush) -> bool {
+    a.tip == b.tip && a.spacing == b.spacing && a.coloured == b.coloured
 }
 
 /// What reading this `.gih` will throw away.
@@ -509,9 +570,16 @@ mod tests {
         assert!(!from_gih(&plain).expect("decode").animated);
         assert!(dropped_features(&plain).is_empty());
 
-        // …but one cell walked by an incremental rule still is not.
+        // …and so is one cell walked by an incremental rule, which used to be
+        // reported as a loss on the reasoning that a pipe is taken at its word.
+        // It is not a loss: a sequence of one has no sequencing, GIMP paints
+        // that cell every dab and so does Umber. Naming it is the same claim
+        // about a file that had not lost anything that `count > 1` made about a
+        // constant pipe, and a list that cries wolf costs the losses that
+        // matter.
         let walked = gih("Single", "ncells:1 sel0:incremental", &[cell(1)]);
-        assert!(from_gih(&walked).expect("decode").animated);
+        assert!(!from_gih(&walked).expect("decode").animated);
+        assert!(dropped_features(&walked).is_empty());
     }
 
     /// `angular` is the one selection rule that describes a *rotating* stamp
@@ -538,11 +606,53 @@ mod tests {
         assert!(!from_gih(&shuffled).expect("decode").angular);
         assert_eq!(dropped_features(&shuffled), ["animated brush sequences"]);
 
-        // A pipe is taken at its word, on the same terms `incremental` is: a
-        // one-cell angular pipe reports the rule it states rather than the
-        // rule its cell count happens to make redundant.
+        // A one-cell angular pipe has nothing to turn *through*, so there is
+        // nothing to report. Same rule as `incremental` on one cell, and the
+        // same reason: the loss is the sequencing, and a sequence of one has
+        // none.
         let single = gih("One", "ncells:1 sel0:angular", &[cell(1)]);
-        assert!(from_gih(&single).expect("decode").angular);
+        assert!(!from_gih(&single).expect("decode").angular);
+        assert!(dropped_features(&single).is_empty());
+    }
+
+    /// The second exact collapse, and the only one that moves a real brush:
+    /// where every cell is the same brush, choosing between them makes exactly
+    /// the mark one of them repeated makes. Two of David Revoy's bundled tips
+    /// are this — four copies of one stamp under `sel0:random`.
+    #[test]
+    fn a_pipe_whose_cells_are_all_the_same_brush_is_one_stamp_and_loses_nothing() {
+        let same = gih(
+            "Copies",
+            "ncells:4 dim:1 rank0:4 sel0:random",
+            &[cell(7), cell(7), cell(7), cell(7)],
+        );
+        let pipe = from_gih(&same).expect("decode");
+        assert_eq!(pipe.written, 4, "the file still held four");
+        assert_eq!(pipe.cells.len(), 1);
+        assert!(!pipe.animated);
+        assert!(dropped_features(&same).is_empty());
+
+        // One cell out of four differing is a pipe that genuinely shuffles.
+        let nearly = gih(
+            "Nearly",
+            "ncells:4 sel0:random",
+            &[cell(7), cell(7), cell(8), cell(7)],
+        );
+        let pipe = from_gih(&nearly).expect("decode");
+        assert_eq!(pipe.cells.len(), 4);
+        assert_eq!(dropped_features(&nearly), [ANIMATION]);
+
+        // Sameness is over everything the import reads off a cell, not over the
+        // coverage alone. These two masks are identical and one of them is a
+        // `.gpb` carrying a colour the other does not have, so they are not the
+        // same stamp — and the colour is still reported, which it could not be
+        // if the pipe had been collapsed onto the plain one.
+        let mut pixmap = gbr(2, 2, 2, 1, "", &[7, 8, 9, 10]);
+        pixmap.extend_from_slice(&pattern(2, 2));
+        let mixed = gih("Mixed", "ncells:2 sel0:random", &[cell(7), pixmap]);
+        let pipe = from_gih(&mixed).expect("decode");
+        assert_eq!(pipe.cells.len(), 2);
+        assert_eq!(dropped_features(&mixed), [ANIMATION, gbr::COLOURED]);
     }
 
     /// The one collapse a pipe admits that loses nothing: `constant` pins the
@@ -601,10 +711,11 @@ mod tests {
         assert!(dropped_features(&alone).is_empty());
 
         // A word this build has never heard of walks, for the same reason.
-        let strange = gih("Strange", "ncells:1 sel0:hyperbolic", &[cell(1)]);
+        let strange = gih("Strange", "ncells:2 sel0:hyperbolic", &[cell(1), cell(2)]);
         let pipe = from_gih(&strange).expect("decode");
         assert_eq!(pipe.rules, [Some(Selection::Unknown)]);
         assert!(pipe.animated);
+        assert_eq!(pipe.cells.len(), 2);
     }
 
     /// A pipe can lose two different things at once, and the `if angular …
