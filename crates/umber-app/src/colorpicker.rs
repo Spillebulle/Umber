@@ -936,7 +936,12 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
         && let Some(pos) = response.interact_pointer_pos()
     {
         let t = ((pos.x - bar.left()) / bar.width().max(1.0)).clamp(0.0, 1.0);
-        hsv.h = t * 360.0;
+        // Through `wrap_hue`, like the ring's, because the far right of the bar
+        // is `t == 1.0` and `1.0 * 360.0` is exactly 360 — the one value outside
+        // the range `Hsv` documents. `to_color` wraps again and so paints the
+        // red it should, but the field is read by more than that, and a hue held
+        // outside its own range is a trap laid for whichever reader comes next.
+        hsv.h = umber_core::color::wrap_hue(t * 360.0);
         changed = true;
     }
 
