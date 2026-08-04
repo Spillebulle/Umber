@@ -209,14 +209,17 @@ pub fn from_kpp_in(
     }
     // `Texture/Pattern/Enabled`, and the prefix is the whole point: this read
     // `Texture/Enabled` for a while, which is a key Krita has never written.
-    // `KisTextureOption` puts every one of its settings under
-    // `Texture/Pattern/`, so the check was false in all 119 presets of the
-    // fetched packs and the paper was dropped in silence — 31 of them switch a
-    // texture on, and **eleven were shipping** without it, several of them
-    // named for the grain they had lost ("Thick Dry Canvas", "Texture Fabric",
-    // "Rough Rake Textured"). `MaskingBrush/Enabled` beside it is spelled
-    // correctly and fires on the one preset that uses it, which is what made
-    // the silence look like an absence of textured brushes rather than a bug.
+    // Every texture setting is under `Texture/Pattern/` — checked against
+    // Krita's own source at both ends of the range these packs were written in,
+    // `kis_texture_option.cpp` at v4.4.8 and `KisTextureOptionData.cpp` on
+    // master, neither of which has a bare `Texture/Enabled`. So the check was
+    // false in all 119 presets of the fetched packs and the paper was dropped
+    // in silence — 31 of them switch a texture on, and **eleven were shipping**
+    // without it, several named for the grain they had lost ("Thick Dry
+    // Canvas", "Texture Fabric", "Rough Rake Textured").
+    // `MaskingBrush/Enabled` beside it is spelled correctly and fires on the
+    // one preset that uses it, which is what made the silence look like an
+    // absence of textured brushes rather than a bug.
     if preset.flag("Texture/Pattern/Enabled") {
         dropped.push("paper texture");
     }

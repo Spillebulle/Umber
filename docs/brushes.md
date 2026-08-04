@@ -844,10 +844,12 @@ not the brush its author drew.
 A fifth fault, and the same shape as the first four: a value read without the
 thing that decides whether Krita reads it — except here the *key itself* was
 invented. The reader tested `Texture/Enabled`. Krita has never written that:
-`KisTextureOption` states every one of its settings under `Texture/Pattern/`, so
-the flag was false in all 119 presets of the fetched packs, no import has ever
-mentioned a paper, and the table of fields no source fills recorded "nothing in
-any pack asks for paper" as a *finding*.
+every texture setting is under `Texture/Pattern/`, in `kis_texture_option.cpp`
+at v4.4.8 and in `KisTextureOptionData.cpp` on master, which are the two ends of
+the range these packs were written in. So the flag was false in all 119 presets
+of the fetched packs, no import has ever mentioned a paper, and the table of
+fields no source fills recorded "nothing in any pack asks for paper" as a
+*finding*.
 
 **31 presets switch a texture on**, at a live strength — 0.45 at the lowest and
 1 in thirty of them — and **eleven of them were shipping**. Several are named
@@ -876,12 +878,14 @@ having before anybody assumes it is one job:
 So every pattern is *available*, and every pack's licence is verified inside its
 own download, which is what redistributing a bitmap needs — the `ship_tips`
 question in `docs/brush-sources.md`, asked again about paper. What is missing is
-the **model**. Krita's texture carries a texturing mode (14 of the 31 use
-Subtract, which Umber has no equivalent for, and four use modes this project has
-not identified at all), an inversion (11), a levels remap of the pattern
+the **model**. Krita's texture carries a texturing mode — `TexturingMode` in
+`KisTextureOptionData.h`, and the packs use five of its sixteen: Multiply (13),
+Subtract (14), Colour Dodge, Hard Mix (softer) and Height ×2 — plus an
+inversion (11), a levels remap of the pattern
 (`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15) and a pressure curve on the
 strength (25). Umber's grain is one multiply — `mix(1.0, tile, strength)` — and
 that is deliberate, because a strength of zero has to be the exact identity.
+Multiply is therefore the only mode of the five that carries across at all.
 
 Of the eleven that were shipping, **four** are plain multiply and would come
 back exactly once a preset can name a paper: "C2) Mechanical Pencil Detail",
