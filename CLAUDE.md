@@ -2920,6 +2920,35 @@ parts that mattered are not the obvious ones.
   one round trip adds a BOM and turns every em-dash into mojibake. It stays
   valid UTF-8, so `fmt`, `clippy` and the whole suite pass; the only symptom is
   a two-line change committing as 109 insertions. Say so in the brief.
+- **An agent may drive only a process it started itself, by the handle it got
+  at launch — never one it found by name.** An agent verifying a settings page
+  wrote a script that took `Get-Process umber | Select -First 1`, matched the
+  *user's own installed Umber*, and sent four synthetic clicks into it; two of
+  them painted strokes onto a document with unsaved work. It stopped as soon as
+  it noticed and deliberately did not send an undo into a window it should not
+  have been driving, which was right — but the damage was already done and only
+  the user could assess it. **The default in a brief is that an agent does not
+  drive a GUI at all**: a `docshot::Stage` preview or a headless
+  `egui::Context::run_ui` test answers almost every question a window would,
+  and does it reproducibly. This one is not about tidiness — an agent reaching
+  outside its worktree can reach the artist's own work.
+- **Do not clean up worktrees while any agent might still be resumed.** A merged
+  branch is not a finished agent: an agent that has reported can be sent a
+  follow-up, and several were. Removing its worktree mid-session leaves an
+  ordinary directory *inside* the shared checkout, which `.gitignore` hides, so
+  every `git` command the agent runs silently operates on **the main
+  repository** — the one that caught this reported `git status` clean while its
+  file differed from `HEAD` by 128 lines, and it had by then created a branch in
+  the shared checkout and switched the working tree onto it. Tie the cleanup to
+  the agent being finished with, not to its branch being merged, and do the
+  whole sweep once at the end.
+- **Verify the claim that failed last time, personally.** When a review finds
+  that a guard covered a *copy* of the code rather than the code, do not accept
+  "fixed" on report — re-run the mutation yourself. Doing so is two minutes and
+  it is the only way to know the second attempt did not repeat the first's
+  mistake in a new place. It has already paid for itself once here: the
+  reintroduced defect that had left twenty-eight tests green did, after the
+  rework, fail the one test that was supposed to catch it.
 
 ## The README
 
