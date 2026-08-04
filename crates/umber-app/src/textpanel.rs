@@ -203,14 +203,37 @@ pub struct TextState {
     /// Filter for the family menu. Several hundred faces is a list nobody
     /// scrolls.
     pub search: String,
-    /// The panel's picture of the block, and what it was made from.
+    /// The panel's picture of the block, and everything it costs to work out.
     ///
     /// Keyed by everything that changes the picture **including the colour**,
     /// so a preview cannot outlive the thing it is a preview of. Single
     /// consumer — the panel body, drawn once per pass — which is the property
     /// that makes one cache entry safe; see `brushlib::tip_preview` and the
     /// rule in CLAUDE.md about a cache with two call sites.
-    preview: Option<(u64, egui::TextureHandle)>,
+    preview: Option<Preview>,
+}
+
+/// What the panel drew, and what it had to rasterise twice to be able to say.
+///
+/// **The measured size and the notices are cached beside the picture, and that
+/// is not tidiness.** Both come from setting the block at its *real* size —
+/// which for a 72 px caption on a large canvas is a rasterisation measured in
+/// megapixels — and a panel body runs on every frame the module is open. Read
+/// afresh each time, opening the Text panel would rasterise somebody's caption
+/// sixty times a second for as long as they left it open, which is precisely
+/// the class of cost the "nothing on the drawing path allocates per frame" rule
+/// is about.
+struct Preview {
+    key: u64,
+    /// `None` where the block would not set at all — nothing typed, no ink, or
+    /// past the cap. The panel then draws no picture and no figure.
+    picture: Option<egui::TextureHandle>,
+    /// What it will measure on the canvas, from the same call that made the
+    /// picture's smaller twin — so the figure and the notices cannot come from
+    /// a different block than the one on screen.
+    measured: Option<(u32, u32)>,
+    missing: Vec<char>,
+    mixed: bool,
 }
 
 impl Default for TextState {
@@ -448,11 +471,84 @@ fn preview_key(ed: &Editor) -> u64 {
     h.finish()
 }
 
-/// What the block will look like, in the face it will be set in.
+/// Set the block twice — small for the picture, full size for the figure and
+/// the notices — and keep both.
 ///
-/// Rasterised at [`PREVIEW_EM`] rather than at the real size — a caption for a
-/// 4000-pixel canvas is not a picture that fits in a 264-point panel — and
-/// scaled to fit. The figure underneath is what says how big it really is.
+/// Twice, and not once scaled, because trimming to the ink is not linear in the
+/// size: a 26-pixel `Hxg` and a 400-pixel one do not have the same proportions
+/// once the antialiased edge is a smaller share of the mark. The figure has to
+/// be what the canvas will actually receive, so it comes from a real setting.
+///
+/// The small one is the picture because a caption for a 4000-pixel canvas is
+/// not something that fits in a 264-point panel, and what the artist is
+/// checking here — the face, the weight, the line breaks — all survives being
+/// scaled down.
+///
+/// Called only when [`preview_key`] has moved. See [`Preview`].
+fn build_preview(ui: &Ui, ed: &Editor, key: u64) -> Preview {
+    let mut small = ed.text.block.clone();
+    let ratio = PREVIEW_EM / ed.text.block.size.clamp(text::MIN_SIZE, text::MAX_SIZE);
+    small.size = PREVIEW_EM;
+    small.tracking *= ratio;
+
+    let loaded = ed
+        .text
+        .face()
+        .and_then(|face| face.load().map(|data| (face.clone(), data)));
+    let Some((face, data)) = loaded else {
+        return Preview {
+            key,
+            picture: None,
+            measured: None,
+            missing: Vec::new(),
+            mixed: false,
+        };
+    };
+
+    let picture = match text::set(&face, &data, &small) {
+        Ok(setting) => {
+            let [r, g, b, _] = ed.color.to_srgb_u8();
+            let pixels: Vec<egui::Color32> = setting
+                .coverage
+                .iter()
+                .map(|&c| egui::Color32::from_rgba_unmultiplied(r, g, b, c))
+                .collect();
+            let image = egui::ColorImage {
+                size: [setting.width as usize, setting.height as usize],
+                pixels,
+                source_size: vec2(setting.width as f32, setting.height as f32),
+            };
+            Some(
+                ui.ctx()
+                    .load_texture("text-preview", image, egui::TextureOptions::LINEAR),
+            )
+        }
+        Err(_) => None,
+    };
+
+    // The real block, for the figure and the notices. `missing` and
+    // `mixed_directions` are read off *this* setting rather than the small one:
+    // the two agree today, and reading them from the picture would make the
+    // notice a statement about the preview rather than about what is going on
+    // the canvas.
+    let (measured, missing, mixed) = match text::set(&face, &data, &ed.text.block) {
+        Ok(setting) => (
+            Some((setting.width, setting.height)),
+            setting.missing,
+            setting.mixed_directions,
+        ),
+        Err(_) => (None, Vec::new(), false),
+    };
+    Preview {
+        key,
+        picture,
+        measured,
+        missing,
+        mixed,
+    }
+}
+
+/// What the block will look like, in the face it will be set in.
 fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     if ed.text.block.text.trim().is_empty() {
         controls::note(
@@ -465,55 +561,21 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     }
 
     let key = preview_key(ed);
-    let stale = ed.text.preview.as_ref().map(|(k, _)| *k) != Some(key);
-    // What the real block measures, which is what the caption reports. Taken
-    // from the same call that makes the picture, so the two cannot disagree.
-    let mut measured = None;
-    let mut missing: Vec<char> = Vec::new();
-    let mut mixed = false;
-
-    if stale {
-        let mut small = ed.text.block.clone();
-        let ratio = PREVIEW_EM / ed.text.block.size.max(text::MIN_SIZE);
-        small.size = PREVIEW_EM;
-        small.tracking *= ratio;
-        let made = ed
-            .text
-            .face()
-            .and_then(|face| face.load().map(|data| (face.clone(), data)))
-            .map(|(face, data)| text::set(&face, &data, &small));
-        match made {
-            Some(Ok(setting)) => {
-                let [r, g, b, _] = ed.color.to_srgb_u8();
-                let pixels: Vec<egui::Color32> = setting
-                    .coverage
-                    .iter()
-                    .map(|&c| egui::Color32::from_rgba_unmultiplied(r, g, b, c))
-                    .collect();
-                let image = egui::ColorImage {
-                    size: [setting.width as usize, setting.height as usize],
-                    pixels,
-                    source_size: vec2(setting.width as f32, setting.height as f32),
-                };
-                let handle =
-                    ui.ctx()
-                        .load_texture("text-preview", image, egui::TextureOptions::LINEAR);
-                ed.text.preview = Some((key, handle));
-            }
-            _ => ed.text.preview = None,
-        }
+    // **Rebuilt only when something that changes it has changed.** Everything
+    // below this line rasterises the block twice — once small for the picture
+    // and once at its real size for the figure and the notices — and a panel
+    // body runs on every frame the module is open. Doing it unconditionally
+    // would rasterise somebody's caption sixty times a second for as long as
+    // the panel was on screen.
+    if ed.text.preview.as_ref().map(|c| c.key) != Some(key) {
+        ed.text.preview = Some(build_preview(ui, ed, key));
     }
+    let Some(cache) = ed.text.preview.as_ref() else {
+        return;
+    };
+    let (measured, missing, mixed) = (cache.measured, cache.missing.as_slice(), cache.mixed);
 
-    // The real block, for the figure and the notices. Measured rather than
-    // guessed from the preview's ratio, because trimming to the ink is not
-    // linear in the size.
-    if let Ok(setting) = ed.text.set() {
-        measured = Some((setting.width, setting.height));
-        missing = setting.missing;
-        mixed = setting.mixed_directions;
-    }
-
-    if let Some((_, handle)) = &ed.text.preview {
+    if let Some(handle) = &cache.picture {
         let [w, h] = handle.size();
         let (w, h) = (w as f32, h as f32);
         let full = ui.available_width();
