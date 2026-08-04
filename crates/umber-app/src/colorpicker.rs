@@ -12,6 +12,18 @@
 //! black and the hue would snap back to red on the way out. The Harmony mode
 //! leans on that hardest: a harmony is a function of hue alone, so a mode that
 //! read the hue off the colour would offer a red harmony for every grey.
+//!
+//! A wheel carries two controls in one hit area, and they are kept apart by two
+//! rules that have to hold together. [`Hub`] is the centre's geometry, handed to
+//! the hit test and to the painting by one function, so a press cannot land on a
+//! shape that is not drawn there — and it turns with the shape, because both
+//! centres carry an angle and the triangle can be turned by the hue itself. And
+//! [`settle`] runs **once, on the press frame**, with [`frame`] holding its
+//! answer for the rest of the gesture; the shape moving underneath afterwards
+//! therefore cannot change what the gesture is. Each was a bug on its own, and
+//! the second is the subtler: a press on the ring sets a hue, the hue swings the
+//! apex round to meet that very press, and a wheel that asked again would read
+//! it as a press on the triangle — hue frozen, marker slammed to the apex.
 
 use crate::theme::{Palette, metrics};
 use egui::{
@@ -200,11 +212,104 @@ fn hsv_colour(h: f32, s: f32, v: f32) -> Color32 {
 /// How far out a press has to be to belong to the hue ring rather than to the
 /// centre.
 ///
-/// The hub's outermost 8% steers hue too, so the ring's inner edge is
-/// forgiving to grab. Everything inside it — including the three wide gaps
-/// between an inscribed triangle and the ring — belongs to the saturation and
-/// value shape, which is where those presses have always gone.
+/// The hub's outermost 8% steers hue too, so the ring's inner edge is forgiving
+/// to grab — but only where the centre's own shape is not already under the
+/// pointer, which is why [`settle`] asks [`Hub::contains`] first. At the sizes
+/// the picker is actually drawn at, a triangle inscribed at `inner - 3` and a
+/// square inscribed in the same circle both put their corners *outside* this
+/// radius, so a ring tested first would take every press on the apex: the
+/// corner that is the hue, and the one place on the shape somebody aims at
+/// deliberately. (Below an `inner` of about 37 the corners fall inside it
+/// instead. Nothing depends on which way round it is — the hub is asked first
+/// either way — so the ordering is right at every size and this is only the
+/// reason it had to be chosen.)
 const RING_GRIP: f32 = 0.92;
+
+/// The shape drawn in the middle of a wheel, as both the hit test and the
+/// painting read it.
+///
+/// One value rather than a shape and a hit test that agree by discipline — the
+/// transform tool's rule, that a control may never be drawn where the hit test
+/// disagrees with it, applied where the shape can be turned. Both centres carry
+/// an angle and the triangle can be turned by the hue itself, so a test that was
+/// right at one heading would be this bug at another.
+///
+/// A bounding box is right at *no* heading. Round the triangle it covers the
+/// three wide gaps between the shape and the ring; round a square turned 45° it
+/// covers twice the square. That is what a press on the hue ring used to be read
+/// as — see [`frame`] for the other half of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hub {
+    /// The saturation/value triangle, by its three corners: full hue, white,
+    /// black.
+    Triangle(Pos2, Pos2, Pos2),
+    /// The saturation/value field, by its centre, its semi-axes before the turn,
+    /// and the angle it is turned by.
+    Field(Pos2, Vec2, f32),
+}
+
+impl Hub {
+    /// Whether a press at `pos` landed on the shape that was drawn.
+    ///
+    /// Asked of the **press** alone. A drag that began inside goes on being the
+    /// centre's however far out it wanders — that is what [`clamp_barycentric`]
+    /// and [`field_at`]'s clamp are for, and it is how every picker behaves — so
+    /// putting this test on each frame of a drag would freeze the marker at the
+    /// edge instead of sliding it along. A press and a drag ask different
+    /// questions and only one of them is about containment.
+    fn contains(self, pos: Pos2) -> bool {
+        match self {
+            // A degenerate triangle answers NaN, which is neither inside nor
+            // out; false is the honest reading and keeps the NaN out of a hue.
+            Self::Triangle(a, b, c) => {
+                let (x, y, z) = barycentric(pos, a, b, c);
+                x.is_finite() && x >= 0.0 && y >= 0.0 && z >= 0.0
+            }
+            // In the field's own frame, which is what makes this exact at every
+            // angle: the same two axes the mesh and the marker are built on.
+            Self::Field(centre, half, angle) => {
+                let (across, down) = field_axes(angle);
+                let d = pos - centre;
+                d.dot(across).abs() <= half.x && d.dot(down).abs() <= half.y
+            }
+        }
+    }
+}
+
+/// The centre's geometry, from the shape and the ring it is inscribed in.
+///
+/// One function, so the hit test and the painting cannot disagree about where
+/// the shape is. The square is the largest that fits inside the ring —
+/// inscribed in the circle, so turning it cannot take it outside and its size
+/// is the same at every angle.
+fn hub_of(shape: WheelShape, centre: Pos2, inner: f32, base: f32) -> Hub {
+    match shape {
+        WheelShape::Square => Hub::Field(
+            centre,
+            Vec2::splat((inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0)),
+            base,
+        ),
+        WheelShape::Triangle => {
+            let (hue_pt, white_pt, black_pt) =
+                triangle_corners(centre, (inner - 3.0).max(1.0), base);
+            Hub::Triangle(hue_pt, white_pt, black_pt)
+        }
+    }
+}
+
+/// Draw the centre and give it this frame's share of the gesture.
+///
+/// The two shapes read a point differently — barycentric weights against two
+/// axes — but they answer the same question, so the choice is made once here
+/// rather than at each of the two call sites.
+fn hub_field(ui: &mut Ui, hub: Hub, drag: Option<Pos2>, hsv: &mut Hsv) -> bool {
+    match hub {
+        Hub::Triangle(hue_pt, white_pt, black_pt) => {
+            sv_triangle(ui, hue_pt, white_pt, black_pt, drag, hsv)
+        }
+        Hub::Field(centre, half, angle) => sv_field(ui, centre, half, angle, drag, hsv),
+    }
+}
 
 /// Draw the picker. Returns true when the colour changed.
 #[allow(clippy::too_many_arguments)]
@@ -256,21 +361,218 @@ fn wheel_angle(shape: WheelShape, rotate: bool, angles: WheelAngles, hue: f32) -
     }
 }
 
-/// Where the gesture this response is reporting began, or `None` if there is no
-/// gesture.
+/// The same answer as radians from egui's zero angle, which is what
+/// [`hub_of`], [`field_axes`] and [`triangle_corners`] all take.
 ///
-/// A drag reports where the pointer is *now*, which by the end of one can be
-/// anywhere; which of the wheel's two controls it belongs to has to be settled
-/// from where it was pressed. egui clears the press origin on release and a
-/// click is reported on the release, so a click falls back to its own position —
-/// by definition it has not moved far enough for the two to differ.
-fn gesture_origin(ui: &Ui, response: &Response) -> Option<Pos2> {
-    if !(response.dragged() || response.clicked()) {
-        return None;
+/// Its own function because the hit test and the painting both need it, and a
+/// centre tested at one heading and drawn at another is the whole class of bug
+/// [`Hub`] exists to close.
+fn wheel_base(shape: WheelShape, rotate: bool, angles: WheelAngles, hue: f32) -> f32 {
+    (shape.neutral() + wheel_angle(shape, rotate, angles, hue)).to_radians()
+}
+
+/// What egui reported about this frame's gesture on a wheel.
+///
+/// A plain reading rather than a [`Response`], so that [`gesture`] below is a
+/// pure function of it — the division `gesture::press` and `install::detect`
+/// keep, and the only way the frames a gesture is made of can be driven without
+/// a window.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Reported {
+    /// Where the pointer is, if this widget owns a gesture at all. `Some` from
+    /// the frame of the press — *before* egui has decided the gesture is a drag
+    /// — through to the frame of the release.
+    at: Option<Pos2>,
+    /// Where the button went down, while it is still down. egui clears it on
+    /// the release.
+    press_origin: Option<Pos2>,
+}
+
+/// Which control a gesture reached, with no position in it.
+///
+/// Positionless because it is settled **once**, at the press, and then held —
+/// where the pointer is afterwards is this frame's business and which control
+/// it is working is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Aim {
+    /// Neither control: the gaps between an inscribed shape and the ring, and
+    /// everything beyond the ring's outer edge. Nothing is drawn in either, so
+    /// nothing in either may move a colour.
+    #[default]
+    Nothing,
+    /// The hue ring.
+    Ring,
+    /// The saturation and value shape.
+    Centre,
+}
+
+impl Aim {
+    /// This aim, working at a position.
+    fn at(self, pos: Pos2) -> WheelAim {
+        match self {
+            Self::Nothing => WheelAim::Idle,
+            Self::Ring => WheelAim::Ring(pos),
+            Self::Centre => WheelAim::Centre(pos),
+        }
     }
-    ui.ctx()
-        .input(|i| i.pointer.press_origin())
-        .or_else(|| response.interact_pointer_pos())
+}
+
+/// A gesture as it was settled at its press: where it began, and what it
+/// reached.
+///
+/// Both halves are recorded. The aim is what the gesture *is*, and the origin
+/// is how a later frame tells this gesture from the next one — egui's own
+/// `press_origin` is the pointer's rather than this widget's, so it moves when
+/// any button is pressed and is cleared when any is released.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Settled {
+    from: Pos2,
+    aim: Aim,
+}
+
+/// What a wheel does with this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Frame {
+    /// No gesture. Anything recorded belongs to one that has ended.
+    Idle,
+    /// A gesture already settled, now at this position.
+    Held(Settled, Pos2),
+    /// The first frame of a gesture: settle it from this origin, record the
+    /// answer, and work it at this position.
+    Press(Pos2, Pos2),
+}
+
+/// Which of those three this frame is, given what egui reported and what the
+/// widget recorded on an earlier frame of the same gesture.
+///
+/// The wheel's two controls overlap, so which of them a gesture belongs to is
+/// decided **once, at the press**, and held for the whole gesture. That is what
+/// lets a hue drag carry on across the middle, what stops a drag out of the
+/// centre being handed to the ring when it is let go over one, and — the reason
+/// holding it is not merely tidy — what stops the *shape itself* changing the
+/// answer. The triangle's apex follows the hue by default, so a press on the
+/// ring sets a hue that swings the apex round to meet the very point it was
+/// pressed at: re-asking [`Hub::contains`] on the next frame then reads that
+/// press as a press on the triangle, the hue freezes, and the saturation and
+/// value marker slams to the apex. That is the reported bug, in the 2 px band
+/// [`RING_GRIP`] exists to serve, and holding the aim is the whole of the cure.
+///
+/// Two more frames egui makes awkward, and both were the other half of it. A
+/// press is not yet a *drag* — egui waits for the pointer to travel — and a
+/// release is no longer one, so a reading that asked for a drag fell through to
+/// the pointer's own position on both, and handed a press on the ring to the
+/// field. Here the press frame settles the aim and the release frame is `Held`,
+/// because egui clears `press_origin` on the release and `held` is what is left.
+///
+/// A press and a release inside one frame is `Press` with the pointer's own
+/// position for the origin, which it is: there has been no frame in which to
+/// move.
+fn frame(reported: Reported, held: Option<Settled>) -> Frame {
+    let Some(at) = reported.at else {
+        return Frame::Idle;
+    };
+    match held {
+        // The same gesture, still. `press_origin` gone means released; equal
+        // means held down since. Anything else is a gesture this widget has not
+        // settled — a new press, or a record left behind by one that ended
+        // without a frame to clear it.
+        Some(settled)
+            if reported
+                .press_origin
+                .is_none_or(|from| from == settled.from) =>
+        {
+            Frame::Held(settled, at)
+        }
+        _ => Frame::Press(reported.press_origin.unwrap_or(at), at),
+    }
+}
+
+/// Which of a wheel's two controls this frame's gesture is working, and where.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WheelAim {
+    /// Nothing to do.
+    Idle,
+    /// The hue ring, at this position.
+    Ring(Pos2),
+    /// The saturation and value shape, at this position.
+    Centre(Pos2),
+}
+
+impl WheelAim {
+    /// Where the centre should follow the pointer, if it should at all.
+    fn centre(self) -> Option<Pos2> {
+        match self {
+            Self::Centre(pos) => Some(pos),
+            Self::Idle | Self::Ring(_) => None,
+        }
+    }
+}
+
+/// Settle a press against the two controls.
+///
+/// The one place the hub is consulted, which is what makes the answer a
+/// property of the press rather than of whatever the shape happens to be doing
+/// a frame later — see [`frame`].
+///
+/// The hub is asked **first** and the ring second: [`RING_GRIP`] lets the ring
+/// be grabbed from a little inside its own edge, and both centres reach into
+/// that band, so a ring tested first would take every press on a triangle's
+/// apex — the corner that *is* the hue.
+///
+/// And the ring has an outer edge as well as an inner one. The wheel's hit area
+/// is the square around it, so its four corners reach `outer × √2` with nothing
+/// drawn out there; a press in one used to set a hue.
+fn settle(centre: Pos2, inner: f32, outer: f32, hub: Hub, from: Pos2) -> Aim {
+    if hub.contains(from) {
+        return Aim::Centre;
+    }
+    let out = (from - centre).length();
+    if out > inner * RING_GRIP && out <= outer {
+        Aim::Ring
+    } else {
+        Aim::Nothing
+    }
+}
+
+/// [`frame`] and [`settle`], against what egui and the previous frame have to
+/// say.
+///
+/// The settled gesture is recorded on its press frame and cleared on the first
+/// frame this widget owns no gesture. A record can therefore outlive its gesture
+/// only where no such frame ran — switching picker mode mid-drag, since `wheel`
+/// is then not called at all — and [`frame`] compares the origin so that the
+/// next press settles itself rather than inheriting it.
+fn wheel_aim(
+    ui: &Ui,
+    id: egui::Id,
+    response: &Response,
+    centre: Pos2,
+    inner: f32,
+    outer: f32,
+    hub: Hub,
+) -> WheelAim {
+    let reported = Reported {
+        at: response.interact_pointer_pos(),
+        press_origin: ui.ctx().input(|i| i.pointer.press_origin()),
+    };
+    let held = ui.ctx().data_mut(|d| d.get_temp::<Settled>(id));
+    match frame(reported, held) {
+        Frame::Idle => {
+            ui.ctx().data_mut(|d| d.remove_temp::<Settled>(id));
+            WheelAim::Idle
+        }
+        Frame::Held(settled, at) => settled.aim.at(at),
+        Frame::Press(from, at) => {
+            let settled = Settled {
+                from,
+                aim: settle(centre, inner, outer, hub, from),
+            };
+            // Once per gesture rather than once per frame: the value cannot
+            // change within one, and `insert_temp` boxes what it is given.
+            ui.ctx().data_mut(|d| d.insert_temp(id, settled));
+            settled.aim.at(at)
+        }
+    }
 }
 
 fn wheel(
@@ -303,13 +605,32 @@ fn wheel(
     // field instead. Settling it at the press rather than per frame is also what
     // lets a drag begun on the ring carry on across the middle, which is how
     // both controls have always behaved once held.
-    let response = ui.interact(area, ui.id().with("wheel"), Sense::click_and_drag());
-    let at = response.interact_pointer_pos();
-    let on_ring = gesture_origin(ui, &response)
-        .is_some_and(|from| (from - centre).length() > inner * RING_GRIP);
+    let id = ui.id().with("wheel");
+    let response = ui.interact(area, id, Sense::click_and_drag());
+
+    // The centre as it stands *now*, which is the shape a press this frame
+    // landed on. With "Rotate with hue" on, the hue the ring is about to be
+    // given belongs to a triangle nobody has seen yet, and judging a press
+    // against that one would be judging it by where the shape is going. It is
+    // read only on a press frame — see `frame` — so the shape swinging round
+    // afterwards cannot take the gesture off the ring.
+    let aimed = wheel_aim(
+        ui,
+        id,
+        &response,
+        centre,
+        inner,
+        outer,
+        hub_of(
+            *shape,
+            centre,
+            inner,
+            wheel_base(*shape, *rotate, *angles, hsv.h),
+        ),
+    );
 
     // --- hue ring ---
-    if on_ring && let Some(pos) = at {
+    if let WheelAim::Ring(pos) = aimed {
         hsv.h = ring_hue(centre, pos);
         changed = true;
     }
@@ -321,20 +642,12 @@ fn wheel(
         .circle_stroke(ring_point(centre, inner, outer, hsv.h), 6.0, MARKER_STROKE);
 
     // --- saturation / value shape ---
-    let drag = if on_ring { None } else { at };
-    let base = (shape.neutral() + wheel_angle(*shape, *rotate, *angles, hsv.h)).to_radians();
-    match shape {
-        WheelShape::Square => {
-            // Largest square that fits inside the ring. Inscribed in the circle,
-            // so turning it cannot take it outside — the size is the same
-            // whatever the angle.
-            let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
-            changed |= sv_field(ui, centre, Vec2::splat(half), base, drag, hsv);
-        }
-        WheelShape::Triangle => {
-            changed |= sv_triangle(ui, centre, (inner - 3.0).max(1.0), base, drag, hsv);
-        }
-    }
+    //
+    // Rebuilt from the hue as it now is, so a triangle that follows the hue
+    // turns on the frame the ring is dragged rather than a frame behind the
+    // marker that turned it.
+    let base = wheel_base(*shape, *rotate, *angles, hsv.h);
+    changed |= hub_field(ui, hub_of(*shape, centre, inner, base), aimed.centre(), hsv);
 
     ui.add_space(8.0);
 
@@ -371,13 +684,13 @@ fn wheel(
     // and a square's a quarter: 45° is the coarsest step that has every
     // half-way pose of both shapes on it.
     //
-    // A slider rather than a drag on the shape itself. Both regions of the wheel
-    // are already spoken for: the ring steers hue, and the centre is the
-    // saturation and value field right out to the gaps between an inscribed
-    // shape and the ring, where `clamp_barycentric` deliberately slides along an
-    // edge rather than freezing. A rotate gesture could therefore only be a
-    // modifier or a third zone carved out of one of those, and neither is
-    // something anyone would find without being told.
+    // A slider rather than a drag on the shape itself. The two things drawn on
+    // the wheel are both spoken for — the ring steers hue and the shape sets
+    // saturation and value — so a rotate gesture could only be a modifier, or
+    // the gaps between the shape and the ring, which take no press at all now
+    // that `Hub::contains` decides. Neither is something anyone would find
+    // without being told, and the gaps least of all: nothing is drawn in them,
+    // and round a square they are four slivers.
     //
     // Drawn disabled rather than hidden while the hue *is* deciding it. The
     // setting still holds a value and the shape still has an angle — it is only
@@ -508,12 +821,37 @@ fn hue_ring(ui: &Ui, centre: Pos2, inner: f32, outer: f32) {
     ui.painter().add(Shape::mesh(mesh));
 }
 
-/// Saturation/value triangle inscribed in the ring, turned by `base` radians.
+/// What saturation and value a point in the triangle stands for — [`field_at`]
+/// for the other centre, and `None` where the three corners are not a triangle
+/// at all.
+///
+/// Clamped rather than refused, for the reason [`clamp_barycentric`] gives: a
+/// drag past an edge slides along it instead of freezing the picker. Whether a
+/// point is *in* the triangle is [`Hub::contains`]'s question and is asked of
+/// the press alone — these are two different questions and the clamp is not an
+/// answer to the first.
+fn triangle_at(hue_pt: Pos2, white_pt: Pos2, black_pt: Pos2, pos: Pos2) -> Option<(f32, f32)> {
+    // Barycentric coordinates give saturation and value directly.
+    let (a, b, c) = barycentric(pos, hue_pt, white_pt, black_pt);
+    if !a.is_finite() {
+        return None;
+    }
+    let (a, b, _) = clamp_barycentric(a, b, c);
+    let v = (a + b).clamp(0.0, 1.0);
+    let s = if v > 1e-4 {
+        (a / v).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some((s, v))
+}
+
+/// Saturation/value triangle, drawn at the three corners [`hub_of`] placed.
 ///
 /// The apex is the full hue, with white and black at the other two corners.
-/// `base` is where that apex points: the hue when the shape is following it,
-/// which is what the design shows, and otherwise the shape's neutral pose
-/// turned by the user's own angle.
+/// Where that apex points is the hue when the shape is following it, which is
+/// what the design shows, and otherwise the shape's neutral pose turned by the
+/// user's own angle.
 ///
 /// The choice is not cosmetic. Following the hue keeps the apex next to the
 /// marker that sets it, so the two controls read as one instrument — but it
@@ -523,35 +861,28 @@ fn hue_ring(ui: &Ui, centre: Pos2, inner: f32, outer: f32) {
 /// last picked stays where you left it, and picking the same tint across
 /// several hues becomes a matter of returning to the same place.
 ///
+/// The corners are passed in rather than built here, because the hit test needs
+/// exactly these three points — see [`Hub`].
+///
 /// `drag` is where the pointer is, if this frame's gesture belongs to the
 /// centre. The wheel decides that — see the interaction comment there — so
 /// there is no `interact` of its own to overlap the ring's.
 fn sv_triangle(
     ui: &mut Ui,
-    centre: Pos2,
-    radius: f32,
-    base: f32,
+    hue_pt: Pos2,
+    white_pt: Pos2,
+    black_pt: Pos2,
     drag: Option<Pos2>,
     hsv: &mut Hsv,
 ) -> bool {
     let mut changed = false;
-    let (hue_pt, white_pt, black_pt) = triangle_corners(centre, radius, base);
 
-    if let Some(pos) = drag {
-        // Barycentric coordinates give saturation and value directly.
-        let (a, b, c) = barycentric(pos, hue_pt, white_pt, black_pt);
-        if a.is_finite() {
-            let (a, b, c) = clamp_barycentric(a, b, c);
-            let v = a + b;
-            hsv.v = v.clamp(0.0, 1.0);
-            hsv.s = if v > 1e-4 {
-                (a / v).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let _ = c;
-            changed = true;
-        }
+    if let Some(pos) = drag
+        && let Some((s, v)) = triangle_at(hue_pt, white_pt, black_pt, pos)
+    {
+        hsv.s = s;
+        hsv.v = v;
+        changed = true;
     }
 
     let f = feather(ui);
@@ -611,10 +942,10 @@ fn sv_triangle(
 /// The triangle's three corners, in the order the rest of this file reads them:
 /// full hue, white, black.
 ///
-/// Split out from [`sv_triangle`] because it is the whole of what the angle
-/// changes, and everything else about the triangle — the hit test, the mesh,
-/// the marker — is derived from these three points. Testing it without a `Ui`
-/// is therefore testing the feature.
+/// Its own function because it is the whole of what the angle changes, and
+/// everything else about the triangle — the hit test, the mesh, the marker — is
+/// derived from these three points. Testing it without a `Ui` is therefore
+/// testing the feature. [`Hub`] is what carries them from here to both.
 fn triangle_corners(centre: Pos2, radius: f32, base: f32) -> (Pos2, Pos2, Pos2) {
     let corner = |k: f32| {
         let a = base + k * std::f32::consts::TAU / 3.0;
@@ -714,8 +1045,20 @@ fn square(ui: &mut Ui, _p: &Palette, hsv: &mut Hsv) -> bool {
     if (response.dragged() || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let t = ((pos.x - bar.left()) / bar.width().max(1.0)).clamp(0.0, 1.0);
-        hsv.h = t * 360.0;
+        // A hair short of a whole turn at the right-hand end, and then through
+        // `wrap_hue` like the ring's.
+        //
+        // Both halves are needed and neither is arbitrary. `t` reaches exactly
+        // 1.0 — it is clamped there, and the pointer can be dragged past the
+        // edge — so `t * 360.0` is exactly 360, the one value outside the range
+        // `Hsv` documents; `to_color` wraps again and paints the red it should,
+        // but the field is read by more than that. Storing the *wrap* of it is
+        // not enough on its own: a whole turn is the same hue as none, so the
+        // right-hand end would store 0 and the knob, which is drawn from the
+        // hue, would jump to the left while the pointer was at the right. One
+        // step short is the same red, in range, and under the hand.
+        let t = ((pos.x - bar.left()) / bar.width().max(1.0)).clamp(0.0, 1.0 - f32::EPSILON);
+        hsv.h = umber_core::color::wrap_hue(t * 360.0);
         changed = true;
     }
 
@@ -930,22 +1273,25 @@ fn harmony_wheel(ui: &mut Ui, p: &Palette, harmony: &mut Harmony, hsv: &mut Hsv)
     // the reason the Wheel mode's is: the centre's rect covers the ring at the
     // four diagonals, so two overlapping `interact` rects would send a hue drag
     // begun there to the saturation and value field.
-    let response = ui.interact(area, ui.id().with("harmony-wheel"), Sense::click_and_drag());
-    let at = response.interact_pointer_pos();
-    let on_ring = gesture_origin(ui, &response)
-        .is_some_and(|from| (from - centre).length() > inner * RING_GRIP);
+    let id = ui.id().with("harmony-wheel");
+    let response = ui.interact(area, id, Sense::click_and_drag());
 
-    if on_ring && let Some(pos) = at {
+    // The saturation and value field, level and inscribed in the ring — the
+    // Wheel mode's square at its neutral, through the one function that places
+    // it, so the two modes cannot end up with differently sized centres. Built
+    // before the ring is read because the press is judged against it, and it
+    // does not move when the hue does.
+    let hub = hub_of(WheelShape::Square, centre, inner, 0.0);
+    let aimed = wheel_aim(ui, id, &response, centre, inner, outer, hub);
+
+    if let WheelAim::Ring(pos) = aimed {
         hsv.h = ring_hue(centre, pos);
         changed = true;
     }
 
     hue_ring(ui, centre, inner, outer);
 
-    // The saturation and value field, level and inscribed in the ring.
-    let half = (inner * std::f32::consts::FRAC_1_SQRT_2 - 2.0).max(1.0);
-    let drag = if on_ring { None } else { at };
-    changed |= sv_field(ui, centre, Vec2::splat(half), 0.0, drag, hsv);
+    changed |= hub_field(ui, hub, aimed.centre(), hsv);
 
     ui.add_space(8.0);
 
@@ -1184,8 +1530,150 @@ mod tests {
         angles: WheelAngles,
         hue: f32,
     ) -> (Pos2, Pos2, Pos2) {
-        let base = (shape.neutral() + wheel_angle(shape, rotate, angles, hue)).to_radians();
-        triangle_corners(CENTRE, RADIUS, base)
+        triangle_corners(CENTRE, RADIUS, wheel_base(shape, rotate, angles, hue))
+    }
+
+    /// The ring the widest wheel the picker will draw actually has.
+    ///
+    /// `wheel` clamps its side to 176, halves it for `outer`, and takes
+    /// `outer - RING_THICKNESS` for `inner` — so these are the real numbers and
+    /// not a convenient pair. That matters: every margin checked below is
+    /// checked at a size the picker can be at, and the margins are narrower
+    /// here than at a made-up radius.
+    const OUTER: f32 = 176.0 * 0.5;
+    const INNER: f32 = OUTER - RING_THICKNESS;
+
+    /// The centre as [`wheel`] builds it: a shape at an angle, through the one
+    /// function that places it.
+    fn hub_at(shape: WheelShape, degrees: f32) -> Hub {
+        let mut angles = WheelAngles::default();
+        angles.set(shape, degrees);
+        hub_of(shape, CENTRE, INNER, wheel_base(shape, false, angles, 0.0))
+    }
+
+    /// A point on the hue ring, at a given fraction across the band.
+    ///
+    /// Zero is the ring's inner edge, which is the *closest in* a press can be
+    /// and still be unambiguously the ring's: every shape `hub_of` builds is
+    /// inscribed inside it. Nearer the middle than that is the grip band, which
+    /// both shapes' corners reach into deliberately.
+    fn on_the_ring(degrees: f32, across: f32) -> Pos2 {
+        let a = degrees.to_radians();
+        CENTRE + vec2(a.cos(), a.sin()) * (INNER + (OUTER - INNER) * across)
+    }
+
+    /// The extreme points of a centre — the three corners of a triangle, the
+    /// four of a field. These are what reach past [`RING_GRIP`], so they are
+    /// what says the hub has to be asked before the ring.
+    fn hub_corners(hub: Hub) -> Vec<Pos2> {
+        match hub {
+            Hub::Triangle(a, b, c) => vec![a, b, c],
+            Hub::Field(centre, half, angle) => {
+                let (across, down) = field_axes(angle);
+                [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
+                    .iter()
+                    .map(|(u, w)| centre + across * (half.x * u) + down * (half.y * w))
+                    .collect()
+            }
+        }
+    }
+
+    /// [`wheel`]'s own loop with the `Ui` and the painting taken out: the hub
+    /// rebuilt from the hue every frame exactly as the real one rebuilds it,
+    /// the frame settled, then whichever of the picker's own readers the aim
+    /// names.
+    ///
+    /// Rebuilding the hub per frame is the point rather than an accident. A
+    /// triangle following the hue *moves while the ring is being dragged*, and
+    /// a test that held one still could not see the gesture being taken off the
+    /// ring by the shape swinging round to meet the press. Nothing here is a
+    /// copy of the arithmetic: `hub_of`, `wheel_base`, `frame`, `settle`,
+    /// `ring_hue`, `triangle_at` and `field_at` are the functions the running
+    /// picker calls.
+    struct Wheel {
+        shape: WheelShape,
+        rotate: bool,
+        angles: WheelAngles,
+        held: Option<Settled>,
+        hsv: Hsv,
+    }
+
+    impl Wheel {
+        fn new(shape: WheelShape, rotate: bool, hsv: Hsv) -> Self {
+            Self {
+                shape,
+                rotate,
+                angles: WheelAngles::default(),
+                held: None,
+                hsv,
+            }
+        }
+
+        fn hub(&self) -> Hub {
+            hub_of(
+                self.shape,
+                CENTRE,
+                INNER,
+                wheel_base(self.shape, self.rotate, self.angles, self.hsv.h),
+            )
+        }
+
+        fn step(&mut self, reported: Reported) -> WheelAim {
+            let aimed = match frame(reported, self.held) {
+                Frame::Idle => {
+                    self.held = None;
+                    WheelAim::Idle
+                }
+                Frame::Held(settled, at) => settled.aim.at(at),
+                Frame::Press(from, at) => {
+                    let settled = Settled {
+                        from,
+                        aim: settle(CENTRE, INNER, OUTER, self.hub(), from),
+                    };
+                    self.held = Some(settled);
+                    settled.aim.at(at)
+                }
+            };
+            match aimed {
+                WheelAim::Idle => {}
+                WheelAim::Ring(pos) => self.hsv.h = ring_hue(CENTRE, pos),
+                // Rebuilt after the hue, as `wheel` does.
+                WheelAim::Centre(pos) => match self.hub() {
+                    Hub::Triangle(a, b, c) => {
+                        if let Some((s, v)) = triangle_at(a, b, c, pos) {
+                            self.hsv.s = s;
+                            self.hsv.v = v;
+                        }
+                    }
+                    Hub::Field(centre, half, angle) => {
+                        (self.hsv.s, self.hsv.v) = field_at(centre, half, angle, pos);
+                    }
+                },
+            }
+            aimed
+        }
+
+        fn press(&mut self, at: Pos2) -> WheelAim {
+            self.step(Reported {
+                at: Some(at),
+                press_origin: Some(at),
+            })
+        }
+
+        fn drag(&mut self, from: Pos2, at: Pos2) -> WheelAim {
+            self.step(Reported {
+                at: Some(at),
+                press_origin: Some(from),
+            })
+        }
+
+        /// The release, on which egui has already cleared its own origin.
+        fn release(&mut self, at: Pos2) -> WheelAim {
+            self.step(Reported {
+                at: Some(at),
+                press_origin: None,
+            })
+        }
     }
 
     fn corners(rotate: bool, hue: f32) -> (Pos2, Pos2, Pos2) {
@@ -1348,6 +1836,376 @@ mod tests {
         );
         // And the centre itself, where there is no direction at all.
         assert!(ring_hue(CENTRE, CENTRE).is_finite());
+    }
+
+    /// The bug this file was opened for: turning the hue ring moved the
+    /// saturation and value marker, towards whatever direction the ring had been
+    /// grabbed from.
+    ///
+    /// A whole turn, a degree at a time, from a press on the ring — the press
+    /// frame, every frame of the drag and the release are all one gesture and
+    /// all of them are in here. Saturation and value have to come out **bit for
+    /// bit** what they went in as: this is arithmetic that either runs or does
+    /// not, so anything short of exact would mean the field had taken a frame.
+    ///
+    /// Driven with "Rotate with hue" both off and **on**, which is the default
+    /// and the case that matters: with it on the triangle's apex chases the hue
+    /// the ring is setting, so a wheel that re-settled its aim per frame reads
+    /// the press as a press on the triangle the moment the apex reaches it.
+    ///
+    /// Pressed at several headings and at the ring's *inner* edge, which is
+    /// both the press a hit region one size too large takes — the box round a
+    /// square turned 37° reaches past the ring at its four diagonals — and the
+    /// press the apex can swing round to.
+    #[test]
+    fn turning_the_hue_through_a_whole_circle_leaves_the_saturation_and_value_alone() {
+        for shape in WheelShape::ALL {
+            for rotate in [false, true] {
+                for pressed_at in [0.0_f32, 45.0, 137.0, 250.0] {
+                    let start = Hsv::new(0.0, 0.375, 0.625);
+                    let mut wheel = Wheel::new(shape, rotate, start);
+                    let press = on_the_ring(pressed_at, 0.0);
+                    let mut hues = Vec::new();
+
+                    let check = |aimed: WheelAim, wheel: &Wheel, what: &str| {
+                        assert!(
+                            matches!(aimed, WheelAim::Ring(_)),
+                            "{shape:?} rotate={rotate} pressed at {pressed_at}°: \
+                             {what} left the ring as {aimed:?}"
+                        );
+                        assert_eq!(
+                            (wheel.hsv.s, wheel.hsv.v),
+                            (start.s, start.v),
+                            "{shape:?} rotate={rotate} pressed at {pressed_at}°: \
+                             {what} moved the marker"
+                        );
+                    };
+
+                    let aimed = wheel.press(press);
+                    check(aimed, &wheel, "the press");
+                    for step in 0..=360 {
+                        let aimed = wheel.drag(press, on_the_ring(step as f32, 0.5));
+                        check(aimed, &wheel, "a drag frame");
+                        assert!(
+                            (0.0..360.0).contains(&wheel.hsv.h),
+                            "{} is not a hue",
+                            wheel.hsv.h
+                        );
+                        hues.push(wheel.hsv.h.round() as i32);
+                    }
+                    // A drag begun on the ring carries on across the middle,
+                    // and is still the ring's when it is let go there.
+                    let aimed = wheel.drag(press, CENTRE);
+                    check(aimed, &wheel, "crossing the middle");
+                    let aimed = wheel.release(CENTRE);
+                    check(aimed, &wheel, "the release");
+
+                    // And the hue went where it was dragged: a sweep that
+                    // reached the whole circle, rather than a control that
+                    // holds still and passes the assertions above for free.
+                    hues.sort_unstable();
+                    hues.dedup();
+                    assert!(hues.len() > 300, "the sweep reached {} hues", hues.len());
+                }
+            }
+        }
+    }
+
+    /// The narrow case defect-hunting found, on its own and stated in full.
+    ///
+    /// A press in the band between [`RING_GRIP`]'s forgiving edge and the ring
+    /// itself is the ring's. With "Rotate with hue" on, that press sets a hue,
+    /// and the hue points the apex *at the press*: the pressed point is then
+    /// inside the triangle. A wheel that asked again would hand the rest of the
+    /// gesture to the saturation and value field, the hue would freeze at the
+    /// angle of the press, and the marker would slam to the apex — which is the
+    /// reported bug, reached by clicking a 2 px annulus.
+    #[test]
+    fn a_hue_the_press_itself_set_cannot_turn_the_shape_onto_that_press() {
+        let start = Hsv::new(0.0, 0.4, 0.6);
+        // Strictly inside the grip's own edge and no further out than the
+        // triangle's circumradius: that band, `(0.92 × inner, inner − 3]`, is
+        // the whole of where the trap can be sprung.
+        for across in [0.005_f32, 0.015, 0.03] {
+            // Just inside the ring's inner edge — inside the triangle's own
+            // circumradius, which is what makes the case reachable at all.
+            let at = |degrees: f32| {
+                let a = degrees.to_radians();
+                CENTRE + vec2(a.cos(), a.sin()) * (INNER * RING_GRIP + across * INNER)
+            };
+            for degrees in [7.0_f32, 100.0, 250.0] {
+                let press = at(degrees);
+                assert!(
+                    (press - CENTRE).length() > INNER * RING_GRIP,
+                    "that is not the grip band"
+                );
+                let mut wheel = Wheel::new(WheelShape::Triangle, true, start);
+                assert!(matches!(wheel.press(press), WheelAim::Ring(_)));
+                // The apex is now at `degrees`, so the press is inside the
+                // triangle — which is exactly the trap.
+                assert!(
+                    wheel.hub().contains(press),
+                    "at {degrees}° the apex did not reach the press, so this \
+                     proves nothing"
+                );
+                for step in 1..=8 {
+                    let aimed = wheel.drag(press, at(degrees + step as f32 * 5.0));
+                    assert!(
+                        matches!(aimed, WheelAim::Ring(_)),
+                        "{degrees}°, frame {step}: the triangle took the drag"
+                    );
+                }
+                assert_eq!((wheel.hsv.s, wheel.hsv.v), (start.s, start.v));
+                let moved = (wheel.hsv.h - degrees).abs();
+                assert!(moved > 30.0, "the hue froze at {}", wheel.hsv.h);
+            }
+        }
+    }
+
+    /// The press has to land on the shape that is *drawn*, not on the square
+    /// around the ring it is inscribed in — the transform tool's rule, that a
+    /// control may never be drawn where the hit test disagrees with it.
+    ///
+    /// Driven at 37° and 214° as well as the level poses, because both centres
+    /// can be turned and an axis-aligned bounding box passes at 0° and 90°
+    /// whatever is behind it.
+    #[test]
+    fn only_the_shape_that_is_drawn_takes_a_press() {
+        for shape in WheelShape::ALL {
+            for degrees in [0.0_f32, 37.0, 90.0, 214.0] {
+                let hub = hub_at(shape, degrees);
+                assert!(hub.contains(CENTRE), "{shape:?} at {degrees}° is empty");
+                // Nowhere on the ring is inside the centre, at any heading and
+                // anywhere across the band. Stopping a hair short of the outer
+                // edge rather than landing on it: `length()` of a point placed
+                // by `cos`/`sin` at exactly that radius rounds either way, and
+                // a test that flickers on the boundary tests the boundary
+                // rather than the rule. The rule at the edge is the sweep
+                // below.
+                for across in [0.0_f32, 0.5, 0.98] {
+                    for step in 0..72 {
+                        let at = on_the_ring(step as f32 * 5.0, across);
+                        assert!(
+                            !hub.contains(at),
+                            "{shape:?} at {degrees}° reaches the ring at {}°, {across} across",
+                            step * 5
+                        );
+                        assert_eq!(
+                            settle(CENTRE, INNER, OUTER, hub, at),
+                            Aim::Ring,
+                            "{shape:?} at {degrees}°: a press on the ring at {}° went elsewhere",
+                            step * 5
+                        );
+                    }
+                }
+                // Past the ring's *outer* edge nothing is drawn either, and the
+                // wheel's hit area is the square around it — so its four
+                // corners reach `outer × √2` and used to set a hue.
+                for step in 0..72 {
+                    let out = on_the_ring(step as f32 * 5.0, 1.0);
+                    let past = CENTRE + (out - CENTRE) * 1.02;
+                    assert_eq!(
+                        settle(CENTRE, INNER, OUTER, hub, past),
+                        Aim::Nothing,
+                        "{shape:?} at {degrees}°: outside the ring at {}° set a hue",
+                        step * 5
+                    );
+                }
+                // And the shape's own corners are its own, which is the whole
+                // reason the hub is asked before the ring: they reach past
+                // `RING_GRIP`'s forgiving inner edge.
+                for corner in hub_corners(hub) {
+                    let just_inside = CENTRE + (corner - CENTRE) * 0.98;
+                    assert!(
+                        (just_inside - CENTRE).length() > INNER * RING_GRIP,
+                        "{shape:?} at {degrees}°: this corner does not reach the grip, so \
+                         the ordering is untested"
+                    );
+                    assert_eq!(
+                        settle(CENTRE, INNER, OUTER, hub, just_inside),
+                        Aim::Centre,
+                        "{shape:?} at {degrees}°: the ring took a press on a corner"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A drag that began inside the centre keeps it however far out it wanders,
+    /// and goes on sliding along the edge. Containment is the *press*'s
+    /// question; asking it again every frame would freeze the marker where the
+    /// pointer left the shape, and the clamp exists precisely so it does not.
+    #[test]
+    fn a_drag_out_of_the_centre_still_belongs_to_the_centre() {
+        for shape in WheelShape::ALL {
+            let mut wheel = Wheel::new(shape, true, Hsv::new(123.0, 0.5, 0.5));
+            assert!(matches!(wheel.press(CENTRE), WheelAim::Centre(_)));
+            let mut seen = Vec::new();
+            for step in 0..36 {
+                let a = (step as f32 * 10.0).to_radians();
+                let at = CENTRE + vec2(a.cos(), a.sin()) * INNER * 2.0;
+                let aimed = wheel.drag(CENTRE, at);
+                assert!(
+                    matches!(aimed, WheelAim::Centre(_)),
+                    "{shape:?} lost the drag at {}° as {aimed:?}",
+                    step * 10
+                );
+                assert_eq!(wheel.hsv.h, 123.0, "the hue is not the centre's to move");
+                seen.push((wheel.hsv.s, wheel.hsv.v));
+            }
+            // Let go out on the ring: still the centre's, which is the same bug
+            // the other way round and what the recorded aim exists for.
+            let aimed = wheel.release(on_the_ring(210.0, 0.5));
+            assert!(matches!(aimed, WheelAim::Centre(_)), "{aimed:?}");
+            assert_eq!(wheel.hsv.h, 123.0, "the release moved the hue");
+            // It slid rather than froze: a drag right round the outside of the
+            // shape reaches distinct places, not one.
+            seen.dedup();
+            assert!(seen.len() > 4, "{shape:?} froze: {seen:?}");
+        }
+    }
+
+    /// A press in a gap between the shape and the ring moves nothing at all.
+    /// Nothing is drawn there, and a press that quietly snapped the marker to
+    /// the nearest edge is the control that lies.
+    #[test]
+    fn a_press_between_the_shape_and_the_ring_moves_no_colour() {
+        // Straight down from the centre of an apex-up triangle is the middle of
+        // the opposite edge, which is the widest of the three gaps.
+        let hub = hub_at(WheelShape::Triangle, 0.0);
+        let from = CENTRE + vec2(0.0, INNER * 0.7);
+        assert!(!hub.contains(from), "that is not a gap");
+        assert!(
+            (from - CENTRE).length() < INNER * RING_GRIP,
+            "nor is it ring"
+        );
+        assert_eq!(settle(CENTRE, INNER, OUTER, hub, from), Aim::Nothing);
+
+        // Held still rather than following the hue, so the wheel's own shape is
+        // the one `hub_at` just measured — with the hue at 200° and the apex
+        // chasing it, this point would be *inside* the triangle and rightly
+        // taken by it.
+        let before = Hsv::new(200.0, 0.4, 0.6);
+        let mut wheel = Wheel::new(WheelShape::Triangle, false, before);
+        assert_eq!(wheel.press(from), WheelAim::Idle);
+        // And a drag begun there stays nothing, wherever it goes.
+        assert_eq!(wheel.drag(from, CENTRE), WheelAim::Idle);
+        assert_eq!(wheel.drag(from, on_the_ring(90.0, 0.5)), WheelAim::Idle);
+        assert_eq!(wheel.release(CENTRE), WheelAim::Idle);
+        assert_eq!(
+            (wheel.hsv.h, wheel.hsv.s, wheel.hsv.v),
+            (before.h, before.s, before.v)
+        );
+    }
+
+    /// A gesture is settled at its press and not at its release.
+    ///
+    /// egui reports a *drag* only once the pointer has travelled far enough to
+    /// be one, which a press is not yet and a release is no longer — and it
+    /// clears the press origin on the very frame a click is reported. Reading
+    /// the pointer's own position on those two frames is what handed a press on
+    /// the hue ring to the saturation and value field.
+    #[test]
+    fn a_gesture_is_settled_at_its_press_and_not_at_its_release() {
+        let press = pos2(10.0, 10.0);
+        let now = pos2(80.0, 90.0);
+        let ring = Settled {
+            from: press,
+            aim: Aim::Ring,
+        };
+
+        // The press: nothing recorded yet, so it is settled here.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: Some(press),
+                    press_origin: Some(press),
+                },
+                None
+            ),
+            Frame::Press(press, press)
+        );
+        // Held down since, whether or not egui calls it a drag yet: the aim
+        // stands and only the position moves.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: Some(now),
+                    press_origin: Some(press),
+                },
+                Some(ring)
+            ),
+            Frame::Held(ring, now)
+        );
+        // Released: egui has cleared its own origin, and what was recorded is
+        // all that is left.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: Some(now),
+                    press_origin: None,
+                },
+                Some(ring)
+            ),
+            Frame::Held(ring, now)
+        );
+        // Pressed and released inside one frame — a click too fast to be seen
+        // twice. Nothing recorded, and the pointer has had no frame in which to
+        // move, so its own position is the origin.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: Some(now),
+                    press_origin: None,
+                },
+                None
+            ),
+            Frame::Press(now, now)
+        );
+        // A *different* origin is a different gesture, so it settles itself
+        // rather than inheriting a record left behind by one that ended with no
+        // frame to clear it — switching picker mode mid-drag is how that
+        // happens, since the wheel is then not drawn at all.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: Some(now),
+                    press_origin: Some(now),
+                },
+                Some(ring)
+            ),
+            Frame::Press(now, now)
+        );
+        // No gesture on this widget: a pointer merely passing over the wheel,
+        // or one pressed on something else. The record goes.
+        assert_eq!(
+            frame(
+                Reported {
+                    at: None,
+                    press_origin: Some(press),
+                },
+                Some(ring)
+            ),
+            Frame::Idle
+        );
+        assert_eq!(frame(Reported::default(), None), Frame::Idle);
+    }
+
+    /// The release frame of a drag out of the centre must not be handed to the
+    /// ring. This is the same bug the other way round, and it is what the
+    /// recorded origin exists for: without it the release falls back to the
+    /// pointer, which by then is out on the ring.
+    #[test]
+    fn a_drag_released_over_the_ring_does_not_move_the_hue() {
+        let mut wheel = Wheel::new(WheelShape::Triangle, true, Hsv::new(30.0, 0.5, 0.5));
+        assert!(matches!(wheel.press(CENTRE), WheelAim::Centre(_)));
+        let release = on_the_ring(210.0, 0.5);
+        let aimed = wheel.release(release);
+        assert!(
+            matches!(aimed, WheelAim::Centre(_)),
+            "the release was read as a press on the ring: {aimed:?}"
+        );
+        assert_eq!(wheel.hsv.h, 30.0);
     }
 
     #[test]
