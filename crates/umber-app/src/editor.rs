@@ -1636,6 +1636,75 @@ pub fn over_egui_area(editor: &Editor, ctx: &egui::Context, screen: Vec2) -> boo
 mod tests {
     use super::*;
 
+    /// The one place a paper name becomes a tile, and every state it can be in.
+    ///
+    /// The failure that matters is the last one: a name that resolves to
+    /// nothing must paint **flat**, not fall back to a shipped tile. Grain
+    /// multiplies coverage, so a substituted paper is a stroke weaker than its
+    /// own opacity through pits its author never drew — which is exactly what
+    /// the Clip Studio importer used to produce, at 78% of the opacity it was
+    /// set to.
+    #[test]
+    fn a_paper_name_resolves_to_the_users_tile_then_umbers_then_to_nothing_at_all() {
+        let mut ed = Editor::default();
+
+        // No name: whichever of the shipped three the brush's own enum says,
+        // which is what every brush written before papers had names does.
+        ed.brush.grain_pattern = umber_core::GrainPattern::Grit;
+        let shipped = ed.paper_tile().expect("a shipped tile");
+        assert!(Arc::ptr_eq(
+            &shipped,
+            umber_core::tip::pattern("grit").expect("shipped")
+        ));
+
+        // A name Umber ships, which is how a preset can pin one whatever the
+        // enum happens to hold.
+        ed.set_paper(Some("canvas".to_owned()));
+        assert!(Arc::ptr_eq(
+            &ed.paper_tile().expect("a shipped tile"),
+            umber_core::tip::pattern("canvas").expect("shipped")
+        ));
+        assert_eq!(
+            ed.brush.grain_pattern,
+            umber_core::GrainPattern::Grit,
+            "the name overrides the enum rather than rewriting it"
+        );
+
+        // The user's library first, so a tile of theirs taking a shipped name
+        // wins — `apply_preset`'s order for the tip, and the browser says which
+        // is which rather than hiding one.
+        let mine = Arc::new(TipMask::new(2, 2, vec![7; 4]).expect("tile"));
+        ed.papers.insert("canvas".to_owned(), Arc::clone(&mine));
+        assert!(Arc::ptr_eq(&ed.paper_tile().expect("mine"), &mine));
+
+        // And a name behind nothing at all — a library copied without its
+        // `papers/` directory.
+        ed.set_paper(Some("gone".to_owned()));
+        assert!(
+            ed.paper_tile().is_none(),
+            "an unresolvable paper must paint flat, not through a stranger's tile"
+        );
+    }
+
+    /// Selecting a brush carries its paper, and carries the *absence* of one.
+    /// A name left standing from the previous brush would be a paper on a brush
+    /// whose author never asked for one.
+    #[test]
+    fn selecting_a_brush_takes_its_paper_and_drops_the_last_ones() {
+        let mut ed = Editor::default();
+        let papered = umber_core::BrushPreset {
+            paper: Some("linen".to_owned()),
+            ..umber_core::BrushPreset::fresh("Papered")
+        };
+        let plain = umber_core::BrushPreset::fresh("Plain");
+        ed.presets = vec![papered, plain];
+
+        ed.apply_preset(0);
+        assert_eq!(ed.paper_name.as_deref(), Some("linen"));
+        ed.apply_preset(1);
+        assert!(ed.paper_name.is_none());
+    }
+
     /// **Every canvas overlay has to be in `canvas_overlay_owns_pointer`**, and
     /// until this there was nothing that would notice one falling out of the
     /// chain. All three kinds are checked together — the scrollbars, the
