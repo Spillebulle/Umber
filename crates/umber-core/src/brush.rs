@@ -398,21 +398,29 @@ impl Brush {
     /// and it is not a missing feature — a dab deposits
     /// `lerp(palette, picked-up, smudge)`, so **`1 - smudge` already *is* a
     /// paint-deposit rate**. What a two-knob application says that one number
-    /// cannot is the pair's *magnitude*; what decides the colour is their
-    /// *ratio*, and that is what carries across exactly.
+    /// cannot is the pair's *magnitude*: how faintly the dab lands at all,
+    /// rather than what colour it is.
     ///
-    /// So the mix is the pickup's share of the two, `p / (p + d)`. Reading the
-    /// pickup alone — which is what a reader does when it has nowhere to put
-    /// the other number — is wrong in the direction that shows: a brush whose
-    /// author had it laying down as much paint as it lifts arrives as a pure
-    /// blender that deposits no colour however hard it is leant on, which is
-    /// indistinguishable from an ink that does not work.
+    /// The mix is the pickup's share of the two, `p / (p + d)`. **That is a
+    /// heuristic and not Krita's arithmetic**, and the distinction is worth
+    /// keeping: `KisColorSmudgeStrategyBase` composites the paint over the
+    /// smudged dab at `ColorRate` **squared**, which this expression is nowhere
+    /// in. What it is instead is monotone in both rates, scale-free, and exact
+    /// at both ends — a deposit of zero is a pure blender and a pickup of zero
+    /// an ordinary brush — which is as much as one number can promise about
+    /// two.
     ///
-    /// Exact at both ends (a deposit of zero is a pure blender, a pickup of
-    /// zero an ordinary brush) and scale-free, so a pair stated out of ten and
-    /// the same pair out of one give the same brush. Two zeroes mean a dab that
-    /// puts nothing anywhere, which is not a state to carry into a mix: it
-    /// answers `0.0`, the ordinary brush, rather than a division by zero.
+    /// Reproducing the composite faithfully is the obvious alternative and is
+    /// worse *here*, for a reason that is about the file rather than the maths:
+    /// a colour rate is usually stated as a pressure curve, and the recorded
+    /// value is its height at full pressure. Taking the over-composite at that
+    /// height answers "no pickup at all" for every brush whose curve happens to
+    /// reach the top, which is the value at one end of the stroke rather than
+    /// the constant Umber needs for the whole of it.
+    ///
+    /// Two zeroes mean a dab that puts nothing anywhere, which is not a state
+    /// to carry into a mix: it answers `0.0`, the ordinary brush, rather than a
+    /// division by zero.
     pub fn smudge_from_rates(pickup: f32, deposit: f32) -> f32 {
         let pickup = if pickup.is_finite() {
             pickup.max(0.0)
