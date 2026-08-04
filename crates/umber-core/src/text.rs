@@ -196,6 +196,16 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
     if block.text.is_empty() {
         return Err(TextError::Empty);
     }
+    // **Refused before any of it is used, rather than clamped.** A NaN survives
+    // `f32::clamp` — the comparisons are all false, so it comes back out
+    // unchanged — and from there it reaches `as usize`, which saturates to
+    // zero, and the rasteriser's own coordinates, where it is a silent
+    // nothing rather than an error. The rails cannot produce one, but a
+    // hand-edited figure or a later caller can, and "the Place button did
+    // nothing and said nothing" is the worst shape this takes.
+    if !block.size.is_finite() || !block.line_spacing.is_finite() || !block.tracking.is_finite() {
+        return Err(TextError::Unreadable);
+    }
     let font = data.font().ok_or(TextError::Unreadable)?;
     // Empty variations is the exact identity and the fast path: a static face,
     // and a variable font's own default instance, both take `Location::default`
@@ -798,6 +808,65 @@ mod tests {
             b * 2 > a * 9 / 10 && b * 2 < a * 11 / 10,
             "{b} is not half of {a}"
         );
+    }
+
+    /// A number that is not a number is refused rather than being clamped into
+    /// one. `f32::clamp` hands a NaN straight back — every comparison in it is
+    /// false — and what it reaches after that is `as usize`, which saturates to
+    /// zero, and the rasteriser's own coordinates, where nothing is drawn and
+    /// nothing is said.
+    #[test]
+    fn a_size_that_is_not_a_number_is_refused_rather_than_drawn_as_nothing() {
+        let lib = library();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut b = block("Umber");
+            b.size = bad;
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+            let mut b = block("Umber");
+            b.line_spacing = bad;
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+            let mut b = block("Umber");
+            b.tracking = bad;
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+        }
+    }
+
+    /// The sizes the rails cannot reach still have to be safe, because a
+    /// preferences file and a later caller both can. A size below the floor is
+    /// clamped up rather than dividing by zero, and a wildly negative tracking
+    /// closes a line up to nothing rather than making a negative width.
+    #[test]
+    fn a_size_or_a_tracking_off_the_end_of_its_rail_still_sets_something() {
+        let lib = library();
+        for (what, mut b) in [
+            ("a size of zero", {
+                let mut b = block("Umber");
+                b.size = 0.0;
+                b
+            }),
+            ("a negative size", {
+                let mut b = block("Umber");
+                b.size = -50.0;
+                b
+            }),
+            ("tracking far past the rail", {
+                let mut b = block("Umber");
+                b.tracking = -10_000.0;
+                b
+            }),
+            ("no line spacing at all", {
+                let mut b = block("Umber\nUmber");
+                b.line_spacing = 0.0;
+                b
+            }),
+        ] {
+            b.text = b.text.clone();
+            let out = set_with(&lib, "Regular", &b);
+            assert!(
+                matches!(out, Ok(_) | Err(TextError::NoInk)),
+                "{what}: {out:?}"
+            );
+        }
     }
 
     /// Refused with the figure rather than allocating something no canvas could
