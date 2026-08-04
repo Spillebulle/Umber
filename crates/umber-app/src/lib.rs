@@ -43,6 +43,7 @@ mod session;
 mod settings;
 mod shortcuts;
 mod splash;
+mod swapchain;
 mod sysclip;
 mod syscursor;
 mod tabs;

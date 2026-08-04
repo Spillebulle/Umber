@@ -324,6 +324,14 @@ impl Reporter<'_> {
         // The same arms `app::render` takes, minus the logging: a box that
         // misses one frame is redrawn by the next event and nothing is lost in
         // the meantime, so anything but a usable texture simply skips.
+        //
+        // `Suboptimal` deliberately reconfigures nothing at all, where the
+        // canvas defers it to the next frame — see `swapchain`. The two agree
+        // on the rule that matters, that a surface is never configured while a
+        // texture from it is alive; this window has no `Resized` burst to keep
+        // up with and one frame drawn through a stale swapchain is a box
+        // slightly the wrong size, so it carries no state between frames to
+        // get that wrong. `Resized` reconfigures, and that is enough.
         let acquired = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
