@@ -83,13 +83,26 @@ const HEADER: &str = "Umber theme";
 
 /// The most themes one library directory may hold.
 ///
-/// The directory is read whole when the pane is first opened, so this is what
-/// stops a folder somebody pointed at a colour-scheme dump costing a second.
-/// Far past what anybody makes by hand.
+/// It bounds the *parses*, not the listing — [`ThemeLibrary::load_from`] still
+/// lists and sorts every path before the cap applies, because every file it
+/// finds owns its name whether or not it was read. That is the expensive half
+/// only for a directory somebody pointed at something absurd; what this stops
+/// is reading and rasterising a card for each. Far past what anybody makes by
+/// hand.
 pub const MAX_THEMES: usize = 128;
 
 /// What a theme falls back to being called.
 pub const UNTITLED: &str = "Untitled theme";
+
+/// The longest name a theme may carry, in characters.
+///
+/// A bound rather than a design value, and it is enforced on the way *in* as
+/// well as on the way out, because a name is the one thing in a theme file that
+/// is free text and it ends up on a 150-point card. Without it a hand-edited or
+/// truncated file could hand the card row a name the length of the file, which
+/// has to be laid out and cut to fit — per card, per frame — and that is work
+/// on the drawing path bounded by nothing.
+pub const MAX_NAME: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -233,16 +246,47 @@ fn base_from_id(id: &str) -> Option<ThemeKind> {
     ThemeKind::ALL.into_iter().find(|k| base_id(*k) == id)
 }
 
-/// A name with anything that would break the line format taken out.
-fn one_line(text: &str) -> String {
-    let cleaned: String = text
-        .chars()
+/// A name with anything that would break the line format taken out, cut to
+/// [`MAX_NAME`].
+///
+/// Both directions go through this — [`CustomTheme::to_text`] on the way out
+/// and [`read_theme`] on the way in — so a file somebody hand-edited is held to
+/// the same bound as a name typed into the editor. A control character would
+/// otherwise produce a file whose next line is read as a token; an unbounded
+/// name is the drawing-path cost [`MAX_NAME`] describes.
+fn clean_name(text: &str) -> String {
+    text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    match cleaned.trim() {
+        .take(MAX_NAME)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// [`clean_name`], with the fallback for a name that came out empty.
+///
+/// Separate, because "" is a real answer on the way *in*: a file whose `name`
+/// line is blank falls back to its own filename, the way every `.gpl` reader
+/// does, rather than to the word Untitled.
+fn one_line(text: &str) -> String {
+    match clean_name(text).as_str() {
         "" => UNTITLED.to_owned(),
         trimmed => trimmed.to_owned(),
     }
+}
+
+/// Room left under [`MAX_NAME`] for the number `unique_name` appends.
+///
+/// A desired name is clipped to this before it is made unique, so the suffix
+/// can never be the part the cap cuts off — which would put two themes back on
+/// one name, the thing `free_name` exists to prevent.
+const SUFFIX_ROOM: usize = 8;
+
+fn clipped(desired: &str) -> String {
+    desired
+        .chars()
+        .take(MAX_NAME.saturating_sub(SUFFIX_ROOM))
+        .collect()
 }
 
 /// What came of reading a theme file.
@@ -301,7 +345,9 @@ pub fn read_theme(text: &str, path: &Path) -> Result<ThemeRead, ThemeError> {
     for (key, value) in body {
         match key {
             "base" => {}
-            "name" => theme.name = value.to_owned(),
+            // Through the same door the writer uses, so a hand-edited file
+            // cannot carry a name the editor could not have produced.
+            "name" => theme.name = clean_name(value),
             _ => match (Token::from_id(key), parse_hex(value)) {
                 (Some(token), Some(colour)) => theme.palette.set_token(token, colour),
                 // A token this build does not have, or a colour that will not
@@ -344,25 +390,6 @@ pub struct ThemeLibrary {
     warnings: Vec<String>,
 }
 
-/// Where [`ThemeLibrary::load`] reads from, when something has said.
-///
-/// The same shape as `prefs::LABEL`, and it exists for a related reason: a
-/// preview shot of the Themes pane has to have a theme in the library to show
-/// the editable half of it, and the only library there is belongs to whoever is
-/// running the tests. Writing into somebody's real data directory to take a
-/// picture is not something a test may do; taking the picture at all is the
-/// only way the pane's *layout* is ever looked at, which is the failure both
-/// bugs on this page were. Set once, by `settings`' preview alone. Nothing in
-/// the application calls it, and [`stage_dir`] is the only way in.
-static STAGED_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Read themes from `dir` instead of the user's own directory. Takes effect
-/// once and cannot be undone.
-#[cfg(test)]
-pub fn stage_dir(dir: PathBuf) {
-    let _ = STAGED_DIR.set(dir);
-}
-
 impl ThemeLibrary {
     /// Directory name under the platform's user-data directory, beside
     /// `umber_core::preset::UserLibrary::DIR_NAME` and the palettes'.
@@ -377,9 +404,6 @@ impl ThemeLibrary {
     /// reason `Library::collections` exists, and the reason a theme cannot live
     /// beside the two that are compiled in.
     pub fn default_dir() -> Option<PathBuf> {
-        if let Some(dir) = STAGED_DIR.get() {
-            return Some(dir.clone());
-        }
         directories::ProjectDirs::from("", "", "Umber")
             .map(|dirs| dirs.data_dir().join(Self::DIR_NAME))
     }
@@ -550,6 +574,47 @@ impl ThemeLibrary {
         self.save(theme)
     }
 
+    /// Rename a theme. The id — and therefore the file — does not move.
+    ///
+    /// Deliberately: the id is what the preferences file holds, and renaming a
+    /// file to match its title would orphan that reference in exchange for a
+    /// tidier directory listing. `PaletteLibrary::rename`'s rule, and
+    /// `BrushPreset::id`'s.
+    ///
+    /// A name something else already has is **numbered**, not taken —
+    /// [`Self::free_name`]'s argument, which covers the built-ins as well: two
+    /// cards both called Graphite are two cards you can only tell apart by
+    /// which one has a Delete on it. It is a separate method from [`Self::save`]
+    /// for exactly that reason. `save` may not free the name, because the name
+    /// it is handed is usually the theme's own and freeing it would number a
+    /// theme every time one of its colours changed.
+    pub fn rename(&mut self, id: &str, name: &str) -> Result<(), ThemeError> {
+        let Some(theme) = self.get(id) else {
+            return Err(ThemeError::Unknown(id.to_owned()));
+        };
+        let mut renamed = theme.clone();
+        // Against every *other* theme, so re-committing the name it already has
+        // is not a rename to "Mine 2".
+        let taken: Vec<String> = self
+            .themes
+            .iter()
+            .filter(|t| t.id != id)
+            .map(|t| t.name.clone())
+            .collect();
+        let built_in: Vec<&str> = ThemeKind::ALL.into_iter().map(ThemeKind::label).collect();
+        renamed.name = umber_core::preset::unique_name(
+            &clipped(name),
+            UNTITLED,
+            taken.iter().map(String::as_str).chain(built_in),
+        );
+        self.write(&renamed)?;
+        if let Some(slot) = self.themes.iter_mut().find(|t| t.id == id) {
+            *slot = renamed;
+        }
+        self.sort();
+        Ok(())
+    }
+
     /// Take a theme out of the library and delete its file.
     ///
     /// `false` means there was nothing with that id, which is not an error — a
@@ -624,7 +689,7 @@ impl ThemeLibrary {
     fn free_name(&self, desired: &str) -> String {
         let built_in: Vec<&str> = ThemeKind::ALL.into_iter().map(ThemeKind::label).collect();
         umber_core::preset::unique_name(
-            desired,
+            &clipped(desired),
             UNTITLED,
             self.themes.iter().map(|t| t.name.as_str()).chain(built_in),
         )
@@ -1056,6 +1121,107 @@ mod tests {
             .collect();
         assert_eq!(written.len(), 1, "{written:?}");
         assert_eq!(written[0], dir.join(format!("{id}.{EXTENSION}")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename is the third way a name is chosen, after `duplicate` and
+    /// `import`, and it has to be held to the same rule as those two: two cards
+    /// called Graphite are two cards you can only tell apart by which one has a
+    /// Delete on it. It must also *not* number a theme for keeping the name it
+    /// already has, which is what going through `save` would have done.
+    #[test]
+    fn a_rename_cannot_take_a_name_something_else_already_has() {
+        let dir = temp_dir("rename");
+        let mut library = ThemeLibrary::load_from(&dir);
+        let graphite = Palette::of(ThemeKind::Graphite);
+        let first = library
+            .duplicate("Dusk", ThemeKind::Graphite, graphite)
+            .unwrap();
+        let second = library
+            .duplicate("Dawn", ThemeKind::Graphite, graphite)
+            .unwrap();
+
+        library
+            .rename(&second, "Dusk")
+            .expect("it is in the library");
+        assert_ne!(
+            library.get(&second).unwrap().name,
+            "Dusk",
+            "two themes took one name"
+        );
+        assert_eq!(
+            library.get(&first).unwrap().name,
+            "Dusk",
+            "and the first kept it"
+        );
+
+        library.rename(&first, "Graphite").expect("in the library");
+        assert_ne!(
+            library.get(&first).unwrap().name,
+            "Graphite",
+            "a custom theme took a built-in's name"
+        );
+
+        // Re-committing the name it already holds is not a rename to "X 2" —
+        // which is what happens on every blur of the name field, so it has to
+        // be a no-op.
+        let held = library.get(&first).unwrap().name.clone();
+        library.rename(&first, &held).expect("in the library");
+        assert_eq!(library.get(&first).unwrap().name, held);
+
+        // And it reaches the file, not only the list.
+        assert_eq!(
+            ThemeLibrary::load_from(&dir)
+                .get(&first)
+                .map(|t| t.name.clone()),
+            Some(held)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A name is the one free-text field in a theme file and it ends up on a
+    /// 150-point card, so it is bounded on the way in as well as on the way
+    /// out — and the number a duplicate takes has to survive that bound, or two
+    /// themes come back on one name.
+    #[test]
+    fn a_name_is_bounded_in_both_directions_and_leaves_room_for_its_number() {
+        let long: String = "wide".repeat(200);
+        let theme = CustomTheme::new(
+            long.clone(),
+            ThemeKind::Graphite,
+            Palette::of(ThemeKind::Graphite),
+        );
+        let back = read_theme(&theme.to_text(), &here())
+            .expect("written by us")
+            .theme;
+        assert!(back.name.chars().count() <= MAX_NAME, "{}", back.name.len());
+
+        // Straight out of a hand-edited file, not through the writer.
+        let text = format!("Umber theme\nbase = graphite\nname = {long}\n");
+        let read = read_theme(&text, &here()).expect("a header and a name");
+        assert!(read.theme.name.chars().count() <= MAX_NAME);
+
+        let dir = temp_dir("long-names");
+        let mut library = ThemeLibrary::load_from(&dir);
+        let graphite = Palette::of(ThemeKind::Graphite);
+        let a = library
+            .duplicate(&long, ThemeKind::Graphite, graphite)
+            .unwrap();
+        let b = library
+            .duplicate(&long, ThemeKind::Graphite, graphite)
+            .unwrap();
+        let (a, b) = (
+            library.get(&a).unwrap().name.clone(),
+            library.get(&b).unwrap().name.clone(),
+        );
+        assert_ne!(a, b, "the number was the part the cap cut off");
+        // And it is still two names after a round trip through the file.
+        let reopened = ThemeLibrary::load_from(&dir);
+        let mut names: Vec<&str> = reopened.themes().iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "{names:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -365,6 +365,12 @@ fn settings_shot(
     let mut ed = editor();
     ed.ui.settings_open = true;
     ed.ui.settings_tab = tab;
+    // An empty theme library, so the Themes pane shows the two Umber ships with
+    // and nothing else. Left alone it reads the *user's* directory — and this
+    // picture is committed, so a card for every theme the person regenerating
+    // it happens to have would publish their workspace in the README. It is the
+    // leak `prefs::set_config_path_label` exists to stop, one door over.
+    settings::stage_themes(&stage.ctx, crate::themelib::ThemeLibrary::default());
     let palette = ed.palette();
 
     // The modal dims whatever is behind it, and behind it here is nothing, so
@@ -458,7 +464,11 @@ fn palette_colour(c: Color32) -> Color {
 /// surface.
 pub(crate) struct Stage {
     gpu: Gpu,
-    ctx: egui::Context,
+    /// `pub(crate)` for the reason `Stage` itself is: a caller that wants to
+    /// seed the context before the interface reads it — `settings::stage_themes`
+    /// is the one — has to reach the context this will draw with, and there is
+    /// only one of it for the whole run.
+    pub(crate) ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
 }
 

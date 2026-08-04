@@ -131,13 +131,22 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
     if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::InputAndPen {
         ed.input.end_probe();
     }
-    // Delete asks once before it acts, and the answer must not outlive the page
-    // it was asked on: a "Delete?" still armed when somebody walks away to
-    // Shortcuts and back is a control that takes a theme on the next click,
-    // for a question they answered a page ago. Same rule, and the same place,
-    // as ending the pressure probe above.
+    // Nothing the Themes pane was in the middle of may outlive the page it was
+    // started on. Same rule, and the same place, as ending the pressure probe
+    // above; two things depend on it and both were bugs:
+    //
+    // - a "Delete?" still armed when somebody walks away to Shortcuts and back
+    //   is a control that takes a theme on the next click, for a question they
+    //   answered a page ago.
+    // - **Escape does not abandon a field**, whatever a text editor's habits
+    //   suggest: egui's `TextEdit` handles no `Key::Escape` at all, and
+    //   `egui::Modal` consumes it to close the dialog. So a half-typed name, or
+    //   a hex that says `rebeccapurple`, is left in the buffer with the field
+    //   never drawn again — and reopening the page shows a readout the chip
+    //   beside it disagrees with, whose *next* blur applies the rename the user
+    //   thought they had cancelled.
     if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::Themes {
-        disarm_delete(&ctx);
+        forget_themes_edit(&ctx);
     }
 
     if !ed.ui.settings_open {
@@ -1495,19 +1504,58 @@ fn store_themes(ctx: &egui::Context, state: Themes) {
     ctx.data_mut(|d| d.insert_temp(themes_id(), state));
 }
 
-/// Forget a Delete that has been pressed once.
+/// Put a library in the context before the pane is drawn, so that it reads that
+/// one instead of the user's.
 ///
-/// Called on every frame the Themes pane is not in front, including every frame
-/// the dialog is shut — so it returns as early as it can rather than taking
-/// egui's data lock twice for nothing, exactly as [`stop_listening`] does.
-fn disarm_delete(ctx: &egui::Context) {
+/// [`load_themes`] reads the directory only when there is no state yet — the
+/// arrangement `palettelib` keeps — so seeding the state is the whole of it,
+/// and no global has to be reachable from the drawing path.
+///
+/// It exists because two things that draw this pane must not read whatever
+/// themes the machine happens to hold. **`docshot`** writes
+/// `docs/images/settings-themes.png`, which is committed: a card, with its
+/// name, for every theme the person regenerating it happens to have is a
+/// contributor's own workspace published in the README — the leak
+/// `prefs::set_config_path_label` already exists to stop, one door over. And
+/// the pane's **measurements** would otherwise be taken against a card row of
+/// a length nobody chose, so the same test would measure something different on
+/// every machine.
+pub(crate) fn stage_themes(ctx: &egui::Context, library: ThemeLibrary) {
+    store_themes(
+        ctx,
+        Themes {
+            store: Ok(std::sync::Arc::new(library)),
+            filled_from: String::new(),
+            hex: Vec::new(),
+            name: String::new(),
+            confirming: None,
+        },
+    );
+}
+
+/// Forget whatever the Themes pane was in the middle of — a Delete pressed
+/// once, and anything typed into a field and not committed.
+///
+/// The library is deliberately *kept*: it is a directory read, and throwing it
+/// away would re-read it every time somebody looked at another page. What goes
+/// is the state that means "you are part way through something".
+///
+/// Called on every frame the pane is not in front, including every frame the
+/// dialog is shut — so it returns as early as it can rather than taking egui's
+/// data lock twice for nothing, exactly as [`stop_listening`] does. Emptying
+/// `hex` is what makes [`Themes::refill`] run again on the way back in, since
+/// its early return needs a full table.
+fn forget_themes_edit(ctx: &egui::Context) {
     let Some(mut state) = ctx.data(|d| d.get_temp::<Themes>(themes_id())) else {
         return;
     };
-    if state.confirming.is_none() {
+    if state.confirming.is_none() && state.hex.is_empty() {
         return;
     }
     state.confirming = None;
+    state.filled_from = String::new();
+    state.hex.clear();
+    state.name.clear();
     store_themes(ctx, state);
 }
 
@@ -1764,7 +1812,7 @@ fn theme_card(
 /// Painted text, not a `Label`, so egui's own truncation is not available: the
 /// card is drawn into a rectangle it allocated, and a label in it would be a
 /// second widget in the middle of a painted one.
-fn elide(painter: &egui::Painter, text: &str, room: f32) -> String {
+fn elide(painter: &egui::Painter, label: &str, room: f32) -> String {
     let font = FontId::proportional(text::SMALL);
     let width = |s: &str| {
         painter
@@ -1772,20 +1820,31 @@ fn elide(painter: &egui::Painter, text: &str, room: f32) -> String {
             .size()
             .x
     };
-    if width(text) <= room {
-        return text.to_owned();
+    if width(label) <= room {
+        return label.to_owned();
     }
-    let mut cut = text.to_owned();
-    while !cut.is_empty() {
-        cut.pop();
-        // Measured with the ellipsis on, or the result is one character too
-        // wide exactly when the name is one character too long.
-        let candidate = format!("{}…", cut.trim_end());
-        if width(&candidate) <= room {
-            return candidate;
-        }
+    // Binary search over character boundaries rather than a character taken off
+    // at a time: this runs per card, per frame, and each step lays the whole
+    // string out. `themelib::MAX_NAME` bounds the string, so the difference is
+    // sixty-odd layouts against six — but the bound is a *file's* rule and this
+    // must not be the thing that makes it load-bearing.
+    let stops: Vec<usize> = label
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(label.len()))
+        .collect();
+    // Measured with the ellipsis on, or the result is one character too wide
+    // exactly when the name is one character too long.
+    let fits = |cut: usize| width(&format!("{}…", label[..stops[cut]].trim_end())) <= room;
+    let (mut lo, mut hi) = (0usize, stops.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
     }
-    String::new()
+    if lo == 0 {
+        return String::new();
+    }
+    format!("{}…", label[..stops[lo]].trim_end())
 }
 
 /// The design's dashed "New theme" card.
@@ -2052,9 +2111,15 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                     // On losing focus rather than on every keystroke, unlike
                     // the colours: a rename moves the card in a list sorted by
                     // name, and a row that jumped under the pointer on every
-                    // letter would be unusable. Escape abandons; anything else
+                    // letter would be unusable. Anything that takes the focus
                     // keeps what was typed, and an emptied field is not a
                     // nameless theme — the model substitutes "Untitled theme".
+                    // **Escape is not an abandon here** and cannot be made one
+                    // cheaply: egui's `TextEdit` handles no `Key::Escape`, and
+                    // `egui::Modal` takes it to close the dialog. What stops
+                    // that leaving a half-typed name lying about is
+                    // `forget_themes_edit`, which empties the buffers on every
+                    // frame this page is not in front.
                     renamed = field.lost_focus();
                 }
                 None => {
@@ -2160,13 +2225,25 @@ fn import_theme(state: &mut Themes, ed: &mut Editor) {
     else {
         return;
     };
+    // Written to directly rather than through `write_theme`, because that
+    // raises a notice per failure and this loop has to end with **one**: a
+    // folder of themes may hold a file that reads, one that lost lines and one
+    // that will not open at all, and a notice per file that the next file
+    // overwrites is the same as no notice for everything before it.
+    let Ok(library) = &mut state.store else {
+        ed.notice = Some(Notice {
+            title: "Could not import".to_owned(),
+            lines: vec![state.why_not().to_owned()],
+        });
+        return;
+    };
+    let library = std::sync::Arc::make_mut(library);
     let mut lines = Vec::new();
+    let mut failed = false;
     let mut added = None;
     for path in &paths {
-        match write_theme(state, ed, "Could not import", |library| {
-            library.import(path)
-        }) {
-            Some((id, skipped)) => {
+        match library.import(path) {
+            Ok((id, skipped)) => {
                 if skipped > 0 {
                     // An import that loses something must say so —
                     // `docimport`'s rule. A line Umber could not read is a
@@ -2179,12 +2256,13 @@ fn import_theme(state: &mut Themes, ed: &mut Editor) {
                 }
                 added = Some(id);
             }
-            // `write_theme` has already raised the notice; the loop carries on
-            // because a folder of themes may hold one that reads and one that
-            // does not.
-            None => continue,
+            Err(e) => {
+                failed = true;
+                lines.push(e.to_string());
+            }
         }
     }
+    let any = added.is_some();
     if let Some(id) = added
         && let Some(theme) = state
             .library()
@@ -2195,37 +2273,44 @@ fn import_theme(state: &mut Themes, ed: &mut Editor) {
     }
     if !lines.is_empty() {
         ed.notice = Some(Notice {
-            title: "Imported, with notes".to_owned(),
+            // Both halves are reachable in one go, so the title says which of
+            // the two happened rather than only the last — `palettelib`'s
+            // wording and its reasoning.
+            title: match (any, failed) {
+                (true, true) => "Imported some, with notes".to_owned(),
+                (true, false) => "Imported, with notes".to_owned(),
+                (false, _) => "Could not import".to_owned(),
+            },
             lines,
         });
     }
 }
 
 fn rename_theme(state: &mut Themes, ed: &mut Editor) {
-    let Some(mut theme) = ed.custom_theme.clone() else {
+    let Some(id) = ed.custom_theme.as_ref().map(|t| t.id.clone()) else {
         return;
     };
     let typed = state.name.trim().to_owned();
-    if typed == theme.name {
+    if ed.custom_theme.as_ref().is_some_and(|t| t.name == typed) {
         return;
     }
-    theme.name = typed;
     if write_theme(state, ed, "Could not rename the theme", |library| {
-        library.save(theme.clone())
+        library.rename(&id, &typed)
     })
     .is_none()
     {
         return;
     }
-    // Back out of the library rather than out of `theme`: the model may have
-    // numbered the name to keep it distinct from another theme's, and the field
-    // has to show what was actually stored rather than what was typed.
+    // Back out of the library rather than out of what was typed: `rename`
+    // numbers a name something else already has, and the field has to show what
+    // was actually stored — otherwise it would sit there reading "Graphite"
+    // beside a card labelled "Graphite 2".
     if let Some(stored) = state
         .library()
-        .and_then(|library| library.get(&theme.id).cloned())
+        .and_then(|library| library.get(&id).cloned())
     {
-        ed.custom_theme = Some(stored.clone());
-        state.name = stored.name;
+        state.name = stored.name.clone();
+        ed.custom_theme = Some(stored);
     }
 }
 
@@ -2249,7 +2334,13 @@ fn token_row(
     token: Token,
     editable: bool,
 ) {
-    let at = Token::ALL.iter().position(|t| *t == token).unwrap_or(0);
+    // The token's place in the buffer table. `None` is unreachable — every
+    // token drawn comes out of `TokenGroup::tokens`, which is a filter over
+    // `Token::ALL` — and it falls through to the read-only readout rather than
+    // to slot zero, because writing *Backdrop's* buffer would be a row silently
+    // editing the wrong colour, and to `expect` would be a panic on the drawing
+    // path. Neither is a trade worth taking for a case that cannot happen.
+    let at = Token::ALL.iter().position(|t| *t == token);
     let colour = ed.palette().token(token);
     ui.horizontal(|ui| {
         let (chip, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), Sense::hover());
@@ -2274,7 +2365,7 @@ fn token_row(
             // index panic on the *drawing path*, which is the worst place in
             // the application to put one. `Palette::link_colour`'s modulo is
             // the same argument.
-            if !editable || state.hex.len() != Token::ALL.len() {
+            let Some(at) = at.filter(|_| editable && state.hex.len() == Token::ALL.len()) else {
                 ui.label(
                     egui::RichText::new(themelib::hex(colour))
                         .monospace()
@@ -2282,7 +2373,7 @@ fn token_row(
                         .color(p.text),
                 );
                 return;
-            }
+            };
             let field = inset_field(
                 ui,
                 p,
@@ -2298,30 +2389,40 @@ fn token_row(
             // be judged against the interface it is for while it is being
             // typed, which is the whole point of a theme editor.
             let body = state.hex[at].trim().trim_start_matches('#');
-            if (field.changed() && body.len() == 6) || field.lost_focus() {
+            if field.changed() && body.len() == 6 {
                 set_token(ed, state, token, at);
+            }
+            // On the way out, a field that will not read goes back to the
+            // colour that is actually there. While it has the caret it is what
+            // somebody is typing and must be left alone; once it does not, it
+            // is a *readout*, and a readout saying `rebeccapurple` beside a
+            // chip that is `#111214` is the control that lies.
+            if field.lost_focus() && !set_token(ed, state, token, at) {
+                state.hex[at] = themelib::hex(colour);
             }
         });
     });
 }
 
-/// Put what was typed into the theme in hand, and write it out.
-fn set_token(ed: &mut Editor, state: &mut Themes, token: Token, at: usize) {
+/// Put what was typed into the theme in hand, and write it out. Answers whether
+/// it read as a colour at all.
+fn set_token(ed: &mut Editor, state: &mut Themes, token: Token, at: usize) -> bool {
     let Some(colour) = themelib::parse_hex(&state.hex[at]) else {
-        // Nothing is applied and nothing is refused: the field keeps what was
-        // typed so it can be corrected, and the palette keeps the colour it
-        // had. A theme that quietly took black for a misread line would be a
-        // theme with an invisible interface in it.
-        return;
+        // Nothing is applied and nothing is refused: while the field has the
+        // caret it keeps what was typed so it can be corrected, and the palette
+        // keeps the colour it had. A theme that quietly took black for a
+        // misread line would be a theme with an invisible interface in it. The
+        // caller is what puts the readout back on the way out.
+        return false;
     };
     let Some(theme) = ed.custom_theme.as_mut() else {
-        return;
+        return false;
     };
     if theme.palette.token(token) == colour {
         // The blur after a keystroke that already landed. Writing the file
         // again would be a second write for no change.
         state.hex[at] = themelib::hex(colour);
-        return;
+        return true;
     }
     theme.palette.set_token(token, colour);
     // Normalised back into the field, so `#fff` becomes `#FFFFFF` once it has
@@ -2331,6 +2432,7 @@ fn set_token(ed: &mut Editor, state: &mut Themes, token: Token, at: usize) {
     write_theme(state, ed, "Could not save the theme", |library| {
         library.save(stored)
     });
+    true
 }
 
 /// The design's four accent options.
@@ -2835,6 +2937,11 @@ mod tests {
         if let Some(tab) = tab {
             ed.ui.settings_tab = tab;
         }
+        // An empty library rather than whatever themes this machine holds. The
+        // Themes pane's card row grows by a card per theme, so without this the
+        // same measurement is a different measurement on every machine — and it
+        // would read the tester's own data directory to take it.
+        stage_themes(&ctx, ThemeLibrary::default());
         let given = match tab {
             Some(_) => vec2(WIDTH - RAIL_WIDTH, HEIGHT),
             None => vec2(RAIL_WIDTH, HEIGHT),
@@ -2887,6 +2994,46 @@ mod tests {
                 "the {tab:?} pane reported {width} points in a {given}-point column",
             );
         }
+    }
+
+    /// What the footer costs must fit the room the pane keeps for it.
+    ///
+    /// This is the assertion that actually pins the fix, and the one below is
+    /// not: `pane` now allocates exactly the height it was handed and draws the
+    /// footer into a `new_child`, which never advances the parent — so the
+    /// pane's own height can no longer fail whatever the footer turns out to
+    /// cost. What *would* fail instead is silent: the footer paints outside its
+    /// rectangle, and nothing clips it. So the footer is measured on its own,
+    /// in a rectangle of its own, against the reserve.
+    #[test]
+    fn the_footer_fits_the_room_the_pane_keeps_for_it() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIDTH, HEIGHT))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        let mut ed = Editor::default();
+        let mut measured = 0.0;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(WIDTH - RAIL_WIDTH, HEIGHT),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                storage_footer(&mut child, &palette, &mut ed);
+                measured = child.min_rect().height();
+            });
+        }
+        assert!(
+            measured <= FOOTER_RESERVE,
+            "the footer draws {measured} points into a {FOOTER_RESERVE}-point reserve, \
+             so it paints outside the rectangle the pane gives it",
+        );
     }
 
     /// And every pane is the *height* it was given, which is what makes the
@@ -3036,10 +3183,61 @@ mod tests {
 
         for bad in ["", "#12345", "rebeccapurple"] {
             state.hex[at] = bad.to_owned();
-            set_token(&mut ed, &mut state, Token::Window, at);
+            assert!(
+                !set_token(&mut ed, &mut state, Token::Window, at),
+                "{bad} was read as a colour"
+            );
             assert_eq!(ed.palette(), before, "{bad} moved the palette");
+            // While the field has the caret this is right: it is what somebody
+            // is typing. What puts the readout back is the *caller*, on the
+            // blur — see `token_row`, and the test below.
             assert_eq!(state.hex[at], bad, "{bad} was taken out of the field");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing the pane was part way through may outlive the page it was
+    /// started on.
+    ///
+    /// Escape looks like it should abandon a field and does not: egui's
+    /// `TextEdit` handles no `Key::Escape` and `egui::Modal` takes it to close
+    /// the dialog, so the field is simply never drawn again and `lost_focus` is
+    /// never seen. Left alone, reopening the page showed a name the theme did
+    /// not have — whose next blur would apply the rename somebody thought they
+    /// had cancelled — and a hex readout the chip beside it disagreed with.
+    #[test]
+    fn walking_away_from_the_page_forgets_what_was_half_typed() {
+        let ctx = egui::Context::default();
+        let (dir, ed, mut state) = staged("forget");
+        let at = Token::ALL
+            .iter()
+            .position(|t| *t == Token::Window)
+            .expect("a token");
+
+        state.hex[at] = "rebeccapurple".to_owned();
+        state.name = "half a name".to_owned();
+        state.confirming = ed.custom_theme.as_ref().map(|t| t.id.clone());
+        store_themes(&ctx, state);
+
+        forget_themes_edit(&ctx);
+
+        let mut back = ctx
+            .data(|d| d.get_temp::<Themes>(themes_id()))
+            .expect("the state is still there");
+        assert!(back.confirming.is_none(), "a Delete stayed armed");
+        assert!(
+            back.library().is_some(),
+            "the library was thrown away with the edit, so the next visit \
+             re-reads the directory"
+        );
+        // And the way back in fills the fields from the theme, not from what
+        // was abandoned.
+        back.refill(&ed);
+        assert_eq!(back.name, ed.custom_theme.as_ref().unwrap().name);
+        assert_eq!(
+            back.hex[at],
+            themelib::hex(ed.palette().token(Token::Window))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3073,7 +3271,6 @@ mod tests {
         // and cannot write into — whatever themes the machine running it has.
         let staged = dir.join("library");
         let _ = std::fs::remove_dir_all(&staged);
-        themelib::stage_dir(staged.clone());
         let mut library = ThemeLibrary::load_from(&staged);
         let mut palette = Palette::of(ThemeKind::Graphite);
         palette.set_token(Token::Accent, egui::Color32::from_rgb(0x6E, 0x9E, 0xC8));
@@ -3093,6 +3290,7 @@ mod tests {
             ed.ui.settings_open = true;
             ed.ui.settings_tab = SettingsTab::Themes;
             ed.custom_theme = mine;
+            stage_themes(&stage.ctx, ThemeLibrary::load_from(&staged));
             let palette = ed.palette();
             let field = vec2(1048.0, 688.0);
             let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |ui| {
