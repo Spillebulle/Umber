@@ -1129,13 +1129,31 @@ mod tests {
 
         let rows = matched("  rough ");
         assert_eq!(rows[0].name, "Rough Nib", "yours first, whatever matched");
-        // A shipped stamp with the same word in it is found by the same query:
-        // one list, one search.
-        assert!(
-            rows.iter().any(|r| r.source == Source::Shipped),
-            "the shipped half was not searched"
-        );
         assert!(rows.len() < matched("").len(), "nothing was filtered out");
         assert!(matched("nothing is called this").is_empty());
+
+        // And the shipped half is searched by the same query box. The word is
+        // taken *from* the shipped half rather than written down here: the
+        // shipped table is generated, and a stamp named in a test is one that
+        // silently stops being tested the day the library is retrimmed. It
+        // already happened — this assertion used to search for "rough", which
+        // matched a shipped stamp until eleven brushes and five masks left.
+        let all = matched("");
+        let shipped = all
+            .iter()
+            .find(|r| r.source == Source::Shipped)
+            .expect("the shipped half of the merged list is not empty");
+        let word = shipped
+            .name
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| w.len() > 3)
+            .expect("a shipped stamp has a word in its name")
+            .to_owned();
+        assert!(
+            matched(&word.to_uppercase())
+                .iter()
+                .any(|r| r.source == Source::Shipped),
+            "the shipped half was not searched, for `{word}`"
+        );
     }
 }
