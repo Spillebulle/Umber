@@ -1356,6 +1356,28 @@ and named, as a tip is, and the tile size is taken from the size **before** the
 reduction — a reduced tile has to cover the same document ground as the picture
 it came from, or the grain changes frequency to fit Umber's texture budget.
 
+**Where it cannot cover that ground, `dropped::PAPER_SPACING` says so.**
+`Brush::MAX_GRAIN_SCALE` is 2048, and the clamp was unreachable while the tile
+was always 256 — it needed a `TextureScale2` of 800%. Reading the material's own
+size makes it overlap `REDUCED_PAPER` *exactly*: both fire above
+`TipMask::MAX_SIZE`, and at the default 100% a 4096-texel paper asks for a
+4096-pixel tile and gets 2048, so the grain recurs twice as often as its author
+set. The two are separate notices deliberately — one is a picture coarser than
+it was drawn, the other is that picture repeated at a finer pitch, and folding
+the second into the first would put a sentence about softening over a change of
+spatial frequency.
+
+**And a paper that cannot be resolved at all paints flat in *both* halves.**
+The strength is read from `TextureDensity` before the picture is looked for, so
+leaving it behind when the picture fails is not "no paper": `paper` unset means
+`BrushPreset::paper` unset, which sends `Editor::paper_tile` to
+`brush.grain_pattern` — never written by this converter, and `Brush::default()`'s
+`Tooth`. That is the 78% substitution above, arriving by the back door on
+exactly the brushes whose material Clip Studio left out of the file. The failure
+arm zeroes the strength, which is the dab pass's exact identity, and
+`a_paper_the_reader_cannot_resolve_is_named_and_paints_flat` asserts the brush
+rather than the loss string — it passed for as long as it did not.
+
 Measured, because it is the first thing to look at if an imported brush is ever
 reported painting weaker than its opacity says: the `Sketch` brush in the sample
 file used to import at `grain: 1.0` on `Tooth`, whose texels run 0.569..0.988
