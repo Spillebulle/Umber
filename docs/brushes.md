@@ -581,12 +581,18 @@ that a field is dead if the reader that would have filled it in is looking in
 the right place.
 
 `build_up` went with them. It was 232 default and 1 live — Raghukamath's
-"Drybrush", measured — and that one brush asks for paper, so **no shipped preset
-sets `build_up` today**. The flag is still measured per brush rather than
-defaulted, by `stroke_coverage`, and every stamp an import produces still gets
-the same answer; what has gone is the library's own example of it, which is what
-`crates/umber-render/src/canvas.rs` measured its `R8Unorm` accumulation error
-against.
+"Drybrush", measured — and that one brush asks for paper, so **no brush out of a
+pack sets `build_up` any more**. Umber's own "Stipple chalk" still does, so the
+blend state is exercised and the flag is still measured per brush rather than
+defaulted, by `stroke_coverage`; every stamp an import produces gets the same
+answer as before. What has gone is the *third-party* example of it, which is
+what `crates/umber-render/src/canvas.rs` measured its `R8Unorm` accumulation
+error against.
+
+Note also that this table counts the 222 the generator writes, not
+`preset::builtin()`. Umber's own six are on top of it, and Stipple chalk is
+where the `grain` row's "none" stops being true for the library as a whole: it
+is the one shipped brush that paints through paper.
 
 `smudge_length` and `smudge_radius` look like the same case at a glance — 153
 and 195 presets sit on Umber's default — and are not: those *are* MyPaint's
