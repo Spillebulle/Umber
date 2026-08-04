@@ -2554,7 +2554,10 @@ mod tests {
         // round trip byte for byte, and that has nothing to do with this code.
         let plain = TipMask::new(2, 1, vec![255, 128]).expect("tip");
         let image = tip_image(&plain, ink, 32);
-        assert_eq!(image.pixels[0].to_srgba_unmultiplied(), [200, 200, 200, 255]);
+        assert_eq!(
+            image.pixels[0].to_srgba_unmultiplied(),
+            [200, 200, 200, 255]
+        );
         let [r, g, b, a] = image.pixels[1].to_srgba_unmultiplied();
         assert!(
             r.abs_diff(200) <= 1 && g.abs_diff(200) <= 1 && b.abs_diff(200) <= 1 && a == 128,
