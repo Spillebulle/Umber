@@ -90,6 +90,13 @@ impl Kind {
     }
 }
 
+/// The gap between two rows of the browser's list.
+///
+/// Named because `show_rows` is told the row height and adds this itself, so
+/// the two figures have to be the ones really in force or the scroll position
+/// drifts from the rows under it.
+const ROW_GAP: f32 = 6.0;
+
 /// Where one picture in the list came from.
 ///
 /// Drawn on the row rather than inferred from the name, because the two
@@ -224,8 +231,14 @@ fn header(ui: &mut Ui, p: &Palette, state: &mut State) {
             );
         });
         ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+            // Through `close`, not by clearing the flag: that is what gives the
+            // preview textures and the seam answers back, and both hold
+            // **full-resolution** `Arc<TipMask>`s — up to four megabytes each.
+            // Setting `open = None` here left every picture the user had looked
+            // at pinned in egui's store for the rest of the session, including
+            // ones since removed from the library. One exit, one teardown.
             if icon_button(ui, p, Icon::Close, true, "Close") {
-                state.open = None;
+                close(ui.ctx(), state);
             }
         });
     });
@@ -323,44 +336,68 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
     // Who is using each of the user's own, which is what decides whether Remove
     // may be offered. Asked once per frame rather than once per row, and only
     // of the rows that can be removed at all.
+    let in_hand = match kind {
+        Kind::Stamps => ed.tip_name.clone(),
+        Kind::Papers => ed.paper_name.clone(),
+    };
     if let Some(library) = &held {
         for row in rows.iter_mut().filter(|r| r.source == Source::Yours) {
             row.users = match kind {
                 Kind::Stamps => library.tip_users(&row.name),
                 Kind::Papers => library.paper_users(&row.name),
             };
+            // The brush the artist is holding counts, and the model cannot see
+            // it — `UserLibrary` knows only what has been saved. Without this,
+            // the picture under the pointer could be deleted with a cheerful
+            // notice and the next stroke would silently change.
+            if in_hand.as_deref() == Some(row.name.as_str()) {
+                row.users.push("the brush in your hand".to_owned());
+            }
         }
     }
 
     let mut action = None;
-    egui::ScrollArea::vertical()
+    let area = egui::ScrollArea::vertical()
         .id_salt("stamp-library-list")
         .auto_shrink([false, false])
-        .max_height(height)
-        .show(ui, |ui| {
-            if rows.is_empty() {
-                // The first of these is reachable only where every shipped
-                // picture failed to decode, which is exactly when a blank box
-                // would be least informative — the library says so in a
-                // warning at load, and this is what the browser shows for it.
-                controls::note(
-                    ui,
-                    p,
-                    if state.query.trim().is_empty() {
-                        "Nothing here yet. Import a picture to start."
-                    } else {
-                        "Nothing of that name."
-                    },
-                );
-                return;
-            }
-            ui.spacing_mut().item_spacing.y = 6.0;
-            for entry in &rows {
+        .max_height(height);
+
+    if rows.is_empty() {
+        area.show(ui, |ui| {
+            // The first of these is reachable only where every shipped picture
+            // failed to decode, which is exactly when a blank box would be
+            // least informative — the library says so in a warning at load, and
+            // this is what the browser shows for it.
+            controls::note(
+                ui,
+                p,
+                if state.query.trim().is_empty() {
+                    "Nothing here yet. Import a picture to start."
+                } else {
+                    "Nothing of that name."
+                },
+            );
+        });
+    } else {
+        // **`show_rows`, not `show`**, and that is not a nicety: laying a row
+        // out builds its thumbnail by box-averaging the *whole* picture — up to
+        // four million texels — uploads a texture, and for a paper walks the
+        // tile again for its seam. Twenty large pictures at once is tens of
+        // millions of texel reads and twenty uploads in a single frame, which
+        // is the cost `brushlib`'s own list refuses at 201 presets. The caches
+        // make every *later* frame free; this is what makes the first one
+        // bearable. It is legal here because every row is the same height by
+        // construction — a fixed square and two lines beside it, neither of
+        // which wraps.
+        area.show_rows(ui, metrics::STAMP_ROW, rows.len(), |ui, visible| {
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            for entry in &rows[visible] {
                 if let Some(chosen) = row(ui, p, ed, state, kind, entry) {
                     action = Some(chosen);
                 }
             }
         });
+    }
 
     match action {
         Some(Action::Use(name)) => choose(ed, state, kind, name),

@@ -136,6 +136,25 @@ pub struct BrushPreset {
     /// already pays for — rather than falling back to a shipped tile, because
     /// substituting a paper the author did not choose is the bug that made a
     /// Clip Studio import paint at 78% of the opacity it was set to.
+    ///
+    /// **It did not move [`FORMAT_VERSION`], and unlike the other additive
+    /// fields that is not an easy call.** An older Umber ignores this and
+    /// paints through `Brush::grain_pattern` at `Brush::grain` — the default
+    /// `Tooth` for anything imported, which is the 78% substitution above,
+    /// happening in a build that cannot be told about it. That is a *pixel*
+    /// change, where `Library::made_collections` was only a grouping, so the
+    /// rule "bumped only when a change would make an older Umber misread a
+    /// newer file" is genuinely in play.
+    ///
+    /// It stays at 1 because of what a bump costs on *this* file. The version
+    /// gate is over the whole `brushes.ron`: an older build reading a newer
+    /// number refuses the library entire, so one papered brush would put every
+    /// brush the user has ever saved out of reach on the older build. Losing
+    /// two hundred brushes to protect the grain of one is the worse trade, and
+    /// it is a different bargain from the document format's — there a refusal
+    /// costs one file, and the alternative is a *picture* that is wrong. Here
+    /// the alternative is one brush's texture, on a build the user has chosen
+    /// to go back to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paper: Option<String>,
 }
@@ -845,22 +864,38 @@ impl UserLibrary {
     /// added to has nothing to discard. It is recorded in
     /// [`Library::kept_tips`], which is what stops the next write pruning a
     /// stamp no brush names yet.
+    /// **The picture is taken back off if the index cannot be written.** The
+    /// two go together or neither does: a PNG on disk whose name is not in
+    /// `kept_tips` is read back on the next launch, shown in the browser, and
+    /// then deleted by the first save that succeeds — appearing and vanishing
+    /// depending on what the user did next, which is the precise failure
+    /// `kept_tips` exists to prevent, surviving in the failure path.
     pub fn add_tip(&mut self, desired: &str, mask: TipMask) -> Result<String, PresetError> {
         let name = free_stem(desired, "tip", &self.tips, &self.tips_dir());
         write_mask(&self.tips_dir(), &name, &mask)?;
         self.tips.insert(name.clone(), Arc::new(mask));
         keep(&mut self.kept_tips, &name);
-        self.write()?;
+        if let Err(e) = self.write() {
+            self.tips.remove(&name);
+            self.kept_tips.retain(|held| held != &name);
+            let _ = fs::remove_file(self.tips_dir().join(format!("{name}.png")));
+            return Err(e);
+        }
         Ok(name)
     }
 
-    /// The same for a paper. See [`Self::add_tip`].
+    /// The same for a paper, undone the same way. See [`Self::add_tip`].
     pub fn add_paper(&mut self, desired: &str, tile: TipMask) -> Result<String, PresetError> {
         let name = free_stem(desired, "paper", &self.papers, &self.papers_dir());
         write_mask(&self.papers_dir(), &name, &tile)?;
         self.papers.insert(name.clone(), Arc::new(tile));
         keep(&mut self.kept_papers, &name);
-        self.write()?;
+        if let Err(e) = self.write() {
+            self.papers.remove(&name);
+            self.kept_papers.retain(|held| held != &name);
+            let _ = fs::remove_file(self.papers_dir().join(format!("{name}.png")));
+            return Err(e);
+        }
         Ok(name)
     }
 
@@ -1269,10 +1304,8 @@ impl UserLibrary {
             let _ = fs::remove_file(self.tips_dir().join(format!("{name}.png")));
             self.tips.remove(&name);
         }
-        // A name in the kept list whose file has gone — deleted from outside
-        // Umber, or on a library copied without its pictures — would otherwise
-        // keep a row in the browser for ever with nothing behind it.
-        self.kept_tips.retain(|name| self.tips.contains_key(name));
+        let dir = self.tips_dir();
+        forget_gone(&mut self.kept_tips, &self.tips, &dir);
     }
 
     /// The same for `papers/`. See [`Self::prune_tips`].
@@ -1287,9 +1320,27 @@ impl UserLibrary {
             let _ = fs::remove_file(self.papers_dir().join(format!("{name}.png")));
             self.papers.remove(&name);
         }
-        self.kept_papers
-            .retain(|name| self.papers.contains_key(name));
+        let dir = self.papers_dir();
+        forget_gone(&mut self.kept_papers, &self.papers, &dir);
     }
+}
+
+/// Drop the names in a kept list whose pictures have really gone.
+///
+/// **"Gone" is a file that is not there, not a picture that would not decode**,
+/// and the difference is the whole of this function. A PNG that will not decode
+/// is skipped by [`read_masks`] with a warning, so it is not in `held` — and a
+/// rule reading only `held` would delete the user's record that they imported
+/// it while leaving the file on disk for ever, unreachable and undeletable from
+/// inside Umber. That is [`free_stem`]'s rule turned round: the allocator was
+/// taught that a broken file still owns its name, and the sweep has to agree,
+/// or the two disagree about what the library holds.
+///
+/// What it really removes is a name whose picture was deleted from outside
+/// Umber, or a library copied without its pictures, which would otherwise keep
+/// a row in the browser for ever with nothing behind it.
+fn forget_gone(kept: &mut Vec<String>, held: &BTreeMap<String, Arc<TipMask>>, dir: &Path) {
+    kept.retain(|name| held.contains_key(name) || dir.join(format!("{name}.png")).exists());
 }
 
 /// Which of `held` is named by nothing in `referenced`.
@@ -2232,8 +2283,9 @@ mod tests {
         let scratch = Scratch::new("kept-tip");
         let mut library = UserLibrary::load_from(scratch.path()).expect("load");
         let mask = TipMask::new(4, 4, vec![7; 16]).expect("mask");
-        let name = library.add_tip("Rough edge.png", mask).expect("add");
-        assert_eq!(name, "rough-edge-png");
+        // A file stem, which is what the only real caller passes.
+        let name = library.add_tip("Rough edge", mask).expect("add");
+        assert_eq!(name, "rough-edge");
         assert!(scratch.tip_file(&name).exists());
 
         // A save is what runs the prune, and this one names no tip at all.
@@ -2381,6 +2433,43 @@ mod tests {
             fs::read(scratch.tip_file("user-nib")).expect("read"),
             b"not a png"
         );
+    }
+
+    /// The other half of that rule, and it was the wrong way round: the
+    /// allocator was taught that a broken file still owns its name and the
+    /// *sweep* was not, so the first write after a corrupted picture appeared
+    /// destroyed the user's record of having imported it — while leaving the
+    /// file on disk for ever, unreachable and undeletable from inside Umber.
+    #[test]
+    fn a_kept_picture_that_will_not_decode_keeps_its_place() {
+        let scratch = Scratch::new("broken-kept");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let name = library
+            .add_tip("Nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+
+        // Corrupt it behind Umber's back and reload, which is how it would
+        // really happen — a truncated copy, a sync conflict.
+        fs::write(scratch.tip_file(&name), b"not a png").expect("corrupt");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(library.tip(&name).is_none(), "it should not have decoded");
+        assert!(!library.warnings().is_empty(), "and it should have said so");
+
+        // Any write runs the sweep.
+        library
+            .save(BrushPreset::unsaved("Round", Brush::default()), None)
+            .expect("save");
+        assert!(
+            scratch.tip_file(&name).exists(),
+            "the file was left orphaned"
+        );
+
+        // Put a readable picture back under the same name and it is still the
+        // stamp the user imported, rather than one the library has forgotten.
+        let good = TipMask::new(2, 2, vec![9; 4]).expect("mask");
+        fs::write(scratch.tip_file(&name), good.to_png().expect("png")).expect("repair");
+        let library = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(library.tip(&name).is_some());
     }
 
     #[test]

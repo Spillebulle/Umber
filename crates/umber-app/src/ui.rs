@@ -2669,17 +2669,30 @@ fn paper_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                     chosen = Some(Some(name.clone()));
                 }
             }
-            // A name with no tile behind it: a library copied without its
-            // `papers/` directory. Said out loud rather than left out, or the
-            // picker would name one of Umber's three for a brush that is
-            // painting flat. See `BrushPreset::paper`.
+            // A name the brush carries that this list has not already drawn.
+            // Two of them, and they must not be told apart by anything but the
+            // **resolver**: `Editor::paper_tile` reads the user's library and
+            // then the shipped table, so a name is missing only when *it*
+            // answers nothing. Testing `ed.papers` alone said "not in your
+            // library" about a shipped tile the brush was visibly painting
+            // through — three modules with three definitions of "resolves",
+            // two of them on screen together.
             if let Some(name) = ed
                 .paper_name
                 .as_deref()
                 .filter(|name| !ed.papers.contains_key(*name))
             {
                 ui.separator();
-                let _ = ui.selectable_label(true, format!("{name} — not in your library"));
+                let _ = match ed.paper_tile() {
+                    // One Umber ships, named rather than chosen through the
+                    // enum — an imported preset can do that.
+                    Some(_) => ui.selectable_label(true, format!("{name} — shipped with Umber")),
+                    // Nothing behind it at all: a library copied without its
+                    // `papers/` directory. Said out loud rather than left out,
+                    // or the picker would name one of Umber's three for a brush
+                    // that is painting flat. See `BrushPreset::paper`.
+                    None => ui.selectable_label(true, format!("{name} — not in your library")),
+                };
             }
             ui.separator();
             if ui.selectable_label(false, "Browse papers…").clicked() {

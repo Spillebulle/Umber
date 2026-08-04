@@ -133,6 +133,16 @@ pub mod dropped {
     /// [`UNUSABLE_TIP`] gives for the analogous tip, and for the same reason:
     /// a substituted paper is a grain nobody drew.
     pub const PAPER_TEXTURE: &str = "the paper texture's own picture";
+    /// The paper that *did* arrive is the material's thumbnail, not its full
+    /// pixels — [`THUMBNAIL_TIP`]'s twin, and needed for a sharper reason. The
+    /// tile size comes from the file's own `TextureScale2`, which describes the
+    /// real texture, so a thumbnail is stretched to the author's spatial
+    /// frequency at a fraction of the author's detail: soft blotches where
+    /// there was tooth. And a preview render is under no obligation to *tile*,
+    /// so a paper that arrives this way may well be reported as drawing a grid
+    /// — which it will, because of this and not because the author's texture
+    /// was bad.
+    pub const THUMBNAIL_PAPER: &str = "paper textures at their full resolution";
     /// Umber has no tilt input on any platform it runs on, so a tilt mapping
     /// could only ever be evaluated at a value the pen never reports.
     pub const TILT_INPUT: &str = "settings driven by pen tilt";
@@ -782,11 +792,24 @@ fn tar_member(archive: &[u8], wanted: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Decode a material's thumbnail to straight-alpha, sRGB RGBA8.
+/// Decode a material's thumbnail to straight-alpha, sRGB RGBA8, for the paper
+/// reading.
 ///
-/// Split out from the two readings above it so that a tip and a paper come out
-/// of one decoder: the material is the same PNG either way, and what differs is
-/// only what its texels are taken to *mean*.
+/// **Not shared with [`mask_from_thumbnail`], which keeps its own decoder**, and
+/// that is worth stating because it looks like an oversight. The tip reading is
+/// `alpha × (1 − Rec.601 luma)` computed in place; this one has to hand whole
+/// pixels to [`crate::tip::grain_of`], which is the *shared* rule — the one an
+/// interactive paper import goes through as well, and Rec.709 like every other
+/// luminance in `umber-core`. Merging the two would mean choosing one set of
+/// luma weights for both, which is a change to what every existing tip import
+/// produces, for no gain: on the neutral grey a paper material actually is, the
+/// two agree exactly.
+///
+/// `Transformations::ALPHA` is what lets the match below cover only two colour
+/// types; a shape that guessed at an alpha for the other three would be the
+/// silent kind of wrong. `a_greyscale_paper_material_decodes` pins that the
+/// expansion really happens, because a real material's thumbnail is as likely
+/// to be greyscale as RGBA.
 fn thumbnail_rgba(png_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     // Expands a palette or a low bit depth, and 16-bit down to 8, and adds the
@@ -1222,8 +1245,14 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
         // nothing ever samples. A `.sutg` is fifteen of them.
         if brush.has_grain() {
             paper = paper_for(reference, materials);
-            if paper.is_none() {
-                push_once(&mut dropped, dropped::PAPER_TEXTURE);
+            match paper {
+                // What arrived is the thumbnail, exactly as a tip is, and it
+                // has to be named for the same reason — see `THUMBNAIL_PAPER`.
+                // Reporting the loss only when the paper is *missing* would be
+                // a brush claiming to carry its author's texture while
+                // carrying a preview of it.
+                Some(_) => push_once(&mut dropped, dropped::THUMBNAIL_PAPER),
+                None => push_once(&mut dropped, dropped::PAPER_TEXTURE),
             }
         }
     }
@@ -1686,7 +1715,52 @@ mod tests {
         ])
     }
 
+    /// A material whose thumbnail is an 8-bit **greyscale** PNG with no alpha
+    /// channel — which is what a real paper material's preview is as likely to
+    /// be as RGBA, and the case `thumbnail_rgba` leans on
+    /// `Transformations::ALPHA` to expand.
+    fn grey_material(w: u32, h: u32, value: u8) -> Vec<u8> {
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, w, h);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("fixture png header");
+            writer
+                .write_image_data(&vec![value; (w * h) as usize])
+                .expect("fixture png data");
+        }
+        tar(&[
+            ("catalog.zip", vec![0x89, b'C', b'2', b'F']),
+            ("thumbnail/thumbnail.png", png_bytes),
+            ("icedata/layerData.xml", b"<infolist/>".to_vec()),
+        ])
+    }
+
     // ----------------------------------------------------------------- tests
+
+    /// `thumbnail_rgba` matches only the two colour types that carry an alpha
+    /// channel and relies on `Transformations::ALPHA` to expand the other
+    /// three. Nothing exercised that: the RGBA fixture takes the first arm
+    /// whatever the transformation does. If the expansion ever stopped
+    /// happening, every paper import would quietly degrade to "paints flat"
+    /// with a loss notice, which reads as the feature not working.
+    #[test]
+    fn a_greyscale_paper_material_decodes() {
+        let path = ".:paper:data:material_0.layer";
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 60),
+            )],
+            &[(path, grey_material(4, 4, 200))],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        let paper = tool.paper.as_ref().expect("a greyscale thumbnail decodes");
+        assert_eq!(paper.at(1, 1), 200, "brightness straight through");
+    }
 
     #[test]
     fn a_single_sub_tool_arrives_with_its_name_and_size() {
@@ -2690,6 +2764,10 @@ mod tests {
         assert!((tool.brush.grain_scale - 64.0).abs() < 1e-4);
         assert!(tool.brush.has_grain());
         assert!(!tool.dropped.contains(&dropped::PAPER_TEXTURE));
+        // But it is the material's *thumbnail*, which is a loss of its own and
+        // has to be named — a brush claiming to carry its author's texture
+        // while carrying a preview of it is the quiet kind of wrong.
+        assert!(tool.dropped.contains(&dropped::THUMBNAIL_PAPER));
 
         // Brightness, not ink: a mid-grey paper keeps about half the dab.
         // Read the other way round this tile would keep the other half, which

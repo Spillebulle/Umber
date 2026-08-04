@@ -475,6 +475,15 @@ pub mod metrics {
     pub const STAMP_LIBRARY: [f32; 2] = [520.0, 360.0];
     /// The square one stamp or paper is previewed in, in the browser's rows.
     pub const STAMP_PREVIEW: f32 = 44.0;
+    /// One row of that browser, gap excluded.
+    ///
+    /// Stated rather than measured, because the list uses `show_rows` and has
+    /// to know the height before it lays a row out — which is the whole point:
+    /// a row that is laid out box-averages a picture of up to four million
+    /// texels and uploads a texture. [`STAMP_PREVIEW`] plus the row frame's own
+    /// six points of padding either side; the two lines of text beside the
+    /// square are shorter than it and neither wraps.
+    pub const STAMP_ROW: f32 = STAMP_PREVIEW + 12.0;
     /// The tallest a dropdown's menu grows before it scrolls.
     ///
     /// Some of the lists are long — thirteen dab inputs, ten blend modes, a
