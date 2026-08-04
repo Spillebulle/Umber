@@ -3050,4 +3050,49 @@ mod tests {
         }
         println!("wrote 6 shots to {}", dir.display());
     }
+
+    /// The tool options strip, with the brush in hand and at three widths.
+    ///
+    /// The stabiliser is a third `widgets::inline_slider` beside size and
+    /// opacity rather than the `widgets::chip` it was, and the two things worth
+    /// looking at are whether three rails on a 36-point strip read as three
+    /// controls and whether the budget that drops them one at a time drops them
+    /// where it says it does.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app options_strip_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn options_strip_preview() {
+        use crate::docshot;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // Wide enough for all three, for two of them, and for one.
+        for (n, width) in [900.0_f32, 560.0, 380.0].into_iter().enumerate() {
+            let mut ed = Editor::default();
+            ed.layout = crate::dock::Layout::default();
+            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let field = vec2(width, metrics::OPTIONS_STRIP);
+            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                    .show(root, |ui| {
+                        ui.set_height(metrics::OPTIONS_STRIP);
+                        super::options_strip(ui, &palette, &mut ed);
+                    });
+            });
+            let name = format!("strip-{}-{width:.0}.png", n + 1);
+            docshot::write_png(&dir.join(name), &image).expect("write the png");
+        }
+        println!("wrote 3 strips to {}", dir.display());
+    }
 }

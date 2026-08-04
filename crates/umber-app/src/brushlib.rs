@@ -2909,6 +2909,78 @@ mod tests {
         );
     }
 
+    /// The library browser, with a shipped brush and one of the user's own in
+    /// the same list.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is:
+    /// what changed is *which of three marks on a row is alive*, and the only
+    /// question worth asking about that is whether somebody can tell the live
+    /// pencil from the dead rename and bin beside it — which no assertion about
+    /// widgets can answer. The row is also the one place three 18-point marks
+    /// share a 40-point row with a name, a sample and a credit line.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app brush_library_browser_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn brush_library_browser_preview() {
+        use crate::dock::Layout;
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::Palette;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        let mut ed = Editor::default();
+        ed.layout = Layout::default();
+        // One brush past the shipped library, which is what `Index::is_user`
+        // reads, so the list holds both a row whose three marks are all live
+        // and rows where only the pencil is.
+        // Named to match the search below and filed in "My brushes", which
+        // `Index::rank` puts first — so the row where all three marks are live
+        // is the top one, directly above the shipped rows where only the pencil
+        // is.
+        let mut mine = preset("user/mine", "Round, mine", "My brushes");
+        mine.collection = Some("My brushes".to_owned());
+        ed.presets.push(mine);
+        let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+
+        let [w, h] = metrics::BRUSH_LIBRARY;
+        let field = vec2(w + 48.0, h + 48.0);
+        let image = stage.shoot(field, 1.5, &palette, palette.backdrop, |root| {
+            // Re-seeded every frame: `load` would otherwise reach the brush
+            // library of whoever is running this, and the browser would open on
+            // their collection rather than on Umber's.
+            store(
+                root.ctx(),
+                State {
+                    index: Arc::new(Index::build(&ed.presets, &[])),
+                    store: Store::Broken("no library".to_owned()),
+                    query: "round".to_owned(),
+                    scope: Scope::All,
+                    browser_open: true,
+                    saving: None,
+                    renaming: None,
+                    confirming: None,
+                    creating: None,
+                    drag: None,
+                    notice: None,
+                },
+            );
+            super::dialogs(root, &palette, &mut ed);
+        });
+        docshot::write_png(&dir.join("browser.png"), &image).expect("write the png");
+        println!("wrote the browser to {}", dir.display());
+    }
+
     fn preset(id: &str, name: &str, category: &str) -> BrushPreset {
         BrushPreset {
             id: id.to_owned(),
