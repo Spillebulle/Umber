@@ -151,8 +151,9 @@ else, which is what a fix aimed at that reason would actually ship.
 | dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 2 |
 | bitmap tips stored outside the file | 0 | 0 | 0 | 10 | 0 | 10 | 3 |
 | square brush shapes | 0 | 0 | 5 | 2 | 0 | 7 | 0 |
-| a paper texture whose strength varies over the stroke | 0 | 1 | 5 | 0 | 0 | 6 | 4 |
+| a paper texture whose strength varies over the stroke | 0 | 1 | 5 | 0 | 0 | 6 | 1 |
 | brush-tip density | 0 | 0 | 5 | 0 | 0 | 5 | 1 |
+| a paper texture whose cutoff Krita applies before scaling its pattern | 0 | 0 | 4 | 0 | 0 | 4 | 0 |
 | brush-tip randomness | 0 | 0 | 4 | 0 | 0 | 4 | 0 |
 | edge sharpening | 0 | 1 | 1 | 2 | 0 | 4 | 1 |
 | star-shaped brushes | 0 | 0 | 1 | 2 | 0 | 3 | 1 |
@@ -162,9 +163,12 @@ else, which is what a fix aimed at that reason would actually ship.
 | masking brushes | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
 
 333 refused in all, against 252 shipped. **"paper texture" used to be one row of
-31, eleven of them alone**; it is two rows of 18 and 6 now, because the pattern
-itself comes across and only the parts of Krita's texture option Umber has no
-model for are left. See the section under the Krita reader.
+31, eleven of them alone**; it is three rows now, because the pattern itself
+comes across and what is left is the parts of Krita's texture option Umber has
+no model for, which are not one thing. Ten presets are refused for paper
+reasons and nothing else, and the **alone** column no longer adds up to that:
+three of the ten carry two paper losses at once, so they are alone under
+neither. See the section under the Krita reader.
 
 **Thirteen more presets are refused whole, before a brush comes out of them**,
 because they name one of Krita's other paint engines: `experimentbrush` ×4,
@@ -972,16 +976,18 @@ Ten presets are still refused for paper alone, and the order of the two
 remaining features is **not** the order it looked in before the tiles could be
 read:
 
-| Missing | Refused alone | What it needs |
+| Missing | Presets waiting on it | What it needs |
 |---|---:|---|
 | a grain strength that follows pressure | 4 | `grain` per dab rather than per pass: instance data, `StrokeBuilder`, a curve or a `dynamics` target, a control |
 | Krita's Subtract | 3 | a `GrainMode` on `Brush`, a scalar in `DabParams`, a `select` in `dab.wgsl`, a control, a GPU test |
 | Height ×2, Hard Mix ×1 | 3 | the same shader work again, twice more, for one preset each |
+| levelling the pattern before it is scaled | 0 | nothing on its own: all four that name it also want the pressure curve above |
 
 All four of the pressure-curve group are Raghukamath's and all four are
-*Multiply* — their tiles are already correct and only the ramp is missing. The
-Subtract three are "Pack01 Chalk02", "Pack01 Crayon09" and "GDquest Rock Texture
-Crevaces".
+*Multiply*, so their tiles come across; what is missing is the ramp, and — for
+all four of them, which is why the last row buys nothing on its own — the order
+of the levelling against the scale. The Subtract three are "Pack01 Chalk02",
+"Pack01 Crayon09" and "GDquest Rock Texture Crevaces".
 
 Neither was built. Each buys three or four brushes for a change that reaches the
 dab pipeline or the shader plus a control in the brush editor, where the bake

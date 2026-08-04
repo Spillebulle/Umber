@@ -355,7 +355,16 @@ fn sibling_files(path: &Path, directory: &'static str) -> impl Fn(&str) -> Optio
     move |wanted: &str| {
         // A file name, never a path: `../../etc/passwd` in a preset must not
         // reach outside the pack.
-        if wanted.contains(['/', '\\']) || wanted.is_empty() {
+        //
+        // The colon is in the set for Windows alone, and it is not decoration.
+        // `PathBuf::join` replaces the base entirely when what it is given is
+        // drive-relative, so `C:passwd` — which holds neither separator — would
+        // resolve against the current directory of the C: drive rather than
+        // against the pack. `kpp.rs` already reduces a pattern's name to its
+        // last component before this is called, so nothing in the packs can
+        // reach it; the guard is what makes the sentence above true rather than
+        // true-by-luck for the next caller.
+        if wanted.contains(['/', '\\', ':']) || wanted.is_empty() {
             return None;
         }
         let here = here.as_ref()?;

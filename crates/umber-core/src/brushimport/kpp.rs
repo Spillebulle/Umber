@@ -167,7 +167,11 @@
 //!   whole of it is a 256-entry table applied once at import — where a shader
 //!   would pay for it on every fragment of every dab for ever, and `Brush`
 //!   would have to grow six `Copy` fields and six controls to carry settings
-//!   that describe a *picture* rather than a brush.
+//!   that describe a *picture* rather than a brush. Krita applies that pipeline
+//!   *after* it resamples the pattern and this applies it before, which is the
+//!   same picture for as long as the table is affine and is not once a cutoff
+//!   thresholds — [`PAPER_LEVELS_AFTER_SCALE`] names the one case where both
+//!   halves are true.
 //! - **The blending mode is the one part that cannot be**, and it is why a
 //!   texture is still named as a loss rather more often than not.
 //!   `TexturingMode` 0 is Multiply, and Krita has **two** arithmetics for it —
@@ -1560,11 +1564,11 @@ impl TipSpec {
 ///
 /// The other fifteen subtract, darken, dodge, burn, threshold, or replace the
 /// dab's colour outright (`LIGHTNESS`, `GRADIENT`). Four of them are in the
-/// packs: Subtract (14 presets), which is `max(0, alpha − mask)` and no
-/// `mix(1.0, tile, strength)` can stand in for at any tile; a linear dodge; Hard
-/// Mix (softer); and Height ×2. They are named rather than approximated, which
-/// is this reader's standing rule and the reason `build-brush-library.rs`
-/// refuses them.
+/// packs, at the enum's own indices: Subtract (1, 14 presets), which is
+/// `max(0, alpha − mask)` and no `mix(1.0, tile, strength)` can stand in for at
+/// any tile; Colour Dodge (6); Hard Mix softer (11); and Height (12) ×2. They
+/// are named rather than approximated, which is this reader's standing rule and
+/// the reason `build-brush-library.rs` refuses them.
 const MULTIPLY: i32 = 0;
 
 /// A texture Umber cannot reproduce, because Krita composites its mask with the
@@ -1596,13 +1600,46 @@ pub const UNREADABLE_PATTERN: &str = "a paper texture whose pattern Umber cannot
 pub const PAPER_STRETCHED: &str =
     "a paper texture that is not square (stretched to fit a square tile)";
 
+/// Krita levels the pattern **and then** scales it; Umber levels it and lets
+/// the sampler scale it. The two only commute while the levels are affine.
+///
+/// `recalculateMask` resamples the QImage with `Qt::SmoothTransformation` and
+/// runs its per-texel pipeline over the result, where [`TextureSpec::levels`]
+/// runs over the stored texels and the hardware scales what comes out. Every
+/// step of the pipeline but one is affine on the value, so for almost every
+/// pattern the order cannot be seen — the exception is a **cutoff**, which is a
+/// threshold, and thresholding before and after a resample are different
+/// pictures: measured against Krita's own order on the fetched packs, a tile
+/// with a live cutoff and a scale below 1 moves the grain's contrast by up to
+/// a fifth.
+///
+/// So it is named exactly where it can be seen: a cutoff whose window really
+/// clips, and a scale that is not 1. Neither alone is enough, and none of the
+/// six presets that ship a paper has both, so this refuses nothing today and
+/// covers the import that would otherwise be quietly wrong.
+///
+/// Levelling *after* is the right way round to keep, for the reason there is no
+/// resampler in `umber-core`: the alternative is a second one here that has to
+/// stay in step with what the sampler does, which is the drift this codebase
+/// refuses everywhere. Note that the sampler's minification is a bilinear tap
+/// with no prefilter where Krita area-averages, so even an affine table is not
+/// bit-for-bit — that difference is the sampler's own, applies to every tiled
+/// texture Umber draws, and is not this sentence's to name.
+pub const PAPER_LEVELS_AFTER_SCALE: &str =
+    "a paper texture whose cutoff Krita applies before scaling its pattern";
+
 /// Krita's texture strength varies over the stroke and Umber's grain is one
 /// number for the whole of it.
 ///
-/// "Varies" rather than "follows pressure", because the sensor is not read: a
-/// strength driven by speed loses exactly as much and would be reported under a
-/// cause that is not its cause. Every one of the six in the fetched packs is
-/// pressure.
+/// **"Varies" rather than "follows pressure", because only the pressure sensor
+/// is examined.** `TextureSpec::read` asks `sensor_curve` for the pressure
+/// curve and takes the identity where there is none, so a strength driven by
+/// speed alone is still reported — through the fallback rather than because it
+/// was recognised, which makes "follows pressure" a cause that would sometimes
+/// not be the cause. The one shape it would miss is a *flat* pressure curve
+/// beside a live curve on another sensor; every one of the 25 curve-bearing
+/// presets in the fetched packs states `<params id="pressure">` and nothing
+/// else, so that shape does not occur here.
 pub const PAPER_UNDER_PRESSURE: &str = "a paper texture whose strength varies over the stroke";
 
 /// What Krita's texture option says, read only where Krita reads it.
@@ -1752,14 +1789,28 @@ impl TextureSpec {
         if self.mode != MULTIPLY {
             return (None, vec![OTHER_TEXTURE_MODE]);
         }
+        // **Both routes are tried, and the embedded one only goes first.** A
+        // preset that embeds its pattern nearly always names its author's own
+        // path beside it — all twenty in the fetched packs do — so an embedded
+        // blob that decodes to something this reader cannot use must not end
+        // the lookup while the bundle holds the picture. The first attempt that
+        // yields a tile wins.
+        let sources: Vec<Vec<u8>> = [
+            self.embedded_png(),
+            self.file.as_ref().and_then(|name| patterns(name)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
         // The two ways there is no tile are two sentences: a pattern this
-        // reader could not find, and one it found and could not read. One
-        // sentence covering both would name "stored outside the file" for a
+        // reader could not find at all, and one it found and could not read.
+        // One sentence covering both would name "stored outside the file" for a
         // picture sitting inside the preset.
-        let Some(png) = self.pattern(patterns) else {
+        if sources.is_empty() {
             return (None, vec![MISSING_PATTERN]);
-        };
-        let Some(paper) = self.tile(&png) else {
+        }
+        let Some(paper) = sources.iter().find_map(|png| self.tile(png)) else {
             return (None, vec![UNREADABLE_PATTERN]);
         };
         // Both of these keep the tile, and that is what separates them from
@@ -1769,6 +1820,11 @@ impl TextureSpec {
         let mut losses = Vec::new();
         if paper.stretched {
             losses.push(PAPER_STRETCHED);
+        }
+        // Only where both halves are true: a threshold that never fires, or a
+        // pattern that is never resampled, leaves the two orders identical.
+        if self.clips() && self.resampled() {
+            losses.push(PAPER_LEVELS_AFTER_SCALE);
         }
         if self.strength_varies {
             losses.push(PAPER_UNDER_PRESSURE);
@@ -1801,12 +1857,47 @@ impl TextureSpec {
     /// already folded into a few lines below. So this answers the pair, and the
     /// caller multiplies the second into the opacity it was going to compute
     /// anyway.
+    ///
+    /// **The fold is exact under the `max` blend and not under build-up**, and
+    /// that is worth stating because it is a property of the *blend* rather
+    /// than of this reader. `max` is positively homogeneous, so
+    /// `max(cov · tile) · s` is `max(cov · tile · s)` and moving the constant
+    /// to commit time changes nothing. Build-up's `a ← c + a(1 − c)` is not, so
+    /// a build-up brush at a plain strength below 1 comes out evenly fainter
+    /// than Krita in the middle of a stroke rather than accumulating from
+    /// scaled dabs. No such brush exists in the packs — the one build-up preset
+    /// is Multiply at full strength, where the fold is the identity — and the
+    /// remedy if one ever does is to name it, not to put the strength back on
+    /// the grain, which would be wrong in the other direction for every brush.
+    ///
+    /// Neither form is exactly *Krita*, and never was: Krita composites every
+    /// dab where Umber saturates with `max`. That is the wet-layer design in
+    /// `CLAUDE.md` and the reason `FlowValue` is folded here too; this makes it
+    /// neither better nor worse.
     fn bite(&self) -> (f32, f32) {
         if self.soft {
             (self.strength, 1.0)
         } else {
             (1.0, self.strength)
         }
+    }
+
+    /// Whether the cutoff window really removes anything.
+    ///
+    /// The one step of [`Self::levels`] that is not affine on the value, and so
+    /// the one that makes levelling and resampling not commute — see
+    /// [`PAPER_LEVELS_AFTER_SCALE`]. A policy of zero is off whatever the
+    /// window says, and a full `0..=255` window clips nothing whatever the
+    /// policy says; seven of the fifteen presets that name a policy are the
+    /// second case, which is Krita's editor leaving the sliders where it found
+    /// them.
+    fn clips(&self) -> bool {
+        self.cutoff_policy != 0 && (self.cutoff_left > 0.0 || self.cutoff_right < 255.0)
+    }
+
+    /// Whether Krita resamples the pattern before levelling it.
+    fn resampled(&self) -> bool {
+        (self.scale - 1.0).abs() > 1e-3
     }
 
     /// Krita's mask pipeline as a table, one entry per greyscale value.
@@ -1875,8 +1966,13 @@ impl TextureSpec {
         let (width, height, rgba) = decode_rgba(png)?;
         // The tile is stored at the pattern's own resolution and stretched over
         // `side × scale` document pixels by the sampler that was going to run
-        // anyway — which is the picture Krita's pre-resample makes, without a
-        // second resampler in `umber-core` to keep in step with the hardware's.
+        // anyway, rather than resampled here — a second resampler in
+        // `umber-core` would have to stay in step with what the hardware does,
+        // which is the drift this codebase refuses everywhere. It is *nearly*
+        // the picture Krita's own pre-resample makes and not exactly it: Krita
+        // levels what it has scaled, and the two orders part company where the
+        // table thresholds. `PAPER_LEVELS_AFTER_SCALE` has the measurement and
+        // names the case.
         //
         // The longer side, because `Brush::grain_scale` is one number and the
         // shader stretches the tile square over it. That changes a non-square
@@ -1908,7 +2004,7 @@ impl TextureSpec {
         })
     }
 
-    /// The pattern's PNG bytes, from inside the preset or from beside it.
+    /// The bytes of the pattern the preset carries inside itself.
     ///
     /// **Krita's embedded pattern is base64 twice**: the option holds the
     /// picture as a base64 string and the properties configuration then encodes
@@ -1916,22 +2012,26 @@ impl TextureSpec {
     /// Sniffing the result rather than decoding a fixed number of times is what
     /// keeps this right for a writer that only does it once.
     ///
-    /// An embedded blob that will not decode **falls through to the file**
-    /// rather than ending the lookup. A preset routinely carries both — every
-    /// one of the twenty embedded patterns also names its author's own path —
-    /// so a `?` inside the first branch would turn one unreadable blob into a
-    /// brush painting flat beside a bundle that holds the picture.
-    fn pattern(&self, patterns: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    /// Whatever the second decode produces is handed back rather than being
+    /// checked for a PNG header here. This is the *finding* step and
+    /// [`Self::tile`] is the reading one; refusing here would make an embedded
+    /// blob that is not a picture indistinguishable from a preset that embeds
+    /// nothing, and those are two different sentences — see
+    /// [`MISSING_PATTERN`] against [`UNREADABLE_PATTERN`].
+    fn embedded_png(&self) -> Option<Vec<u8>> {
         const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-        let embedded = || {
-            let mut raw = base64(self.embedded.as_ref()?)?;
-            if !raw.starts_with(PNG_MAGIC) {
-                raw = base64(std::str::from_utf8(&raw).ok()?)?;
-            }
-            raw.starts_with(PNG_MAGIC).then_some(raw)
-        };
-        embedded().or_else(|| self.file.as_ref().and_then(|name| patterns(name)))
+        let once = base64(self.embedded.as_ref()?)?;
+        if once.starts_with(PNG_MAGIC) {
+            return Some(once);
+        }
+        match std::str::from_utf8(&once).ok().and_then(base64) {
+            Some(twice) => Some(twice),
+            // Not text and not a PNG: hand back the one decode so the caller
+            // reports a pattern it could not *read* rather than one it could
+            // not find.
+            None => Some(once),
+        }
     }
 }
 
@@ -3249,10 +3349,11 @@ mod tests {
         assert!(multiply.dropped.is_empty());
         assert!(multiply.paper.is_some());
 
-        // 1 is Subtract, 6 a linear dodge, 11 Hard Mix (softer) and 12 Height —
-        // the four other modes the fetched packs actually use. Krita has
-        // sixteen and the rest are refused by the same `!= MULTIPLY`, so the
-        // list here is what has been *seen* rather than what is covered.
+        // 1 is Subtract, 6 Colour Dodge, 11 Hard Mix softer and 12 Height — the
+        // four other modes the fetched packs actually use, at `TexturingMode`'s
+        // own indices. Krita has sixteen and the rest are refused by the same
+        // `!= MULTIPLY`, so the list here is what has been *seen* rather than
+        // what is covered.
         for mode in ["1", "6", "11", "12"] {
             let other = with_mode(mode);
             assert_eq!(other.dropped, vec![OTHER_TEXTURE_MODE], "mode {mode}");
@@ -3536,6 +3637,53 @@ mod tests {
         assert!(missing.paper.is_none());
         assert_eq!(missing.brush.grain, 0.0);
         assert_eq!(missing.brush.opacity, 1.0);
+    }
+
+    /// A cutoff is a threshold, and Krita thresholds *before* it scales the
+    /// pattern where Umber thresholds before the sampler scales it. Named
+    /// exactly where both halves are true.
+    ///
+    /// Everything else in the levels pipeline is affine on the value, and an
+    /// affine table commutes with any resample — so a scale on its own, or a
+    /// cutoff on its own, is not a difference anybody can see. Both together
+    /// is: measured against Krita's own order, a live cutoff under a scale
+    /// below 1 moves the grain's contrast by up to a fifth.
+    #[test]
+    fn a_cutoff_under_a_scale_is_named_and_either_alone_is_not() {
+        let png = grey_pattern(2, 2, &[10, 120, 200, 250]);
+        let with = |scale: &str, policy: &str, left: &str, right: &str| {
+            from_kpp(&textured(&format!(
+                "{}{}{}{}{}",
+                embedded_pattern(&png),
+                param("Texture/Pattern/Scale", scale),
+                param("Texture/Pattern/CutoffPolicy", policy),
+                param("Texture/Pattern/CutoffLeft", left),
+                param("Texture/Pattern/CutoffRight", right),
+            )))
+            .expect("decode")
+            .dropped
+        };
+
+        // Both: a window that clips, and a pattern Krita would resample.
+        assert_eq!(
+            with("0.5", "2", "50", "200"),
+            vec![PAPER_LEVELS_AFTER_SCALE]
+        );
+        assert_eq!(with("2", "1", "50", "200"), vec![PAPER_LEVELS_AFTER_SCALE]);
+
+        // A scale with no threshold under it: the table is affine and the two
+        // orders are the same picture. This is where five of the six shipped
+        // papers sit.
+        assert!(with("0.5", "0", "50", "200").is_empty());
+
+        // A threshold at a scale of 1: nothing is resampled, so there is no
+        // order to get wrong.
+        assert!(with("1", "2", "50", "200").is_empty());
+
+        // And a policy whose window is the whole range removes nothing, which
+        // is Krita's editor leaving the sliders where it found them — seven of
+        // the fifteen presets that name a policy.
+        assert!(with("0.5", "2", "0", "255").is_empty());
     }
 
     /// One sentence at most, and the mode wins.
