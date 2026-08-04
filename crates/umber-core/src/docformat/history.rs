@@ -13,10 +13,11 @@
 //! # Slots are not layer identities
 //!
 //! [`crate::history::PixelPatch::slot`] is a texture-array slice, handed out by
-//! [`LayerStack`] and **recycled** when a layer is deleted. That is why
-//! deleting a layer clears the history: a patch replayed into a layer that
-//! merely inherited a slot corrupts it. A slot written into a file and read
-//! back into a different session's allocation is that same bug, made permanent.
+//! [`LayerStack`] and **recycled** — a patch replayed into a layer that merely
+//! inherited a slot corrupts it, which is why a deleted layer's slice is parked
+//! in the undo entry rather than returned. A slot written into a file and read
+//! back into a *different session's* allocation is that same bug with no such
+//! defence, and permanent.
 //!
 //! So a slot is never written. Every entry names a **stack position** instead —
 //! an index into [`super::SaveDocument::layers`], bottom first, which is the
@@ -1198,6 +1199,68 @@ mod tests {
                 Some(body.to_vec())
             }
         })
+    }
+
+    /// A saved history stops at the newest structural entry rather than being
+    /// refused whole.
+    ///
+    /// This revision cannot write an entry that restores a deleted layer — the
+    /// pixels are in a parked slice, which is deliberately not part of the
+    /// picture — and it must not therefore lose the entries *after* one. What
+    /// makes the cut sound rather than arbitrary is the theorem the stepped
+    /// timeline gives: a patch on a deleted layer is necessarily older than the
+    /// delete, so everything newer resolves against the stack as it stands.
+    ///
+    /// `dropped` has to move forward by what was cut, or a reopened list would
+    /// draw its oldest surviving entry as though it were the beginning of the
+    /// document.
+    #[test]
+    fn a_history_with_a_delete_in_it_is_truncated_rather_than_refused() {
+        let stack = stack(&["Paper", "Ink"]);
+        let b = stack.get(1).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 11)));
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 12)));
+        // A structural entry. Its shape names the stack as it stands, which is
+        // all this test needs: what the writer must do with it is refuse to
+        // describe it, whatever it holds.
+        history.record(Edit::new(
+            EditKind::DeleteLayer,
+            EditBody::Structure(Box::new(stack.shape())),
+        ));
+        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
+        assert_eq!((history.len(), history.dropped()), (4, 0));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(back.len(), 1, "the run after the delete is what survives");
+        assert_eq!(back.kind_at(0), Some(EditKind::Erase));
+        assert_eq!(back.position(), 1);
+        assert_eq!(
+            back.dropped(),
+            3,
+            "the list must be able to say it no longer reaches the beginning"
+        );
+    }
+
+    /// A history whose *newest* entry is structural writes nothing at all,
+    /// which is what every build before saved histories did — and it must be a
+    /// quiet absence rather than a warning, because nothing went wrong.
+    #[test]
+    fn a_history_of_nothing_but_structure_saves_none_and_says_nothing() {
+        let stack = stack(&["Paper"]);
+        let mut history = History::default();
+        history.record(Edit::new(
+            EditKind::AddLayer,
+            EditBody::Structure(Box::new(stack.shape())),
+        ));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.open().history.len(), 0);
     }
 
     fn without_entry(bytes: &[u8], name: &str) -> Vec<u8> {

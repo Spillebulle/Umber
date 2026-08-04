@@ -549,6 +549,12 @@ impl UmberApp {
     ///
     /// * A patch is swapped for the pixels it replaces, so the entry that goes
     ///   on the other stack holds what was there a moment ago.
+    /// * A structural entry is swapped for the shape the stack has now, which
+    ///   is the same move one level up and **touches no pixels at all**. A
+    ///   layer this takes out of the stack travels inside the entry that goes
+    ///   on the other stack, holding its texture slice, so nothing else can be
+    ///   given that slice and every recorded patch naming it goes on meaning
+    ///   the pixels it was captured from.
     /// * A flip is **its own inverse**, so it is carried out again and the
     ///   entry that goes on the other stack is the same nothing. This is what
     ///   the history's whole flip design rests on: no coordinate mapping, no
@@ -568,6 +574,17 @@ impl UmberApp {
                 // is what an undo *is*, and the pixels between them were never
                 // touched.
                 EditBody::Pixels(swap_patch(canvas, &gfx.gpu, &patch))
+            }
+            EditBody::Structure(shape) => {
+                let back = self.editor.layers.restore_shape(*shape);
+                // Stepping over an "Add mask" takes the slice away while the
+                // switch still says Mask. `Editor::stroke_target` already falls
+                // back to the layer, so nothing downstream sees an impossible
+                // state; what this stops is the *control* showing one.
+                if self.editor.layers.active_mask().is_none() {
+                    self.editor.edit_target = umber_core::EditTarget::Layer;
+                }
+                EditBody::Structure(Box::new(back))
             }
             EditBody::Flip => {
                 if let Some(axis) = kind.flip_axis() {
@@ -715,6 +732,13 @@ impl UmberApp {
             }
             return false;
         };
+        // The preview takes the slice one past the highest one claimed, which
+        // is above every parked slice by construction — so a float can never be
+        // rendered into a deleted layer's pixels. That also means a history
+        // holding parked layers pushes the number up, and the release below is
+        // what stops an ordinary session of adding and deleting walking it to
+        // the ceiling and refusing every transform from then on.
+        self.free_a_slot();
         let reserved = self.editor.layers.slot_capacity_needed();
         // A lift is clipped by the selection; a paste puts down exactly what it
         // was given, having been masked when it was copied.
@@ -1258,15 +1282,42 @@ impl UmberApp {
         self.editor.mark_modified();
     }
 
+    /// Give the history's oldest entries up until the document has a texture
+    /// slice to hand out, and say whether it now has.
+    ///
+    /// **The one release, in front of the three operations that take a slice**
+    /// — a layer, a mask, a transform's preview — because the ceiling is now
+    /// something a history competes for: a deleted layer's slice is parked in
+    /// the entry that could put it back, so a session of adding and deleting
+    /// can walk the pool empty where before a delete returned the number on the
+    /// spot. It cannot live in `umber-render`, which is where the float's gate
+    /// is and which cannot see a `History`.
+    ///
+    /// A `SlotRoom` rather than the stack itself, because the history is being
+    /// mutated while the question is asked and the two are separate fields.
+    fn free_a_slot(&mut self) -> bool {
+        let room = self.editor.layers.room();
+        self.editor.history.free_until(move || room.has_room())
+    }
+
     fn add_layer(&mut self) {
         // A new layer takes the next slot, which is the one a float would be
         // previewing into. Put the picture down before the two can collide.
         self.finish_transform();
+        self.free_a_slot();
+        // Before the add, so a refusal records nothing. Every entry is `Kept`;
+        // what makes this an undoable *add* is that the new layer is not among
+        // them, so restoring this shape takes it back out — and the entry that
+        // goes on the redo stack is the one that then holds it.
+        let before = self.editor.layers.shape();
         let Some(slot) = self.editor.layers.add() else {
             log::warn!("layer limit reached");
             return;
         };
         let needed = self.editor.layers.slot_capacity_needed();
+        self.editor
+            .history
+            .record(Edit::new(EditKind::AddLayer, before));
         self.editor.mark_modified();
 
         let id = self.editor.session.active_id();
@@ -1289,6 +1340,24 @@ impl UmberApp {
 
     fn delete_layer(&mut self, index: usize) {
         self.delete_entries(&[index]);
+    }
+
+    /// Run a reorder and record it, if it moved anything.
+    ///
+    /// The two chevrons share it so the shape is snapshotted before the move
+    /// and the entry only recorded where one happened — a `MoveLayer` row for a
+    /// drop that changed nothing would be a step the artist could click and see
+    /// nothing undo. The drag in the layers panel does the same thing at its
+    /// own call site, because it holds the `Editor` and not the `App`.
+    fn record_move(&mut self, moved: impl FnOnce(&mut umber_core::LayerStack) -> bool) {
+        let before = self.editor.layers.shape();
+        if !moved(&mut self.editor.layers) {
+            return;
+        }
+        self.editor
+            .history
+            .record(Edit::new(EditKind::MoveLayer, before));
+        self.editor.mark_modified();
     }
 
     /// Delete every ticked layer.
@@ -1333,33 +1402,46 @@ impl UmberApp {
             return;
         }
         self.finish_transform();
-        if self.editor.layers.remove_many(indices).is_none() {
+        // Snapshotted before the removal, because what comes back names the
+        // entries that are about to go and cannot hold them until the stack has
+        // handed them over.
+        let before = self.editor.layers.shape();
+        let Some(gone) = self.editor.layers.remove_many(indices) else {
             return;
-        }
-        // Slots are recycled — both of them, where a layer had a mask — so an
-        // undo entry recorded against a freed slot would later be replayed into
-        // whichever layer or mask inherits it. Dropping history is the blunt but
-        // safe fix; structural undo is the real one.
-        self.editor.history.clear();
+        };
+        // **This is the whole of why deleting a layer no longer clears the
+        // history.** The removed layers travel into the entry, and each owns
+        // its texture slice and its mask's, so neither number can be handed to
+        // the next layer that asks: every recorded patch goes on meaning the
+        // pixels it was captured from, and the deleted layer's slice is left
+        // holding exactly the picture an undo would want to put back. No copy,
+        // no readback, no GPU work at all.
+        self.editor
+            .history
+            .record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
         self.editor.mark_modified();
     }
 
     /// Put the ticked layers — or the selected one — into a new group.
     ///
-    /// **Does not clear the undo history**, and for exactly the reason
-    /// reordering does not: no slot changes hands. A folder holds none at all,
-    /// and the layers moving into it keep the slices they always had, so every
-    /// recorded patch still names the pixels it was captured from.
+    /// Costs the undo history nothing to record, for exactly the reason
+    /// reordering does: no slot changes hands. A folder holds none at all, and
+    /// the layers moving into it keep the slices they always had, so the entry
+    /// is a shape and a name and nothing else.
     fn group_layers(&mut self) {
         // The float previews into a spare slice and is anchored to a layer's
         // slot; grouping moves that layer. Put it down first, exactly as adding
         // a layer does.
         self.finish_transform();
         let targets = self.editor.layers.targets();
+        let before = self.editor.layers.shape();
         if self.editor.layers.group(&targets).is_none() {
             log::warn!("nothing to group, or the stack is full");
             return;
         }
+        self.editor
+            .history
+            .record(Edit::new(EditKind::Group, before));
         self.editor.mark_modified();
     }
 
@@ -1374,10 +1456,18 @@ impl UmberApp {
         if self.editor.layers.locked_at(index) {
             return;
         }
+        self.free_a_slot();
+        // The mask this layer has *now* — none — so restoring this shape takes
+        // the new one off again and parks its slice in the entry that would put
+        // it back.
+        let before = self.editor.layers.shape_with_mask(index);
         let Some(slot) = self.editor.layers.add_mask(index) else {
             return;
         };
         let needed = self.editor.layers.slot_capacity_needed();
+        self.editor
+            .history
+            .record(Edit::new(EditKind::AddMask, before));
         self.editor.mark_modified();
         // Painting the mask is what the painter almost certainly wants next,
         // and the switch is one click away either way.
@@ -1403,9 +1493,9 @@ impl UmberApp {
 
     /// Take the selected layer's mask off.
     ///
-    /// The mask's slice goes back on the free list, so this **clears the undo
-    /// history** for exactly the reason deleting a layer does: a patch recorded
-    /// against that slice would be replayed into whatever inherits it.
+    /// The one structural edit that changes the picture — what the mask hid
+    /// comes back — which is why it is `EditKind::RemoveMask` and not filed
+    /// under deleting a layer.
     fn remove_mask(&mut self) {
         self.finish_transform();
         self.finish_stroke();
@@ -1413,11 +1503,19 @@ impl UmberApp {
         if self.editor.layers.locked_at(index) {
             return;
         }
+        // The claim is *cloned* into the shape before the layer's own copy is
+        // taken away, so the slice stays alive with the entry holding it. That
+        // is what stopped this clearing the whole history: dropping the claim
+        // here would put the number straight back on the free list, and a patch
+        // recorded against it would be replayed into whatever inherited it.
+        let before = self.editor.layers.shape_with_mask(index);
         if self.editor.layers.remove_mask(index).is_none() {
             return;
         }
         self.editor.edit_target = umber_core::EditTarget::Layer;
-        self.editor.history.clear();
+        self.editor
+            .history
+            .record(Edit::new(EditKind::RemoveMask, before));
         self.editor.mark_modified();
     }
 
@@ -2464,12 +2562,10 @@ impl UmberApp {
             self.delete_picked_layers();
         }
         if let Some(index) = actions.move_layer_up {
-            self.editor.layers.move_up(index);
-            self.editor.mark_modified();
+            self.record_move(|layers| layers.move_up(index).is_some());
         }
         if let Some(index) = actions.move_layer_down {
-            self.editor.layers.move_down(index);
-            self.editor.mark_modified();
+            self.record_move(|layers| layers.move_down(index).is_some());
         }
         if actions.fit_view {
             self.editor.fit_view();

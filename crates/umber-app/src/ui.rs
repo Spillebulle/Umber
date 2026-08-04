@@ -86,8 +86,8 @@ pub struct UiActions {
     pub move_layer_up: Option<usize>,
     pub move_layer_down: Option<usize>,
     /// Give the selected layer a mask, or take its mask off. The caller's,
-    /// because a new mask has to be filled white on the GPU and a removed one
-    /// clears the undo history.
+    /// because a new mask has to be filled white on the GPU and both have to be
+    /// recorded in the history.
     pub add_mask: bool,
     pub remove_mask: bool,
     /// Make this document active. Every document has GPU storage of its own,

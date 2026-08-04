@@ -1401,4 +1401,373 @@ mod tests {
         while h.take_undo().is_some() {}
         assert_eq!(h.used_bytes(), 0);
     }
+
+    // --- structural entries -------------------------------------------------
+
+    /// A CPU stand-in for a document: the layer stack, and one small canvas per
+    /// texture slice.
+    ///
+    /// The claim structural undo rests on is not about the history's
+    /// bookkeeping — it is that a slice parked in an undo entry is never handed
+    /// to another layer, so a patch recorded against it goes on meaning the
+    /// pixels it was captured from. That is a statement about *who holds which
+    /// number*, and no GPU is needed to check it.
+    struct Doc {
+        stack: LayerStack,
+        /// Indexed by slot. Four bytes a pixel, like the real thing.
+        slices: Vec<Vec<u8>>,
+        w: u32,
+        h: u32,
+    }
+
+    impl Doc {
+        fn new(w: u32, h: u32) -> Self {
+            Self {
+                stack: LayerStack::new(),
+                slices: Vec::new(),
+                w,
+                h,
+            }
+        }
+
+        fn slice(&mut self, slot: u32) -> &mut Vec<u8> {
+            let blank = vec![0u8; (self.w * self.h * 4) as usize];
+            while self.slices.len() <= slot as usize {
+                self.slices.push(blank.clone());
+            }
+            &mut self.slices[slot as usize]
+        }
+
+        fn read(&mut self, slot: u32, rect: PixelRect) -> Vec<u8> {
+            let w = self.w;
+            let px = self.slice(slot).clone();
+            let mut out = Vec::with_capacity((rect.area() * 4) as usize);
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    let i = ((y * w + x) * 4) as usize;
+                    out.extend_from_slice(&px[i..i + 4]);
+                }
+            }
+            out
+        }
+
+        fn write(&mut self, slot: u32, rect: PixelRect, bytes: &[u8]) {
+            let w = self.w;
+            let px = self.slice(slot);
+            let mut i = 0;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    let d = ((y * w + x) * 4) as usize;
+                    px[d..d + 4].copy_from_slice(&bytes[i..i + 4]);
+                    i += 4;
+                }
+            }
+        }
+
+        /// Paint a rectangle of one slice flat, recording what was there — a
+        /// stroke's commit, in miniature.
+        fn paint(&mut self, slot: u32, rect: PixelRect, fill: u8) -> PixelPatch {
+            let before = self.read(slot, rect);
+            self.write(slot, rect, &vec![fill; before.len()]);
+            PixelPatch::new(rect, slot, before)
+        }
+
+        /// Step one entry backwards the way `App::reverse` does.
+        fn reverse(&mut self, edit: Edit) -> Edit {
+            let body = match edit.body {
+                EditBody::Pixels(patch) => {
+                    let now = self.read(patch.slot, patch.rect);
+                    let was = patch.pieces()[0].bytes().to_vec();
+                    self.write(patch.slot, patch.rect, &was);
+                    EditBody::Pixels(PixelPatch::new(patch.rect, patch.slot, now))
+                }
+                EditBody::Structure(shape) => {
+                    EditBody::Structure(Box::new(self.stack.restore_shape(*shape)))
+                }
+                EditBody::Flip => EditBody::Flip,
+            };
+            Edit::made_at(edit.kind, edit.at, body)
+        }
+    }
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> PixelRect {
+        PixelRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// The claim the whole design rests on, end to end.
+    ///
+    /// A structural entry stores **no pixels**: the deleted layer travels
+    /// inside it, holding its texture slice, and the slice goes on holding
+    /// exactly the picture an undo would want to put back. That is only sound
+    /// if two things hold, and both are asserted here — a layer added *after*
+    /// the delete must not be given the parked number, and stepping back over
+    /// the delete must put every older patch in the layer it was recorded in.
+    ///
+    /// The shape of `stepping_back_over_a_flip_puts_older_patches_where_they_
+    /// were_recorded`, and for the identical reason: the stepped-not-seeked
+    /// guarantee, one level up.
+    #[test]
+    fn stepping_back_over_a_delete_puts_older_patches_in_the_layer_they_were_recorded_in() {
+        let mut doc = Doc::new(8, 6);
+        let mut h = History::default();
+
+        let bottom = doc.stack.active_slot().expect("a fresh stack has a layer");
+        let victim = doc.stack.add().expect("room for a second layer");
+        assert_ne!(bottom, victim);
+
+        // Paint on both, recording each — the first is the patch that must
+        // survive the delete above it.
+        let mark = rect(0, 0, 3, 2);
+        h.record(Edit::new(EditKind::Paint, doc.paint(bottom, mark, 200)));
+        let bottom_after_paint = doc.read(bottom, mark);
+        doc.paint(victim, mark, 111);
+        let victim_pixels = doc.read(victim, mark);
+
+        // Delete the top layer, holding it in the entry.
+        let before = doc.stack.shape();
+        let gone = doc.stack.remove_many(&[1]).expect("the top layer can go");
+        h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+        assert_eq!(doc.stack.len(), 1);
+
+        // **The parked slice is not handed out.** A new layer takes a fresh
+        // number, so the deleted layer's pixels are still there to come back.
+        let fresh = doc.stack.add().expect("room for another layer");
+        assert_ne!(fresh, victim, "a parked slice was handed to a new layer");
+        h.record(Edit::new(EditKind::AddLayer, doc.stack.shape()));
+        doc.paint(fresh, mark, 42);
+        h.record(Edit::new(EditKind::Paint, doc.paint(fresh, mark, 7)));
+
+        assert_eq!(
+            (0..h.len())
+                .map(|i| h.kind_at(i).unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                EditKind::Paint,
+                EditKind::DeleteLayer,
+                EditKind::AddLayer,
+                EditKind::Paint,
+            ]
+        );
+
+        // All the way back.
+        while let Some(e) = h.take_undo() {
+            let back = doc.reverse(e);
+            h.push_redo(back);
+        }
+
+        assert_eq!(doc.stack.len(), 2, "the deleted layer did not come back");
+        assert_eq!(
+            doc.stack.get(1).and_then(Layer::slot),
+            Some(victim),
+            "it came back holding a different slice"
+        );
+        assert_eq!(
+            doc.read(victim, mark),
+            victim_pixels,
+            "the parked slice lost its picture"
+        );
+        assert_eq!(
+            doc.read(bottom, mark),
+            vec![0; bottom_after_paint.len()],
+            "the patch recorded before the delete landed in the wrong pixels"
+        );
+
+        // And forward again, to exactly where it was.
+        while let Some(e) = h.take_redo() {
+            let back = doc.reverse(e);
+            h.push_undo(back);
+        }
+        assert_eq!(h.position(), 4);
+        assert_eq!(doc.stack.len(), 2);
+        assert_eq!(doc.read(bottom, mark), bottom_after_paint);
+        assert_eq!(doc.read(fresh, mark), doc.read(fresh, mark));
+    }
+
+    /// The rule that would otherwise ship broken, and be found by a painter.
+    ///
+    /// A `Kept` row carries an id and a depth and **nothing else**, so undoing
+    /// a move cannot revert a property changed after it. A snapshot of the whole
+    /// `Vec` — the tempting shape, and one inverse rule for every operation
+    /// there will ever be — would make an undo damage something it was never
+    /// asked about.
+    #[test]
+    fn undoing_a_reorder_does_not_put_back_an_opacity_changed_since() {
+        let mut doc = Doc::new(4, 4);
+        doc.stack.add();
+        doc.stack.add();
+        let names: Vec<String> = doc.stack.layers().iter().map(|l| l.name.clone()).collect();
+
+        let before = doc.stack.shape();
+        assert!(doc.stack.reorder(0, 2), "bottom to top");
+        let entry = Edit::new(EditKind::MoveLayer, before);
+
+        // Afterwards, the artist drags an opacity and renames a layer.
+        doc.stack.get_mut(1).unwrap().opacity = 0.25;
+        doc.stack.get_mut(1).unwrap().name = "Shading".into();
+
+        doc.reverse(entry);
+
+        // Layer 3 was renamed while it sat in the middle, and the undo puts it
+        // back on top — carrying the name and the opacity it has *now*.
+        assert_eq!(
+            doc.stack
+                .layers()
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>(),
+            vec![names[0].clone(), names[1].clone(), "Shading".to_string()],
+            "the order did not come back, or a name travelled to the wrong row"
+        );
+        assert_eq!(
+            doc.stack.get(2).unwrap().opacity,
+            0.25,
+            "undoing a move reverted an opacity set afterwards"
+        );
+    }
+
+    /// A whole folder undoes in **one** entry and one step, with the stack
+    /// never in a state it was not in.
+    ///
+    /// A per-operation inverse would have to delete and re-insert position by
+    /// position, which is where `remove_many`'s reverse loop once deleted a
+    /// layer nobody ticked. A recorded shape describes the whole stack, so
+    /// there is no index arithmetic to get wrong.
+    #[test]
+    fn a_folder_deletion_undoes_in_one_step() {
+        let mut doc = Doc::new(4, 4);
+        doc.stack.add();
+        doc.stack.add();
+        let folder = doc.stack.group(&[1, 2]).expect("the top two");
+        let shape = |s: &LayerStack| -> Vec<(String, u8, bool)> {
+            s.layers()
+                .iter()
+                .map(|l| (l.name.clone(), l.depth, l.is_folder()))
+                .collect()
+        };
+        let inside: Vec<u32> = doc.stack.layers()[1..3]
+            .iter()
+            .filter_map(Layer::slot)
+            .collect();
+        assert_eq!(inside.len(), 2);
+        let was = shape(&doc.stack);
+
+        let before = doc.stack.shape();
+        let gone = doc.stack.remove_many(&[folder]).expect("the group can go");
+        assert_eq!(gone.len(), 3, "the folder and both layers");
+        let entry = Edit::new(EditKind::DeleteLayer, before.with_removed(gone));
+        assert_eq!(doc.stack.len(), 1);
+
+        // Both slices are still claimed, so nothing else can be given them.
+        let fresh = doc.stack.add().expect("room");
+        assert!(!inside.contains(&fresh), "a parked slice was reissued");
+        doc.stack.remove_many(&[doc.stack.active_index()]);
+
+        doc.reverse(entry);
+        assert_eq!(
+            shape(&doc.stack),
+            was,
+            "one step did not put the group back"
+        );
+        assert_eq!(
+            doc.stack.layers()[1..3]
+                .iter()
+                .filter_map(Layer::slot)
+                .collect::<Vec<_>>(),
+            inside,
+            "the layers came back holding different slices"
+        );
+    }
+
+    /// A parked slice is given up when the entry holding it goes, and not
+    /// before — which is what makes the ceiling shorten the history rather than
+    /// refuse a layer.
+    #[test]
+    fn the_slot_ceiling_shortens_the_history_rather_than_refusing_a_layer() {
+        let mut stack = LayerStack::new();
+        let mut h = History::default();
+        let room = stack.room();
+        assert!(room.has_room());
+
+        // Fill the pool by adding and deleting, parking every slice as we go.
+        // Each pass claims one more slice than it gives back, because the
+        // deleted layer travels into the entry.
+        let mut parked = Vec::new();
+        for _ in 0..LayerStack::MAX_SLOTS {
+            if !room.has_room() {
+                break;
+            }
+            let Some(slot) = stack.add() else { break };
+            parked.push(slot);
+            let before = stack.shape();
+            let gone = stack
+                .remove_many(&[stack.active_index()])
+                .expect("the bottom layer stays");
+            h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+        }
+        assert!(!room.has_room(), "the pool never filled");
+        assert!(stack.add().is_none(), "a full pool handed out a slice");
+        let held = h.len();
+        assert!(held > 1);
+
+        // The history gives one back rather than the layer being refused, and
+        // says how many it dropped so the panel can admit the list no longer
+        // reaches the document's beginning.
+        assert!(h.free_until(|| room.has_room()), "no slice came free");
+        assert!(h.len() < held);
+        assert!(h.dropped() > 0);
+        assert!(stack.add().is_some(), "the released slice was not usable");
+    }
+
+    /// A slice is freed exactly once, when the last holder lets go — so an
+    /// entry cloned for inspection cannot hand the number back twice, and a
+    /// mask parked in an entry outlives the layer's own copy of the claim.
+    #[test]
+    fn a_slot_returns_to_the_pool_only_when_the_last_holder_lets_go() {
+        let mut stack = LayerStack::new();
+        let mask = stack
+            .add_mask(0)
+            .expect("a layer with no mask can gain one");
+        let capacity = stack.slot_capacity_needed();
+
+        // The shape clones the claim; the layer's own copy is then taken away.
+        let parked = stack.shape_with_mask(0);
+        assert!(stack.remove_mask(0).is_some());
+        assert_eq!(
+            stack.slot_capacity_needed(),
+            capacity,
+            "the mask's slice came free while an entry still named it"
+        );
+        assert_ne!(
+            stack.add().expect("room"),
+            mask,
+            "a parked slice was reissued"
+        );
+
+        // A clone of the entry is not a second claim.
+        let copy = parked.clone();
+        drop(parked);
+        assert_ne!(
+            stack.add_mask(stack.active_index()).expect("room"),
+            mask,
+            "dropping one of two holders freed the slice"
+        );
+        drop(copy);
+        // Now nothing names it, so the next taker gets it back.
+        let mut freed = Vec::new();
+        while let Some(slot) = stack.add() {
+            freed.push(slot);
+            if freed.len() > LayerStack::MAX_SLOTS as usize {
+                break;
+            }
+        }
+        assert!(
+            freed.contains(&mask),
+            "the last holder let go and nothing did"
+        );
+    }
 }

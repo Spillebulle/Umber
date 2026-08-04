@@ -850,7 +850,10 @@ impl LayerStack {
         }
         self.layers.insert(at + n, folder);
 
-        debug_assert!(well_formed(&self.shape_pairs()), "group left a malformed stack");
+        debug_assert!(
+            well_formed(&self.shape_pairs()),
+            "group left a malformed stack"
+        );
         // The new folder is selected, which is what makes it renameable the
         // moment it exists. Nothing was removed, so no slot changed hands and
         // the layer that *was* selected is still in the stack — inside the
@@ -928,7 +931,10 @@ impl LayerStack {
         let mut layer = Layer::named(&name, self.take_id(), Some(slot));
         layer.depth = depth;
         self.layers.insert(at, layer);
-        debug_assert!(well_formed(&self.shape_pairs()), "add left a malformed stack");
+        debug_assert!(
+            well_formed(&self.shape_pairs()),
+            "add left a malformed stack"
+        );
         self.active = at;
         Some(number)
     }
@@ -1375,7 +1381,10 @@ impl LayerStack {
                 layer
             })
             .collect();
-        debug_assert!(well_formed(&self.shape_pairs()), "reorder left a malformed stack");
+        debug_assert!(
+            well_formed(&self.shape_pairs()),
+            "reorder left a malformed stack"
+        );
         self.active = after
             .iter()
             .position(|(i, _)| *i == was)
@@ -1593,7 +1602,9 @@ impl LayerStack {
                             layer.depth = depth;
                             self.layers.push(layer);
                         }
-                        None => debug_assert!(false, "a recorded shape named an entry that is gone"),
+                        None => {
+                            debug_assert!(false, "a recorded shape named an entry that is gone")
+                        }
                     }
                 }
                 ShapeEntry::Gone { layer } => self.layers.push(layer),
@@ -1767,9 +1778,7 @@ impl StackShape {
                 .iter()
                 .map(|e| match e {
                     ShapeEntry::Kept { .. } => 0,
-                    ShapeEntry::Gone { layer } => {
-                        std::mem::size_of::<Layer>() + layer.name.len()
-                    }
+                    ShapeEntry::Gone { layer } => std::mem::size_of::<Layer>() + layer.name.len(),
                 })
                 .sum::<usize>()
             + self.masks.len() * std::mem::size_of::<(u32, Option<SlotClaim>)>()
