@@ -995,12 +995,10 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
     // four big-endian words. The two are told apart by whether the first bytes
     // are a plausible header size, which for text they never are.
     if let Ok(pipe) = gih::from_gih(raw) {
-        let mut dropped = Vec::new();
-        if pipe.angular {
-            dropped.push(gih::ANGULAR);
-        } else if pipe.animated {
-            dropped.push(gih::ANIMATION);
-        }
+        // The pipe's own list, so a preset whose tip is a `.gih` reports what a
+        // loose `.gih` would — including both losses where a pipe turns *and*
+        // shuffles, which naming one of the two could not.
+        let mut dropped = pipe.sequence_losses();
         if pipe.cells.iter().any(|c| c.coloured) {
             dropped.push(gbr::COLOURED);
         }

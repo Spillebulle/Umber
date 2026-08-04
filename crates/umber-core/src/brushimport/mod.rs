@@ -111,8 +111,11 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
             let pipe = gih::from_gih(&bytes).map_err(|e| e.at(path))?;
             let base = embedded_name(&pipe.name, &stem);
             let many = pipe.cells.len() > 1;
-            let animated = pipe.animated;
-            let angular = pipe.angular;
+            // One list for the whole pipe, from the one place that knows what
+            // its rules mean — a pipe that both turns and shuffles loses both,
+            // which the `if angular … else if animated` this replaced could
+            // never say. The colour is still per cell, below.
+            let sequence = pipe.sequence_losses();
             Ok(pipe
                 .cells
                 .into_iter()
@@ -125,12 +128,7 @@ pub fn read_file(path: &Path) -> Result<Vec<Imported>, PresetError> {
                     } else {
                         base.clone()
                     };
-                    let mut dropped = Vec::new();
-                    if angular {
-                        dropped.push(gih::ANGULAR);
-                    } else if animated {
-                        dropped.push(gih::ANIMATION);
-                    }
+                    let mut dropped = sequence.clone();
                     if cell.coloured {
                         dropped.push(gbr::COLOURED);
                     }
