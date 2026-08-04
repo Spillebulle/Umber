@@ -586,9 +586,11 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// the canvas would read as something selected rather than as somewhere to be.
 ///
 /// These are on screen on every frame of every document — see
-/// `ui::canvas_scrollbars` — so the idle ink is the quietest token there is and
-/// the track is left unpainted. Two permanent filled strips down the edges of a
-/// picture is the furniture that decision is against.
+/// `ui::canvas_scrollbars` — so the idle ink is `rail`, the token a slider's
+/// *track* is drawn in and therefore one chosen to sit behind something rather
+/// than be read, and the track here is left unpainted altogether. Two permanent
+/// filled strips down the edges of a picture is the furniture that decision is
+/// against.
 pub fn canvas_scrollbar(
     ui: &mut Ui,
     p: &Palette,
