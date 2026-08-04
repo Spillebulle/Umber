@@ -209,7 +209,7 @@ Three things follow, and the first two are why the answer is not "downsample".
   masks that ship are shipped at their original resolution**, which needs no cap
   and no re-measurement.
 - **12.4 MB was never the question**, because 315 masks was never the set. The
-  masks the shipping brushes need are 25, and without rubberduck's 10.
+  masks the shipping brushes need are 28, and without rubberduck's 10.
 
 ### The three that ship, and the one that does not
 

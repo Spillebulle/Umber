@@ -147,8 +147,8 @@ else, which is what a fix aimed at that reason would actually ship.
 | animated brush sequences (a `.gih` pipe) | 0 | 12 | 1 | 2 | 252 | 267 | 257 |
 | paper texture | 0 | 11 | 11 | 9 | 0 | 31 | 11 |
 | coloured stamps | 0 | 4 | 7 | 14 | 0 | 25 | 11 |
-| mirrored dabs | 0 | 9 | 3 | 8 | 0 | 20 | 2 |
 | dynamics driven by speed, tilt or stroke position | 0 | 7 | 1 | 12 | 0 | 20 | 3 |
+| mirrored dabs | 0 | 9 | 3 | 8 | 0 | 20 | 2 |
 | a separate paint-deposit rate | 0 | 5 | 1 | 13 | 0 | 19 | 7 |
 | a mask this project does not redistribute | 0 | 0 | 0 | 0 | 17 | 17 | 17 |
 | dab rotation driven by tilt, pen rotation or pressure | 0 | 8 | 1 | 4 | 0 | 13 | 1 |
@@ -160,9 +160,18 @@ else, which is what a fix aimed at that reason would actually ship.
 | star-shaped brushes | 0 | 0 | 1 | 2 | 0 | 3 | 1 |
 | masking brushes | 0 | 1 | 0 | 0 | 0 | 1 | 0 |
 
-Seven more files are refused whole, before a brush comes out of them, because
-they are one of Krita's other paint engines — `spraybrush` ×3,
-`experimentbrush` ×2, `deformbrush`, `hatchingbrush`, all GDQuest's.
+**Thirteen more presets are refused whole, before a brush comes out of them**,
+because they name one of Krita's other paint engines: `experimentbrush` ×4,
+`spraybrush` ×3, `hairybrush` ×2, `deformbrush` ×2, `hatchingbrush`,
+`roundmarker` — GDQuest 7, Raghukamath 4, Revoy 2.
+
+Only GDQuest's seven appear in the run's own output, and that is a hole worth
+naming rather than rounding off: GDQuest ships loose `.kpp`, so each refusal is
+a file `read_file` failed on, where the other six are *inside* bundles.
+`BundleContents::refused` records them and `brushimport::read_file`'s `bundle`
+arm throws it away, so nothing downstream can see them. Six brushes are missing
+from a table this section calls the honest answer, which is exactly the shape of
+omission the table exists against.
 
 Three things the table says that are worth reading twice.
 
@@ -180,11 +189,15 @@ Three things the table says that are worth reading twice.
   same claim.
 - **`umber-core::dynamics` exists and `kpp.rs` does not use it.** That row is a
   refusal the *reader* makes rather than one the engine forces, and its own
-  wording is wrong about these packs. All 20 are `fuzzy` — Krita's per-dab
-  random — either alone (9) or compounded with pressure (11), plus one `speed`
-  and one `fuzzystroke`. Umber has had `DabInput::Random` and `DabInput::Speed`
-  since the MyPaint importer needed them, so **19 of the 20 name an input the
-  engine can drive**; only `fuzzystroke`, a draw held for a whole stroke, has no
+  wording is wrong about these packs — no dynamic in any of them is driven by
+  tilt or by stroke position. **19 of the 20 name `fuzzy`**, Krita's per-dab
+  random: 9 alone, and 10 through a compound `sensorslist` holding pressure and
+  fuzzy together (11 such dynamics, because "pack01-leaf" has two). The
+  twentieth is GDQuest's "Ink speed", whose size is driven by `speed`. Umber has
+  had `DabInput::Random` and `DabInput::Speed` since the MyPaint importer needed
+  them, so **every one of the 20 names an input the engine can drive**. One of
+  the fuzzy ones, "Blend Smoky", carries a second dynamic on `fuzzystroke` — a
+  draw held for a whole stroke — which is the only input here with no
   equivalent. What is missing is the half of `mypaint.rs` that turns a mapping
   into a `Modulated` entry, which this reader never grew. See "The two things
   that would unlock the most" below.
@@ -213,8 +226,9 @@ is not, which is most of why the second is worth doing first.
    `sensor_id`, the *first* id in the sensor, which for Krita's compound
    `<params id="sensorslist">` is the wrapper's own name. That is the exact bug
    `sensor_ids` was written for and it was only ever applied to rotation, so
-   for those 11 presets the pressure curve is being dropped as well as the
-   random one. No shipped preset is affected, because all 20 are refused today.
+   for those 10 presets — 11 dynamics — the pressure curve is being dropped as
+   well as the random one. No shipped preset is affected, because all 20 are
+   refused today.
 
 Two more, for scale: **coloured stamps** (25, 11 alone) needs a colour scratch
 the dab pass does not have and is a large change; **paper texture** (31, 11
@@ -863,8 +877,9 @@ of the fetched packs, no import has ever mentioned a paper, and the table of
 fields no source fills recorded "nothing in any pack asks for paper" as a
 *finding*.
 
-**31 presets switch a texture on**, at a live strength — 0.45 at the lowest and
-1 in thirty of them — and **eleven of them were shipping**. Several are named
+**31 presets switch a texture on**, at a live strength — thirty of the
+thirty-one at 1.0 and the last at 0.45 — and **eleven of them were shipping**.
+Several are named
 for the grain they had lost: "F) Thick Dry Canvas", "GDquest Texture Fabric",
 "GDquest Rock Texture Crevaces", "F) Rough Rake Textured", "C5) Thin Brush Hard
 Edge Textured", both of Raghukamath's Drybrushes. They are refused now, which is
@@ -894,15 +909,20 @@ the **model**. Krita's texture carries a texturing mode — `TexturingMode` in
 `KisTextureOptionData.h`, and the packs use five of its sixteen: Multiply (13),
 Subtract (14), Colour Dodge, Hard Mix (softer) and Height ×2 — plus an
 inversion (11), a levels remap of the pattern
-(`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15) and a pressure curve on the
+(`CutoffLeft`/`CutoffRight`/`CutoffPolicy`, 15), a brightness and contrast on
+it (11 state them and 5 carry a live brightness), and a pressure curve on the
 strength (25). Umber's grain is one multiply — `mix(1.0, tile, strength)` — and
 that is deliberate, because a strength of zero has to be the exact identity.
 Multiply is therefore the only mode of the five that carries across at all.
 
-Of the eleven that were shipping, **four** are plain multiply and would come
-back exactly once a preset can name a paper: "C2) Mechanical Pencil Detail",
-"C4) Thin Brush Regular", "F) Rough Rake Textured" and "GDquest Texture Fabric".
-The other seven need an inverted pattern, a cutoff remap or Subtract, and until
+Of the eleven that were shipping, **four** are plain multiply, no inversion and
+no cutoff: "C2) Mechanical Pencil Detail", "C4) Thin Brush Regular",
+"F) Rough Rake Textured" and "GDquest Texture Fabric". **Two of those four come
+back exactly** — the last two, one at brightness 0 and contrast 1 and one
+written before Krita had those keys. The other two would need their pattern
+darkened first, by 0.1 and 0.29, which a texture store could bake in once when
+it takes the bitmap rather than needing anything in `Brush::grain`. The
+remaining seven need an inverted pattern, a cutoff remap or Subtract, and until
 one of those exists they are correctly refused. Approximating them is the thing
 the generator is fussy in order not to do.
 
@@ -1393,7 +1413,7 @@ how they get there:
   GPU upload, and `CanvasRenderer::set_tip`'s identity check skipping the upload
   when a second such brush is picked up. A mask takes its name from the **first**
   preset to use it, so refusing an earlier user hands the name to a later one:
-  two files were renamed when the textured presets stopped shipping, and that is
+  one file was renamed when the textured presets stopped shipping, and that is
   the rule working rather than a fault.
 - **At their original resolution.** A cap was measured rather than assumed and
   is not worth having: the median mask in the packs is 350 px, so capping the
@@ -1452,14 +1472,20 @@ per pack. See `docs/brush-sources.md`.
 - **Krita's dynamics as `Modulated` entries.** `mypaint.rs` turns a mapping into
   a table entry and `kpp.rs` never learned to; the engine's side has existed
   since. 20 presets are refused for a dynamic driven by something other than
-  pressure, and 19 of them name `fuzzy` (per-dab random), `pressure` and
-  `fuzzy` compounded, or `speed` — every one of which `DabInput` already
-  carries. Three ship the day it lands and the rest stop being approximated on
-  import. It would also fix `Preset::dynamic` and `has_foreign_sensor` reading
-  `sensor_id` rather than `sensor_ids`, which for Krita's compound
-  `<params id="sensorslist">` takes the wrapper's own name and drops the
-  pressure curve with the random one — the same fault `sensor_ids` was written
-  for, applied to rotation only.
+  pressure, and every one names `fuzzy` (per-dab random), `pressure` and `fuzzy`
+  compounded, or `speed` — all of which `DabInput` already carries. Three ship
+  the day it lands and the rest stop being approximated on import. It would also
+  fix `Preset::dynamic` and `has_foreign_sensor` reading `sensor_id` rather than
+  `sensor_ids`, which for Krita's compound `<params id="sensorslist">` takes the
+  wrapper's own name and drops the pressure curve with the random one — the same
+  fault `sensor_ids` was written for, applied to rotation only.
+- **A bundle's refused presets, in the generator's own report.**
+  `BundleContents::refused` records a preset written by one of Krita's other
+  paint engines, and `brushimport::read_file`'s `bundle` arm discards it — so
+  six of the thirteen such presets in the packs are invisible to the refusal
+  table above. The *import notice* is told now, through
+  `bundle::dropped_features`; carrying the same fact out of `read_file` means
+  widening what it returns, which touches every arm and every caller.
 - **A row's sample ignores the modulation table.** `widgets::brush_sample` is a
   miniature dab loop of its own rather than a `StrokeBuilder`, so a brush whose
   ellipticity is thrown per dab draws its row as though it were not. Fixing it

@@ -445,10 +445,13 @@ const NOT_REDISTRIBUTED: &str = "a mask this project does not redistribute";
 fn report_refusals(refusals: &[Refusal]) {
     let mut rows: BTreeMap<&str, (Vec<usize>, usize)> = BTreeMap::new();
     for refusal in refusals {
+        // `refusal.pack` is a `Pack::dir`, so this cannot miss — and filing an
+        // unrecognised pack under the first one silently would be a column of
+        // somebody else's brushes.
         let pack = PACKS
             .iter()
             .position(|p| p.dir == refusal.pack)
-            .unwrap_or(0);
+            .expect("a refusal names a pack this run walked");
         for reason in &refusal.reasons {
             let row = rows
                 .entry(reason.as_str())
@@ -460,13 +463,21 @@ fn report_refusals(refusals: &[Refusal]) {
         }
     }
 
+    // Heaviest first, which is the order the table in `docs/brushes.md` is in.
+    // The map is keyed alphabetically because it has to be keyed by something;
+    // printing that order would leave the record and the run in two orders
+    // nobody can check one against the other by eye. `sort_by_key` is stable,
+    // so ties keep the map's order and the output does not move between runs.
+    let mut ranked: Vec<_> = rows.iter().collect();
+    ranked.sort_by_key(|(_, (per_pack, _))| std::cmp::Reverse(per_pack.iter().sum::<usize>()));
+
     println!("\nrefused, by reason and pack:");
     print!("  {:<54}", "");
     for pack in PACKS {
         print!(" {:>11}", pack.dir);
     }
     println!(" {:>6} {:>6}", "total", "alone");
-    for (reason, (per_pack, alone)) in &rows {
+    for (reason, (per_pack, alone)) in ranked {
         print!("  {reason:<54}");
         for count in per_pack {
             print!(" {count:>11}");

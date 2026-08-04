@@ -173,9 +173,26 @@ pub fn from_bundle(bytes: &[u8]) -> Result<BundleContents, PresetError> {
     Ok(out)
 }
 
+/// A bundle held presets written by an engine Umber has no equivalent for.
+///
+/// Named because the alternative is silence: a loose `.kpp` of one of these
+/// fails the whole file and the caller is told, and inside a bundle the same
+/// preset is passed over so the other forty-five survive — which is right, and
+/// leaves nothing on screen to say so. Revoy's bundle drops two this way and
+/// Raghukamath's four.
+pub const OTHER_ENGINES: &str = "brushes written by another of Krita's painting engines";
+
 /// What reading this `.bundle` will throw away.
 pub fn dropped_features(bytes: &[u8]) -> Vec<&'static str> {
-    from_bundle(bytes).map(|b| b.dropped).unwrap_or_default()
+    from_bundle(bytes)
+        .map(|b| {
+            let mut out = b.dropped;
+            if !b.refused.is_empty() {
+                out.push(OTHER_ENGINES);
+            }
+            out
+        })
+        .unwrap_or_default()
 }
 
 /// Read one entry whole, or `None` if it is not there.
@@ -461,6 +478,11 @@ mod tests {
             "{:?}",
             contents.refused
         );
+        // And the caller is told. Passing the preset over is what saves the
+        // pack; saying nothing about it is a loss the import notice exists to
+        // report, and this went unreported for as long as the field went
+        // unread — six presets across two of the fetched packs.
+        assert!(dropped_features(&file).contains(&OTHER_ENGINES));
     }
 
     #[test]

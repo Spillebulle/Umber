@@ -220,7 +220,22 @@ pub fn from_kpp_in(
     // `MaskingBrush/Enabled` beside it is spelled correctly and fires on the
     // one preset that uses it, which is what made the silence look like an
     // absence of textured brushes rather than a bug.
-    if preset.flag("Texture/Pattern/Enabled") {
+    //
+    // The strength is read for the reason `SharpnessValue` is read eleven lines
+    // below and `ScatterValue` is gated on `PressureScatter`: a setting Krita
+    // leaves in the file is not a setting Krita applies, and a texture at zero
+    // strength paints identically with and without paper — naming it would
+    // refuse a brush from the shipped library over a loss that is not one.
+    // Krita has spelled it twice, `Texture/Strength/Value` on the curve option
+    // and `Texture/Pattern/Strength` before it, and both are in the packs;
+    // absent means the default, which is full. No fetched preset is at zero —
+    // thirty sit at 1.0 and one at 0.45 — so this changes nothing today and is
+    // the guard being stated rather than assumed.
+    let texture_strength = preset
+        .number("Texture/Strength/Value")
+        .or_else(|| preset.number("Texture/Pattern/Strength"))
+        .unwrap_or(1.0);
+    if preset.flag("Texture/Pattern/Enabled") && texture_strength > 0.0 {
         dropped.push("paper texture");
     }
     if preset.flag("PressureMirror") {
@@ -1408,8 +1423,10 @@ mod tests {
     /// stroke; Umber's `max` caps a stroke at the mask's brightest texel and
     /// paints a fraction of the author's mark. `.gbr` and `.abr` have measured
     /// this since build-up existed and `.kpp` did not, which meant a Krita
-    /// stamp — Raghukamath's "Drybrush" is one — shipped at 88% of the strength
-    /// it was drawn at.
+    /// stamp — Raghukamath's "Drybrush" was the one in the library — shipped at
+    /// 88% of the strength it was drawn at. That preset no longer ships, for a
+    /// paper texture Umber cannot carry, so the measurement now serves imports
+    /// alone; it is the same stamp either way.
     #[test]
     fn a_krita_stamp_is_measured_for_build_up() {
         let stamp = |level: u8| {
@@ -1712,6 +1729,29 @@ mod tests {
         // The spelling this reader used to look for. Krita has never written
         // it, so a brush that says only this has no texture to lose.
         assert!(with("Texture/Enabled").is_empty());
+
+        // And a texture switched on at no strength is not a loss. Krita leaves
+        // the option's settings in the file either way, which is the trap
+        // `ScatterValue` and `SharpnessValue` are both read against.
+        let at_strength = |key: &str, value: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                internal("Texture/Pattern/Enabled", "true"),
+                param(key, value),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+        assert!(at_strength("Texture/Strength/Value", "0").is_empty());
+        assert!(at_strength("Texture/Pattern/Strength", "0").is_empty());
+        assert_eq!(
+            at_strength("Texture/Strength/Value", "0.45"),
+            vec!["paper texture"]
+        );
     }
 
     /// All three of PNG's text chunks turn up in one real pack, and a reader

@@ -278,7 +278,7 @@ fn umber_defaults() -> Vec<BrushPreset> {
     };
     // A shipped brush that carries a bitmap tip, resolved out of
     // `crate::tip::builtin` rather than the user's library. Only one of *these*
-    // — the generated library carries nineteen more, out of the three Krita
+    // — the generated library carries eleven more, out of the three Krita
     // packs whose licences allow their masks to be redistributed — and this one
     // is Umber's own, drawn by `examples/build-bitmaps.rs`. Deliberately
     // sparse, because a stamp that paints the same under either coverage rule
