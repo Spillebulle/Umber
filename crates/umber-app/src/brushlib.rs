@@ -1,6 +1,6 @@
 //! The brush library, in front of the user.
 //!
-//! `umber-core` already held all of this: 201 shipped presets with their
+//! `umber-core` already held all of this: a couple of hundred shipped presets with their
 //! attribution ([`preset::builtin`]), a user library that writes itself to disk
 //! on every change ([`UserLibrary`]), and importers for MyPaint, GIMP, Krita,
 //! Photoshop and Umber's own `.ron`. None of it was reachable from the
@@ -17,7 +17,7 @@
 //! - **Nothing allocates per frame on the drawing path.** The grouping, and the
 //!   credit line each row shows, are built once per change to the library;
 //!   searching walks borrowed data and folds case in place; the rows skip
-//!   painting when they are scrolled out of view. At 239 presets the naive
+//!   painting when they are scrolled out of view. At a couple of hundred presets the naive
 //!   version of any of those is visible in a frame time.
 //! - **State lives in egui's temporary store**, keyed by an `Id`, exactly the
 //!   way `settings.rs` keeps what its shortcut table is in the middle of. It is
@@ -49,7 +49,7 @@
 //! The design draws a Brushes panel of five presets: a header with a `＋`, a
 //! column of rows, and a link to the brush editor. All three are here. The
 //! search field, the collection picker and the browser are not in the design,
-//! because a column that works for five brushes does not work for 201 — see the
+//! because a column that works for five brushes does not work for two hundred — see the
 //! README.
 
 use crate::brushdrag;
@@ -278,7 +278,7 @@ struct Index {
     groups: Vec<Group>,
     /// The credit line for each preset, parallel to `Editor::presets`.
     ///
-    /// Formatted here rather than in the row, because the row runs 201 times a
+    /// Formatted here rather than in the row, because the row runs once per preset a
     /// frame and this runs when the library changes.
     details: Vec<String>,
     /// `Editor::presets.len()` when this was built — the staleness check.
@@ -378,7 +378,7 @@ fn rank(group: &Group) -> usize {
 /// Walk the presets in `scope` that match `query`, in display order.
 ///
 /// An iterator over borrowed data rather than a filtered `Vec`: this runs on
-/// every frame of both lists, and building 201 entries a frame to draw fifteen
+/// every frame of both lists, and building an entry per preset a frame to draw fifteen
 /// visible rows is exactly the waste immediate mode invites.
 fn visit<'a>(
     index: &'a Index,
@@ -411,7 +411,7 @@ fn matches(preset: &BrushPreset, query: &str) -> bool {
 
 /// Case-insensitive substring, without lowering a copy of the haystack.
 ///
-/// `to_lowercase` on every name on every frame is 201 allocations to answer a
+/// `to_lowercase` on every name on every frame is an allocation per preset to answer a
 /// question about fifteen visible rows. The fold is ASCII-only, which suits the
 /// data: the non-ASCII in the shipped library is inside author names ("Ramón
 /// Miranda"), where the accented bytes are identical either way and match
@@ -836,7 +836,7 @@ enum Request {
 struct ListOut {
     picked: Option<usize>,
     /// Where the row named by `editing` landed, so the overlays can be drawn
-    /// over it without the list threading a rect out for all 201 rows.
+    /// over it without the list threading a rect out for every row.
     editing_rect: Option<Rect>,
     request: Option<Request>,
 }
@@ -3228,7 +3228,7 @@ mod tests {
         assert!(!matches(&p, "charcoal"));
     }
 
-    /// The whole point of the grouping: 239 presets under one heading is the
+    /// The whole point of the grouping: Two hundred and fifty presets under one heading is the
     /// flat list this replaces.
     #[test]
     fn collections_run_yours_first_then_styles_in_their_declared_order() {

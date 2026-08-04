@@ -112,17 +112,23 @@ is the surest way not to ship them.
 
 ## What is in it today
 
-**228 presets**: Umber's own six, all 196 MyPaint brushes, and 26 out of four
-more packs — David Revoy's 2025-01 Krita bundle (11), Raghavendra Kamath's v2.1
-(6), GDQuest's (9), and rubberduck's 60 GIMP stamps (none). All CC0 except
+**258 presets**: Umber's own six, all 196 MyPaint brushes, and 56 out of four
+more packs — David Revoy's 2025-01 Krita bundle (21), Raghavendra Kamath's v2.1
+(9), GDQuest's (26), and rubberduck's 60 GIMP stamps (none). All CC0 except
 GDQuest's, which is CC-BY and therefore carries its credit.
 
-Fifteen of those 26 are Krita brushes whose dab is *generated* rather than
-stamped, so they convert exactly. **The other eleven stamp a bitmap tip**,
-which the shipped library carries now: 10 masks, 295 kB of 8-bit greyscale PNG
-in `crates/umber-core/assets/tips/`. Measured once at 624 kB of PNG, the
-release binary grew by 664 kB, so a mask costs the binary about what it costs
-the directory. See "Tips in the shipped library" below.
+**Read the counts off a run of the generator, not off this page.** It prints
+the total and the refusal table every time, and the figures here have been
+wrong twice by being added to rather than re-measured — once because a reader
+changed and nobody regenerated, once because two branches counted from
+different baselines. Everything below is from the run that produced the
+committed library.
+
+32 of those 56 stamp a **bitmap tip** and 6 paint through the author's own
+**paper texture**: 25 masks and 10 pattern tiles, 8-bit greyscale PNG in
+`crates/umber-core/assets/tips/` and `assets/patterns/`. Measured once at 624
+kB of PNG, the release binary grew by 664 kB, so a bitmap costs the binary
+about what it costs the directory. See "Tips in the shipped library" below.
 
 The rest of what those packs hold needs a mask too and still does not ship. 338
 brushes across the five packs carry one, and the numbers say where they went:

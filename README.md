@@ -54,18 +54,19 @@ before anything is downloaded. You can turn that off on the first run, or in
 <img src="docs/images/brushes.png" alt="The Brushes module: a searchable list of
 presets, each drawing its own stroke" align="right" width="300">
 
-**239 presets ship with Umber**, grouped by what they *do* — pencils, inks,
+**258 presets ship with Umber**, grouped by what they *do*. Pencils, inks,
 markers, charcoal, paint, watercolour, airbrush, blenders, erasers, texture,
-foliage, effects — rather than by which pack they came from.
+foliage, effects. Not by which pack they came from.
 
 Every row draws **a real stroke made by the real brush**, with a loop and a
 taper in it, so a rake, a chisel or an angle-following brush looks like what it
 is instead of like a flat bar.
 
 196 are the whole of
-[mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes); 37 more
-come from CC0 and CC-BY Krita packs, 19 of those stamping a **bitmap tip**
-rather than an ellipse. Six are Umber's own. Each keeps its author and licence.
+[mypaint-brushes 2.0.2](https://github.com/mypaint/mypaint-brushes). 56 more
+come from CC0 and CC-BY Krita packs, 32 of those stamping a **bitmap tip**
+rather than an ellipse, and 6 painting through the author's own **paper
+texture**. Six are Umber's own. Each keeps its author and licence.
 
 Blenders work: a smudging brush picks colour up off the canvas and carries it,
 and scrubbing back and forth blends its own wet paint. **A brush can carry its

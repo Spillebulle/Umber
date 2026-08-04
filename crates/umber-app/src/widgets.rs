@@ -1158,7 +1158,7 @@ pub struct BrushRow<'a> {
     /// has no room for it and puts the credit in a tooltip instead.
     pub detail: &'a str,
     /// The brush itself, rather than the two numbers the sample used to be
-    /// drawn from. The library is 239 presets deep and the sample is how you
+    /// drawn from. The library is a couple of hundred presets deep and the sample is how you
     /// choose between them, so it has to show what actually separates them.
     pub brush: &'a Brush,
     /// The stamp this brush lays down, if it has one.
@@ -1206,7 +1206,7 @@ pub fn brush_row(ui: &mut Ui, p: &Palette, row: BrushRow<'_>) -> Response {
         },
     );
 
-    // The library is 239 presets deep and both lists are scrolled, so most rows
+    // The library is a couple of hundred presets deep and both lists are scrolled, so most rows
     // on most frames are off screen. A sample is a few hundred stamps
     // rasterised the first time it is asked for — cached afterwards, but a row
     // nobody can see should not build one at all, and this early return is the
@@ -1362,7 +1362,7 @@ impl MarkBox {
     /// The brush is drawn at whatever scale puts a full-pressure dab at
     /// [`MarkBox::radius`], so a row shows the brush's *response* to pressure
     /// rather than its absolute size — a 400 px wash and a 4 px pen both fill
-    /// their row, which is the only way a list of 201 of them is readable.
+    /// their row, which is the only way a list of that many is readable.
     fn scale(&self, brush: &Brush) -> f32 {
         self.radius / (brush.size * 0.5).max(0.5)
     }
@@ -1509,7 +1509,7 @@ fn smoothstep(from: f32, to: f32, x: f32) -> f32 {
 /// line, because opacity is one of the numbers people choose a brush by.
 ///
 /// The other alternative — a real GPU pass per row — is not the answer either.
-/// The library is 201 presets deep and both lists scroll, so it would be a
+/// The library is a couple of hundred presets deep and both lists scroll, so it would be a
 /// pass, a target and a readback per visible row per change, from inside a
 /// scroll area, to draw a picture 70 pixels wide. This is a few hundred stamps
 /// of arithmetic, once per brush, and the result is cached.
@@ -1619,7 +1619,7 @@ fn preview_image(mark: &Mark, brush: &Brush, at: &MarkBox, inks: [Color32; 2]) -
 
 /// One row's stamped stroke, cached against the brush it was stamped from.
 ///
-/// A few hundred stamps is cheap once and not cheap 201 times a frame, and the
+/// A few hundred stamps is cheap once and not cheap once per preset a frame, and the
 /// picture only changes when the brush does. Keyed by the preset's own address
 /// **and the shape of the row it is drawn in** — and what is *compared* is
 /// everything else the picture depends on: the brush by value, so a slider

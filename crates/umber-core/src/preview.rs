@@ -1,6 +1,6 @@
 //! The shape of the stroke a brush preview draws.
 //!
-//! The brush library is 201 presets deep and the sample beside each name is how
+//! The brush library is a couple of hundred presets deep and the sample beside each name is how
 //! you choose between them, so the sample has to be a *stroke*: something with
 //! a direction that changes, a hand that presses and lifts, and a crossing —
 //! because a rake, a chisel and a brush whose angle follows the stroke are
