@@ -157,9 +157,28 @@ impl ScrollSpan {
     /// by other means — a space-drag has no such limit — and a thumb drawn
     /// outside its own track would be a worse answer than one pinned at the end
     /// that says "further that way".
+    ///
+    /// **The start maps the camera's range onto the track the thumb leaves
+    /// free**, rather than onto the travel directly, and the difference is only
+    /// visible once the `0.02` length floor bites — which is `extent < doc/49`,
+    /// a large canvas at a working zoom rather than a curiosity. There
+    /// `extent / travel` is *not* what the thumb is drawn at, so a start of
+    /// `centre / travel` saturated while the camera still had a fiftieth of the
+    /// document to go: the last screenfuls of a big canvas moved the picture
+    /// under a thumb standing still, and the bar could not describe where you
+    /// were. Against the free track the two ends line up by construction —
+    /// `centre = 0` is `start = 0` and `centre = doc` is `start = 1 - length`,
+    /// at every zoom. Wherever the floor does not bite `1 - length` is exactly
+    /// `doc / travel`, so this is the same number the simpler form gave and
+    /// nothing about the ordinary case changed.
     pub fn thumb(&self) -> (f32, f32) {
         let length = (self.extent / self.travel()).clamp(0.02, 1.0);
-        let start = (self.centre / self.travel()).clamp(0.0, 1.0 - length);
+        let free = 1.0 - length;
+        let start = if self.doc > 0.0 {
+            (self.centre / self.doc * free).clamp(0.0, free)
+        } else {
+            0.0
+        };
         (start, length)
     }
 
@@ -179,30 +198,36 @@ impl ScrollSpan {
     /// bars are drawn on a document that fits, because then the ends are a
     /// short drag away rather than somewhere nobody goes.
     ///
-    /// The far end is **where the thumb actually stops, which is not always the
-    /// end of the document**, and getting that wrong is the whole bug written
-    /// out again rather than a rounding detail. `thumb` floors its length at
-    /// `0.02` so a sliver is still visible and still catchable, and a floored
-    /// length pins its start at `1 - 0.02` — short of the document whenever the
-    /// raw length was under the floor, which is `extent < doc / 49` and
-    /// therefore a large canvas at an ordinary working zoom rather than a
-    /// corner of one. Bounding on `doc` there would let the camera carry on for
-    /// hundreds of document pixels under a thumb that had already stopped.
-    /// Where the floor does not bite, `travel × (1 - length)` *is* `doc`
-    /// exactly, so this is the same number the obvious version reaches.
+    /// The distance is the document spread over the track the thumb leaves
+    /// free — the exact inverse of [`ScrollSpan::thumb`]'s start, so a drag of
+    /// a tenth of the bar moves the thumb a tenth of the bar, at every zoom.
+    /// Where the length floor does not bite, `doc / (1 - length)` is exactly
+    /// `travel`, which is the plain multiply this used to be and the figure the
+    /// type's own docs describe.
     ///
-    /// A camera already outside that range — a space-drag has no limit — is
-    /// left where it is rather than snapped back in, so the bounds are widened
-    /// to wherever it stands. The bar can then only ever improve matters, and
-    /// a hair of a drag can never teleport a picture that was pushed a long way
-    /// out. The widening does ratchet: a camera nudged inwards cannot be put
-    /// back where it was by the bar, only by whatever took it out there.
+    /// The **bound is the document**, both ends. That is where the thumb's
+    /// range now lines up, so neither end can move the picture under a thumb
+    /// that has stopped. Bounding it short of the document was tried and was
+    /// worse in the other direction: it put the last fiftieth of a large canvas
+    /// out of the bar's reach entirely, which on a 16384 canvas at full zoom is
+    /// thirteen screenfuls of the edge that could be seen and not scrolled to.
+    ///
+    /// A camera already outside that range — a space-drag has no limit, and
+    /// neither does zooming in on a corner — is left where it is rather than
+    /// snapped back in, so the bounds are widened to wherever it stands. The
+    /// bar can then only ever improve matters, and a hair of a drag can never
+    /// teleport a picture that was pushed a long way out. The widening does
+    /// ratchet: a camera nudged inwards cannot be put back where it was by the
+    /// bar, only by whatever took it out there.
     pub fn pan_by(&self, fraction: f32) -> f32 {
         let (_, length) = self.thumb();
-        let far = self.doc.min(self.travel() * (1.0 - length));
+        let free = 1.0 - length;
+        if free <= 0.0 {
+            return 0.0;
+        }
         let lo = self.centre.min(0.0);
-        let hi = self.centre.max(far);
-        (self.centre + fraction * self.travel()).clamp(lo, hi) - self.centre
+        let hi = self.centre.max(self.doc);
+        (self.centre + fraction * self.doc / free).clamp(lo, hi) - self.centre
     }
 }
 
@@ -487,17 +512,17 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_stops_where_the_thumb_does_even_when_the_thumb_is_at_its_floor() {
-        // The half of the rule above that the document alone does not state.
-        // `thumb` floors its length at 0.02 so a sliver stays catchable, and a
-        // floored length pins its start short of the document — so bounding the
-        // drag on the document would carry the camera on under a thumb that had
-        // already stopped, which is the banking the clamp is there to remove.
+    fn the_thumb_and_the_camera_reach_their_ends_together_at_the_length_floor() {
+        // The case the `0.02` length floor creates, and it caught two opposite
+        // bugs on the way to this, so it asserts against both ends.
         //
         // These are not extreme numbers: 16384 square is `Document::MAX_EDGE`
         // and 1440 physical pixels at zoom 64 is somebody looking closely at a
-        // large canvas. The gap the old bound left was about 300 document
-        // pixels, which at that zoom is 19,000 pixels of picture.
+        // large canvas. Draw the thumb's start off the *travel* and it
+        // saturates a fiftieth of the document early, so the last thirteen
+        // screenfuls move the picture under a thumb standing still. Bound the
+        // drag short to match, and those thirteen screenfuls become unreachable
+        // by the bar at all. Against the free track both ends line up.
         let span = ScrollSpan::new(16384.0, 1440.0, 64.0, 8192.0);
         let (_, length) = span.thumb();
         assert_eq!(length, 0.02, "this test needs the floored case to bite");
@@ -506,21 +531,22 @@ mod tests {
             centre: span.centre + span.pan_by(10.0),
             ..span
         };
-        // Stated against the camera, because that is the half a clamped thumb
-        // hides: `thumb` pins either way, so a test that only read the thumb
-        // would pass over the bug it is here for.
-        let stops_at = span.travel() * (1.0 - length);
+        // The bar reaches the far edge of the document — not a fraction short.
         assert!(
-            far.centre <= stops_at + 1e-2,
-            "the camera reached {} where the thumb stops at {stops_at}",
-            far.centre
+            (far.centre - far.doc).abs() < 1e-2,
+            "the bar reached {} of {}",
+            far.centre,
+            far.doc
         );
+        // And the thumb is at its own end there rather than having got there
+        // first: the two agree.
         assert!(
             (far.thumb().0 - (1.0 - length)).abs() < 1e-4,
-            "the thumb stopped at {} rather than its own end",
-            far.thumb().0
+            "the thumb was at {} where its end is {}",
+            far.thumb().0,
+            1.0 - length
         );
-        // And nothing was banked on the way out: the smallest drag home moves
+        // Nothing was banked on the way out, so the smallest drag home moves
         // the thumb at once.
         let back = ScrollSpan {
             centre: far.centre + far.pan_by(-0.001),
@@ -530,6 +556,29 @@ mod tests {
             back.thumb().0 < far.thumb().0,
             "the thumb did not follow the hand home"
         );
+    }
+
+    #[test]
+    fn the_thumb_describes_a_camera_no_gesture_but_the_bar_put_there() {
+        // The bar is not the only thing that moves the camera — `zoom_at` pulls
+        // the centre towards the anchor, and the wheel pan clamps nothing — so
+        // the thumb has to be able to say where *anywhere* in the document is.
+        // A start taken off the travel could not, in exactly the band the floor
+        // creates, and the failure looked like a frozen bar rather than like an
+        // arithmetic mistake.
+        let span = ScrollSpan::new(16384.0, 1440.0, 64.0, 0.0);
+        let (_, length) = span.thumb();
+        let mut last = -1.0;
+        for step in 0..=20 {
+            let at = ScrollSpan {
+                centre: span.doc * step as f32 / 20.0,
+                ..span
+            };
+            let start = at.thumb().0;
+            assert!(start > last, "the thumb stalled at centre {}", at.centre);
+            last = start;
+        }
+        assert!((last - (1.0 - length)).abs() < 1e-4, "ended at {last}");
     }
 
     #[test]

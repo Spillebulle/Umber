@@ -769,13 +769,28 @@ fn selection_buttons(
     // bottom edge would be a button that scrolls. `canvas_free_of_scrollbars`
     // has the argument. The *pivot* above is still the full rect's centre,
     // because that is where the picture is.
+    //
+    // With the whole region as the fallback, and that is not belt and braces.
+    // `place_strip` begins by intersecting the marquee with the view, so a
+    // selection whose visible sliver lies *entirely* inside the eleven-point
+    // band has no overlap with the inset region and gets no strip at all —
+    // Deselect, Copy and Cut simply gone, for a selection with a perfectly good
+    // place above it. Losing the commands is far worse than a button sharing an
+    // edge with a scrollbar, and "the strip comes to the pointer rather than
+    // declining to appear" is the rule that module exists to hold.
     let free = canvas_free_of_scrollbars(ed, rect);
-    let view = umber_core::Rect::new(
-        glam::Vec2::new(free.left(), free.top()),
-        glam::Vec2::new(free.right(), free.bottom()),
-    );
+    let as_view = |r: Rect| {
+        umber_core::Rect::new(
+            glam::Vec2::new(r.left(), r.top()),
+            glam::Vec2::new(r.right(), r.bottom()),
+        )
+    };
     let size = glam::Vec2::new(strip_width(3), CANVAS_BUTTON);
-    let Some(strip) = umber_core::overlay::place_strip(anchor, view, size, CANVAS_BUTTON_GAP)
+    let place =
+        |r: Rect| umber_core::overlay::place_strip(anchor, as_view(r), size, CANVAS_BUTTON_GAP);
+    let Some((clip, strip)) = place(free)
+        .map(|s| (free, s))
+        .or_else(|| place(rect).map(|s| (rect, s)))
     else {
         return;
     };
@@ -811,7 +826,7 @@ fn selection_buttons(
         // reason `Editor::selection_screen` exists.
         let button = CanvasButton {
             at,
-            clip: free,
+            clip,
             id: ("selection-strip", i),
             icon,
             enabled,
@@ -2931,10 +2946,16 @@ mod tests {
     /// The middle shot is the one to judge: that is the fitted document, which
     /// used to draw no bars at all and is the whole of what changed.
     ///
-    /// The background is `chrome` rather than the backdrop the composite pass
-    /// actually paints, which is on the GPU and not this module's to reach —
-    /// close enough to say whether the idle thumb is too loud, and not a claim
-    /// about the exact contrast.
+    /// **Both themes, on `backdrop`.** Not one of the two, and not on `chrome`,
+    /// and both of those were wrong here rather than approximations: the thumb
+    /// lies over the *canvas*, which is what the composite pass paints
+    /// `backdrop` with, and the surfaces invert between Graphite and Paper so a
+    /// shot of one says nothing about the other. Shooting the idle thumb on
+    /// `chrome` in Graphite alone is how an ink at 1.07:1 in Paper survived
+    /// being looked at.
+    ///
+    /// It takes **no `gputest::lock()`**, and that is decided rather than
+    /// skipped — see the note in the body.
     ///
     /// ```sh
     /// cargo test -p umber-app canvas_scrollbar_preview -- --ignored --nocapture
@@ -2945,20 +2966,19 @@ mod tests {
     fn canvas_scrollbar_preview() {
         use crate::docshot;
         use crate::editor::Editor;
-        use crate::gputest;
-        use crate::theme::Palette;
+        use crate::theme::{Palette, ThemeKind};
         use egui::{Pos2, Rect, vec2};
         use glam::Vec2;
 
-        // Held for the whole test. `Stage` builds a device of its own, and the
-        // rule this crate learned the hard way is that two tests creating and
-        // tearing one down concurrently killed the binary with
-        // `STATUS_ACCESS_VIOLATION` at process exit on the ARM64 Windows
-        // runner — every test passing and the run failing on the way out.
-        // `--ignored` runs the previews together, so the guard is what
-        // serialises them. See `gputest`'s own docs.
-        let _device = gputest::lock();
-
+        // No `gputest::lock()`, against this crate's stated rule, and the
+        // reason is that taking it here would make the thing the rule guards
+        // *worse*. `lock` builds the shared device on the way past, and
+        // `docshot::Stage` builds one of its own regardless — so the guard buys
+        // two live devices where there was one, which is the configuration
+        // blamed for the `STATUS_ACCESS_VIOLATION` at process exit on the ARM64
+        // runner. The six other `#[ignore]`d previews take no guard either, so
+        // it would not serialise them; the faithful fix is for `Stage` to take
+        // the shared device, and it belongs in `docshot` rather than here.
         let Some(mut stage) = docshot::Stage::new() else {
             eprintln!("no GPU adapter: nothing to draw into. Skipped.");
             return;
@@ -2967,33 +2987,43 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/canvas-scrollbars");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        // The zoom at which the whole document just fits, taken from the
-        // document rather than restated: 720x480 points at two pixels a point
-        // is 1440x960 physical, and the shorter side bounds it. Restating 2048
-        // would make the middle shot quietly stop being the fitted case the
-        // moment `Document::default` moved.
+        // The zoom at which the whole document just fits: 720x480 points at two
+        // pixels a point is 1440x960 physical, and what bounds it is the
+        // smaller *ratio* rather than the shorter side — the same rule
+        // `Camera::fit` keeps, minus its margin. Restating the document's own
+        // size would make the middle shot quietly stop being the fitted case
+        // the moment `Document::default` moved.
         let field = vec2(720.0, 480.0);
         let doc = Editor::default().doc.size_vec2();
-        let fits = 960.0 / doc.y;
+        let fits = (1440.0 / doc.x).min(960.0 / doc.y);
         let middle = doc * 0.5;
-        for (name, zoom, centre) in [
-            ("1-zoomed-in", 1.0, middle),
-            ("2-fits", fits, middle),
-            // Pushed towards the bottom-right corner, so both thumbs are off
-            // their middles and in opposite directions.
-            ("3-pushed-off", fits, doc * Vec2::new(0.88, 0.15)),
+        let mut written = 0;
+        for (theme, ink) in [
+            (ThemeKind::Graphite, "graphite"),
+            (ThemeKind::Paper, "paper"),
         ] {
-            let mut ed = Editor::default();
-            ed.pixels_per_point = 2.0;
-            ed.camera.zoom = zoom;
-            ed.camera.center = centre;
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
-            let rect = Rect::from_min_size(Pos2::ZERO, field);
-            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |ui| {
-                super::canvas_scrollbars(ui, &palette, &mut ed, rect);
-            });
-            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+            for (name, zoom, centre) in [
+                ("1-zoomed-in", 1.0, middle),
+                ("2-fits", fits, middle),
+                // Pushed towards the bottom-right corner, so both thumbs are
+                // off their middles and in opposite directions.
+                ("3-pushed-off", fits, doc * Vec2::new(0.88, 0.15)),
+            ] {
+                let mut ed = Editor::default();
+                ed.ui.theme = theme;
+                ed.pixels_per_point = 2.0;
+                ed.camera.zoom = zoom;
+                ed.camera.center = centre;
+                let palette = Palette::with_accent(theme, ed.ui.accent);
+                let rect = Rect::from_min_size(Pos2::ZERO, field);
+                let image = stage.shoot(field, 2.0, &palette, palette.backdrop, |ui| {
+                    super::canvas_scrollbars(ui, &palette, &mut ed, rect);
+                });
+                docshot::write_png(&dir.join(format!("{ink}-{name}.png")), &image)
+                    .expect("write the png");
+                written += 1;
+            }
         }
-        println!("wrote 3 shots to {}", dir.display());
+        println!("wrote {written} shots to {}", dir.display());
     }
 }

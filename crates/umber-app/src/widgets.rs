@@ -586,11 +586,15 @@ fn paint_track(painter: &egui::Painter, p: &Palette, track: Rect, t: f32, knob: 
 /// the canvas would read as something selected rather than as somewhere to be.
 ///
 /// These are on screen on every frame of every document — see
-/// `ui::canvas_scrollbars` — so the idle ink is `rail`, the token a slider's
-/// *track* is drawn in and therefore one chosen to sit behind something rather
-/// than be read, and the track here is left unpainted altogether. Two permanent
-/// filled strips down the edges of a picture is the furniture that decision is
-/// against.
+/// `ui::canvas_scrollbars` — so the track is left unpainted altogether: two
+/// permanent filled strips down the edges of a picture is the furniture that
+/// decision is against. The thumb's own ink went the other way for the same
+/// reason; see the note beside it.
+///
+/// `live` is the caller's "a press in this strip is not mine" — the space-held
+/// canvas pan. The thumb is still painted and still lights under the pointer,
+/// because it goes on reporting where the picture is while somebody drags it
+/// about by other means.
 pub fn canvas_scrollbar(
     ui: &mut Ui,
     p: &Palette,
@@ -639,20 +643,43 @@ pub fn canvas_scrollbar(
     // furniture a paint application is trying not to put there — the more so
     // now that the bars are drawn on every frame rather than only where the
     // picture runs off the view. Only the thumb is drawn.
-    // The primary button alone. `Sense::click_and_drag` answers to *any*
-    // button, and the middle one is already the canvas pan — which
-    // `gesture::press` gives the canvas before the interface is consulted, so
-    // a middle-drag over the bar would drive the camera twice, in opposite
-    // directions, and slide the picture backwards under the hand. Same reason
-    // `live` exists for the space-drag; this is the half a caller cannot see.
-    let dragging = response.dragged_by(egui::PointerButton::Primary);
 
+    // Three conditions, and each is a way the canvas pan and this bar can end
+    // up driving the camera in the same frame with opposite signs — which
+    // slides the picture *backwards* under the hand, since the bar's gain is
+    // the larger. `gesture::press` hands a pan the canvas before the interface
+    // is consulted at all ("a space-drag pans whatever it started over"), so
+    // it never learns about `Editor::scroll_bars` and cannot be the place this
+    // is settled.
+    //
+    // `live` is the caller's answer and is not enough on its own: egui latches
+    // a drag at the press and never re-reads the `Sense`, so a bar already
+    // being dragged when space goes down goes on being dragged. The delta has
+    // to be gated too, not only the sense.
+    //
+    // The middle button is the other pan, and `dragged_by` reads "a drag is
+    // live and this button is down" rather than "this button began it" — so a
+    // middle press *during* a thumb drag starts a pan beside it and neither
+    // stops. Refusing while it is down is the whole of that case.
+    let panning = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+    let dragging = live && !panning && response.dragged_by(egui::PointerButton::Primary);
+
+    // `text_dim` idle, for `pen_cursor`'s reason and it is the same problem:
+    // this is a mark drawn over *artwork*, and `text_dim` is the one token
+    // that is a mid-grey in both themes, where the surfaces invert and most of
+    // the ink with them. `rail` was the obvious choice and is the slider
+    // *track* colour — a hair off the surface it sits on by design, which on
+    // the canvas backdrop is 1.31:1 in Graphite and 1.07:1 in Paper. Six levels
+    // per channel. That was survivable while a bar only appeared when the
+    // picture ran off the view, because its appearing was itself the signal;
+    // now that it is the standing answer to "can this be moved", a control
+    // nobody can see is the same lie as a control that does nothing.
     let ink = if dragging {
-        p.text_muted
+        p.text_strong
     } else if response.hovered() {
-        p.knob
+        p.text_muted
     } else {
-        p.rail
+        p.text_dim
     };
     let inset = thumb_rect.shrink(2.0);
     ui.painter()
