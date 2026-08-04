@@ -811,8 +811,9 @@ preset in the packs asks for each.
 Two more things fell out of reading the sensors properly:
 
 - **`<Name>UseSameCurve` decides which of the two curves in the file is in
-  force**, and Krita's editor leaves the other behind either way. Six presets
-  carry both. Deevad's "Eraser Kneaded Soft" states the flag false and a bare
+  force**, and Krita's editor leaves the other behind either way. Six options
+  across four presets carry both.
+  Deevad's "Eraser Kneaded Soft" states the flag false and a bare
   pressure sensor with no curve of its own, so Krita gives it a linear ramp
   where Umber was giving it the shared curve sitting unused beside it — the one
   brush already in the library that this changed.

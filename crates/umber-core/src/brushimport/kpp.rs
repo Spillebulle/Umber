@@ -135,8 +135,8 @@
 //! `fuzzy` one is [`Brush::dab_angle_jitter`].
 //!
 //! **`<Name>UseSameCurve` decides which curve is in force**, and Krita's editor
-//! leaves the other one in the file either way. Six presets in the fetched
-//! packs carry both a shared curve and per-sensor ones; reading the shared one
+//! leaves the other one in the file either way. Six options across four
+//! presets in the fetched packs carry both; reading the shared one
 //! regardless gave Deevad's "Eraser Kneaded Soft" an opacity ramp Krita never
 //! applies to it. A sensor that states no curve of its own is the *identity*,
 //! which is what Krita's own curve object is constructed as.
@@ -1694,9 +1694,10 @@ mod tests {
     }
 
     /// `<Name>UseSameCurve` decides which of the two curves in the file is in
-    /// force, and Krita's editor leaves the other one behind. Six presets in
-    /// the fetched packs carry both — Deevad's "Eraser Kneaded Soft" among
-    /// them, whose shared curve is not the one Krita applies to it.
+    /// force, and Krita's editor leaves the other one behind. Six options
+    /// across four presets in the fetched packs carry both — Deevad's "Eraser
+    /// Kneaded Soft" among them, whose shared curve is not the one Krita
+    /// applies to it.
     #[test]
     fn the_shared_curve_is_read_only_where_krita_would_read_it() {
         let with = |same: &str| {
