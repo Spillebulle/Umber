@@ -198,6 +198,28 @@
 //! faintly tinted differ by at most 1.9 levels of 255, on one of them, and by
 //! 0.3 on average.
 //!
+//! Compositing a transparent pattern over **white** rather than keeping its
+//! alpha is Krita's own behaviour here and not a simplification:
+//! `recalculateMask` takes that branch unless `preserveAlpha` is set, and
+//! `KisTextureOption` sets it only for the Lightness and Gradient modes, which
+//! are refused above with every other non-Multiply mode.
+//!
+//! ## Two settings that are read and deliberately not named
+//!
+//! - **`OffsetX`/`OffsetY` and `isRandomOffsetX`/`isRandomOffsetY`.** Krita
+//!   shifts where the tile starts, and for twelve of the thirty-one it shifts
+//!   it by a *fresh random amount every stroke*. Umber anchors the grain to the
+//!   document origin. Naming that would be crying wolf twice over: a shift
+//!   through a tiling texture changes which pits a mark lands in and nothing
+//!   about the mark, and Krita's own answer is different on every stroke, so
+//!   there is no "what the author saw" to have lost. What Umber's anchoring
+//!   *does* change is that a second stroke lands in the same pits as the first
+//!   — which is the whole point of the grain being document-anchored, and is
+//!   what Krita gives with both randomisers off.
+//! - **`curveMode`.** It selects how Krita's editor draws the strength curve,
+//!   not how the curve is applied. Whether the curve applies at all is
+//!   `Texture/Strength/UseCurve`, above.
+//!
 //! # Approximated rather than dropped
 //!
 //! - **The paint-deposit rate**, and it belongs in *this* section rather than
@@ -1807,7 +1829,16 @@ fn decode_rgba(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
 
-    let texels = info.width as usize * info.height as usize;
+    // The slices below are bounded by what the *frame* declares and the buffer
+    // by what the *image* declared, and this is a picture out of somebody
+    // else's file: an APNG's frame, or a decoder that ever disagreed with
+    // itself, would index past the end and panic inside an import. The
+    // `checked_mul` is the same guard on the other side, for two dimensions
+    // whose product a `usize` does not hold.
+    let texels = (info.width as usize).checked_mul(info.height as usize)?;
+    if texels.checked_mul(info.color_type.samples())? > buf.len() {
+        return None;
+    }
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Grayscale => buf[..texels].iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::GrayscaleAlpha => buf[..texels * 2]
