@@ -511,8 +511,17 @@ See its own documentation.
 - **`.ora` is the only extension offered.** Krita's `.kra` and Photoshop's
   `.psd` are read but not written, and there is no reason to write them: both
   applications read ORA.
-- **A saved history does not survive a layer being added, deleted or reordered
-  after it was written.** The manifest fingerprints the stack by name and order,
-  so a document whose layers have moved drops its history on the way in — which
-  is the safe direction, and the same limitation the in-memory history already
-  has, for the same reason. Structural undo is what fixes both.
+- **A saved history does not survive the stack being changed *after* it was
+  written** — by another application, or by an Umber that saved and then had
+  its layers rearranged by something else. The manifest fingerprints the stack
+  by name and order, so a document whose layers have moved drops its history on
+  the way in, which is the safe direction. Changes made *before* the save are
+  fine: the fingerprint is taken from the stack being written.
+- **No structural entry is written**, because the layer an undo would put back
+  lives in a parked texture slice and a parked slice is not part of the picture.
+  A move, an add, a group and a new mask are simply left out and everything
+  around them is saved whole; a **delete** or a **mask removal** makes every
+  entry older than it unplaceable as well, so the save keeps the newest run
+  containing neither. Writing the removed layers' images beside the patch PNGs
+  is what would lift that, and it needs a measurement nobody has taken —
+  `docs/structural-undo.md` §8.
