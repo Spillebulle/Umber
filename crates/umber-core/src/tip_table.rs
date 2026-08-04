@@ -36,6 +36,14 @@ pub(crate) const TIPS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/tips/deevad-f-thick-dry-canvas-deevad-25-01.png"),
     ),
     (
+        "deevad-i-glazing-round-mix-deevad-25-01",
+        include_bytes!("../assets/tips/deevad-i-glazing-round-mix-deevad-25-01.png"),
+    ),
+    (
+        "deevad-k-blender-rake-smudge-deevad-25-01",
+        include_bytes!("../assets/tips/deevad-k-blender-rake-smudge-deevad-25-01.png"),
+    ),
+    (
         "deevad-y-textured-big-sponge-deevad-25-01",
         include_bytes!("../assets/tips/deevad-y-textured-big-sponge-deevad-25-01.png"),
     ),
