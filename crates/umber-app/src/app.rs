@@ -779,10 +779,19 @@ impl UmberApp {
         if !started {
             self.editor.notice = Some(Notice {
                 title: "Nothing was picked up".to_string(),
+                // **Not "delete a layer".** That used to free a slice and now
+                // parks one, in the undo entry that could put the layer back —
+                // so the advice would have made the refusal worse, which is the
+                // shape of lying control this project refuses everywhere. What
+                // does free them is what got here: the history has already
+                // given up every entry it could, so the only slices left are
+                // ones the live stack is using.
                 lines: vec![
                     "A transform needs a spare texture slice to preview into, and this \
-                     document's layers are using every one Umber has. Merging or deleting \
-                     a layer will free one."
+                     document is using every one Umber has — a layer takes one and a \
+                     mask takes another. Deleting a layer frees its slice only once the \
+                     undo entry that could put it back has been discarded, so this may \
+                     need a second try."
                         .to_string(),
                 ],
             });
@@ -1336,17 +1345,22 @@ impl UmberApp {
         // what makes this an undoable *add* is that the new layer is not among
         // them, so restoring this shape takes it back out — and the entry that
         // goes on the redo stack is the one that then holds it.
-        let mut before = self.editor.layers.shape();
+        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         let slot = match self.editor.layers.add() {
             Some(slot) => slot,
-            // A parked layer may be holding the last slice. Give the oldest
-            // entries up and try once more — and only here, so a refusal for
-            // any *other* reason costs the history nothing. `free_a_slot`
-            // answers false when the release could not help, which is when the
-            // live stack really is using every slice there is: exactly the
-            // condition that refused this before parking existed.
-            None if self.free_a_slot() => {
-                before = self.editor.layers.shape();
+            // A parked layer may be holding the last slice, so give the oldest
+            // entries up and try once more — but **only where a slice is the
+            // plausible reason**. `add` also refuses a full stack, and on a dry
+            // pool that is exactly the case where releasing would throw an
+            // artist's oldest edits away and then refuse anyway: 64 masked
+            // layers is 128 slices and the 64-entry cap, both at once.
+            //
+            // The shape is not re-taken. A release touches the history and the
+            // pool and never the stack, so the snapshot is still the one this
+            // add is about to change.
+            None if self.editor.layers.len() < umber_core::LayerStack::MAX
+                && self.free_a_slot() =>
+            {
                 let Some(slot) = self.editor.layers.add() else {
                     log::warn!("layer limit reached");
                     return;
@@ -1394,7 +1408,7 @@ impl UmberApp {
     /// nothing undo. The drag in the layers panel does the same thing at its
     /// own call site, because it holds the `Editor` and not the `App`.
     fn record_move(&mut self, moved: impl FnOnce(&mut umber_core::LayerStack) -> bool) {
-        let before = self.editor.layers.shape();
+        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         if !moved(&mut self.editor.layers) {
             return;
         }
@@ -1451,7 +1465,7 @@ impl UmberApp {
         // Snapshotted before the removal, because what comes back names the
         // entries that are about to go and cannot hold them until the stack has
         // handed them over.
-        let before = self.editor.layers.shape();
+        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         let Some(gone) = self.editor.layers.remove_many(indices) else {
             return;
         };
@@ -1480,7 +1494,7 @@ impl UmberApp {
         // a layer does.
         self.finish_transform();
         let targets = self.editor.layers.targets();
-        let before = self.editor.layers.shape();
+        let before = self.editor.layers.shape(self.editor.doc.layer_bytes());
         if self.editor.layers.group(&targets).is_none() {
             log::warn!("nothing to group, or the stack is full");
             return;
@@ -1505,14 +1519,18 @@ impl UmberApp {
         // The mask this layer has *now* — none — so restoring this shape takes
         // the new one off again and parks its slice in the entry that would put
         // it back.
-        let mut before = self.editor.layers.shape_with_mask(index);
+        let before = self
+            .editor
+            .layers
+            .shape_with_mask(index, self.editor.doc.layer_bytes());
         let slot = match self.editor.layers.add_mask(index) {
             Some(slot) => slot,
-            // Retried after a release, never before one, for the reason
-            // `free_a_slot` gives: the other refusal here is "this layer
-            // already has a mask", which no released slice would mend.
-            None if self.free_a_slot() => {
-                before = self.editor.layers.shape_with_mask(index);
+            // Retried after a release, never before one, and only where a slice
+            // is the plausible reason — the other refusal here is "this layer
+            // already has a mask", which no released slice would mend and which
+            // would otherwise cost the artist their oldest edits for nothing.
+            // The shape is not re-taken: a release never touches the stack.
+            None if self.editor.layers.mask_at(index).is_none() && self.free_a_slot() => {
                 let Some(slot) = self.editor.layers.add_mask(index) else {
                     return;
                 };
@@ -1564,7 +1582,10 @@ impl UmberApp {
         // is what stopped this clearing the whole history: dropping the claim
         // here would put the number straight back on the free list, and a patch
         // recorded against it would be replayed into whatever inherited it.
-        let before = self.editor.layers.shape_with_mask(index);
+        let before = self
+            .editor
+            .layers
+            .shape_with_mask(index, self.editor.doc.layer_bytes());
         if self.editor.layers.remove_mask(index).is_none() {
             return;
         }

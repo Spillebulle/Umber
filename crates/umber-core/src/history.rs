@@ -211,6 +211,22 @@ impl EditKind {
         )
     }
 
+    /// Does undoing this put a layer's **pixels** back in the stack?
+    ///
+    /// The line the saved history is cut at, and it is a narrower question than
+    /// [`EditKind::is_structural`] on purpose. None of the six can be written
+    /// into a file yet, but only these two make the entries *older* than them
+    /// unwritable as well: a patch recorded before a delete names a slice no
+    /// layer in the saved stack holds, so it cannot be placed at all. An add, a
+    /// move, a group or a new mask leaves every patch either side naming the
+    /// layer it was captured from, so those entries are simply left out and
+    /// everything around them is saved whole — which matters, because dragging
+    /// a layer in the panel is one of the commonest things an artist does and
+    /// cutting the history there would silently discard the morning.
+    pub fn resurrects_pixels(self) -> bool {
+        matches!(self, Self::DeleteLayer | Self::RemoveMask)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Paint => "Stroke",
@@ -337,21 +353,14 @@ impl Edit {
     }
 
     /// The pixels this entry replaced, for the entries that hold any.
-    pub fn patch(&self) -> Option<&PixelPatch> {
-        match &self.body {
-            EditBody::Pixels(patch) => Some(patch),
-            EditBody::Structure(_) | EditBody::Flip => None,
-        }
-    }
-
-    /// The same, as a slice.
     ///
-    /// The form the multi-layer transform wants — one gesture moving a linked
-    /// set records several patches in one entry, or an undo would step through
-    /// it a layer at a time and leave the document in states it was never in.
-    /// Nothing writes more than one yet, so this is `patch()` with the
-    /// signature that will not have to change at the call sites when something
-    /// does.
+    /// **A slice, and there is deliberately no singular accessor beside it.**
+    /// Nothing writes more than one patch yet; the multi-layer transform will,
+    /// because one gesture moving a linked set has to record every layer it
+    /// touched in *one* entry or an undo would step through it a layer at a
+    /// time and leave the document in states it was never in. Two accessors
+    /// would mean call sites that quietly go on reading the first patch of
+    /// several, which is that feature's failure written out in advance.
     pub fn patches(&self) -> &[PixelPatch] {
         match &self.body {
             EditBody::Pixels(patch) => std::slice::from_ref(patch),
@@ -802,6 +811,12 @@ mod tests {
     use super::*;
     use crate::layer::{Layer, LayerStack};
 
+    /// What one layer slice costs in these tests, which is what a recorded
+    /// shape charges the budget per parked layer. Small, so a test about the
+    /// timeline is not also a test about eviction; the tests that are about
+    /// eviction say so and pass their own.
+    const SLICE_BYTES: u64 = 64;
+
     fn patch(w: u32, h: u32, fill: u8) -> PixelPatch {
         let rect = PixelRect {
             x: 0,
@@ -832,11 +847,11 @@ mod tests {
 
         let undone = h.take_undo().unwrap();
         h.push_redo(edit(4, 4, 2));
-        assert_eq!(undone.patch().unwrap().pieces()[0].bytes()[0], 1);
+        assert_eq!(undone.patches()[0].pieces()[0].bytes()[0], 1);
         assert!(h.can_redo());
 
         let redone = h.take_redo().unwrap();
-        assert_eq!(redone.patch().unwrap().pieces()[0].bytes()[0], 2);
+        assert_eq!(redone.patches()[0].pieces()[0].bytes()[0], 2);
     }
 
     #[test]
@@ -861,7 +876,7 @@ mod tests {
         assert!(h.used_bytes() <= 2500, "used {}", h.used_bytes());
         // The newest entry must survive eviction.
         assert_eq!(
-            h.take_undo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
+            h.take_undo().unwrap().patches()[0].pieces()[0].bytes()[0],
             7
         );
     }
@@ -969,30 +984,22 @@ mod tests {
             let (a, b) = (original.entry_at(i).unwrap(), restored.entry_at(i).unwrap());
             assert_eq!(a.kind, b.kind, "entry {i}");
             assert_eq!(a.at, b.at, "entry {i}");
+            assert_eq!(a.patches()[0].rect, b.patches()[0].rect, "entry {i}");
+            assert_eq!(a.patches()[0].slot, b.patches()[0].slot, "entry {i}");
             assert_eq!(
-                a.patch().unwrap().rect,
-                b.patch().unwrap().rect,
-                "entry {i}"
-            );
-            assert_eq!(
-                a.patch().unwrap().slot,
-                b.patch().unwrap().slot,
-                "entry {i}"
-            );
-            assert_eq!(
-                a.patch().unwrap().pieces()[0].bytes(),
-                b.patch().unwrap().pieces()[0].bytes(),
+                a.patches()[0].pieces()[0].bytes(),
+                b.patches()[0].pieces()[0].bytes(),
                 "entry {i}"
             );
         }
 
         // And the cursor is where it was: one redo available, two undos.
         assert_eq!(
-            restored.take_redo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
+            restored.take_redo().unwrap().patches()[0].pieces()[0].bytes()[0],
             9
         );
         assert_eq!(
-            restored.take_undo().unwrap().patch().unwrap().pieces()[0].bytes()[0],
+            restored.take_undo().unwrap().patches()[0].pieces()[0].bytes()[0],
             2
         );
     }
@@ -1096,7 +1103,7 @@ mod tests {
         assert_eq!(kept + lost, 8);
         // Aged out from the bottom, so the newest is still the next undo.
         assert_eq!(
-            h.entry_at(kept - 1).unwrap().patch().unwrap().pieces()[0].bytes()[0],
+            h.entry_at(kept - 1).unwrap().patches()[0].pieces()[0].bytes()[0],
             7
         );
 
@@ -1533,7 +1540,7 @@ mod tests {
         let victim_pixels = doc.read(victim, mark);
 
         // Delete the top layer, holding it in the entry.
-        let before = doc.stack.shape();
+        let before = doc.stack.shape(SLICE_BYTES);
         let gone = doc.stack.remove_many(&[1]).expect("the top layer can go");
         h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
         assert_eq!(doc.stack.len(), 1);
@@ -1542,7 +1549,7 @@ mod tests {
         // number, so the deleted layer's pixels are still there to come back.
         let fresh = doc.stack.add().expect("room for another layer");
         assert_ne!(fresh, victim, "a parked slice was handed to a new layer");
-        h.record(Edit::new(EditKind::AddLayer, doc.stack.shape()));
+        h.record(Edit::new(EditKind::AddLayer, doc.stack.shape(SLICE_BYTES)));
         doc.paint(fresh, mark, 42);
         h.record(Edit::new(EditKind::Paint, doc.paint(fresh, mark, 7)));
 
@@ -1606,7 +1613,7 @@ mod tests {
         doc.stack.add();
         let names: Vec<String> = doc.stack.layers().iter().map(|l| l.name.clone()).collect();
 
-        let before = doc.stack.shape();
+        let before = doc.stack.shape(SLICE_BYTES);
         assert!(doc.stack.reorder(0, 2), "bottom to top");
         let entry = Edit::new(EditKind::MoveLayer, before);
 
@@ -1660,7 +1667,7 @@ mod tests {
         assert_eq!(inside.len(), 2);
         let was = shape(&doc.stack);
 
-        let before = doc.stack.shape();
+        let before = doc.stack.shape(SLICE_BYTES);
         let gone = doc.stack.remove_many(&[folder]).expect("the group can go");
         assert_eq!(gone.len(), 3, "the folder and both layers");
         let entry = Edit::new(EditKind::DeleteLayer, before.with_removed(gone));
@@ -1707,7 +1714,7 @@ mod tests {
             }
             let Some(slot) = stack.add() else { break };
             parked.push(slot);
-            let before = stack.shape();
+            let before = stack.shape(SLICE_BYTES);
             let gone = stack
                 .remove_many(&[stack.active_index()])
                 .expect("the bottom layer stays");
@@ -1725,6 +1732,78 @@ mod tests {
         assert!(h.len() < held);
         assert!(h.dropped() > 0);
         assert!(stack.add().is_some(), "the released slice was not usable");
+    }
+
+    /// **A parked layer costs the budget a whole texture slice**, and the
+    /// budget is what has to bound them.
+    ///
+    /// This is the defect the design walked into: `docs/structural-undo.md` §7
+    /// says a parked slot "costs no *new* allocation", and that is false.
+    /// `LayerStack::slot_capacity_needed` never falls while a slice is parked,
+    /// and `CanvasRenderer::ensure_slots` doubles and never shrinks — so a
+    /// session of deleting and adding layers walks the layer array to its
+    /// 129-slice ceiling, which is 2.16 GB at 2048² and 51.6 GB at 10000°,
+    /// with a budget that reported a few kilobytes and evicted nothing. An
+    /// allocation failure there is an uncaptured device error, which is fatal.
+    ///
+    /// Charging for the slices is what makes the one figure the user sets mean
+    /// what it says. The slice ceiling stays as the hard backstop; what this
+    /// stops is the ceiling being the *only* bound.
+    #[test]
+    fn a_parked_layer_costs_the_budget_the_slice_it_is_holding() {
+        const SLICE: u64 = 4 * 1024 * 1024;
+        let mut stack = LayerStack::new();
+        // Room for two parked slices and not a third.
+        let mut h = History::with_budget(SLICE as usize * 5 / 2);
+
+        let mut parked = Vec::new();
+        for _ in 0..6 {
+            let slot = stack.add().expect("room");
+            parked.push(slot);
+            let before = stack.shape(SLICE);
+            let gone = stack
+                .remove_many(&[stack.active_index()])
+                .expect("the bottom layer stays");
+            h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+            assert!(
+                h.used_bytes() <= h.budget_bytes().max(SLICE as usize),
+                "the budget did not see the parked slices: {} bytes",
+                h.used_bytes()
+            );
+        }
+
+        assert!(h.len() < 6, "nothing was evicted, so nothing was charged");
+        assert!(h.dropped() > 0);
+        // And the evicted entries genuinely gave their slices back, which is
+        // the point of charging for them: the array stops growing.
+        assert!(
+            stack.slot_capacity_needed() < 6,
+            "every slice stayed claimed: {} of them",
+            stack.slot_capacity_needed()
+        );
+    }
+
+    /// An empty shape is still nearly free, so a session of reorders — which
+    /// park nothing — cannot be evicted on account of the slices it does not
+    /// hold.
+    #[test]
+    fn a_shape_holding_no_layer_costs_almost_nothing() {
+        const SLICE: u64 = 400 * 1024 * 1024;
+        let mut stack = LayerStack::new();
+        stack.add();
+        stack.add();
+        let mut h = History::with_budget(64 * 1024);
+        for _ in 0..200 {
+            let before = stack.shape(SLICE);
+            assert!(stack.reorder(0, 2));
+            h.record(Edit::new(EditKind::MoveLayer, before));
+        }
+        assert_eq!(
+            h.dropped(),
+            0,
+            "a move was evicted for slices it never held"
+        );
+        assert_eq!(h.len(), 200);
     }
 
     /// A floating transform needs a slice **above everything claimed**, and a
@@ -1749,7 +1828,7 @@ mod tests {
             if stack.add().is_none() {
                 break;
             }
-            let before = stack.shape();
+            let before = stack.shape(SLICE_BYTES);
             let gone = stack
                 .remove_many(&[stack.active_index()])
                 .expect("the bottom layer stays");
@@ -1798,7 +1877,7 @@ mod tests {
         let capacity = stack.slot_capacity_needed();
 
         // The shape clones the claim; the layer's own copy is then taken away.
-        let parked = stack.shape_with_mask(0);
+        let parked = stack.shape_with_mask(0, SLICE_BYTES);
         assert!(stack.remove_mask(0).is_some());
         assert_eq!(
             stack.slot_capacity_needed(),

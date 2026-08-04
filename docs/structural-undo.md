@@ -39,18 +39,54 @@ This document is the design. **Pieces 1 to 4 of §11 are built**, and the two
   are still not undoable, and §4's `Kept`-restores-shape-not-values rule is what
   keeps deferring them safe.
 
-Two things the design left implicit and the build had to settle, both in §7's
-territory:
+**§7 is wrong about the cost, and that is the correction to read before
+anything else here.** It says a parked slot "costs no *new* allocation; what it
+costs is the chance to reuse one", and §13 repeats it. That is false.
+`slot_capacity_needed` is one past the highest slice **claimed**, a parked slice
+is claimed, and `CanvasRenderer::ensure_slots` doubles and never shrinks — so
+128 ordinary delete-then-add cycles take the layer array to its 129-slice
+ceiling and leave it there: 2.16 GB at 2048², 51.6 GB at 10000². A budget that
+counted only the rows of a shape (tens of bytes) could not see any of it, and an
+allocation failure in `ensure_slots` is an uncaptured device error, which
+`crash::device_error` makes fatal.
 
-- **`SlotPool::give_back` compacts the tail**, so `slot_capacity_needed` is one
-  past the highest slice *still claimed*. Without it, parking walks that number
-  to `MAX_SLOTS` one delete-then-add at a time and `begin_float` refuses every
-  transform from then on — which `roadmap-review.md` §1.3 flagged and the
-  release valve alone does not fix, because giving a slice back to the free list
-  does not lower the high-water mark.
-- **The release is `App::free_a_slot`**, in front of `add`, `add_mask` *and*
-  `begin_float` — the three gates §7 and the review between them name, and the
-  one nobody owned.
+So **`StackShape::byte_len` charges for the slices a shape is holding**, in the
+same currency and against the same figure as a patch. On a 10000² canvas the
+512 MB budget then holds one parked layer exactly as it holds one full-canvas
+stroke, and `evict_to_budget` gives the slice back on the second. The slice
+ceiling stays as the hard backstop it always was; what this stops is the ceiling
+being the *only* bound. `a_parked_layer_costs_the_budget_the_slice_it_is_
+holding` is the guard.
+
+Three smaller things the design left implicit:
+
+- **`SlotPool::give_back` compacts the tail**, so a released slice at the top of
+  the range lowers `slot_capacity_needed` again. Necessary and not sufficient:
+  compaction only fires on the *highest* claim, which is why the budget above is
+  what actually bounds parking.
+- **A pool with a gap in the middle can hand a slice out and still have nothing
+  above the top.** `has_room` and `has_headroom` are two questions, and a
+  release valve asking the first on the float's behalf never opens — the history
+  answers "there is already room", gives nothing up, and `begin_float` goes on
+  refusing for ever. `a_float_needs_a_slice_above_everything_and_not_merely_a_
+  spare_one` pins it.
+- **The release is `App::free_a_slot` / `free_headroom`**, in front of `add`,
+  `add_mask` and `begin_float` — the three gates §7 and the review between them
+  name, and the one nobody owned. The first two release only **after** a
+  refusal: a layer can be refused for reasons a slice would not mend, and
+  freeing first spends an artist's oldest edits on something that was never
+  going to happen.
+
+**§8's cut is narrower than it says**, and had to be. It proposes cutting at the
+newest entry that resurrects pixels and asserts that "adds, moves and groups save
+whole" — but *none* of the six can be written, so the first draft of this cut at
+all of them, and dragging one layer in the panel then discarded the whole
+morning's history at the next save, silently, for an edit that changed no pixel.
+The four that free no slice are **left out individually** instead, with
+everything around them saved whole: every patch either side still names the
+layer it was captured from, so it still resolves. What a reopened document loses
+is the *structure* half of its history, which is what every build before this
+had. `a_reorder_costs_the_saved_history_nothing_but_its_own_row` is the guard.
 
 ---
 

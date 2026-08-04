@@ -1422,7 +1422,7 @@ mod tests {
 
         let opened = doc.open();
         assert_eq!(opened.history.len(), 1, "the history came back");
-        let slot = opened.history.entry_at(0).unwrap().patch().unwrap().slot;
+        let slot = opened.history.entry_at(0).unwrap().patches()[0].slot;
         assert_eq!(
             Some(slot),
             opened.stack.get(2).unwrap().slot(),

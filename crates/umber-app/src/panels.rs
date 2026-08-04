@@ -1619,7 +1619,7 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
             // rather than there because this holds the `Editor` and not the
             // `App`. The entry costs nothing to hold: no slot changes hands, so
             // it is a shape and no pixels at all.
-            let before = ed.layers.shape();
+            let before = ed.layers.shape(ed.doc.layer_bytes());
             if ed.layers.reorder_to(carried.from, to.index, to.depth) {
                 ed.history.record(Edit::new(EditKind::MoveLayer, before));
                 changed = true;

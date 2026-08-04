@@ -209,7 +209,8 @@ fn main() {
     for i in 0..history.len() {
         let patch = history
             .entry_at(i)
-            .and_then(Edit::patch)
+            .map(Edit::patches)
+            .and_then(<[_]>::first)
             .expect("every entry this example records holds pixels");
         raw += patch.byte_len();
 

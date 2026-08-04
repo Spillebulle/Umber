@@ -137,11 +137,20 @@ impl SlotPool {
         self.next < LayerStack::MAX_SLOTS
     }
 
+    /// Hand out the **lowest** free number, or the next one up.
+    ///
+    /// Lowest rather than highest, which is what a bare `pop` off an ascending
+    /// list would give: taking from the top re-claims the end of the range and
+    /// keeps low numbers on the free list, so `next` can never fall again.
+    /// Taking from the bottom leaves the high end free for [`SlotPool::
+    /// give_back`] to compact away, and the linear removal is over a list of at
+    /// most [`LayerStack::MAX_SLOTS`] numbers on a path that runs once per new
+    /// layer.
     fn take(&mut self) -> Option<u32> {
-        if let Some(n) = self.free.pop() {
-            return Some(n);
+        if !self.free.is_empty() {
+            return Some(self.free.remove(0));
         }
-        if self.next >= LayerStack::MAX_SLOTS {
+        if !self.has_headroom() {
             return None;
         }
         let n = self.next;
@@ -153,16 +162,36 @@ impl SlotPool {
     /// highest slice still claimed.
     ///
     /// The compaction is not tidiness. `next` is what
-    /// [`LayerStack::slot_capacity_needed`] reports and therefore what
-    /// `CanvasRenderer::begin_float` reserves its preview slice at, and that
-    /// reservation is refused once it reaches [`LayerStack::MAX_SLOTS`].
-    /// Without compacting, a session of deleting and adding layers walks `next`
-    /// up to the ceiling one slice at a time — parking is what stops a delete
-    /// returning the number immediately — and the transform tool then refuses
-    /// for ever, on a document with a handful of layers and no way back.
+    /// [`LayerStack::slot_capacity_needed`] reports, which is what the renderer
+    /// allocates to and what `CanvasRenderer::begin_float` reserves its preview
+    /// slice at; and `ensure_slots` doubles and **never shrinks**. So a `next`
+    /// left high is a texture array left large, for the rest of the session.
     ///
-    /// The array itself never shrinks (`ensure_slots` only grows), so a
-    /// capacity that falls and rises again costs nothing.
+    /// It is not on its own enough, and the two things beside it are worth
+    /// naming here because each looks redundant next to this one:
+    ///
+    /// * Compaction only fires when the **highest** claim is released, so a
+    ///   parked slice below a live one holds the number up regardless.
+    ///   [`StackShape::byte_len`] charging the undo budget for a parked slice
+    ///   is what actually bounds how many there are.
+    /// * A pool holding a gap in the middle can hand a slice out and still have
+    ///   nothing above the top, which is what [`SlotPool::has_headroom`] is for.
+    ///
+    /// The array never shrinking is also why a capacity that falls and rises
+    /// again costs nothing: `ensure_slots` returns at once.
+    /// Reach the pool, **recovering from a poisoned lock rather than failing**.
+    ///
+    /// Poisoning means some thread panicked while holding it. The three
+    /// operations inside are a push, a sort and a pop of a `Vec<u32>` with
+    /// nothing in them that can panic, so there is no half-written state to
+    /// protect anybody from — and every alternative here is worse in a
+    /// different direction: failing closed loses a slice for ever, and failing
+    /// open once had `slot_capacity_needed` answering `MAX_SLOTS`, which would
+    /// ask the renderer for 129 canvas-sized slices.
+    fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
+        pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn give_back(&mut self, n: u32) {
         self.free.push(n);
         self.free.sort_unstable();
@@ -209,12 +238,10 @@ impl SlotClaim {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        // A poisoned pool means another thread panicked holding it. Losing a
-        // slice is a leak; panicking in a `Drop` while something else is
-        // already unwinding is an abort.
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.give_back(self.number);
-        }
+        // Never `unwrap`: panicking in a `Drop` while something else is
+        // already unwinding is an abort. `SlotPool::locked` recovers from a
+        // poisoned lock rather than declining, so a slice is not leaked either.
+        SlotPool::locked(&self.pool).give_back(self.number);
     }
 }
 
@@ -232,7 +259,7 @@ pub struct SlotRoom(Arc<Mutex<SlotPool>>);
 impl SlotRoom {
     /// Could the document hand a slice out — to a layer, or to a mask?
     pub fn has_room(&self) -> bool {
-        self.0.lock().is_ok_and(|pool| pool.has_room())
+        SlotPool::locked(&self.0).has_room()
     }
 
     /// Is there a slice above everything claimed, which is what a floating
@@ -244,7 +271,7 @@ impl SlotRoom {
     /// up "until there is room" would stop at once and leave the transform tool
     /// refusing on a document with a handful of layers.
     pub fn has_headroom(&self) -> bool {
-        self.0.lock().is_ok_and(|pool| pool.has_headroom())
+        SlotPool::locked(&self.0).has_headroom()
     }
 }
 
@@ -930,7 +957,7 @@ impl LayerStack {
     /// the *live stack* alone, creates precisely that bug and it would look
     /// like a transform quietly eating an undone layer.
     pub fn slot_capacity_needed(&self) -> u32 {
-        self.pool.lock().map_or(Self::MAX_SLOTS, |pool| pool.next)
+        SlotPool::locked(&self.pool).next
     }
 
     /// Insert a new empty layer directly above the active one and select it.
@@ -979,7 +1006,7 @@ impl LayerStack {
     /// `None` when every slice is claimed — by the stack, or by a layer parked
     /// in an undo entry. See [`SlotPool::has_room`].
     fn take_slot(&mut self) -> Option<SlotClaim> {
-        let number = self.pool.lock().ok()?.take()?;
+        let number = SlotPool::locked(&self.pool).take()?;
         Some(SlotClaim(Arc::new(Claim {
             number,
             pool: Arc::clone(&self.pool),
@@ -1568,7 +1595,14 @@ impl LayerStack {
     /// edit removes is folded in afterwards by [`StackShape::with_removed`],
     /// because the layers do not exist to be held until the operation has
     /// handed them over.
-    pub fn shape(&self) -> StackShape {
+    ///
+    /// `slice_bytes` is what one layer slice costs — `Document::layer_bytes` —
+    /// and it is taken here rather than being left out because a shape holding
+    /// a deleted layer is holding a **canvas-sized texture slice**, which is
+    /// the whole cost of this design and is invisible in the count of entries.
+    /// See [`StackShape::byte_len`]. The stack cannot work it out: it holds
+    /// slots, and the canvas belongs to the document.
+    pub fn shape(&self, slice_bytes: u64) -> StackShape {
         StackShape {
             entries: self
                 .layers
@@ -1580,6 +1614,7 @@ impl LayerStack {
                 .collect(),
             active: self.layers.get(self.active).map_or(0, |l| l.id),
             masks: Vec::new(),
+            slice_bytes,
         }
     }
 
@@ -1589,8 +1624,8 @@ impl LayerStack {
     /// The claim is *cloned*, so the slice stays alive when the layer's own
     /// copy is dropped; that is the whole of how removing a mask stopped
     /// clearing the history.
-    pub fn shape_with_mask(&self, index: usize) -> StackShape {
-        let mut shape = self.shape();
+    pub fn shape_with_mask(&self, index: usize, slice_bytes: u64) -> StackShape {
+        let mut shape = self.shape(slice_bytes);
         if let Some(layer) = self.layers.get(index) {
             shape.masks.push((layer.id, layer.mask.clone()));
         }
@@ -1684,6 +1719,9 @@ impl LayerStack {
                 .collect(),
             active: was_active,
             masks: Vec::new(),
+            // Carried across rather than re-derived: the canvas cannot have
+            // changed under a history, because a resize clears it.
+            slice_bytes: target.slice_bytes,
         };
         back.adopt(&mut left);
         debug_assert!(left.is_empty(), "a removed entry was not in the shape");
@@ -1783,6 +1821,12 @@ pub struct StackShape {
     /// frees storage, and that is the whole reason removing one used to clear
     /// the history.
     masks: Vec<(u32, Option<SlotClaim>)>,
+    /// What one layer slice costs, from `Document::layer_bytes`.
+    ///
+    /// Carried so [`StackShape::byte_len`] can charge for the slices this shape
+    /// is holding. See that method: it is the whole cost of the design and it
+    /// is invisible in the count of entries.
+    slice_bytes: u64,
 }
 
 impl StackShape {
@@ -1824,14 +1868,42 @@ impl StackShape {
         self.entries.is_empty()
     }
 
-    /// What this costs in memory, which is what the undo budget counts.
+    /// What this costs, which is what the undo budget counts.
     ///
-    /// Tens of bytes an entry against patches measured in megabytes, so it is
-    /// never what evicts anything — the slice ceiling is what bounds these, not
-    /// the budget. Counted anyway, because a session of thousands of structural
-    /// edits is the case where a budget that could not see them would be
-    /// counting the wrong thing.
+    /// **Dominated by the slices, not by the entries**, and getting that
+    /// backwards is the trap this design walks straight into. The shape itself
+    /// is tens of bytes a row; what a `Gone` row *holds* is a claim on a
+    /// canvas-sized texture slice, which is 16 MB at 2048² and 400 MB at
+    /// 10000². Counting only the rows would leave the one figure the user sets
+    /// to bound undo blind to the whole cost of the feature, and a session of
+    /// deleting and adding layers would walk the layer array to its 129-slice
+    /// ceiling — 2.16 GB at 2048², 51.6 GB at 10000° — with the budget
+    /// reporting a few kilobytes. `LayerStack::slot_capacity_needed` never
+    /// falls while a slice is parked, and `CanvasRenderer::ensure_slots` never
+    /// shrinks, so that memory is allocated and stays allocated.
+    ///
+    /// Charging for them puts parked slices in the same currency as a patch,
+    /// which is the honest one: on a 10000² canvas the 512 MB budget holds one
+    /// parked layer exactly as it holds one full-canvas stroke, and
+    /// `evict_to_budget` gives the slice back on the second. The slice ceiling
+    /// stays as the hard backstop it always was; what this stops is the ceiling
+    /// being the *only* bound.
+    ///
+    /// A mask is another slice of the same array, so it is charged the same.
     pub fn byte_len(&self) -> usize {
+        let slices: u64 = self
+            .entries
+            .iter()
+            .map(|e| match e {
+                ShapeEntry::Kept { .. } => 0,
+                // Its own, and its mask's: a masked layer parks two slices.
+                ShapeEntry::Gone { layer } => {
+                    u64::from(layer.slot.is_some()) + u64::from(layer.mask.is_some())
+                }
+            })
+            .chain(self.masks.iter().map(|(_, m)| u64::from(m.is_some())))
+            .sum();
+        let held = slices.saturating_mul(self.slice_bytes);
         self.entries.len() * std::mem::size_of::<ShapeEntry>()
             + self
                 .entries
@@ -1842,6 +1914,7 @@ impl StackShape {
                 })
                 .sum::<usize>()
             + self.masks.len() * std::mem::size_of::<(u32, Option<SlotClaim>)>()
+            + usize::try_from(held).unwrap_or(usize::MAX)
     }
 }
 
