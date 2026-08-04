@@ -33,6 +33,26 @@ pub enum Action {
     ZoomTool,
     SizeDown,
     SizeUp,
+    // The temporary brush changes. Every one of these is unbound by default and
+    // bindable, which is the whole of why fourteen of them can exist at all: a
+    // set of keys nobody asked for would collide with whatever the painter's
+    // hands already know, and choosing well for everybody across six settings
+    // is not possible. What each one *does* is `tweaks::of_action`'s — this
+    // table stays a plain list of bindings.
+    OpacityDown,
+    OpacityUp,
+    HardnessDown,
+    HardnessUp,
+    SpacingDown,
+    SpacingUp,
+    RoundnessDown,
+    RoundnessUp,
+    AirbrushDown,
+    AirbrushUp,
+    AngleDown,
+    AngleUp,
+    PickupDown,
+    PickupUp,
     SwapColours,
     FitView,
     ActualSize,
@@ -46,7 +66,7 @@ impl Action {
     /// Walking this rather than `defaults()` means an action with no binding
     /// still appears — shown as unbound — instead of silently vanishing from
     /// the list the moment someone forgets to bind it.
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 38] = [
         Action::Save,
         Action::SaveAs,
         Action::Export,
@@ -66,6 +86,25 @@ impl Action {
         Action::ZoomTool,
         Action::SizeDown,
         Action::SizeUp,
+        // Contiguous with the pair above, because the settings list draws a
+        // category heading whenever the category changes as it walks this
+        // array — so a group split in two would draw "Brush" twice with
+        // something else between. `the_brush_actions_are_contiguous_in_the_
+        // settings_list` guards it.
+        Action::OpacityDown,
+        Action::OpacityUp,
+        Action::HardnessDown,
+        Action::HardnessUp,
+        Action::SpacingDown,
+        Action::SpacingUp,
+        Action::RoundnessDown,
+        Action::RoundnessUp,
+        Action::AirbrushDown,
+        Action::AirbrushUp,
+        Action::AngleDown,
+        Action::AngleUp,
+        Action::PickupDown,
+        Action::PickupUp,
         Action::SwapColours,
         Action::FitView,
         Action::ActualSize,
@@ -95,6 +134,29 @@ impl Action {
             Action::ZoomTool => "Zoom tool",
             Action::SizeDown => "Decrease brush size",
             Action::SizeUp => "Increase brush size",
+            // The wording is "the brush", singular and definite, because every
+            // one of these changes the brush *in hand* and not the brush that
+            // is saved — see `tweaks`. The labels are also what the search
+            // field matches on, so each names the setting the way the rail
+            // does rather than the way the engine's field is spelt.
+            Action::OpacityDown => "Decrease brush opacity",
+            Action::OpacityUp => "Increase brush opacity",
+            Action::HardnessDown => "Decrease brush hardness",
+            Action::HardnessUp => "Increase brush hardness",
+            Action::SpacingDown => "Decrease brush spacing",
+            Action::SpacingUp => "Increase brush spacing",
+            Action::RoundnessDown => "Decrease brush roundness",
+            Action::RoundnessUp => "Increase brush roundness",
+            Action::AirbrushDown => "Decrease airbrush rate",
+            Action::AirbrushUp => "Increase airbrush rate",
+            // Named for the number rather than for a direction on screen: the
+            // angle is measured in the document's y-down frame, so "clockwise"
+            // would be a claim about the rasteriser that this label is the
+            // wrong place to make.
+            Action::AngleDown => "Decrease dab angle",
+            Action::AngleUp => "Increase dab angle",
+            Action::PickupDown => "Decrease colour pickup",
+            Action::PickupUp => "Increase colour pickup",
             Action::SwapColours => "Swap colours",
             Action::FitView => "Fit to view",
             Action::ActualSize => "Actual size",
@@ -123,7 +185,23 @@ impl Action {
             | Action::TransformTool
             | Action::PanTool
             | Action::ZoomTool => "Tools",
-            Action::SizeDown | Action::SizeUp => "Brush",
+            // Every temporary brush change, in one run — see `Action::ALL`.
+            Action::SizeDown
+            | Action::SizeUp
+            | Action::OpacityDown
+            | Action::OpacityUp
+            | Action::HardnessDown
+            | Action::HardnessUp
+            | Action::SpacingDown
+            | Action::SpacingUp
+            | Action::RoundnessDown
+            | Action::RoundnessUp
+            | Action::AirbrushDown
+            | Action::AirbrushUp
+            | Action::AngleDown
+            | Action::AngleUp
+            | Action::PickupDown
+            | Action::PickupUp => "Brush",
             Action::SwapColours => "Colour",
             Action::FitView | Action::ActualSize | Action::ZoomIn | Action::ZoomOut => "View",
         }
@@ -906,10 +984,26 @@ pub fn us_key_name(key: KeyCode) -> String {
 mod tests {
     use super::*;
 
+    /// Every action ships bound, except the ones that deliberately do not.
+    ///
+    /// The exception is the temporary brush changes: fourteen keys nobody
+    /// asked for would collide with whatever the painter's hands already know,
+    /// and choosing well for everybody across six settings is not possible. So
+    /// they ship unbound and bindable — which the settings list already draws,
+    /// because it walks [`Action::ALL`] rather than [`defaults`].
+    ///
+    /// The exception is stated as "is it a brush tweak?" rather than as a
+    /// second hand-written list, so an action cannot be excused from this
+    /// guard by being added to a list. Which tweaks are *nonetheless* bound —
+    /// the size pair, which shipped bound — is pinned by
+    /// `tweaks::the_shortcuts_are_all_unbound_by_default_except_size`.
     #[test]
-    fn every_action_has_a_default_binding() {
+    fn every_action_ships_bound_unless_it_is_a_brush_tweak() {
         let bindings = defaults();
         for action in Action::ALL {
+            if crate::tweaks::of_action(action).is_some() {
+                continue;
+            }
             assert!(
                 bindings.iter().any(|b| b.action == action),
                 "{action:?} has no default binding"

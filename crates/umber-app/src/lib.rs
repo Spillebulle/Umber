@@ -58,6 +58,7 @@ mod taskbar;
 mod theme;
 mod themelib;
 mod thumbs;
+mod tweaks;
 mod ui;
 mod update;
 mod updatedlg;

@@ -653,6 +653,11 @@ pub mod metrics {
     pub const SLIDER_ROW: f32 = 16.0;
     pub const SLIDER_RAIL: f32 = 3.0;
     pub const SLIDER_KNOB: f32 = 11.0;
+    /// The hold-and-drag handle beside a Brush tweaks rail. Square, and wide
+    /// enough to be pressed with a nib rather than only clicked with a mouse —
+    /// which is the whole point of it: the rail is the precise control and this
+    /// is the one you can throw a hand at.
+    pub const TWEAK_GRIP: f32 = 22.0;
     /// A brush in the Brushes panel: sample and name on one line.
     pub const BRUSH_ROW: f32 = 26.0;
     /// A brush in the library browser, where a second line carries the

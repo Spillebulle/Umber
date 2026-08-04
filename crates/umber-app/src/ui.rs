@@ -2134,7 +2134,11 @@ pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 /// bitmap is not rotationally symmetric. [`Brush::dab_has_angle`] can only
 /// answer the first half — `BrushPreset::tip` is a name the editor resolves —
 /// so the two are combined here rather than in the engine.
-fn has_angle(ed: &Editor) -> bool {
+///
+/// `pub(crate)` because the Brush tweaks module asks the same question about
+/// the same rail. A second copy of the OR would be two readings that can
+/// disagree — a rail live in one panel and dead in the other.
+pub(crate) fn has_angle(ed: &Editor) -> bool {
     ed.brush.dab_has_angle() || ed.tip.is_some()
 }
 
@@ -2144,7 +2148,11 @@ fn percent(v: f32) -> String {
 }
 
 /// A caption under a control, explaining why it is off or what it does.
-fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
+///
+/// `pub(crate)` for the reason [`has_angle`] is: the Brush tweaks module draws
+/// the same sentence under the same disabled rails, and a second `RichText`
+/// with the same size and colour written out is a caption that drifts.
+pub(crate) fn caption(ui: &mut egui::Ui, p: &Palette, line: &str) {
     ui.label(egui::RichText::new(line).size(10.0).color(p.text_dim));
 }
 
