@@ -463,7 +463,18 @@ impl UmberApp {
         {
             // Cheap when the brush has not changed: `set_tip` compares the mask
             // by identity and returns without touching the GPU.
-            canvas.set_tip(&gfx.gpu.device, &gfx.gpu.queue, tip);
+            //
+            // Whether the tip's *own* colour is stamped is decided in
+            // `begin_stroke`, above, and handed over rather than re-derived —
+            // it is the same answer `StrokeStyle::per_dab_color` was built
+            // from, and the two must not be able to disagree. An eraser and a
+            // stroke on a mask both say no.
+            canvas.set_tip(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                tip,
+                self.editor.stroke_stamps_colour,
+            );
 
             // The selection, on exactly the same footing and for the same
             // reasons: one binding covers a whole dab pass, and a selection

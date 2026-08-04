@@ -1171,12 +1171,18 @@ box of the rotated quad: exact for a tip, conservative for a round dab, and
 
 ## Coloured stamps
 
-A Clip Studio or Krita "coloured stamp" is a tip whose *pixels carry colour*,
-not just coverage: a leaf, a spatter of two hues, a texture that stamps its own
-palette rather than the brush's. Umber's tips were coverage only, so every such
-brush arrived as its own silhouette — 25 shipped-library presets are refused for
-it, 11 for that reason alone, which makes it the largest single engine feature
-blocking brushes.
+A "coloured stamp" is a tip whose *pixels carry colour*, not just coverage: a
+leaf, a spatter of two hues, a texture that stamps its own palette rather than
+the brush's. Umber's tips were coverage only, so every such brush arrived as its
+own silhouette, and the shipped-library generator refused it outright — nothing
+goes out under an author's name painting unlike their brush.
+
+**What carries colour today is GIMP's `.gbr` and `.gpb`, and an RGBA tip already
+in the library.** The engine is general and the model is shared, so a reader
+that has a colour to hand only has to call `TipMask::coloured` — but Krita's
+`.kpp` colour stamps and Clip Studio's still discard theirs, and this section
+does not claim otherwise. How many presets that unblocks has not been
+re-measured; `docs/brush-sources.md` says what to run rather than guessing.
 
 **It turned out to be a third source of per-dab colour, not something new**, and
 that is the whole of why it cost so little. The obvious reading is that a tip
@@ -1221,8 +1227,9 @@ Which pipeline a stroke uses comes from **one snapshot**. `Brush` cannot answer
 "is the tip coloured", because a tip is a *name* the editor resolves — the same
 split `Brush::dab_has_angle` already has — so `Editor::begin_stroke` combines
 the two halves into `StrokeStyle::per_dab_color` and `app.rs` builds its
-`DabStyle` from that same field. That is stronger than what was there, where the
-dab pipeline and the stroke style were two readings that had to agree.
+`DabStyle` from that same field. That collapses a pair that used to have to
+agree: the dab pipeline was read off `StrokeBuilder::is_coloured` and the
+preview and commit off `stroke_style`.
 
 It is **refused at that one gate** for an eraser and for a stroke on a mask.
 Neither has anywhere for a colour to land: an eraser deposits none, and a mask
@@ -1230,6 +1237,19 @@ is read on `.r`, so a stamp's reds and blues would become "reveal" and "hide". A
 coloured stamp used for either paints as the mask it also is, and costs no
 colour attachment at all. The smudge probe is gated on the *brush* rather than
 on the style, so a coloured stamp does not sample the canvas it never reads.
+
+**The refusal has to reach the dab pass, not only the pipeline choice**, and
+getting that wrong was the one real bug a critic found in this work.
+`per_dab_color` turns on for a smudging brush as well, so a brush that is
+*both* takes the coloured pipeline for its own reason — and `set_tip` deciding
+the stamp's colour by itself would have gone on stamping it into a mask, which
+previews grey and commits red. So `set_tip` takes the answer as an argument,
+`Editor::stroke_stamps_colour` is the snapshot both halves are built from, and
+the `Arc`-identity early-out tests that answer as well as the mask: picking up
+the eraser does not change the tip.
+`a_stamp_told_not_to_colour_paints_what_the_dab_carried` and
+`refusing_a_stamps_colour_is_noticed_even_though_the_tip_did_not_change` are
+the pair.
 
 A coloured tip costs **five bytes a texel** — one of coverage, four of colour —
 where a mask costs one. Only the brushes that carry a colour pay it.

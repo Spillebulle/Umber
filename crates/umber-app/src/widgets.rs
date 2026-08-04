@@ -1676,6 +1676,20 @@ fn brush_sample(
 /// into view.
 const ROW_TIP_TEXELS: u32 = 32;
 
+/// `sRGB byte -> linear`, 256 entries, built once.
+///
+/// `tip_image` decodes a colour per *source* texel, and a source is the whole
+/// mask: a 1024² coloured stamp is three million `powf` pairs per rebuild, and
+/// `brush_sample`'s cache is keyed on the brush **by value**, so dragging any
+/// slider in the brush editor rebuilds it every frame. That is the same reason
+/// `docimport::srgb` carries a table rather than calling `powf` per component,
+/// and this is the small version of it — the *encode* is per output texel and
+/// there are at most a thousand of those, so it stays a call.
+fn srgb_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|v| Color::from_srgb_u8(v as u8, 0, 0, 255).r))
+}
+
 /// Box-average a coverage mask down to a thumbnail, tinted with an ink — or
 /// with the stamp's **own** colour where it has one.
 ///
@@ -1701,6 +1715,7 @@ pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage 
         mask.height().div_ceil(scale).max(1),
     );
     let colour = mask.colour();
+    let decode = srgb_table();
     let mut pixels = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
@@ -1716,11 +1731,10 @@ pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage 
                     n += 1;
                     if let Some(rgb) = colour {
                         let i = (sy * mask.width() + sx) as usize * 3;
-                        let c = Color::from_srgb_u8(rgb[i], rgb[i + 1], rgb[i + 2], 255);
                         let a = f32::from(a) / 255.0;
-                        lit[0] += c.r * a;
-                        lit[1] += c.g * a;
-                        lit[2] += c.b * a;
+                        for (c, lit) in rgb[i..i + 3].iter().zip(&mut lit) {
+                            *lit += decode[*c as usize] * a;
+                        }
                         weight += a;
                     }
                 }
