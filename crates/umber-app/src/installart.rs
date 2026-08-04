@@ -21,7 +21,7 @@
 //! What is available is putting the dark where the text is not. The banner is
 //! light where MSI writes and carries the splash's own brand group — mark,
 //! gap, wordmark, on the theme's backdrop — in a block on the right; the
-//! welcome and exit field is a graphite sidebar down the left, ending four
+//! welcome and exit field is a graphite sidebar down the left, ending five
 //! pixels short of where the first control begins. [`BANNER_SPLIT`] and
 //! [`DIALOG_SIDEBAR`] are those measurements and the tests below check that the
 //! committed pictures actually honour them, because the failure is an installer
@@ -48,18 +48,26 @@ pub const DIALOG: (u32, u32) = (493, 312);
 
 /// Where the banner stops being light.
 ///
-/// `ProgressDlg` draws its title at dialog x 20..220, which is 27..293 px, and
-/// `WelcomeEulaDlg` at 15..215, which is narrower. 300 clears the wider of the
-/// two with seven pixels to spare.
+/// The banner is `ProgressDlg`'s alone in this dialog set, and that dialog's
+/// transparent title is a control 330 dialog units wide starting at 20 — which
+/// is 27..466 px, nearly the whole strip. The control is left-aligned and holds
+/// "Installing [ProductName]", so the glyphs stop well short of a third of it;
+/// 300 is where the picture may safely go dark. Stated as a judgement rather
+/// than as a measurement of the control, because it is one: the failure if a
+/// title ever did run that far is text over the mark, which is ugly, and the
+/// sidebar's figure below is the one that would be unreadable.
 const BANNER_SPLIT: u32 = 300;
 
 /// Where the welcome and exit field stops being dark.
 ///
-/// Those dialogs draw their title and description at dialog x 135, which is
-/// 180 px. Four pixels of clearance, for the same reason the banner has seven:
-/// a text control that overhangs the edge of the light area by a pixel puts a
-/// black serif on a near-black ground.
-const DIALOG_SIDEBAR: u32 = 176;
+/// This is the load-bearing number. `WelcomeEulaDlg` — the whole of
+/// `WixUI_Minimal`'s first page — draws its transparent title at dialog x
+/// **130**, which is 173 px, and its licence and its accept box start at the
+/// same column; `ExitDialog`, `FatalError` and `UserExit` use 135, or 180 px.
+/// 168 clears the tighter of the two by five pixels. It was 176 first, taken
+/// off the exit dialog's 135 alone, which put the first page's title three
+/// pixels into a near-black ground — the one place a heading is drawn largest.
+const DIALOG_SIDEBAR: u32 = 168;
 
 /// Margin around the brand group inside the banner's dark block.
 const BLOCK_MARGIN: f32 = 12.0;
