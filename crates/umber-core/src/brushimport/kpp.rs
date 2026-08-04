@@ -742,11 +742,16 @@ impl Preset {
 
     /// **Every** id the sensor names, in the order it names them.
     ///
-    /// Usually there is one — `<params id="pressure">` — and this and
-    /// [`Preset::sensor_id`] agree. Krita also writes a *compound* sensor,
-    /// `<params id="sensorslist">` holding a `<ChildSensor id="…">` per input,
-    /// whose first id is the wrapper's own and matches nothing. Five presets in
-    /// the fetched packs drive their rotation that way.
+    /// Usually there is one — `<params id="pressure">`. Krita also writes a
+    /// *compound* sensor, `<params id="sensorslist">` holding a
+    /// `<ChildSensor id="…">` per input, whose first id is the wrapper's own
+    /// and matches nothing. Seven presets in the fetched packs drive their
+    /// rotation that way and eleven drive Size, Opacity or Scatter that way.
+    ///
+    /// **This is the one door**, and it is why there is no longer a
+    /// `sensor_id` beside it: a reader that takes the first id it finds is
+    /// right about every simple preset and silently wrong about every compound
+    /// one, which is the shape of every fault this module has had.
     fn sensor_ids(&self, name: &str) -> Vec<&str> {
         let Some(sensor) = self.params.get(&format!("{name}Sensor")) else {
             return Vec::new();
@@ -777,9 +782,9 @@ impl Preset {
     /// states one `<Name>commonCurve` for every sensor, and without it each
     /// sensor carries its own `<curve>` and the shared one — which Krita's
     /// editor leaves behind whether or not it is in force — is not read. Six
-    /// presets in the fetched packs carry both, so consulting the shared curve
-    /// unconditionally is how Deevad's "Eraser Kneaded Soft" came out with an
-    /// opacity ramp Krita never applies to it.
+    /// options across four presets in the fetched packs carry both, so
+    /// consulting the shared curve unconditionally is how Deevad's "Eraser
+    /// Kneaded Soft" came out with an opacity ramp Krita never applies to it.
     ///
     /// A sensor with no `<curve>` of its own is linear, which is what Krita's
     /// own curve object is constructed as and what its editor draws for it.
