@@ -1221,12 +1221,73 @@ mod tests {
         }
     }
 
+    /// Every shipped brush that names a paper has one to bite through, and no
+    /// shipped *import* claims a grain without naming the tile it came from.
+    ///
+    /// A paper that resolves to nothing paints **flat**, which is the right
+    /// answer for a library somebody copied without its `papers/` and the wrong
+    /// one here: both halves are written by the same generator, so a name with
+    /// no file is a generator that lost one — and the brush would then paint
+    /// with the grain strength its author set and no texture at all, which is
+    /// weaker and smoother than either the original or a plain brush.
+    ///
+    /// The second half is the direction that has actually gone wrong before.
+    /// An imported brush carrying a grain with no paper of its own falls back
+    /// to `Brush::grain_pattern`'s default — a shipped tile the author never
+    /// chose, which is exactly the substitution that made a Clip Studio import
+    /// paint at 78% of its stated opacity. Umber's own presets are exempt
+    /// because for them the enum *is* the choice.
+    #[test]
+    fn a_shipped_papered_brush_has_a_paper_to_bite_through() {
+        let papered: Vec<_> = crate::preset::builtin()
+            .iter()
+            .filter(|p| p.paper.is_some())
+            .collect();
+        assert!(
+            !papered.is_empty(),
+            "the shipped library carries no papered brush, so the mechanism is untested"
+        );
+
+        for preset in papered {
+            let name = preset.paper.as_deref().expect("paper");
+            assert!(
+                pattern(name).is_some(),
+                "{} names a paper nobody ships: {name}",
+                preset.name
+            );
+            assert!(
+                preset.brush.has_grain(),
+                "{} names a paper and bites at {}",
+                preset.name,
+                preset.brush.grain
+            );
+        }
+
+        for preset in crate::preset::builtin() {
+            if preset.id.starts_with("umber/") || preset.paper.is_some() {
+                continue;
+            }
+            assert!(
+                !preset.brush.has_grain(),
+                "{} was imported with a grain of {} and no paper of its own",
+                preset.name,
+                preset.brush.grain
+            );
+        }
+    }
+
     /// The grain is anchored to the document and repeats across it, so a seam
     /// would draw a grid over every stroke that used it.
     ///
     /// Tested as a statistic rather than as an equality: the tiles are noise, so
     /// neighbouring texels differ everywhere. What must not happen is for the
     /// pair *across* the seam to differ by more than pairs inside the tile do.
+    ///
+    /// It covers the imported papers as well as Umber's own three, and that is
+    /// deliberate rather than incidental: Krita tiles a pattern exactly as this
+    /// does, so a seam here is a seam its author already paints with — but one
+    /// that fails this is a tile nobody should be handed by a *shipped* brush,
+    /// which is the same standard `build-brush-library.rs` holds everything to.
     #[test]
     fn every_shipped_pattern_tiles_without_a_seam() {
         assert_eq!(

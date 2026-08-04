@@ -12,16 +12,20 @@
 /// Name and 8-bit greyscale PNG, sorted by name.
 pub(crate) const TIPS: &[(&str, &[u8])] = &[
     (
+        "deevad-c2-mechanical-pencil-detail-deevad-25-01",
+        include_bytes!("../assets/tips/deevad-c2-mechanical-pencil-detail-deevad-25-01.png"),
+    ),
+    (
         "deevad-c4-bristles-lineart-deevad-25-01",
         include_bytes!("../assets/tips/deevad-c4-bristles-lineart-deevad-25-01.png"),
     ),
     (
-        "deevad-d-bristle-flat-glazing-deevad-25-01",
-        include_bytes!("../assets/tips/deevad-d-bristle-flat-glazing-deevad-25-01.png"),
-    ),
-    (
         "deevad-d-glazing-round-deevad-25-01",
         include_bytes!("../assets/tips/deevad-d-glazing-round-deevad-25-01.png"),
+    ),
+    (
+        "deevad-f-rough-rake-textured-deevad-25-01",
+        include_bytes!("../assets/tips/deevad-f-rough-rake-textured-deevad-25-01.png"),
     ),
     (
         "deevad-i-glazing-round-mix-deevad-25-01",
@@ -44,12 +48,44 @@ pub(crate) const TIPS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/tips/gdquest-block.png"),
     ),
     (
+        "gdquest-chains-test-1",
+        include_bytes!("../assets/tips/gdquest-chains-test-1.png"),
+    ),
+    (
+        "gdquest-chalk-4",
+        include_bytes!("../assets/tips/gdquest-chalk-4.png"),
+    ),
+    (
+        "gdquest-gdquest-cloud-hard",
+        include_bytes!("../assets/tips/gdquest-gdquest-cloud-hard.png"),
+    ),
+    (
         "gdquest-gdquest-cloud-medium",
         include_bytes!("../assets/tips/gdquest-gdquest-cloud-medium.png"),
     ),
     (
+        "gdquest-gdquest-cloud-soft",
+        include_bytes!("../assets/tips/gdquest-gdquest-cloud-soft.png"),
+    ),
+    (
+        "gdquest-gdquest-rock-builder-cartoon",
+        include_bytes!("../assets/tips/gdquest-gdquest-rock-builder-cartoon.png"),
+    ),
+    (
         "gdquest-gdquest-shadow-directional-dark",
         include_bytes!("../assets/tips/gdquest-gdquest-shadow-directional-dark.png"),
+    ),
+    (
+        "gdquest-gdquest-shadow-directional",
+        include_bytes!("../assets/tips/gdquest-gdquest-shadow-directional.png"),
+    ),
+    (
+        "gdquest-gquest-old-2",
+        include_bytes!("../assets/tips/gdquest-gquest-old-2.png"),
+    ),
+    (
+        "gdquest-gquest-old",
+        include_bytes!("../assets/tips/gdquest-gquest-old.png"),
     ),
     (
         "gdquest-leaves-patch-1",
@@ -58,6 +94,14 @@ pub(crate) const TIPS: &[(&str, &[u8])] = &[
     (
         "raghukamath-pack01-fx",
         include_bytes!("../assets/tips/raghukamath-pack01-fx.png"),
+    ),
+    (
+        "raghukamath-pack01-sponge-03",
+        include_bytes!("../assets/tips/raghukamath-pack01-sponge-03.png"),
+    ),
+    (
+        "raghukamath-pack01-sponge-wet",
+        include_bytes!("../assets/tips/raghukamath-pack01-sponge-wet.png"),
     ),
     (
         "raghukamath-pack01-sponze-dry",
