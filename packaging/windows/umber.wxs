@@ -41,17 +41,22 @@
 
       Windows Installer streams every Icon row out to a real file inside its own
       cache and names it with this Id; the shell then has to identify that file
-      from its name alone. `UmberIcon`, which is what this said, produced a file
-      with no extension and an Add/Remove entry drawing the generic document
-      page. The Icon table's own documentation says so: an icon associated with
-      a shortcut "must be named such that their extension matches the extension
-      of the target", and the shortcut simply does not work otherwise.
+      from its name alone, and `UmberIcon` gave it one with no extension. WiX's
+      own `Shortcut.xsd` says the identifier "should have the same extension as
+      the file that it points at". Whether that is what drew the generic page in
+      Add/Remove Programs is inference — the documentation covers shortcuts
+      rather than `ARPPRODUCTICON` — but an Id that is a valid file name costs
+      nothing and is what every other package does.
 
-      That rule is also why the Start Menu shortcut below no longer names this
-      icon at all. Satisfying it for a shortcut whose target is `umber.exe`
-      would mean an Icon row called `umber.exe` holding a copy of the executable
-      in PE format — thirty megabytes of duplicate inside the package. A
-      non-advertised shortcut is a real `.lnk`, so it takes the icon out of the
+      For the *shortcut* the rule is documented and is stronger than a naming
+      convention: the Icon table requires an icon associated with a shortcut to
+      be "in the EXE binary format" and "named such that their extension matches
+      the extension of the target", and says the shortcut will not work
+      otherwise. So no `.ico` row could ever have served it, whatever it was
+      called, and satisfying the rule literally would mean an Icon row named
+      `umber.exe` holding a PE copy of the executable — thirty megabytes of
+      duplicate inside the package. Hence the Start Menu shortcut below names no
+      icon at all and is not advertised: a real `.lnk` takes the icon out of the
       executable it points at, which is the `RT_GROUP_ICON` that
       `crates/umber-desktop/build.rs` compiles in and the same picture Explorer
       already draws on the file.
@@ -61,15 +66,22 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Spillebulle/umber" />
 
     <!--
-      One page with Install and Cancel on it, rather than the four-page
-      InstallDir set this used to use. Umber has one feature and one file; the
-      directory page offered a choice with one sensible answer, and a wizard
-      whose middle pages only have Next on them is furniture.
+      One page with Install and Cancel on it, rather than the InstallDir set
+      this used to use. Umber is one feature, one executable and three text
+      files that go where it goes; the directory page offered a choice with one
+      sensible answer, and a wizard whose middle pages only have Next on them is
+      furniture.
 
-      `INSTALLFOLDER` can still be set from the command line for anyone who does
-      want to place it elsewhere:
+      Two consequences worth knowing rather than discovering. `INSTALLFOLDER` is
+      no longer choosable in the interface, though it can still be set from the
+      command line:
 
         msiexec /i umber.msi INSTALLFOLDER="D:\Umber"
+
+      And `WixUI_Minimal` sets `ARPNOMODIFY`, so the Add/Remove Programs entry
+      loses its "Change" button. Repair and Remove keep their wizard — the
+      maintenance dialogs are still in the set — and Change would only have led
+      to the directory page that is the point of not using InstallDir.
     -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.AssetDir)\licence.rtf" />
@@ -144,18 +156,21 @@
       than shipping.
 
       The registry value is the price of a non-advertised shortcut: ICE43 is an
-      *error* unless the component holding one has a per-user key as its
-      keypath, and validation runs as part of `wix build`.
+      *error* unless the component holding one has an HKCU key as its keypath,
+      and validation runs as part of `wix build`. It is the arrangement
+      Microsoft's own `DesktopToasts` sample uses for exactly this pair.
 
-      `HKMU` rather than `HKCU`, and the difference is not cosmetic. HKMU
-      compiles to root -1, which Windows Installer resolves to HKLM on a
-      per-machine install and HKCU on a per-user one — and this package is
-      per-machine, so `WriteRegistryValues` runs unimpersonated and a literal
-      HKCU would land in the SYSTEM account's hive: a keypath in a hive no user
-      has, orphaned there for ever. ICE43's own remedy names root -1 alongside
-      HKCU, and ICE57 — which is what objects to per-user and per-machine data
-      sharing a component, and does count a non-advertised shortcut as
-      per-machine data here — has nothing left to object to.
+      **Do not "tidy" the root to HKMU.** It looks like the better answer — HKMU
+      is root -1, which resolves per install context, so on a per-machine
+      package like this one the marker would land in HKLM instead of in
+      whichever hive the unimpersonated `WriteRegistryValues` sees. ICE43 even
+      names root -1 in its own remedy. But ICE57 is the gate on the other side:
+      it refuses per-user and per-machine data sharing a component, an HKLM
+      keypath beside a non-advertised shortcut is that mix, and it reports it at
+      *error* severity where the HKCU spelling is the one case its own examples
+      print as a warning. WiX issue 2433 is that exact configuration, reported
+      as LGHT0204. A stray marker in the wrong hive is a blemish; a release that
+      will not build is not.
     -->
     <StandardDirectory Id="ProgramMenuFolder" />
 
@@ -169,7 +184,7 @@
                   Advertise="no">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="io.github.spillebulle.umber" />
         </Shortcut>
-        <RegistryValue Root="HKMU"
+        <RegistryValue Root="HKCU"
                        Key="Software\Umber contributors\Umber"
                        Name="StartMenuShortcut"
                        Type="integer"
