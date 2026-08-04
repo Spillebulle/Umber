@@ -786,12 +786,17 @@ impl UmberApp {
                 // does free them is what got here: the history has already
                 // given up every entry it could, so the only slices left are
                 // ones the live stack is using.
+                // Nothing here promises a remedy that may not work. The earlier
+                // wording said "deleting a layer will free one", which stopped
+                // being true the day a delete started parking its slice in the
+                // undo entry; a later draft promised a second try, which is
+                // only true when the slice that comes free happens to be the
+                // one at the top of the range.
                 lines: vec![
                     "A transform needs a spare texture slice to preview into, and this \
                      document is using every one Umber has — a layer takes one and a \
-                     mask takes another. Deleting a layer frees its slice only once the \
-                     undo entry that could put it back has been discarded, so this may \
-                     need a second try."
+                     mask takes another, of 129. Fewer layers, or fewer masks, will \
+                     make room."
                         .to_string(),
                 ],
             });
@@ -1332,9 +1337,39 @@ impl UmberApp {
     /// `has_room` and still refuse the float. Asking the wrong question here is
     /// a valve that never opens: the history would answer "there is room" and
     /// give nothing up, and the transform tool would stay refused.
+    ///
+    /// **It refuses to spend the history where spending cannot help**, and that
+    /// guard is not belt and braces. Unlike [`Self::free_a_slot`], which
+    /// succeeds the moment it releases *any* claim, this one is satisfied only
+    /// by releasing the claim at the **top** of the range — the tail is all
+    /// `SlotPool::give_back` can compact. So where the live stack itself
+    /// reaches the ceiling, no eviction whatever can help, and without the
+    /// guard `free_until` would empty the undo stack, drain the redo stack and
+    /// then answer false. On a legal document — 64 layers each with a mask — a
+    /// single pen-down with the transform tool in hand would have destroyed the
+    /// whole session's history and refused the transform anyway.
     fn free_headroom(&mut self) -> bool {
         let room = self.editor.layers.room();
+        if room.has_headroom() {
+            return true;
+        }
+        if self.editor.layers.live_slot_ceiling() >= umber_core::LayerStack::MAX_SLOTS {
+            return false;
+        }
         self.editor.history.free_until(move || room.has_headroom())
+    }
+
+    /// Would a new layer inside the selected folder be nested too deep?
+    ///
+    /// The second of `LayerStack::add`'s two refusals that a released slice
+    /// cannot mend. Read here rather than asked of the stack, because it is a
+    /// statement about what *this* add would do and the stack's own answer is
+    /// the `None` we are already looking at.
+    fn selected_folder_is_full(&self) -> bool {
+        self.editor
+            .layers
+            .get(self.editor.layers.active_index())
+            .is_some_and(|l| l.is_folder() && l.depth >= umber_core::LayerStack::MAX_DEPTH)
     }
 
     fn add_layer(&mut self) {
@@ -1350,15 +1385,18 @@ impl UmberApp {
             Some(slot) => slot,
             // A parked layer may be holding the last slice, so give the oldest
             // entries up and try once more — but **only where a slice is the
-            // plausible reason**. `add` also refuses a full stack, and on a dry
-            // pool that is exactly the case where releasing would throw an
-            // artist's oldest edits away and then refuse anyway: 64 masked
-            // layers is 128 slices and the 64-entry cap, both at once.
+            // plausible reason**, which means excluding *both* of `add`'s other
+            // refusals. A full stack is the obvious one: on a dry pool that is
+            // exactly where releasing would throw an artist's oldest edits away
+            // and then refuse anyway, since 64 masked layers is 128 slices and
+            // the 64-entry cap at once. The second is a folder already at
+            // `MAX_DEPTH`, which no released slice mends either.
             //
             // The shape is not re-taken. A release touches the history and the
             // pool and never the stack, so the snapshot is still the one this
             // add is about to change.
             None if self.editor.layers.len() < umber_core::LayerStack::MAX
+                && !self.selected_folder_is_full()
                 && self.free_a_slot() =>
             {
                 let Some(slot) = self.editor.layers.add() else {
@@ -1526,11 +1564,16 @@ impl UmberApp {
         let slot = match self.editor.layers.add_mask(index) {
             Some(slot) => slot,
             // Retried after a release, never before one, and only where a slice
-            // is the plausible reason — the other refusal here is "this layer
-            // already has a mask", which no released slice would mend and which
-            // would otherwise cost the artist their oldest edits for nothing.
+            // is the plausible reason — the other refusals here are "this layer
+            // already has a mask" and an index off the end, neither of which a
+            // released slice would mend and both of which would otherwise cost
+            // the artist their oldest edits for nothing. `mask_at` answers
+            // `None` to both, so the index is checked separately.
             // The shape is not re-taken: a release never touches the stack.
-            None if self.editor.layers.mask_at(index).is_none() && self.free_a_slot() => {
+            None if index < self.editor.layers.len()
+                && self.editor.layers.mask_at(index).is_none()
+                && self.free_a_slot() =>
+            {
                 let Some(slot) = self.editor.layers.add_mask(index) else {
                     return;
                 };

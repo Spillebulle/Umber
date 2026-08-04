@@ -311,11 +311,15 @@ Four things follow, and each of them is a bug that does not have to be written:
   gains one arm and nothing else changes.
 
 Size: `size_of::<Layer>()` is about 56 bytes with padding, so a 64-entry stack is
-under 4 kB plus the names of whatever was removed. Against a 512 MB budget that
-is on the order of a hundred and thirty thousand entries — which is to say the
-budget is not what bounds these, the slot ceiling is. **That figure is arithmetic
+under 4 kB plus the names of whatever was removed. **That figure is arithmetic
 from the struct, not a measurement**; if it is ever worth pinning,
 `examples/measure-undo.rs` is where it goes.
+
+> **This paragraph used to conclude "the budget is not what bounds these, the
+> slot ceiling is", and that was wrong** — the same error as §7's, from the same
+> place. What a `Gone` row *holds* is a claim on a canvas-sized texture slice,
+> which is 16 MB at 2048² and 400 MB at 10000², and it is the dominant cost by
+> four orders of magnitude. See the note at the head of this document.
 
 ---
 

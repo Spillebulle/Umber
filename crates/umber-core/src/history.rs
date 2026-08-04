@@ -295,10 +295,13 @@ impl EditBody {
     /// free, and the list is allowed to hold as many of them as somebody has
     /// the patience to press.
     ///
-    /// A structural entry is nearly free — tens of bytes an entry — so what
-    /// bounds *those* is not the budget but the slice ceiling: a parked layer
-    /// holds a slot claim, and there are [`crate::layer::LayerStack::MAX_SLOTS`]
-    /// of those. [`History::free_until`] is the release valve.
+    /// A structural entry is **not** nearly free, which is the thing about it
+    /// that is easiest to get wrong: the shape is tens of bytes a row, but a
+    /// row holding a deleted layer holds a claim on a canvas-sized texture
+    /// slice — 16 MB at 2048², 400 MB at 10000°. [`StackShape::byte_len`] has
+    /// the whole argument. The budget is therefore what bounds parked slices,
+    /// and [`crate::layer::LayerStack::MAX_SLOTS`] is only the hard backstop
+    /// behind it; [`History::free_until`] is the valve on that backstop.
     fn byte_len(&self) -> usize {
         match self {
             Self::Pixels(patch) => patch.byte_len(),
@@ -694,15 +697,36 @@ impl History {
         Some(e)
     }
 
+    /// Put an undone edit on the redo stack, and answer to the budget.
+    ///
+    /// **Stepping can cost memory, and used not to.** An entry crossing between
+    /// the stacks is rebuilt, and the rebuilt body need not be the size of the
+    /// one it replaces: undoing a stroke swaps a patch for a patch of the same
+    /// rectangle, but undoing an *added layer* hands the layer to the entry
+    /// that could put it back, which is a canvas-sized texture slice arriving
+    /// on the redo stack. Without the eviction, a session could be walked far
+    /// over the ceiling the user set simply by pressing Ctrl+Z, with nothing to
+    /// bring it back until the next stroke — and the budget is now the only
+    /// thing bounding how many slices a history parks.
+    ///
+    /// It ages out from the bottom of the *undo* stack, which is the same
+    /// oldest-first rule everything else here follows, so stepping back never
+    /// discards the entry it is about to reach.
     pub fn push_redo(&mut self, edit: Edit) {
         self.used_bytes += edit.byte_len();
         self.redo.push(edit);
+        self.evict_to_budget();
     }
 
     /// Re-push onto the undo stack without discarding redo — used when redoing.
+    ///
+    /// Answers to the budget for the reason [`History::push_redo`] does, from
+    /// the other side: redoing a *delete* takes the layer back out of the stack
+    /// and into this entry, which is where a parked slice comes from.
     pub fn push_undo(&mut self, edit: Edit) {
         self.used_bytes += edit.byte_len();
         self.undo.push(edit);
+        self.evict_to_budget();
     }
 
     pub fn clear(&mut self) {
@@ -1916,6 +1940,66 @@ mod tests {
         // Asking the right one keeps going until the top of the range is free.
         assert!(h.free_until(|| room.has_headroom()));
         assert!(stack.slot_capacity_needed() < LayerStack::MAX_SLOTS);
+    }
+
+    /// **Where the live stack itself reaches the ceiling, no eviction can help,
+    /// and the caller has to know that before it spends anything.**
+    ///
+    /// `free_until` is total: given a predicate it cannot satisfy it empties
+    /// the undo stack, drains the redo stack and answers false. That is
+    /// harmless for "is there a slice to hand out", which the first release
+    /// satisfies — but the float's question is only satisfied by releasing the
+    /// claim at the **top** of the range, and a slice a live layer holds can
+    /// never be released. `LayerStack::live_slot_ceiling` is what
+    /// `App::free_headroom` asks first, and without it one pen-down with the
+    /// transform tool in hand would destroy a whole session's history on a
+    /// legal document and refuse the transform anyway.
+    #[test]
+    fn a_release_that_cannot_help_is_refused_before_it_spends_the_history() {
+        let mut stack = LayerStack::new();
+        let mut h = History::default();
+        let room = stack.room();
+
+        // A full document: 64 layers each with a mask, which is 128 slices and
+        // exactly the documented maximum.
+        while stack.len() < LayerStack::MAX {
+            stack.add().expect("room for 64 layers");
+        }
+        for i in 0..stack.len() {
+            stack.add_mask(i).expect("room for 64 masks");
+        }
+        assert_eq!(stack.slot_capacity_needed(), LayerStack::MAX_SLOTS - 1);
+
+        // A patch or two of ordinary history, to be destroyed.
+        h.record(Edit::new(EditKind::Paint, patch(4, 4, 1)));
+        h.record(Edit::new(EditKind::Paint, patch(4, 4, 2)));
+        let held = h.len();
+
+        // Delete one layer and add another. The deleted one parks its two
+        // slices, so the new layer cannot have them and takes the last number
+        // in the range — which a *live* layer now holds, for good.
+        let before = stack.shape(SLICE_BYTES);
+        let gone = stack.remove_many(&[5]).expect("the other 63 stay");
+        h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+        stack.add().expect("a slice above the parked pair");
+
+        assert!(
+            !room.has_headroom(),
+            "the fixture did not reach the ceiling"
+        );
+        assert_eq!(
+            stack.live_slot_ceiling(),
+            LayerStack::MAX_SLOTS,
+            "the top of the range is not held by a live layer, so the fixture \
+             is testing the easy case"
+        );
+
+        // Asked anyway, it would empty everything and still answer false. That
+        // is what the caller's guard exists to avoid, so the guard is what is
+        // asserted: `live_slot_ceiling` says so without spending anything.
+        assert!(!h.free_until(|| room.has_headroom()));
+        assert_eq!(h.len(), 0, "the fixture stopped testing anything");
+        assert!(held > 0);
     }
 
     /// A slice is freed exactly once, when the last holder lets go — so an

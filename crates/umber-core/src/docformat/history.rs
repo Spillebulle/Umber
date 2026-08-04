@@ -296,9 +296,19 @@ impl<'a> SaveHistory<'a> {
     /// is what would fix it, and it needs a measurement nobody has taken — see
     /// `docs/structural-undo.md` §8.
     pub fn new(history: &'a History, layers: &LayerStack) -> Option<Self> {
-        // One past the newest entry that puts pixels back into the stack, or 0
-        // where there is none.
-        let cut = (0..history.len())
+        // One past the newest **applied** entry that puts pixels back into the
+        // stack, or 0 where there is none.
+        //
+        // Applied, not merely present, and that is the difference between
+        // cutting where it is needed and cutting away somebody's morning.
+        // `resurrects_pixels` is a property of the kind; whether the entry has
+        // actually taken a layer out of the stack is a property of which side
+        // of the cursor it is on. A delete that has been **undone** sits at or
+        // beyond `position`, its layer is back in the stack holding its own
+        // slice, and every patch older than it therefore resolves. Cutting
+        // there would make "delete the wrong layer, Ctrl+Z, Ctrl+S" discard the
+        // whole earlier history, silently, for an edit that was taken back.
+        let cut = (0..history.position())
             .rev()
             .find(|i| history.kind_at(*i).is_some_and(EditKind::resurrects_pixels))
             .map_or(0, |i| i + 1);
@@ -321,10 +331,13 @@ impl<'a> SaveHistory<'a> {
             let body = match edit.patches().first() {
                 Some(patch) => {
                     // Either of the layer's two slices. A patch that matches
-                    // neither is one whose slot has been freed — a deleted
-                    // layer or a removed mask — and both of those clear the
-                    // history, so reaching here at all means something went
-                    // wrong and the whole history is refused.
+                    // neither is one whose slot is parked in an undo entry — a
+                    // deleted layer, or a removed mask — and the cut above
+                    // removes every entry that could be in that position, so
+                    // reaching here at all means something went wrong and the
+                    // whole history is refused. It used to be that both of
+                    // those cleared the history outright; the guard is the same
+                    // one and it now guards the cut instead.
                     //
                     // The position counts **every stack entry, folders
                     // included**, and the manifest's name fingerprint is built
@@ -1318,6 +1331,49 @@ mod tests {
             0,
             "nothing was dropped from the beginning, so the list must not say so"
         );
+    }
+
+    /// **An undone delete is not a delete**, so it must not cut the history.
+    ///
+    /// "Delete the wrong layer, Ctrl+Z, Ctrl+S" is an ordinary sequence.
+    /// `resurrects_pixels` is a property of the *kind*, so a cut that looked at
+    /// the whole timeline found the undone entry, cut at it, and discarded
+    /// every earlier patch — silently, for an edit that had been taken back.
+    /// The layer is in the saved stack holding its own slice, so all of those
+    /// entries resolve perfectly.
+    #[test]
+    fn a_delete_that_has_been_undone_does_not_cut_the_saved_history() {
+        let stack = stack(&["Paper", "Ink"]);
+        let b = stack.get(1).unwrap().slot().unwrap();
+
+        let mut history = History::default();
+        history.record(Edit::new(EditKind::Paint, patch(b, 5, 3, 11)));
+        history.record(Edit::new(EditKind::Erase, patch(b, 4, 4, 22)));
+        history.record(Edit::new(
+            EditKind::DeleteLayer,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+        // Taken back: the entry moves onto the redo stack, and the layer it
+        // named is back in the stack the save is written from.
+        let undone = history.take_undo().expect("the delete");
+        history.push_redo(Edit::made_at(
+            undone.kind,
+            undone.at,
+            EditBody::Structure(Box::new(stack.shape(SLICE_BYTES))),
+        ));
+        assert_eq!((history.len(), history.position()), (3, 2));
+
+        let (_, doc) = round_trip(&stack, &history);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let back = doc.open().history;
+
+        assert_eq!(
+            (0..back.len()).map(|i| back.kind_at(i)).collect::<Vec<_>>(),
+            vec![Some(EditKind::Paint), Some(EditKind::Erase)],
+            "an undone delete cut the history behind it"
+        );
+        assert_eq!(back.position(), 2);
+        assert_eq!(back.dropped(), 0, "nothing was dropped from the beginning");
     }
 
     /// A history whose *newest* entry is structural writes nothing at all,

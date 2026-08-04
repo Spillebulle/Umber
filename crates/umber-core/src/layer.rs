@@ -158,6 +158,19 @@ impl SlotPool {
         Some(n)
     }
 
+    /// Reach the pool, **recovering from a poisoned lock rather than failing**.
+    ///
+    /// Poisoning means some thread panicked while holding it. The operations
+    /// inside are a push, a sort and a pop of a `Vec<u32>` with nothing in them
+    /// that can panic, so there is no half-written state to protect anybody
+    /// from — and every alternative is worse in a different direction: failing
+    /// closed loses a slice for ever, and failing open once had
+    /// `slot_capacity_needed` answering `MAX_SLOTS`, which would ask the
+    /// renderer for 129 canvas-sized slices.
+    fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
+        pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Take a number back, and **compact the tail** so `next` is one past the
     /// highest slice still claimed.
     ///
@@ -179,19 +192,6 @@ impl SlotPool {
     ///
     /// The array never shrinking is also why a capacity that falls and rises
     /// again costs nothing: `ensure_slots` returns at once.
-    /// Reach the pool, **recovering from a poisoned lock rather than failing**.
-    ///
-    /// Poisoning means some thread panicked while holding it. The three
-    /// operations inside are a push, a sort and a pop of a `Vec<u32>` with
-    /// nothing in them that can panic, so there is no half-written state to
-    /// protect anybody from — and every alternative here is worse in a
-    /// different direction: failing closed loses a slice for ever, and failing
-    /// open once had `slot_capacity_needed` answering `MAX_SLOTS`, which would
-    /// ask the renderer for 129 canvas-sized slices.
-    fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
-        pool.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn give_back(&mut self, n: u32) {
         self.free.push(n);
         self.free.sort_unstable();
@@ -958,6 +958,29 @@ impl LayerStack {
     /// like a transform quietly eating an undone layer.
     pub fn slot_capacity_needed(&self) -> u32 {
         SlotPool::locked(&self.pool).next
+    }
+
+    /// One past the highest slice the **live stack** claims, ignoring anything
+    /// parked in an undo entry.
+    ///
+    /// Deliberately not what [`LayerStack::slot_capacity_needed`] answers — see
+    /// there, and do not swap one for the other. This is for exactly one
+    /// question, and the question is not "how much storage": it is *could
+    /// releasing every parked slice give a floating transform its preview
+    /// slice?* Where this already reaches [`LayerStack::MAX_SLOTS`], the answer
+    /// is no however much undo history is given up, because the tail cannot be
+    /// compacted past a slice a layer is holding — and a caller that spent the
+    /// history finding that out would have destroyed an afternoon for nothing.
+    /// 64 layers each with a mask is exactly that state and is a legal
+    /// document.
+    pub fn live_slot_ceiling(&self) -> u32 {
+        self.layers
+            .iter()
+            .flat_map(|l| [l.slot(), l.mask()])
+            .flatten()
+            .map(|slot| slot + 1)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Insert a new empty layer directly above the active one and select it.
