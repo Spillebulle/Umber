@@ -2964,6 +2964,29 @@ controls, how to build it and the licence.
   and `docs/` are where an argument lives, and a README that explains why the
   scratch is `R8Unorm` has stopped being a shop window. The test to apply is
   whether a painter would change what they do on reading it.
+- **Cut anything the application already explains, and anything self-evident.**
+  This is the rule that keeps the file from growing back. A settings page that
+  lists the themes does not need the README to list them; a shortcuts page with
+  a search box does not need its search box described; a live pressure readout
+  does not need a paragraph saying it shows pressure. Somebody who has opened
+  Umber learns all of it in less time than reading about it takes, and somebody
+  who has not is deciding whether to download, which a feature inventory does
+  not help them do. Name the thing and stop. "Two themes and an interface
+  scale" is a fact; "Shortcuts lists every command with a search field and lets
+  you rebind" is the manual, and Umber does not ship one because it does not
+  need one.
+- **Write it the way a person writes, and this applies inside the application
+  too.** Short paragraphs. Two or three sentences, then a picture or a table or
+  a heading. **No em-dashes** in user-facing text: they are this file's habit
+  and they read as fussy in a shop window and cramped in a dialog. A full stop
+  and a new sentence almost always says it better. The same goes for every
+  string the interface draws — a notice, a tooltip, an empty state — because a
+  painter meets those more often than they meet the README.
+- **The house voice is for this file and `docs/`, not for the product.** The
+  argumentative register that makes an invariant memorable ("and that is not an
+  oversight", "which is the failure written out in advance") is exactly wrong
+  in front of somebody who just wants to paint. Keep it here. Keep it out of
+  there.
 - **A feature is shown, not only described.** Prefer a picture of the thing
   working, or a table, over a paragraph. `docs/images/brushes.png` says more
   about the brush library in one glance than the three sentences beside it, and
