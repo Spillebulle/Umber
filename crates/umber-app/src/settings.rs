@@ -2996,6 +2996,51 @@ mod tests {
         }
     }
 
+    /// The pane draws whatever library it was seeded with, and reads the disk
+    /// only when it was seeded with none.
+    ///
+    /// This is the whole of how `docshot` keeps a contributor's own themes out
+    /// of a committed README picture, and how the two measurements above stop
+    /// depending on the machine running them. It is checked here rather than
+    /// left to the preview, because the preview wants a GPU and this does not.
+    #[test]
+    fn a_seeded_library_is_what_the_pane_reads() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("umber-themes-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = ThemeLibrary::load_from(&dir);
+        library
+            .duplicate(
+                "Seeded",
+                ThemeKind::Graphite,
+                Palette::of(ThemeKind::Graphite),
+            )
+            .expect("a fresh directory");
+        stage_themes(&ctx, library);
+
+        let mut ed = Editor::default();
+        let state = load_themes(&ctx, &mut ed);
+        let names: Vec<&str> = state
+            .library()
+            .expect("seeded")
+            .themes()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["Seeded"], "the pane read a library nobody seeded");
+
+        // And an empty one is empty, which is what `docshot` seeds: whatever
+        // the machine's own directory holds must not reach the picture.
+        stage_themes(&ctx, ThemeLibrary::default());
+        let mut ed = Editor::default();
+        let state = load_themes(&ctx, &mut ed);
+        assert!(
+            state.library().expect("seeded").themes().is_empty(),
+            "an empty seed still let the user's directory through"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A theme's name is what somebody typed and the card is 150 points wide,
     /// so the label has to be cut — and the cut is a binary search, which is a
     /// *wrong* answer rather than a slow one if the predicate is not monotone
