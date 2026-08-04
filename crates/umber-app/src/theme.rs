@@ -429,16 +429,24 @@ pub mod metrics {
     /// height moves both of its edges and takes the tab strip out from under
     /// the pointer that had just clicked it.
     ///
-    /// The height is measured rather than chosen, off `brush_editor_preview`.
-    /// The dialog's own header, tab strip, footer and gaps take about 136,
-    /// leaving a body of 464; the tallest section that cannot grow is Scatter
-    /// at 444, so this clears it by twenty points. The shortest are Texture and
-    /// Blending at about 220, which leaves a good deal of the frame empty — and
-    /// that is the price of one size, paid deliberately, because the thing it
+    /// The height is measured rather than chosen, and the measurement is
+    /// `brush_editor_preview` — a picture drawn through Umber's own style,
+    /// which is the only reading worth taking. (A first attempt measured the
+    /// six sections through a bare egui context and every gap in it was half
+    /// the one on screen. See `ui::BRUSH_EDITOR_FOOTER`, which was six points
+    /// short for the same reason.)
+    ///
+    /// Of the 600, `ui::BRUSH_EDITOR_FOOTER` and `ui::BRUSH_EDITOR_GAP` take an
+    /// exact 59 at the bottom and the header and tab strip about 83 at the top,
+    /// leaving a body of roughly 458. The tallest section that cannot grow is
+    /// Scatter, at about 444 — so it clears by a little over ten points, and a
+    /// caption that wrapped one more line would scroll rather than move the
+    /// frame. The shortest, Texture and Blending, leave a good deal of it
+    /// empty, and that is the price of one size, paid deliberately: what it
     /// buys is a tab strip that stays where it was clicked. Inputs is the one
-    /// section with no ceiling: it is the shortest of the six until a brush has
-    /// a modulation on it and by far the tallest afterwards, and it scrolls
-    /// inside the frame rather than moving it. See `ui::brush_editor`.
+    /// section with no ceiling — the shortest of the six until a brush has a
+    /// modulation on it and by far the tallest afterwards. See
+    /// `ui::brush_editor`.
     pub const BRUSH_EDITOR: [f32; 2] = [560.0, 600.0];
     /// One dynamics curve panel, square.
     pub const CURVE_PANEL: f32 = 150.0;
