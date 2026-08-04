@@ -595,11 +595,19 @@ pub fn canvas_scrollbar(
     rect: Rect,
     span: ScrollSpan,
     vertical: bool,
+    live: bool,
 ) -> Option<f32> {
     let response = ui.interact(
         rect,
         ui.id().with(("canvas-scroll", vertical)),
-        Sense::click_and_drag(),
+        // `hover` rather than nothing when the bar is not live: the thumb still
+        // has to be *drawn*, and it still lights under the pointer, but a press
+        // in the strip belongs to whatever the caller has decided owns it.
+        if live {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
     );
 
     let length = if vertical {
@@ -629,7 +637,15 @@ pub fn canvas_scrollbar(
     // furniture a paint application is trying not to put there — the more so
     // now that the bars are drawn on every frame rather than only where the
     // picture runs off the view. Only the thumb is drawn.
-    let ink = if response.dragged() {
+    // The primary button alone. `Sense::click_and_drag` answers to *any*
+    // button, and the middle one is already the canvas pan — which
+    // `gesture::press` gives the canvas before the interface is consulted, so
+    // a middle-drag over the bar would drive the camera twice, in opposite
+    // directions, and slide the picture backwards under the hand. Same reason
+    // `live` exists for the space-drag; this is the half a caller cannot see.
+    let dragging = response.dragged_by(egui::PointerButton::Primary);
+
+    let ink = if dragging {
         p.text_muted
     } else if response.hovered() {
         p.knob
@@ -640,7 +656,7 @@ pub fn canvas_scrollbar(
     ui.painter()
         .rect_filled(inset, inset.width().min(inset.height()) * 0.5, ink);
 
-    if response.dragged() {
+    if dragging {
         let moved = response.drag_delta();
         let along = if vertical { moved.y } else { moved.x };
         // A fraction of the bar, so the thumb keeps up with the pointer exactly.

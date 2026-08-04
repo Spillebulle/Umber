@@ -134,10 +134,14 @@ impl ScrollSpan {
     /// under a hand that is painting in them.
     ///
     /// The consequence worth knowing is that [`ScrollSpan::thumb`] is then
-    /// always shorter than its own track, so this never draws a full-length
-    /// thumb meaning "nothing to scroll" — which was the other way this could
-    /// have been spelled, and would have been a bar that says one thing and
-    /// does another.
+    /// shorter than its own track, so this does not draw a full-length thumb
+    /// meaning "nothing to scroll" — which was the other way this could have
+    /// been spelled, and would have been a bar that says one thing and does
+    /// another. It is shorter by the document's share of the travel, so at the
+    /// smallest documents and the lowest zoom it is only *just* shorter — a
+    /// 128-pixel canvas at [`Camera::MIN_ZOOM`] leaves two tenths of a percent
+    /// of the track to drag in. That is honest rather than a gap: the document
+    /// is under three screen pixels across and there is nowhere to go.
     pub fn scrollable(&self) -> bool {
         self.doc > 0.0
     }
@@ -167,22 +171,37 @@ impl ScrollSpan {
     ///
     /// What the clamp does is stop a drag banking distance past the end of the
     /// track. `thumb` pins its start inside the bar, so without this a drag
-    /// carried past an end goes on moving the camera under a thumb that has
-    /// stopped, and the same distance has to be spent again before anything
-    /// moves on the way back — the pointer travelling while the thumb sits
-    /// still, which is the complaint the fixed travel exists to prevent,
-    /// arrived at from the other side. It matters far more now the bars are
-    /// drawn on a document that fits, because then the ends are a short drag
-    /// away rather than somewhere nobody goes.
+    /// carried past an end goes on moving the *camera* under a thumb that has
+    /// stopped, and every bit of that has to be spent again before the thumb
+    /// moves on the way back: the picture slides while the hand is on a thumb
+    /// standing still, which is the complaint the fixed travel exists to
+    /// prevent, arrived at from the other side. It matters far more now the
+    /// bars are drawn on a document that fits, because then the ends are a
+    /// short drag away rather than somewhere nobody goes.
     ///
-    /// A camera already outside the document — a space-drag has no limit — is
+    /// The far end is **where the thumb actually stops, which is not always the
+    /// end of the document**, and getting that wrong is the whole bug written
+    /// out again rather than a rounding detail. `thumb` floors its length at
+    /// `0.02` so a sliver is still visible and still catchable, and a floored
+    /// length pins its start at `1 - 0.02` — short of the document whenever the
+    /// raw length was under the floor, which is `extent < doc / 49` and
+    /// therefore a large canvas at an ordinary working zoom rather than a
+    /// corner of one. Bounding on `doc` there would let the camera carry on for
+    /// hundreds of document pixels under a thumb that had already stopped.
+    /// Where the floor does not bite, `travel × (1 - length)` *is* `doc`
+    /// exactly, so this is the same number the obvious version reaches.
+    ///
+    /// A camera already outside that range — a space-drag has no limit — is
     /// left where it is rather than snapped back in, so the bounds are widened
     /// to wherever it stands. The bar can then only ever improve matters, and
     /// a hair of a drag can never teleport a picture that was pushed a long way
-    /// out.
+    /// out. The widening does ratchet: a camera nudged inwards cannot be put
+    /// back where it was by the bar, only by whatever took it out there.
     pub fn pan_by(&self, fraction: f32) -> f32 {
+        let (_, length) = self.thumb();
+        let far = self.doc.min(self.travel() * (1.0 - length));
         let lo = self.centre.min(0.0);
-        let hi = self.centre.max(self.doc);
+        let hi = self.centre.max(far);
         (self.centre + fraction * self.travel()).clamp(lo, hi) - self.centre
     }
 }
@@ -464,6 +483,52 @@ mod tests {
             (span.centre + back).abs() < 1e-3,
             "landed at {}",
             span.centre + back
+        );
+    }
+
+    #[test]
+    fn a_drag_stops_where_the_thumb_does_even_when_the_thumb_is_at_its_floor() {
+        // The half of the rule above that the document alone does not state.
+        // `thumb` floors its length at 0.02 so a sliver stays catchable, and a
+        // floored length pins its start short of the document — so bounding the
+        // drag on the document would carry the camera on under a thumb that had
+        // already stopped, which is the banking the clamp is there to remove.
+        //
+        // These are not extreme numbers: 16384 square is `Document::MAX_EDGE`
+        // and 1440 physical pixels at zoom 64 is somebody looking closely at a
+        // large canvas. The gap the old bound left was about 300 document
+        // pixels, which at that zoom is 19,000 pixels of picture.
+        let span = ScrollSpan::new(16384.0, 1440.0, 64.0, 8192.0);
+        let (_, length) = span.thumb();
+        assert_eq!(length, 0.02, "this test needs the floored case to bite");
+
+        let far = ScrollSpan {
+            centre: span.centre + span.pan_by(10.0),
+            ..span
+        };
+        // Stated against the camera, because that is the half a clamped thumb
+        // hides: `thumb` pins either way, so a test that only read the thumb
+        // would pass over the bug it is here for.
+        let stops_at = span.travel() * (1.0 - length);
+        assert!(
+            far.centre <= stops_at + 1e-2,
+            "the camera reached {} where the thumb stops at {stops_at}",
+            far.centre
+        );
+        assert!(
+            (far.thumb().0 - (1.0 - length)).abs() < 1e-4,
+            "the thumb stopped at {} rather than its own end",
+            far.thumb().0
+        );
+        // And nothing was banked on the way out: the smallest drag home moves
+        // the thumb at once.
+        let back = ScrollSpan {
+            centre: far.centre + far.pan_by(-0.001),
+            ..far
+        };
+        assert!(
+            back.thumb().0 < far.thumb().0,
+            "the thumb did not follow the hand home"
         );
     }
 
