@@ -16289,7 +16289,7 @@
                 stabilization: 0.35,
                 mode: Paint,
                 blend: Normal,
-                smudge: 0.98,
+                smudge: 1.0,
                 smudge_length: 0.5,
                 smudge_radius: 0.41,
                 dabs_per_second: 0.0,
