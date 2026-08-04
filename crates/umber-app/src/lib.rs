@@ -31,6 +31,12 @@ mod gesture;
 mod gputest;
 mod icons;
 mod inputlog;
+/// The Windows installer's two bitmaps, drawn from `theme::Palette`.
+///
+/// Test-only, like `logo`'s icon generator: the bytes are committed under
+/// `packaging/windows/` and nothing here reaches the shipped binary.
+#[cfg(test)]
+mod installart;
 mod keylayout;
 mod layerdrag;
 mod localtime;
