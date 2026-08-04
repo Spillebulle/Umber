@@ -439,10 +439,24 @@ pub fn from_kpp_in(
     // "Watercolor Sponge" is among them — the author's own spelling, so that it
     // can be searched for.)
     let (smudge, smudge_radius) = if smudging {
-        let pickup = preset
-            .number("SmudgeRateValue")
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
+        // The same `paintAt` gives the pickup its own flag and its own
+        // fallback, and it is *not* the deposit's:
+        //
+        //     smudgeRate = m_smudgeRateOption.isChecked() ? …value… : 1.0;
+        //
+        // — a brush with the option off lifts the canvas whole rather than not
+        // at all. No preset in the fetched packs has it clear, so this changes
+        // nothing shipped; it is here because the rule this module opens with
+        // is that a value is read through the flag beside it, and a reader that
+        // applies it to one of three neighbouring settings has not applied it.
+        let pickup = if preset.flag("PressureSmudgeRate") {
+            preset
+                .number("SmudgeRateValue")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let deposit = if preset.flag("PressureColorRate") {
             preset
                 .number("ColorRateValue")
@@ -451,6 +465,22 @@ pub fn from_kpp_in(
         } else {
             0.0
         };
+        // KNOWN WRONG, and left alone deliberately rather than overlooked.
+        // `SmudgeRadiusValue` has an enable flag too — `smudgeRadiusPortion =
+        // isChecked() ? …value… : 0.0` — and **14 of the 19 colour-smudge
+        // presets in the fetched packs have it clear**, carrying leftovers of
+        // 297.82, 3, 0.41 and 0.0041 that this clamp turns into live radii of
+        // 8.0, 3.0, 0.41 and 0.25. That is the `ScatterValue` bug at scale.
+        //
+        // It is not repaired here because the repair needs a number this cannot
+        // supply honestly: Krita's portion is a fraction of the brush size and
+        // Umber's `smudge_radius` a multiple of the dab radius, so what a
+        // portion of zero maps to — the dab itself, most likely `1.0`, which is
+        // `Brush::default().smudge_radius` — is a reading of Krita's sampling
+        // geometry that nobody here has checked against a running Krita. Fixing
+        // it changes the pickup radius of fourteen brushes, several of them
+        // shipped, so it wants that check first. Guessing would be the thing
+        // this module refuses everywhere else.
         (
             Brush::smudge_from_rates(pickup, deposit),
             preset
@@ -1616,6 +1646,7 @@ mod tests {
         let brush = |deposit_on: bool| {
             let xml = format!(
                 "<Preset name=\"Mix\" paintopid=\"colorsmudge\">{}{}{}\
+                 <param type=\"internal\" name=\"PressureSmudgeRate\">true</param>\
                  <param type=\"internal\" name=\"PressureColorRate\">{deposit_on}</param>\
                  </Preset>",
                 param(
