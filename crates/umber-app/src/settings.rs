@@ -333,9 +333,16 @@ fn rail(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         });
 }
 
+/// A pane's own padding, inside the column the dialog hands it.
+///
+/// Named because the footer's reserve is measured against the width that is
+/// left *after* it, and a test taking the bare column would be measuring in
+/// fifty-six points the footer does not have.
+const PANE_MARGIN: i8 = 28;
+
 fn pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
     Frame::NONE
-        .inner_margin(Margin::symmetric(28, 24))
+        .inner_margin(Margin::symmetric(PANE_MARGIN, 24))
         .show(ui, |ui| {
             ui.set_min_height(ui.available_height());
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -1780,7 +1787,7 @@ fn theme_card(
     painter.text(
         strip.left_center() + vec2(10.0, 0.0),
         Align2::LEFT_CENTER,
-        elide(painter, name, room.max(20.0)),
+        widgets::elide(painter, name, text::SMALL, room.max(20.0)),
         FontId::proportional(text::SMALL),
         swatch.text_strong,
     );
@@ -1805,46 +1812,6 @@ fn theme_card(
     );
 
     response.clicked()
-}
-
-/// `text`, cut with an ellipsis to fit `room` points.
-///
-/// Painted text, not a `Label`, so egui's own truncation is not available: the
-/// card is drawn into a rectangle it allocated, and a label in it would be a
-/// second widget in the middle of a painted one.
-fn elide(painter: &egui::Painter, label: &str, room: f32) -> String {
-    let font = FontId::proportional(text::SMALL);
-    let width = |s: &str| {
-        painter
-            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x
-    };
-    if width(label) <= room {
-        return label.to_owned();
-    }
-    // Binary search over character boundaries rather than a character taken off
-    // at a time: this runs per card, per frame, and each step lays the whole
-    // string out. `themelib::MAX_NAME` bounds the string, so the difference is
-    // sixty-odd layouts against six — but the bound is a *file's* rule and this
-    // must not be the thing that makes it load-bearing.
-    let stops: Vec<usize> = label
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(label.len()))
-        .collect();
-    // Measured with the ellipsis on, or the result is one character too wide
-    // exactly when the name is one character too long.
-    let fits = |cut: usize| width(&format!("{}…", label[..stops[cut]].trim_end())) <= room;
-    let (mut lo, mut hi) = (0usize, stops.len() - 1);
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if fits(mid) { lo = mid } else { hi = mid - 1 }
-    }
-    if lo == 0 {
-        return String::new();
-    }
-    format!("{}…", label[..stops[lo]].trim_end())
 }
 
 /// The design's dashed "New theme" card.
@@ -2111,15 +2078,22 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                     // On losing focus rather than on every keystroke, unlike
                     // the colours: a rename moves the card in a list sorted by
                     // name, and a row that jumped under the pointer on every
-                    // letter would be unusable. Anything that takes the focus
-                    // keeps what was typed, and an emptied field is not a
+                    // letter would be unusable. An emptied field is not a
                     // nameless theme — the model substitutes "Untitled theme".
-                    // **Escape is not an abandon here** and cannot be made one
-                    // cheaply: egui's `TextEdit` handles no `Key::Escape`, and
-                    // `egui::Modal` takes it to close the dialog. What stops
-                    // that leaving a half-typed name lying about is
-                    // `forget_themes_edit`, which empties the buffers on every
-                    // frame this page is not in front.
+                    //
+                    // **Anything that takes the focus while this page is still
+                    // drawn keeps what was typed; anything that takes the page
+                    // away abandons it.** Clicking Export, or another field, is
+                    // the first. Clicking another settings tab, or shutting the
+                    // dialog — which is what Escape does here, since egui's
+                    // `TextEdit` handles no `Key::Escape` and `egui::Modal`
+                    // takes it — is the second: this row is simply not drawn
+                    // again, `lost_focus` is never observed, and the next
+                    // frame's `forget_themes_edit` empties the buffer. That is
+                    // the abandon Escape looks like it should be, and leaving
+                    // the buffer instead would be worse than either: reopening
+                    // the page would show a name the theme does not have, whose
+                    // next blur applied a rename nobody asked for twice.
                     renamed = field.lost_focus();
                 }
                 None => {
@@ -2258,7 +2232,11 @@ fn import_theme(state: &mut Themes, ed: &mut Editor) {
             }
             Err(e) => {
                 failed = true;
-                lines.push(e.to_string());
+                // Named, because not every error carries the path — a library
+                // that filled part way through a batch would otherwise repeat
+                // one identical sentence with nothing to say which file it was
+                // about.
+                lines.push(format!("{}: {e}", path.display()));
             }
         }
     }
@@ -3041,89 +3019,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A theme's name is what somebody typed and the card is 150 points wide,
-    /// so the label has to be cut — and the cut is a binary search, which is a
-    /// *wrong* answer rather than a slow one if the predicate is not monotone
-    /// or an index is not on a character boundary.
-    ///
-    /// Driven against a real `Painter`, because what it measures is a galley
-    /// laid out in Archivo and there is nothing else to compare it with.
-    #[test]
-    fn a_name_too_wide_for_its_card_is_cut_to_fit_and_never_past_a_character() {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIDTH, HEIGHT))),
-            ..Default::default()
-        };
-        // Twice: the first pass through a fresh context builds the font atlas.
-        for _ in 0..2 {
-            let _ = ctx.run_ui(input.clone(), |ui| {
-                let painter = ui.painter();
-                let width = |s: &str| {
-                    painter
-                        .layout_no_wrap(
-                            s.to_owned(),
-                            FontId::proportional(text::SMALL),
-                            Color32::WHITE,
-                        )
-                        .size()
-                        .x
-                };
-                // Multi-byte throughout, so a cut that landed between the bytes
-                // of a character would panic rather than come out short.
-                for label in [
-                    "Midnight oil",
-                    "Skogsbrynet — høst",
-                    "夜のパレット",
-                    "é",
-                    "",
-                ] {
-                    for room in [0.0, 1.0, 8.0, 20.0, 47.5, 100.0, 400.0] {
-                        let cut = elide(painter, label, room);
-                        assert!(
-                            cut == label || width(&cut) <= room,
-                            "{label:?} at {room} came out {cut:?}, which is {} wide",
-                            width(&cut),
-                        );
-                        if cut != label {
-                            assert!(
-                                cut.is_empty() || cut.ends_with('…'),
-                                "{label:?} at {room} was cut to {cut:?} with no ellipsis",
-                            );
-                            let kept = cut.trim_end_matches('…');
-                            assert!(
-                                label.starts_with(kept.trim_end()),
-                                "{label:?} at {room} came out {cut:?}, which is not a prefix",
-                            );
-                        }
-                    }
-                }
-                // The room a card actually gives it: enough for a short name,
-                // not enough for a long one, and the long one comes back
-                // shorter than the room rather than merely shorter than itself.
-                let room = 90.0;
-                let long = "Midnight oil, and rather a lot of it besides";
-                assert_eq!(elide(painter, "Dusk", room), "Dusk");
-                let cut = elide(painter, long, room);
-                assert_ne!(cut, long);
-                assert!(width(&cut) <= room, "{cut:?} is {} wide", width(&cut));
-                // And it is the *most* that fits: one more character would not.
-                let kept: String = cut.trim_end_matches('…').to_owned();
-                let next = long
-                    .char_indices()
-                    .find(|(i, _)| *i >= kept.len())
-                    .map(|(i, c)| i + c.len_utf8());
-                if let Some(end) = next {
-                    assert!(
-                        width(&format!("{}…", long[..end].trim_end())) > room,
-                        "{cut:?} stopped short: {:?} would also have fitted",
-                        &long[..end],
-                    );
-                }
-            });
-        }
-    }
-
     /// What the footer costs must fit the room the pane keeps for it.
     ///
     /// This is the assertion that actually pins the fix, and the one below is
@@ -3145,12 +3040,16 @@ mod tests {
         let mut measured = 0.0;
         for _ in 0..3 {
             let _ = ctx.run_ui(input.clone(), |ui| {
+                // The width the *pane* hands it, which is the column less the
+                // pane's own margin. Measured in the bare column the footer had
+                // 56 points it does not have, and the path label is
+                // `.truncate()`d rather than wrapped — so the day that label
+                // wraps instead, a test taking the wider figure would stay
+                // green while the footer overflowed.
+                let inner = WIDTH - RAIL_WIDTH - PANE_MARGIN as f32 * 2.0;
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(Rect::from_min_size(
-                            pos2(0.0, 0.0),
-                            vec2(WIDTH - RAIL_WIDTH, HEIGHT),
-                        ))
+                        .max_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(inner, HEIGHT)))
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
                 storage_footer(&mut child, &palette, &mut ed);

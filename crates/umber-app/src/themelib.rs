@@ -283,10 +283,16 @@ fn one_line(text: &str) -> String {
 const SUFFIX_ROOM: usize = 8;
 
 fn clipped(desired: &str) -> String {
-    desired
+    // Cleaned as well as cut, so what `unique_name` compares and what the list
+    // holds are the string the file will hold. Without it a name carrying a
+    // control character sat in memory in one form and on disk in another until
+    // the next load — and the uniqueness had been decided against the first.
+    clean_name(desired)
         .chars()
         .take(MAX_NAME.saturating_sub(SUFFIX_ROOM))
-        .collect()
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 /// What came of reading a theme file.
@@ -359,10 +365,14 @@ pub fn read_theme(text: &str, path: &Path) -> Result<ThemeRead, ThemeError> {
     }
 
     if theme.name.trim().is_empty() {
+        // Through `clean_name` as well, and that is not belt and braces: a
+        // filename is up to 255 characters of somebody else's choosing, so a
+        // fallback taken verbatim would put a name on the card row that
+        // [`MAX_NAME`] exists to say cannot get there.
         theme.name = path
             .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| clean_name(&s.to_string_lossy()))
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| UNTITLED.to_owned());
     }
     Ok(ThemeRead { theme, skipped })
@@ -1200,6 +1210,17 @@ mod tests {
         let text = format!("Umber theme\nbase = graphite\nname = {long}\n");
         let read = read_theme(&text, &here()).expect("a header and a name");
         assert!(read.theme.name.chars().count() <= MAX_NAME);
+
+        // And the *filename* fallback, which is the path a file with a blank
+        // name line takes — 255 characters of somebody else's choosing, and the
+        // one route into the card row that was not going through the cap.
+        let stem = PathBuf::from(format!("{long}.{EXTENSION}"));
+        let read = read_theme("Umber theme\nname =\n", &stem).expect("a header");
+        assert!(
+            read.theme.name.chars().count() <= MAX_NAME,
+            "the filename fallback is {} characters",
+            read.theme.name.chars().count()
+        );
 
         let dir = temp_dir("long-names");
         let mut library = ThemeLibrary::load_from(&dir);

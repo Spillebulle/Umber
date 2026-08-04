@@ -2558,6 +2558,91 @@ mod tests {
     /// splitting them again. The failure it guards against is quiet: a picker a
     /// few pixels short elides the one long option and reads as a name somebody
     /// mistyped, and every other option looks fine.
+    /// The cut a painted row makes when a name does not fit.
+    ///
+    /// [`elide`] is a binary search over character boundaries, which is a
+    /// *wrong* answer rather than a slow one if the predicate is not monotone
+    /// or an index is not on a boundary — and neither is visible in a
+    /// screenshot, because a name cut one character short looks like a name.
+    /// Eight call sites depend on it: the document tabs, the layer rows, the
+    /// dropdown trigger, the brush library and the theme cards.
+    ///
+    /// Driven against a real `Painter`, because what it measures is a galley
+    /// laid out by egui and there is nothing else to compare it with.
+    #[test]
+    fn a_name_too_wide_for_its_row_is_cut_to_fit_and_never_past_a_character() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        // Twice: the first pass through a fresh context builds the font atlas.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                let painter = ui.painter();
+                let size = text::SMALL;
+                let width = |s: &str| {
+                    painter
+                        .layout_no_wrap(s.to_owned(), FontId::proportional(size), Color32::WHITE)
+                        .size()
+                        .x
+                };
+                // Multi-byte throughout, so a cut that landed between the bytes
+                // of a character would panic rather than come out short.
+                for label in [
+                    "Midnight oil",
+                    "Skogsbrynet — høst",
+                    "夜のパレット",
+                    "é",
+                    "",
+                ] {
+                    for room in [0.0, 1.0, 8.0, 20.0, 47.5, 100.0, 400.0] {
+                        let cut = elide(painter, label, size, room);
+                        if cut == label {
+                            continue;
+                        }
+                        assert!(
+                            cut.is_empty() || cut.ends_with('…'),
+                            "{label:?} at {room} was cut to {cut:?} with no ellipsis",
+                        );
+                        let kept = cut.trim_end_matches('…');
+                        assert!(
+                            label.starts_with(kept),
+                            "{label:?} at {room} came out {cut:?}, which is not a prefix of it",
+                        );
+                    }
+                }
+
+                // The room a card actually gives a name: enough for a short
+                // one, not enough for a long one — and the long one comes back
+                // narrower than the room rather than merely narrower than
+                // itself.
+                let room = 90.0;
+                let long = "Midnight oil, and rather a lot of it besides";
+                assert_eq!(elide(painter, "Dusk", size, room), "Dusk");
+                let cut = elide(painter, long, size, room);
+                assert_ne!(cut, long);
+                assert!(width(&cut) <= room, "{cut:?} is {} wide", width(&cut));
+
+                // And it is the *most* that fits: one more character would not.
+                // Measured from the untrimmed prefix, or a cut that happened to
+                // land after a space would compare against a string this never
+                // proposed.
+                let kept = cut.trim_end_matches('…').len();
+                if let Some((i, c)) = long.char_indices().find(|(i, _)| *i >= kept) {
+                    let more = &long[..i + c.len_utf8()];
+                    assert!(
+                        width(&format!("{more}…")) > room,
+                        "{cut:?} stopped short: {more:?} would also have fitted",
+                    );
+                }
+            });
+        }
+    }
+
     #[test]
     fn a_dropdown_sized_to_its_content_has_room_for_all_of_it() {
         // Plausible measured widths: a name, and a two-figure member count.
