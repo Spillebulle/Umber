@@ -110,9 +110,11 @@
 //!   a material: a stale reference left behind by a texture that was switched
 //!   off would be a brush painting through paper it does not have. The tile
 //!   size is the material's own size times `TextureScale2`, which is what that
-//!   percentage means — see [`GRAIN_TILE_AT_FULL_SCALE`] for the figure that
+//!   percentage means — see `GRAIN_TILE_AT_FULL_SCALE` for the figure that
 //!   stands in when the material could not be read, and for what it used to
-//!   cost when it stood in for every case.
+//!   cost when it stood in for every case. A paper that cannot be resolved at
+//!   all paints **flat**, strength and picture both, because leaving the
+//!   strength behind falls back to `Brush::default()`'s `Tooth`.
 //! - **Dual brushes, watercolour edges, colour jitter and the vector settings
 //!   have no engine behind them at all** and are named. The dual brush is the
 //!   largest of the four and the one whose column family invites a guess: a
@@ -210,6 +212,18 @@ pub mod dropped {
     /// bites more evenly and more weakly than the author drew it.
     pub const REDUCED_PAPER: &str =
         "a paper texture larger than Umber can hold at full resolution (reduced to fit)";
+    /// `Brush::MAX_GRAIN_SCALE` — or, far more rarely, `MIN_GRAIN_SCALE` — cut
+    /// the tile the file asked for.
+    ///
+    /// **Distinct from [`REDUCED_PAPER`] and it must stay distinct**, because
+    /// the two fire on almost the same condition and mean opposite things. That
+    /// one is the *picture* being coarser than it was drawn; this is the
+    /// picture being repeated at a **finer pitch** than the author set — a
+    /// 4096-texel paper at 100% asks for a 4096-pixel tile and gets 2048, so
+    /// the grain recurs twice as often across the canvas. Folding it into
+    /// `REDUCED_PAPER` would put a notice about softening over a change of
+    /// spatial frequency.
+    pub const PAPER_SPACING: &str = "the paper texture's own spacing";
     /// Umber has no tilt input on any platform it runs on, so a tilt mapping
     /// could only ever be evaluated at a value the pen never reports.
     pub const TILT_INPUT: &str = "settings driven by pen tilt";
@@ -1138,11 +1152,13 @@ struct ResolvedPaper {
     /// `None` where the thumbnail stood in.
     ///
     /// This is what `TextureScale2` is a percentage of, which is why it is
-    /// carried out rather than taken off `tile`: a reduced tile covers exactly
-    /// the same document area as the material it came from, and a thumbnail's
-    /// longest side is capped at 300 and therefore says nothing about the
-    /// picture's. See [`GRAIN_TILE_AT_FULL_SCALE`] for the figure that stands
-    /// in when this is absent.
+    /// carried out rather than taken off `tile`: a reduced tile is meant to
+    /// cover the same document ground as the material it came from, and a
+    /// thumbnail's longest side is capped at 300 and therefore says nothing
+    /// about the picture's. See `GRAIN_TILE_AT_FULL_SCALE` for the figure that
+    /// stands in when this is absent — and `dropped::PAPER_SPACING` for the one
+    /// case where covering the same ground is not possible, because
+    /// [`Brush::MAX_GRAIN_SCALE`] is smaller than the tile the file asked for.
     ///
     /// The *longest* side, because [`Brush::grain_scale`] is one number and the
     /// dab pass divides the document position by it on both axes — so a
@@ -1173,12 +1189,20 @@ struct ResolvedPaper {
 /// disagree about a texel either.
 fn paper_for(reference: &[u8], materials: &Materials) -> Option<ResolvedPaper> {
     let archive = materials.resolve(reference)?;
-    if let Some(material) = materials.pixels(reference) {
-        let grain = material.coverage.iter().map(|v| 255 - *v).collect();
-        if let Ok((tile, reduced)) = TipMask::reduced(material.width, material.height, grain) {
+    if let Some(csmaterial::Material {
+        width,
+        height,
+        coverage,
+    }) = materials.pixels(reference)
+    {
+        // `into_iter` rather than `iter`, so the complement is written back
+        // into the buffer the cache already handed over rather than allocating
+        // a third copy of a picture that can be four megabytes.
+        let grain = coverage.into_iter().map(|v| 255 - v).collect();
+        if let Ok((tile, reduced)) = TipMask::reduced(width, height, grain) {
             return Some(ResolvedPaper {
                 tile,
-                native: Some(material.width.max(material.height)),
+                native: Some(width.max(height)),
                 lost: reduced.then_some(dropped::REDUCED_PAPER),
             });
         }
@@ -1565,10 +1589,38 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
                     }
                     paper = Some(tile);
                 }
-                None => push_once(&mut dropped, dropped::PAPER_TEXTURE),
+                // **And the strength goes with it**, which is the half that
+                // was missing and made three doc comments false. `paper` being
+                // `None` leaves `BrushPreset::paper` unset, and
+                // `Editor::paper_tile`'s `None` arm falls back to
+                // `brush.grain_pattern` — which this converter never writes, so
+                // it is `Brush::default()`'s `Tooth`. A brush whose material
+                // Clip Studio left out of the file therefore arrived painting
+                // through Tooth at whatever strength the file asked for: the
+                // exact 78%-of-its-own-opacity substitution the rest of this
+                // block exists to have stopped doing. Zero is the identity the
+                // dab pass documents, so this is "paints flat" actually meant.
+                None => {
+                    brush.grain = 0.0;
+                    push_once(&mut dropped, dropped::PAPER_TEXTURE);
+                }
             }
         }
-        brush.grain_scale = (full * scale).clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
+        // Umber's own bound on a tile, and it is newly reachable: `full` used
+        // to be 256, so the ceiling needed a `TextureScale2` of 800%. Now that
+        // it is the material's own longest side the two overlap **exactly** —
+        // `REDUCED_PAPER` fires above `TipMask::MAX_SIZE` and at the default
+        // 100% that is the same condition as this clamp — so a paper reduced to
+        // fit would also have been silently re-spaced, repeating twice as often
+        // as its author drew it under a notice that spoke only of softening.
+        // Two different losses may not hide under one name.
+        let wanted = full * scale;
+        brush.grain_scale = wanted.clamp(Brush::MIN_GRAIN_SCALE, Brush::MAX_GRAIN_SCALE);
+        // Only where the brush can feel the grain at all: with the strength
+        // zeroed above there is no spacing left to have lost.
+        if brush.has_grain() && (brush.grain_scale - wanted).abs() > 0.5 {
+            push_once(&mut dropped, dropped::PAPER_SPACING);
+        }
     }
 
     // ---- the tip -------------------------------------------------------
@@ -1748,7 +1800,8 @@ mod tests {
 
     // -------------------------------------------------------------- fixtures
 
-    /// The columns of `Variant` this importer actually reads, in an order that
+    /// The columns of `Variant` this importer reads, plus the five below that
+    /// it deliberately does not, in an order that
     /// is deliberately *not* the order the code reads them in — the point of
     /// the schema being name-addressed is that neither one matters.
     const VARIANT_COLUMNS: [&str; 46] = [
@@ -3560,6 +3613,85 @@ mod tests {
         let tool = from_sut(&bytes).expect("read").tools.remove(0);
         assert!(tool.paper.is_none());
         assert!(tool.dropped.contains(&dropped::PAPER_TEXTURE));
+        // **Flat means the strength too**, and this assertion is the whole of
+        // the claim. Without it the test passes on a brush that paints through
+        // `GrainPattern::Tooth` at 0.8: `paper` is `None`, so the preset names
+        // no tile, so `Editor::paper_tile` falls back to `brush.grain_pattern`,
+        // which this converter never writes and which defaults to `Tooth`. That
+        // is the 78% substitution three doc comments claim was removed, and it
+        // survived because "paints flat" was checked by reading the loss string
+        // rather than the brush.
+        assert_eq!(tool.brush.grain, 0.0);
+        assert!(!tool.brush.has_grain());
+    }
+
+    /// `Brush::MAX_GRAIN_SCALE` cutting the tile is a **second** loss, and it
+    /// is named rather than folded into `REDUCED_PAPER`.
+    ///
+    /// The two fire on almost the same condition — a material past
+    /// `TipMask::MAX_SIZE`, at the default 100% scale — and mean opposite
+    /// things: one is a picture coarser than it was drawn, the other is that
+    /// picture repeated at *twice the frequency* the author set. The clamp was
+    /// unreachable while the tile was always 256, so nothing caught it when the
+    /// material's own size started feeding it.
+    #[test]
+    fn a_paper_too_coarse_for_umbers_own_ceiling_says_so_rather_than_being_quietly_respaced() {
+        let path = ".:paper:data:material_0.layer";
+        let side = Brush::MAX_GRAIN_SCALE as u32 + 512;
+        let flat = vec![64u8; (side * side) as usize];
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 80)
+                    // The default, and `unwrap_or`'s value — so this is the
+                    // ordinary case rather than a contrived one.
+                    .real("TextureScale2", 100.0),
+            )],
+            &[(
+                path,
+                material_with_pixels(8, 8, [128, 128, 128, 255], Some((side, side, flat))),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+
+        assert!(
+            (tool.brush.grain_scale - Brush::MAX_GRAIN_SCALE).abs() < 1e-4,
+            "got {}",
+            tool.brush.grain_scale
+        );
+        assert!(tool.dropped.contains(&dropped::PAPER_SPACING));
+        // Both losses, because both happened: the picture was reduced *and*
+        // the tile it is repeated at is finer than the file asked for.
+        assert!(tool.dropped.contains(&dropped::REDUCED_PAPER));
+
+        // And the ordinary paper loses neither. This is what stops the notice
+        // appearing on every textured import, which is the failure the whole
+        // `dropped` list is written to avoid.
+        let path = ".:small:data:material_0.layer";
+        let bytes = sut(
+            &[(
+                "Pencil",
+                Variant::plain(2)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 80)
+                    .real("TextureScale2", 19.0),
+            )],
+            &[(
+                path,
+                material_with_pixels(
+                    8,
+                    8,
+                    [128, 128, 128, 255],
+                    Some((500, 500, vec![64u8; 500 * 500])),
+                ),
+            )],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+        assert!((tool.brush.grain_scale - 95.0).abs() < 1e-4);
+        assert!(!tool.dropped.contains(&dropped::PAPER_SPACING));
+        assert!(!tool.dropped.contains(&dropped::REDUCED_PAPER));
     }
 
     /// Colour pickup is what puts a stroke on the per-dab colour path, and that
