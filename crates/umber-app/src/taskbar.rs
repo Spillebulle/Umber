@@ -21,6 +21,24 @@
 //! window exists** — the shell reads the identity when the button is created,
 //! and setting it afterwards changes nothing about a button already on screen.
 //!
+//! That was still not enough, and the fifth piece is the other end of the same
+//! wire: **the installed shortcut has to declare the same id.** Microsoft's
+//! rule for an explicit AppUserModelID is that it "must also be assigned to all
+//! running windows or processes, **shortcuts**, and file associations", and the
+//! shortcut is where the taskbar looks — setting `System.AppUserModel.ID` on it
+//! is what "allows the taskbar to identify the proper shortcut to pin and
+//! ensures that windows belonging to the process are appropriately associated
+//! with that taskbar button", after which "the command line, icon, and text of
+//! the shortcut" supply the button's own. Umber claimed an identity that
+//! nothing installed on the machine owned, so the button had no shortcut to
+//! take any of that from. `packaging/windows/umber.wxs` now sets it through
+//! `MsiShortcutProperty`, which is the mechanism Microsoft names for an
+//! installer, and that in turn is why the Start Menu shortcut had to stop being
+//! *advertised*: an advertised shortcut carries no properties, and it also took
+//! its icon from the Icon table, where a row named without a file extension is
+//! the generic document page. `the_start_menu_shortcut_declares_the_same_
+//! application_id` reads the value back out of the packaging.
+//!
 //! The Linux half of the same question is the window's **app id**, set at window
 //! creation in `app.rs`, because Wayland ignores window icons entirely and
 //! matches the app id against an installed `.desktop` file instead.
@@ -73,6 +91,33 @@ pub fn claim_identity() {}
 mod tests {
     use super::*;
 
+    fn packaging() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging")
+    }
+
+    fn wxs() -> String {
+        std::fs::read_to_string(packaging().join("windows").join("umber.wxs"))
+            .expect("the Windows installer's authoring")
+    }
+
+    /// Every value of `attribute` in `text`, in order.
+    fn attributes<'a>(text: &'a str, attribute: &str) -> Vec<&'a str> {
+        let opener = format!("{attribute}=\"");
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(&opener) {
+            rest = &rest[at + opener.len()..];
+            match rest.find('"') {
+                Some(end) => {
+                    found.push(&rest[..end]);
+                    rest = &rest[end..];
+                }
+                None => break,
+            }
+        }
+        found
+    }
+
     /// The identity has to be the same string the packaging installs under, or
     /// the desktop entry and the running window describe two applications and
     /// the icon is looked up under a name nothing provides.
@@ -121,5 +166,107 @@ mod tests {
             entry.contains("StartupWMClass=umber"),
             "X11's class must match what the window sets"
         );
+    }
+
+    /// The Windows half of the same rule, and the one that was missing.
+    ///
+    /// `claim_identity` hands the process an id; the shortcut is what tells the
+    /// shell which installed application that id belongs to. Two spellings of
+    /// it is a taskbar button associated with nothing, which is the whole of
+    /// the bug — so this reads the value out of the packaging rather than
+    /// comparing a copy of the string.
+    #[test]
+    fn the_start_menu_shortcut_declares_the_same_application_id() {
+        let wxs = wxs();
+        // The attribute form, not the bare name: the comment above the element
+        // explains why it is there and would otherwise be what this matched.
+        let at = wxs
+            .find("Key=\"System.AppUserModel.ID\"")
+            .expect("the Start Menu shortcut must carry an AppUserModelID");
+        let element = &wxs[at..wxs.len().min(at + 200)];
+        assert!(
+            attributes(element, "Value").first() == Some(&APP_ID),
+            "the shortcut declares an application id this process never claims"
+        );
+    }
+
+    /// An advertised shortcut cannot carry that property at all — MSI's
+    /// `MsiShortcutProperty` table applies to real `.lnk` files only — and it
+    /// takes its icon from the Icon table rather than from the executable,
+    /// which is the other half of what shipped wrong. Both symptoms come back
+    /// together the moment somebody sets this to yes.
+    #[test]
+    fn the_start_menu_shortcut_is_a_real_one() {
+        assert!(
+            !wxs().contains("Advertise=\"yes\""),
+            "an advertised shortcut can carry no AppUserModelID and takes its \
+             icon from the Icon table"
+        );
+    }
+
+    /// Windows Installer streams each Icon row out to a file named with its Id
+    /// and then asks the shell to identify that file by name. Its own
+    /// documentation is explicit that an icon used by a shortcut "must be named
+    /// such that their extension matches the extension of the target"; an Id
+    /// with no extension at all is what drew a blank page in Add/Remove
+    /// Programs and on the Start Menu.
+    #[test]
+    fn every_installer_icon_is_named_with_a_file_extension() {
+        let wxs = wxs();
+        let ids: Vec<&str> = wxs
+            .match_indices("<Icon ")
+            .map(|(at, _)| &wxs[at..])
+            .filter_map(|element| attributes(element, "Id").first().copied())
+            .collect();
+        assert!(!ids.is_empty(), "the installer declares no icon at all");
+        for id in ids {
+            assert!(
+                id.ends_with(".ico") || id.ends_with(".exe"),
+                "Icon id {id:?} has no extension, so the shell cannot identify \
+                 the file the installer extracts it to"
+            );
+        }
+    }
+
+    /// Every file the installer names has to be one the release workflow
+    /// actually stages, or `wix build` fails at tag time with the tag already
+    /// pushed — which is the moment `ci.yml`'s packaging job exists to avoid.
+    #[test]
+    fn the_release_workflow_stages_every_asset_the_installer_names() {
+        let wxs = wxs();
+        let workflow = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.github/workflows/release.yml"),
+        )
+        .expect("the release workflow");
+
+        let mut rest = wxs.as_str();
+        let mut named = 0;
+        while let Some(at) = rest.find("$(var.AssetDir)\\") {
+            rest = &rest[at + "$(var.AssetDir)\\".len()..];
+            let end = rest.find('"').expect("an unterminated SourceFile");
+            let file = &rest[..end];
+            assert!(
+                workflow.contains(file),
+                "the installer wants {file}, which the release workflow never \
+                 puts in the asset directory"
+            );
+            named += 1;
+            rest = &rest[end..];
+        }
+        assert!(
+            named >= 4,
+            "only {named} assets found — did the paths change?"
+        );
+    }
+
+    /// Not a name this module owns, but a one-line invariant that any edit to
+    /// the shortcut arrangement above sits next to. Umber installs per-machine,
+    /// so the installer is elevated: without this the "Start Umber" checkbox
+    /// runs Umber as the elevated account and every preference, brush and
+    /// autosave it writes lands in that profile instead of the user's.
+    #[test]
+    fn the_installer_still_starts_umber_as_the_user() {
+        assert!(wxs().contains("Impersonate=\"yes\""));
     }
 }

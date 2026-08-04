@@ -9,7 +9,8 @@
   Deliberately small. Umber is one executable with everything — brushes, fonts,
   papers, icons — compiled into it, so there is nothing to lay out beside it and
   no runtime to chain in. An installer that only has to place one file should
-  look like one.
+  look like one, which is why the dialog set is WixUI_Minimal: the licence, one
+  Install button, one Cancel, and a page at the end.
 
   Two values come from the command line so nothing here has to be edited to cut
   a release: `Version` and `BinDir`. See `.github/workflows/release.yml`.
@@ -35,21 +36,62 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="UmberIcon" SourceFile="$(var.AssetDir)\umber.ico" />
-    <Property Id="ARPPRODUCTICON" Value="UmberIcon" />
+    <!--
+      The Id is a file name, not a label, and the extension is load-bearing.
+
+      Windows Installer streams every Icon row out to a real file inside its own
+      cache and names it with this Id; the shell then has to identify that file
+      from its name alone. `UmberIcon`, which is what this said, produced a file
+      with no extension and an Add/Remove entry drawing the generic document
+      page. The Icon table's own documentation says so: an icon associated with
+      a shortcut "must be named such that their extension matches the extension
+      of the target", and the shortcut simply does not work otherwise.
+
+      That rule is also why the Start Menu shortcut below no longer names this
+      icon at all. Satisfying it for a shortcut whose target is `umber.exe`
+      would mean an Icon row called `umber.exe` holding a copy of the executable
+      in PE format — thirty megabytes of duplicate inside the package. A
+      non-advertised shortcut is a real `.lnk`, so it takes the icon out of the
+      executable it points at, which is the `RT_GROUP_ICON` that
+      `crates/umber-desktop/build.rs` compiles in and the same picture Explorer
+      already draws on the file.
+    -->
+    <Icon Id="umber.ico" SourceFile="$(var.AssetDir)\umber.ico" />
+    <Property Id="ARPPRODUCTICON" Value="umber.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Spillebulle/umber" />
 
-    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <!--
+      One page with Install and Cancel on it, rather than the four-page
+      InstallDir set this used to use. Umber has one feature and one file; the
+      directory page offered a choice with one sensible answer, and a wizard
+      whose middle pages only have Next on them is furniture.
+
+      `INSTALLFOLDER` can still be set from the command line for anyone who does
+      want to place it elsewhere:
+
+        msiexec /i umber.msi INSTALLFOLDER="D:\Umber"
+    -->
+    <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.AssetDir)\licence.rtf" />
+
+    <!--
+      The two pictures WixUI takes, drawn from `theme::Palette` by
+      `umber-app`'s `installart` module and committed beside this file.
+      Regenerating them is one ignored test; see that module for why they are
+      light on the side MSI writes its headings over, which is the whole of what
+      decides their layout.
+    -->
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.AssetDir)\banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.AssetDir)\dialog.bmp" />
 
     <!--
       "Start Umber" on the last page, ticked.
 
-      `WixUI_InstallDir`'s exit dialog has a spare checkbox built into it: give
-      it text and it appears, and setting the property to 1 is what makes it
-      start ticked. Ticked because somebody who has just chosen to install a
-      painting application almost certainly wants to paint, and it is one click
-      to say otherwise.
+      `ExitDialog` has a spare checkbox built into it: give it text and it
+      appears, and setting the property to 1 is what makes it start ticked.
+      Ticked because somebody who has just chosen to install a painting
+      application almost certainly wants to paint, and it is one click to say
+      otherwise.
 
       `Impersonate="yes"` is the part that matters. Umber installs per-machine,
       so the installer is elevated; a launch without this would run Umber as the
@@ -80,22 +122,59 @@
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="Umber" />
     </StandardDirectory>
-    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!--
+      The Start Menu shortcut, and it is deliberately **not** advertised.
+
+      Two things need it to be a plain `.lnk`. Its icon, for the reason the Icon
+      element above gives. And `System.AppUserModel.ID`, which is the fifth
+      mechanism the taskbar icon needed and the one that was missing:
+      `taskbar::claim_identity` gives the process an explicit AppUserModelID,
+      and Microsoft's rule for that is that the same id "must also be assigned
+      to all running windows or processes, shortcuts, and file associations" —
+      setting it on the shortcut is what "allows the taskbar to identify the
+      proper shortcut to pin and ensures that windows belonging to the process
+      are appropriately associated with that taskbar button". Without it the
+      running window claims an identity nothing installed on the machine owns,
+      so the button has no shortcut to take its icon, its name or its pinning
+      from. `MsiShortcutProperty` is the table Microsoft names for doing this
+      from an installer, and it is what this element compiles to.
+      `umber-app`'s `taskbar` tests read the value back out of this file, so
+      renaming the id in one place and not the other fails `cargo test` rather
+      than shipping.
+
+      The registry value is the price of a non-advertised shortcut: ICE43 is an
+      *error* unless the component holding one has an HKCU key as its keypath,
+      and validation runs as part of `wix build`. It is the arrangement
+      Microsoft's own guidance gives for this case.
+    -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="95c43486-778e-4975-9cb5-112e6ba93260">
+        <Shortcut Id="UmberShortcut"
+                  Name="Umber"
+                  Description="Paint in Umber"
+                  Target="[#UmberExe]"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Advertise="no">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="io.github.spillebulle.umber" />
+        </Shortcut>
+        <RegistryValue Root="HKCU"
+                       Key="Software\Umber contributors\Umber"
+                       Name="StartMenuShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
 
     <Feature Id="Main" Title="Umber" Level="1">
       <ComponentGroupRef Id="Files" />
+      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
 
     <ComponentGroup Id="Files" Directory="INSTALLFOLDER">
       <Component Id="Executable" Guid="aaa698ce-4d5d-41c6-8f1e-5098c7fffb1b">
-        <File Id="UmberExe" Source="$(var.BinDir)\umber.exe" KeyPath="yes">
-          <!-- Under the executable, so the shortcut is removed with it. -->
-          <Shortcut Id="StartMenuShortcut"
-                    Directory="ProgramMenuFolder"
-                    Name="Umber"
-                    Icon="UmberIcon"
-                    Advertise="yes" />
-        </File>
+        <File Id="UmberExe" Source="$(var.BinDir)\umber.exe" KeyPath="yes" />
       </Component>
       <!--
         One component per file, rather than one holding all three.
