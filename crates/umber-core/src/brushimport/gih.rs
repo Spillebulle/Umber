@@ -243,13 +243,21 @@ pub struct GihPipe {
     /// **not** the same as constant and must not be read as it — see the module
     /// docs. A dimension with no rule is taken as walking its cells.
     pub rules: Vec<Option<Selection>>,
-    /// True when the pipe walks its cells by anything other than "always the
-    /// first" — which every pipe in the wild does, and which is the thing
-    /// Umber cannot reproduce.
+    /// True when the pipe reaches more than one cell, so the mark it makes is
+    /// one Umber's single bound tip cannot reproduce.
+    ///
+    /// **Not simply "the file states a rule other than `constant`".** It is
+    /// false for either collapse in [`from_gih`], because a pipe that cannot
+    /// reach a second cell — or whose cells are all the same brush — has
+    /// nothing to walk, and reporting a loss that did not happen is the failure
+    /// [`dropped_features`] exists to avoid.
     pub animated: bool,
-    /// True when some dimension walks them by the **direction of the stroke**,
-    /// which is a rotating stamp rather than a shuffled one. Reported
+    /// True when some dimension walks the cells by the **direction of the
+    /// stroke**, which is a rotating stamp rather than a shuffled one. Reported
     /// separately because it is a different loss: see the module docs.
+    ///
+    /// Cleared by a collapse for the same reason `animated` is: a stamp with
+    /// nothing to turn *through* has not lost a rotation.
     pub angular: bool,
 }
 
