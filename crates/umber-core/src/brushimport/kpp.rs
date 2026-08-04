@@ -207,7 +207,17 @@ pub fn from_kpp_in(
     if preset.flag("MaskingBrush/Enabled") {
         dropped.push("masking brushes");
     }
-    if preset.flag("Texture/Enabled") {
+    // `Texture/Pattern/Enabled`, and the prefix is the whole point: this read
+    // `Texture/Enabled` for a while, which is a key Krita has never written.
+    // `KisTextureOption` puts every one of its settings under
+    // `Texture/Pattern/`, so the check was false in all 119 presets of the
+    // fetched packs and the paper was dropped in silence — 31 of them switch a
+    // texture on, and **eleven were shipping** without it, several of them
+    // named for the grain they had lost ("Thick Dry Canvas", "Texture Fabric",
+    // "Rough Rake Textured"). `MaskingBrush/Enabled` beside it is spelled
+    // correctly and fires on the one preset that uses it, which is what made
+    // the silence look like an absence of textured brushes rather than a bug.
+    if preset.flag("Texture/Pattern/Enabled") {
         dropped.push("paper texture");
     }
     if preset.flag("PressureMirror") {
@@ -1504,6 +1514,11 @@ mod tests {
         assert_eq!(from_kpp(&kpp(&xml)).unwrap().brush.mode, BrushMode::Erase);
     }
 
+    /// Note the texture key. This fixture said `Texture/Enabled`, which is
+    /// what the reader looked for and what Krita has never written, so the two
+    /// agreed with each other and with no real file — a hand-built fixture's
+    /// one failure mode, and the reason the pack sweep in `docs/brushes.md`
+    /// exists beside these tests rather than instead of them.
     #[test]
     fn features_umber_cannot_render_are_named() {
         let xml = format!(
@@ -1515,7 +1530,7 @@ mod tests {
                  hfade=\"0.5\" spikes=\"5\"/></Brush>"
             ),
             "<param type=\"internal\" name=\"MaskingBrush/Enabled\">true</param>",
-            "<param type=\"internal\" name=\"Texture/Enabled\">true</param>",
+            "<param type=\"internal\" name=\"Texture/Pattern/Enabled\">true</param>",
         );
         let dropped = from_kpp(&kpp(&xml)).expect("decode").dropped;
         for expected in [
@@ -1665,6 +1680,35 @@ mod tests {
         }
         assert!(with("drawingangle").is_empty());
         assert!(with("fuzzy").is_empty());
+    }
+
+    /// A paper texture is named, and the *key* is what this pins.
+    ///
+    /// Krita states every texture setting under `Texture/Pattern/`, and this
+    /// reader looked for `Texture/Enabled` — a key nothing writes. So the loss
+    /// was never reported, for the shipped library or for a user's import, and
+    /// eleven textured presets shipped as plain ones. Asserting the flag alone
+    /// would have passed under the old spelling too, so the second half is the
+    /// one that matters: the key Krita does not write must change nothing.
+    #[test]
+    fn a_paper_texture_is_named_under_the_key_krita_actually_writes() {
+        let with = |key: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"30\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+                ),
+                internal(key, "true"),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").dropped
+        };
+
+        assert_eq!(with("Texture/Pattern/Enabled"), vec!["paper texture"]);
+        // The spelling this reader used to look for. Krita has never written
+        // it, so a brush that says only this has no texture to lose.
+        assert!(with("Texture/Enabled").is_empty());
     }
 
     /// All three of PNG's text chunks turn up in one real pack, and a reader
