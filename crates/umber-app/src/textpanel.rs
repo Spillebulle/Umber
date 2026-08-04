@@ -81,16 +81,35 @@ pub struct Fonts {
     /// Whether a scan has been asked for. Separate from `pending` so a scan
     /// that finished is not started again every frame.
     started: bool,
+    /// Bumped whenever `library` is replaced.
+    ///
+    /// **What everything cached off a face has to be keyed by.** The library is
+    /// swapped wholesale when a scan lands and again when the folder
+    /// preference changes, and the caches beside it hold a `FontData` and a
+    /// picture resolved out of the *old* one — same family name, same style
+    /// name, different file. Without this the panel goes on drawing a preview,
+    /// a size and a missing-glyph notice made with a face `resolve` no longer
+    /// answers with, while Place uses the new one; the two disagree silently
+    /// until something else the key hashes happens to move.
+    generation: u64,
+    /// `library.faces().len()`, as the string the dropdown draws.
+    ///
+    /// Kept rather than formatted, because the dropdown draws it on every frame
+    /// the panel is open and the figure changes twice in a session.
+    count: String,
 }
 
 impl Default for Fonts {
     fn default() -> Self {
         let mut library = FontLibrary::default();
         library.add_builtin(BUILTIN, crate::cputext::ARCHIVO);
+        let count = library.faces().len().to_string();
         Self {
             library,
             pending: None,
             started: false,
+            generation: 0,
+            count,
         }
     }
 }
@@ -104,6 +123,23 @@ impl Fonts {
         self.pending.is_some()
     }
 
+    /// How many faces there are, as the dropdown draws it.
+    pub fn count(&self) -> &str {
+        &self.count
+    }
+
+    /// Which library this is. See the field.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Take a new library and tell everything cached off the old one.
+    fn adopt(&mut self, library: FontLibrary) {
+        self.count = library.faces().len().to_string();
+        self.library = library;
+        self.generation += 1;
+    }
+
     /// Look for the machine's fonts, once, on a worker thread.
     ///
     /// On a thread because a scan is several hundred file reads — see `fonts` —
@@ -113,11 +149,14 @@ impl Fonts {
     /// while the Text module is on screen. The update check's `EventLoopProxy`
     /// wake exists because *that* answer may arrive with nothing on screen
     /// waiting for it.
-    pub fn start(&mut self, folder: Option<PathBuf>) {
+    pub fn start(&mut self, folder: &Option<PathBuf>) {
         if self.started {
             return;
         }
         self.started = true;
+        // Cloned here and not by the caller: this runs on every frame the panel
+        // is open and spawns on one of them.
+        let folder = folder.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("umber-fonts".to_string())
@@ -159,7 +198,7 @@ impl Fonts {
                     library.scanned,
                     library.unreadable
                 );
-                self.library = library;
+                self.adopt(library);
                 self.pending = None;
                 true
             }
@@ -182,7 +221,7 @@ impl Fonts {
         self.started = false;
         let mut library = FontLibrary::default();
         library.add_builtin(BUILTIN, crate::cputext::ARCHIVO);
-        self.library = library;
+        self.adopt(library);
     }
 }
 
@@ -200,9 +239,29 @@ pub struct TextState {
     pub family: String,
     pub style: String,
     pub fonts: Fonts,
-    /// Filter for the family menu. Several hundred faces is a list nobody
-    /// scrolls.
+    /// Filter for the family list. Several hundred families is not a list
+    /// anybody scrolls.
+    ///
+    /// It is a field on the **panel**, not a widget inside the dropdown's menu,
+    /// and that is not a layout preference. `widgets::dropdown` opens its menu
+    /// with `egui::Popup::menu`, whose default close behaviour is
+    /// `CloseOnClick` — *any* click, inside the popup included, which is
+    /// correct for the `selectable_label`s every other call site puts in there
+    /// and fatal for a text field: the click that would focus it is the click
+    /// that shuts the menu, so the field could never be typed into at all.
+    /// Above the trigger it is an ordinary widget, it stays put while the list
+    /// is scrolled, and the trigger says how many families the filter is
+    /// leaving.
     pub search: String,
+    /// The bytes of the face in hand, and what they were resolved from.
+    ///
+    /// **A font file is read whole**, and a CJK collection is sixteen
+    /// megabytes; the preview is rebuilt on every keystroke, so re-reading it
+    /// there would put a disk read and a full parse between somebody and each
+    /// character they type. Keyed by the family, the style *and*
+    /// `Fonts::generation`, because the library is replaced wholesale when a
+    /// scan lands and the same two names then mean a different file.
+    loaded: Option<(String, String, u64, umber_core::fonts::FontData)>,
     /// The panel's picture of the block, and everything it costs to work out.
     ///
     /// Keyed by everything that changes the picture **including the colour**,
@@ -244,6 +303,7 @@ impl Default for TextState {
             style: "Regular".to_string(),
             fonts: Fonts::default(),
             search: String::new(),
+            loaded: None,
             preview: None,
         }
     }
@@ -256,15 +316,38 @@ impl TextState {
         self.fonts.library().resolve(&self.family, &self.style)
     }
 
+    /// The face in hand and its bytes, read from disk at most once per
+    /// (family, style, library).
+    ///
+    /// `&mut self` because it fills the cache; see [`TextState::loaded`] for
+    /// why there is one.
+    fn face_and_data(&mut self) -> Option<(Face, &umber_core::fonts::FontData)> {
+        let face = self.face()?.clone();
+        let generation = self.fonts.generation();
+        let stale = match &self.loaded {
+            Some((family, style, held, _)) => {
+                *held != generation || *family != face.family || *style != face.style
+            }
+            None => true,
+        };
+        if stale {
+            let data = face.load()?;
+            self.loaded = Some((face.family.clone(), face.style.clone(), generation, data));
+        }
+        self.loaded.as_ref().map(|(.., data)| (face, data))
+    }
+
     /// Rasterise the block at its real size, ready to be placed.
     ///
-    /// Blocking on a file read and on the rasteriser, which is what an explicit
-    /// click may do. Nothing on the drawing path calls this — the preview has
-    /// its own, smaller one.
-    pub fn set(&self) -> Result<umber_core::text::Setting, TextError> {
-        let face = self.face().ok_or(TextError::Unreadable)?;
-        let data = face.load().ok_or(TextError::Unreadable)?;
-        text::set(face, &data, &self.block)
+    /// Blocking on the rasteriser, and on a file read the first time a face is
+    /// used, which is what an explicit click may do.
+    pub fn set(&mut self) -> Result<umber_core::text::Setting, TextError> {
+        // Cloned before the borrow, because `face_and_data` fills the cache and
+        // therefore holds `self` — a paragraph is cloned once per Place, which
+        // is a click, not once per frame.
+        let block = self.block.clone();
+        let (face, data) = self.face_and_data().ok_or(TextError::Unreadable)?;
+        text::set(&face, data, &block)
     }
 }
 
@@ -273,8 +356,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     // The scan starts the first time somebody opens this module, not at
     // start-up: it is several hundred file reads for a feature most sessions
     // never reach.
-    let folder = ed.font_folder.clone();
-    ed.text.fonts.start(folder);
+    ed.text.fonts.start(&ed.font_folder);
     if ed.text.fonts.poll() {
         ui.ctx().request_repaint();
     }
@@ -303,11 +385,13 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     style_picker(ui, p, ed);
     ui.add_space(6.0);
 
-    let mut block = ed.text.block.clone();
+    // The rails write into the block's own fields. Taking a copy and putting it
+    // back is the obvious shape and clones the artist's whole paragraph on
+    // every frame the panel is open, which is what the drawing path may not do.
     widgets::number_row(
         ui,
         p,
-        &mut block.size,
+        &mut ed.text.block.size,
         NumberRow {
             label: "Size",
             range: text::MIN_SIZE..=text::MAX_SIZE,
@@ -321,7 +405,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     widgets::number_row(
         ui,
         p,
-        &mut block.line_spacing,
+        &mut ed.text.block.line_spacing,
         NumberRow {
             label: "Line spacing",
             range: 0.5..=3.0,
@@ -335,7 +419,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     widgets::number_row(
         ui,
         p,
-        &mut block.tracking,
+        &mut ed.text.block.tracking,
         NumberRow {
             label: "Tracking",
             range: -20.0..=40.0,
@@ -347,19 +431,16 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
         },
     );
     ui.add_space(4.0);
-    let mut align = block.align;
     widgets::segmented(
         ui,
         p,
-        &mut align,
+        &mut ed.text.block.align,
         &[
             (Align::Left, Align::Left.label()),
             (Align::Centre, Align::Centre.label()),
             (Align::Right, Align::Right.label()),
         ],
     );
-    block.align = align;
-    ed.text.block = block;
 
     ui.add_space(10.0);
     preview(ui, p, ed);
@@ -368,39 +449,71 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     place_row(ui, p, ed, actions);
 }
 
-/// Which family. A dropdown, because there is one dropdown in this interface,
-/// with a search field above the list — several hundred families is not a list
-/// anybody scrolls.
+/// Which family: a search field, and under it the dropdown this interface has
+/// one of.
+///
+/// **The field is above the trigger and not inside the menu**, and that is the
+/// difference between a control and a control-shaped thing.
+/// `widgets::dropdown` opens with `egui::Popup::menu`, whose default close
+/// behaviour is `CloseOnClick` — *any* click, one inside the popup included.
+/// That is exactly right for the `selectable_label`s every other call site puts
+/// in a menu, and it means a text field in there can never be typed into at
+/// all: the click that would focus it is the click that shuts the menu.
+/// Outside, it is an ordinary widget, it stays put while the list is scrolled,
+/// and it is still there to be adjusted after a look at the list.
+///
+/// The menu therefore holds only rows, and needs no scroll area of its own —
+/// `widgets::dropdown` already wraps the body in one at `metrics::DROPDOWN_MENU`.
+/// A second, *taller* one inside it was two bars over one list and a wheel that
+/// meant two things.
 fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
-    let label = ed.text.family.clone();
-    let count = ed.text.fonts.library().faces().len().to_string();
+    controls::search_field(ui, p, &mut ed.text.search, "Search fonts");
+    ui.add_space(4.0);
+
+    // Borrowed field by field, so the trigger can hold `&family` while the menu
+    // body reads the library — and so neither is cloned on a frame that changes
+    // nothing.
+    let crate::textpanel::TextState {
+        family,
+        fonts,
+        search,
+        ..
+    } = &ed.text;
+    let query = search.trim().to_lowercase();
+    let matching = fonts
+        .library()
+        .families()
+        .into_iter()
+        .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
+        .count();
+    // The figure is what the filter is leaving rather than what the machine
+    // holds, because the filter is now a control somebody can see above it —
+    // a count that did not move as they typed would say the field did nothing.
+    let count = if query.is_empty() {
+        fonts.count().to_string()
+    } else {
+        matching.to_string()
+    };
     let mut chosen: Option<String> = None;
     widgets::dropdown(
         ui,
         p,
-        widgets::Dropdown::new(&label)
+        widgets::Dropdown::new(family)
             .icon(Icon::Text)
             .trailing(&count)
             .width(DropdownWidth::Fill),
         |ui| {
-            controls::search_field(ui, p, &mut ed.text.search, "Search fonts");
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    let query = ed.text.search.to_lowercase();
-                    for family in ed.text.fonts.library().families() {
-                        if !query.is_empty() && !family.to_lowercase().contains(&query) {
-                            continue;
-                        }
-                        if ui
-                            .selectable_label(family == ed.text.family, family)
-                            .clicked()
-                        {
-                            chosen = Some(family.to_string());
-                        }
-                    }
-                });
+            for name in fonts.library().families() {
+                if !query.is_empty() && !name.to_lowercase().contains(&query) {
+                    continue;
+                }
+                if ui
+                    .selectable_label(name.eq_ignore_ascii_case(family), name)
+                    .clicked()
+                {
+                    chosen = Some(name.to_string());
+                }
+            }
         },
     );
     if let Some(family) = chosen {
@@ -420,28 +533,31 @@ fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 }
 
 /// Which style within the family.
+///
+/// The list is walked **inside** the menu body, which only runs while the menu
+/// is open. Collecting it outside is the shape that reads more naturally and
+/// builds a `String` per style of the family on every frame the panel is
+/// open — a variable font is nine of them, and the panel is open for as long as
+/// somebody is composing.
 fn style_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
-    let label = ed.text.style.clone();
-    let styles: Vec<String> = ed
-        .text
-        .fonts
-        .library()
-        .family(&ed.text.family)
-        .iter()
-        .map(|f| f.style.clone())
-        .collect();
+    let crate::textpanel::TextState {
+        family,
+        style,
+        fonts,
+        ..
+    } = &ed.text;
     let mut chosen = None;
     widgets::dropdown(
         ui,
         p,
-        widgets::Dropdown::new(&label).width(DropdownWidth::Fill),
+        widgets::Dropdown::new(style).width(DropdownWidth::Fill),
         |ui| {
-            for style in &styles {
+            for face in fonts.library().family(family) {
                 if ui
-                    .selectable_label(*style == ed.text.style, style)
+                    .selectable_label(face.style.eq_ignore_ascii_case(style), face.label())
                     .clicked()
                 {
-                    chosen = Some(style.clone());
+                    chosen = Some(face.style.clone());
                 }
             }
         },
@@ -456,6 +572,14 @@ fn style_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 /// A hash rather than a stored copy of the block: the block holds a `String`
 /// that can be a paragraph, and cloning it every frame to compare would be an
 /// allocation on the drawing path.
+///
+/// **`Fonts::generation` is in it, and that is the one nobody thinks of.** The
+/// family and the style are *names*; the library they resolve against is
+/// replaced wholesale when a scan lands and again when the folder preference
+/// changes, and the same two names then mean a different file. Without it the
+/// panel goes on drawing a picture, a size and a missing-glyph notice made with
+/// a face `resolve` no longer answers with, while Place uses the new one — the
+/// two disagreeing silently until something else in this list happens to move.
 fn preview_key(ed: &Editor) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -467,6 +591,7 @@ fn preview_key(ed: &Editor) -> u64 {
     b.align.hash(&mut h);
     ed.text.family.hash(&mut h);
     ed.text.style.hash(&mut h);
+    ed.text.fonts.generation().hash(&mut h);
     ed.color.to_srgb_u8().hash(&mut h);
     h.finish()
 }
@@ -485,17 +610,18 @@ fn preview_key(ed: &Editor) -> u64 {
 /// scaled down.
 ///
 /// Called only when [`preview_key`] has moved. See [`Preview`].
-fn build_preview(ui: &Ui, ed: &Editor, key: u64) -> Preview {
+fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
     let mut small = ed.text.block.clone();
     let ratio = PREVIEW_EM / ed.text.block.size.clamp(text::MIN_SIZE, text::MAX_SIZE);
     small.size = PREVIEW_EM;
     small.tracking *= ratio;
+    let colour = ed.color;
+    let block = ed.text.block.clone();
 
-    let loaded = ed
-        .text
-        .face()
-        .and_then(|face| face.load().map(|data| (face.clone(), data)));
-    let Some((face, data)) = loaded else {
+    // Through the cache, so the font file is read once per face rather than
+    // once per keystroke — a CJK collection is sixteen megabytes, and this runs
+    // on every character typed.
+    let Some((face, data)) = ed.text.face_and_data() else {
         return Preview {
             key,
             picture: None,
@@ -505,9 +631,9 @@ fn build_preview(ui: &Ui, ed: &Editor, key: u64) -> Preview {
         };
     };
 
-    let picture = match text::set(&face, &data, &small) {
+    let picture = match text::set(&face, data, &small) {
         Ok(setting) => {
-            let [r, g, b, _] = ed.color.to_srgb_u8();
+            let [r, g, b, _] = colour.to_srgb_u8();
             let pixels: Vec<egui::Color32> = setting
                 .coverage
                 .iter()
@@ -531,7 +657,7 @@ fn build_preview(ui: &Ui, ed: &Editor, key: u64) -> Preview {
     // the two agree today, and reading them from the picture would make the
     // notice a statement about the preview rather than about what is going on
     // the canvas.
-    let (measured, missing, mixed) = match text::set(&face, &data, &ed.text.block) {
+    let (measured, missing, mixed) = match text::set(&face, data, &block) {
         Ok(setting) => (
             Some((setting.width, setting.height)),
             setting.missing,
@@ -813,9 +939,60 @@ mod tests {
             ("colour", |ed| {
                 ed.color = umber_core::Color::from_srgb_u8(200, 30, 30, 255)
             }),
+            // The one nobody thinks of. The family and the style are *names*,
+            // and the library they resolve against is replaced wholesale when a
+            // scan lands or the folder preference changes — so the same two
+            // names then mean a different file. Without this the panel goes on
+            // drawing a picture, a size and a missing-glyph notice made with a
+            // face `resolve` no longer answers with, while Place uses the new
+            // one.
+            ("font library", |ed| ed.text.fonts.forget()),
         ] {
             assert_ne!(typed(f), base, "changing the {what} did not move the key");
         }
+    }
+
+    /// A face is read off the disk once per face, not once per keystroke.
+    ///
+    /// A font file is read *whole* and a CJK collection is sixteen megabytes;
+    /// the preview is rebuilt on every character typed, so a read there would
+    /// put a disk hit and a full parse between somebody and each key they
+    /// press. The cache has to survive the block changing and must **not**
+    /// survive the library changing, because the same two names then name a
+    /// different file.
+    #[test]
+    fn the_font_file_is_read_once_per_face_and_not_once_per_keystroke() {
+        let mut ed = Editor::default();
+        ed.text.block.text = "U".to_string();
+        assert!(ed.text.set().is_ok());
+        let first = ed
+            .text
+            .loaded
+            .as_ref()
+            .map(|(f, s, g, _)| (f.clone(), s.clone(), *g));
+        assert!(first.is_some(), "nothing was cached");
+
+        // Typing more does not re-read.
+        ed.text.block.text.push('m');
+        assert!(ed.text.set().is_ok());
+        assert_eq!(
+            ed.text
+                .loaded
+                .as_ref()
+                .map(|(f, s, g, _)| (f.clone(), s.clone(), *g)),
+            first,
+            "the same face was read again"
+        );
+
+        // A new library does.
+        ed.text.fonts.forget();
+        assert!(ed.text.set().is_ok());
+        let after = ed
+            .text
+            .loaded
+            .as_ref()
+            .map(|(f, s, g, _)| (f.clone(), s.clone(), *g));
+        assert_ne!(after, first, "a replaced library kept the old face's bytes");
     }
 
     /// The Text module at the panel's real width, in the states it can be in.

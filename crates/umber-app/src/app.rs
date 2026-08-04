@@ -1252,6 +1252,14 @@ impl UmberApp {
                          since Umber found it; reopen the Text panel to look again."
                             .to_string()
                     }
+                    // Its own sentence rather than the one above, which accuses
+                    // the typeface. Not reachable from the rails, which is
+                    // exactly why the wrong sentence would have survived.
+                    umber_core::TextError::NotFinite => {
+                        "The size, line spacing or tracking is not a number. Drag one of \
+                         the rails in the Text panel to set it again."
+                            .to_string()
+                    }
                 };
                 self.editor.notice = Some(Notice {
                     title: "Nothing was placed".to_string(),

@@ -429,10 +429,23 @@ impl FontLibrary {
     }
 
     /// Every family name, in the order the list draws them.
+    ///
+    /// **Grouped case-insensitively, because that is how the list is sorted.**
+    /// Two files naming one typeface with different capitals is an ordinary
+    /// thing to find on a real disk — foundries are inconsistent about it
+    /// between weight files, and so are the people who rename them — and those
+    /// faces sort into one contiguous run under [`Self::insert`]'s lowercased
+    /// key. Comparing the raw names here would then start a *second* row part
+    /// way through that run, and [`Self::family`] would hand each row only its
+    /// own spelling: half a typeface's weights hidden behind a picker that
+    /// looked complete. The first spelling met is the one shown.
     pub fn families(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for face in &self.faces {
-            if out.last().is_none_or(|last| *last != face.family) {
+            if out
+                .last()
+                .is_none_or(|last| !last.eq_ignore_ascii_case(&face.family))
+            {
                 out.push(&face.family);
             }
         }
@@ -440,8 +453,15 @@ impl FontLibrary {
     }
 
     /// The faces of one family, in style order.
+    ///
+    /// Case-insensitive, for the reason [`Self::families`] gives: the name this
+    /// is called with came out of that list, and the run it names may hold more
+    /// than one spelling.
     pub fn family(&self, name: &str) -> Vec<&Face> {
-        self.faces.iter().filter(|f| f.family == name).collect()
+        self.faces
+            .iter()
+            .filter(|f| f.family.eq_ignore_ascii_case(name))
+            .collect()
     }
 
     /// The face a `(family, style)` pair names, or the nearest thing to it.
@@ -454,17 +474,20 @@ impl FontLibrary {
     /// caller is what says a substitution happened; this only refuses when the
     /// library is empty.
     pub fn resolve(&self, family: &str, style: &str) -> Option<&Face> {
+        // Case-insensitively on both halves, for the reason [`Self::families`]
+        // gives about the family and one more about the style: the style is
+        // stored in a preferences file and typed back by whoever edits it.
         if let Some(exact) = self
             .faces
             .iter()
-            .find(|f| f.family == family && f.style == style)
+            .find(|f| f.family.eq_ignore_ascii_case(family) && f.style.eq_ignore_ascii_case(style))
         {
             return Some(exact);
         }
         let nearest = self
             .faces
             .iter()
-            .filter(|f| f.family == family)
+            .filter(|f| f.family.eq_ignore_ascii_case(family))
             .min_by_key(|f| (f.italic, f.weight.abs_diff(400)));
         nearest.or_else(|| self.faces.first())
     }
@@ -472,12 +495,16 @@ impl FontLibrary {
 
 /// Walk one directory, pushing every font file into `out`.
 ///
-/// Iterative rather than recursive so the depth limit is the only thing
-/// bounding it — a symbolic link pointing at its own parent is a real thing to
-/// find in a font directory, and it would otherwise be an unbounded recursion
-/// that ends in a stack overflow rather than in a log line.
+/// Recursive, and [`MAX_DEPTH`] is what makes that safe rather than a hope: a
+/// symbolic link pointing at its own parent is a real thing to find in a font
+/// directory, and without the bound it is an unbounded recursion that ends in a
+/// stack overflow rather than in a shorter list. **Anyone raising `MAX_DEPTH`
+/// is raising a stack depth**, which is the sentence this comment exists for.
 fn collect(root: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+    // `>=`, so `MAX_DEPTH` is the number of levels walked rather than one less
+    // than it: the root is depth 0, and the deepest directory opened is
+    // `MAX_DEPTH - 1`.
+    if depth >= MAX_DEPTH || out.len() >= MAX_FILES {
         return;
     }
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -783,6 +810,51 @@ mod tests {
         lib.add_builtin("archivo", TEST_FONT);
         assert!(lib.resolve("Helvetica Neue", "Bold").is_some());
         assert!(lib.resolve("Archivo", "A style it does not have").is_some());
+    }
+
+    /// One typeface spelled two ways is **one** row in the list, and that row
+    /// reaches every one of its weights.
+    ///
+    /// Two files naming one family with different capitals is an ordinary thing
+    /// to find on a real disk. They sort into one contiguous run under
+    /// `insert`'s lowercased key, so a raw-string comparison in `families`
+    /// started a second row part way through it — and `family` then handed each
+    /// row only its own spelling, hiding half a typeface's weights behind a
+    /// picker that looked complete.
+    #[test]
+    fn one_typeface_spelled_two_ways_is_one_family_with_all_its_weights() {
+        let mut lib = FontLibrary::default();
+        let face = |family: &str, style: &str, weight: u16| Face {
+            family: family.to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from(format!("{family}-{style}.ttf")),
+                index: 0,
+            },
+            variations: Vec::new(),
+        };
+        lib.insert(face("Archivo", "Regular", 400));
+        lib.insert(face("ARCHIVO", "Medium", 500));
+        lib.insert(face("archivo", "Bold", 700));
+
+        assert_eq!(lib.families().len(), 1, "{:?}", lib.families());
+        let styles: Vec<&str> = lib
+            .family(lib.families()[0])
+            .iter()
+            .map(|f| f.label())
+            .collect();
+        assert_eq!(styles, vec!["Regular", "Medium", "Bold"], "{styles:?}");
+        // And every spelling still resolves, whichever one a preferences file
+        // happens to have recorded.
+        for name in ["Archivo", "ARCHIVO", "archivo", "ArChIvO"] {
+            assert_eq!(
+                lib.resolve(name, "bold").map(|f| f.weight),
+                Some(700),
+                "{name}"
+            );
+        }
     }
 
     /// The same family in two directories is one row in the list, not two — the

@@ -529,8 +529,8 @@ fn fonts_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             "Currently: {current}.\nEvery font installed on this machine is already \
              offered in the Text panel — this is for a folder of your own beside them, \
              such as a foundry licence or a work library. Umber reads it and copies \
-             nothing out of it. `.ttf`, `.otf`, `.ttc` and `.otc` are read; web fonts \
-             are not."
+             nothing out of it. TrueType and OpenType are read — .ttf, .otf, .ttc \
+             and .otc — and web fonts are not."
         ),
     );
 }

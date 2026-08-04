@@ -155,6 +155,14 @@ pub enum TextError {
     TooLarge { width: u32, height: u32 },
     /// The face would not parse, or holds no outlines.
     Unreadable,
+    /// A size, a line spacing or a tracking that is not a number.
+    ///
+    /// Its own variant rather than [`Self::Unreadable`], because the notice for
+    /// that one names the *font* — "it may have been moved or removed since
+    /// Umber found it" — and a figure that is not a figure would then have
+    /// accused somebody's typeface. Not reachable from the rails, which is
+    /// exactly why the wrong sentence would have survived.
+    NotFinite,
 }
 
 /// A rectangle of antialiased coverage, trimmed to its own ink.
@@ -212,7 +220,7 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
     // hand-edited figure or a later caller can, and "the Place button did
     // nothing and said nothing" is the worst shape this takes.
     if !block.size.is_finite() || !block.line_spacing.is_finite() || !block.tracking.is_finite() {
-        return Err(TextError::Unreadable);
+        return Err(TextError::NotFinite);
     }
     let font = data.font().ok_or(TextError::Unreadable)?;
     // Empty variations is the exact identity and the fast path: a static face,
@@ -510,14 +518,29 @@ impl Pen<'_> {
     /// Font space is y-up from the baseline; the rasteriser is y-down from the
     /// top of its box.
     ///
-    /// Clamped to the box, because `Rasterizer` indexes its accumulation buffer
-    /// from these coordinates directly: an outline straying outside — which a
-    /// script face's swash routinely does — would be a panic rather than a
-    /// clipped pixel.
+    /// **Clamped two pixels inside the box, and the two is the whole of this
+    /// comment.** `Rasterizer` does not panic on a point outside its buffer —
+    /// `draw_line_scalar` guards a negative row start and its index macro
+    /// `continue`s rather than indexing out of range — so the clamp is not
+    /// about a crash. It is about the accumulator: `for_each_pixel` carries one
+    /// running sum across the *whole flat buffer*, and a span deposits its
+    /// closing delta one cell past where it ends. A point clamped to exactly
+    /// the width therefore writes into the first cell of the **next row**,
+    /// which is in bounds, so the sum for that row never returns to zero and
+    /// the block gains a faint line all the way across. Two pixels in is enough
+    /// that the closing delta still lands inside the row it belongs to.
+    ///
+    /// Passing the raw point through instead is worse rather than better: a
+    /// coordinate far outside lands at `linestart + x`, which for a large `x`
+    /// is a perfectly valid cell several rows further down.
+    ///
+    /// It is reached at all because outlines routinely stray past the advance
+    /// width — a script face's swash further than most — and the padding is
+    /// generous rather than infinite.
     fn at(&self, x: f32, y: f32) -> Point {
         point(
-            (self.dx + x).clamp(0.0, self.bounds.0),
-            (self.baseline - y).clamp(0.0, self.bounds.1),
+            (self.dx + x).clamp(0.0, (self.bounds.0 - 2.0).max(0.0)),
+            (self.baseline - y).clamp(0.0, (self.bounds.1 - 2.0).max(0.0)),
         )
     }
 }
@@ -840,13 +863,13 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut b = block("Umber");
             b.size = bad;
-            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::NotFinite));
             let mut b = block("Umber");
             b.line_spacing = bad;
-            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::NotFinite));
             let mut b = block("Umber");
             b.tracking = bad;
-            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::Unreadable));
+            assert_eq!(set_with(&lib, "Regular", &b), Err(TextError::NotFinite));
         }
     }
 
@@ -942,13 +965,17 @@ mod tests {
         // the paste path performs and this module must not have performed
         // already: white text at half coverage is a half-grey premultiplied
         // pixel, never white with an alpha beside it.
-        let half = placed
+        // `expect`, not `if let`: an assertion inside a conditional that might
+        // not hold is a test that passes having checked nothing, and this is
+        // the one conversion the test exists to pin. Text this size always has
+        // an antialiased edge, so a run that cannot find one has already gone
+        // wrong somewhere else.
+        let px = placed
             .pixels
             .chunks_exact(4)
-            .find(|px| (60..=200).contains(&px[3]));
-        if let Some(px) = half {
-            assert!(px[0] < 250, "the colour was not premultiplied: {px:?}");
-        }
+            .find(|px| (60..=200).contains(&px[3]))
+            .expect("an antialiased pixel");
+        assert!(px[0] < 250, "the colour was not premultiplied: {px:?}");
     }
 
     /// Two lines whose descenders and ascenders meet saturate rather than

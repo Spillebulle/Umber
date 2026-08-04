@@ -193,6 +193,16 @@ impl Transform {
     /// [`Self::is_identity`] still reads true — which is what stops a text
     /// float that was typed into but never dragged from recording an edit it
     /// did not make.
+    ///
+    /// **Nothing calls this yet**, and that is said here rather than left to be
+    /// discovered. Text placed on the canvas today is a *paste* — pixels the
+    /// moment they land, with no caret and therefore no box that grows as it is
+    /// typed into. This is here because the exactness is the part that is worth
+    /// proving before anything depends on it, and it is provable without a
+    /// device: the pair of tests beside
+    /// `a_transform_and_its_inverse_are_exact_opposites` is the whole of the
+    /// argument, and it will not have to be reconstructed by whoever builds the
+    /// caret. See `docs/text-tool.md` §4(a).
     pub fn reseat(&mut self, source: PixelRect) {
         let was = self.pivot();
         let m = self.rotation() * Mat2::from_diagonal(self.scale);

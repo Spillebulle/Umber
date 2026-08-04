@@ -193,7 +193,7 @@ impl PanelKind {
                  of them."
             }
             Self::Text => {
-                "Set a line of text in any font on this machine, and place it \
+                "Set a line of text in the fonts on this machine, and place it \
                  on the canvas to move, scale and turn."
             }
         }
