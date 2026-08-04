@@ -1466,9 +1466,9 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
         } else if pipe.animated {
             dropped.push(gih::ANIMATION);
         }
-        if pipe.cells.iter().any(|c| c.coloured) {
-            dropped.push(gbr::COLOURED);
-        }
+        // A coloured cell is no longer a loss: `gih` and `gbr` go through the
+        // same decoder, and a `TipMask` carries a colour plane now. What a pipe
+        // still loses is its *sequencing*, reported above.
         let cell = pipe
             .cells
             .into_iter()
@@ -1480,12 +1480,10 @@ fn decode_tip(name: &str, raw: &[u8]) -> Result<DecodedTip, PresetError> {
         });
     }
     match gbr::from_gbr(raw) {
+        // Nothing dropped: a coloured `.gbr` keeps its colour through the same
+        // decoder every other stamp uses.
         Ok(brush) => Ok(DecodedTip {
-            dropped: if brush.coloured {
-                vec![gbr::COLOURED]
-            } else {
-                Vec::new()
-            },
+            dropped: Vec::new(),
             mask: brush.tip,
         }),
         Err(_) => Err(PresetError::Malformed(

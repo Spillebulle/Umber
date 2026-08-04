@@ -314,14 +314,6 @@ pub fn dropped_features(_bytes: &[u8]) -> Vec<&'static str> {
     Vec::new()
 }
 
-/// The loss this format *used* to have, named once so `.gih` and `.bundle`
-/// report it with the same words.
-///
-/// A `.gbr`'s own colour is no longer among them — see [`dropped_features`] —
-/// and the readers that embed this one should stop reporting it too, since they
-/// go through the same decoder and get the same colour.
-pub(crate) const COLOURED: &str = "coloured stamps";
-
 fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, PresetError> {
     bytes
         .get(offset..offset + 4)
