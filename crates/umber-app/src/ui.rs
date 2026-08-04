@@ -154,7 +154,7 @@ pub struct UiOutput {
 /// nests inside a `Ui` rather than attaching to the `Context`, which is why
 /// this takes a `&mut Ui`.
 pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
-    let p = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+    let p = ed.palette();
     let mut actions = UiActions::default();
 
     // The design gives every chrome strip a hairline along the edge it meets

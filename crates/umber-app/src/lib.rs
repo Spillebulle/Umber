@@ -49,6 +49,7 @@ mod syscursor;
 mod tabs;
 mod taskbar;
 mod theme;
+mod themelib;
 mod thumbs;
 mod ui;
 mod update;

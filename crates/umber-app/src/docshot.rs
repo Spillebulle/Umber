@@ -344,7 +344,7 @@ fn panel_shot(
 ) -> Result<(PathBuf, u64, u32, u32), String> {
     let mut ed = editor();
     setup(&mut ed);
-    let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+    let palette = ed.palette();
     let rect = Rect::from_min_size(Pos2::ZERO, field);
     let image = stage
         .shoot(field, PANEL_SCALE, &palette, palette.dock, |root| {
@@ -365,7 +365,13 @@ fn settings_shot(
     let mut ed = editor();
     ed.ui.settings_open = true;
     ed.ui.settings_tab = tab;
-    let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+    // An empty theme library, so the Themes pane shows the two Umber ships with
+    // and nothing else. Left alone it reads the *user's* directory — and this
+    // picture is committed, so a card for every theme the person regenerating
+    // it happens to have would publish their workspace in the README. It is the
+    // leak `prefs::set_config_path_label` exists to stop, one door over.
+    settings::stage_themes(&stage.ctx, crate::themelib::ThemeLibrary::default());
+    let palette = ed.palette();
 
     // The modal dims whatever is behind it, and behind it here is nothing, so
     // the clear is the backdrop the dialog would be dimming in the application.
@@ -398,9 +404,9 @@ fn picker_shot(
     // colour the picker can actually show is the same licence `brush_sample`
     // takes when it seeds a pressure ramp — and the colour is the palette's own
     // accent rather than a number typed here, so it follows the theme.
-    let accent = palette_colour(Palette::with_accent(ed.ui.theme, ed.ui.accent).accent);
+    let accent = palette_colour(ed.palette().accent);
     ed.set_color(accent);
-    let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+    let palette = ed.palette();
 
     let rect = Rect::from_min_size(Pos2::ZERO, PICKER_FIELD);
     // `p.dock` is the sidebar column's fill, which `panels::sidebars` supplies
@@ -458,7 +464,11 @@ fn palette_colour(c: Color32) -> Color {
 /// surface.
 pub(crate) struct Stage {
     gpu: Gpu,
-    ctx: egui::Context,
+    /// `pub(crate)` for the reason `Stage` itself is: a caller that wants to
+    /// seed the context before the interface reads it — `settings::stage_themes`
+    /// is the one — has to reach the context this will draw with, and there is
+    /// only one of it for the whole run.
+    pub(crate) ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
 }
 

@@ -578,7 +578,7 @@ mod tests {
     fn update_dialog_preview() {
         use crate::docshot;
         use crate::editor::Editor;
-        use crate::theme::Palette;
+
         use crate::update::{Applied, Phase, flow::Countdown};
         use egui::vec2;
 
@@ -636,7 +636,7 @@ mod tests {
         for (name, phase) in screens {
             let mut ed = Editor::default();
             ed.updates.demo(phase, now);
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+            let palette = ed.palette();
             let image = stage.shoot(
                 // Wide enough that the modal sits in a margin of dimmed
                 // backdrop rather than against the edge of the picture.

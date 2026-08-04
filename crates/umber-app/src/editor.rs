@@ -5,7 +5,7 @@ use crate::dock::Layout;
 use crate::session::{DocId, DocumentState, Session};
 use crate::settings::SettingsTab;
 use crate::tabs::Notice;
-use crate::theme::{Accent, ThemeKind};
+use crate::theme::{Accent, Palette, ThemeKind};
 use glam::Vec2;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -301,6 +301,16 @@ pub struct Editor {
     /// that could not be represented in full, or one that failed outright.
     pub notice: Option<Notice>,
     pub ui: UiState,
+    /// The theme somebody made, when one is in use, or `None` for whichever of
+    /// the two built-in themes [`UiState::theme`] names.
+    ///
+    /// Kept out of [`UiState`] so that stays `Copy` — it carries an id and a
+    /// name, which are `String`s — and held here rather than looked up in the
+    /// library every frame, because the palette is read on the drawing path and
+    /// the library is a directory on disk. `UiState::theme` still holds the
+    /// built-in this was made from, which is what [`Editor::palette`] falls
+    /// back to when the file has gone.
+    pub custom_theme: Option<crate::themelib::CustomTheme>,
     /// State of the New document and Canvas settings dialogs. Kept out of
     /// [`UiState`] so that stays `Copy` — it holds a colour picker's HSV, which
     /// has the same reason to be its own source of truth here as in the Colour
@@ -525,6 +535,7 @@ impl Default for Editor {
             session: Session::default(),
             notice: None,
             ui: UiState::default(),
+            custom_theme: None,
             canvas_form: crate::canvasdlg::CanvasForm::default(),
             export_form: crate::exportdlg::ExportForm::default(),
             updates: crate::update::Updates::default(),
@@ -575,6 +586,25 @@ impl Default for Editor {
 impl Editor {
     pub fn now(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
+    }
+
+    /// The colours the interface is drawn in.
+    ///
+    /// One door, so that "which theme is in use" is answered in one place
+    /// rather than at each of the dozen call sites that used to spell out
+    /// `Palette::with_accent(ed.ui.theme, ed.ui.accent)` — and so that a theme
+    /// somebody made needs no branch at any of them.
+    ///
+    /// A custom theme carries its accent as two of its own tokens, so
+    /// [`UiState::accent`] does not re-hue it: the four-accent chooser is a
+    /// shortcut for re-hueing a *built-in*, and applying it on top of colours
+    /// somebody chose by hand would overwrite one of the things they chose. The
+    /// pane draws that chooser only for a built-in, for the same reason.
+    pub fn palette(&self) -> Palette {
+        match &self.custom_theme {
+            Some(theme) => theme.palette,
+            None => Palette::with_accent(self.ui.theme, self.ui.accent),
+        }
     }
 
     pub fn screen_to_doc(&self, screen: Vec2) -> Vec2 {
