@@ -586,6 +586,15 @@ impl LayerStack {
             Layer::folder_named(&name, id)
         } else {
             let slot = self.take_slot();
+            // An import is bounded at [`LayerStack::MAX`] entries by
+            // `ImportedDocument::validate`, so 64 layers and 64 masks is 128
+            // slices against [`LayerStack::MAX_SLOTS`]'s 129 and the pool cannot
+            // run dry here. Nothing parks a slice during an import either — a
+            // freshly opened document has no history. Said out loud because the
+            // failure would be a layer with no slice and `folder` false, which
+            // is a state nothing downstream expects and every reader of
+            // `Layer::slot` would take for a folder.
+            debug_assert!(slot.is_some(), "an import outran the slice pool");
             Layer::named(&name, id, slot)
         };
         entry.name = name;
