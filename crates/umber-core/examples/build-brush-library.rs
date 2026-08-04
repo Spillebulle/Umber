@@ -234,6 +234,7 @@ fn main() {
             for Imported {
                 mut preset,
                 tip,
+                paper,
                 dropped,
             } in found
             {
@@ -251,6 +252,21 @@ fn main() {
                         pack: pack.dir,
                         reasons: dropped.iter().map(|r| r.to_string()).collect(),
                     });
+                    continue;
+                }
+                // A paper this generator has nowhere to put. `BrushPreset::
+                // paper` names a picture in the **user's** library, and the
+                // shipped one is an embedded RON with no `papers/` beside it —
+                // so keeping the brush would ship it with its grain strength
+                // set and no tile to bite through, painting flat where its
+                // author painted through paper. Refused rather than flattened,
+                // which is this file's standing rule and the opposite of what
+                // an interactive import does.
+                if paper.is_some() {
+                    skipped
+                        .entry("a paper texture the shipped library cannot carry".to_string())
+                        .or_default()
+                        .push(label(&preset.name));
                     continue;
                 }
                 if tip.is_some() && !pack.ship_tips {

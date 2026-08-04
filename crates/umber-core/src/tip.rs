@@ -294,23 +294,43 @@ impl TipMask {
     /// and — worse — it would change the mask silently, so a spatter stamp
     /// would come back softer than the one on disk with nothing saying why.
     pub fn from_picture(bytes: &[u8]) -> Result<(Self, TipReading), PresetError> {
-        /// The eight bytes every PNG starts with.
-        const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-
-        let (width, height, rgba) = if bytes.starts_with(&PNG_MAGIC) {
-            let image =
-                crate::docimport::flat::decode_png(bytes, crate::docimport::SourceFormat::Png)
-                    .map_err(|e| malformed(e.to_string()))?;
-            (image.size.x, image.size.y, image.rgba)
-        } else {
-            let decoded = image::load_from_memory(bytes)
-                .map_err(|e| malformed(format!("the picture could not be read ({e})")))?
-                .to_rgba8();
-            (decoded.width(), decoded.height(), decoded.into_raw())
-        };
-
+        let (width, height, rgba) = decode_picture(bytes)?;
         let (coverage, reading) = coverage_of(&rgba);
         Ok((Self::new(width, height, coverage)?, reading))
+    }
+
+    /// Read any picture Umber can decode as a **paper**.
+    ///
+    /// The same decoder [`from_picture`](Self::from_picture) uses and a
+    /// different rule, and there is deliberately no reading to announce: see
+    /// [`grain_of`]. A picture larger than [`TipMask::MAX_SIZE`] is refused for
+    /// the same reason a tip that size is.
+    pub fn from_paper(bytes: &[u8]) -> Result<Self, PresetError> {
+        let (width, height, rgba) = decode_picture(bytes)?;
+        Self::new(width, height, grain_of(&rgba))
+    }
+}
+
+/// Decode a picture to straight-alpha, sRGB RGBA8.
+///
+/// PNG goes through the document importer's decoder rather than a second one of
+/// this module's — [`TipMask::from_png`] is strict on purpose and reads only
+/// what Umber itself wrote into `tips/`. Everything else goes through the
+/// `image` crate, which is already carried for the flat export and covers JPEG,
+/// TIFF, GIF and BMP.
+fn decode_picture(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), PresetError> {
+    /// The eight bytes every PNG starts with.
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+    if bytes.starts_with(&PNG_MAGIC) {
+        let image = crate::docimport::flat::decode_png(bytes, crate::docimport::SourceFormat::Png)
+            .map_err(|e| malformed(e.to_string()))?;
+        Ok((image.size.x, image.size.y, image.rgba))
+    } else {
+        let decoded = image::load_from_memory(bytes)
+            .map_err(|e| malformed(format!("the picture could not be read ({e})")))?
+            .to_rgba8();
+        Ok((decoded.width(), decoded.height(), decoded.into_raw()))
     }
 }
 
@@ -470,6 +490,178 @@ pub fn coverage_of(rgba: &[u8]) -> (Vec<u8>, TipReading) {
             TipReading::Alpha
         },
     )
+}
+
+/// The tile a picture makes when it is read as **paper**.
+///
+/// `rgba` is straight-alpha, sRGB-encoded RGBA8 — the same input
+/// [`coverage_of`] takes.
+///
+/// **The rule is brightness, and there is nothing to decide.** A tip has to
+/// guess between transparency and ink because a tip *is* a coverage mask and a
+/// picture is four channels; a paper does not, because the grain multiplies
+/// coverage — `mix(1.0, tile, strength)` — so the value at a texel already
+/// means "how much of the dab this texel keeps". White keeps all of it and
+/// black takes it away. That is what Umber's own three tiles hold, and it is
+/// what a paper authored for any other application holds, for the plain reason
+/// that a paper is a picture of paper and paper is light.
+///
+/// **Transparency is composited over white before the brightness is taken**, so
+/// a hole in a tile is paper rather than a pit. The alternative reads an alpha
+/// channel the author never used as a grain nobody drew — and since a pit
+/// *removes* paint, the failure direction is a texture that erases most of
+/// every stroke.
+///
+/// Note that this is very nearly the negative of [`coverage_of`]'s `Ink`
+/// reading, and it must be: ink is where the paint goes and grain is where the
+/// paint stays. Getting the two the wrong way round inverts somebody's paper,
+/// which looks like a texture that bites in exactly the wrong places rather
+/// than like a bug.
+///
+/// **Both steps happen in the stored, gamma-encoded values, and that is chosen
+/// rather than overlooked.** The luminance is [`luminance`]'s perceptual one —
+/// its own docs have the argument, and it is the same reading
+/// [`Color::to_hsv`](crate::Color::to_hsv) takes — and the composite over white
+/// rides on top of it, so half-transparent black comes out at 128 rather than
+/// the 188 a linear-light composite would give. That is right for what this
+/// value *is*: a paper is authored by eye, its texel is a *fraction of the dab
+/// kept* rather than a light measurement, and the shader multiplies coverage by
+/// it directly. This is the one place in Umber where a picture is read without
+/// being linearised, and it is the one place where the number is not a colour.
+pub fn grain_of(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .map(|px| {
+            let a = px[3] as f32 / 255.0;
+            let over_white = (1.0 - a) + a * luminance(px[0], px[1], px[2]);
+            (over_white * 255.0 + 0.5) as u8
+        })
+        .collect()
+}
+
+/// How well a tile meets itself when it is repeated.
+///
+/// Grain is anchored to the *document* and wraps across it, so a tile whose
+/// right edge does not continue into its left draws a **grid over the whole
+/// canvas** — one hard line every `Brush::grain_scale` pixels, in every stroke
+/// made with that brush. That is exactly the "subtly wrong pixels" this
+/// codebase refuses to ship in silence, and it is invisible in the 56-point
+/// thumbnail the brush editor shows.
+///
+/// Stated as a statistic rather than as an equality, because a paper is noise:
+/// neighbouring texels differ everywhere, so "the edges match" is never true.
+///
+/// **The reading is a *column* step, signed, judged against the same reading
+/// taken at every other offset in the tile** — and each of those three words
+/// was arrived at by getting it wrong.
+///
+/// - **Signed**, because the artefact is a spatially *coherent* brightness
+///   step and the noise it hides in is not. A mean of absolute differences was
+///   the first attempt and is exactly the statistic that cancels the signal it
+///   is looking for: for grain with a per-texel spread of σ the interior mean
+///   absolute step is about `1.13σ`, so any tolerance loose enough not to
+///   reject real papers swallows a systematic step of up to about `2σ` —
+///   twenty or thirty levels on a photographed paper, which as a straight line
+///   repeated across the canvas is unmissable to an eye that integrates a
+///   coherent edge and invisible to a mean that does not.
+/// - **A whole column against a whole column**, averaged down the join, which
+///   is what turns per-texel noise of σ into `σ/√h` and leaves the step
+///   standing at its full height.
+/// - **Judged against every other offset, not against zero.** This is the
+///   correction the shipped `canvas` tile forced: it is a woven grid, so
+///   *every* column-to-column step in it is a real signed number of its own,
+///   and a rule comparing the join against zero called a tile that provably
+///   wraps — it is built from a sine of an exact multiple of the tile width —
+///   a seam. What matters is not that the join steps, but that it steps by
+///   more than the tile's own structure ever does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seams {
+    /// Mean **signed** step from the last column round to the first: the
+    /// brightness the tile jumps by where its right edge meets its own left.
+    pub across_x: f32,
+    /// Mean of the same reading taken at every *interior* offset — the size of
+    /// step this tile's own structure and noise routinely produce.
+    pub inside_x: f32,
+    pub across_y: f32,
+    pub inside_y: f32,
+}
+
+impl Seams {
+    /// Whether one axis joins without a step the eye would follow.
+    ///
+    /// Three times what the tile does elsewhere, plus one level. Both terms
+    /// answer a different false alarm:
+    ///
+    /// - the multiple of `inside` is what keeps a *structured* paper from
+    ///   being nagged about. A weave steps by the same amount at every thread,
+    ///   so the join stepping by that much is the tile working, not failing.
+    /// - the `+ 1` is what keeps a smooth, nearly seamless tile out of
+    ///   trouble. Its interior steps can be a fraction of a level, so a
+    ///   proportional tolerance alone would report a one-level dither mismatch
+    ///   as a grid — and one level is the finest thing an 8-bit tile can
+    ///   express at all.
+    ///
+    /// Three rather than the two the absolute reading needed is *not* a looser
+    /// rule: these are averages down a whole edge, so the noise in them is
+    /// smaller by `√h` and the same multiple bites far harder.
+    fn axis_tiles(across: f32, inside: f32) -> bool {
+        across.abs() <= inside * 3.0 + 1.0
+    }
+
+    /// Whether this tile repeats without a visible join on either axis.
+    pub fn tiles(&self) -> bool {
+        Self::axis_tiles(self.across_x, self.inside_x)
+            && Self::axis_tiles(self.across_y, self.inside_y)
+    }
+}
+
+/// Measure how `tile` meets itself. See [`Seams`].
+///
+/// One pass over the tile: a 2048² paper is four million texels and this runs
+/// on an import, never on a frame — and the browser caches the answer, because
+/// even an import's cost is not a per-row one.
+pub fn seams(tile: &TipMask) -> Seams {
+    let (w, h) = (tile.width(), tile.height());
+
+    // The signed step from each line to the next, averaged down the whole
+    // length of the join. The last entry is the wrap — the seam itself — and
+    // the rest are what the tile does everywhere else.
+    let steps = |count: u32, along: u32, at: &dyn Fn(u32, u32) -> u8| -> (f32, f32) {
+        if count == 0 || along == 0 {
+            return (0.0, 0.0);
+        }
+        let mut totals = vec![0.0f32; count as usize];
+        for i in 0..count {
+            let next = (i + 1) % count;
+            let mut total = 0.0;
+            for j in 0..along {
+                total += at(next, j) as f32 - at(i, j) as f32;
+            }
+            totals[i as usize] = total / along as f32;
+        }
+        let across = totals[count as usize - 1];
+        // The wrap is excluded from its own baseline, or a large seam would
+        // raise the very figure it is being judged against.
+        let inside = if count < 2 {
+            0.0
+        } else {
+            totals[..count as usize - 1]
+                .iter()
+                .map(|v| v.abs())
+                .sum::<f32>()
+                / (count - 1) as f32
+        };
+        (across, inside)
+    };
+
+    let (across_x, inside_x) = steps(w, h, &|x, y| tile.at(x, y));
+    let (across_y, inside_y) = steps(h, w, &|y, x| tile.at(x, y));
+
+    Seams {
+        across_x,
+        inside_x,
+        across_y,
+        inside_y,
+    }
 }
 
 /// Every mask Umber ships, by name, decoded once.
@@ -841,35 +1033,191 @@ mod tests {
         );
 
         for (name, tile) in patterns() {
-            let (w, h) = (tile.width(), tile.height());
-            let step = |a: u8, b: u8| a.abs_diff(b) as f32;
-
-            let interior: f32 = (0..h)
-                .map(|y| step(tile.at(w / 2, y), tile.at(w / 2 + 1, y)))
-                .sum::<f32>()
-                / h as f32;
-            let seam: f32 = (0..h)
-                .map(|y| step(tile.at(w - 1, y), tile.at(0, y)))
-                .sum::<f32>()
-                / h as f32;
-            assert!(
-                seam <= interior * 2.0 + 1.0,
-                "{name} has a vertical seam: {seam:.2} across it, {interior:.2} inside"
-            );
-
-            let interior: f32 = (0..w)
-                .map(|x| step(tile.at(x, h / 2), tile.at(x, h / 2 + 1)))
-                .sum::<f32>()
-                / w as f32;
-            let seam: f32 = (0..w)
-                .map(|x| step(tile.at(x, h - 1), tile.at(x, 0)))
-                .sum::<f32>()
-                / w as f32;
-            assert!(
-                seam <= interior * 2.0 + 1.0,
-                "{name} has a horizontal seam: {seam:.2} across it, {interior:.2} inside"
-            );
+            let measured = seams(tile);
+            assert!(measured.tiles(), "{name} has a seam: {measured:?}");
         }
+    }
+
+    /// The check an imported texture is put through. Both directions matter:
+    /// a tile that plainly does not join has to be caught, and one that does
+    /// must not be nagged about, or the notice becomes noise nobody reads.
+    #[test]
+    fn a_tile_that_does_not_join_is_told_from_one_that_does() {
+        // Two unrelated halves butted together: smooth inside, a cliff at the
+        // join. This is what an unprepared photograph of paper looks like.
+        let mut split = vec![0u8; 16 * 16];
+        for y in 0..16 {
+            for x in 0..16 {
+                split[y * 16 + x] = if x < 8 { 40 } else { 220 };
+            }
+        }
+        let measured = seams(&TipMask::new(16, 16, split).expect("build"));
+        assert!(
+            !measured.tiles(),
+            "a hard vertical join should be caught: {measured:?}"
+        );
+        // The horizontal axis of that tile is perfect — every row is the same —
+        // so it is the *pair* of readings that decides, not either alone.
+        assert_eq!(measured.across_y, 0.0);
+
+        // A gradient that wraps: every step is one level, including across the
+        // join. Noise with a matched border behaves the same way.
+        let ramp: Vec<u8> = (0..16 * 16)
+            .map(|i| ((i % 16) * 16) as u8)
+            .collect::<Vec<_>>();
+        let measured = seams(&TipMask::new(16, 16, ramp).expect("build"));
+        assert!(!measured.tiles(), "a saw-tooth ramp does not wrap");
+
+        // Flat: nothing to see anywhere, and the `+ 1` is what keeps it from
+        // being reported on a single level of rounding.
+        let flat = TipMask::new(16, 16, vec![128; 256]).expect("build");
+        assert!(seams(&flat).tiles());
+
+        // A one-texel tile has no interior at all and must not divide by zero.
+        let dot = TipMask::new(1, 1, vec![200]).expect("build");
+        assert!(seams(&dot).tiles());
+    }
+
+    /// The two cases the tolerance actually adjudicates, neither of which the
+    /// test above reaches: a *noisy* tile hiding a moderate step, and a smooth
+    /// one with nothing wrong but a level of dither. The synthetic extremes are
+    /// separable by any rule at all; these are the ones a real paper produces,
+    /// and getting either wrong is what makes the notice noise nobody reads.
+    #[test]
+    fn a_step_hidden_in_grain_is_still_found_and_a_level_of_dither_is_not() {
+        // Deterministic, so this cannot be flaky: a hash-like sequence with a
+        // spread of about ±25 levels, which is a coarse paper.
+        let noise = |x: u32, y: u32| {
+            let n =
+                (x.wrapping_mul(1_664_525) ^ y.wrapping_mul(1_013_904_223)).wrapping_mul(69_069);
+            ((n >> 16) % 51) as i32 - 25
+        };
+        let side = 64u32;
+        // A photographed paper: grain of about ±25 levels over a slow ramp of
+        // `lift` levels across the tile. The ramp is the failure — it is
+        // smooth everywhere inside and jumps back the whole way at the wrap,
+        // which is precisely what uneven lighting on a scan produces and what
+        // a purely absolute rule cannot see.
+        let build = |lift: i32| {
+            let texels: Vec<u8> = (0..side * side)
+                .map(|i| {
+                    let (x, y) = (i % side, i / side);
+                    let ramp = lift * x as i32 / side as i32;
+                    (128 + noise(x, y) + ramp).clamp(0, 255) as u8
+                })
+                .collect();
+            TipMask::new(side, side, texels).expect("build")
+        };
+
+        // No ramp: the noise is the only thing there, and it must not be
+        // reported. This is the false alarm that would put a warning on every
+        // real paper anybody imports.
+        let clean = seams(&build(0));
+        assert!(
+            clean.tiles(),
+            "grain alone should not read as a seam: {clean:?}"
+        );
+
+        // A 25-level ramp — *smaller* than the grain it sits in, and the case
+        // a mean of absolute differences cannot see at all: per texel the join
+        // differs by about the same as any other pair, so the old rule passed
+        // it. Averaged down the edge the noise falls away and the step stands.
+        let seamed = seams(&build(25));
+        assert!(
+            !seamed.tiles(),
+            "a step buried in grain was missed: {seamed:?}"
+        );
+        // And it really is buried: per-texel, the join is indistinguishable.
+        let per_texel = |a: &TipMask, at: &dyn Fn(u32, u32) -> (u32, u32)| {
+            let seam: f32 = (0..side)
+                .map(|j| {
+                    let (x0, y0) = at(side - 1, j);
+                    let (x1, y1) = at(0, j);
+                    a.at(x0, y0).abs_diff(a.at(x1, y1)) as f32
+                })
+                .sum::<f32>()
+                / side as f32;
+            seam
+        };
+        let ramped = build(25);
+        let joined = per_texel(&ramped, &|i, j| (i, j));
+        let inside: f32 = (0..side - 1)
+            .map(|x| {
+                (0..side)
+                    .map(|y| ramped.at(x, y).abs_diff(ramped.at(x + 1, y)) as f32)
+                    .sum::<f32>()
+                    / side as f32
+            })
+            .sum::<f32>()
+            / (side - 1) as f32;
+        assert!(
+            joined <= inside * 2.0 + 1.0,
+            "this fixture has to be one the old absolute-difference rule passed, \
+             or it proves nothing: {joined:.1} across, {inside:.1} inside"
+        );
+
+        // And the other end: a nearly flat tile whose edges disagree by one
+        // level of dither is fine, which is what the `+ 1` is for. A purely
+        // proportional tolerance would call this a grid.
+        let dithered: Vec<u8> = (0..side * side)
+            .map(|i| {
+                let x = i % side;
+                if x == 0 { 129 } else { 128 }
+            })
+            .collect();
+        let smooth = seams(&TipMask::new(side, side, dithered).expect("build"));
+        assert!(
+            smooth.inside_x < 0.1,
+            "the fixture is not smooth: {smooth:?}"
+        );
+        assert!(
+            smooth.tiles(),
+            "one level of dither is not a grid: {smooth:?}"
+        );
+    }
+
+    /// The tile that forced the statistic to be relative rather than absolute.
+    ///
+    /// `canvas` is a woven grid built from a sine of an exact multiple of the
+    /// tile width, so it provably wraps — and *every* column-to-column step in
+    /// it is a real signed number, nineteen levels at the join included. A rule
+    /// that compared the join against zero called it a seam. Pinned here as
+    /// well as in the shipped sweep, because the sweep would go quiet the day
+    /// somebody changed the tile rather than the rule.
+    #[test]
+    fn a_woven_tile_steps_at_every_thread_and_still_joins() {
+        let canvas = pattern("canvas").expect("shipped");
+        let measured = seams(canvas);
+        assert!(
+            measured.across_x.abs() > 5.0,
+            "the fixture no longer demonstrates anything: {measured:?}"
+        );
+        assert!(measured.tiles(), "a weave is not a seam: {measured:?}");
+    }
+
+    /// The paper rule, and the reason it is not the tip's. Getting these the
+    /// wrong way round inverts somebody's grain — the paper bites where the
+    /// author drew a peak — which reads as a texture that behaves oddly rather
+    /// than as a bug.
+    #[test]
+    fn a_paper_is_read_as_brightness_where_a_tip_is_read_as_ink() {
+        // White keeps the whole dab, black takes it away. That is the opposite
+        // end of the same picture from `coverage_of`'s ink reading.
+        let opaque = [255, 255, 255, 255, 0, 0, 0, 255];
+        assert_eq!(grain_of(&opaque), [255, 0]);
+        assert_eq!(coverage_of(&opaque).0, [0, 255]);
+
+        // Transparent is paper, not a pit: composited over white it is white,
+        // so the dab passes through untouched.
+        assert_eq!(grain_of(&[0, 0, 0, 0]), [255]);
+        // Half-transparent black is half way there.
+        let half = grain_of(&[0, 0, 0, 128])[0];
+        assert!((half as i32 - 128).abs() <= 2, "got {half}");
+
+        // And through a file, which is the door an import comes in by.
+        let png = encode(2, 1, png::ColorType::Grayscale, &[255, 0]);
+        let paper = TipMask::from_paper(&png).expect("import");
+        assert_eq!(paper.coverage(), [255, 0]);
     }
 
     /// The measurement `docs/brush-sources.md` turns on, in a form small enough

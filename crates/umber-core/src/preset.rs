@@ -118,6 +118,45 @@ pub struct BrushPreset {
     /// brush's size, spacing and dynamics rather than refusing to load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<String>,
+    /// The paper this brush's grain bites through, named rather than carried,
+    /// and `None` for one of the three [`crate::GrainPattern`] ships.
+    ///
+    /// **A name here for exactly [`Self::tip`]'s reason, and one of its own.**
+    /// The reason it shares: a tile is a bitmap and the library is text, so the
+    /// preset holds the name of a picture in the library's `papers/` directory
+    /// and [`UserLibrary::paper`] resolves it — which is also what lets twenty
+    /// brushes share one paper and one GPU upload. The reason of its own:
+    /// [`Brush`] is `Copy`, so `GrainPattern` cannot grow a `Custom(String)`
+    /// arm without ending that, and the arm would have to be carried through
+    /// every `Brush` a preview, a snapshot and an undo entry copies.
+    ///
+    /// So the enum stays the closed set of shipped papers and this overrides it
+    /// where it is set. A name that resolves to nothing paints **flat** — no
+    /// grain at all, which is the exact identity `mix(1.0, tile, strength)`
+    /// already pays for — rather than falling back to a shipped tile, because
+    /// substituting a paper the author did not choose is the bug that made a
+    /// Clip Studio import paint at 78% of the opacity it was set to.
+    ///
+    /// **It did not move [`FORMAT_VERSION`], and unlike the other additive
+    /// fields that is not an easy call.** An older Umber ignores this and
+    /// paints through `Brush::grain_pattern` at `Brush::grain` — the default
+    /// `Tooth` for anything imported, which is the 78% substitution above,
+    /// happening in a build that cannot be told about it. That is a *pixel*
+    /// change, where `Library::made_collections` was only a grouping, so the
+    /// rule "bumped only when a change would make an older Umber misread a
+    /// newer file" is genuinely in play.
+    ///
+    /// It stays at 1 because of what a bump costs on *this* file. The version
+    /// gate is over the whole `brushes.ron`: an older build reading a newer
+    /// number refuses the library entire, so one papered brush would put every
+    /// brush the user has ever saved out of reach on the older build. Losing
+    /// two hundred brushes to protect the grain of one is the worse trade, and
+    /// it is a different bargain from the document format's — there a refusal
+    /// costs one file, and the alternative is a *picture* that is wrong. Here
+    /// the alternative is one brush's texture, on a build the user has chosen
+    /// to go back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper: Option<String>,
 }
 
 /// Where a brush read out of somebody else's file lands.
@@ -154,6 +193,7 @@ impl BrushPreset {
             credit: None,
             brush,
             tip: None,
+            paper: None,
         }
     }
 
@@ -275,6 +315,7 @@ fn umber_defaults() -> Vec<BrushPreset> {
         credit: Some(credit.clone()),
         brush,
         tip: None,
+        paper: None,
     };
     // A shipped brush that carries a bitmap tip, resolved out of
     // `crate::tip::builtin` rather than the user's library. Only one of *these*
@@ -406,6 +447,14 @@ struct LibraryFile {
     /// config lives by.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     made_collections: Vec<String>,
+    /// Tips the user put in the library themselves, which no preset need name.
+    /// See [`Library::kept_tips`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kept_tips: Vec<String>,
+    /// Papers the user put in the library themselves. See
+    /// [`Library::kept_papers`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kept_papers: Vec<String>,
 }
 
 /// Everything in a library file.
@@ -452,6 +501,27 @@ pub struct Library {
     /// collection that disappeared from under a drag would take the drop target
     /// with it.
     pub made_collections: Vec<String>,
+    /// Tips the user imported into the library, which no preset need name.
+    ///
+    /// Exactly [`Self::made_collections`]'s argument, one level down. Every
+    /// *other* mask in `tips/` is derived: it is there because some preset's
+    /// [`BrushPreset::tip`] names it, and [`UserLibrary`]'s pruning deletes the
+    /// rest so that a discarded experiment does not leave a megabyte behind.
+    /// A stamp somebody imported to *use later* has nothing to be derived from
+    /// and would be swept away by the next save — appearing and vanishing
+    /// depending on what the user did next, which is the worst shape this bug
+    /// takes.
+    ///
+    /// So the two doors have one rule each, and this is what makes the second
+    /// legal: a picture imported into a **brush's hand** is written when the
+    /// brush is saved and pruned with it, and a picture imported into the
+    /// **library** is written at once and kept until it is removed.
+    pub kept_tips: Vec<String>,
+    /// Papers the user imported into the library. See [`Self::kept_tips`] —
+    /// the argument is the same one, and the two lists are separate only
+    /// because the pictures live in separate directories and a tip is not a
+    /// paper.
+    pub kept_papers: Vec<String>,
 }
 
 /// What came of asking for a new collection.
@@ -494,6 +564,8 @@ pub fn parse(text: &str) -> Result<Library, PresetError> {
         presets: file.presets,
         collections: file.collections,
         made_collections: file.made_collections,
+        kept_tips: file.kept_tips,
+        kept_papers: file.kept_papers,
     })
 }
 
@@ -509,19 +581,26 @@ pub fn parse_library(text: &str) -> Result<Vec<BrushPreset>, PresetError> {
 /// Serialise a brush library to RON, pretty-printed so that a generated library
 /// gives a readable diff when it is regenerated.
 pub fn to_ron(presets: &[BrushPreset]) -> Result<String, PresetError> {
-    to_ron_file(presets, &BTreeMap::new(), &[])
+    to_ron_file(&Library {
+        presets: presets.to_vec(),
+        ..Library::default()
+    })
 }
 
-fn to_ron_file(
-    presets: &[BrushPreset],
-    collections: &BTreeMap<String, String>,
-    made_collections: &[String],
-) -> Result<String, PresetError> {
+/// The whole envelope, which is what a [`UserLibrary`] writes.
+///
+/// One argument rather than the growing list of parallel slices it used to
+/// take: every field is written whether or not this caller has one, and a
+/// writer that had to be told each of them separately is one that will
+/// eventually be told four of five.
+fn to_ron_file(library: &Library) -> Result<String, PresetError> {
     let file = LibraryFile {
         version: FORMAT_VERSION,
-        presets: presets.to_vec(),
-        collections: collections.clone(),
-        made_collections: made_collections.to_vec(),
+        presets: library.presets.clone(),
+        collections: library.collections.clone(),
+        made_collections: library.made_collections.clone(),
+        kept_tips: library.kept_tips.clone(),
+        kept_papers: library.kept_papers.clone(),
     };
     let config = ron::ser::PrettyConfig::new().struct_names(false);
     ron::ser::to_string_pretty(&file, config)
@@ -545,7 +624,16 @@ fn to_ron_file(
 ///     brushes.ron     the presets, exactly the format it always was
 ///     tips/
 ///         <name>.png  one 8-bit greyscale coverage mask per tip
+///     papers/
+///         <name>.png  one 8-bit greyscale tile per paper
 /// ```
+///
+/// Two directories rather than one, because a tip and a paper are the same
+/// bytes and not the same thing: a stamp is stretched over one dab and a tile
+/// wraps across the document, so one is stamped through a clamping sampler and
+/// the other through a repeating one, one is read from a picture as ink and the
+/// other as brightness, and only one of them has to join to itself. Mixing them
+/// in one folder would make every picker offer the wrong half of the list.
 ///
 /// A directory rather than a zip, which was the obvious alternative. Three
 /// reasons, in order of weight:
@@ -581,8 +669,31 @@ pub struct UserLibrary {
     /// and identity is what lets the renderer skip re-uploading it at the start
     /// of every stroke.
     tips: BTreeMap<String, Arc<TipMask>>,
+    /// Every tile in `papers/`, by name. `Arc` for [`Self::tips`]'s reason.
+    papers: BTreeMap<String, Arc<TipMask>>,
+    /// See [`Library::kept_tips`] — the tips that survive a prune with no
+    /// preset naming them.
+    kept_tips: Vec<String>,
+    kept_papers: Vec<String>,
     migrated: bool,
     warnings: Vec<String>,
+}
+
+/// What came of asking for a picture to be taken out of the library.
+///
+/// Three answers rather than a `bool`, because the refusal that matters needs
+/// to be able to name the brushes standing in the way: removing a stamp two
+/// brushes are painting with would leave both painting round, silently, and
+/// there is no undo for it — the history covers painting only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Removed {
+    Gone,
+    /// Still named by these brushes, by display name, so a sentence can list
+    /// them.
+    InUse(Vec<String>),
+    /// Nothing of that name, which is not an error — a double-click on Remove
+    /// should not raise a dialog.
+    Unknown,
 }
 
 impl UserLibrary {
@@ -593,6 +704,7 @@ impl UserLibrary {
     pub const DIR_NAME: &'static str = "brushes";
     pub const FILE_NAME: &'static str = "brushes.ron";
     const TIPS_DIR: &'static str = "tips";
+    const PAPERS_DIR: &'static str = "papers";
 
     /// Where [`UserLibrary::load`] reads from: `%APPDATA%\Umber\data\brushes`
     /// on Windows, `~/.local/share/umber/brushes` on Linux,
@@ -648,10 +760,14 @@ impl UserLibrary {
             collections: contents.collections,
             made_collections: contents.made_collections,
             tips: BTreeMap::new(),
+            papers: BTreeMap::new(),
+            kept_tips: contents.kept_tips,
+            kept_papers: contents.kept_papers,
             migrated,
             warnings: Vec::new(),
         };
         library.load_tips();
+        library.load_papers();
         // Only after the tips are in hand: the migrated file may name tips that
         // were never there, and `write` is what drops those references.
         //
@@ -675,40 +791,20 @@ impl UserLibrary {
         self.dir.join(Self::TIPS_DIR)
     }
 
+    fn papers_dir(&self) -> PathBuf {
+        self.dir.join(Self::PAPERS_DIR)
+    }
+
     /// Read every mask in `tips/`.
-    ///
-    /// A mask that will not decode is skipped with a warning rather than
-    /// failing the load: one unreadable picture must not put the whole
-    /// collection out of reach, and the brush that named it still paints — as a
-    /// round one. The warning is what stops that being silent.
     fn load_tips(&mut self) {
-        let Ok(entries) = fs::read_dir(self.tips_dir()) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-            {
-                continue;
-            }
-            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            match fs::read(&path).map_err(|source| PresetError::Io {
-                path: path.clone(),
-                source,
-            }) {
-                Ok(bytes) => match TipMask::from_png(&bytes) {
-                    Ok(mask) => {
-                        self.tips.insert(name, Arc::new(mask));
-                    }
-                    Err(e) => self.warnings.push(format!("{}: {e}", path.display())),
-                },
-                Err(e) => self.warnings.push(e.to_string()),
-            }
-        }
+        let masks = read_masks(&self.tips_dir(), &mut self.warnings);
+        self.tips = masks;
+    }
+
+    /// Read every tile in `papers/`.
+    fn load_papers(&mut self) {
+        let tiles = read_masks(&self.papers_dir(), &mut self.warnings);
+        self.papers = tiles;
     }
 
     /// The library's directory. Shown to the user, so it names the folder they
@@ -746,6 +842,120 @@ impl UserLibrary {
     /// selecting a brush does not have to reach for the library.
     pub fn tips(&self) -> &BTreeMap<String, Arc<TipMask>> {
         &self.tips
+    }
+
+    /// The tile a [`BrushPreset::paper`] names, if it is here.
+    pub fn paper(&self, name: &str) -> Option<&Arc<TipMask>> {
+        self.papers.get(name)
+    }
+
+    /// Every paper tile, by name.
+    pub fn papers(&self) -> &BTreeMap<String, Arc<TipMask>> {
+        &self.papers
+    }
+
+    /// Put a stamp in the library on its own, under a name derived from
+    /// `desired`, and return the name it was given.
+    ///
+    /// This is the **library** door, and it writes at once — where a picture
+    /// imported into a *brush's hand* waits for the brush to be saved. The two
+    /// differ because only one of them can be undone by walking away: a brush
+    /// in hand is discarded by selecting another, and a library nobody has
+    /// added to has nothing to discard. It is recorded in
+    /// [`Library::kept_tips`], which is what stops the next write pruning a
+    /// stamp no brush names yet.
+    /// **The picture is taken back off if the index cannot be written.** The
+    /// two go together or neither does: a PNG on disk whose name is not in
+    /// `kept_tips` is read back on the next launch, shown in the browser, and
+    /// then deleted by the first save that succeeds — appearing and vanishing
+    /// depending on what the user did next, which is the precise failure
+    /// `kept_tips` exists to prevent, surviving in the failure path.
+    pub fn add_tip(&mut self, desired: &str, mask: TipMask) -> Result<String, PresetError> {
+        let name = free_stem(desired, "tip", &self.tips, &self.tips_dir());
+        write_mask(&self.tips_dir(), &name, &mask)?;
+        self.tips.insert(name.clone(), Arc::new(mask));
+        keep(&mut self.kept_tips, &name);
+        if let Err(e) = self.write() {
+            self.tips.remove(&name);
+            self.kept_tips.retain(|held| held != &name);
+            let _ = fs::remove_file(self.tips_dir().join(format!("{name}.png")));
+            return Err(e);
+        }
+        Ok(name)
+    }
+
+    /// The same for a paper, undone the same way. See [`Self::add_tip`].
+    pub fn add_paper(&mut self, desired: &str, tile: TipMask) -> Result<String, PresetError> {
+        let name = free_stem(desired, "paper", &self.papers, &self.papers_dir());
+        write_mask(&self.papers_dir(), &name, &tile)?;
+        self.papers.insert(name.clone(), Arc::new(tile));
+        keep(&mut self.kept_papers, &name);
+        if let Err(e) = self.write() {
+            self.papers.remove(&name);
+            self.kept_papers.retain(|held| held != &name);
+            let _ = fs::remove_file(self.papers_dir().join(format!("{name}.png")));
+            return Err(e);
+        }
+        Ok(name)
+    }
+
+    /// The brushes still stamping with a tip, by display name.
+    pub fn tip_users(&self, name: &str) -> Vec<String> {
+        self.presets
+            .iter()
+            .filter(|p| p.tip.as_deref() == Some(name))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// The brushes still painting through a paper, by display name.
+    pub fn paper_users(&self, name: &str) -> Vec<String> {
+        self.presets
+            .iter()
+            .filter(|p| p.paper.as_deref() == Some(name))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Take a stamp out of the library.
+    ///
+    /// **Refused while a brush in this library still names it**, and the
+    /// refusal carries the names so the caller can say which. The control that
+    /// offers this is disabled for the same reason — a button that lights up
+    /// and then declines is the control this codebase refuses everywhere — but
+    /// the model refuses too, because it can see the whole library and a
+    /// control can only see what it drew. Note it can only speak for *this*
+    /// library: a shipped brush naming the same word is a different namespace,
+    /// since [`crate::tip::builtin`] is consulted only after this one.
+    pub fn remove_tip(&mut self, name: &str) -> Result<Removed, PresetError> {
+        if !self.tips.contains_key(name) {
+            return Ok(Removed::Unknown);
+        }
+        let users = self.tip_users(name);
+        if !users.is_empty() {
+            return Ok(Removed::InUse(users));
+        }
+        // Only the record comes off here. The picture and the map entry are
+        // `prune_tips`'s, which `write` runs — so there is one place a stamp is
+        // deleted rather than two that have to agree, and taking it out of the
+        // map first would hide it from the very sweep that removes the file.
+        self.kept_tips.retain(|held| held != name);
+        self.write()?;
+        Ok(Removed::Gone)
+    }
+
+    /// The same for a paper. See [`Self::remove_tip`].
+    pub fn remove_paper(&mut self, name: &str) -> Result<Removed, PresetError> {
+        if !self.papers.contains_key(name) {
+            return Ok(Removed::Unknown);
+        }
+        let users = self.paper_users(name);
+        if !users.is_empty() {
+            return Ok(Removed::InUse(users));
+        }
+        self.kept_papers.retain(|held| held != name);
+        self.write()?;
+        Ok(Removed::Gone)
     }
 
     /// Add `preset`, or replace the one that already has its id, then write the
@@ -923,7 +1133,10 @@ impl UserLibrary {
         // the caller's job — it has the whole selection in hand and can report
         // twenty files as one sentence.
         for brushimport::Imported {
-            mut preset, tip, ..
+            mut preset,
+            tip,
+            paper,
+            ..
         } in found
         {
             // Importing the same pack twice must not overwrite a copy the user
@@ -963,6 +1176,23 @@ impl UserLibrary {
                     }
                 }
             }
+            match paper {
+                Some(tile) => preset.paper = Some(self.store_paper(&preset.id, tile)?),
+                // Exactly the tip's rule, and needed for exactly its reason: an
+                // Umber `.ron` names its papers and the pictures are not in it,
+                // so a reference to one this library does not hold is dropped
+                // rather than left pointing at nothing. Dropping it paints
+                // flat, which is what `BrushPreset::paper` promises.
+                None => {
+                    if preset
+                        .paper
+                        .as_deref()
+                        .is_some_and(|n| !self.papers.contains_key(n))
+                    {
+                        preset.paper = None;
+                    }
+                }
+            }
             self.presets.push(preset.clone());
             added.push(preset);
         }
@@ -977,14 +1207,33 @@ impl UserLibrary {
     /// directory unreadable, and a stamp library is something people go and look
     /// at.
     fn store_tip(&mut self, preset_id: &str, mask: TipMask) -> Result<String, PresetError> {
-        let name = self.allocate_tip_name(preset_id);
-        create_dir(&self.tips_dir())?;
-        let path = self.tips_dir().join(format!("{name}.png"));
-        fs::write(&path, mask.to_png()?).map_err(|source| PresetError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let name = free_stem(preset_id, "tip", &self.tips, &self.tips_dir());
+        write_mask(&self.tips_dir(), &name, &mask)?;
         self.tips.insert(name.clone(), Arc::new(mask));
+        Ok(name)
+    }
+
+    /// Write a paper into `papers/` on a preset's behalf and return the name to
+    /// record on it. [`Self::store_tip`]'s twin, and deliberately **not** in
+    /// [`Library::kept_papers`]: this tile arrived with a brush and belongs to
+    /// it, so deleting that brush should take it with them.
+    ///
+    /// **A tile equal to one already held is shared rather than copied**, which
+    /// [`Self::store_tip`] deliberately does not do. The difference is in the
+    /// formats: a stamp belongs to one brush, where a Clip Studio texture
+    /// material is *referenced* by every sub-tool in the file that uses it — so
+    /// a group of fifteen brushes over one paper wrote fifteen copies of the
+    /// same half-megabyte picture and put fifteen indistinguishable rows in the
+    /// browser. Compared by value and only against what this library holds,
+    /// which is a few tiles rather than a content-addressed store; the naming
+    /// stays [`free_stem`]'s, so the directory is still readable.
+    fn store_paper(&mut self, preset_id: &str, tile: TipMask) -> Result<String, PresetError> {
+        if let Some((name, _)) = self.papers.iter().find(|(_, held)| ***held == tile) {
+            return Ok(name.clone());
+        }
+        let name = free_stem(preset_id, "paper", &self.papers, &self.papers_dir());
+        write_mask(&self.papers_dir(), &name, &tile)?;
+        self.papers.insert(name.clone(), Arc::new(tile));
         Ok(name)
     }
 
@@ -1000,31 +1249,15 @@ impl UserLibrary {
         candidate
     }
 
-    /// A file name for a tip. Ids carry a `/`, which a file name cannot, so
-    /// they go through [`slug`] — and two ids can slug to the same thing, so
-    /// the result still has to be made unique.
-    ///
-    /// Hyphenated rather than [`unique_name`]'s ` 2`, and deliberately: this is
-    /// a **file stem**, not something anybody reads, and the directory is meant
-    /// to be openable with whatever opens pictures. Replacing the same brush's
-    /// tip twice therefore gives `user-nib`, `user-nib-2`, `user-nib-3` —
-    /// distinct files, so the mask a preset still names can never be written
-    /// over by a mask for a different one.
-    fn allocate_tip_name(&self, preset_id: &str) -> String {
-        let stem = slug(preset_id);
-        let stem = if stem.is_empty() { "tip" } else { &stem };
-        let mut candidate = stem.to_string();
-        let mut n = 2;
-        while self.tips.contains_key(&candidate) {
-            candidate = format!("{stem}-{n}");
-            n += 1;
-        }
-        candidate
-    }
-
     fn write(&mut self) -> Result<(), PresetError> {
         create_dir(&self.dir)?;
-        let text = to_ron_file(&self.presets, &self.collections, &self.made_collections)?;
+        let text = to_ron_file(&Library {
+            presets: self.presets.clone(),
+            collections: self.collections.clone(),
+            made_collections: self.made_collections.clone(),
+            kept_tips: self.kept_tips.clone(),
+            kept_papers: self.kept_papers.clone(),
+        })?;
         let file = self.dir.join(Self::FILE_NAME);
 
         // Write beside the library and rename over it. A direct write that is
@@ -1043,34 +1276,176 @@ impl UserLibrary {
         })?;
 
         self.prune_tips();
+        self.prune_papers();
         Ok(())
     }
 
-    /// Delete the masks no preset names any more.
+    /// Delete the masks nothing names any more.
     ///
     /// Deleting a stamp brush has to take its picture with it, or the directory
     /// grows a megabyte per discarded experiment and never gives it back. Run
     /// *after* the RON is safely written, so a failure here leaves orphaned
     /// files rather than a preset pointing at a file that has gone.
+    ///
+    /// "Nothing names it" is a preset **or** [`Library::kept_tips`]: a stamp
+    /// imported into the library to be used later has no preset to be derived
+    /// from, and sweeping it would make it appear and vanish depending on what
+    /// the user did next.
     fn prune_tips(&mut self) {
         let referenced: Vec<&str> = self
             .presets
             .iter()
             .filter_map(|preset| preset.tip.as_deref())
+            .chain(self.kept_tips.iter().map(String::as_str))
             .collect();
-        let orphans: Vec<String> = self
-            .tips
-            .keys()
-            .filter(|name| !referenced.contains(&name.as_str()))
-            .cloned()
-            .collect();
-        for name in orphans {
+        for name in orphans(&self.tips, &referenced) {
             // Best effort: a mask that will not delete is a file left behind,
             // which is untidy, and nothing worse.
             let _ = fs::remove_file(self.tips_dir().join(format!("{name}.png")));
             self.tips.remove(&name);
         }
+        let dir = self.tips_dir();
+        forget_gone(&mut self.kept_tips, &self.tips, &dir);
     }
+
+    /// The same for `papers/`. See [`Self::prune_tips`].
+    fn prune_papers(&mut self) {
+        let referenced: Vec<&str> = self
+            .presets
+            .iter()
+            .filter_map(|preset| preset.paper.as_deref())
+            .chain(self.kept_papers.iter().map(String::as_str))
+            .collect();
+        for name in orphans(&self.papers, &referenced) {
+            let _ = fs::remove_file(self.papers_dir().join(format!("{name}.png")));
+            self.papers.remove(&name);
+        }
+        let dir = self.papers_dir();
+        forget_gone(&mut self.kept_papers, &self.papers, &dir);
+    }
+}
+
+/// Drop the names in a kept list whose pictures have really gone.
+///
+/// **"Gone" is a file that is not there, not a picture that would not decode**,
+/// and the difference is the whole of this function. A PNG that will not decode
+/// is skipped by [`read_masks`] with a warning, so it is not in `held` — and a
+/// rule reading only `held` would delete the user's record that they imported
+/// it while leaving the file on disk for ever, unreachable and undeletable from
+/// inside Umber. That is [`free_stem`]'s rule turned round: the allocator was
+/// taught that a broken file still owns its name, and the sweep has to agree,
+/// or the two disagree about what the library holds.
+///
+/// What it really removes is a name whose picture was deleted from outside
+/// Umber, or a library copied without its pictures, which would otherwise keep
+/// a row in the browser for ever with nothing behind it.
+fn forget_gone(kept: &mut Vec<String>, held: &BTreeMap<String, Arc<TipMask>>, dir: &Path) {
+    kept.retain(|name| held.contains_key(name) || dir.join(format!("{name}.png")).exists());
+}
+
+/// Which of `held` is named by nothing in `referenced`.
+fn orphans(held: &BTreeMap<String, Arc<TipMask>>, referenced: &[&str]) -> Vec<String> {
+    held.keys()
+        .filter(|name| !referenced.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Record a name as one the user put in the library themselves, once.
+fn keep(kept: &mut Vec<String>, name: &str) {
+    if !kept.iter().any(|held| held == name) {
+        kept.push(name.to_owned());
+    }
+}
+
+/// A file name for a stamp or a paper, free in both the map and the directory.
+///
+/// Ids carry a `/`, which a file name cannot, so `desired` goes through
+/// [`slug`] — and two ids can slug to the same thing, so the result still has
+/// to be made unique.
+///
+/// **The directory is checked as well as the map**, and that is not belt and
+/// braces: a picture that would not decode is *not* in the map and still owns
+/// its name on disk, so allocating from the map alone would hand that name out
+/// again and write over the file. It is a picture nobody can see, which is
+/// exactly why nobody would notice.
+///
+/// Hyphenated rather than [`unique_name`]'s ` 2`, and deliberately: this is a
+/// **file stem**, not something anybody reads, and the directory is meant to be
+/// openable with whatever opens pictures. Replacing the same brush's tip twice
+/// therefore gives `user-nib`, `user-nib-2`, `user-nib-3` — distinct files, so
+/// the mask a preset still names can never be written over by a mask for a
+/// different one.
+fn free_stem(
+    desired: &str,
+    fallback: &str,
+    held: &BTreeMap<String, Arc<TipMask>>,
+    dir: &Path,
+) -> String {
+    let stem = slug(desired);
+    let stem = if stem.is_empty() { fallback } else { &stem };
+    let free = |candidate: &str| {
+        !held.contains_key(candidate) && !dir.join(format!("{candidate}.png")).exists()
+    };
+    let mut candidate = stem.to_string();
+    let mut n = 2;
+    while !free(&candidate) {
+        candidate = format!("{stem}-{n}");
+        n += 1;
+    }
+    candidate
+}
+
+/// Write one 8-bit greyscale PNG into a library directory, making it first.
+fn write_mask(dir: &Path, name: &str, mask: &TipMask) -> Result<(), PresetError> {
+    create_dir(&dir.to_path_buf())?;
+    let path = dir.join(format!("{name}.png"));
+    fs::write(&path, mask.to_png()?).map_err(|source| PresetError::Io {
+        path: path.clone(),
+        source,
+    })
+}
+
+/// Read every 8-bit greyscale PNG in one directory, by file stem.
+///
+/// A picture that will not decode is skipped with a warning rather than failing
+/// the load: one unreadable file must not put the whole collection out of
+/// reach, and the brush that named it still paints — round, or with no grain.
+/// The warning is what stops that being silent.
+///
+/// One function for `tips/` and `papers/` because both hold exactly the same
+/// bytes on disk; what differs is only how they are *read from a picture* and
+/// what samples them, and neither of those is here.
+fn read_masks(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, Arc<TipMask>> {
+    let mut masks = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return masks;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        {
+            continue;
+        }
+        let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        match fs::read(&path).map_err(|source| PresetError::Io {
+            path: path.clone(),
+            source,
+        }) {
+            Ok(bytes) => match TipMask::from_png(&bytes) {
+                Ok(mask) => {
+                    masks.insert(name, Arc::new(mask));
+                }
+                Err(e) => warnings.push(format!("{}: {e}", path.display())),
+            },
+            Err(e) => warnings.push(e.to_string()),
+        }
+    }
+    masks
 }
 
 fn create_dir(dir: &PathBuf) -> Result<(), PresetError> {
@@ -1232,6 +1607,10 @@ mod tests {
 
         fn tip_file(&self, name: &str) -> PathBuf {
             self.path().join("tips").join(format!("{name}.png"))
+        }
+
+        fn paper_file(&self, name: &str) -> PathBuf {
+            self.path().join("papers").join(format!("{name}.png"))
         }
     }
 
@@ -1893,6 +2272,204 @@ mod tests {
 
         assert!(library.get(&id).unwrap().tip.is_none());
         assert!(library.tips().is_empty(), "the orphan should have gone");
+    }
+
+    /// The whole point of the library door: a stamp put there on its own has
+    /// no preset to be derived from, and the next write must not sweep it away.
+    /// Before [`Library::kept_tips`] existed it did — the picture appeared and
+    /// vanished depending on what the user did next.
+    #[test]
+    fn a_stamp_imported_into_the_library_survives_a_save_that_names_it_nowhere() {
+        let scratch = Scratch::new("kept-tip");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let mask = TipMask::new(4, 4, vec![7; 16]).expect("mask");
+        // A file stem, which is what the only real caller passes.
+        let name = library.add_tip("Rough edge", mask).expect("add");
+        assert_eq!(name, "rough-edge");
+        assert!(scratch.tip_file(&name).exists());
+
+        // A save is what runs the prune, and this one names no tip at all.
+        library
+            .save(BrushPreset::unsaved("Round", Brush::default()), None)
+            .expect("save");
+        assert!(scratch.tip_file(&name).exists(), "the stamp was swept away");
+
+        // And it is still there on the next launch, which is where the record
+        // in `brushes.ron` earns its place.
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(reloaded.tip(&name).is_some());
+        assert_eq!(reloaded.tip(&name).expect("mask").coverage(), [7; 16]);
+    }
+
+    /// The same for a paper, and the one difference between the two doors: a
+    /// tile stored *for a preset* belongs to it and goes when it does.
+    #[test]
+    fn a_paper_imported_into_the_library_is_kept_and_one_that_came_with_a_brush_is_not() {
+        let scratch = Scratch::new("kept-paper");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+
+        let kept = library
+            .add_paper("Linen", TipMask::new(2, 2, vec![200; 4]).expect("tile"))
+            .expect("add");
+        assert!(scratch.paper_file(&kept).exists());
+
+        // The importer's door: the tile arrives with a brush and is named by
+        // it, so deleting that brush takes it away.
+        let owned = library
+            .store_paper(
+                "user/pencil",
+                TipMask::new(2, 2, vec![90; 4]).expect("tile"),
+            )
+            .expect("store");
+        let id = library
+            .save(
+                BrushPreset {
+                    paper: Some(owned.clone()),
+                    ..BrushPreset::unsaved("Pencil", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
+        assert!(scratch.paper_file(&owned).exists());
+
+        library.delete(&id).expect("delete");
+        assert!(
+            !scratch.paper_file(&owned).exists(),
+            "a brush's own paper should go with it"
+        );
+        assert!(
+            scratch.paper_file(&kept).exists(),
+            "a paper in the library is not any brush's to take"
+        );
+    }
+
+    /// A Clip Studio tool group references one texture material from every
+    /// sub-tool that uses it, so fifteen brushes over one paper used to write
+    /// fifteen copies of the same half-megabyte picture and put fifteen
+    /// indistinguishable rows in the browser. A stamp does not share this rule:
+    /// it belongs to one brush, and two brushes drawn the same stamp are two
+    /// people's work that happen to match.
+    #[test]
+    fn one_paper_behind_several_brushes_is_stored_once() {
+        let scratch = Scratch::new("shared-paper");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let tile = || TipMask::new(4, 4, vec![120; 16]).expect("tile");
+
+        let first = library.store_paper("clipstudio/pencil", tile()).expect("a");
+        let second = library.store_paper("clipstudio/ink", tile()).expect("b");
+        assert_eq!(first, second, "the same tile should share one file");
+        assert_eq!(library.papers().len(), 1);
+
+        // A different tile is a different file, or the sharing would be a
+        // silent substitution.
+        let other = library
+            .store_paper(
+                "clipstudio/chalk",
+                TipMask::new(4, 4, vec![30; 16]).expect("tile"),
+            )
+            .expect("c");
+        assert_ne!(other, first);
+        assert_eq!(library.papers().len(), 2);
+    }
+
+    /// Removing a picture two brushes are painting with would leave both
+    /// painting round, silently and with no undo. The control that offers this
+    /// is disabled to match, but the model refuses too: it can see the whole
+    /// library and a control can only see what it drew.
+    #[test]
+    fn a_stamp_two_brushes_are_using_cannot_be_taken_out_of_the_library() {
+        let scratch = Scratch::new("in-use");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let name = library
+            .add_tip("Nib", TipMask::new(2, 2, vec![5; 4]).expect("mask"))
+            .expect("add");
+        for brush in ["Liner", "Sketcher"] {
+            library
+                .save(
+                    BrushPreset {
+                        tip: Some(name.clone()),
+                        ..BrushPreset::unsaved(brush, Brush::default())
+                    },
+                    None,
+                )
+                .expect("save");
+        }
+
+        match library.remove_tip(&name).expect("refuse") {
+            Removed::InUse(users) => assert_eq!(users, ["Liner", "Sketcher"]),
+            other => panic!("expected a refusal naming both brushes, got {other:?}"),
+        }
+        assert!(scratch.tip_file(&name).exists());
+        assert_eq!(
+            library.remove_tip("never-there").expect("miss"),
+            Removed::Unknown
+        );
+
+        // With nothing naming it, it goes — file and all.
+        for id in ["user/liner", "user/sketcher"] {
+            library.delete(id).expect("delete");
+        }
+        assert_eq!(library.remove_tip(&name).expect("remove"), Removed::Gone);
+        assert!(!scratch.tip_file(&name).exists());
+        assert!(library.tip(&name).is_none());
+    }
+
+    /// A picture that will not decode is not in the map and still owns its name
+    /// on disk. Allocating from the map alone would hand that name straight
+    /// back out and write over the file — and it is a picture nobody can see,
+    /// which is exactly why nobody would notice.
+    #[test]
+    fn a_name_a_broken_file_holds_is_not_free() {
+        let scratch = Scratch::new("held-name");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        fs::create_dir_all(scratch.path().join("tips")).expect("dir");
+        fs::write(scratch.tip_file("user-nib"), b"not a png").expect("write");
+
+        let name = library
+            .add_tip("user/nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+        assert_eq!(name, "user-nib-2");
+        assert_eq!(
+            fs::read(scratch.tip_file("user-nib")).expect("read"),
+            b"not a png"
+        );
+    }
+
+    /// The other half of that rule, and it was the wrong way round: the
+    /// allocator was taught that a broken file still owns its name and the
+    /// *sweep* was not, so the first write after a corrupted picture appeared
+    /// destroyed the user's record of having imported it — while leaving the
+    /// file on disk for ever, unreachable and undeletable from inside Umber.
+    #[test]
+    fn a_kept_picture_that_will_not_decode_keeps_its_place() {
+        let scratch = Scratch::new("broken-kept");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let name = library
+            .add_tip("Nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+
+        // Corrupt it behind Umber's back and reload, which is how it would
+        // really happen — a truncated copy, a sync conflict.
+        fs::write(scratch.tip_file(&name), b"not a png").expect("corrupt");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(library.tip(&name).is_none(), "it should not have decoded");
+        assert!(!library.warnings().is_empty(), "and it should have said so");
+
+        // Any write runs the sweep.
+        library
+            .save(BrushPreset::unsaved("Round", Brush::default()), None)
+            .expect("save");
+        assert!(
+            scratch.tip_file(&name).exists(),
+            "the file was left orphaned"
+        );
+
+        // Put a readable picture back under the same name and it is still the
+        // stamp the user imported, rather than one the library has forgotten.
+        let good = TipMask::new(2, 2, vec![9; 4]).expect("mask");
+        fs::write(scratch.tip_file(&name), good.to_png().expect("png")).expect("repair");
+        let library = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(library.tip(&name).is_some());
     }
 
     #[test]

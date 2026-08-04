@@ -3037,6 +3037,7 @@ version = "0.0.6"
 dependencies = [
  "bytemuck",
  "directories",
+ "flate2",
  "glam",
  "image",
  "png",

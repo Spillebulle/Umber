@@ -133,6 +133,14 @@ pub enum Icon {
     SelectSubtract,
     /// Two overlapping squares with only the overlap filled: the intersection.
     SelectIntersect,
+    // The stamps and papers a brush is made of. At the end for the reason every
+    // mark above it is: this enum is shared, and renumbering it would be a
+    // merge that compiles and draws the wrong icons.
+    /// A square with a stipple in it: the pictures a brush paints *through* —
+    /// bitmap stamps and paper tiles. Distinct from [`Icon::Grid`], which means
+    /// "the whole set of brushes"; this one is the set of pictures. Four dots
+    /// rather than a real texture, because a texture at 16 px is mud.
+    Stamps,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -492,6 +500,22 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                     at(x, y + 6.5),
                     at(x, y),
                 ]);
+            }
+        }
+
+        Icon::Stamps => {
+            // The sheet, and the grain on it. The dots are off a regular grid
+            // on purpose: four in a square would read as `Grid` with a border
+            // round it, which is the one mark this has to be told apart from.
+            path(vec![
+                at(4.5, 4.5),
+                at(19.5, 4.5),
+                at(19.5, 19.5),
+                at(4.5, 19.5),
+                at(4.5, 4.5),
+            ]);
+            for (x, y) in [(9.0, 8.5), (15.0, 10.5), (8.5, 15.0), (14.5, 16.0)] {
+                painter.circle_filled(at(x, y), 1.6 * scale, colour);
             }
         }
 

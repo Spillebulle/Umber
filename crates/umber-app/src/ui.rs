@@ -25,9 +25,10 @@ use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
+use std::sync::Arc;
 use umber_core::{
     BlendMode, Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan,
-    Selection, SelectionMode, SelectionOp, input::PressureSource,
+    Selection, SelectionMode, SelectionOp, TipMask, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -1846,7 +1847,7 @@ fn status_link(ui: &mut egui::Ui, p: &Palette, label: &str, tip: &str) -> bool {
 /// Holds every brush parameter that is not on the options strip, so the strip
 /// can stay short. Edits apply live — there is no OK or Cancel, because a paint
 /// app should let you see a change as you make it.
-fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+pub(crate) fn brush_editor(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     if !ed.ui.brush_editor_open {
         return;
     }
@@ -2594,15 +2595,10 @@ fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
         }
         ui.spacing_mut().item_spacing.y = 12.0;
 
-        let mut pattern = ed.brush.grain_pattern;
-        let options: Vec<(GrainPattern, &str)> =
-            GrainPattern::ALL.iter().map(|g| (*g, g.label())).collect();
-        if widgets::segmented(ui, p, &mut pattern, &options) {
-            ed.brush.grain_pattern = pattern;
-        }
+        paper_picker(ui, p, ed);
 
         ui.horizontal(|ui| {
-            paper_preview(ui, p, ed.brush.grain_pattern);
+            paper_preview(ui, p, ed);
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 widgets::slider_row(
@@ -2633,43 +2629,137 @@ fn brush_editor_texture(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     );
 }
 
+/// Which paper the brush bites through: Umber's three, then the user's own,
+/// then the way into the library.
+///
+/// **One dropdown where this used to be a segmented control**, and that is the
+/// change a texture library forces rather than a restyling. A segmented control
+/// is a row of every choice there is, which is right for a closed set of three
+/// and cannot be right for a list that grows — and offering the three as
+/// segments *and* the user's own as a second control would be two spellings of
+/// one question, which is the rule `widgets::dropdown` exists to keep. The
+/// shipped three still come first, still in `GrainPattern::ALL`'s order.
+fn paper_picker(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
+    // `Brush::grain_pattern` is what a `None` name means, so the label has to
+    // read the same two-step `Editor::paper_tile` does.
+    let label = match ed.paper_name.as_deref() {
+        Some(name) => name.to_owned(),
+        None => ed.brush.grain_pattern.label().to_owned(),
+    };
+    let mut chosen: Option<Option<String>> = None;
+    let mut browse = false;
+    widgets::dropdown(
+        ui,
+        p,
+        widgets::Dropdown::new(&label).width(widgets::DropdownWidth::Fill),
+        |ui| {
+            for pattern in GrainPattern::ALL {
+                let selected = ed.paper_name.is_none() && ed.brush.grain_pattern == pattern;
+                if ui.selectable_label(selected, pattern.label()).clicked() {
+                    ed.brush.grain_pattern = pattern;
+                    chosen = Some(None);
+                }
+            }
+            if !ed.papers.is_empty() {
+                ui.separator();
+            }
+            for name in ed.papers.keys() {
+                let selected = ed.paper_name.as_deref() == Some(name.as_str());
+                if ui.selectable_label(selected, name).clicked() {
+                    chosen = Some(Some(name.clone()));
+                }
+            }
+            // A name the brush carries that this list has not already drawn.
+            // Two of them, and they must not be told apart by anything but the
+            // **resolver**: `Editor::paper_tile` reads the user's library and
+            // then the shipped table, so a name is missing only when *it*
+            // answers nothing. Testing `ed.papers` alone said "not in your
+            // library" about a shipped tile the brush was visibly painting
+            // through — three modules with three definitions of "resolves",
+            // two of them on screen together.
+            if let Some(name) = ed
+                .paper_name
+                .as_deref()
+                .filter(|name| !ed.papers.contains_key(*name))
+            {
+                ui.separator();
+                let _ = match ed.paper_tile() {
+                    // One Umber ships, named rather than chosen through the
+                    // enum — an imported preset can do that.
+                    Some(_) => ui.selectable_label(true, format!("{name} — shipped with Umber")),
+                    // Nothing behind it at all: a library copied without its
+                    // `papers/` directory. Said out loud rather than left out,
+                    // or the picker would name one of Umber's three for a brush
+                    // that is painting flat. See `BrushPreset::paper`.
+                    None => ui.selectable_label(true, format!("{name} — not in your library")),
+                };
+            }
+            ui.separator();
+            if ui.selectable_label(false, "Browse papers…").clicked() {
+                browse = true;
+            }
+        },
+    );
+    if let Some(name) = chosen {
+        ed.set_paper(name);
+    }
+    if browse {
+        crate::stamplib::open(ui.ctx(), crate::stamplib::Kind::Papers);
+    }
+}
+
 /// Widest a tile is downsampled to for the 56-point thumbnail. A paper is at
 /// most a few hundred texels and this is more than the square can show.
 const PAPER_PREVIEW_TEXELS: u32 = 96;
 
-/// A thumbnail of one paper tile.
+/// A thumbnail of the paper in hand, drawn **tiled**.
 ///
-/// Cached in egui's temporary store and keyed by the pattern, exactly as
+/// Two copies across and two down, which is the one thing a single square
+/// cannot show: the grain is anchored to the document and wraps across it, so a
+/// tile whose edges do not meet draws a grid over the canvas — invisible in one
+/// copy and unmissable the moment it meets itself. Umber's own three join by
+/// construction; a picture somebody imported may not.
+///
+/// Cached in egui's temporary store and validated by `Arc` identity, exactly as
 /// `brushlib`'s tip preview is: the modal redraws every frame and this would
-/// otherwise upload a texture on each of them.
-fn paper_preview(ui: &mut egui::Ui, p: &Palette, pattern: GrainPattern) {
-    let Some(tile) = umber_core::tip::pattern(pattern.key()) else {
+/// otherwise upload a texture on each of them. Its own slot and its own id —
+/// the browser's rows draw the same tiles through a cache of their own, because
+/// two consumers of a one-slot cache evict each other's live texture.
+fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
+    let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+    ui.painter().rect_filled(rect, metrics::RADIUS, p.chrome);
+
+    let Some(tile) = ed.paper_tile() else {
+        // A name with nothing behind it. Left as the empty well rather than
+        // filled with one of the shipped tiles, because painting flat is
+        // exactly what the brush is about to do.
         return;
     };
     let id = egui::Id::new("brush-paper-preview");
-    let cached: Option<(GrainPattern, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
+    let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
     let texture = match cached {
-        Some((held, texture)) if held == pattern => texture,
+        Some((held, texture)) if Arc::ptr_eq(&held, &tile) => texture,
         _ => {
             let texture = ui.ctx().load_texture(
                 "brush-paper",
-                widgets::tip_image(tile, p.text_strong, PAPER_PREVIEW_TEXELS),
+                widgets::tip_image(&tile, p.text_strong, PAPER_PREVIEW_TEXELS),
                 egui::TextureOptions::LINEAR,
             );
             ui.ctx()
-                .data_mut(|d| d.insert_temp(id, (pattern, texture.clone())));
+                .data_mut(|d| d.insert_temp(id, (Arc::clone(&tile), texture.clone())));
             texture
         }
     };
 
-    let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, metrics::RADIUS, p.chrome);
-    painter.image(
+    // Four separate draws, not one with a uv range past 1: egui's textures are
+    // clamped rather than repeating, so the wide uv would magnify the top-left
+    // quarter and smear its edge row over the rest — which is the one thing a
+    // square that exists to show a join must not do.
+    crate::stamplib::tiled(
+        ui,
         texture.id(),
         rect.shrink(2.0),
-        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
+        crate::stamplib::Kind::Papers.repeats(),
     );
 }
 
