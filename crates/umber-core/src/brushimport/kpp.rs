@@ -105,14 +105,41 @@
 //!   `opaque_linearize` in [`super::mypaint`].
 //! - **Auto-spacing.** `useAutoSpacing` asks Krita to derive spacing from the
 //!   tip; the recorded `spacing` is used instead of guessing at the formula.
-//! - **Non-pressure sensors.** A dynamic driven by `speed`, `fuzzy`,
-//!   `drawingangle`, `tilt` or `time` has no input here, with two exceptions
-//!   that are read for what they mean rather than as curves: a `drawingangle`
-//!   rotation is "this dab follows the stroke", and a `fuzzy` one is
-//!   [`Brush::dab_angle_jitter`]. A **rotation** driven by anything else —
-//!   `ascension` (tilt direction) or `rotation` (barrel rotation), neither of
-//!   which a desktop pointer reports — is switched on and does nothing, so it
-//!   is named.
+//! - **Sensors Umber has no input for**, which after the section below are
+//!   `speed`, `fuzzystroke`, `tilt`, `time` and their relatives. A **rotation**
+//!   driven by `ascension` (tilt direction) or `rotation` (barrel rotation) —
+//!   neither of which a desktop pointer reports — is switched on and does
+//!   nothing, so it is named too.
+//!
+//! # Sensors, and which of them Umber has an input for
+//!
+//! Krita states a dynamic as a *set* of sensors and multiplies their outputs
+//! together. Three shapes of that reach here:
+//!
+//! - **Pressure** is stated on the brush itself, as one of Umber's four
+//!   pressure curves. [`Preset::dynamic`] reads it.
+//! - **`fuzzy`** is a fresh uniform draw per dab, which is exactly
+//!   [`DabInput::Random`], so it becomes a [`Modulation`] on the same setting.
+//!   Krita multiplies, so the sensor's *peak* lands on the setting's own value
+//!   and the entry carries the fraction of that peak each draw asks for — the
+//!   arrangement [`super::mypaint`]'s opacity path already uses, and the reason
+//!   `Brush::size` and `Brush::opacity` stay "the value at the peak".
+//! - **Everything else** is named. Two are worth the sentence: `speed`, whose
+//!   axis is a fraction of a fixed maximum drawing speed where Umber's is
+//!   MyPaint's log-speed scale, so a curve written for one cannot be placed on
+//!   the other from anything the file says; and `fuzzystroke`, which is one
+//!   draw for a whole stroke where Umber's random is one per dab.
+//!
+//! Two sensors are read for what they *mean* rather than as curves, and only
+//! on rotation: a `drawingangle` one is "this dab follows the stroke" and a
+//! `fuzzy` one is [`Brush::dab_angle_jitter`].
+//!
+//! **`<Name>UseSameCurve` decides which curve is in force**, and Krita's editor
+//! leaves the other one in the file either way. Six presets in the fetched
+//! packs carry both a shared curve and per-sensor ones; reading the shared one
+//! regardless gave Deevad's "Eraser Kneaded Soft" an opacity ramp Krita never
+//! applies to it. A sensor that states no curve of its own is the *identity*,
+//! which is what Krita's own curve object is constructed as.
 //!
 //! # Approximated rather than dropped
 //!
@@ -122,6 +149,12 @@
 //!   for it. A stroke differs from Krita's only where it changes direction
 //!   abruptly, and only for a dab or two — the same register as the HSL-in-HSV
 //!   approximation in [`super::mypaint`], and stated for the same reason.
+//! - **A random sensor on *scatter*.** Krita multiplies where Umber adds, so
+//!   the entry carries `scatter × (factor − 1)` — exact for a brush whose
+//!   scatter has no pressure sensor beside it, which is seven of the nine in
+//!   the fetched packs, and at light pressure an under-estimate rather than a
+//!   spray nobody asked for. Size and opacity need no such trade: a log offset
+//!   and a factor are both products already.
 
 use std::collections::BTreeMap;
 
@@ -129,6 +162,7 @@ use quick_xml::events::Event;
 
 use crate::brush::{Brush, BrushMode};
 use crate::curve::ResponseCurve;
+use crate::dynamics::{DabInput, DabTarget, Modulation, Modulations};
 use crate::preset::PresetError;
 use crate::tip::TipMask;
 
@@ -269,6 +303,15 @@ pub fn from_kpp_in(
     let opacity = preset.dynamic("Opacity");
     let scatter = preset.dynamic("Scatter");
 
+    // Krita drives a setting from several sensors at once and multiplies their
+    // outputs together. Pressure is the one Umber states on the brush itself;
+    // the rest are modulation-table entries, and each one's *peak* multiplies
+    // the setting's own value exactly as the pressure curve's does.
+    let mut mods: Vec<Modulation> = Vec::new();
+    let size_extras = preset.extras("Size");
+    let opacity_extras = preset.extras("Opacity");
+    let scatter_extras = preset.extras("Scatter");
+
     let default = Brush::default();
     let (min_size_ratio, size_curve, pressure_size) = size.split(default.min_size_ratio.max(0.01));
 
@@ -377,11 +420,50 @@ pub fn from_kpp_in(
     let (min_scatter_ratio, scatter_curve, pressure_scatter) = scatter.split(0.0);
     let (_, opacity_curve, pressure_opacity) = opacity.split(0.0);
 
+    // --- the other inputs -----------------------------------------------------
+    //
+    // Each entry's units are its target's, and the three differ — see
+    // `Modulated`. Size is a **log** offset, because `radius_logarithmic` is a
+    // log and a factor there composes by multiplication in pixels, which is
+    // precisely what Krita's own sensor product is. Opacity is a factor
+    // already. Scatter is the odd one: Umber adds it in dab radii where Krita
+    // multiplies, so the entry carries `scatter × (factor − 1)` — exact for a
+    // brush whose scatter has no pressure sensor beside it, which is seven of
+    // the nine in the fetched packs, and an under-estimate at light pressure
+    // for the other two rather than a spray they never asked for.
+    let mut size_scale = 1.0f32;
+    for e in &size_extras {
+        size_scale *= e.peak;
+        // A factor of zero is a dab of no size at all; `radius_at` floors the
+        // radius at half a pixel anyway, so the log is floored to match rather
+        // than being allowed to reach negative infinity.
+        let values = e.factors.map(|f| f.max(0.01).ln());
+        mods.extend(entry(DabTarget::Size, e.input, values));
+    }
+    let mut opacity_scale = 1.0f32;
+    for e in &opacity_extras {
+        opacity_scale *= e.peak;
+        mods.extend(entry(DabTarget::Opacity, e.input, e.factors));
+    }
+    let scatter_scale: f32 = scatter_extras.iter().map(|e| e.peak).product();
+    let scatter_value = if preset.flag("PressureScatter") {
+        scatter.peak * scatter_scale * preset.number("ScatterValue").unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    for e in &scatter_extras {
+        let values = e.factors.map(|f| scatter_value * (f - 1.0));
+        mods.extend(entry(DabTarget::Scatter, e.input, values));
+    }
+
     // A dynamic that is switched on but driven by something Umber has no input
     // for arrives as a constant. Worth naming: those brushes are the ones that
     // will feel dead rather than wrong.
-    if preset.has_foreign_sensor(["Size", "Opacity", "Scatter"]) {
-        dropped.push("dynamics driven by speed, tilt or stroke position");
+    if ["Size", "Opacity", "Scatter"]
+        .iter()
+        .any(|name| preset.drops_a_sensor(name))
+    {
+        dropped.push("a dynamic driven by an input Umber cannot produce");
     }
 
     let spacing = tip_spec.spacing.unwrap_or(default.spacing);
@@ -397,7 +479,7 @@ pub fn from_kpp_in(
         .is_some_and(|mask| crate::tip::stroke_coverage(mask, spacing).needs_build_up());
 
     let brush = Brush {
-        size: (base_size * size.peak).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
+        size: (base_size * size.peak * size_scale).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
         min_size_ratio,
         size_curve,
         pressure_size,
@@ -406,7 +488,7 @@ pub fn from_kpp_in(
         // nothing left to shape and the file states none for a predefined
         // brush either.
         hardness: tip_spec.hardness.unwrap_or(default.hardness),
-        opacity: (opacity_peak * flow * opacity.peak).clamp(0.0, 1.0),
+        opacity: (opacity_peak * flow * opacity.peak * opacity_scale).clamp(0.0, 1.0),
         opacity_curve,
         pressure_opacity,
         spacing,
@@ -424,16 +506,20 @@ pub fn from_kpp_in(
         // value. Krita leaves `ScatterValue` at its default of 1 in a preset
         // that never scatters, so reading it unconditionally turned twenty of
         // the twenty-one shipped Krita brushes into sprays.
-        scatter: if preset.flag("PressureScatter") {
-            scatter.peak * preset.number("ScatterValue").unwrap_or(0.0)
-        } else {
-            0.0
-        },
+        scatter: scatter_value,
         min_scatter_ratio,
         scatter_curve,
         pressure_scatter,
         smudge,
         smudge_radius,
+        // Heaviest first, so a preset with more live sensors than the table
+        // holds keeps the ones that change the mark most. Nothing in the
+        // fetched packs comes near the cap — the busiest asks for two — but a
+        // hand-tuned preset from elsewhere might.
+        modulations: {
+            mods.sort_by(|a, b| b.weight().total_cmp(&a.weight()));
+            mods.into_iter().collect::<Modulations>()
+        },
         ..default
     };
 
@@ -644,16 +730,14 @@ impl Preset {
         self.params.get(key).is_some_and(|v| v == "true")
     }
 
-    /// Which input drives a dynamic, out of `<Name>Sensor`.
+    /// A flag whose *absence* does not mean `false`.
     ///
-    /// The sensor is itself a scrap of XML — `<params id="pressure"><curve>…`
-    /// — so this reads the `id` off it rather than parsing it properly, which
-    /// is enough: the id is the only part Umber can act on.
-    fn sensor_id(&self, name: &str) -> Option<String> {
-        let sensor = self.params.get(&format!("{name}Sensor"))?;
-        let at = sensor.find("id=\"")? + 4;
-        let end = sensor[at..].find('"')?;
-        Some(sensor[at..at + end].to_string())
+    /// Krita reads `<Name>UseSameCurve` with a default of `true`, so a preset
+    /// that states a `commonCurve` and nothing beside it means that curve to
+    /// apply. Every preset in the fetched packs writes the flag, so this is
+    /// about what a hand-written or older file means rather than about them.
+    fn flag_or(&self, key: &str, default: bool) -> bool {
+        self.params.get(key).map_or(default, |v| v == "true")
     }
 
     /// **Every** id the sensor names, in the order it names them.
@@ -687,43 +771,200 @@ impl Preset {
         sensor[at..at + end].parse().ok()
     }
 
-    /// One of Krita's curve-driven settings, read the way Umber states a
-    /// dynamic.
+    /// The curve Krita applies to one *named* sensor of one option.
     ///
-    /// `Pressure<Name>` is the *enabled* flag — see the module docs — and the
-    /// curve is `<Name>commonCurve` when `<Name>UseSameCurve` says so, which it
-    /// almost always does.
-    fn dynamic(&self, name: &str) -> Dynamic {
-        let enabled = self.flag(&format!("Pressure{name}"));
-        let by_pressure = self.sensor_id(name).as_deref() == Some("pressure");
-        let live = enabled && by_pressure && self.flag(&format!("{name}UseCurve"));
+    /// `<Name>UseSameCurve` decides between the two: with it set the file
+    /// states one `<Name>commonCurve` for every sensor, and without it each
+    /// sensor carries its own `<curve>` and the shared one — which Krita's
+    /// editor leaves behind whether or not it is in force — is not read. Six
+    /// presets in the fetched packs carry both, so consulting the shared curve
+    /// unconditionally is how Deevad's "Eraser Kneaded Soft" came out with an
+    /// opacity ramp Krita never applies to it.
+    ///
+    /// A sensor with no `<curve>` of its own is linear, which is what Krita's
+    /// own curve object is constructed as and what its editor draws for it.
+    ///
+    /// The search is bounded at the *next* `id="`, which is the whole reason
+    /// this cannot simply take the first `<curve>` in the blob: a compound
+    /// sensor lists a `<ChildSensor>` per input, and the pressure child is
+    /// routinely the one written without a curve — so an unbounded search
+    /// hands pressure whatever the next child happens to state.
+    fn sensor_curve(&self, name: &str, sensor: &str) -> Option<Vec<(f32, f32)>> {
+        if self.flag_or(&format!("{name}UseSameCurve"), true)
+            && let Some(points) = self
+                .params
+                .get(&format!("{name}commonCurve"))
+                .and_then(|text| curve_points(text))
+        {
+            return Some(points);
+        }
+        let blob = self.params.get(&format!("{name}Sensor"))?;
+        let key = format!("id=\"{sensor}\"");
+        let rest = &blob[blob.find(&key)? + key.len()..];
+        let rest = rest.find("id=\"").map_or(rest, |next| &rest[..next]);
+        let at = rest.find("<curve>")? + 7;
+        let end = rest[at..].find("</curve>")?;
+        curve_points(&rest[at..at + end])
+    }
+
+    /// One of Krita's curve-driven settings as one *input* sees it.
+    ///
+    /// `Pressure<Name>` is the *enabled* flag — see the module docs — and
+    /// `<Name>UseCurve` says whether the curve is in force at all. A sensor the
+    /// option does not name contributes nothing, which is what makes
+    /// [`Dynamic::flat`] the identity here: Krita multiplies its sensors
+    /// together, so one is a factor of 1.
+    fn sensor_dynamic(&self, name: &str, sensor: &str) -> Dynamic {
+        let live = self.flag(&format!("Pressure{name}"))
+            && self.flag(&format!("{name}UseCurve"))
+            && self.sensor_ids(name).contains(&sensor);
         if !live {
             return Dynamic::flat();
         }
-        let points = self
-            .params
-            .get(&format!("{name}commonCurve"))
-            .and_then(|text| curve_points(text))
-            .or_else(|| {
-                let sensor = self.params.get(&format!("{name}Sensor"))?;
-                let at = sensor.find("<curve>")? + 7;
-                let end = sensor[at..].find("</curve>")?;
-                curve_points(&sensor[at..at + end])
-            });
-        match points {
-            Some(points) => Dynamic::from_samples(points),
-            None => Dynamic::flat(),
-        }
+        // A sensor the option names but that states no curve is the *identity*,
+        // not a dynamic that does nothing: Krita's curve object is constructed
+        // as the diagonal and only `fromXML` finding a `<curve>` child replaces
+        // it. Reading the absence as flat is how Deevad's "Eraser Kneaded Soft"
+        // — whose pressure sensor is a bare `<params id="pressure"/>` — would
+        // have arrived with no pressure ramp at all once the shared curve
+        // beside it stopped being read.
+        Dynamic::from_samples(
+            self.sensor_curve(name, sensor)
+                .unwrap_or_else(|| vec![(0.0, 0.0), (1.0, 1.0)]),
+        )
     }
 
-    /// Whether any of these dynamics is switched on but driven by an input
-    /// Umber does not have.
-    fn has_foreign_sensor<const N: usize>(&self, names: [&str; N]) -> bool {
-        names.iter().any(|name| {
-            self.flag(&format!("Pressure{name}"))
-                && self.sensor_id(name).is_some_and(|id| id != "pressure")
-        })
+    /// The pressure half of a dynamic, which is the half Umber states as a
+    /// curve on the brush itself.
+    ///
+    /// Read through [`Preset::sensor_ids`] rather than off the first id in the
+    /// blob, and that is not a refinement: Krita's compound
+    /// `<params id="sensorslist">` reports the *wrapper's* own name, which is
+    /// not `pressure`, so every preset that drives a setting by pressure **and**
+    /// something else lost its pressure curve entirely. Eleven presets in the
+    /// fetched packs do that, and the same fault refused all eleven, which is
+    /// the only reason none of them shipped wrong.
+    fn dynamic(&self, name: &str) -> Dynamic {
+        self.sensor_dynamic(name, "pressure")
     }
+
+    /// The non-pressure sensors of a dynamic, as Umber's modulation table
+    /// states them.
+    ///
+    /// Krita **multiplies** its sensors together, which is why the peak belongs
+    /// in the setting's own value and the entry carries only the fraction of
+    /// that peak each input asks for — exactly what [`super::mypaint`]'s
+    /// opacity path does, and for the same reason: `Brush::size` and
+    /// `Brush::opacity` are the value at the peak, not the value now.
+    fn extras(&self, name: &str) -> Vec<Extra> {
+        self.sensor_ids(name)
+            .into_iter()
+            .filter_map(|id| {
+                let input = dab_input(id).filter(|i| *i != DabInput::Pressure)?;
+                let d = self.sensor_dynamic(name, id);
+                if !d.live || d.peak <= 0.0 {
+                    return None;
+                }
+                Some(Extra {
+                    input,
+                    peak: d.peak,
+                    factors: d.samples.map(|s| (s / d.peak).clamp(0.0, 1.0)),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether this dynamic names a sensor whose contribution went nowhere.
+    ///
+    /// Derived from the same two facts [`Preset::extras`] reads rather than
+    /// from a second scan, so a sensor cannot be carried and named at the same
+    /// time — nor silently dropped. Two things reach it: an input Umber cannot
+    /// produce, and an option whose curve is switched off, where there is
+    /// nothing to sample and the sensor really does do nothing here.
+    ///
+    /// **Pressure is exempt, and deliberately.** `<Name>UseCurve` being off is
+    /// read here as "no dynamic", where Krita reads it as "the sensor, applied
+    /// straight" — a linear ramp. That is a separate question from this one,
+    /// it is how this reader has always behaved, and it reaches 34 of the
+    /// fetched presets' Opacity and Scatter options; naming it as a loss would
+    /// refuse nine brushes that ship today over a reading nobody has checked.
+    fn drops_a_sensor(&self, name: &str) -> bool {
+        if !self.flag(&format!("Pressure{name}")) {
+            return false;
+        }
+        let curved = self.flag(&format!("{name}UseCurve"));
+        self.sensor_ids(name)
+            .into_iter()
+            // The wrapper of a compound sensor is not an input of its own, and
+            // pressure is the half stated on the brush rather than here.
+            .filter(|id| !matches!(*id, "sensorslist" | "pressure"))
+            .any(|id| dab_input(id).is_none() || !curved)
+    }
+}
+
+/// One non-pressure sensor of one Krita dynamic.
+struct Extra {
+    input: DabInput,
+    /// The sensor's greatest output, which multiplies the setting's own value.
+    peak: f32,
+    /// The five outputs, normalised so the largest is exactly 1.
+    factors: [f32; ResponseCurve::N],
+}
+
+/// Which of Umber's dab inputs a Krita sensor id is, where there is one.
+///
+/// Three of Krita's sensors are read elsewhere for what they *mean* rather
+/// than as curves — `drawingangle` is "this dab follows the stroke" and a
+/// `fuzzy` rotation is [`Brush::dab_angle_jitter`] — and the rest have no input
+/// here at all. Two are worth saying why:
+///
+/// - **`speed` is deliberately absent.** Krita's speed sensor is a fraction of
+///   a fixed maximum drawing speed and Umber's [`DabInput::Speed`] is
+///   MyPaint's log-speed axis, on which 45 px/s reads 0.5. Neither the preset
+///   nor Umber states where the other's axis begins, so a curve written for
+///   one cannot be placed on the other from anything in the file — and a
+///   modulation on the wrong axis is a brush that thins at a speed nobody
+///   draws at, which is worse than one that says it dropped something. One
+///   preset in the fetched packs asks for it.
+/// - **`fuzzystroke` is one draw for the whole stroke**, where
+///   [`DabInput::Random`] is one per dab. Reading it as the latter turns a
+///   single faint splash into a stroke of confetti, so it is named too.
+fn dab_input(id: &str) -> Option<DabInput> {
+    match id {
+        "pressure" => Some(DabInput::Pressure),
+        "fuzzy" => Some(DabInput::Random),
+        _ => None,
+    }
+}
+
+/// Wrap five sampled outputs as a modulation, or reject it as too faint to be
+/// worth a slot — `mypaint::build`'s rule, restated because that one is private
+/// to its own reader and neither wants the other's file format.
+fn entry(
+    target: DabTarget,
+    input: DabInput,
+    values: [f32; ResponseCurve::N],
+) -> Option<Modulation> {
+    let low = values.iter().copied().fold(f32::MAX, f32::min);
+    let high = values.iter().copied().fold(f32::MIN, f32::max);
+    if !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    let span = high - low;
+    let mut points = [0.0f32; ResponseCurve::N];
+    if span > 0.0 {
+        for (point, value) in points.iter_mut().zip(values) {
+            *point = ((value - low) / span).clamp(0.0, 1.0);
+        }
+    }
+    let m = Modulation {
+        target,
+        input,
+        low,
+        high,
+        curve: ResponseCurve { points },
+    };
+    (m.weight() >= 1.0).then_some(m)
 }
 
 /// Krita's curve, sampled at the five pressures a [`ResponseCurve`] holds.
@@ -1294,15 +1535,236 @@ mod tests {
         assert!(by_pressure.brush.pressure_size);
         assert!(by_pressure.brush.min_size_ratio < 0.01);
 
+        // `speed` stays unread, and is named. Krita's speed sensor is a
+        // fraction of a fixed maximum drawing speed where Umber's is MyPaint's
+        // log-speed axis; neither the preset nor Umber states where the other's
+        // begins, so the curve cannot be placed and a guess would be a brush
+        // that thins at a speed nobody draws at.
         let by_speed = with("speed");
         assert!(!by_speed.brush.pressure_size);
+        assert!(by_speed.brush.modulations.is_empty());
         assert!(
             by_speed
                 .dropped
-                .contains(&"dynamics driven by speed, tilt or stroke position"),
+                .contains(&"a dynamic driven by an input Umber cannot produce"),
             "{:?}",
             by_speed.dropped
         );
+
+        // `fuzzy` is a fresh uniform draw per dab, which is exactly
+        // `DabInput::Random`, so it is carried rather than named.
+        let by_fuzzy = with("fuzzy");
+        assert!(!by_fuzzy.brush.pressure_size);
+        assert!(by_fuzzy.dropped.is_empty(), "{:?}", by_fuzzy.dropped);
+        let m = by_fuzzy.brush.modulations.as_slice();
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(
+            (m[0].target, m[0].input),
+            (DabTarget::Size, DabInput::Random)
+        );
+    }
+
+    /// The `sensorslist` fault, which cost a preset **both** halves of its
+    /// dynamic.
+    ///
+    /// Krita writes a compound sensor as `<params id="sensorslist">` with a
+    /// `<ChildSensor>` per input, so reading the first id off the blob answers
+    /// "sensorslist" — which is not `pressure`, so the pressure curve was
+    /// dropped, and is not an input Umber has, so the whole preset was refused.
+    /// Eleven presets in the fetched packs drive Size, Opacity or Scatter that
+    /// way.
+    #[test]
+    fn a_compound_sensor_keeps_its_pressure_curve_and_its_random_one() {
+        // Deevad's "c3) Thin Brush Textured", trimmed: the pressure child
+        // carries no curve of its own and the fuzzy one does, with
+        // `UseSameCurve` off — so Krita gives pressure the default linear ramp
+        // and fuzzy its own.
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}{}{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                 <MaskGenerator diameter=\"20\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+            ),
+            param("OpacityValue", "1"),
+            param(
+                "OpacitySensor",
+                "<params id=\"sensorslist\"> <ChildSensor id=\"pressure\"/> \
+                 <ChildSensor id=\"fuzzy\"> <curve>0,0.5;1,1;</curve> </ChildSensor> </params>"
+            ),
+            param("OpacitycommonCurve", "0,0.5;1,1;"),
+            internal("PressureOpacity", true),
+            internal("OpacityUseCurve", true),
+            internal("OpacityUseSameCurve", false),
+        );
+        let preset = from_kpp(&kpp(&xml)).expect("decode");
+        assert!(preset.dropped.is_empty(), "{:?}", preset.dropped);
+
+        // The pressure half, which used to vanish entirely.
+        assert!(preset.brush.pressure_opacity);
+        assert!(preset.brush.coverage_at(0.0) < 0.01);
+        assert!((preset.brush.coverage_at(1.0) - 1.0).abs() < 0.01);
+
+        // The random half, as a factor on coverage: Krita multiplies its
+        // sensors, and `Modulated::opacity` is the one target that already
+        // composes that way.
+        let m = preset.brush.modulations.as_slice();
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(
+            (m[0].target, m[0].input),
+            (DabTarget::Opacity, DabInput::Random)
+        );
+        assert!((m[0].at(0.0) - 0.5).abs() < 0.01, "{:?}", m[0]);
+        assert!((m[0].at(1.0) - 1.0).abs() < 0.01, "{:?}", m[0]);
+        // The sensor's peak is 1, so the brush's own opacity is untouched.
+        assert!((preset.brush.opacity - 1.0).abs() < 1e-5);
+    }
+
+    /// The units differ per target and getting one wrong is a brush at the
+    /// wrong size — which has happened here before.
+    ///
+    /// Krita multiplies its sensors together, so the sensor's peak belongs in
+    /// the setting's own value and the entry carries the fraction of it each
+    /// draw asks for. Size is a **log** offset, because a factor there
+    /// multiplies the radius; scatter is stated in dab radii and Umber adds it.
+    #[test]
+    fn a_random_sensor_carries_its_targets_own_units() {
+        let with = |option: &str, extra: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{extra}{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+                     </Brush>"
+                ),
+                param(
+                    &format!("{option}Sensor"),
+                    "<params id=\"fuzzy\"> <curve>0,0.5;1,1;</curve> </params>"
+                ),
+                internal(&format!("Pressure{option}"), true),
+                internal(&format!("{option}UseCurve"), true),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush
+        };
+
+        // Size: half the diameter at the bottom of the draw, all of it at the
+        // top, and the base size is the peak — which is 1 here, so 40 stands.
+        let size = with("Size", "");
+        assert_eq!(size.size, 40.0);
+        let m = size.modulations.as_slice()[0];
+        assert!((m.at(1.0).exp() - 1.0).abs() < 0.01, "{m:?}");
+        assert!((m.at(0.0).exp() - 0.5).abs() < 0.01, "{m:?}");
+
+        // Scatter: Umber adds where Krita multiplies, so the entry runs from
+        // minus half the scatter to nothing.
+        let scatter = with("Scatter", &param("ScatterValue", "2"));
+        assert!((scatter.scatter - 2.0).abs() < 1e-5);
+        let m = scatter.modulations.as_slice()[0];
+        assert_eq!(m.target, DabTarget::Scatter);
+        assert!((m.at(1.0)).abs() < 0.01, "{m:?}");
+        assert!((m.at(0.0) + 1.0).abs() < 0.01, "{m:?}");
+    }
+
+    /// A sensor's peak multiplies the setting's own value, exactly as the
+    /// pressure curve's does — so a draw that never reaches full strength
+    /// makes the brush smaller rather than leaving it at its stated size and
+    /// putting the shortfall in the table.
+    #[test]
+    fn a_sensors_peak_lands_on_the_setting_it_scales() {
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                 <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+            ),
+            param(
+                "SizeSensor",
+                "<params id=\"fuzzy\"> <curve>0,0.25;1,0.5;</curve> </params>"
+            ),
+            internal("PressureSize", true),
+            internal("SizeUseCurve", true),
+        );
+        let brush = from_kpp(&kpp(&xml)).expect("decode").brush;
+        assert!((brush.size - 20.0).abs() < 0.01, "{}", brush.size);
+        let m = brush.modulations.as_slice()[0];
+        assert!((m.at(1.0).exp() - 1.0).abs() < 0.01, "{m:?}");
+        assert!((m.at(0.0).exp() - 0.5).abs() < 0.01, "{m:?}");
+    }
+
+    /// `<Name>UseSameCurve` decides which of the two curves in the file is in
+    /// force, and Krita's editor leaves the other one behind. Six presets in
+    /// the fetched packs carry both — Deevad's "Eraser Kneaded Soft" among
+    /// them, whose shared curve is not the one Krita applies to it.
+    #[test]
+    fn the_shared_curve_is_read_only_where_krita_would_read_it() {
+        let with = |same: &str| {
+            let xml = format!(
+                "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}{}{}{}</Preset>",
+                param(
+                    "brush_definition",
+                    "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                     <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/>\
+                     </Brush>"
+                ),
+                param(
+                    "SizeSensor",
+                    "<params id=\"pressure\"> <curve>0,0;1,0.25;</curve> </params>"
+                ),
+                param("SizecommonCurve", "0,0;1,1;"),
+                internal("PressureSize", true),
+                internal("SizeUseCurve", true),
+                internal("SizeUseSameCurve", same),
+            );
+            from_kpp(&kpp(&xml)).expect("decode").brush.size
+        };
+        assert!((with("true") - 40.0).abs() < 0.01);
+        assert!((with("false") - 10.0).abs() < 0.01);
+        // Absent means shared, which is Krita's own default for the flag.
+        assert!((with("true") - 40.0).abs() < 0.01);
+    }
+
+    /// A dynamic whose curve is switched off has nothing to sample, so an
+    /// input that reaches it through one really does do nothing here — and
+    /// must be named rather than quietly carried at full strength.
+    #[test]
+    fn a_sensor_whose_curve_is_switched_off_is_named_rather_than_invented() {
+        let xml = format!(
+            "<Preset name=\"T\" paintopid=\"paintbrush\">{}{}{}{}{}</Preset>",
+            param(
+                "brush_definition",
+                "<Brush type=\"auto_brush\" spacing=\"0.1\" angle=\"0\">\
+                 <MaskGenerator diameter=\"40\" type=\"circle\" ratio=\"1\" hfade=\"1\"/></Brush>"
+            ),
+            param("ScatterValue", "2"),
+            param(
+                "ScatterSensor",
+                "<params id=\"sensorslist\"> <ChildSensor id=\"pressure\"/> \
+                 <ChildSensor id=\"fuzzy\"/> </params>"
+            ),
+            internal("PressureScatter", true),
+            internal("ScatterUseCurve", false),
+        );
+        let preset = from_kpp(&kpp(&xml)).expect("decode");
+        assert!(preset.brush.modulations.is_empty());
+        assert!(
+            preset
+                .dropped
+                .contains(&"a dynamic driven by an input Umber cannot produce"),
+            "{:?}",
+            preset.dropped
+        );
+    }
+
+    /// The fast path. A preset that names nothing but pressure must arrive with
+    /// an empty table, or every Krita brush in the library pays the stroke
+    /// builder's modulation machinery to be told it changes nothing.
+    #[test]
+    fn a_preset_driven_by_pressure_alone_gains_no_modulations() {
+        let preset = from_kpp(&kpp(&oval())).expect("decode");
+        assert!(preset.brush.modulations.is_empty());
+        assert!(!preset.brush.is_modulated());
     }
 
     /// A pressure curve has to come back through Umber's own `radius_at`.
