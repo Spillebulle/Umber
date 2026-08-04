@@ -1599,13 +1599,66 @@ mod tests {
         assert_eq!(doc.read(fresh, mark), doc.read(fresh, mark));
     }
 
+    /// The budget's arithmetic stays balanced across a structural entry
+    /// crossing between the stacks, in both directions and repeatedly.
+    ///
+    /// `used_bytes` is a running total: `byte_len` is added when an entry is
+    /// pushed and subtracted when it is popped, so a body whose cost is read
+    /// differently on the two sides drifts the total — and it is a `usize`, so
+    /// the drift eventually *underflows*, which is a panic in a debug build and
+    /// silent wrap in a release one. A structural entry is the case that could
+    /// go wrong, because undoing it swaps the body for a different shape
+    /// holding a different number of parked slices: a delete's entry is
+    /// expensive while it is applied and nearly free once it is undone.
+    #[test]
+    fn stepping_a_structural_entry_between_the_stacks_keeps_the_budget_balanced() {
+        const SLICE: u64 = 1024;
+        let mut doc = Doc::new(4, 4);
+        let mut h = History::default();
+        doc.stack.add();
+
+        let before = doc.stack.shape(SLICE);
+        let gone = doc.stack.remove_many(&[1]).expect("the bottom layer stays");
+        h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
+        let applied = h.used_bytes();
+        assert!(
+            applied >= SLICE as usize,
+            "the parked slice was not charged: {applied} bytes"
+        );
+
+        for _ in 0..4 {
+            // Undone: the layer is back in the stack, so the entry that goes on
+            // the redo stack holds no slice and costs almost nothing.
+            let e = h.take_undo().expect("one entry");
+            let back = doc.reverse(e);
+            h.push_redo(back);
+            assert!(
+                h.used_bytes() < SLICE as usize,
+                "an undone delete is still charged for a slice it does not hold"
+            );
+
+            // And redone: the layer leaves again and the cost comes back.
+            let e = h.take_redo().expect("one entry");
+            let back = doc.reverse(e);
+            h.push_undo(back);
+            assert_eq!(
+                h.used_bytes(),
+                applied,
+                "the total drifted on the way round"
+            );
+        }
+
+        while h.take_undo().is_some() {}
+        assert_eq!(h.used_bytes(), 0, "emptying the history left a balance");
+    }
+
     /// The rule that would otherwise ship broken, and be found by a painter.
     ///
     /// A `Kept` row carries an id and a depth and **nothing else**, so undoing
-    /// a move cannot revert a property changed after it. A snapshot of the whole
-    /// `Vec` — the tempting shape, and one inverse rule for every operation
-    /// there will ever be — would make an undo damage something it was never
-    /// asked about.
+    /// a move cannot revert a property changed after it. A snapshot of the
+    /// whole `Vec` — the tempting shape, and one inverse rule for every
+    /// operation there will ever be — would make an undo damage something it
+    /// was never asked about.
     #[test]
     fn undoing_a_reorder_does_not_put_back_an_opacity_changed_since() {
         let mut doc = Doc::new(4, 4);
