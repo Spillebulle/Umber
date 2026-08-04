@@ -41,6 +41,7 @@
 use crate::icons::{self, Icon};
 use crate::logo;
 use crate::prefs;
+use crate::swapchain;
 use crate::tabs;
 use crate::theme::{self, Palette, metrics, text};
 use egui::{Sense, vec2};
@@ -184,11 +185,19 @@ impl ApplicationHandler for Reporter<'_> {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // A zero on either axis skips the handler, as `app.rs`'s does, so
+            // the surface keeps the configuration it had. Clamping to 1 was
+            // enough to satisfy wgpu, which refuses a zero-area configure —
+            // but `config` also sizes the `ScreenDescriptor`, so a zero
+            // reported while a Wayland window is being mapped drew the whole
+            // box into one pixel until the next real `Resized`.
             WindowEvent::Resized(size) => {
-                gfx.config.width = size.width.max(1);
-                gfx.config.height = size.height.max(1);
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                gfx.window.request_redraw();
+                if size.width > 0 && size.height > 0 {
+                    gfx.config.width = size.width;
+                    gfx.config.height = size.height;
+                    gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+                    gfx.window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Named rather than tested inline. Clippy would rather this
@@ -334,26 +343,39 @@ impl Reporter<'_> {
                 .update_texture(&gfx.gpu.device, &gfx.gpu.queue, *id, delta);
         }
 
-        // The same arms `app::render` takes, minus the logging: a box that
-        // misses one frame is redrawn by the next event and nothing is lost in
-        // the meantime, so anything but a usable texture simply skips.
+        // The same decision `app::render` makes, through the same model rather
+        // than through a second copy of its arms — which is what this was, and
+        // sat fifteen lines above a fix whose whole argument is that a second
+        // copy is how the two get out of step. `swapchain` has no wgpu
+        // lifetime state in it, so it is the cheapest thing in the application
+        // to share, and sharing it puts the second surface in Umber under the
+        // one tested rule.
         //
-        // `Suboptimal` deliberately reconfigures nothing at all, where the
-        // canvas defers it to the next frame — see `swapchain`. The two agree
-        // on the rule that matters, that a surface is never configured while a
-        // texture from it is alive; this window has no `Resized` burst to keep
-        // up with and one frame drawn through a stale swapchain is a box
-        // slightly the wrong size, so it carries no state between frames to
-        // get that wrong. `Resized` reconfigures, and that is enough.
-        let acquired = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
-                None
+        // The reporter takes `reconfigure_now` and deliberately ignores
+        // `reconfigure_later`: it keeps no state between frames, and a
+        // suboptimal swapchain here is a box drawn slightly the wrong size for
+        // one frame rather than a canvas mid-resize. `Resized` reconfigures,
+        // and for this window that is enough.
+        let (acquisition, texture) = match gfx.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (swapchain::Acquisition::Fresh, Some(t)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                (swapchain::Acquisition::Suboptimal, Some(t))
             }
-            _ => None,
+            wgpu::CurrentSurfaceTexture::Outdated => (swapchain::Acquisition::Outdated, None),
+            wgpu::CurrentSurfaceTexture::Lost => (swapchain::Acquisition::Lost, None),
+            wgpu::CurrentSurfaceTexture::Occluded => (swapchain::Acquisition::Occluded, None),
+            wgpu::CurrentSurfaceTexture::Timeout => (swapchain::Acquisition::Timeout, None),
+            _ => (swapchain::Acquisition::Failed, None),
         };
+        debug_assert_eq!(acquisition.carries_texture(), texture.is_some());
+        let plan = swapchain::plan(acquisition);
+        // Let go of anything not being drawn into before touching the surface,
+        // in that order and for the reason `app::render` gives at the same
+        // point.
+        let acquired = texture.filter(|_| plan.draws());
+        if plan.reconfigure_now() {
+            gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+        }
         let Some(frame) = acquired else {
             // Nothing was recorded, so the frees may be applied at once — the
             // one case where that is true, exactly as in `app::render`.
@@ -361,6 +383,14 @@ impl Reporter<'_> {
                 &mut gfx.egui_renderer,
                 &output.textures_delta.free,
             );
+            // And ask for the frame that will draw on whatever was just put
+            // right. `app::render` needs no such line because a canvas gives
+            // itself redraws for other reasons; this window gives itself none
+            // and sits under `ControlFlow::Wait`, so a skipped frame would
+            // leave the box unpainted until the user happened to move the
+            // mouse — on the one window where nothing on screen is the whole
+            // failure. Costs one frame, and only on a skip.
+            gfx.window.request_redraw();
             return close;
         };
         let view = frame

@@ -52,8 +52,9 @@ impl Acquisition {
     /// It is **not** exhaustive by construction and saying so matters: a
     /// variant added later has to be written in here by hand. What is forced
     /// is the *implementation* — `plan` and [`Acquisition::carries_texture`]
-    /// are exhaustive matches, so neither compiles until the new answer has
-    /// been thought about. `cfg(test)` because the sweep is the only caller.
+    /// are exhaustive matches, so neither builds until the new answer has been
+    /// thought about. `cfg(test)` because the sweep is the only caller, which
+    /// is deliberately not true of `carries_texture`; see there.
     #[cfg(test)]
     pub const ALL: [Self; 7] = [
         Self::Fresh,
@@ -73,10 +74,18 @@ impl Acquisition {
     /// restatement of the code it is checking is a tautology, and two of them
     /// shipped in the first draft of this module.
     ///
+    /// It is **not** `cfg(test)`, and that was the second thing this module
+    /// got wrong. The model can only be right about a translation it is shown:
+    /// `app.rs` maps wgpu's answers onto these by hand, and mapping a
+    /// texture-carrying one onto `Outdated` would bring the crash straight
+    /// back with every test here still passing, because the plan was never
+    /// wrong — the translation was. So `app.rs` asserts this against
+    /// `Option::is_some` at the one line where the two meet, which it cannot
+    /// do against something that exists only under `cargo test`.
+    ///
     /// An exhaustive `match` rather than a `matches!`, so an answer added
     /// later cannot default to "no texture" — which is the reading that would
     /// quietly make the safety property hold by never being tested.
-    #[cfg(test)]
     pub fn carries_texture(self) -> bool {
         match self {
             Self::Fresh | Self::Suboptimal => true,
@@ -87,13 +96,20 @@ impl Acquisition {
 
 /// What the frame that received an [`Acquisition`] does about it.
 ///
-/// An enum of the four whole answers rather than a pair of booleans, and that
-/// is the guarantee: **there is no variant meaning "draw into the texture and
-/// configure the surface now"**, so the state that crashed Umber cannot be
-/// written down, let alone acted on. A `draws` flag beside a `reconfigure`
-/// flag can spell it, and a test asserting the two are never combined is a
-/// test of the accessors rather than of the decision — which is what the first
-/// draft of this module shipped, unfalsifiably.
+/// An enum of the four whole answers rather than a `draws` flag beside a
+/// `reconfigure` flag, and the gain is exactly one thing, stated precisely
+/// because the first attempt at this comment overstated it: **there is no
+/// field a call site can read and act on at the wrong moment.** The old shape
+/// exposed `reconfigure` publicly, which says *whether* and never *when*, and
+/// acting on it directly is the whole of the bug — its own doc said so, which
+/// is a warning where this is a type.
+///
+/// It is not a guarantee that the crash is unreachable. Nothing here can stop
+/// `app.rs` calling `configure` with a texture in hand; what the enum removes
+/// is the value that would make doing so look reasonable. And a test asserting
+/// `draws` and `reconfigure_now` are never both true says nothing under either
+/// spelling, since both are derived from the same value — which is what the
+/// first draft shipped, unfalsifiably, twice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame {
     /// Draw into the texture. The surface is as it should be.
@@ -115,6 +131,10 @@ impl Frame {
     }
 
     /// Whether the surface may be configured on the spot.
+    ///
+    /// Only where the frame is not drawing, because only then is there no
+    /// surface texture alive for `configure` to refuse. That sentence is why
+    /// the ordering at the call site is not arbitrary, and it belongs here.
     pub fn reconfigure_now(self) -> bool {
         matches!(self, Self::ReconfigureAndSkip)
     }

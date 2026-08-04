@@ -268,6 +268,14 @@ const PUT_DOWN_SLOP: f32 = 4.0;
 /// the underlying resource alive for as long as the submission using it. This
 /// is what `egui_wgpu`'s own painter does, for the same reason, stated in the
 /// same place.
+///
+/// **`crash::window` calls this too**, which is why it is `pub(crate)` and free
+/// rather than a method: the crash reporter is a second process drawing a
+/// second egui pass, it had its own copy of the ordering, and its copy was the
+/// wrong way round. Anything given to this function must stay reachable from a
+/// process with no `Editor`, no document and no `CanvasRenderer` — a `Graphics`
+/// parameter, or anything that reads editor state, breaks the window whose
+/// whole job is to survive Umber having stopped.
 pub(crate) fn submit_frame(
     gpu: &Gpu,
     renderer: &mut egui_wgpu::Renderer,
@@ -280,8 +288,12 @@ pub(crate) fn submit_frame(
 
 /// Hand egui's finished textures back.
 ///
-/// Only ever called with nothing recorded and unsubmitted: [`submit_frame`] is
-/// the one caller that has a command buffer, and it submits first.
+/// Only ever called with nothing recorded and unsubmitted. [`submit_frame`] is
+/// the one caller that has a command buffer, and it submits first; the two
+/// direct callers — `UmberApp::render` and `crash::window`, each on the path
+/// where the surface gave them nothing to draw into — have not created an
+/// encoder yet. Calling it anywhere a frame's commands are recorded and
+/// unsubmitted is the crash [`submit_frame`] describes.
 pub(crate) fn release_finished_textures(
     renderer: &mut egui_wgpu::Renderer,
     finished: &[egui::TextureId],
@@ -2153,6 +2165,18 @@ impl UmberApp {
                 (swapchain::Acquisition::Failed, None)
             }
         };
+        // The one line where wgpu's answer and the model's meet, and therefore
+        // the one place they can disagree. Everything `swapchain` proves is
+        // about answers it was *shown*: map a texture-carrying acquisition
+        // onto `Outdated` here and the Wayland crash comes back with every
+        // test in that module still passing, because the plan would not be
+        // wrong — this translation would. Debug-only: it is a statement about
+        // the two arms above, which cannot change at runtime.
+        debug_assert_eq!(
+            acquisition.carries_texture(),
+            texture.is_some(),
+            "{acquisition:?} was translated from an answer that disagrees with it"
+        );
         let frame = swapchain::plan(acquisition);
         // A texture this frame is not going to draw into is let go of *before*
         // the surface is touched, and this is the order rather than the
