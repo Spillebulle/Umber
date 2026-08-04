@@ -72,6 +72,17 @@ const DIALOG_SIDEBAR: u32 = 168;
 /// Margin around the brand group inside the banner's dark block.
 const BLOCK_MARGIN: f32 = 12.0;
 
+/// Margin either side of the wordmark in the sidebar, which is twice the
+/// banner's.
+///
+/// Not an oversight and not a second opinion about the same measurement. The
+/// banner's block is 193 px of a 58 px strip and the group is laid out across
+/// it, so 12 px is the whole of the air there is; the sidebar is 168 px of a
+/// 312 px column, where the constraint is the *width* alone and the wordmark
+/// would otherwise be set almost edge to edge under a mark 88 px across. The
+/// wider margin is what keeps the two elements reading as one stack.
+const SIDEBAR_MARGIN: f32 = 24.0;
+
 /// The mark's side in the sidebar, and the gap under it before the wordmark.
 ///
 /// The splash lays the mark and the wordmark out as a *row*, and that row does
@@ -138,7 +149,7 @@ fn dialog_pixels() -> Vec<u32> {
     }
 
     let column = DIALOG_SIDEBAR as f32;
-    let wordmark = fitted_wordmark(column - BLOCK_MARGIN * 4.0);
+    let wordmark = fitted_wordmark(column - SIDEBAR_MARGIN * 2.0);
     let word_h = wordmark.as_ref().map_or(0.0, |f| f.cap_height());
     let group_h = SIDEBAR_MARK
         + if word_h > 0.0 {

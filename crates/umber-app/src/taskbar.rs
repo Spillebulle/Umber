@@ -101,6 +101,12 @@ mod tests {
     }
 
     /// Every value of `attribute` in `text`, in order.
+    ///
+    /// A substring search with no left boundary, so it would answer a *longer*
+    /// attribute ending in the same name — `DefaultValue` asked for `Value`.
+    /// Nothing in the file is of that shape, and the guard against it is that
+    /// every caller slices to one element first rather than that this is
+    /// careful. Case matters, which is what keeps `Guid` out of `Id`.
     fn attributes<'a>(text: &'a str, attribute: &str) -> Vec<&'a str> {
         let opener = format!("{attribute}=\"");
         let mut found = Vec::new();
@@ -210,7 +216,9 @@ mod tests {
     #[test]
     fn the_start_menu_shortcut_is_a_real_one() {
         let wxs = wxs();
-        let at = wxs.find("<Shortcut ").expect("there is no Start Menu shortcut");
+        let at = wxs
+            .find("<Shortcut ")
+            .expect("there is no Start Menu shortcut");
         let end = at + wxs[at..].find('>').expect("an unterminated element");
         let element = &wxs[at..end];
 
@@ -241,10 +249,15 @@ mod tests {
     #[test]
     fn every_installer_icon_is_named_with_a_file_extension() {
         let wxs = wxs();
+        // Sliced to each element, for the reason the two tests above are: from
+        // `<Icon ` to the end of the file, a second icon or a reordered
+        // attribute would have this reading somebody else's `Id`.
         let ids: Vec<&str> = wxs
             .match_indices("<Icon ")
-            .map(|(at, _)| &wxs[at..])
-            .filter_map(|element| attributes(element, "Id").first().copied())
+            .filter_map(|(at, _)| {
+                let end = at + wxs[at..].find('>')?;
+                attributes(&wxs[at..end], "Id").first().copied()
+            })
             .collect();
         assert!(!ids.is_empty(), "the installer declares no icon at all");
         for id in ids {
