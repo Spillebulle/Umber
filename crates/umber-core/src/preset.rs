@@ -1667,8 +1667,10 @@ mod tests {
                 preset.name,
                 b.size
             );
+            // Across the long axis, which is the shortest step a chisel
+            // can be asked for and therefore the one that would spin.
             assert!(
-                b.step_at(0.0) > 0.0,
+                b.step_at(0.0, std::f32::consts::FRAC_PI_2) > 0.0,
                 "{} would spin the dab loop",
                 preset.name
             );
@@ -2605,7 +2607,10 @@ mod tests {
         let preset = BrushPreset::fresh("My brush");
         let b = &preset.brush;
         assert!((Brush::MIN_SIZE..=Brush::MAX_SIZE).contains(&b.size));
-        assert!(b.step_at(0.0) > 0.0, "the dab loop would spin");
+        assert!(
+            b.step_at(0.0, std::f32::consts::FRAC_PI_2) > 0.0,
+            "the dab loop would spin"
+        );
         assert!(b.opacity > 0.0, "a new brush that paints nothing");
         assert!(b.stabilization < 1.0, "it would never reach the pointer");
         // No stamp: a tip is the one thing that cannot be defaulted, because it

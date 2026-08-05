@@ -1313,7 +1313,7 @@ mod tests {
             assert!((0.0..=1.0).contains(&b.hardness));
             assert!((0.0..=1.0).contains(&b.min_size_ratio));
             assert!(b.stabilization < 1.0);
-            assert!(b.step_at(0.0) > 0.0);
+            assert!(b.step_at(0.0, std::f32::consts::FRAC_PI_2) > 0.0);
         }
     }
 

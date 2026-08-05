@@ -376,8 +376,14 @@ impl StrokeBuilder {
             pos: point.pos,
             ..point
         });
-        // A tap has already consumed one dab's worth of travel.
-        self.residual = self.brush.step_at(point.pressure);
+        // A tap has already consumed one dab's worth of travel. `heading` is
+        // still `Vec2::X` here — nothing has moved yet — which for a brush
+        // that follows the stroke is the whole answer and for one that does
+        // not is the best guess available. The first `extend` recomputes it
+        // against the direction the hand actually went.
+        self.residual = self
+            .brush
+            .step_at(point.pressure, self.brush.off_heading(self.heading));
     }
 
     /// Feed a new sample, emitting however many dabs the travel calls for.
@@ -431,7 +437,10 @@ impl StrokeBuilder {
             let f = t / len;
             let pressure = last.pressure + (point.pressure - last.pressure) * f;
             self.emit(from + dir * t, pressure);
-            t += self.brush.step_at(pressure);
+            // Off `dir` rather than off `self.heading`: they are the same
+            // number here, and this is the direction the walk below is
+            // actually taking.
+            t += self.brush.step_at(pressure, self.brush.off_heading(dir));
         }
         self.residual = t - len;
 

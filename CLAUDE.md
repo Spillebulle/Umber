@@ -1596,6 +1596,28 @@ raising `dab_ratio` narrows the dab rather than growing it.
 - **Antialiasing is sized from the *short* axis.** It is the demanding one: a
   chisel two pixels across needs the same softening a two-pixel round brush
   does.
+- **Spacing is a fraction of the dab's width *along the stroke*, not of its
+  long axis.** `Brush::step_at` takes the angle between the two and uses the
+  ellipse's own support, `sqrt((a cos Δ)² + (b sin Δ)²)`; `Brush::off_heading`
+  is where that angle comes from, and it is constant for a brush that follows
+  the stroke and a function of the heading for one that does not. **A round dab
+  is the exact identity** — `a == b` makes the support constant — so this
+  changed nothing for 246 of the 258 shipped presets. It changed the other
+  twelve completely: a marker nib held across the line travels on its *short*
+  axis, so measuring the step against the long one steps past the dab and lays
+  the mark down as a row of separate ellipses with gaps between them. Every
+  marker, the calligraphy pen and the palette knife did it. **This is not an
+  import bug and matching MyPaint is not the defence** — MyPaint states its
+  spacing against the same long radius, so Ramón Miranda's "Marker" asks for a
+  14.1 px step on a dab 10.4 px wide there too, and the faithful reading was
+  the wrong one. What is left gapping is the two presets whose spacing is
+  *above* 1.0, which is an author asking for separated dabs. The nominal
+  `dab_ratio` and angle decide it, never `dab_angle_jitter` or a `dynamics`
+  modulation: both move a single dab, and letting either into the step would
+  make a stroke's spacing wander with the RNG. The tip mask's own proportions
+  are **not** in it either — `tip_scale` narrows the quad and `Brush` cannot
+  see the mask — which is a real gap only for an extreme mask at a wide
+  spacing, and is where to look if a stamp brush ever shows this.
 - **The damaged rect must cover the dab's *quad*, not its circle.**
   `StrokeBuilder::bounds` unions the axis-aligned box of the rotated quad of the
   *scattered* dab. Too tight and the edge of a mark is never committed — it

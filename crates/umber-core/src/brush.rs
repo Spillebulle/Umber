@@ -80,8 +80,12 @@ pub struct Brush {
     /// Opacity of the finished stroke, applied once on commit rather than per
     /// dab — see [`crate::stroke`] for why that distinction matters.
     pub opacity: f32,
-    /// Distance between dabs as a fraction of the current diameter. Smaller is
-    /// smoother and more expensive; 0.1 is a good default.
+    /// Distance between dabs as a fraction of how wide the dab is **along the
+    /// stroke**. Smaller is smoother and more expensive; 0.1 is a good default.
+    ///
+    /// Along the stroke rather than across the long axis, which for a round dab
+    /// is the same number and for a chisel is not — see [`Brush::step_at`],
+    /// which has the argument and the brush that proved it.
     pub spacing: f32,
     pub pressure_size: bool,
     pub pressure_opacity: bool,
@@ -398,9 +402,61 @@ impl Brush {
         (self.scatter * (ratio + (1.0 - ratio) * p)).max(0.0)
     }
 
-    /// Distance to the next dab, in document pixels.
-    pub fn step_at(&self, pressure: f32) -> f32 {
-        (self.radius_at(pressure) * 2.0 * self.spacing).max(0.25)
+    /// Distance to the next dab, in document pixels, for a dab whose long axis
+    /// makes an angle of `off_heading` radians with the direction of travel.
+    ///
+    /// **Spacing is a fraction of how wide the dab is *along the stroke*, not of
+    /// its long axis**, and the difference is the whole of this function. A
+    /// round dab is the same width whichever way it is walked, so the two
+    /// readings coincide and every brush that has ever been round is untouched:
+    /// `a² cos²Δ + b² sin²Δ` with `a == b` is `a` exactly. A chisel is not. A
+    /// marker nib held across the line — [`Brush::dab_angle`] at 90° with
+    /// [`Brush::dab_angle_follows_stroke`] — travels on its *short* axis, so
+    /// measuring the step against the long one steps further than the dab
+    /// reaches and lays the mark down as a row of separate ellipses with gaps
+    /// between them.
+    ///
+    /// That is not a hypothetical and it is not an import bug: MyPaint states
+    /// its spacing against the same long radius and Ramón Miranda's "Marker"
+    /// therefore asks for a step of 14.1 px on a dab 10.4 px wide, which is
+    /// what the brush had always done here. Twelve shipped presets did it —
+    /// every marker, the calligraphy pen, the palette knife — and the reading
+    /// that fixes them is the one every painter would assume: a spacing of 10%
+    /// means each dab lands a tenth of a mark past the last one, whatever shape
+    /// the mark is.
+    ///
+    /// The half-width in a direction `Δ` off the long axis is
+    /// `sqrt((a cos Δ)² + (b sin Δ)²)` — the ellipse's support function — with
+    /// `b = a / dab_ratio`. Nominal rather than per-dab: [`Brush::dab_angle_jitter`]
+    /// and a `dynamics` modulation both move a single dab's angle, and letting
+    /// either decide the *step* would make the spacing of a stroke wander with
+    /// the RNG.
+    pub fn step_at(&self, pressure: f32, off_heading: f32) -> f32 {
+        let long = self.radius_at(pressure);
+        let short = long / self.dab_ratio.max(1.0);
+        let (sin, cos) = off_heading.sin_cos();
+        let half = ((long * cos).powi(2) + (short * sin).powi(2)).sqrt();
+        (half * 2.0 * self.spacing).max(0.25)
+    }
+
+    /// How far the dab's long axis sits from the direction of travel, in
+    /// radians, for a stroke that is going anywhere at all.
+    ///
+    /// Constant for a brush that follows the stroke — that is what following
+    /// means — and, for one that does not, a function of which way the hand is
+    /// moving. Both are exactly what [`crate::stroke::StrokeBuilder`] computes
+    /// for the dab's own angle, minus the two per-dab terms that must not reach
+    /// the spacing.
+    pub fn off_heading(&self, heading: Vec2) -> f32 {
+        if self.dab_angle_follows_stroke {
+            return self.dab_angle.to_radians();
+        }
+        if heading.length_squared() < 1e-12 {
+            // No direction to be off. The long axis is as good an answer as
+            // any and is the one the round case gives.
+            return 0.0;
+        }
+        self.dab_angle.to_radians() - heading.y.atan2(heading.x)
     }
 
     /// [`Brush::smudge`] for an application that states the pickup and the
@@ -791,6 +847,94 @@ mod tests {
             spacing: 0.0,
             ..Default::default()
         };
-        assert!(b.step_at(0.0) > 0.0);
+        assert!(b.step_at(0.0, std::f32::consts::FRAC_PI_2) > 0.0);
+    }
+
+    /// **A chisel is spaced by the width it actually travels on**, which is the
+    /// bug that made every marker in the library paint as a row of separate
+    /// nib marks with gaps between them.
+    ///
+    /// The figures are Ramón Miranda's "Marker": a 56.5 px long axis at 5.46:1,
+    /// held across the line, at a spacing of 0.25. The old rule measured
+    /// against the long axis and asked for a 14.1 px step on a dab 10.35 px
+    /// wide — a mark, a gap, a mark. It is now a quarter of the 10.35, and the
+    /// stroke closes.
+    #[test]
+    fn a_chisel_is_spaced_by_the_width_it_travels_on() {
+        let marker = Brush {
+            size: 56.48749,
+            dab_ratio: 5.46,
+            dab_angle: 90.0,
+            dab_angle_follows_stroke: true,
+            spacing: 0.25,
+            pressure_size: false,
+            ..Default::default()
+        };
+        let across = marker.off_heading(Vec2::X);
+        let short = marker.size / marker.dab_ratio;
+        assert!(
+            (marker.step_at(1.0, across) - short * 0.25).abs() < 1e-3,
+            "got {}",
+            marker.step_at(1.0, across)
+        );
+        // Which is a step well inside the dab rather than past it. The old
+        // reading was 14.1 against a reach of 10.35.
+        assert!(marker.step_at(1.0, across) < short);
+
+        // Pulled *along* its long axis instead — a nib dragged sideways — the
+        // dab really is 56.5 px wide and the step really is a quarter of that.
+        // The rule is the dab's own geometry, not a special case for chisels.
+        let along = Brush {
+            dab_angle: 0.0,
+            ..marker
+        };
+        assert!((along.step_at(1.0, along.off_heading(Vec2::X)) - marker.size * 0.25).abs() < 1e-3);
+
+        // **And a round dab is untouched, at every heading.** `a == b` makes
+        // the ellipse's support constant, so this is the identity for every
+        // brush that has ever been round — which is 246 of the 258 shipped.
+        let round = Brush {
+            size: 40.0,
+            dab_ratio: 1.0,
+            spacing: 0.1,
+            pressure_size: false,
+            ..Default::default()
+        };
+        for eighth in 0..8 {
+            let theta = eighth as f32 * std::f32::consts::FRAC_PI_4;
+            assert!(
+                (round.step_at(1.0, theta) - 40.0 * 0.1).abs() < 1e-4,
+                "a round dab must step the same way whichever way it is walked"
+            );
+        }
+    }
+
+    /// A brush that does not follow the stroke is spaced by *which way the hand
+    /// went*, and one that does is spaced by its own fixed offset.
+    #[test]
+    fn a_fixed_nib_is_measured_against_the_direction_of_travel() {
+        let nib = Brush {
+            size: 40.0,
+            dab_ratio: 4.0,
+            dab_angle: 0.0,
+            dab_angle_follows_stroke: false,
+            spacing: 0.25,
+            pressure_size: false,
+            ..Default::default()
+        };
+        // Dragged along its own long axis: the full 40 px is what it covers.
+        let along = nib.step_at(1.0, nib.off_heading(Vec2::X));
+        // Dragged across it: 10 px, so a quarter of that.
+        let across = nib.step_at(1.0, nib.off_heading(Vec2::Y));
+        assert!((along - 10.0).abs() < 1e-3, "got {along}");
+        assert!((across - 2.5).abs() < 1e-3, "got {across}");
+
+        // A brush that follows the stroke has one answer, because "follows"
+        // means the offset is the same wherever the hand goes.
+        let rake = Brush {
+            dab_angle_follows_stroke: true,
+            ..nib
+        };
+        assert_eq!(rake.off_heading(Vec2::X), rake.off_heading(Vec2::Y));
     }
 }
