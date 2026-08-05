@@ -9,7 +9,7 @@
 //!
 //! The window is [`crate::shell`]'s, shared with the crash reporter.
 
-use super::installer::{Command, Job, Step, stage_helper};
+use super::installer::{Command, Job, Step, installed_path, stage_helper};
 use crate::shell::{self, Page};
 use crate::theme::{Palette, text};
 use crate::{controls, prefs, tabs, widgets};
@@ -127,7 +127,8 @@ fn unpack_payload() -> Result<(std::path::PathBuf, String), String> {
     let bytes = std::fs::read(&exe)
         .map_err(|e| format!("Umber could not read its own program file: {e}"))?;
     let package = super::payload::read(&bytes).ok_or_else(|| {
-        "This copy of Umber's installer carries no package. Take a fresh one          from the releases page."
+        "This copy of Umber's installer carries no package. Take a fresh one \
+         from the releases page."
             .to_string()
     })?;
 
@@ -190,19 +191,41 @@ impl Installer {
             }) {
                 Ok(()) => {
                     let _ = tx.send(Step::Starting);
-                    match start_installed(target.as_deref()) {
+                    // **Where to start it from differs between the two, and
+                    // getting this wrong made a successful first install
+                    // report a failure.** An update knows the path already —
+                    // it is the Umber that spawned this helper, carried in
+                    // `Job::target`. A first install has no such Umber to have
+                    // asked, so the path is the one the package itself uses.
+                    let exe = match target.clone() {
+                        Some(path) => Some(path),
+                        None if setup => {
+                            installed_path(std::env::var("ProgramFiles").ok().as_deref())
+                        }
+                        None => None,
+                    };
+                    let started = exe
+                        .ok_or_else(|| "Umber does not know where it was installed".to_string())
+                        .and_then(|exe| {
+                            std::process::Command::new(&exe)
+                                .spawn()
+                                .map(|_| ())
+                                .map_err(|e| format!("{e}"))
+                        });
+                    match started {
                         Ok(()) => {
                             let _ = tx.send(Step::Finished);
                         }
-                        // The update *worked*; only the relaunch did not. Saying so
-                        // is the honest reading, and it is the same guarantee
-                        // `relaunch` makes: never leave somebody believing an
-                        // update failed when their next start will be the new one.
+                        // **The package went in.** Only the relaunch did not,
+                        // and that is a nicety rather than the job: reporting
+                        // it as a failed installation would send somebody
+                        // looking for a problem that is not there. The same
+                        // guarantee `relaunch` makes, where an update that
+                        // could not restart leaves the old Umber running
+                        // instead of claiming the update failed.
                         Err(why) => {
-                            let _ = tx.send(Step::Failed(format!(
-                                "Umber was updated, but could not be started again: {why}\n\n\
-                             Start it from the Start menu."
-                            )));
+                            log::warn!("installed, but could not start Umber: {why}");
+                            let _ = tx.send(Step::Installed);
                         }
                     }
                 }
@@ -512,17 +535,4 @@ fn install(command: &Command, started: &dyn Fn()) -> Result<(), String> {
 #[cfg(not(windows))]
 fn install(_command: &Command, _started: &dyn Fn()) -> Result<(), String> {
     Err("Umber only installs a package this way on Windows.".to_string())
-}
-
-/// Start the version that was just installed.
-///
-/// The *installed* path rather than this helper's own, because this helper is a
-/// copy in the temporary directory — starting it again would open the updater,
-/// not Umber.
-fn start_installed(target: Option<&Path>) -> Result<(), String> {
-    let exe = target.ok_or_else(|| "Umber was not told where it is installed.".to_string())?;
-    std::process::Command::new(exe)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("{e}"))
 }

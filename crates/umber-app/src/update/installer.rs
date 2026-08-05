@@ -199,6 +199,15 @@ impl Command {
 /// over something it cannot see is the control this project refuses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// In place, and the artist will have to start it themselves.
+    ///
+    /// A **success**, and keeping it out of [`Step::Failed`] is the point. The
+    /// package went on exactly as asked; all that is missing is the relaunch,
+    /// which for a first install is a nicety. Reporting that as a failed
+    /// installation would send somebody looking for a problem that is not
+    /// there — the same rule `relaunch` follows, where an update that could not
+    /// restart leaves the old Umber running rather than claiming it failed.
+    Installed,
     /// Waiting to be told to start.
     ///
     /// The first-run installer alone. An update was asked for and carries on;
@@ -227,6 +236,7 @@ impl Step {
     pub fn label(&self) -> String {
         match self {
             Self::Ready => "Umber will be installed for everyone on this machine.".to_string(),
+            Self::Installed => "Umber is installed. Start it from the Start menu.".to_string(),
             Self::WaitingForUmber => "Waiting for Umber to close...".to_string(),
             Self::AskingPermission => "Asking Windows for permission to install...".to_string(),
             Self::Installing => "Installing...".to_string(),
@@ -242,7 +252,10 @@ impl Step {
     /// that vanished mid-install would leave `msiexec` running with nothing on
     /// screen to say so.
     pub fn holds_work(&self) -> bool {
-        !matches!(self, Self::Ready | Self::Finished | Self::Failed(_))
+        !matches!(
+            self,
+            Self::Ready | Self::Installed | Self::Finished | Self::Failed(_)
+        )
     }
 
     /// How far along the bar sits, where that can be said at all.
@@ -253,6 +266,7 @@ impl Step {
     pub fn progress(&self) -> Option<f32> {
         match self {
             Self::Ready => Some(0.0),
+            Self::Installed => Some(1.0),
             Self::WaitingForUmber => Some(0.1),
             Self::AskingPermission => Some(0.25),
             Self::Installing => None,
@@ -261,6 +275,33 @@ impl Step {
             Self::Failed(_) => None,
         }
     }
+}
+
+/// The folder name the package installs into, under Program Files.
+///
+/// Pinned against `packaging/windows/umber.wxs` by a test rather than merely
+/// matching it today: the setup window starts Umber from this path when the
+/// package has gone in, and a rename over there would otherwise turn a
+/// successful install into a window that could not find what it had installed.
+/// Same arrangement `taskbar`'s names keep against `packaging/`.
+pub const INSTALL_FOLDER: &str = "Umber";
+
+/// Where the package puts `umber.exe`, given what Windows says Program Files
+/// is.
+///
+/// Injected rather than read from the environment here, for the reason
+/// [`super::install::detect`] takes a `Probe`: it is the only way the answer is
+/// testable on a machine that is not Windows.
+///
+/// **Only for the first install.** An update knows the path already — it is the
+/// Umber that spawned the helper — and carries it in [`Job::target`]. This is
+/// the case where there was no Umber to ask.
+pub fn installed_path(program_files: Option<&str>) -> Option<PathBuf> {
+    let root = program_files?;
+    if root.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(root).join(INSTALL_FOLDER).join("umber.exe"))
 }
 
 /// Put a copy of this executable somewhere the installer will not be replacing
@@ -399,6 +440,49 @@ mod tests {
         assert!(line.starts_with("\"/i\""), "{line}");
     }
 
+    /// **A successful install is never reported as a failure**, however the
+    /// relaunch went. `Installed` is the arm that says so.
+    #[test]
+    fn being_unable_to_start_umber_is_not_a_failed_install() {
+        assert!(!Step::Installed.holds_work());
+        assert_eq!(Step::Installed.progress(), Some(1.0));
+        let said = Step::Installed.label().to_lowercase();
+        for word in ["fail", "could not", "error", "sorry", "problem"] {
+            assert!(!said.contains(word), "{said:?} reads as a failure");
+        }
+    }
+
+    /// Where the first install starts Umber from, and it must be where the
+    /// package actually put it.
+    #[test]
+    fn the_installed_path_is_program_files_and_the_packages_own_folder() {
+        assert_eq!(
+            installed_path(Some(r"C:\Program Files")),
+            Some(PathBuf::from(r"C:\Program Files\Umber\umber.exe"))
+        );
+        // Nothing to build a path from is "do not guess", which the window
+        // reads as `Installed` rather than as a failure.
+        assert_eq!(installed_path(None), None);
+        assert_eq!(installed_path(Some("")), None);
+    }
+
+    /// **The folder is the package's**, and this is what stops the two drifting:
+    /// renaming it in the `.wxs` without changing it here would leave a
+    /// successful install unable to find what it had just installed.
+    #[test]
+    fn the_install_folder_is_the_one_the_package_uses() {
+        let wxs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/windows/umber.wxs"),
+        )
+        .expect("the packaging file");
+        let wanted = format!("<Directory Id=\"INSTALLFOLDER\" Name=\"{INSTALL_FOLDER}\" />");
+        assert!(
+            wxs.contains(&wanted),
+            "umber.wxs does not install into {INSTALL_FOLDER}; expected {wanted}"
+        );
+    }
+
     /// The window may not be dismissed while `msiexec` is running, and must be
     /// dismissible the moment it is not.
     #[test]
@@ -435,6 +519,7 @@ mod tests {
     fn no_step_calls_anything_verified() {
         for step in [
             Step::Ready,
+            Step::Installed,
             Step::WaitingForUmber,
             Step::AskingPermission,
             Step::Installing,
