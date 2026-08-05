@@ -405,11 +405,11 @@ impl Brush {
     /// Distance to the next dab, in document pixels, for a dab whose long axis
     /// makes an angle of `off_heading` radians with the direction of travel.
     ///
-    /// **Spacing is a fraction of how wide the dab is *along the stroke*, not of
-    /// its long axis**, and the difference is the whole of this function. A
-    /// round dab is the same width whichever way it is walked, so the two
-    /// readings coincide and every brush that has ever been round is untouched:
-    /// `a² cos²Δ + b² sin²Δ` with `a == b` is `a` exactly. A chisel is not. A
+    /// **Spacing is a fraction of how far the dab reaches *along the stroke*,
+    /// not of its long axis**, and the difference is the whole of this
+    /// function. A round dab reaches the same distance whichever way it is
+    /// walked, so every brush that has ever been round is untouched. A chisel
+    /// is not. A
     /// marker nib held across the line — [`Brush::dab_angle`] at 90° with
     /// [`Brush::dab_angle_follows_stroke`] — travels on its *short* axis, so
     /// measuring the step against the long one steps further than the dab
@@ -425,18 +425,31 @@ impl Brush {
     /// means each dab lands a tenth of a mark past the last one, whatever shape
     /// the mark is.
     ///
-    /// The half-width in a direction `Δ` off the long axis is
-    /// `sqrt((a cos Δ)² + (b sin Δ)²)` — the ellipse's support function — with
-    /// `b = a / dab_ratio`. Nominal rather than per-dab: [`Brush::dab_angle_jitter`]
-    /// and a `dynamics` modulation both move a single dab's angle, and letting
-    /// either decide the *step* would make the spacing of a stroke wander with
-    /// the RNG.
+    /// **The reading is the ellipse's *radius* in the direction of travel**,
+    /// `1 / sqrt((cos Δ / a)² + (sin Δ / b)²)`, with `b = a / dab_ratio`. Not
+    /// its shadow, `sqrt((a cos Δ)² + (b sin Δ)²)`, which is what this used
+    /// first and is a different number wherever the stroke runs at an angle to
+    /// the nib: for the shipped calligraphy pen at 46° off its own axis they
+    /// are 8.3 px and 2.9 px, and the pen combed at the larger one. The shadow
+    /// is how much ground the dab covers *measured across* the direction of
+    /// travel; what decides whether two dabs merge is how far the ellipse
+    /// actually reaches *along* it. The two agree at 0° and at 90°, which is
+    /// why the markers were fixed by either and the calligraphy pen by only
+    /// one of them.
+    ///
+    /// Nominal rather than per-dab: [`Brush::dab_angle_jitter`] and a
+    /// `dynamics` modulation both move a single dab's angle, and letting either
+    /// decide the *step* would make the spacing of a stroke wander with the RNG.
     pub fn step_at(&self, pressure: f32, off_heading: f32) -> f32 {
-        let long = self.radius_at(pressure);
-        let short = long / self.dab_ratio.max(1.0);
+        let long = self.radius_at(pressure).max(1e-4);
+        let short = (long / self.dab_ratio.max(1.0)).max(1e-4);
         let (sin, cos) = off_heading.sin_cos();
-        let half = ((long * cos).powi(2) + (short * sin).powi(2)).sqrt();
-        (half * 2.0 * self.spacing).max(0.25)
+        // `a == b` reduces this to `a` exactly, which is what keeps every round
+        // brush byte for byte what it was.
+        let reach = ((cos / long).powi(2) + (sin / short).powi(2))
+            .sqrt()
+            .recip();
+        (reach * 2.0 * self.spacing).max(0.25)
     }
 
     /// How far the dab's long axis sits from the direction of travel, in
@@ -870,6 +883,7 @@ mod tests {
             pressure_size: false,
             ..Default::default()
         };
+        // Across the nib, where the ellipse's radius and its shadow agree.
         let across = marker.off_heading(Vec2::X);
         let short = marker.size / marker.dab_ratio;
         assert!(

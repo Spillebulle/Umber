@@ -30,7 +30,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.59328866, 0.8449665, 1.0, 1.0, 1.0),
+                    points: (0.99810493, 0.9999976, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -218,7 +218,7 @@
                 size: 3.2213929,
                 min_size_ratio: 0.81058425,
                 hardness: 0.9753333,
-                opacity: 0.5,
+                opacity: 0.9999845,
                 spacing: 0.061652284,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -302,7 +302,7 @@
                     points: (0.0, 0.20395328, 0.435946, 0.69983333, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.55, 0.7, 0.85, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -359,7 +359,7 @@
                 size: 2.5723345,
                 min_size_ratio: 0.08,
                 hardness: 0.81,
-                opacity: 0.17146777,
+                opacity: 0.9999872,
                 spacing: 0.015070934,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -368,7 +368,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.47500002, 0.65, 0.82500005, 1.0),
+                    points: (0.0, 0.9938897, 0.999175, 0.9999056, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -434,7 +434,7 @@
                 size: 2.0269327,
                 min_size_ratio: 0.08,
                 hardness: 0.8523333,
-                opacity: 0.9970436,
+                opacity: 1.0,
                 spacing: 0.026959263,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -668,7 +668,7 @@
                 size: 7.8707013,
                 min_size_ratio: 0.08,
                 hardness: 0.70669997,
-                opacity: 0.73,
+                opacity: 0.99996156,
                 spacing: 0.10570824,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -677,7 +677,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.801683, 0.9731821, 0.99810904, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -743,7 +743,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.08125, 0.355, 0.82125, 1.0),
+                    points: (0.0, 0.4879275, 0.9674735, 0.99999774, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -800,7 +800,7 @@
                 size: 2.0,
                 min_size_ratio: 0.08,
                 hardness: 1.0,
-                opacity: 0.83,
+                opacity: 0.999858,
                 spacing: 0.18518518,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -809,7 +809,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.6874924, 0.9316183, 0.9924746, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -932,7 +932,7 @@
                 size: 3.8601635,
                 min_size_ratio: 0.08,
                 hardness: 0.83,
-                opacity: 0.99,
+                opacity: 1.0,
                 spacing: 0.025870131,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1016,7 +1016,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2777778, 0.5555556, 0.8333334, 1.0),
+                    points: (0.0, 0.9889686, 0.9999853, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1100,7 +1100,7 @@
                 size: 3.1602378,
                 min_size_ratio: 0.08,
                 hardness: 0.85,
-                opacity: 0.30568558,
+                opacity: 0.99999994,
                 spacing: 0.010258514,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1109,7 +1109,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.9991129, 0.9999996, 0.99999994, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1166,7 +1166,7 @@
                 size: 2.0269327,
                 min_size_ratio: 0.08,
                 hardness: 0.8523333,
-                opacity: 0.9970436,
+                opacity: 1.0,
                 spacing: 0.02149613,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1175,7 +1175,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.9999952, 0.99999994, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1250,7 +1250,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.5, 1.0, 1.0, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1370,7 +1370,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.5, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.875, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1454,7 +1454,7 @@
                 size: 26.927473,
                 min_size_ratio: 0.08,
                 hardness: 0.69,
-                opacity: 0.85,
+                opacity: 1.0,
                 spacing: 0.083333336,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1463,7 +1463,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.27272907, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.92933035, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1510,7 +1510,7 @@
                 size: 257.4446,
                 min_size_ratio: 0.35286608,
                 hardness: 0.8,
-                opacity: 0.90857136,
+                opacity: 1.0,
                 spacing: 0.08403361,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -1585,7 +1585,7 @@
                 size: 14.778112,
                 min_size_ratio: 0.08,
                 hardness: 0.6,
-                opacity: 0.4,
+                opacity: 0.9996776,
                 spacing: 0.05,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1594,7 +1594,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.8139008, 0.971437, 0.996774, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 0.74999994, 0.50000006, 0.24999999, 0.0),
@@ -1660,7 +1660,7 @@
                     points: (0.0, 0.011956018, 0.06611356, 0.43404886, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.97560334, 0.9999982, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1838,7 +1838,7 @@
                 size: 4.0275054,
                 min_size_ratio: 0.08,
                 hardness: 0.2,
-                opacity: 0.8,
+                opacity: 0.99976707,
                 spacing: 0.1,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1847,7 +1847,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.15625, 0.375, 0.65625006, 1.0),
+                    points: (0.0, 0.54720354, 0.8746217, 0.9849882, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1894,7 +1894,7 @@
                 size: 5.171419,
                 min_size_ratio: 0.08,
                 hardness: 0.52,
-                opacity: 0.59,
+                opacity: 0.9999998,
                 spacing: 0.041666668,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1903,7 +1903,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.94450176, 0.9981348, 0.99996984, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1950,7 +1950,7 @@
                 size: 15.15222,
                 min_size_ratio: 0.08,
                 hardness: 0.59,
-                opacity: 0.99,
+                opacity: 0.9999998,
                 spacing: 0.1923077,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -1959,7 +1959,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.6899317, 0.9357935, 0.9946627, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2025,7 +2025,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.74284375, 0.9594243, 0.9978954, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2081,7 +2081,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2125, 0.45000002, 0.71250004, 1.0),
+                    points: (0.0, 0.96559286, 0.9997167, 0.9999999, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2435,7 +2435,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.6982434, 0.9395613, 0.995276, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2566,7 +2566,7 @@
                     points: (0.0, 0.05253042, 0.20239581, 0.644073, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.55911106, 0.9685712, 1.0, 1.0),
+                    points: (0.0, 0.99715114, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2622,7 +2622,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.9495504, 0.9992015, 0.99999917, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2678,7 +2678,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.81600004, 0.88400006, 0.9520001, 1.0),
+                    points: (0.0, 0.8698872, 0.92053837, 0.9681643, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -2919,7 +2919,7 @@
                 size: 10.4313345,
                 min_size_ratio: 0.44190207,
                 hardness: 0.71,
-                opacity: 0.49920002,
+                opacity: 0.9914151,
                 spacing: 0.12437811,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -2928,7 +2928,7 @@
                     points: (1.0, 0.6691019, 0.39931187, 0.17934486, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.5544982, 0.82813424, 0.9510963, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -3012,7 +3012,7 @@
                 size: 3.0136347,
                 min_size_ratio: 0.6570468,
                 hardness: 0.79,
-                opacity: 0.22960171,
+                opacity: 0.83441275,
                 spacing: 0.13623978,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -3021,7 +3021,7 @@
                     points: (1.0, 0.8464351, 0.6167707, 0.28690326, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.0, 0.0021857952, 0.71519876, 1.0),
+                    points: (0.0, 0.0, 0.0029448653, 0.77760434, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.63515663, 1.0, 1.0, 1.0),
@@ -3207,7 +3207,7 @@
                 size: 2.4428055,
                 min_size_ratio: 0.08,
                 hardness: 0.4,
-                opacity: 0.7,
+                opacity: 0.99818593,
                 spacing: 0.125,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -3216,7 +3216,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.6571071, 0.9070385, 0.98355675, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25000003, 0.5, 0.75000006, 1.0),
@@ -3533,7 +3533,7 @@
                 size: 54.225277,
                 min_size_ratio: 0.08,
                 hardness: 1.0,
-                opacity: 0.69,
+                opacity: 0.99999744,
                 spacing: 0.083333336,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -3542,7 +3542,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.87542236, 0.99048215, 0.9996726, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -3598,7 +3598,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.22, 0.48999998, 0.80999994, 1.0),
+                    points: (0.0, 0.81603825, 0.9895402, 0.9999836, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -3766,7 +3766,7 @@
                 size: 26.92748,
                 min_size_ratio: 0.3678794,
                 hardness: 0.72,
-                opacity: 0.64,
+                opacity: 0.9931561,
                 spacing: 0.18796992,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -3775,7 +3775,7 @@
                     points: (1.0, 0.6500679, 0.3775407, 0.16529617, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.39264828, 0.4794252, 0.7019927, 1.0),
+                    points: (0.0, 0.73582625, 0.8153552, 0.9394907, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.24999997, 0.49999994, 0.74999994, 1.0),
@@ -3841,7 +3841,7 @@
                 size: 9.906065,
                 min_size_ratio: 0.08,
                 hardness: 0.6,
-                opacity: 0.99999994,
+                opacity: 1.0,
                 spacing: 0.25,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -3850,7 +3850,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.56321055, 0.86144716, 0.9789602, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.49999997, 0.74999994, 1.0),
@@ -3916,7 +3916,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.96314305, 1.0, 1.0, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -3982,7 +3982,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.8236715, 0.953341, 0.9766705, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -4029,7 +4029,7 @@
                 size: 5.6394086,
                 min_size_ratio: 0.3773625,
                 hardness: 0.5,
-                opacity: 0.15,
+                opacity: 0.6203546,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4038,7 +4038,7 @@
                     points: (0.0, 0.2177132, 0.5136335, 0.9158545, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.32987797, 0.6007043, 0.82145613, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.50000006, 0.75, 1.0),
@@ -4085,7 +4085,7 @@
                 size: 5.6394086,
                 min_size_ratio: 0.3773625,
                 hardness: 0.5,
-                opacity: 0.025720164,
+                opacity: 0.1445867,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4094,7 +4094,7 @@
                     points: (0.0, 0.2177132, 0.5136335, 0.9158545, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.26250926, 0.5165284, 0.7622846, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.50000006, 0.75, 1.0),
@@ -4141,7 +4141,7 @@
                 size: 219.8943,
                 min_size_ratio: 0.08,
                 hardness: 0.48,
-                opacity: 0.52,
+                opacity: 0.99766034,
                 spacing: 0.08695652,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -4150,7 +4150,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.7343748, 0.87946403, 0.939732, 1.0),
+                    points: (0.0, 0.9842754, 0.9960649, 0.99845433, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -4197,7 +4197,7 @@
                 size: 5.2495756,
                 min_size_ratio: 0.84366477,
                 hardness: 0.5,
-                opacity: 0.2,
+                opacity: 0.7345792,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4206,7 +4206,7 @@
                     points: (0.0, 0.23429525, 0.47876236, 0.7338441, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.35996732, 0.6358508, 0.84450334, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.50000006, 0.75, 1.0),
@@ -4272,7 +4272,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.033490784, 0.14301786, 0.40718126, 1.0),
+                    points: (0.0, 0.35778862, 0.86552763, 0.9988832, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 1.0, 1.0, 1.0, 1.0),
@@ -4338,7 +4338,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.034080803, 0.06816161, 0.27866608, 1.0),
+                    points: (0.0, 0.5495585, 0.80283314, 0.9994541, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.4807693, 0.9615385, 1.0, 1.0),
@@ -4404,7 +4404,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.033490784, 0.14301786, 0.40718126, 1.0),
+                    points: (0.0, 0.35778862, 0.86552763, 0.9988832, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 1.0, 1.0, 1.0, 1.0),
@@ -4470,7 +4470,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.034080803, 0.06816161, 0.27866608, 1.0),
+                    points: (0.0, 0.5495585, 0.80283314, 0.9994541, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.4807693, 0.9615385, 1.0, 1.0),
@@ -4527,7 +4527,7 @@
                 size: 38.21191,
                 min_size_ratio: 0.08,
                 hardness: 0.98,
-                opacity: 0.5580001,
+                opacity: 0.998267,
                 spacing: 0.12376238,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -4536,7 +4536,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.68095326, 0.9162014, 0.98448616, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25000003, 0.49999994, 0.74999994, 1.0),
@@ -4649,7 +4649,7 @@
                 size: 3.5720768,
                 min_size_ratio: 0.08,
                 hardness: 1.0,
-                opacity: 0.6,
+                opacity: 0.9999998,
                 spacing: 0.055555556,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -4658,7 +4658,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.125, 0.3333333, 0.625, 1.0),
+                    points: (0.0, 0.7342891, 0.97748214, 0.9996614, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.17309928, 0.3461986, 0.68705064, 1.0),
@@ -4724,7 +4724,7 @@
                 size: 14.198655,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.09,
+                opacity: 0.6456314,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4733,7 +4733,7 @@
                     points: (0.0, 0.3181461, 0.60289097, 0.8198659, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.12702218, 0.39075413, 0.8864779, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -4780,7 +4780,7 @@
                 size: 14.198655,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.027777778,
+                opacity: 0.26646477,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4789,7 +4789,7 @@
                     points: (0.0, 0.3181461, 0.60289097, 0.8198659, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.09755571, 0.31927824, 0.84539765, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -4836,7 +4836,7 @@
                 size: 6.443986,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.09,
+                opacity: 0.6456314,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4845,7 +4845,7 @@
                     points: (0.0, 0.318146, 0.6028908, 0.8198657, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.12702218, 0.39075413, 0.8864779, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -4892,7 +4892,7 @@
                 size: 6.508749,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.03,
+                opacity: 0.28469858,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -4901,7 +4901,7 @@
                     points: (0.0, 0.318146, 0.60289085, 0.81986576, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.0985182, 0.32170734, 0.8469432, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5013,7 +5013,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.3175, 0.685, 1.0, 1.0),
+                    points: (0.0, 0.9922878, 0.9999988, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -5060,7 +5060,7 @@
                 size: 15.849649,
                 min_size_ratio: 0.28650475,
                 hardness: 1.0,
-                opacity: 0.09,
+                opacity: 0.6456314,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5069,7 +5069,7 @@
                     points: (0.0, 0.31814602, 0.60289085, 0.81986576, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.12702218, 0.39075413, 0.8864779, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5116,7 +5116,7 @@
                 size: 174.71349,
                 min_size_ratio: 0.28650472,
                 hardness: 1.0,
-                opacity: 0.09,
+                opacity: 0.6456314,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5125,7 +5125,7 @@
                     points: (0.0, 0.3181459, 0.60289085, 0.8198658, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.12702218, 0.39075413, 0.8864779, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5228,7 +5228,7 @@
                 size: 89.40237,
                 min_size_ratio: 0.08,
                 hardness: 0.9,
-                opacity: 0.9814678,
+                opacity: 1.0,
                 spacing: 0.0481232,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -5237,7 +5237,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.6846314, 0.7897543, 0.89487714, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -5350,7 +5350,7 @@
                 size: 89.40237,
                 min_size_ratio: 0.08,
                 hardness: 0.9,
-                opacity: 0.9814678,
+                opacity: 1.0,
                 spacing: 0.0481232,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -5359,7 +5359,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.6846314, 0.7897543, 0.89487714, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -5491,7 +5491,7 @@
                 size: 8.69847,
                 min_size_ratio: 0.28650483,
                 hardness: 1.0,
-                opacity: 0.09,
+                opacity: 0.6456314,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5500,7 +5500,7 @@
                     points: (0.0, 0.05914715, 0.1638572, 0.34997794, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.12702218, 0.39075413, 0.8864779, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5547,7 +5547,7 @@
                 size: 6.0687175,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.2916,
+                opacity: 0.9774543,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5556,7 +5556,7 @@
                     points: (0.0, 0.31814605, 0.60289085, 0.8198658, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.24961062, 0.63573295, 0.9736387, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5603,7 +5603,7 @@
                 size: 4.773822,
                 min_size_ratio: 0.2865048,
                 hardness: 0.67,
-                opacity: 0.57,
+                opacity: 0.920493,
                 spacing: 0.25,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5612,7 +5612,7 @@
                     points: (0.0, 0.31814605, 0.60289085, 0.81986594, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.15222204, 0.45435518, 0.92523736, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 0.75000006, 0.4999999, 0.24999996, 0.0),
@@ -5659,7 +5659,7 @@
                 size: 11.624875,
                 min_size_ratio: 0.28650478,
                 hardness: 1.0,
-                opacity: 0.015432099,
+                opacity: 0.15724294,
                 spacing: 0.095419854,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5668,7 +5668,7 @@
                     points: (0.0, 0.31814608, 0.60289097, 0.8198658, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.086097255, 0.2898207, 0.82571095, 1.0),
+                    points: (0.0, 0.09233207, 0.30597487, 0.8367274, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8333332, 0.4166666, 0.0),
@@ -5724,7 +5724,7 @@
                     points: (0.0, 0.05253042, 0.20239581, 0.644073, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.55911106, 0.9685712, 1.0, 1.0),
+                    points: (0.0, 0.99715114, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -5771,7 +5771,7 @@
                 size: 81.71609,
                 min_size_ratio: 0.2845715,
                 hardness: 0.75,
-                opacity: 0.22999999,
+                opacity: 0.93450844,
                 spacing: 0.083333336,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -5780,7 +5780,7 @@
                     points: (0.0, 0.14683591, 0.34787685, 0.6231327, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.21835499, 0.45780665, 0.71835494, 1.0),
+                    points: (0.0, 0.4462197, 0.7358875, 0.907839, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.24999996, 0.5000001, 0.75000006, 1.0),
@@ -5855,7 +5855,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.8610699, 0.99047285, 0.9998727, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -5921,7 +5921,7 @@
                 size: 5.171419,
                 min_size_ratio: 0.08,
                 hardness: 0.44,
-                opacity: 0.291666,
+                opacity: 0.9971355,
                 spacing: 0.041666668,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -5930,7 +5930,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.73042583, 0.93560916, 0.9880213, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6061,7 +6061,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.80202365, 0.9251717, 1.0, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 0.81942254, 0.63884515, 0.43182075, 0.0),
@@ -6211,7 +6211,7 @@
                     points: (0.0, 0.122377716, 0.30647168, 0.5834057, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.79205996, 1.0, 1.0, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6343,7 +6343,7 @@
                     points: (0.0, 0.15803456, 0.36602148, 0.63975, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.79549164, 0.97623456, 0.9992482, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25000003, 0.5, 0.75000006, 1.0),
@@ -6418,7 +6418,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6465,7 +6465,7 @@
                 size: 2.1130812,
                 min_size_ratio: 0.733447,
                 hardness: 0.64,
-                opacity: 0.6,
+                opacity: 0.936,
                 spacing: 0.25,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -6474,7 +6474,7 @@
                     points: (1.0, 0.7374606, 0.48471555, 0.2325322, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.41225967, 0.7019231, 0.89062506, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6576,7 +6576,7 @@
                 size: 6.4762855,
                 min_size_ratio: 0.8187309,
                 hardness: 0.6,
-                opacity: 0.4,
+                opacity: 0.8249857,
                 spacing: 0.21739131,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -6585,7 +6585,7 @@
                     points: (1.0, 0.74773526, 0.49843356, 0.24269634, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.37206063, 0.6519532, 0.85632294, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6705,7 +6705,7 @@
                 size: 27.735981,
                 min_size_ratio: 0.60653067,
                 hardness: 0.19,
-                opacity: 0.43,
+                opacity: 0.96973085,
                 spacing: 0.09090909,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -6789,7 +6789,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.9058346, 0.9963895, 0.99998355, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -6845,7 +6845,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7004,7 +7004,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7124,7 +7124,7 @@
                 size: 19.846802,
                 min_size_ratio: 0.83535737,
                 hardness: 0.72,
-                opacity: 0.6,
+                opacity: 0.936,
                 spacing: 0.25,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -7133,7 +7133,7 @@
                     points: (1.0, 0.7328907, 0.47752863, 0.23339652, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.41225967, 0.7019231, 0.89062506, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7253,7 +7253,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.6453128, 0.83880985, 0.9194049, 1.0),
+                    points: (0.0, 0.9553793, 0.99581194, 0.9994765, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7319,7 +7319,7 @@
                 size: 39.639023,
                 min_size_ratio: 0.62708896,
                 hardness: 0.56,
-                opacity: 0.9100001,
+                opacity: 0.9999979,
                 spacing: 0.13297872,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -7328,7 +7328,7 @@
                     points: (1.0, 0.7047062, 0.44193012, 0.20808998, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.39264828, 0.47942516, 0.7019927, 1.0),
+                    points: (0.0, 0.9121341, 0.9561437, 0.99545664, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7544,7 +7544,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7610,7 +7610,7 @@
                 size: 6.7743754,
                 min_size_ratio: 0.170333,
                 hardness: 0.71,
-                opacity: 0.46,
+                opacity: 0.842536,
                 spacing: 0.25,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -7619,7 +7619,7 @@
                     points: (1.0, 0.5690179, 0.29214272, 0.11427029, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.3641932, 0.6450372, 0.85336256, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7666,7 +7666,7 @@
                 size: 22.416878,
                 min_size_ratio: 0.14709643,
                 hardness: 0.63,
-                opacity: 0.1627249,
+                opacity: 0.59371036,
                 spacing: 0.15923566,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -7675,7 +7675,7 @@
                     points: (1.0, 0.5536415, 0.277212, 0.10601942, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.8140023, 1.0, 0.7165114, 0.27385035),
+                    points: (0.0, 0.86511624, 1.0, 0.786317, 0.34795064),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7741,7 +7741,7 @@
                     points: (0.0, 0.15803452, 0.3660215, 0.63975006, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.79549164, 0.97623456, 0.9992482, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25000003, 0.5, 0.75000006, 1.0),
@@ -7816,7 +7816,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7891,7 +7891,7 @@
                     points: (1.0, 0.5690179, 0.29214272, 0.11427029, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -7947,7 +7947,7 @@
                     points: (0.0, 0.20524764, 0.4378236, 0.70136666, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.5984294, 0.88688385, 0.98657537, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.24999985, 0.4999991, 0.7500002, 1.0),
@@ -8013,7 +8013,7 @@
                 size: 2.6581903,
                 min_size_ratio: 0.08,
                 hardness: 0.84,
-                opacity: 0.09,
+                opacity: 0.57207024,
                 spacing: 0.1,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -8022,7 +8022,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.3237369, 0.59303975, 0.81609225, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8079,7 +8079,7 @@
                 size: 219.8943,
                 min_size_ratio: 0.08,
                 hardness: 0.36,
-                opacity: 0.5,
+                opacity: 0.9992755,
                 spacing: 0.0625,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -8088,7 +8088,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.7343748, 0.87946403, 0.939732, 1.0),
+                    points: (0.0, 0.99283415, 0.9984479, 0.9994217, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8135,7 +8135,7 @@
                 size: 39.771366,
                 min_size_ratio: 0.01,
                 hardness: 0.99,
-                opacity: 0.1,
+                opacity: 0.40951002,
                 spacing: 0.18518518,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -8200,7 +8200,7 @@
                     points: (0.0, 0.30739427, 0.7998603, 1.0, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.11102939, 0.3512658, 0.6407043, 1.0),
+                    points: (0.0, 0.72599316, 0.9914349, 0.9999871, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.0, 1.0, 1.0, 1.0),
@@ -8266,7 +8266,7 @@
                     points: (0.0, 0.0, 0.081197105, 0.4301928, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.7914276, 0.996569, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8323,7 +8323,7 @@
                 size: 478.99423,
                 min_size_ratio: 0.050360844,
                 hardness: 0.36,
-                opacity: 0.7,
+                opacity: 0.9999948,
                 spacing: 0.0625,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -8332,7 +8332,7 @@
                     points: (0.0, 0.0589151, 0.18328162, 0.4458124, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.73437476, 0.879464, 0.939732, 1.0),
+                    points: (0.0, 0.9994599, 0.9999504, 0.9999872, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8388,7 +8388,7 @@
                     points: (0.0, 0.13109335, 0.32152537, 0.59815526, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.7343748, 0.87946403, 0.939732, 1.0),
+                    points: (0.0, 0.99999833, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 0.75000006, 0.49999997, 0.25000003, 0.0),
@@ -8435,7 +8435,7 @@
                 size: 105.96906,
                 min_size_ratio: 0.084584855,
                 hardness: 0.43,
-                opacity: 0.969792,
+                opacity: 0.99999994,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -8444,7 +8444,7 @@
                     points: (1.0, 0.49672118, 0.22530755, 0.078936554, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.71366835, 0.86293244, 0.9308998, 1.0),
+                    points: (0.0, 0.99829787, 0.9999264, 0.9999934, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8510,7 +8510,7 @@
                     points: (0.0, 0.15325402, 0.35833356, 0.63276476, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1095503, 0.3020833, 0.7615525, 1.0),
+                    points: (0.0, 0.68782, 0.97231156, 0.9999991, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8576,7 +8576,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1095503, 0.3020833, 0.7615525, 1.0),
+                    points: (0.0, 0.9181298, 0.9995609, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -8642,7 +8642,7 @@
                     points: (0.0, 0.0052998434, 0.0356078, 0.34982622, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.7914276, 0.996569, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.34233013, 0.67168075, 0.8358403, 1.0),
@@ -8764,7 +8764,7 @@
                     points: (0.0, 0.006725401, 0.14669323, 1.0, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.9526031, 0.99998057, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.34233013, 0.67168075, 0.8358403, 1.0),
@@ -8952,7 +8952,7 @@
                     points: (0.0, 0.50465846, 0.82921016, 0.9620026, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.43097967, 0.82976466, 1.0, 1.0),
+                    points: (0.0, 0.9403461, 0.999857, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9008,7 +9008,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1095503, 0.3020833, 0.7615525, 1.0),
+                    points: (0.0, 0.82455504, 0.99546, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9074,7 +9074,7 @@
                     points: (1.0, 0.8352771, 0.59990495, 0.3029556, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1095503, 0.3020833, 0.7615525, 1.0),
+                    points: (0.0, 0.82455504, 0.99546, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9140,7 +9140,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1095503, 0.3020833, 0.7615525, 1.0),
+                    points: (0.0, 0.82455504, 0.99546, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9206,7 +9206,7 @@
                     points: (0.0, 0.011956019, 0.06611356, 0.43404883, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.7914276, 0.996569, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9262,7 +9262,7 @@
                     points: (0.0, 0.011956017, 0.06611356, 0.4340488, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.7914276, 0.996569, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9365,7 +9365,7 @@
                 size: 2.9836495,
                 min_size_ratio: 0.08,
                 hardness: 0.12,
-                opacity: 0.8,
+                opacity: 0.9994978,
                 spacing: 0.1,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -9374,7 +9374,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.15625, 0.375, 0.65625006, 1.0),
+                    points: (0.0, 0.5221724, 0.85474974, 0.97941417, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9421,7 +9421,7 @@
                 size: 4.4418163,
                 min_size_ratio: 0.5009499,
                 hardness: 0.56,
-                opacity: 0.5270202,
+                opacity: 0.9996901,
                 spacing: 0.07032349,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -9430,7 +9430,7 @@
                     points: (0.9254455, 1.0, 0.56905574, 0.4974599, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.17052998, 0.5156648, 0.9756934, 1.0),
+                    points: (0.0, 0.6469067, 0.9693663, 0.9998995, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9486,7 +9486,7 @@
                     points: (1.0, 0.27065253, 0.0702188, 0.015137128, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2321737, 0.479167, 0.7395835, 1.0),
+                    points: (0.0, 0.7920976, 0.9760236, 0.99922854, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9543,7 +9543,7 @@
                 size: 274.58243,
                 min_size_ratio: 0.059880987,
                 hardness: 0.4,
-                opacity: 0.68,
+                opacity: 0.9745309,
                 spacing: 0.20920502,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -9552,7 +9552,7 @@
                     points: (0.21703665, 1.0, 0.48910838, 0.22359742, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.47446, 0.765702, 0.9261714, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9599,7 +9599,7 @@
                 size: 66.2309,
                 min_size_ratio: 0.08,
                 hardness: 0.53,
-                opacity: 0.15,
+                opacity: 0.8228301,
                 spacing: 0.071428575,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -9608,7 +9608,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.40796342, 0.686944, 0.8750614, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 0.75, 0.50000006, 0.24999999, 0.0),
@@ -9664,7 +9664,7 @@
                     points: (0.0, 0.07875944, 0.22541888, 0.40679464, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.33364022, 0.7428451, 0.94414896, 1.0),
+                    points: (0.0, 0.92359746, 0.99975014, 0.99999994, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9814,7 +9814,7 @@
                     points: (0.0, 0.016044112, 0.070194535, 0.4365219, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.97102135, 0.999997, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9870,7 +9870,7 @@
                     points: (1.0, 0.36465782, 0.355514, 0.013085487, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.9517045, 0.96780294, 0.9839015, 1.0),
+                    points: (0.0, 0.99988735, 0.9999666, 0.9999958, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -9945,7 +9945,7 @@
                 size: 415.63782,
                 min_size_ratio: 0.23069306,
                 hardness: 0.14,
-                opacity: 0.30864197,
+                opacity: 0.88601756,
                 spacing: 0.093457945,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -9954,7 +9954,7 @@
                     points: (1.0, 0.6009922, 0.32446364, 0.13281813, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.23217368, 0.47916698, 0.7395835, 1.0),
+                    points: (0.0, 0.4092399, 0.69704014, 0.8869953, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10038,7 +10038,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.78262836, 0.979842, 1.0, 1.0),
+                    points: (0.0, 0.99915606, 0.99999887, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10170,7 +10170,7 @@
                     points: (0.0, 0.032058585, 0.119202904, 0.35608572, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.8236715, 0.953341, 0.9766705, 1.0),
+                    points: (0.0, 0.99982953, 0.99999976, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10226,7 +10226,7 @@
                     points: (0.0, 0.17840515, 0.3978759, 0.6678646, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.4698319, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.8509813, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.2499997, 0.4999994, 0.7500003, 1.0),
@@ -10301,7 +10301,7 @@
                 size: 2.6462595,
                 min_size_ratio: 0.08,
                 hardness: 0.2,
-                opacity: 0.5234568,
+                opacity: 0.99944776,
                 spacing: 0.055555556,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -10310,7 +10310,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.1067217, 0.30896226, 0.6067217, 1.0),
+                    points: (0.0, 0.46117282, 0.84739023, 0.9820958, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10385,7 +10385,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.16749999, 0.5894262, 0.8862841, 1.0, 1.0),
+                    points: (0.93606126, 0.9999984, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.48615646, 0.8346925, 0.85293657, 1.0),
@@ -10460,7 +10460,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.9648176, 0.9765451, 0.98827255, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10526,7 +10526,7 @@
                     points: (0.0, 0.011956019, 0.06611356, 0.43404883, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2691111, 0.6785712, 1.0, 1.0),
+                    points: (0.0, 0.7914276, 0.996569, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10573,7 +10573,7 @@
                 size: 35.251995,
                 min_size_ratio: 0.43198043,
                 hardness: 1.0,
-                opacity: 0.927083,
+                opacity: 0.9999979,
                 spacing: 0.21834062,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -10582,7 +10582,7 @@
                     points: (1.0, 0.6667559, 0.3965915, 0.17756607, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.2684261, 0.6451448, 0.92650396, 1.0),
+                    points: (0.0, 0.7608772, 0.9895169, 0.99994624, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.5656107, 1.0, 1.0, 1.0),
@@ -10648,7 +10648,7 @@
                 size: 29.073124,
                 min_size_ratio: 0.441902,
                 hardness: 1.0,
-                opacity: 0.5408,
+                opacity: 0.99909216,
                 spacing: 0.12437811,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -10657,7 +10657,7 @@
                     points: (1.0, 0.6691017, 0.39931184, 0.17934494, 0.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.71761036, 0.93587554, 0.9899581, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10750,7 +10750,7 @@
                     points: (0.0, 0.15315026, 0.3581659, 0.63261145, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.09624103, 0.572917, 0.8768784, 1.0),
+                    points: (0.0, 0.6681983, 0.99990267, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10816,7 +10816,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.08509782, 0.49999988, 0.91999996, 1.0),
+                    points: (0.0, 0.67899215, 0.9998486, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10872,7 +10872,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.565357, 0.86343247, 0.97979164, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.0, 0.3510415, 0.77552074, 1.0),
@@ -10929,7 +10929,7 @@
                 size: 108.10978,
                 min_size_ratio: 0.45632327,
                 hardness: 0.5,
-                opacity: 0.0616,
+                opacity: 0.2627968,
                 spacing: 0.1552795,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -10938,7 +10938,7 @@
                     points: (0.032773215, 0.0, 0.092164524, 0.46961075, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.74999994, 1.0),
+                    points: (0.0, 0.27338332, 0.5306939, 0.7726635, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -10994,7 +10994,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 1.0, 0.97937524, 1.0, 1.0),
+                    points: (0.0, 1.0, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -11069,7 +11069,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -11125,7 +11125,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.047066454, 0.60872924, 0.9089917, 1.0),
+                    points: (0.0, 0.35823026, 0.99981093, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -11191,7 +11191,7 @@
                     points: (0.0, 0.0, 0.0, 0.0, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.5, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.9976538, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (1.0, 1.0, 0.8350522, 0.4175261, 0.0),
@@ -11641,7 +11641,7 @@
                 size: 17.718132,
                 min_size_ratio: 0.3528659,
                 hardness: 0.18,
-                opacity: 0.9142855,
+                opacity: 0.99999064,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -11716,7 +11716,7 @@
                 size: 18.38979,
                 min_size_ratio: 0.35286596,
                 hardness: 0.8,
-                opacity: 0.91714257,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -11791,7 +11791,7 @@
                 size: 16.447512,
                 min_size_ratio: 0.14709643,
                 hardness: 0.8,
-                opacity: 0.9757142,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -11800,7 +11800,7 @@
                     points: (0.0, 0.10601944, 0.277212, 0.5536415, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.74999994, 1.0),
+                    points: (0.0, 0.89914083, 0.99539465, 0.9999595, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -11884,7 +11884,7 @@
                     points: (0.0, 0.19685021, 0.42555752, 0.69127744, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.4642857, 0.64285713, 0.8214286, 1.0),
+                    points: (0.0, 0.9709297, 0.9954142, 0.9995673, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -11959,7 +11959,7 @@
                 size: 4.0275054,
                 min_size_ratio: 0.60653067,
                 hardness: 1.0,
-                opacity: 0.95,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -11968,7 +11968,7 @@
                     points: (0.0, 0.20524746, 0.43782347, 0.70136654, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.12521802, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.68013006, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -12034,7 +12034,7 @@
                 size: 6.0083323,
                 min_size_ratio: 0.08,
                 hardness: 1.0,
-                opacity: 0.95,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -12043,7 +12043,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.38208255, 0.57972854, 0.785701, 1.0),
+                    points: (0.0, 0.9827262, 0.99925447, 0.99999565, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -12109,7 +12109,7 @@
                 size: 26.927473,
                 min_size_ratio: 0.08,
                 hardness: 0.1,
-                opacity: 0.95,
+                opacity: 0.99999154,
                 spacing: 0.1,
                 pressure_size: false,
                 pressure_opacity: true,
@@ -12118,7 +12118,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.38208255, 0.57972854, 0.785701, 1.0),
+                    points: (0.0, 0.9058252, 0.98227656, 0.9984708, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -12175,7 +12175,7 @@
                 size: 3.2809966,
                 min_size_ratio: 0.86070794,
                 hardness: 1.0,
-                opacity: 0.4,
+                opacity: 0.784,
                 spacing: 0.29761904,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12241,7 +12241,7 @@
                 size: 15.458315,
                 min_size_ratio: 0.4965854,
                 hardness: 0.90000004,
-                opacity: 0.2,
+                opacity: 0.48800004,
                 spacing: 0.29761904,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12250,7 +12250,7 @@
                     points: (0.0, 0.18865173, 0.41338256, 0.6810922, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.29226434, 0.55532783, 0.7907275, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.24999996, 0.4999999, 0.75000006, 1.0),
@@ -12634,7 +12634,7 @@
                 size: 19.393711,
                 min_size_ratio: 0.352866,
                 hardness: 0.8,
-                opacity: 0.9142855,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12709,7 +12709,7 @@
                 size: 17.718132,
                 min_size_ratio: 0.3528659,
                 hardness: 0.8,
-                opacity: 0.9142855,
+                opacity: 1.0,
                 spacing: 0.1,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12793,7 +12793,7 @@
                 size: 34.49282,
                 min_size_ratio: 0.28457144,
                 hardness: 1.0,
-                opacity: 0.1,
+                opacity: 0.5217031,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12802,7 +12802,7 @@
                     points: (0.0, 0.14683586, 0.34787667, 0.62313247, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.17721644, 0.40295523, 0.6772164, 1.0),
+                    points: (0.0, 0.22550699, 0.47952616, 0.74353486, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.37499997, 0.75000024, 1.0, 1.0),
@@ -12868,7 +12868,7 @@
                 size: 3.094973,
                 min_size_ratio: 0.3773625,
                 hardness: 0.5,
-                opacity: 0.15,
+                opacity: 0.6203546,
                 spacing: 0.125,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12877,7 +12877,7 @@
                     points: (0.0, 0.21771318, 0.51363355, 0.9158545, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.32987797, 0.6007043, 0.82145613, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.50000006, 0.75, 1.0),
@@ -12924,7 +12924,7 @@
                 size: 1.5236158,
                 min_size_ratio: 0.032453753,
                 hardness: 1.0,
-                opacity: 0.45000002,
+                opacity: 0.94967157,
                 spacing: 0.19762845,
                 pressure_size: true,
                 pressure_opacity: true,
@@ -12933,7 +12933,7 @@
                     points: (0.0, 0.07161467, 0.29613057, 1.0, 0.60932165),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.125, 0.33333334, 0.625, 1.0),
+                    points: (0.0, 0.26465958, 0.5857759, 0.8510121, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13138,7 +13138,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13213,7 +13213,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13288,7 +13288,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.25, 0.5, 0.75, 1.0),
+                    points: (0.0, 0.578125, 0.875, 0.984375, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13372,7 +13372,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.8712896, 1.0, 1.0, 1.0),
+                    points: (0.0, 0.9999973, 1.0, 1.0, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13447,7 +13447,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.6970317, 0.7980211, 0.89901054, 1.0),
+                    points: (0.0, 0.9721906, 0.9917602, 0.99897003, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -13503,7 +13503,7 @@
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),
                 ),
                 opacity_curve: (
-                    points: (0.0, 0.7967607, 0.8645071, 0.93225354, 1.0),
+                    points: (0.0, 0.9860213, 0.9946057, 0.99873215, 1.0),
                 ),
                 hardness_curve: (
                     points: (0.0, 0.25, 0.5, 0.75, 1.0),

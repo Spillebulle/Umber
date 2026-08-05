@@ -1596,9 +1596,10 @@ raising `dab_ratio` narrows the dab rather than growing it.
 - **Antialiasing is sized from the *short* axis.** It is the demanding one: a
   chisel two pixels across needs the same softening a two-pixel round brush
   does.
-- **Spacing is a fraction of the dab's width *along the stroke*, not of its
-  long axis.** `Brush::step_at` takes the angle between the two and uses the
-  ellipse's own support, `sqrt((a cos Δ)² + (b sin Δ)²)`; `Brush::off_heading`
+- **Spacing is a fraction of how far the dab *reaches* along the stroke, not of
+  its long axis.** `Brush::step_at` takes the angle between the two and uses the
+  ellipse's **radius** in that direction, `1 / sqrt((cos Δ / a)² + (sin Δ / b)²)`;
+  `Brush::off_heading`
   is where that angle comes from, and it is constant for a brush that follows
   the stroke and a function of the heading for one that does not. **A round dab
   is the exact identity** — `a == b` makes the support constant — so this
@@ -1611,7 +1612,16 @@ raising `dab_ratio` narrows the dab rather than growing it.
   spacing against the same long radius, so Ramón Miranda's "Marker" asks for a
   14.1 px step on a dab 10.4 px wide there too, and the faithful reading was
   the wrong one. What is left gapping is the two presets whose spacing is
-  *above* 1.0, which is an author asking for separated dabs. The nominal
+  *above* 1.0, which is an author asking for separated dabs. **It is the radius
+  and not the *shadow*, `sqrt((a cos Δ)² + (b sin Δ)²)`**, which is what this
+  used first and is a different number wherever the stroke runs at an angle to
+  the nib: for the shipped calligraphy pen at 46° off its own axis they are
+  8.3 px and 2.9 px, and the pen still combed at the larger one. The shadow is
+  how much ground a dab covers measured *across* the direction of travel; what
+  decides whether two dabs merge is how far the ellipse actually reaches
+  *along* it. The two agree at 0° and 90°, which is why the markers were fixed
+  by either reading and the calligraphy pen, the scrapers and every other fixed
+  nib by only one. The nominal
   `dab_ratio` and angle decide it, never `dab_angle_jitter` or a `dynamics`
   modulation: both move a single dab, and letting either into the step would
   make a stroke's spacing wander with the RNG. The tip mask's own proportions
@@ -1647,6 +1657,22 @@ genuinely reaches zero.
 
 - **Read them through `radius_at` / `hardness_at` / `scatter_at`, never off the
   field.** The field is the value at full pressure, not the value now.
+- **An imported per-dab opacity is converted to a stroke opacity, and is not
+  the same number.** MyPaint, Krita and Clip Studio state an alpha *per dab*
+  and composite every dab; `Brush::opacity` is applied once at commit over
+  coverage a `max` has already saturated. `tip::dab_stack_alpha` is the
+  conversion — the third of `stroke_coverage`'s family — and it simulates the
+  dab pass's own falloff at the stroke's centre line. Reading one as the other
+  shipped `4H_pencil` at 0.026 where MyPaint draws about 0.14, and put
+  twenty-nine presets under 35% opacity with the faintest at 0.015. **The curve
+  is converted with it**, because the relation is not linear: half the per-dab
+  alpha is not half the built-up one, so a curve normalised on the raw values
+  bends the wrong way once the peak has moved. A brush already painting solid
+  comes back unchanged, which is most of the library — the median opacity is
+  and stays exactly 1.0. **Only the MyPaint reader does this so far**; `kpp`
+  and `clipstudio` state their opacity the same way and have not been
+  converted, and Krita's wash/build-up painting modes have to be read before
+  its can be.
 - **`min_scatter_ratio` may legitimately be zero**, unlike the size and hardness
   ratios: "clean line until you press" is a real pencil, and 16 shipped brushes
   are exactly that.

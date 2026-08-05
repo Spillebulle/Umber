@@ -954,6 +954,61 @@ impl StrokeCoverage {
     }
 }
 
+/// The stroke opacity that reproduces a per-dab one.
+///
+/// The third of this family, after [`stroke_coverage`] for a tip and
+/// [`grain_coverage`] for a paper, and it exists for the same reason both of
+/// those do: **MyPaint, Krita and Clip Studio state a per-dab alpha and
+/// composite every dab, where `Brush::opacity` is applied once at commit over
+/// coverage a `max` has already saturated.** Reading one as the other is not an
+/// approximation, it is a different number — and on a dense brush it is out by
+/// most of the mark.
+///
+/// `4H_pencil` states `opaque` 0.0257 with four dabs per radius. In MyPaint
+/// those eight overlapping dabs build to about 0.19; read as a stroke opacity
+/// it painted at 0.026, which is a pencil seven times fainter than its author
+/// drew. Twenty-nine shipped presets sat under 35% for this reason, the
+/// faintest at 0.015.
+///
+/// The simulation is the dab pass's own: dabs every `spacing` of a radius along
+/// a line, each contributing `per_dab × falloff` at the point being measured,
+/// composited `a += c(1 − a)`. Measured at the **centre line**, which is where
+/// a stroke's strength is read from — the edges differ between the two rules
+/// whatever is done here, because one has a built-up falloff and the other has
+/// a `max`ed one, and no single number reconciles that.
+///
+/// **`per_dab` at or above 1.0 comes back as 1.0**, so every brush that already
+/// paints solid is untouched — which is most of the library, whose median
+/// opacity is exactly 1.0.
+pub fn dab_stack_alpha(per_dab: f32, spacing: f32, hardness: f32) -> f32 {
+    let per_dab = per_dab.clamp(0.0, 1.0);
+    if per_dab <= 0.0 {
+        return 0.0;
+    }
+    // In radii: a dab lands every `2 × spacing` of them, and one reaches 1.0.
+    let step = (spacing.clamp(0.001, 4.0) * 2.0).max(1e-3);
+    let reach = (1.0 / step).ceil() as i32;
+
+    let mut alpha = 0.0f32;
+    for i in -reach..=reach {
+        let d = (i as f32 * step).abs();
+        if d >= 1.0 {
+            continue;
+        }
+        // The fragment shader's falloff, with the antialiasing margin left out:
+        // that is a per-pixel softening at the rim and this is the centre line.
+        let inner = hardness.clamp(0.0, 1.0);
+        let t = if inner >= 1.0 {
+            0.0
+        } else {
+            ((d - inner) / (1.0 - inner)).clamp(0.0, 1.0)
+        };
+        let coverage = 1.0 - t * t * (3.0 - 2.0 * t);
+        alpha += per_dab * coverage * (1.0 - alpha);
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
 /// What a stroke through `tile` reaches under each rule, at `strength`.
 ///
 /// [`stroke_coverage`]'s twin for the *paper*, and it exists because the tip's

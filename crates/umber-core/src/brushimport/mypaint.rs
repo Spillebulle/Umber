@@ -281,7 +281,7 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
         || file.is_driven("opaque_multiply", DabInput::Pressure))
         && a_max > 0.0
         && a_min < a_max * 0.99;
-    let opacity_curve = if opacity_varies {
+    let mut opacity_curve = if opacity_varies {
         let mut points = [0.0f32; ResponseCurve::N];
         for (point, a) in points.iter_mut().zip(&alphas) {
             *point = (a / a_max).clamp(0.0, 1.0);
@@ -334,6 +334,36 @@ pub fn from_myb(json: &str) -> Result<Brush, PresetError> {
     } else {
         Brush::default().spacing
     };
+
+    // --- what that opacity is *of* ---------------------------------------
+    //
+    // **MyPaint's `opaque` is a per-dab alpha and MyPaint composites every
+    // dab; `Brush::opacity` is applied once at commit over coverage a `max`
+    // has already saturated.** Reading one as the other is not an
+    // approximation, it is a different number, and on a dense brush it is out
+    // by most of the mark: `4H_pencil` states 0.0257 with four dabs per
+    // radius, which builds to about 0.19 in MyPaint and arrived here painting
+    // at 0.026. Twenty-nine shipped presets sat under 35% opacity for this
+    // reason, the faintest at 0.015.
+    //
+    // Here rather than in the block above because the conversion needs the
+    // spacing, which is what decides how many dabs reach a point.
+    // `dab_stack_alpha` is the third of `stroke_coverage`'s family and has the
+    // argument; a brush already painting solid comes back unchanged, which is
+    // most of the library.
+    let stacked = |a: f32| crate::tip::dab_stack_alpha(a, spacing, h_max);
+    let opacity = stacked(opacity);
+    // And the curve with it, because the relation is not linear: half the
+    // per-dab alpha is not half the built-up one, so a curve normalised on the
+    // raw values would bend the wrong way once the peak had moved.
+    if opacity_varies {
+        let peak = stacked(a_max).max(1e-6);
+        let mut points = [0.0f32; ResponseCurve::N];
+        for (point, a) in points.iter_mut().zip(&alphas) {
+            *point = (stacked(*a) / peak).clamp(0.0, 1.0);
+        }
+        opacity_curve = ResponseCurve { points };
+    }
 
     // `dabs_per_second` carries straight across — Umber's dab loop now has a
     // time term of its own. A brush with *no* distance term is an airbrush and
@@ -1094,9 +1124,13 @@ mod tests {
         let b = from_myb(json).expect("imports");
         assert!(b.opacity > 0.99, "opacity was {}", b.opacity);
         assert!(b.pressure_opacity);
-        // alpha(p) = p * p, so a light touch is nearly nothing and full
-        // pressure is solid.
-        assert!(b.coverage_at(0.5) < 0.3, "{}", b.coverage_at(0.5));
+        // alpha(p) = p * p per dab, and what Umber holds is what a *stroke* of
+        // those reaches — see `tip::dab_stack_alpha`. So a light touch is still
+        // light and full pressure is still solid, but the middle is fuller than
+        // the per-dab figure: ten overlapping dabs at a quarter each build most
+        // of the way, which is what MyPaint draws.
+        assert!(b.coverage_at(0.1) < 0.25, "{}", b.coverage_at(0.1));
+        assert!(b.coverage_at(0.5) < b.coverage_at(1.0));
         assert!((b.coverage_at(1.0) - 1.0).abs() < 1e-4);
     }
 
@@ -1285,10 +1319,18 @@ mod tests {
     fn an_airbrush_keeps_its_opacity_curve() {
         let b = from_myb(AIRBRUSH).expect("import");
         assert!(b.pressure_opacity);
-        assert!((b.opacity - 0.4).abs() < 1e-5, "opacity {}", b.opacity);
-        // The mapping is 0 → 0, 0.5 → 0.25, 1 → 1: strongly eased in, which is
-        // what makes an airbrush feel like one.
-        assert!(b.opacity_curve.sample(0.5) < 0.3);
+        // 0.4 is the per-*dab* alpha the file states; what Umber holds is the
+        // stroke those dabs build to, which is more. Asserted as an inequality
+        // rather than as a figure, because the figure is
+        // `tip::dab_stack_alpha`'s and pinning it here would be testing that
+        // function against itself in a second place.
+        assert!(b.opacity > 0.4, "opacity {}", b.opacity);
+        assert!(b.opacity <= 1.0);
+        // The mapping is 0 → 0, 0.5 → 0.25, 1 → 1: eased in, which is what
+        // makes an airbrush feel like one. Still eased after the conversion,
+        // which is the property that matters — a curve that came out straight
+        // would be a brush whose pressure did nothing until it did everything.
+        assert!(b.opacity_curve.sample(0.5) < 0.95);
         assert!((b.opacity_curve.sample(1.0) - 1.0).abs() < 1e-5);
         assert!((b.opacity_curve.sample(0.0)).abs() < 1e-5);
         // slow_tracking 4 → 4/5.
