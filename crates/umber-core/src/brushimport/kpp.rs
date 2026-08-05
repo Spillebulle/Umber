@@ -733,9 +733,22 @@ pub fn from_kpp_in(bytes: &[u8], beside: &Sidecar<'_>) -> Result<KppPreset, Pres
     // [`super::gbr::to_brush`] and [`super::abr::to_brush`] measure it, and for
     // the same reason: a photographic stamp looks dense and is not. A generated
     // dab is solid, so this is the identity for every brush without a tip.
+    //
+    // **And the paper decides it on the same grounds**, which the tip's reading
+    // is structurally unable to see. A grain is anchored to the document, so
+    // every dab reaching a pixel is scaled by the same texel: Krita's
+    // compositing builds those faint texels towards solid where Umber's `max`
+    // caps the whole stroke at the tile's own value. The tip's rule takes the
+    // *peak* — right for a stamp, and blind to a paper, whose brightest texel
+    // survives any strength. `crate::tip::grain_coverage` takes the mean and
+    // says why. The strength is folded in there, so a brush with no texture
+    // asks and is told no.
     let build_up = tip
         .as_ref()
-        .is_some_and(|mask| crate::tip::stroke_coverage(mask, spacing).needs_build_up());
+        .is_some_and(|mask| crate::tip::stroke_coverage(mask, spacing).needs_build_up())
+        || paper
+            .as_ref()
+            .is_some_and(|tile| crate::tip::grain_coverage(tile, grain, spacing).needs_build_up());
 
     let brush = Brush {
         size: (base_size * size.peak * size_scale).clamp(Brush::MIN_SIZE, Brush::MAX_SIZE),
@@ -3205,6 +3218,39 @@ mod tests {
             internal("Texture/Pattern/Enabled", "true"),
         );
         kpp(&xml)
+    }
+
+    /// A paper caps a `max` stroke exactly as a faint stamp does, so it is
+    /// measured for build-up too.
+    ///
+    /// The same rule the tip has answered to since build-up existed, applied to
+    /// the half of the mark it cannot see: `stroke_coverage` takes the *peak*,
+    /// which for a grain survives any strength, so a tile that keeps a tenth of
+    /// the dab everywhere but its highlights reads as perfect agreement. The
+    /// bug was reported against a Clip Studio brush and this reader had it too —
+    /// Krita composites every dab, which is the sentence build-up already rests
+    /// on here.
+    #[test]
+    fn a_paper_that_caps_the_stroke_is_measured_for_build_up() {
+        // A quarter white, the rest a tenth lit: faint rather than black, which
+        // is what compositing can build and a `max` cannot. A generated dab, so
+        // the tip's reading is not what answers.
+        let dark = grey_pattern(2, 2, &[255, 26, 26, 26]);
+        let read = from_kpp(&textured(&embedded_pattern(&dark))).expect("decode");
+        assert!(read.paper.is_some());
+        assert_eq!(read.brush.grain, 1.0);
+        assert!(
+            read.brush.build_up,
+            "a paper this dark caps the stroke at a fraction of its own opacity"
+        );
+
+        // A tile that takes nothing away leaves the brush on the `max` path,
+        // which is the cheaper one and the default everything without a texture
+        // still gets.
+        let blank = grey_pattern(2, 2, &[255, 255, 255, 255]);
+        let plain = from_kpp(&textured(&embedded_pattern(&blank))).expect("decode");
+        assert!(plain.paper.is_some());
+        assert!(!plain.brush.build_up);
     }
 
     /// A paper texture is read under the key Krita actually writes.

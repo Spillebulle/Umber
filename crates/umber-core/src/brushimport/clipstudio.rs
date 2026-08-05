@@ -149,7 +149,7 @@ use crate::curve::ResponseCurve;
 use crate::dynamics::{DabInput, DabTarget, Modulation};
 use crate::preset::PresetError;
 use crate::sqlite::{Database, Row, Table, Value};
-use crate::tip::{TipMask, stroke_coverage};
+use crate::tip::{self, TipMask, stroke_coverage};
 
 /// Every loss this importer can report, in one place.
 ///
@@ -1606,6 +1606,31 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
                 }
             }
         }
+        // **A paper decides build-up exactly as a tip does**, and leaving it to
+        // the tip alone is what made a textured brush arrive nearly
+        // transparent. Clip Studio composites every dab — the sentence the tip
+        // block below already rests on — and the grain is anchored to the
+        // document, so every dab reaching a pixel is scaled by the *same*
+        // texel: under compositing those faint texels build towards solid, and
+        // under Umber's `max` they cap the whole stroke at the tile's own value
+        // for as long as the stroke lasts.
+        //
+        // The reported brush is the measurement: a 500×500 grunge scatter at
+        // `TextureDensity` 100, mean 0.272, painting at 27% of the opacity its
+        // author set where Clip Studio's stroke reaches 77%. The tip's rule
+        // could not have caught it and this is not a threshold that was too
+        // slack — two of the four sub-tools carry no tip at all, so it never
+        // ran, and the tile's brightest texel is 255, so the peak it takes
+        // agrees with itself. See `tip::grain_coverage` for why the paper's
+        // statistic is the mean.
+        //
+        // `|=` in both places rather than an assignment in each: either the tip
+        // or the paper is reason enough, and whichever is read second must not
+        // be able to take the other's answer off.
+        if let Some(tile) = &paper {
+            brush.build_up |=
+                tip::grain_coverage(tile, brush.grain, brush.spacing).needs_build_up();
+        }
         // Umber's own bound on a tile, and it is newly reachable: `full` used
         // to be 256, so the ceiling needed a `TextureScale2` of 800%. Now that
         // it is the material's own longest side the two overlap **exactly** —
@@ -1642,7 +1667,7 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
                 // the shipped library.
                 let measured = stroke_coverage(&mask, brush.spacing);
                 if measured.is_usable() {
-                    brush.build_up = measured.needs_build_up();
+                    brush.build_up |= measured.needs_build_up();
                     tip = Some(mask);
                 } else {
                     // A mask with nothing dark in it would be a brush that
@@ -3483,6 +3508,52 @@ mod tests {
             "got {}",
             paper.at(4, 4)
         );
+    }
+
+    /// **A brush with no tip at all still has to be measured for build-up**,
+    /// because its paper can cap the stroke just as a faint stamp does.
+    ///
+    /// This is the bug as it was reported, in the smallest form that carries
+    /// it. A sketch pencil arrived painting at roughly a quarter of the opacity
+    /// it was set to: its texture is a dark grunge scatter at `TextureDensity`
+    /// 100, and under Umber's `max` the whole stroke is capped at the tile's own
+    /// mean for as long as the stroke lasts, where Clip Studio composites every
+    /// dab and builds the faint texels back towards solid.
+    ///
+    /// Two of the four textured sub-tools in the reported file carry no bitmap
+    /// tip, so `stroke_coverage` never ran on them at all — which is why the
+    /// fixture has none either. `tip::grain_coverage`'s own test covers the
+    /// half where it runs and cannot see the paper.
+    #[test]
+    fn a_paper_that_caps_the_stroke_arrives_with_build_up() {
+        let path = ".:paper:data:material_0.layer";
+        // A tenth lit, which is a paper that bites hard and is not a stencil:
+        // faint texels are what compositing builds and a `max` cannot.
+        let dark = material(8, 8, [26, 26, 26, 255]);
+        let bytes = sut(
+            &[(
+                "Sketch",
+                Variant::plain(1)
+                    .set("TextureImage", reference(path, 1))
+                    .int("TextureDensity", 100),
+            )],
+            &[(path, dark)],
+        );
+        let tool = from_sut(&bytes).expect("read").tools.remove(0);
+
+        assert!(tool.tip.is_none(), "the fixture has no stamp to be read");
+        assert_eq!(tool.brush.grain, 1.0);
+        assert!(
+            tool.brush.build_up,
+            "a paper this dark caps the stroke at a fraction of its own opacity"
+        );
+
+        // And a brush whose texture is switched off is untouched by any of it,
+        // so the `max` path stays the default it always was.
+        let plain = sut(&[("Flat", Variant::plain(1))], &[]);
+        let plain = from_sut(&plain).expect("read").tools.remove(0);
+        assert!(!plain.brush.has_grain());
+        assert!(!plain.brush.build_up);
     }
 
     /// The paper is the **material's own pixels**, and the thumbnail is only

@@ -1577,6 +1577,50 @@ with a mean of 0.775 — so a single stroke at full opacity could not reach 1.0
 anywhere, and a second pass over the first was darker, because the pits are
 anchored to the document and the second stroke fell into the same ones.
 
+#### The paper decides build-up, and the tip's reading could not see it
+
+It was reported painting weaker than its opacity says, and the paper above was
+not why. `Sketch` carries its author's own tile now — a 500×500 grunge scatter,
+mean **0.272**, brightest texel 255 — at `TextureDensity` 100. Under the `max`
+blend that is the entire stroke at 27% of the opacity it was set to, for as long
+as the stroke lasts. Clip Studio composites every dab, which is the sentence the
+tip's build-up measurement already rests on here, and the grain is anchored to
+the document, so every dab reaching a pixel is scaled by the *same* texel: at a
+spacing of 0.100 those faint texels build towards solid and the same tile reaches
+**0.771**. Nearly three times the mark, and gritty rather than a flat wash.
+
+Two things kept `stroke_coverage` from catching it, and only the first is an
+oversight:
+
+- It ran **inside the tip block**. Two of the four textured sub-tools in the
+  reported file carry no bitmap tip at all, so nothing measured them.
+- It takes the **peak**, and for a paper the peak is not the mark. A tip is
+  stretched over its dab, so a `max` stroke is capped at the mask's brightest
+  texel and the whole mark is capped with it. A paper is sampled at the document
+  pixel: its brightest texel survives any strength, so peak agreement is 1.0 on
+  a tile that is taking three quarters of the stroke away.
+
+So `tip::grain_coverage` is the twin that takes the **mean**, with the strength
+folded in through the dab pass's own `mix(1, t, strength)` — zero strength is the
+exact identity there as everywhere else. It needs no stamping loop, because
+there is no geometry: `max` is exactly the tile and compositing is
+`1 − (1 − t)^n` for the `n = 1 / spacing` dabs deep a point sits under. Both
+readers ask it, `|=` beside the tip's answer, since either is reason enough and
+neither may take the other's off.
+
+**A stencil is the boundary and answers no.** Where a tile holds only 0 and 1
+there is nothing for compositing to build — a texel at zero stays there however
+many dabs land on it — so the two rules make the identical mark and the cheaper
+one is right. The rule is for a grain that is *faint*, not one that is merely
+dark, and `a_paper_that_caps_a_stroke_asks_for_build_up_where_a_tips_peak_cannot`
+pins both ends of it.
+
+In the shipped library this changed exactly six presets, all of them Krita's and
+all at `grain: 1.0`, and nothing else: no preset appeared, none vanished, and
+`build_up` is the only field that moved. The guard is
+`a_shipped_stamp_paints_at_the_strength_it_was_drawn_at`, which now measures both
+halves of the mark and agrees with the generator independently.
+
 **The `Dual*` columns are a second whole brush, and `UseDualBrush` is the only
 field that says whether it is live.** Clip Studio's dual brush stamps a second
 brush on top of the first at the same time: `Variant` carries a parallel copy of

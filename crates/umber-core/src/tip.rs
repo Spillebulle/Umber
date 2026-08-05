@@ -894,18 +894,25 @@ pub fn pattern(name: &str) -> Option<&'static Arc<TipMask>> {
     patterns().get(name)
 }
 
-/// What a straight stroke of one tip reaches, under each of the two coverage
-/// rules the dab pass offers.
+/// What a straight stroke reaches, under each of the two coverage rules the dab
+/// pass offers.
 ///
 /// The measurement that decides whether a stamp can be shipped, and the reason
 /// it is a function rather than a judgement: a photographic texture stamp looks
 /// dense and is not. See `docs/brush-sources.md`.
+///
+/// **Two things are measured into it and they take different statistics**, so
+/// the fields say "coverage" rather than "peak". [`stroke_coverage`] reads a
+/// tip and takes the **peak**; [`grain_coverage`] reads a paper and takes the
+/// **mean**. Each of those documents why, and the choice is not cosmetic — the
+/// peak rule cannot see a paper at all, which is exactly how a Clip Studio
+/// brush came to paint at 27% of its own opacity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StrokeCoverage {
-    /// Strongest coverage anywhere in the stroke under the wet-layer `max`.
+    /// Coverage the stroke reaches under the wet-layer `max`.
     ///
-    /// Bounded above by the mask's own brightest texel, whatever the spacing
-    /// and however long the stroke — which is the entire problem.
+    /// Bounded above by the brightest texel it was measured from, whatever the
+    /// spacing and however long the stroke — which is the entire problem.
     pub under_max: f32,
     /// The same, with each dab compositing over the last:
     /// [`crate::Brush::build_up`]. This is what GIMP and Krita draw.
@@ -938,8 +945,67 @@ impl StrokeCoverage {
     /// The floor is the `R8Unorm` scratch: a dab weaker than `1/255` rounds
     /// away and a stroke of them never accumulates, so a mask that faint is a
     /// brush that paints nothing however hard it is pressed.
+    ///
+    /// A tip's reading alone. A paper is not a mark and cannot be unusable —
+    /// grain at any strength still lets the peaks through — so
+    /// [`grain_coverage`]'s answer is never asked this.
     pub fn is_usable(&self) -> bool {
         self.under_build_up >= 0.5
+    }
+}
+
+/// What a stroke through `tile` reaches under each rule, at `strength`.
+///
+/// [`stroke_coverage`]'s twin for the *paper*, and it exists because the tip's
+/// reading is structurally blind to a grain. Three things differ, and each of
+/// them is why:
+///
+/// - **The statistic is the mean, not the peak.** A tip is stretched over its
+///   dab, so a `max` stroke is capped at the mask's brightest texel and the
+///   whole mark is capped with it — peak is the mark. A paper is anchored to
+///   the *document*: it is sampled at the pixel rather than at the dab, so its
+///   brightest texel survives whatever the strength and the peak agrees with
+///   itself. What collapses is everything else. The tile that prompted this is
+///   a dark grunge scatter with a mean of 0.272 and a maximum of 255 — peak
+///   agreement 1.0, and a stroke at 27% of the opacity its author set.
+/// - **There is no geometry.** Every dab reaching one document pixel is scaled
+///   by the *same* texel, so the `max` rule is exactly `tile × strength'd`,
+///   and build-up is `1 - (1 - t)^n` with `n` the dabs deep the spacing puts on
+///   a point. No stamping loop, no mask centred in a square: those describe a
+///   picture that moves with the brush, and this one does not.
+/// - **`strength` is folded in first**, through `mix(1, t, strength)` — the dab
+///   pass's own line, so a strength of zero is the exact identity here as well
+///   and answers agreement 1.0 without a special case.
+///
+/// `n` is `1 / spacing`, the dabs whose footprint covers a point when they land
+/// every `spacing × diameter`. Taken at full coverage: what is being asked is
+/// whether the *rule* changes the mark, and a dab's own falloff scales both
+/// sides of that.
+pub fn grain_coverage(tile: &TipMask, strength: f32, spacing: f32) -> StrokeCoverage {
+    let strength = strength.clamp(0.0, 1.0);
+    let deep = (1.0 / spacing.clamp(0.01, 1.0)).round().max(1.0) as i32;
+
+    let texels = tile.coverage();
+    if texels.is_empty() {
+        return StrokeCoverage {
+            under_max: 1.0,
+            under_build_up: 1.0,
+        };
+    }
+
+    let mut under_max = 0.0f64;
+    let mut under_build_up = 0.0f64;
+    for texel in texels {
+        let t = f64::from(*texel) / 255.0;
+        let bite = 1.0 - f64::from(strength) * (1.0 - t);
+        under_max += bite;
+        under_build_up += 1.0 - (1.0 - bite).powi(deep);
+    }
+    let count = texels.len() as f64;
+
+    StrokeCoverage {
+        under_max: (under_max / count) as f32,
+        under_build_up: (under_build_up / count) as f32,
     }
 }
 
@@ -1195,28 +1261,54 @@ mod tests {
 
     /// Every shipped stamp has to paint at the strength it was drawn at, which
     /// after the build-up work is a measurable claim rather than a hope.
+    ///
+    /// **Both halves of the mark are measured, because either can cap it.** A
+    /// tip is capped at its own brightest texel; a paper caps the stroke at the
+    /// tile's mean wherever the grain bites. Reading only the first is what
+    /// shipped six textured presets on the `max` path — and what let a Clip
+    /// Studio sketch pencil arrive at 27% of its own opacity, which is where
+    /// this was reported from.
     #[test]
     fn a_shipped_stamp_paints_at_the_strength_it_was_drawn_at() {
-        let stamped: Vec<_> = crate::preset::builtin()
+        let marked: Vec<_> = crate::preset::builtin()
             .iter()
-            .filter(|p| p.tip.is_some())
+            .filter(|p| p.tip.is_some() || p.brush.has_grain())
             .collect();
         assert!(
-            !stamped.is_empty(),
-            "the shipped library carries no stamp brush, so the mechanism is untested"
+            !marked.is_empty(),
+            "the shipped library carries no stamp or textured brush, so the \
+             mechanism is untested"
         );
 
-        for preset in stamped {
-            let name = preset.tip.as_deref().expect("tip");
-            let mask = builtin(name)
-                .unwrap_or_else(|| panic!("{} names a tip nobody ships: {name}", preset.name));
-            let measured = stroke_coverage(mask, preset.brush.spacing);
+        for preset in marked {
+            let mut wanted = false;
+            let mut how = String::new();
+
+            if let Some(name) = preset.tip.as_deref() {
+                let mask = builtin(name)
+                    .unwrap_or_else(|| panic!("{} names a tip nobody ships: {name}", preset.name));
+                let measured = stroke_coverage(mask, preset.brush.spacing);
+                wanted |= measured.needs_build_up();
+                how.push_str(&format!(" tip {measured:?}"));
+            }
+
+            if preset.brush.has_grain() {
+                let name = preset
+                    .paper
+                    .as_deref()
+                    .unwrap_or_else(|| preset.brush.grain_pattern.key());
+                let tile = pattern(name).unwrap_or_else(|| {
+                    panic!("{} names a paper nobody ships: {name}", preset.name)
+                });
+                let measured = grain_coverage(tile, preset.brush.grain, preset.brush.spacing);
+                wanted |= measured.needs_build_up();
+                how.push_str(&format!(" paper {measured:?}"));
+            }
+
             assert_eq!(
-                preset.brush.build_up,
-                measured.needs_build_up(),
-                "{} is shipped with build_up = {} but measures {measured:?}",
-                preset.name,
-                preset.brush.build_up
+                preset.brush.build_up, wanted,
+                "{} is shipped with build_up = {} but measures{how}",
+                preset.name, preset.brush.build_up
             );
         }
     }
@@ -1513,6 +1605,93 @@ mod tests {
         // brush at all.
         let ghost = TipMask::new(8, 8, vec![0; 64]).expect("build");
         assert!(!stroke_coverage(&ghost, 0.1).is_usable());
+    }
+
+    /// **The tip's rule is structurally blind to a paper, and this is the shape
+    /// of the brush that proved it.**
+    ///
+    /// A Clip Studio sketch pencil arrived nearly transparent: a 500×500 grunge
+    /// scatter at `TextureDensity` 100, a mean of 0.272 and a brightest texel of
+    /// 255. Under the `max` blend that is the whole stroke at 27% of the opacity
+    /// its author set, for as long as the stroke lasts; Clip Studio composites
+    /// every dab, so the same tile there reaches 77%.
+    ///
+    /// The fixture is that tile in miniature — a quarter of it white and the
+    /// rest a tenth lit — and the first assertion is the one that matters:
+    /// [`stroke_coverage`]'s peak agrees with itself on it, so no threshold on
+    /// the tip's reading could ever have caught this.
+    ///
+    /// The faint texels are deliberately **not** black, and that is the rule's
+    /// own boundary rather than a detail of the fixture: see the stencil at the
+    /// foot of this test.
+    #[test]
+    fn a_paper_that_caps_a_stroke_asks_for_build_up_where_a_tips_peak_cannot() {
+        let scatter = TipMask::new(4, 4, {
+            let mut texels = vec![26u8; 16];
+            texels[..4].fill(255);
+            texels
+        })
+        .expect("build");
+
+        // The reading that was already there, on the same picture. Its peak is
+        // 1.0 under both rules, so it reports perfect agreement — correctly,
+        // for a *tip*, and uselessly for a paper.
+        assert!(!stroke_coverage(&scatter, 0.1).needs_build_up());
+
+        let measured = grain_coverage(&scatter, 1.0, 0.1);
+        assert!(
+            (measured.under_max - 0.326).abs() < 1e-2,
+            "the mean is the mark a `max` stroke makes, got {measured:?}"
+        );
+        assert!(
+            measured.under_build_up > 0.7,
+            "compositing builds the faint texels towards solid, got {measured:?}"
+        );
+        assert!(measured.needs_build_up());
+
+        // Half the strength is half the bite, so the same tile at 0.5 still
+        // caps the stroke and still asks.
+        assert!(grain_coverage(&scatter, 0.5, 0.1).needs_build_up());
+
+        // **A stencil is the boundary, and it answers no.** Where a tile is
+        // only ever 0 or 1 there is nothing for compositing to build: a texel
+        // at zero stays at zero however many dabs land on it, and one at full
+        // is already solid. The two rules make the identical mark, so the
+        // cheaper one is right — build-up is for a grain that is *faint*, not
+        // for one that is merely dark.
+        let stencil = TipMask::new(4, 4, {
+            let mut texels = vec![0u8; 16];
+            texels[..4].fill(255);
+            texels
+        })
+        .expect("build");
+        assert!(!grain_coverage(&stencil, 1.0, 0.1).needs_build_up());
+    }
+
+    /// A grain that takes nothing away asks for nothing, and the two ends of
+    /// that are the identities the dab pass already promises.
+    #[test]
+    fn a_grain_that_bites_nothing_needs_no_build_up() {
+        let scatter = TipMask::new(4, 4, {
+            let mut texels = vec![0u8; 16];
+            texels[..4].fill(255);
+            texels
+        })
+        .expect("build");
+
+        // `mix(1, tile, 0)` is exactly 1.0 — the shader's own line — so a brush
+        // with a paper it cannot feel is on the `max` path, whatever the tile
+        // happens to hold.
+        let none = grain_coverage(&scatter, 0.0, 0.1);
+        assert_eq!(none.under_max, 1.0);
+        assert!(!none.needs_build_up());
+
+        // And a tile that is white everywhere is the same identity from the
+        // other side, at full strength.
+        let blank = TipMask::new(4, 4, vec![255; 16]).expect("build");
+        let full = grain_coverage(&blank, 1.0, 0.1);
+        assert_eq!(full.under_max, 1.0);
+        assert!(!full.needs_build_up());
     }
 
     /// The whole of what a tip drawn in Umber is: the alpha, and nothing else.

@@ -90,6 +90,25 @@ Invariants that are easy to break:
   stays exactly as it was. Build-up is only meaningful where a dab is not solid
   — a bitmap tip, grain, or a pressure-opacity ramp — which is why no MyPaint
   brush uses it.
+- **An importer measures the *paper* for build-up as well as the tip, and the
+  two take different statistics.** Both can cap a stroke and the tip's reading
+  cannot see the other one. `tip::stroke_coverage` takes the **peak**, which is
+  the mark for a stamp: a tip is stretched over its dab, so a `max` stroke is
+  capped at the mask's brightest texel and the whole mark is capped with it. A
+  grain is anchored to the *document*, so it is sampled at the pixel rather than
+  at the dab — its brightest texel survives whatever the strength, the peak
+  agrees with itself, and what collapses is the **mean**. That is
+  `tip::grain_coverage`, and there is no stamping loop in it because every dab
+  reaching a pixel is scaled by the same texel: `max` is exactly the tile, and
+  compositing is `1 − (1 − t)^n`. Reading the tip alone shipped six textured
+  presets on the `max` path and made a Clip Studio sketch pencil arrive at 27%
+  of the opacity its author set — a 500×500 grunge scatter of mean 0.272 at
+  `TextureDensity` 100, where Clip Studio's own stroke reaches 77%. Two of that
+  file's four textured sub-tools carry no tip at all, so the measurement never
+  even ran. **A stencil is the boundary and answers no**: where a tile is only
+  ever 0 or 1 there is nothing to build, so the two rules make the identical
+  mark and the cheaper one is right. Build-up is for a grain that is *faint*,
+  not for one that is merely dark.
 - **There are four dab pipelines**, from two independent binary choices
   (per-dab colour, build-up), built by one loop over one descriptor rather than
   four copies of it. `DabStyle` carries both and must be the same for every
