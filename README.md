@@ -111,12 +111,11 @@ hardness, scatter, ellipticity, angle and colour.
 
 ### Change one mid-painting
 
-<img src="docs/images/tweaks.png" alt="The Brush tweaks module: six rails, each
-with a hold-and-drag grip beside it" align="right" width="270">
+<img src="docs/images/tweaks.png" alt="The Brush tweaks module: six rails"
+align="right" width="270">
 
 **Brush tweaks** puts six rails where you can reach them while a picture is
-under way. Each has a hold-and-drag grip beside it, and size and opacity have
-theirs above the canvas already.
+under way. Size and opacity are above the canvas already.
 
 All eight take a keyboard pair too. They change the brush in your hand and not
 the brush you saved, so picking any brush puts its own settings back.

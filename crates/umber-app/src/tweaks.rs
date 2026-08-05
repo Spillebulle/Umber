@@ -32,51 +32,51 @@
 //!   `Editor::brush`. It has always done so; a tweak is not hidden from it, and
 //!   the Update button there is what makes one permanent.
 //!
-//! ## One table, three ways of asking
+//! ## One table, two ways of asking
 //!
-//! A rail, an increase/decrease shortcut and a hold-and-drag grip are three
-//! spellings of one question, so they go through one [`Tweak`]. What makes it
-//! worth a table rather than three call sites is the *step*: one press of a
-//! shortcut is worth [`STEP_PX`] pixels of the drag. `Brush::RESIZE_DOUBLE_PX`
-//! is 100, so a size press is `2^(20/100)` — 1.1487, the 1.15 the size
-//! shortcut has always used, now falling out of the rule instead of restating
-//! it. `a_size_press_is_still_the_115_it_always_was` pins that.
+//! A rail and an increase/decrease shortcut are two spellings of one question,
+//! so they go through one [`Tweak`]. What makes it worth a table rather than
+//! two call sites is the *step*: one press of a shortcut is worth [`STEP_PX`]
+//! pixels of the drag. `Brush::RESIZE_DOUBLE_PX` is 100, so a size press is
+//! `2^(20/100)` — 1.1487, the 1.15 the size shortcut has always used, now
+//! falling out of the rule instead of restating it.
+//! `a_size_press_is_still_the_115_it_always_was` pins that.
 //!
-//! ## The grip is not a canvas gesture, and must not become one
+//! ## There was a third, and what it cost
 //!
-//! `gesture.rs` answers "what does a press **on the canvas** mean", and the
-//! grip's press lands on a panel — where `ui_owns` is true and the answer is
-//! `Press::Ignored` unless one of the pan overrides is held, which are tested
-//! first on purpose so a middle-drag or a space-drag pans whatever it started
-//! over. None of that changed. So nothing here is in that model and
-//! `a_pen_press_resolves_to_what_a_mouse_press_would` did not have to move.
-//! It still reaches a pen: `egui-winit`'s `on_touch` emits an ordinary cursor
-//! move and mouse-button press for a contact, so a nib pressing the grip drags
-//! it exactly as a mouse does, and `app.rs`'s touch arm ignores the press for
-//! the same reason its mouse arm does.
+//! Every row used to carry a hold-and-drag grip on its right: three dots in a
+//! column, offering the same value over a longer travel than a 264-point panel
+//! can give a rail. It was reported as a row of buttons that do nothing, and
+//! that is exactly what it was. Three dots at the end of a row is a menu
+//! everywhere else in this interface and everywhere else on the desktop, so it
+//! invited a *click*, and it answered only to a hold — a control whose whole
+//! affordance pointed at the one gesture it ignored.
 //!
-//! Putting six more settings into `gesture::press` would be the combinatorial
-//! mess: Alt is already spoken for twice on the canvas — the eyedropper with a
-//! button and the size drag without one — and there is no seventh modifier, so
-//! it could only be a modal "which setting is Alt about?" that the pointer
-//! could not see. A control that says which setting it adjusts by *being* that
-//! setting's grip is the answer, and it is the one every other application with
-//! this feature reaches for.
+//! Nothing went with it. [`widgets::slider_row`] is a drag in its own right and
+//! covers the same range; what the grip bought was travel, not reach, and the
+//! rail is wider now that it has the row to itself. The lesson worth keeping is
+//! that a second control for a value the panel already has must not look like a
+//! control for something else.
 
 use crate::editor::Editor;
 use crate::shortcuts::Action;
-use crate::theme::{Palette, metrics};
+use crate::theme::Palette;
 use crate::widgets;
-use egui::{Pos2, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Ui, pos2};
 use std::ops::RangeInclusive;
 use umber_core::Brush;
 
-/// How far the pointer travels, in physical window pixels, for a *linear*
-/// setting to cross its whole range under the hold-grip.
+/// How far a pointer would travel, in physical window pixels, for a *linear*
+/// setting to cross its whole range.
 ///
-/// A logarithmic one uses `Brush::RESIZE_DOUBLE_PX` instead, which is the rate
-/// the brush-size drag has always used — the point being that a size dragged
-/// by this grip and a size dragged by Alt move at exactly the same rate.
+/// The unit [`STEP_PX`] is stated in, and therefore what a shortcut press is
+/// worth. It outlived the hold-grip it was written for — see the module docs —
+/// because the shortcut still has to answer "how much is a bit more", and this
+/// is the answer that keeps the size press at the 1.15 it has always been.
+///
+/// A logarithmic setting uses `Brush::RESIZE_DOUBLE_PX` instead, which is the
+/// rate the canvas's Alt-drag has always used, so a size changed from here and
+/// a size changed on the canvas move at exactly the same rate.
 pub const DRAG_FULL_PX: f32 = 400.0;
 
 /// What one press of an increase or decrease shortcut is worth, in pixels of
@@ -371,14 +371,6 @@ pub fn of_action(action: Action) -> Option<(Tweak, f32)> {
 /// The module's body: one rail and one hold-grip per setting.
 pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.add_space(4.0);
-    crate::controls::note(
-        ui,
-        p,
-        "Changes here go to the brush in hand, like Size and Opacity above the \
-         canvas. Picking a brush puts its own settings back; the brush editor's \
-         Update is what makes one stick.",
-    );
-    ui.add_space(10.0);
     ui.spacing_mut().item_spacing.y = 12.0;
 
     for tweak in Tweak::PANEL {
@@ -405,128 +397,30 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 }
 
 /// One setting: the rail, and the grip beside it.
+/// The rail takes the whole line, and there is no second control beside it.
+///
+/// There used to be a hold-and-drag grip on the right of every row, three dots
+/// in a column, offering the same value over a longer travel. It came off
+/// because of what it *looked* like: three dots at the end of a row is a menu
+/// everywhere else in this interface and everywhere else on the desktop, so it
+/// was clicked rather than held — and a click did nothing at all, which reads
+/// as a broken control rather than as a control being held wrong. Nothing was
+/// lost with it. `widgets::slider_row` covers the same range and is a drag in
+/// its own right; what the grip bought was travel, not reach, and the rail is
+/// wider now that it has the row to itself.
 fn row(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
     let mut value = tweak.value(&ed.brush);
-    // The grip's width comes off the line before the rail is drawn, because
-    // `widgets::slider_row` sizes itself from `available_width` and would
-    // otherwise take all of it and push the grip off the panel. The gap is the
-    // style's own, read rather than typed: a number here that was two points
-    // more than the layout actually spends is wrong the moment that token
-    // moves, and wrong in the direction nobody would look at.
-    let gap = ui.spacing().item_spacing.x;
-    let rail = (ui.available_width() - metrics::TWEAK_GRIP - gap).max(metrics::TWEAK_GRIP);
-    ui.horizontal(|ui| {
-        // **`vertical`, not `scope`.** A `slider_row` is two rows — the name
-        // and readout on one baseline, the rail under them — and it allocates
-        // them one after another in whatever layout it is handed. Given the
-        // horizontal one this line is in, it laid the rail out *beside* its own
-        // header and pushed both off the edge of the panel: labels with no
-        // rails under them, which is what the first shot of
-        // `tweaks_panel_preview` showed.
-        ui.vertical(|ui| {
-            ui.set_width(rail);
-            if widgets::slider_row(
-                ui,
-                p,
-                tweak.label(),
-                &mut value,
-                tweak.range(),
-                tweak.log(),
-                |v| tweak.format(v),
-            ) {
-                tweak.apply(&mut ed.brush, value);
-            }
-        });
-        grip(ui, p, ed, tweak);
-    });
-}
-
-/// The hold-and-drag handle: press it, drag anywhere, let go.
-///
-/// The rail beside it is the precise control and this is the wide one — a
-/// panel is 264 points across, so a rail's whole range is a couple of hundred
-/// pixels of travel, while this measures against the screen and keeps
-/// measuring wherever the pointer goes. It is the brush-size drag's rate and
-/// the brush-size drag's absolute-against-the-press rule, for every setting
-/// that has no modifier left to spell that with.
-///
-/// The value at the press and where the press landed live in egui's own
-/// per-widget memory rather than on [`Editor`]: they belong to one gesture on
-/// one widget, which is exactly what that memory is for, and it keeps a
-/// transient out of the state a tab switch has to reason about.
-///
-/// A panel body is a `ScrollArea`, which senses a drag of its own so a finger
-/// can scroll it, and this widget is drawn over that. It wins for the same
-/// reason every rail already in a panel does — the layer stack's opacity
-/// slider, the colour picker's three — because egui resolves an overlap to the
-/// topmost widget that senses the drag. A control here that lost to the scroll
-/// would be a control every panel in Umber has already been proving works.
-fn grip(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
-    let size = metrics::TWEAK_GRIP;
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
-
-    if response.drag_started()
-        && let Some(origin) = response.interact_pointer_pos()
-    {
-        let from = tweak.value(&ed.brush);
-        ui.data_mut(|d| d.insert_temp(response.id, (from, origin)));
+    if widgets::slider_row(
+        ui,
+        p,
+        tweak.label(),
+        &mut value,
+        tweak.range(),
+        tweak.log(),
+        |v| tweak.format(v),
+    ) {
+        tweak.apply(&mut ed.brush, value);
     }
-    if response.dragged()
-        && let Some(now) = response.interact_pointer_pos()
-        && let Some((from, origin)) = ui.data(|d| d.get_temp::<(f32, Pos2)>(response.id))
-    {
-        // egui works in points and the drag rate is stated in physical window
-        // pixels, which is what makes this grip travel at the same rate as the
-        // Alt-drag on the canvas whatever the interface scale is.
-        let scale = ed.pixels_per_point.max(1e-3);
-        let delta = glam::vec2((now.x - origin.x) * scale, (now.y - origin.y) * scale);
-        let along = umber_core::geom::drag_towards_more(delta);
-        tweak.apply(&mut ed.brush, tweak.after_drag(from, along));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-    }
-    if response.drag_stopped() {
-        ui.data_mut(|d| d.remove::<(f32, Pos2)>(response.id));
-    }
-
-    let active = response.dragged();
-    let ink = if active || response.hovered() {
-        p.accent
-    } else {
-        p.text_dim
-    };
-    let painter = ui.painter();
-    if active || response.hovered() {
-        painter.rect_filled(rect, metrics::RADIUS, p.control);
-    }
-    painter.rect_stroke(
-        rect,
-        metrics::RADIUS,
-        Stroke::new(1.0, if active { p.accent } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
-    // Three dots in a column: the grab mark this interface already uses on a
-    // panel header, rather than a glyph — Archivo carries none of the ones
-    // that would say this.
-    for k in 0..3 {
-        painter.circle_filled(
-            pos2(rect.center().x, rect.center().y + (k as f32 - 1.0) * 4.0),
-            1.2,
-            ink,
-        );
-    }
-
-    // `on_hover_ui`, not `on_hover_text`: the closure runs only while the
-    // pointer is on the grip, where `on_hover_text` would build this string —
-    // and the `to_lowercase` under it — once per grip per frame, on the
-    // drawing path, for six rows nobody is pointing at.
-    response.on_hover_ui(|ui| {
-        ui.label(format!(
-            "Hold and drag to set {}. Right and up for more, left and down for \
-             less; come back to where you pressed and it is exactly what it \
-             was.",
-            tweak.label().to_lowercase()
-        ));
-    });
 }
 
 /// The module's picture in the module library, painted into `body`.
@@ -537,10 +431,10 @@ fn grip(ui: &mut Ui, p: &Palette, ed: &mut Editor, tweak: Tweak) {
 /// palette tokens, never a bitmap.
 pub fn preview(painter: &egui::Painter, p: &Palette, body: egui::Rect) {
     let ink = p.text_dim;
-    // Three rails with a grip beside each, which is exactly what the panel is.
+    // Three rails across the whole width, which is exactly what the panel is.
     for k in 0..3 {
         let y = body.top() + 6.0 + k as f32 * 11.0;
-        let right = body.right() - 8.0;
+        let right = body.right();
         painter.rect_filled(
             egui::Rect::from_min_max(pos2(body.left(), y - 1.0), pos2(right, y + 1.0)),
             1.0,
@@ -554,15 +448,13 @@ pub fn preview(painter: &egui::Painter, p: &Palette, body: egui::Rect) {
             2.5,
             p.accent,
         );
-        for dot in 0..3 {
-            painter.circle_filled(pos2(right + 4.0, y + (dot as f32 - 1.0) * 2.2), 0.7, ink);
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::metrics;
     use glam::vec2;
     use umber_core::geom::drag_towards_more;
 

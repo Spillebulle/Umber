@@ -1848,8 +1848,8 @@ impl UmberApp {
             Action::ZoomTool => self.pick_tool(Tool::Zoom),
             Action::SwapColours => self.editor.swap_colors(),
             // Every temporary brush change goes through one table, so the
-            // shortcut, the Brush tweaks rail and its hold-grip cannot
-            // disagree about what "a bit more" is worth — see `tweaks`. The
+            // shortcut and the Brush tweaks rail cannot disagree about what
+            // "a bit more" is worth — see `tweaks`. The
             // two size arms used to spell 1.15 here; that figure is now what
             // `STEP_PX` of the drag comes to, which is where it came from.
             Action::SizeDown

@@ -690,12 +690,6 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
 /// What the block will look like, in the face it will be set in.
 fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     if ed.text.block.text.trim().is_empty() {
-        controls::note(
-            ui,
-            p,
-            "Type something above, then Place it on the canvas to move, scale \
-             and turn it before it is put down.",
-        );
         return;
     }
 
@@ -857,13 +851,6 @@ fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
             response.on_hover_text(tooltip);
         });
     });
-    ui.add_space(2.0);
-    controls::note(
-        ui,
-        p,
-        "Text is painted into the layer when it is put down. It is pixels \
-         afterwards, not something that can be re-typed.",
-    );
 }
 
 #[cfg(test)]

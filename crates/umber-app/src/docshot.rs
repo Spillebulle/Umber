@@ -328,7 +328,7 @@ fn interface(stage: &mut Stage, dir: &Path) -> Result<Vec<(PathBuf, u64, u32, u3
         "layers.png",
     )?);
 
-    // The Brush tweaks module: six rails and a grip beside each. An elliptical
+    // The Brush tweaks module: six rails, each across the whole row. An elliptical
     // dab so the Angle rail is live rather than greyed, which is the one row
     // whose enablement is decided by another row.
     out.push(panel_shot(
