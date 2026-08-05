@@ -12,6 +12,49 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.8 — 2026-08-05
+
+Brushes now paint the way their authors drew them. Markers, calligraphy pens
+and scrapers were laying down a row of separate nib marks instead of a
+continuous stroke, textured brushes were painting at a quarter of the opacity
+they were set to, and imported brushes were arriving far too faint. All three
+had the same cause and all three are fixed.
+
+On Windows, updating no longer shows you a Windows installer. Neither does
+installing.
+
+### New
+
+- **Windows installs and updates in Umber's own window.** A new
+  `umber-setup.exe` is one file: run it, press Install, and Umber is on your
+  machine. Updating is the same window, and the new version opens by itself
+  when it has finished. Windows still asks once for permission, because
+  installing for everyone on the machine needs it.
+- The `.msi` is still published for anyone deploying Umber across several
+  machines.
+
+### Fixed
+
+- **Markers, calligraphy pens, scrapers and every other flat nib** painted as a
+  comb of separate slivers rather than a stroke. Spacing was measured against
+  the nib's long axis when what matters is how far it reaches along the
+  direction you are drawing. Round brushes are unchanged.
+- **Textured brushes painted at a fraction of their opacity.** A Clip Studio
+  sketch pencil arrived at 27% of what it was set to. Its paper is meant to
+  bite, and the marks between the bites are meant to build up as the stroke
+  passes over them.
+- **Imported brushes were far too faint.** A 4H pencil from MyPaint arrived
+  painting at a seventh of its real strength; twenty-nine of the brushes Umber
+  ships were affected, the faintest at 1.5%. Brushes that already painted at
+  full strength are untouched.
+- The Brush tweaks module had a column of three-dot buttons that looked like
+  menus and did nothing when clicked. They are gone and the sliders have the
+  space.
+
+### Changed
+
+- Three paragraphs of explanation came off the Brush tweaks and Text modules.
+
 ## 0.0.7 — 2026-08-05
 
 Text on the canvas, a module for changing a brush mid-painting, themes you can
