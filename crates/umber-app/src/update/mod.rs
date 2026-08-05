@@ -36,6 +36,8 @@
 pub mod apply;
 pub mod flow;
 pub mod install;
+pub mod installer;
+pub mod installwin;
 pub mod release;
 pub mod version;
 
@@ -441,10 +443,13 @@ impl Updates {
             return;
         }
 
+        // The version travels with the job so the installer's own window can
+        // name what it is putting in place. Only ever displayed.
+        let version = release.version.to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.spawn("umber-update-fetch", move |reporter| {
-            install_job(reporter, &kind, &asset, &cancel);
+            install_job(reporter, &kind, &asset, &version, &cancel);
         });
     }
 
@@ -555,7 +560,13 @@ impl Reporter {
 /// The stages are the ones that genuinely happen, in the order they happen, and
 /// the length check is its own step because it is the one guarantee an unsigned
 /// release has and is worth naming.
-fn install_job(reporter: &Reporter, kind: &InstallKind, asset: &Asset, cancel: &AtomicBool) {
+fn install_job(
+    reporter: &Reporter,
+    kind: &InstallKind,
+    asset: &Asset,
+    version: &str,
+    cancel: &AtomicBool,
+) {
     reporter.send(Report::Stage(Stage::Contacting));
     let bytes = match fetch(asset, cancel, &|received| {
         reporter.send(Report::Stage(Stage::Downloading {
@@ -590,7 +601,7 @@ fn install_job(reporter: &Reporter, kind: &InstallKind, asset: &Asset, cancel: &
         return reporter.send(Report::Stopped);
     }
 
-    match apply::apply(kind, &asset.name, &bytes, &|stage| {
+    match apply::apply(kind, &asset.name, &bytes, version, &|stage| {
         reporter.send(Report::Stage(stage));
     }) {
         Ok(applied) => reporter.send(Report::Installed(applied)),

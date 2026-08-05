@@ -81,6 +81,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",
+    # `OpenProcess`/`WaitForSingleObject`/`GetExitCodeProcess`, which is how the
+    # update helper waits for Umber to close and then for `msiexec` to finish.
+    # See `src/update/installer.rs`.
+    "Win32_System_Threading",
+    # `SHELLEXECUTEINFOW` is gated behind this in windows-sys 0.61 even though
+    # nothing here touches the registry.
+    "Win32_System_Registry",
     # `SetCurrentProcessExplicitAppUserModelID`, which is what gives the taskbar
     # button an identity of its own. See `taskbar::claim_identity`.
     "Win32_UI_Shell",

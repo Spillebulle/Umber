@@ -47,6 +47,7 @@ mod prefs;
 mod recoverdlg;
 mod session;
 mod settings;
+mod shell;
 mod shortcuts;
 mod splash;
 mod stamplib;
@@ -77,6 +78,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // draws the box on a device that has not just died. So the command line is
     // read before anything else is set up, and the reporter path never touches
     // the editor, the autosave or the update check at all. See `crash`.
+    // And its own installer, by the same mechanism and for a related reason: a
+    // running executable cannot be replaced, so the process that puts an update
+    // in place and starts the new build has to be a different one. See
+    // `update::installer`. Read before the crash reporter only because the two
+    // are mutually exclusive and one of them has to be first; neither parser
+    // recognises the other's flag.
+    if let Some(job) = update::installer::parse(std::env::args()) {
+        return update::installwin::show(job);
+    }
+
     if let crash::Launch::Report(path) = crash::parse_args(std::env::args()) {
         return crash::show_report(&path);
     }

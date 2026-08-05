@@ -6,9 +6,12 @@
 //!   the running one is.
 //! * **AppImage** — the download *is* the application; replace the file
 //!   `$APPIMAGE` names.
-//! * **MSI** — hand the package to `msiexec` and get out of the way. Umber does
-//!   not touch Program Files itself: the installer owns those files, keeps a
-//!   record of them, and elevates on its own.
+//! * **MSI** — write the package down and start Umber's own updater over it.
+//!   Umber does not touch Program Files itself: the installer owns those files
+//!   and keeps a record of them. It used to hand `msiexec` the package and get
+//!   out of the way, which showed a Windows installer nobody had asked for and
+//!   left the artist to start Umber again themselves; `super::installer` has
+//!   what replaced that and why it has to be a second process.
 //!
 //! The awkward part is Windows, where a running executable cannot be deleted or
 //! written to — but *can* be renamed, because the lock is on the file's data,
@@ -56,12 +59,13 @@ pub fn apply(
     kind: &InstallKind,
     asset_name: &str,
     bytes: &[u8],
+    version: &str,
     report: &dyn Fn(Stage),
 ) -> Result<Applied, String> {
     match kind {
         InstallKind::Msi => {
             report(Stage::HandingOver);
-            hand_to_msiexec(asset_name, bytes)?;
+            hand_to_msiexec(asset_name, bytes, version)?;
             Ok(Applied::Installer)
         }
 
@@ -295,13 +299,21 @@ fn read_capped(reader: &mut impl Read, declared: u64) -> Result<Vec<u8>, String>
     Ok(out)
 }
 
-/// Write the package somewhere `msiexec` can reach it, and start it.
+/// Write the package somewhere the installer can reach it, and start Umber's
+/// own updater over it.
 ///
-/// `msiexec` is given the package and nothing else: it shows its own interface,
-/// asks for elevation itself, and — because `packaging/windows/umber.wxs` keeps
-/// one `UpgradeCode` for ever — replaces the installed version rather than
-/// installing beside it.
-fn hand_to_msiexec(asset_name: &str, bytes: &[u8]) -> Result<(), String> {
+/// **`msiexec` is no longer run from here and no longer shows its interface.**
+/// It used to be given the package and left to it, which meant somebody who
+/// asked Umber for an update watched a Windows installer they had not asked for
+/// and then had to start Umber again themselves. `installwin::spawn` puts a
+/// copy of this executable in the same directory and starts it with
+/// `--install-update`; that process draws Umber's own window, waits for this
+/// one to close, runs `msiexec` silently and starts the new build. See
+/// [`super::installer`] for why it has to be a second process.
+///
+/// What has not changed: the package is written first and the installer owns
+/// Program Files. Umber still does not touch those files itself.
+fn hand_to_msiexec(asset_name: &str, bytes: &[u8], version: &str) -> Result<(), String> {
     // The asset's own name, with anything that is not part of a file name
     // stripped. It comes from the release API rather than from the user, but it
     // is about to become a path and a command-line argument.
@@ -323,17 +335,13 @@ fn hand_to_msiexec(asset_name: &str, bytes: &[u8]) -> Result<(), String> {
         )
     })?;
 
-    std::process::Command::new("msiexec")
-        .arg("/i")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "Umber could not start the Windows installer: {e}\n\n\
-                 The package was saved to {}.",
-                path.display(),
-            )
-        })?;
+    super::installwin::spawn(&path, version).map_err(|e| {
+        format!(
+            "{e}\n\n\
+             The package was saved to {} and can be installed by opening it.",
+            path.display(),
+        )
+    })?;
     Ok(())
 }
 
@@ -479,7 +487,7 @@ mod tests {
             InstallKind::Managed(super::super::install::Manager::Flatpak),
             InstallKind::Unknown,
         ] {
-            assert!(apply(&kind, "umber-1.0.0-x64.msi", b"anything", &|_| {}).is_err());
+            assert!(apply(&kind, "umber-1.0.0-x64.msi", b"anything", "1.0.0", &|_| {}).is_err());
         }
     }
 
@@ -498,9 +506,15 @@ mod tests {
             zip.finish().expect("finish the zip");
         }
         assert!(
-            apply(&InstallKind::Portable, "umber-1.0.0.zip", &buf, &|stage| {
-                seen.borrow_mut().push(stage);
-            })
+            apply(
+                &InstallKind::Portable,
+                "umber-1.0.0.zip",
+                &buf,
+                "1.0.0",
+                &|stage| {
+                    seen.borrow_mut().push(stage);
+                }
+            )
             .is_err(),
             "an archive with no binary in it is a refusal",
         );
