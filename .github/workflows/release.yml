@@ -155,6 +155,22 @@ jobs:
             -d AssetDir="wixassets" \
             -o "dist/umber-${VERSION}-${{ matrix.arch }}.msi"
 
+      # --- Windows setup executable -----------------------------------------
+      #
+      # `umber.exe` with the MSI concatenated onto it and a footer saying how
+      # long the package is, so a first install shows Umber's own window rather
+      # than Windows Installer's. `update::payload` has the format;
+      # `make-setup` is the one writer of it and reads the package back out
+      # before writing the file, so a build that produced something the
+      # installer cannot open fails here rather than on somebody's machine.
+      #
+      # After the MSI, obviously: it is the payload.
+      - name: Build setup executable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo run --release -p umber-app --example make-setup --             "target/release/umber.exe"             "dist/umber-${VERSION}-${{ matrix.arch }}.msi"             "dist/umber-setup-${VERSION}-${{ matrix.arch }}.exe"
+
       # --- Linux packages ---------------------------------------------------
       - name: Build Linux packages
         if: runner.os == 'Linux'

@@ -54,71 +54,176 @@ pub fn spawn(package: &Path, version: &str) -> Result<(), String> {
 }
 
 /// Be the installer. Returns once the window has closed.
-pub fn show(job: Job) -> Result<(), Box<dyn std::error::Error>> {
-    let (tx, rx) = channel();
-    let package = job.package.clone();
-    let parent = job.parent;
-    let target = job.target.clone();
-    // The work runs on a thread and the window draws: the alternative is a
-    // window that stops answering for as long as `msiexec` takes, which on a
-    // slow machine is the whole install. Same reason the update check threads.
-    std::thread::spawn(move || {
-        let _ = tx.send(Step::WaitingForUmber);
-        if let Some(pid) = parent {
-            wait_for(pid);
-        }
-        let _ = tx.send(Step::AskingPermission);
-        let command = Command::for_package(&package);
-        // The prompt is up until `install` reports the installer has started,
-        // which is the moment the consent was given. Two steps rather than one
-        // because they fail differently and look different: a prompt waiting on
-        // somebody, and Windows working.
-        let running = tx.clone();
-        match install(&command, &move || {
-            let _ = running.send(Step::Installing);
-        }) {
-            Ok(()) => {
-                let _ = tx.send(Step::Starting);
-                match start_installed(target.as_deref()) {
-                    Ok(()) => {
-                        let _ = tx.send(Step::Finished);
-                    }
-                    // The update *worked*; only the relaunch did not. Saying so
-                    // is the honest reading, and it is the same guarantee
-                    // `relaunch` makes: never leave somebody believing an
-                    // update failed when their next start will be the new one.
-                    Err(why) => {
-                        let _ = tx.send(Step::Failed(format!(
-                            "Umber was updated, but could not be started again: {why}\n\n\
-                             Start it from the Start menu."
-                        )));
-                    }
+///
+/// An update starts working immediately — it was asked for, and the artist is
+/// looking at a countdown in the Umber that spawned this. Setup waits: it was
+/// double-clicked by somebody who has not agreed to anything yet, so the window
+/// opens on [`Step::Ready`] with an Install button.
+pub fn show(mut job: Job) -> Result<(), Box<dyn std::error::Error>> {
+    // Setup carries its package on its own end. Lifting it out here rather than
+    // on the worker means a file that is not an installer says so at once,
+    // instead of after a button has been pressed.
+    if job.setup {
+        match unpack_payload() {
+            Ok((package, version)) => {
+                job.package = package;
+                if job.version.is_empty() {
+                    job.version = version;
                 }
             }
-            Err(why) => {
-                let _ = tx.send(Step::Failed(why));
-            }
+            Err(why) => return show_failed(job, why),
         }
-    });
+    }
 
+    let start = job.setup;
     let mut page = Installer {
-        job,
         palette: {
             let prefs = prefs::load();
             crate::themelib::resolve(prefs.theme, prefs.accent, prefs.custom_theme.as_deref())
         },
-        step: Step::WaitingForUmber,
-        news: rx,
+        step: if start {
+            Step::Ready
+        } else {
+            Step::WaitingForUmber
+        },
+        news: None,
+        worker: None,
         log: None,
+        job,
+    };
+    if !start {
+        page.begin();
+    }
+    shell::run(&mut page)
+}
+
+/// A window that only reports why there is nothing to install.
+///
+/// Setup with no package on it, which is a build that went wrong or a file that
+/// was truncated on the way down. Saying so in the same window is better than a
+/// console message nobody sees behind a double-click.
+fn show_failed(job: Job, why: String) -> Result<(), Box<dyn std::error::Error>> {
+    let mut page = Installer {
+        palette: {
+            let prefs = prefs::load();
+            crate::themelib::resolve(prefs.theme, prefs.accent, prefs.custom_theme.as_deref())
+        },
+        step: Step::Failed(why),
+        news: None,
+        worker: None,
+        log: None,
+        job,
     };
     shell::run(&mut page)
+}
+
+/// Lift the package off the end of this executable and write it down.
+///
+/// The version is taken from the package's own file name, which is what
+/// `examples/make-setup.rs` puts there.
+fn unpack_payload() -> Result<(std::path::PathBuf, String), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Umber could not read its own program file: {e}"))?;
+    let bytes = std::fs::read(&exe)
+        .map_err(|e| format!("Umber could not read its own program file: {e}"))?;
+    let package = super::payload::read(&bytes).ok_or_else(|| {
+        "This copy of Umber's installer carries no package. Take a fresh one          from the releases page."
+            .to_string()
+    })?;
+
+    let dir = std::env::temp_dir();
+    let name = exe
+        .file_stem()
+        .map(|s| format!("{}.msi", s.to_string_lossy()))
+        .unwrap_or_else(|| "umber-setup.msi".to_string());
+    let to = dir.join(name);
+    std::fs::write(&to, package)
+        .map_err(|e| format!("Umber could not write the package to {}: {e}", to.display()))?;
+
+    // `umber-setup-0.0.8-x64` -> `0.0.8`, and nothing if it is not shaped like
+    // that. Only ever displayed, so a miss costs a heading and not a install.
+    let version = exe
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .and_then(|stem| {
+            stem.split('-')
+                .find(|part| {
+                    part.split('.').count() == 3
+                        && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                })
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_default();
+    Ok((to, version))
+}
+
+impl Installer {
+    /// Start the work. Called once, either straight away for an update or from
+    /// the Install button for setup.
+    fn begin(&mut self) {
+        let (tx, rx) = channel();
+        self.news = Some(rx);
+        let package = self.job.package.clone();
+        let parent = self.job.parent;
+        let target = self.job.target.clone();
+        let setup = self.job.setup;
+        // The work runs on a thread and the window draws: the alternative is a
+        // window that stops answering for as long as `msiexec` takes, which on
+        // a slow machine is the whole install. Same reason the check threads.
+        self.worker = Some(std::thread::spawn(move || {
+            // Setup has no Umber to wait for: it *is* the first one. An update
+            // does, and it is the step that could hang, so it is named rather
+            // than folded into the next.
+            if !setup && let Some(pid) = parent {
+                let _ = tx.send(Step::WaitingForUmber);
+                wait_for(pid);
+            }
+            let _ = tx.send(Step::AskingPermission);
+            let command = Command::for_package(&package);
+            // The prompt is up until `install` reports the installer has started,
+            // which is the moment the consent was given. Two steps rather than one
+            // because they fail differently and look different: a prompt waiting on
+            // somebody, and Windows working.
+            let running = tx.clone();
+            match install(&command, &move || {
+                let _ = running.send(Step::Installing);
+            }) {
+                Ok(()) => {
+                    let _ = tx.send(Step::Starting);
+                    match start_installed(target.as_deref()) {
+                        Ok(()) => {
+                            let _ = tx.send(Step::Finished);
+                        }
+                        // The update *worked*; only the relaunch did not. Saying so
+                        // is the honest reading, and it is the same guarantee
+                        // `relaunch` makes: never leave somebody believing an
+                        // update failed when their next start will be the new one.
+                        Err(why) => {
+                            let _ = tx.send(Step::Failed(format!(
+                                "Umber was updated, but could not be started again: {why}\n\n\
+                             Start it from the Start menu."
+                            )));
+                        }
+                    }
+                }
+                Err(why) => {
+                    let _ = tx.send(Step::Failed(why));
+                }
+            }
+        }));
+    }
 }
 
 struct Installer {
     job: Job,
     palette: Palette,
     step: Step,
-    news: Receiver<Step>,
+    /// News from the worker, once there is a worker. `None` before setup has
+    /// been told to start, and for a window that opened only to report why
+    /// there is nothing to install.
+    news: Option<Receiver<Step>>,
+    /// Held so the thread is joined rather than detached when the window goes.
+    worker: Option<std::thread::JoinHandle<()>>,
     /// The installer's log, once there is one worth naming. Held so the failure
     /// screen can offer it.
     log: Option<PathBuf>,
@@ -138,8 +243,11 @@ impl Page for Installer {
     }
 
     fn poll(&mut self) -> Option<Duration> {
+        // Nothing to hear from: setup that has not been told to start, or a
+        // window that opened only to say why there is nothing to install.
+        let news = self.news.as_ref()?;
         loop {
-            match self.news.try_recv() {
+            match news.try_recv() {
                 Ok(step) => {
                     if matches!(step, Step::Failed(_)) {
                         self.log = Some(Command::for_package(&self.job.package).log);
@@ -159,12 +267,16 @@ impl Page for Installer {
 
     fn draw(&mut self, ui: &mut egui::Ui, close: &mut bool) {
         let p = self.palette;
+        // Collected here and acted on after the frame, so the step cannot
+        // change half way through drawing the window that reads it.
+        let mut start = false;
         tabs::dialog_frame(&p).show(ui, |ui| {
             ui.add_space(4.0);
-            let heading = if self.job.version.is_empty() {
-                "Updating Umber".to_string()
-            } else {
-                format!("Updating Umber to {}", self.job.version)
+            let heading = match (self.job.setup, self.job.version.as_str()) {
+                (true, "") => "Install Umber".to_string(),
+                (true, v) => format!("Install Umber {v}"),
+                (false, "") => "Updating Umber".to_string(),
+                (false, v) => format!("Updating Umber to {v}"),
             };
             ui.label(
                 egui::RichText::new(heading)
@@ -193,6 +305,16 @@ impl Page for Installer {
                                 .line_height(Some(12.5)),
                         );
                     }
+                }
+                // Before anything has been done. No bar, because nothing is
+                // happening yet and a track sitting at zero would read as an
+                // install that had stalled.
+                Step::Ready => {
+                    controls::note(
+                        ui,
+                        &p,
+                        "Umber will be installed for everyone on this machine,                          so Windows will ask for permission once.",
+                    );
                 }
                 step => {
                     // The bar, and a line saying which step it is on. An empty
@@ -225,7 +347,18 @@ impl Page for Installer {
                     // working with nothing on screen to say so — the rule
                     // `Flow::holds_work` already keeps.
                     let done = !self.step.holds_work();
-                    if done && tabs::button(ui, &p, "Close", true) {
+                    if matches!(self.step, Step::Ready) {
+                        // Setup, waiting to be told. The emphasised button is
+                        // the one that acts; Cancel is beside it, because a
+                        // window opened by a double-click has to be refusable
+                        // without installing anything.
+                        if tabs::button(ui, &p, "Install", true) {
+                            start = true;
+                        }
+                        if tabs::button(ui, &p, "Cancel", false) {
+                            *close = true;
+                        }
+                    } else if done && tabs::button(ui, &p, "Close", true) {
                         *close = true;
                     }
                     if let Some(dir) = self.log.as_deref().and_then(Path::parent)
@@ -242,6 +375,10 @@ impl Page for Installer {
             });
         });
 
+        if start {
+            self.step = Step::AskingPermission;
+            self.begin();
+        }
         // Nothing left to do and nothing to read: close on its own rather than
         // asking somebody to dismiss a window that is only saying "done".
         if matches!(self.step, Step::Finished) {

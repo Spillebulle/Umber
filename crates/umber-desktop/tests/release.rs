@@ -98,6 +98,8 @@ fn this_version_is_the_newest_entry() {
 /// `umber_0.0.5_amd64.deb`, rpm adds its release number, and the AppImage is
 /// capitalised after the application rather than the crate.
 const ASSETS: &[&str] = &[
+    "umber-setup-{v}-x64.exe",
+    "umber-setup-{v}-arm64.exe",
     "umber-{v}-x64.msi",
     "umber-{v}-arm64.msi",
     "umber-{v}-universal-apple-darwin.tar.gz",

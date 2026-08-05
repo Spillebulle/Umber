@@ -38,6 +38,7 @@ pub mod flow;
 pub mod install;
 pub mod installer;
 pub mod installwin;
+pub mod payload;
 pub mod release;
 pub mod version;
 

@@ -2764,6 +2764,71 @@ must not learn about HTTP, the same boundary that keeps them testable.
   from archives the test builds itself, and the dialog's whole state machine
   from `update::flow` — see below.
 
+#### Installing on Windows, in Umber's own window
+
+`umber-app::update::installer` is the model, `installwin.rs` opens the window
+and touches the platform, `payload.rs` is the format a setup executable carries,
+and `shell.rs` is the window itself. Both a first install and an update go
+through the same three screens.
+
+- **The window is `shell::Page`'s, and there is one host.** `crash/window.rs`
+  had the only winit-and-wgpu-and-egui host in the crate and this would have
+  been the second copy of it, so the host moved to `shell.rs` and the crash
+  reporter became a `Page` beside the installer. A `Page` has no wgpu in it,
+  which is what makes what a window *says* checkable without a device.
+- **A running executable cannot be replaced, so the installer cannot be
+  Umber.** That is the whole reason this is a second process, exactly as the
+  crash reporter is: `--install-update` is the helper an update spawns, and
+  `--install` is `umber-setup.exe`. Nor could the package do it — the MSI's
+  "Start Umber" action is published on the exit dialog's Finish button, so a
+  silent install has no UI sequence to fire it and nothing would relaunch
+  anything.
+- **The helper runs from a copy in the temporary directory.** Not tidiness: it
+  would otherwise be a file *inside* the installation the package is replacing,
+  which Windows Installer finds in use and either reboots around or has Restart
+  Manager kill mid-window. `stage_helper` is the copy, and it is also why the
+  helper is told where to relaunch Umber from — its own `current_exe` is the
+  updater.
+- **`msiexec /qn /norestart` with a verbose log, elevated through
+  `ShellExecuteExW`'s `runas` verb.** The elevation is not optional and a plain
+  spawn will not do it: a per-machine MSI started from an unelevated Umber fails
+  as "you must be an administrator", *silently*, because `/qn` has no interface
+  to say it in. `/norestart` is load-bearing too — a painting application that
+  reboots somebody's machine to finish updating itself is indefensible, and a
+  failed install is recoverable where a reboot is not.
+- **The UAC prompt stays and is explained before it appears.** It is a Windows
+  security guarantee and not ours to suppress. Saying so is the difference
+  between a consent dialog somebody expects and one that arrives unexplained.
+- **The bar is empty while `msiexec` runs.** Nothing reports progress out of a
+  silent install, so `Step::progress` answers `None` and the track draws empty —
+  the rule `Stage::progress` already follows for `HandingOver`. A bar that moved
+  anyway would be inventing somebody's installation.
+- **An update starts at once and setup waits to be asked.** An update was asked
+  for and the artist is watching a countdown; setup was double-clicked by
+  somebody who has agreed to nothing, so it opens on `Step::Ready` with Install
+  and Cancel. Putting files on a machine because a window opened is the wrong
+  way round.
+- **`payload::append` and `payload::read` are the one statement of the format**,
+  which is why `examples/make-setup.rs` is a Rust example rather than the pair
+  of shell scripts `tools/` keeps: two scripts would be two more statements of a
+  byte layout. The length is at the *end* because the start is not ours — a PE's
+  length changes with every build — and Windows loads a PE by its headers, so
+  appended bytes are ignored and `umber-setup.exe` still runs as Umber.
+  **The magic is not a signature and must not be described as one**: it says
+  something appended this deliberately, and nothing whatever about where the
+  package came from. Umber does not sign its releases.
+- **`umber-setup-<version>-<arch>.exe` is a fourth statement of an asset
+  name.** `release.yml` builds it, `ASSETS` in `crates/umber-desktop/tests/
+  release.rs` lists it and the README links it; `update::release::wanted_asset`
+  deliberately does **not**, because the updater fetches the `.msi` and not the
+  setup binary. The version in that filename is read back by `unpack_payload` to
+  head the window, so the name is load-bearing rather than decorative.
+- **None of the platform half has ever been run.** Nobody here can cut a release
+  to install, so everything that could be decided without one is: the command
+  line, the `msiexec` arguments, the quoting of a path with a space in it, which
+  steps hold the window open, and that no step claims progress it cannot see.
+  The two `unsafe` calls and the install itself are not covered by anything.
+
 #### The update dialog
 
 `umber-app::update::flow` is the model — which screen, which stage, the

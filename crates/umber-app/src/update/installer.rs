@@ -46,8 +46,15 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The flag that turns this executable into the installer.
+/// The flag that turns this executable into the update installer.
 pub const FLAG: &str = "--install-update";
+
+/// The flag that turns it into the *first-run* installer.
+///
+/// `umber-setup.exe` carries the package on its own end — see
+/// [`super::payload`] — so this needs no arguments at all, which matters
+/// because it is the one flag a person may type or a shortcut may carry.
+pub const SETUP_FLAG: &str = "--install";
 
 /// What the helper was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +70,13 @@ pub struct Job {
     /// The version being installed, for the window to name. Free text out of
     /// the release API, so it is only ever displayed.
     pub version: String,
+    /// Whether this is the first-run installer rather than an update.
+    ///
+    /// The two do the same thing to the machine and differ in what the window
+    /// says and in one behaviour: an update was already asked for and gets on
+    /// with it, where setup was double-clicked by somebody who has not yet
+    /// agreed to anything and waits to be told to start.
+    pub setup: bool,
     /// The installed `umber.exe` to start when the package is in place.
     ///
     /// Carried rather than worked out here, and that is the point: this helper
@@ -82,6 +96,17 @@ pub struct Job {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Option<Job> {
     let mut args = args.into_iter().skip(1);
     while let Some(arg) = args.next() {
+        // The first-run installer. No arguments: the package is on the end of
+        // this file and the window asks before it does anything.
+        if arg == SETUP_FLAG {
+            return Some(Job {
+                package: PathBuf::new(),
+                parent: None,
+                version: String::new(),
+                setup: true,
+                target: None,
+            });
+        }
         if arg != FLAG {
             continue;
         }
@@ -98,6 +123,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Option<Job> {
             package: PathBuf::from(package),
             parent,
             version,
+            setup: false,
             target,
         });
     }
@@ -173,6 +199,12 @@ impl Command {
 /// over something it cannot see is the control this project refuses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Waiting to be told to start.
+    ///
+    /// The first-run installer alone. An update was asked for and carries on;
+    /// setup was double-clicked, and putting files on somebody's machine
+    /// because they opened a window would be the wrong way round.
+    Ready,
     /// Waiting for Umber to close. Fast, and the one step that could hang, so
     /// it is named rather than folded into the next.
     WaitingForUmber,
@@ -194,6 +226,7 @@ impl Step {
     /// The line under the bar.
     pub fn label(&self) -> String {
         match self {
+            Self::Ready => "Umber will be installed for everyone on this machine.".to_string(),
             Self::WaitingForUmber => "Waiting for Umber to close...".to_string(),
             Self::AskingPermission => "Asking Windows for permission to install...".to_string(),
             Self::Installing => "Installing...".to_string(),
@@ -209,7 +242,7 @@ impl Step {
     /// that vanished mid-install would leave `msiexec` running with nothing on
     /// screen to say so.
     pub fn holds_work(&self) -> bool {
-        !matches!(self, Self::Finished | Self::Failed(_))
+        !matches!(self, Self::Ready | Self::Finished | Self::Failed(_))
     }
 
     /// How far along the bar sits, where that can be said at all.
@@ -219,6 +252,7 @@ impl Step {
     /// draws an empty track, exactly as `Stage::HandingOver`'s does.
     pub fn progress(&self) -> Option<f32> {
         match self {
+            Self::Ready => Some(0.0),
             Self::WaitingForUmber => Some(0.1),
             Self::AskingPermission => Some(0.25),
             Self::Installing => None,
@@ -274,6 +308,23 @@ mod tests {
         assert_eq!(parse(args(&["umber", "--crash-report", "r.json"])), None);
     }
 
+    /// **The first-run installer needs no arguments**, because the package is
+    /// on the end of the file it is reading from. That is what lets it be
+    /// double-clicked.
+    #[test]
+    fn setup_is_its_own_flag_and_carries_nothing() {
+        let job = parse(args(&["umber-setup.exe", SETUP_FLAG])).expect("setup");
+        assert!(job.setup);
+        assert_eq!(job.parent, None);
+        assert_eq!(job.target, None);
+
+        // And it is not the update flag: an update names a package and waits
+        // for the process that spawned it, and confusing the two would install
+        // nothing or install it twice.
+        let update = parse(args(&["umber", FLAG, "p.msi"])).expect("update");
+        assert!(!update.setup);
+    }
+
     #[test]
     fn the_flag_carries_a_package_a_parent_and_a_version() {
         let job = parse(args(&[
@@ -303,6 +354,7 @@ mod tests {
         assert_eq!(job.parent, None);
         assert_eq!(job.version, "");
         assert_eq!(job.target, None);
+        assert!(!job.setup);
 
         // And a parent that is not a number is "do not wait" rather than a
         // refusal, for the reason `crash::parse_args` ignores what it cannot
@@ -361,6 +413,9 @@ mod tests {
         }
         assert!(!Step::Finished.holds_work());
         assert!(!Step::Failed("no".into()).holds_work());
+        // Setup before it has been told to start is not working either: the
+        // window has a Cancel that must not be refused.
+        assert!(!Step::Ready.holds_work());
     }
 
     /// **The bar is empty while Windows is installing**, because nothing
@@ -379,6 +434,7 @@ mod tests {
     #[test]
     fn no_step_calls_anything_verified() {
         for step in [
+            Step::Ready,
             Step::WaitingForUmber,
             Step::AskingPermission,
             Step::Installing,

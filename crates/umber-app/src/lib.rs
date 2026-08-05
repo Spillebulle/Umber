@@ -62,7 +62,12 @@ mod themelib;
 mod thumbs;
 mod tweaks;
 mod ui;
-mod update;
+/// Checking for, fetching and installing a new release.
+///
+/// Public because `examples/make-setup.rs` builds the setup executable with
+/// `update::payload::append` — the same function the running binary reads a
+/// payload back with, so the writer and the reader cannot drift.
+pub mod update;
 mod updatedlg;
 mod widgets;
 
@@ -78,12 +83,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // draws the box on a device that has not just died. So the command line is
     // read before anything else is set up, and the reporter path never touches
     // the editor, the autosave or the update check at all. See `crash`.
-    // And its own installer, by the same mechanism and for a related reason: a
-    // running executable cannot be replaced, so the process that puts an update
-    // in place and starts the new build has to be a different one. See
-    // `update::installer`. Read before the crash reporter only because the two
-    // are mutually exclusive and one of them has to be first; neither parser
-    // recognises the other's flag.
+    // And its own installer, twice over: `--install-update` is the helper an
+    // update spawns, because a running executable cannot be replaced and the
+    // process that puts the package in place cannot be Umber; `--install` is
+    // `umber-setup.exe`, which is this same binary with the package on its own
+    // end. See `update::installer` and `update::payload`. Read before the crash
+    // reporter only because the two are mutually exclusive and one of them has
+    // to be first; neither parser recognises the other's flag.
     if let Some(job) = update::installer::parse(std::env::args()) {
         return update::installwin::show(job);
     }
