@@ -12,6 +12,75 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.7 — 2026-08-05
+
+Text on the canvas, a module for changing a brush mid-painting, themes you can
+make yourself, and undo that survives deleting a layer. Plus a crash on Wayland,
+a colour picker that moved the wrong marker, and Clip Studio brushes that
+imported as fixed nibs when their authors had them following the stroke.
+
+### New
+
+- **Text.** Set a line or a paragraph in any font installed on your machine, or
+  in a folder of your own. It lands on the canvas as a floating piece you can
+  move, scale and turn before putting it down. Text is properly shaped, so
+  ligatures and Arabic joining are right. You type it in the panel rather than
+  on the canvas, and a character your font has no glyph for is named instead of
+  quietly swapped.
+- **Brush tweaks.** A module with six rails you can reach while painting:
+  hardness, spacing, roundness, airbrush rate, angle and colour pickup. Each has
+  a grip you hold and drag, like brush size above the canvas. All eight take a
+  keyboard pair too, unbound until you choose one. They change the brush in your
+  hand and not the brush you saved.
+- **Themes of your own.** Copy Graphite or Paper and type any of its twenty
+  seven colours as a hex. It is one small file, so you can export it or bring
+  somebody else's in.
+- **Stamps and papers have a library.** Import your own, browse what you have,
+  and pick one while editing a brush. A paper is previewed tiled, so you can see
+  whether its edges meet.
+- **Deleting a layer no longer throws away your undo history.** Adding,
+  deleting, reordering and renaming a layer are all undoable now, as is adding
+  or removing a mask. Clearing a layer is the one command left that still
+  clears the history.
+- **A harmony wheel a painter would recognise.** It used to answer with the
+  opposite colour in light rather than in paint, so blue's complement came out
+  yellow instead of orange. It now uses the artist's wheel by default, with the
+  additive one still available, and you pick two, three or four colours rather
+  than naming a relation.
+- **Coloured stamps.** GIMP pixmap brushes arrive in colour rather than as
+  silhouettes.
+- **258 presets**, up from 239. Krita brushes that ask for a paper texture now
+  bring it with them.
+
+### Fixed
+
+- **Umber crashed on Wayland** when a window was dragged to the top of a second
+  screen and dropped. It was reconfiguring the display surface while still
+  holding a frame, which validation caught. Without validation the same gesture
+  would have drawn into a surface that no longer existed.
+- **Turning the hue in the colour wheel moved the saturation marker.** Three
+  separate causes, the first being that the centre responded to presses well
+  outside the shape it draws. There is also a toggle now for swapping the light
+  and dark corners.
+- **Clip Studio brushes imported as fixed nibs.** A sketching pencil whose
+  author had it following the stroke arrived rigid, under a note about a
+  stroke-speed setting that was never the problem. Their bitmap tips also come
+  across at full resolution instead of from a 300 pixel preview.
+- **The Start Menu shortcut and the taskbar button drew Windows' own icons**
+  rather than Umber's mark.
+- **The installer wears Umber's colours**, and its flow is one page.
+- **The canvas scrollbars are always there.** They used to appear only when part
+  of the picture was off screen, so zooming out until the whole canvas fitted
+  left no way to shift it off centre. `Ctrl+0`, or "Fit" in the status bar, puts
+  it back in the middle.
+- **The brush editor is one size** whatever section is in front, instead of
+  resizing as you moved between tabs.
+- **Shipped brushes can be edited from the library**, not only from the panel.
+- **The `+` in the Brushes panel makes a brush.** It used to do nothing.
+- Eleven Krita brushes had been shipping without the paper texture their authors
+  gave them, because of a misread setting name. They are refused for now rather
+  than painting wrongly, and six have since come back with their paper.
+
 ## 0.0.6 — 2026-08-04
 
 The clipboard now reaches other applications, an autosaved copy is offered back

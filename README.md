@@ -25,21 +25,21 @@ Layers and History modules](docs/images/window.png)
 
 ## Install
 
-**Umber 0.0.6.** Take the file for your system, or browse the
+**Umber 0.0.7.** Take the file for your system, or browse the
 [release itself](https://github.com/Spillebulle/umber/releases/latest) for the
 notes and the checksums.
 
 | Your system | x86-64 | ARM64 |
 |---|---|---|
-| Windows | [`.msi` installer](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-x64.msi) | [`.msi` installer](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-arm64.msi) |
-| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
-| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber_0.0.6_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber_0.0.6_arm64.deb) |
-| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-1.aarch64.rpm) |
-| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-bin-0.0.6-1-x86_64.pkg.tar.zst) | not built |
-| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.0.6/Umber-0.0.6-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.0.6/Umber-0.0.6-aarch64.AppImage) |
-| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-x86_64.flatpak) | not built |
-| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-aarch64-pc-windows-msvc.zip) |
-| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.6/umber-0.0.6-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows | [`.msi` installer](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-x64.msi) | [`.msi` installer](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-arm64.msi) |
+| macOS | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-universal-apple-darwin.tar.gz), one universal binary with both slices | *(the same file)* |
+| Debian, Ubuntu, Mint | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber_0.0.7_amd64.deb) | [`.deb`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber_0.0.7_arm64.deb) |
+| Fedora, RHEL, openSUSE | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-1.x86_64.rpm) | [`.rpm`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-1.aarch64.rpm) |
+| Arch | [`.pkg.tar.zst`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-bin-0.0.7-1-x86_64.pkg.tar.zst) | not built |
+| Any other Linux | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.0.7/Umber-0.0.7-x86_64.AppImage), one file with nothing to install | [AppImage](https://github.com/Spillebulle/umber/releases/download/v0.0.7/Umber-0.0.7-aarch64.AppImage) |
+| Flatpak | [`.flatpak` bundle](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-x86_64.flatpak) | not built |
+| Windows, no installer | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-x86_64-pc-windows-msvc.zip) | [`.zip`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-aarch64-pc-windows-msvc.zip) |
+| Linux, no package | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-x86_64-unknown-linux-gnu.tar.gz) | [`.tar.gz`](https://github.com/Spillebulle/umber/releases/download/v0.0.7/umber-0.0.7-aarch64-unknown-linux-gnu.tar.gz) |
 
 You need a GPU with Vulkan, Direct3D 12 or Metal, which is essentially any
 machine from the last decade. The Linux packages pull in the libraries Umber
