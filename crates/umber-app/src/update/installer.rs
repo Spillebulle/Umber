@@ -454,12 +454,28 @@ mod tests {
 
     /// Where the first install starts Umber from, and it must be where the
     /// package actually put it.
+    ///
+    /// **Read as components rather than compared against a spelled-out path**,
+    /// which is what this did first and is a test that only passes on Windows:
+    /// a backslash is not a separator on Unix, so `PathBuf::from(r"C:\Program
+    /// Files")` is *one* component there and joining two more onto it produced
+    /// `C:\Program Files/Umber/umber.exe` against an expected literal of one
+    /// piece. It failed on all three Unix runners and passed on both Windows
+    /// ones, which is exactly the shape of failure the release script's CI wait
+    /// exists to catch — and did.
+    ///
+    /// The root has no drive letter for the same reason: nothing here is about
+    /// how a platform spells a path, only that the folder and the binary are
+    /// appended to it in that order.
     #[test]
     fn the_installed_path_is_program_files_and_the_packages_own_folder() {
-        assert_eq!(
-            installed_path(Some(r"C:\Program Files")),
-            Some(PathBuf::from(r"C:\Program Files\Umber\umber.exe"))
-        );
+        let path = installed_path(Some("root")).expect("a path");
+        let parts: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(parts, ["root", INSTALL_FOLDER, "umber.exe"]);
+
         // Nothing to build a path from is "do not guess", which the window
         // reads as `Installed` rather than as a failure.
         assert_eq!(installed_path(None), None);
