@@ -145,6 +145,46 @@ pub fn press(p: Pointer) -> Press {
     }
 }
 
+/// Whether a press that resolved to `decision` must end a stroke already in
+/// flight.
+///
+/// **A second button going down mid-stroke used to strand the stroke in a state
+/// nothing ended.** Hold the left button and draw, then press the middle one:
+/// [`press`] answers [`Press::Pan`] and `pointer_pressed` sets
+/// `Interaction::Panning` over the top of `Interaction::Drawing`. The left
+/// button coming up then falls through `pointer_released`'s `_` arm — it
+/// dispatches on the interaction, which is no longer `Drawing` — so
+/// `finish_stroke` is never called at all. Three things follow, and the last is
+/// the worst:
+///
+/// * The dabs already stamped stay in the scratch texture and go on being
+///   composited, so a half-stroke hangs on the canvas that is in no layer. Save
+///   or export in that state and the file disagrees with the screen.
+/// * `render`'s `quiet` test requires `!stroke.is_active()`, and the builder
+///   still is, so **the autosave stops for the rest of the session** until some
+///   later stroke happens to begin and end properly.
+/// * The next `start_stroke` clears the scratch, so the hanging mark silently
+///   vanishes rather than being baked in — which is the one mercy here, and is
+///   why this is a lost stroke rather than a wrong-coloured one.
+///
+/// The answer is **finish, not cancel**, and the asymmetry with
+/// [`Contact::Pinch`] is deliberate rather than an oversight: a second finger
+/// means the first contact was never a stroke, so those dabs must never reach
+/// the canvas, where a second *button* arrives after the artist has drawn a
+/// visible mark with the first. Every other "something else is happening now"
+/// path in `app.rs` commits too — `switch_document`, `apply_canvas`,
+/// `close_document`, `float_a_clip` and `take_region` all call `finish_stroke`.
+/// Do not unify the two.
+///
+/// [`Press::Paint`] is excluded because it *is* a stroke, and
+/// [`Press::Ignored`] because the canvas never sees it. Neither is reachable
+/// while a stroke runs — one mouse cannot press left twice, and a finger
+/// landing on a panel is a [`Contact::Pinch`] — so both are stated as the rule
+/// they follow rather than left to be worked out from what cannot happen.
+pub fn supersedes_stroke(decision: Press) -> bool {
+    !matches!(decision, Press::Paint | Press::Ignored)
+}
+
 /// What a `WindowEvent::Touch` turns out to be.
 ///
 /// The routing half of this module: `press` says what a press *means*, and this
@@ -368,6 +408,39 @@ mod tests {
             Press::Ignored,
             "nor may a contact on a panel resize the brush"
         );
+    }
+
+    #[test]
+    fn every_press_but_a_stroke_of_its_own_ends_the_stroke_it_interrupts() {
+        // The reported sequence: hold left and draw, then press middle. The
+        // pan takes `Interaction` over, and `pointer_released` dispatches on
+        // `Interaction` — so without this the left button coming up never
+        // reaches `finish_stroke`, the dabs hang in the scratch, and the
+        // autosave stops for the rest of the session.
+        assert!(supersedes_stroke(press(Pointer {
+            pan_button: true,
+            ..mouse(Tool::Brush)
+        })));
+
+        // Stated over the whole enum rather than over the two cases the mouse
+        // can currently produce, because a `Press` added later must arrive
+        // having answered this. Paint is the stroke itself and Ignored is a
+        // press the canvas never sees; everything else supersedes.
+        for decision in [
+            Press::Pan,
+            Press::Zoom,
+            Press::Select,
+            Press::Transform,
+            Press::Eyedropper,
+            Press::ResizeBrush,
+        ] {
+            assert!(
+                supersedes_stroke(decision),
+                "{decision:?} left a stroke running"
+            );
+        }
+        assert!(!supersedes_stroke(Press::Paint));
+        assert!(!supersedes_stroke(Press::Ignored));
     }
 
     #[test]

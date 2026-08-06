@@ -3423,6 +3423,17 @@ impl UmberApp {
         // `inputlog`.
         self.editor.input.note_gesture(decision);
 
+        // A press that begins something *else* ends the stroke that is running,
+        // and it has to happen here rather than at the call sites: a pan takes
+        // `Interaction` over, and `pointer_released` dispatches on
+        // `Interaction`, so the button that was drawing comes up and never
+        // reaches `finish_stroke` at all. Finish rather than cancel, and not
+        // what `Contact::Pinch` does — `gesture::supersedes_stroke` has the
+        // whole argument and both failure modes.
+        if gesture::supersedes_stroke(decision) && self.editor.stroke.is_active() {
+            self.finish_stroke();
+        }
+
         // Every press ends the brush-size drag except the one that is carrying
         // it on. A mouse press is never a contact, so `press` can never answer
         // `ResizeBrush` for one and this stays exactly the rule it always was:
@@ -4060,9 +4071,19 @@ impl ApplicationHandler<Wake> for UmberApp {
                     // flick of the wrist would silently rescale the brush.
                     (true, _) => self.set_brush_resize(false),
                     // The middle button pans and nothing else, so its release
-                    // has nothing to finish.
+                    // has nothing to finish — but it may only end the pan it
+                    // began. Writing `Idle` unconditionally is the same defect
+                    // `gesture::supersedes_stroke` fixes, arriving from the
+                    // other direction: middle-press to pan, left-press to draw,
+                    // then let the middle button go, and this cleared the
+                    // `Drawing` the stroke was dispatching on, so the left
+                    // button coming up never finished it. That fix is what
+                    // repairs the sequence; this is what stops the arm being
+                    // able to break it again.
                     (false, MouseButton::Middle) => {
-                        self.editor.interaction = Interaction::Idle;
+                        if self.editor.interaction == Interaction::Panning {
+                            self.editor.interaction = Interaction::Idle;
+                        }
                     }
                     (false, MouseButton::Left) => self.pointer_released(pos, false),
                     (false, _) => {}

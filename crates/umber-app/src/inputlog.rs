@@ -423,15 +423,26 @@ impl InputLog {
     /// Record which gesture the one real `gesture::press` call resolved a press
     /// to.
     ///
-    /// **Only ever lands on a sample that is itself a press.** `note` records
-    /// the left button and touches and skips everything else, so a middle-click
-    /// — which resolves to a pan and is a press the page never saw — would
-    /// otherwise back-fill its answer onto whatever motion happened to be
-    /// newest. Same shape as [`Self::note_resolved`], and the same reason it is
-    /// called immediately after the real decision rather than deciding again.
+    /// **Only ever lands on a sample that is itself a press, and never twice.**
+    /// `note` records the left button and touches and skips everything else, so
+    /// a middle-click — which resolves to a pan and is a press the page never
+    /// saw — would otherwise back-fill its answer onto whatever motion happened
+    /// to be newest. The `Down` test alone was not enough for that: it catches
+    /// a middle press that follows a move, and not one that follows the left
+    /// press directly, which is exactly the sequence that supersedes a stroke.
+    /// The newest sample would then be the *left* press's and its recorded
+    /// gesture would be overwritten with "pan" — the one column that exists to
+    /// say the press became the wrong thing, saying it about the wrong press.
+    ///
+    /// `is_none` settles it because there is exactly one legitimate call per
+    /// press: `pointer_pressed` runs once, and `push` writes a whole fresh
+    /// `Sample`, so the field starts empty for every sample the ring holds.
+    /// Same shape as [`Self::note_resolved`], and the same reason it is called
+    /// immediately after the real decision rather than deciding again.
     pub fn note_gesture(&mut self, gesture: crate::gesture::Press) {
         if let Some(newest) = self.ring.newest_mut()
             && newest.motion == Motion::Down
+            && newest.gesture.is_none()
         {
             newest.gesture = Some(gesture);
         }
@@ -773,6 +784,33 @@ mod tests {
             log.last_gesture(),
             Some(crate::gesture::Press::ResizeBrush),
             "and the readout still names the last real press"
+        );
+    }
+
+    #[test]
+    fn a_second_press_the_page_never_saw_cannot_overwrite_the_first() {
+        // A middle press during a stroke resolves to a pan, and `note` skips it
+        // — so the newest sample is still the *left* press's. The `Down` guard
+        // does not catch that: it only stops the back-fill where something
+        // moved in between. Overwriting is exactly the wrong answer, because
+        // this column exists to say what the press somebody made became.
+        let mut log = InputLog::default();
+        log.note(
+            &WindowEvent::MouseInput {
+                device_id: winit::event::DeviceId::dummy(),
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+            },
+            0.0,
+        );
+        log.note_gesture(crate::gesture::Press::Paint);
+        // The middle press: no sample of its own, and `pointer_pressed` calls
+        // `note_gesture` for it all the same.
+        log.note_gesture(crate::gesture::Press::Pan);
+        assert_eq!(
+            log.ring.newest().unwrap().gesture,
+            Some(crate::gesture::Press::Paint),
+            "the left press became a stroke and the page must go on saying so"
         );
     }
 
