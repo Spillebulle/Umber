@@ -25,10 +25,9 @@ use crate::tabs;
 use crate::theme::{Palette, metrics, text};
 use crate::widgets;
 use egui::{Align2, FontId, Frame, Margin, Rect, Sense, Stroke, pos2, vec2};
-use std::sync::Arc;
 use umber_core::{
     BlendMode, Brush, DabInput, DabTarget, GrainPattern, Modulation, ResponseCurve, ScrollSpan,
-    Selection, SelectionMode, SelectionOp, TipMask, input::PressureSource,
+    Selection, SelectionMode, SelectionOp, input::PressureSource,
 };
 
 /// Requests the UI makes that need GPU access, handled by the caller.
@@ -2951,11 +2950,14 @@ const PAPER_PREVIEW_TEXELS: u32 = 96;
 /// copy and unmissable the moment it meets itself. Umber's own three join by
 /// construction; a picture somebody imported may not.
 ///
-/// Cached in egui's temporary store and validated by `Arc` identity, exactly as
-/// `brushlib`'s tip preview is: the modal redraws every frame and this would
-/// otherwise upload a texture on each of them. Its own slot and its own id —
-/// the browser's rows draw the same tiles through a cache of their own, because
-/// two consumers of a one-slot cache evict each other's live texture.
+/// Cached through [`widgets::tip_texture`], which is where the rule lives:
+/// validated by the tile's `Arc` identity **and by the ink it was drawn in**.
+/// The modal redraws every frame and this would otherwise upload a texture on
+/// each of them, while a cache that forgot the colour would keep a tile drawn in
+/// the old theme's ink until the paper itself changed. `"brush-paper"` is this
+/// square's alone — the name is what the slot is derived from, and the browser
+/// draws the same tiles under names of its own, because two consumers sharing a
+/// slot evict each other's live texture every frame.
 fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
     let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
     ui.painter().rect_filled(rect, metrics::RADIUS, p.chrome);
@@ -2966,21 +2968,13 @@ fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
         // exactly what the brush is about to do.
         return;
     };
-    let id = egui::Id::new("brush-paper-preview");
-    let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui.ctx().data(|d| d.get_temp(id));
-    let texture = match cached {
-        Some((held, texture)) if Arc::ptr_eq(&held, &tile) => texture,
-        _ => {
-            let texture = ui.ctx().load_texture(
-                "brush-paper",
-                widgets::tip_image(&tile, p.text_strong, PAPER_PREVIEW_TEXELS),
-                egui::TextureOptions::LINEAR,
-            );
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(id, (Arc::clone(&tile), texture.clone())));
-            texture
-        }
-    };
+    let texture = widgets::tip_texture(
+        ui.ctx(),
+        "brush-paper",
+        &tile,
+        p.text_strong,
+        PAPER_PREVIEW_TEXELS,
+    );
 
     // Four separate draws, not one with a uv range past 1: egui's textures are
     // clamped rather than repeating, so the wide uv would magnify the top-left
