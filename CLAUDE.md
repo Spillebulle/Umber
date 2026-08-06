@@ -1632,10 +1632,25 @@ raising `dab_ratio` narrows the dab rather than growing it.
   `StrokeBuilder::bounds` unions the axis-aligned box of the rotated quad of the
   *scattered* dab. Too tight and the edge of a mark is never committed — it
   redraws as a live preview and is then baked in by the next stroke, in that
-  stroke's colour, and that has now happened three times. A round dab fits its
+  stroke's colour, and that has now happened four times. A round dab fits its
   bounding square at any angle, which is why the circle held until bitmap tips
   arrived: **a tip paints into the corners**, and a quad turned 45° reaches
   `radius * sqrt(2)`.
+- **Its short semi-axis is the *dab's* `aspect`, never `Brush::dab_ratio`.**
+  `dab.wgsl` builds the quad as `radius / max(aspect, 1.0)`, and `aspect`
+  carries whatever a `DabTarget::Ratio` modulation added — 30 of the 258
+  shipped presets can drive it below the nominal ratio, and
+  `tanda/charcoal-04` all the way to a round dab against a `dab_ratio` of 10,
+  so the box recorded a tenth of the dab's height. **This is the exact
+  opposite of the spacing rule above, and the adjacency is how it happened**:
+  damage is per dab and must follow the dab, spacing is per stroke and must
+  not, or a stroke's step would wander with the RNG. Bind `aspect` to a name
+  once and derive the short axis from it, so `bounds` and `damage` are fed
+  from the same numbers structurally rather than by discipline.
+  `widgets::preview_mark` had read `dab.aspect` all along — **the one
+  duplicate this file licenses was right and the canvas was the outlier**,
+  which is worth remembering before distrusting a second implementation on
+  principle.
 - **The same box goes into `StrokeBuilder::damage`, from the same numbers.**
   The cell mask is what the undo patch and the commit are both cut to, so a
   mask that did not cover what the bounding box covers is the under-tight
