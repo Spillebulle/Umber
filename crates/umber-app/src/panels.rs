@@ -923,10 +923,15 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 
     ui.add_space(9.0);
     ui.horizontal(|ui| {
+        // The rectangle is claimed first and painted last, because typing the
+        // sixth digit moves the colour *during* `hex_field`: a chip filled on
+        // the way past would spend that frame showing the colour the field has
+        // just stopped saying, which is the disagreement `paint_colour` exists
+        // to prevent.
         let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+        hex_field(ui, p, ed);
         ui.painter()
             .rect_filled(chip, metrics::RADIUS, paint_colour(ed));
-        hex_field(ui, p, ed);
     });
 }
 
@@ -959,12 +964,16 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // overwrite `#8` with the full hex on the next one, so nothing could be typed
     // at all.
     //
-    // "Part way through" is two passes wider than "has the caret", and that is
-    // not slack: egui reports a blur on the pass after the caret left *or the one
-    // after that*, since a widget drawn before the one that took the focus cannot
-    // learn of it until its next pass — and wiping the buffer on the blur pass
-    // means the short hex somebody typed is gone before it can be taken. The
-    // window is closed explicitly the moment the blur is dealt with, below.
+    // "Part way through" reaches one pass past "has the caret", and that is not
+    // slack: egui reports a blur on the pass *after* the caret left, and wiping
+    // the buffer on that pass loses the short hex somebody typed before it can
+    // be taken. One and not two, which is the tighter of the two readings and
+    // the right one. egui's own `lost_focus` is two passes wide, but `held` is
+    // rewritten on every pass the field is drawn holding the caret, so a
+    // genuine blur is always exactly one pass past the last recorded one; the
+    // extra pass only ever covered the case where the field was *not drawn*,
+    // which is the case that must abandon rather than apply. The window is
+    // closed explicitly the moment the blur is dealt with, below.
     //
     // It is also this rule that answers the panel going away. The field lives in
     // a dock panel that can be closed, undocked or dragged short, and egui
@@ -976,16 +985,17 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // remember to call, because the rule is structural.
     //
     // The field's id is stated rather than left to egui's running count of the
-    // widgets drawn before it, and both halves of that were needed. The question
-    // above has to be answered *before* the widget is drawn, because it decides
-    // what the buffer holds — an automatic id is not known until afterwards. And
-    // the automatic one was not stable: on the pass the field held the caret it
-    // came back different, which egui's end-of-pass sweep read as a widget that
-    // had gone and surrendered the focus for, so a single click could not keep
-    // the caret in the field for two frames running.
+    // widgets drawn before it, and the reason is the question above: it has to
+    // be answered *before* the widget is drawn, because it decides what the
+    // buffer holds, and an automatic id is not knowable until afterwards. That
+    // argument stands on its own and is the whole of it. (An earlier draft also
+    // claimed the automatic id was unstable under focus. It was observed once in
+    // a harness and never root-caused, and the likelier reading is that the
+    // harness was naming an id nothing drew; nothing here rests on it, and it is
+    // recorded as an observation rather than repeated as a fact.)
     let pass = ui.ctx().cumulative_pass_nr();
     let typing = ui.ctx().memory(|m| m.has_focus(hex_edit_id()));
-    let settling = state.held.is_some_and(|at| pass <= at + 2);
+    let settling = state.held.is_some_and(|at| pass <= at + 1);
 
     // Escape abandons what was typed, and it has to be read here rather than
     // left to the blur below. egui's `TextEdit` handles no `Key::Escape`, but
@@ -995,14 +1005,14 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // to be rid of. Guarded on the field having the caret, or having had it
     // moments ago, because Escape is a key the rest of the application answers
     // too and this must not reach out and change a colour nobody was typing.
-    let abandoned = (typing || settling) && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Bare Escape only, matching `Focus::begin_pass`'s own condition exactly. It
+    // drops the caret for `Escape if !modifiers.any()`, so reading the key alone
+    // would take Shift+Escape and Ctrl+Escape — which egui ignores — and empty
+    // the buffer out from under a caret that is still sitting in it.
+    let abandoned = (typing || settling)
+        && ui.input(|i| i.key_pressed(egui::Key::Escape) && !i.modifiers.any());
     if abandoned || (!typing && !settling) {
-        state.text = current_hex(ed);
-    }
-    if abandoned {
-        // Settled, so the blur that follows on this pass or the next finds the
-        // colour's own hex in the field and applying it is the identity.
-        state.held = None;
+        state.forget(current_hex(ed));
     }
 
     // No `shortcuts::set_capturing` here, and that is not an omission: `ui::draw`
@@ -1028,20 +1038,33 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // short hex; applying only on blur would mean the colour cannot be judged
     // against the picker above it while it is being typed.
     let body = state.text.trim().trim_start_matches('#');
-    if field.changed() && body.len() == 6 {
-        apply_hex(ed, &state.text);
+    if field.changed() {
+        state.edited = true;
+        if body.len() == 6 {
+            apply_hex(ed, &state.text);
+        }
     }
     if field.lost_focus() {
-        apply_hex(ed, &state.text);
+        // **Only what somebody typed.** A blur with an untouched buffer must
+        // apply nothing, and this is not tidiness — it was a real bug both ways
+        // round. The click that picks a colour off the wheel is the same click
+        // that blurs this field, and egui surrenders the focus inside the
+        // field's own `interact`, so `lost_focus` fires on the pass where
+        // `colour_body` has already run `commit_picker`: applying the buffer
+        // there writes the *old* hex back over the colour just chosen. And even
+        // with nothing else moving, re-applying the colour to itself is not the
+        // identity — `Editor::set_color` copies saturation across unguarded, so
+        // a colour dialled down to zero value comes back with the picker's
+        // saturation wiped and the wheel's marker on the grey axis.
+        if state.edited {
+            apply_hex(ed, &state.text);
+        }
         // Whichever way that went, the caret has left and the field is a readout
         // again: normalised where it read, so `#fff` becomes `#FFFFFF` — which is
         // also what says it was taken — and back to the colour that is actually
         // there where it did not, because a readout saying `rebeccapurple` beside
-        // a chip that is `#C08A4E` is the control that lies. One line for both,
-        // rather than two that could disagree about what the field ends up
-        // holding.
-        state.text = current_hex(ed);
-        state.held = None;
+        // a chip that is `#C08A4E` is the control that lies.
+        state.forget(current_hex(ed));
     }
 
     ui.ctx().data_mut(|d| d.insert_temp(hex_field_id(), state));
@@ -1073,6 +1096,24 @@ struct HexEdit {
     /// has been dealt with. What it bounds is how long the buffer goes on
     /// belonging to whoever was typing — see `hex_field`.
     held: Option<u64>,
+    /// Whether anybody has actually typed into the buffer since it was last a
+    /// readout. Only an edited buffer may be applied on the way out; see the
+    /// `lost_focus` branch for the two bugs that answers.
+    edited: bool,
+}
+
+impl HexEdit {
+    /// Hand the buffer back to the colour: it is a readout again, holds `shown`,
+    /// and has nothing in it for a blur to apply.
+    ///
+    /// One place, because "the field is settled" is three facts that must move
+    /// together — leave `edited` set and the next blur applies a buffer nobody
+    /// typed; leave `held` set and the refill stays suppressed.
+    fn forget(&mut self, shown: String) {
+        self.text = shown;
+        self.held = None;
+        self.edited = false;
+    }
 }
 
 /// Where the buffer is kept.
@@ -2954,6 +2995,88 @@ mod tests {
         assert_eq!(typist.srgb(), before, "the abandoned hex landed later");
     }
 
+    /// A colour chosen while the caret happens to be in the field is not undone
+    /// by the blur that choosing it causes.
+    ///
+    /// The nastiest case this control has, and it needs no typing at all. The
+    /// click that picks a colour off the wheel is the same click that blurs the
+    /// field, and egui surrenders the focus inside the field's own `interact` —
+    /// so `lost_focus` fires on the very pass `colour_body` has already run
+    /// `commit_picker` and moved `Editor::color`. A blur that applied the buffer
+    /// unconditionally then wrote the *old* hex back over the new colour. On a
+    /// drag of the wheel the next frame hides it; on a single click, on the
+    /// eyedropper and on a palette swatch the colour the artist picked was
+    /// simply thrown away.
+    ///
+    /// So the buffer is applied on blur only where somebody actually typed into
+    /// it. `HexEdit::edited` is that, and this is what holds it.
+    #[test]
+    fn a_colour_chosen_while_the_caret_is_in_the_field_survives_the_blur() {
+        use umber_core::Color;
+
+        let mut typist = Typist::new();
+        // The caret goes in and nothing is typed, so the buffer is the colour's
+        // own hex — which parses, which is what makes this dangerous.
+        typist
+            .ctx
+            .memory_mut(|m| m.request_focus(super::hex_edit_id()));
+        typist.frame(Vec::new());
+        // The wheel, the eyedropper or a swatch moves the colour. Every one of
+        // them lands before the field is drawn on the pass that blurs it.
+        typist
+            .ed
+            .set_color(Color::from_srgb_u8(0x11, 0x22, 0x33, 0xFF));
+        typist.lets_go();
+
+        assert_eq!(
+            typist.srgb(),
+            [0x11, 0x22, 0x33],
+            "the blur put the colour back that the click had just replaced"
+        );
+        assert_eq!(
+            typist.buffer(),
+            "#112233",
+            "and the readout has to be showing the new one"
+        );
+    }
+
+    /// Clicking into the field and out again, typing nothing, leaves the picker
+    /// exactly as it was.
+    ///
+    /// The other half of the rule above, and it needs no colour to change at
+    /// all: re-applying the colour to *itself* is not the identity.
+    /// `Editor::set_color` guards the hue for a grey and copies saturation
+    /// across unguarded, so a colour dialled down to zero value — black, with a
+    /// hue and a saturation the picker is still holding — comes back with the
+    /// saturation wiped and the wheel's marker on the grey axis. Raising the
+    /// value afterwards then gives grey rather than the colour being dialled in.
+    /// A label could not be clicked into; a field can, so this had to be
+    /// answered.
+    #[test]
+    fn clicking_in_and_out_of_the_field_leaves_the_picker_alone() {
+        use umber_core::Hsv;
+
+        let mut typist = Typist::new();
+        // A colour being dialled in from the bottom of the value rail: the
+        // picker holds a hue and a saturation that the colour itself cannot
+        // state, which is the whole point of `Editor::hsv`.
+        typist.ed.hsv = Hsv::new(200.0, 0.8, 0.0);
+        typist.ed.commit_picker();
+        let before = typist.ed.hsv;
+
+        typist
+            .ctx
+            .memory_mut(|m| m.request_focus(super::hex_edit_id()));
+        typist.frame(Vec::new());
+        typist.lets_go();
+
+        assert_eq!(
+            typist.ed.hsv.s, before.s,
+            "clicking through the field wiped the picker's saturation"
+        );
+        assert_eq!(typist.ed.hsv.h, before.h, "and its hue with it");
+    }
+
     /// The readout follows a colour chosen anywhere else — the wheel, the
     /// eyedropper, a palette swatch, `X` — exactly as the label it replaced did,
     /// and stops following while somebody is typing into it.
@@ -3324,6 +3447,8 @@ mod tests {
                             super::HexEdit {
                                 text: half.to_owned(),
                                 held: None,
+                                // Typed, which is what the shot is of.
+                                edited: true,
                             },
                         );
                     });
