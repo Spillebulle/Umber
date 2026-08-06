@@ -53,6 +53,24 @@ pub trait Page {
     /// buttons out of reach. Bodies scroll instead.
     fn size(&self) -> [f32; 2];
 
+    /// Whether the window should shrink its **height** to what the page draws.
+    ///
+    /// `false` by default, which is the rule above: a page with an unbounded
+    /// body must keep the size it asked for and scroll. The installer opts in
+    /// because its body is short, bounded and *varies* — measured, its steps
+    /// draw between 142 and 204 points into a window fixed at 260, so the one a
+    /// person looks at longest sat in nearly twice the height it needed with
+    /// the rest empty. Reported from a real machine.
+    ///
+    /// Height only, and never upward past [`Self::size`]: the width is where a
+    /// wrapped paragraph's height comes from, so changing it could not settle,
+    /// and growing is how a page with a body that gets longer walks off the
+    /// bottom of the screen. Shrinking cannot clip, because what it shrinks to
+    /// is what was drawn.
+    fn fits_content(&self) -> bool {
+        false
+    }
+
     /// The user's own theme. Read from their preferences by each page, because
     /// these processes have no `Editor` to take one from — which is exactly why
     /// prefs are a file rather than a field.
@@ -278,6 +296,32 @@ impl Host<'_> {
         let output = gfx.egui_ctx.run_ui(raw_input, |ui| {
             page.draw(ui, &mut close);
         });
+
+        // Fit the height to what was actually drawn, for a page that asked.
+        // Measured off the shapes rather than `used_rect`, because the frame
+        // paints a background over the whole window and `used_rect` would
+        // therefore always report the window back to us.
+        //
+        // Asked once per frame and acted on only when it differs by more than a
+        // point, so a window already the right height requests nothing and the
+        // two cannot chase each other. Never taller than the page asked for:
+        // see `Page::fits_content`.
+        if page.fits_content() {
+            let drawn = output.shapes.iter().fold(0.0f32, |tallest, shape| {
+                tallest.max(shape.shape.visual_bounding_rect().max.y)
+            });
+            let wanted = drawn.ceil().min(page.size()[1]);
+            let have = gfx
+                .window
+                .inner_size()
+                .to_logical::<f32>(gfx.window.scale_factor())
+                .height;
+            if wanted.is_finite() && wanted > 0.0 && (have - wanted).abs() > 1.0 {
+                let _ = gfx
+                    .window
+                    .request_inner_size(winit::dpi::LogicalSize::new(page.size()[0], wanted));
+            }
+        }
 
         gfx.egui_state
             .handle_platform_output(&gfx.window, output.platform_output);

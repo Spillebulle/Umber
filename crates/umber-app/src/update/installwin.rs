@@ -269,6 +269,13 @@ impl Page for Installer {
         WINDOW
     }
 
+    /// Yes: every step here is short and bounded, and they differ enough that a
+    /// single height wastes most of the window on the one shown longest. See
+    /// `Page::fits_content` for what that is allowed to do.
+    fn fits_content(&self) -> bool {
+        true
+    }
+
     fn palette(&self) -> Palette {
         self.palette
     }
