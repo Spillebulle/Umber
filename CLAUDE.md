@@ -3210,6 +3210,35 @@ parts that mattered are not the obvious ones.
   mistake in a new place. It has already paid for itself once here: the
   reintroduced defect that had left twenty-eight tests green did, after the
   rework, fail the one test that was supposed to catch it.
+- **A brief that forbids a change must name who to ask.** "Report it rather
+  than change it" is not an instruction until the agent knows where reports go.
+  Three agents were told to report rather than edit a contested file, none was
+  told how to reach its lead, and one lost a request into a dead address —
+  where it looked, from every side, as though the question had simply not been
+  worth asking. **And a commitment made to a coordinator about a running agent
+  is not in force until that agent has been told**; the moment to send it is
+  the same turn the commitment is made. That one is easy to get wrong because
+  the promise *feels* discharged when the coordinator has been told, and the
+  coordinator is the one who asked.
+- **A lead that says "no critic reviewed this" is worth more than one that says
+  a review happened.** Several critics returned nothing at all this session,
+  twice on one branch. The right response is to say so and run an independent
+  one, not to substitute your own walk-through — and the leads who did that
+  produced the honest map. Read it beside the note above about the branch that
+  self-reviewed.
+- **The lens that actually finds a thin module is "a field the file format
+  round-trips that the interface cannot author".** The tempting one — that a
+  module this file says nothing about is an unexamined module — was tried and
+  is weak: eleven of twelve unmentioned modules turned out to be finished,
+  because an argument about one module belongs in that module's own docs and
+  this project puts it there. The narrow lens went four for four in a single
+  pass: `Swatch::name`, `Palette::columns`, a stamp's name, and `Layer::name`.
+  It needs no prior knowledge of the codebase, which is what makes it worth
+  writing down. `sqlite.rs` and `themelib.rs` are the bar the thin ones should
+  be measured against — the first because every one of its tests is an
+  adversarial case for a reader of a file a stranger wrote, the second because
+  it reasons about whether two ids differing only in case are one file or two
+  depending on the platform.
 
 ## The README
 
