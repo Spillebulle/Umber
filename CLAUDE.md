@@ -2962,6 +2962,27 @@ at which walking away has already gone wrong once. So:
   exactly the half that was never the risk. If shaders changed, run
   `UMBER_TEST_SOFTWARE=1` over `umber-render` as well — CI has no graphics card,
   and the last bit of floating point is where hardware and lavapipe disagree.
+- **Build the Windows installer and run it before tagging.** It is the one
+  artefact whose failure is total — a setup executable that does not install is
+  a release nobody can take — and it shipped broken in 0.0.8 because it had
+  never once been launched. `wix` 5.0.2 with the UI and Util extensions is all
+  it needs beyond the release build:
+  ```sh
+  cargo build --release -p umber-desktop
+  mkdir -p wixassets dist
+  cp assets/icons/umber.ico wixassets/
+  cp packaging/windows/banner.bmp packaging/windows/dialog.bmp wixassets/
+  sh packaging/windows/make-licence-rtf.sh LICENSE wixassets/licence.rtf
+  wix build packaging/windows/umber.wxs -arch x64 \
+    -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -pdbtype none \
+    -d Version=$V -d BinDir=target/release -d DocDir=. -d AssetDir=wixassets \
+    -o dist/umber-$V-x64.msi
+  cargo run --release -p umber-app --example make-setup -- \
+    target/release/umber.exe dist/umber-$V-x64.msi dist/umber-setup-$V-x64.exe
+  ```
+  Then **double-click it** — not `--install`, because a double-click is the case
+  that was broken and the flag is the case that was not. `dist/` is ignored, so
+  this leaves the tree clean.
 - **`pwsh` may not be installed.** `release.ps1` needs PowerShell 7, because
   under 5.1 a native command's stderr becomes an error record and
   `$ErrorActionPreference = 'Stop'` aborts on cargo's ordinary progress output.
@@ -3110,11 +3131,42 @@ through the same three screens.
   deliberately does **not**, because the updater fetches the `.msi` and not the
   setup binary. The version in that filename is read back by `unpack_payload` to
   head the window, so the name is load-bearing rather than decorative.
-- **None of the platform half has ever been run.** Nobody here can cut a release
-  to install, so everything that could be decided without one is: the command
-  line, the `msiexec` arguments, the quoting of a path with a space in it, which
-  steps hold the window open, and that no step claims progress it cannot see.
-  The two `unsafe` calls and the install itself are not covered by anything.
+- **It has now been run, and 0.0.8's shipped broken in three ways. All three
+  were things the reasoning had already covered and got wrong.** Everything
+  that can be decided without a release still is — the command line, the
+  `msiexec` arguments, which steps hold the window open, that no step claims
+  progress it cannot see — but the record below is what that turned out to be
+  worth. Build one and run it before believing this path again:
+  `wix build packaging/windows/umber.wxs …` then `make-setup`, both exactly as
+  `release.yml` does them.
+  - **Dispatch went by a flag nothing passes.** `--install` was the only way
+    into setup, and setup is *double-clicked*, which passes no command line at
+    all — so `umber-setup.exe` started the application. The comment beside the
+    check said "No arguments" while the code required one. **What tells the two
+    apart is the payload**, so that is what `installer::job` asks; the flag
+    remains for asking deliberately. `payload::carried_by` reads sixteen bytes
+    off the end and `umber.exe` pays one seek per launch to answer no.
+  - **`msiexec` was handed quoted switches.** `parameters()` quoted every
+    argument, and `msiexec` parses its own command line rather than going
+    through `CommandLineToArgvW`: it will not read `"/i"` or `"/qn"`. It raised
+    its usage dialog, which an elevated process draws where nobody can see it,
+    and `WaitForSingleObject` waited on it for ever. Consent given, then
+    nothing. **A path is quoted and a switch never is**, and the test that
+    should have caught it asserted the opposite — `every_parameter_is_quoted`
+    required `"/i"`, so the guard held the defect in place.
+  - **The window was fixed at 260 points for steps that draw 142 to 204.**
+    Measured, by running each `Step` through `run_ui` and taking the tallest
+    shape. `Page::fits_content` is the opt-in, height only and never upward;
+    see `shell.rs` for why width could not settle and why `used_rect` is the
+    wrong reading here.
+  - **`make-setup` now asks the written file `carried_by`, not only the bytes
+    `read`.** Those are different questions and only the second one was being
+    asked: the format was perfect in the build that shipped broken. A writer
+    that checks its output against the *runtime's own* predicate is the rule
+    worth taking from this, not the three bugs.
+  - Still uncovered: the two `unsafe` calls, and whether `msiexec` actually
+    installs. A green build says the artefact will be recognised, not that the
+    package is good.
 
 #### The update dialog
 

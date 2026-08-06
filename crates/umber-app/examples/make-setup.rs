@@ -60,6 +60,21 @@ fn main() -> std::process::ExitCode {
         eprintln!("could not write {out}: {e}");
         return std::process::ExitCode::FAILURE;
     }
+
+    // And then ask the **written file** the question the running binary asks of
+    // itself, which is a different question from the one above and is the one
+    // that was never checked. `read` proves the format round-trips in memory;
+    // `carried_by` is what decides, on a double-click, that this executable is
+    // an installer rather than Umber. A setup binary that fails it is one that
+    // opens the application instead of installing it, which is exactly what
+    // 0.0.8's shipped and nothing here caught: the format had always been fine.
+    if !payload::carried_by(std::path::Path::new(out)) {
+        eprintln!(
+            "{out} was written but is not recognised as an installer; it would \
+             open Umber instead of installing it"
+        );
+        return std::process::ExitCode::FAILURE;
+    }
     println!(
         "{out}: {} bytes ({} of program, {} of package)",
         setup.len(),

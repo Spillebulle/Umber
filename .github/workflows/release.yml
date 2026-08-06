@@ -160,9 +160,17 @@ jobs:
       # `umber.exe` with the MSI concatenated onto it and a footer saying how
       # long the package is, so a first install shows Umber's own window rather
       # than Windows Installer's. `update::payload` has the format;
-      # `make-setup` is the one writer of it and reads the package back out
-      # before writing the file, so a build that produced something the
-      # installer cannot open fails here rather than on somebody's machine.
+      # `make-setup` is the one writer of it and checks its work twice, which
+      # is one more time than it used to and for a reason worth keeping.
+      #
+      # It reads the package back out of the bytes before writing them, and it
+      # then asks the **written file** `payload::carried_by` — the predicate the
+      # running binary uses to decide, on a double-click, that it is an
+      # installer rather than Umber. Those are different questions. 0.0.8
+      # shipped a setup executable whose format was perfect and which opened the
+      # application instead of installing, because dispatch went by a
+      # command-line flag nothing passes; only the second check would have
+      # caught it.
       #
       # After the MSI, obviously: it is the payload.
       - name: Build setup executable
