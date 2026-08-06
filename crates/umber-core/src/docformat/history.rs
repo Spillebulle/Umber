@@ -486,6 +486,17 @@ pub(crate) struct ManifestPiece {
 /// Stable name for an [`EditKind`]. The debug spelling, like
 /// [`super::blend_id`], so it cannot drift out of step with the enum the way a
 /// second hand-written table would.
+///
+/// What "stable" rests on, since the derive cannot enforce it: the variant's
+/// **name in the source is the identifier on disk**. Adding a variant is safe
+/// and is what the derive was chosen for; *renaming* one is a refactor with no
+/// behavioural intent that silently changes the file format. [`kind_from_id`]
+/// then answers `None` for any entry recorded under the old name, and
+/// `docimport::history` drops the **whole** history of every document holding
+/// one — which for a rename of `Paint` or `Erase` is very nearly all of them.
+/// The round trip against `kind_from_id` cannot catch that, because both sides
+/// move together. `the_names_written_into_a_saved_history_are_these_exact_
+/// strings` spells the set out as literal text, which is what does.
 pub fn kind_id(kind: EditKind) -> String {
     format!("{kind:?}")
 }
@@ -1154,6 +1165,49 @@ mod tests {
             assert_eq!(kind_from_id(&kind_id(kind)), Some(kind));
         }
         assert_eq!(kind_from_id("Smudge"), None);
+    }
+
+    /// **These strings are a file format, and what this catches is a rename.**
+    ///
+    /// [`kind_id`] is the derived `Debug` spelling, so the identifier written
+    /// into `umber/history/index.json` is the variant's *name in the source*.
+    /// Renaming one is a refactor with no behavioural intent — the kind a
+    /// reviewer waves through — and it silently changes what is on disk:
+    /// [`kind_from_id`] then answers `None` for every history any earlier
+    /// build wrote, and `docimport::history` turns that into a hard error that
+    /// drops the **whole** history of every saved document carrying one.
+    ///
+    /// The round trip above cannot see it. It compares the writer against the
+    /// reader, and both move together under a rename, so it agrees with itself
+    /// whatever the variants are called. Only text written out here does not
+    /// move.
+    ///
+    /// **Which of the two triggers this is decides what to do about it.** A
+    /// variant *added* fails this too, because the list is built from `ALL`,
+    /// and there appending the new name is simply the right fix: nothing
+    /// already on disk says anything about it. A variant *renamed* is the case
+    /// this exists for, and editing the literal is then the wrong move on its
+    /// own — it is the point at which somebody has to decide what happens to
+    /// the files already written under the old name.
+    #[test]
+    fn the_names_written_into_a_saved_history_are_these_exact_strings() {
+        let spelled: Vec<String> = EditKind::ALL.into_iter().map(kind_id).collect();
+        assert_eq!(
+            spelled,
+            [
+                "Paint",
+                "Erase",
+                "Transform",
+                "FlipHorizontal",
+                "FlipVertical",
+                "AddLayer",
+                "DeleteLayer",
+                "MoveLayer",
+                "Group",
+                "AddMask",
+                "RemoveMask",
+            ]
+        );
     }
 
     /// Both halves of the timestamp's compatibility story, which is why it did

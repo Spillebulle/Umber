@@ -738,6 +738,34 @@ pub fn composite_op(mode: BlendMode) -> (&'static str, bool) {
 
 /// Stable name for [`BLEND_ATTR`]. The debug spelling, so it cannot drift out
 /// of step with the enum the way a second hand-written table would.
+///
+/// What "stable" rests on, since the derive cannot enforce it: the variant's
+/// **name in the source is the identifier on disk**. Adding a mode is safe and
+/// is what the derive was chosen for; *renaming* one silently changes the file
+/// format. The damage is milder here than for `history::kind_id` and is worth
+/// stating exactly rather than dramatically. The attribute is written only
+/// where [`composite_op`] reports `!exact`, which is Add alone, so only Add
+/// layers carry one; on a rename [`blend_from_id`] answers `None` and the
+/// reader falls back to `composite-op`, which for such a layer is
+/// `svg:plus` — and `blend::nearest` reads that back as Add. **The mode and
+/// the pixels are unchanged.** What is lost is the fidelity: the import raises
+/// a spurious `BlendApproximated` warning, which is precisely the regression
+/// [`BLEND_ATTR`] exists to prevent, reintroduced on every Add layer in every
+/// document already on disk.
+///
+/// **The ORA file is not the only thing this spelling reaches, and the other
+/// one is worse** — which is worth saying, having claimed to state the cost
+/// exactly. [`BlendMode`] derives `Serialize`, and `Brush::blend` carries one
+/// into `brushes.ron`, where serde's variant name is that same source
+/// identifier. `preset::parse` is a single `ron::from_str(…)?` over the whole
+/// file, so an unrecognised variant is not a per-brush fallback but a hard
+/// error: a user who has ever set a brush to Add loses their entire saved
+/// library rather than gaining a warning. Two consumers of one identifier,
+/// and only one of them is this module's.
+///
+/// `the_names_written_into_the_blend_attribute_are_
+/// these_exact_strings` is what catches it; the round trip against
+/// `blend_from_id` cannot, because both sides move together.
 pub fn blend_id(mode: BlendMode) -> String {
     format!("{mode:?}")
 }
@@ -2122,6 +2150,85 @@ mod tests {
             assert_eq!(blend_from_id(&blend_id(mode)), Some(mode));
         }
         assert_eq!(blend_from_id("Dissolve"), None);
+    }
+
+    /// **These strings are a file format, and what this catches is a rename.**
+    ///
+    /// [`blend_id`] is the derived `Debug` spelling, so what goes into
+    /// [`BLEND_ATTR`] is the variant's name in the source. See that function
+    /// for what a rename costs — briefly, a spurious "blend approximated"
+    /// warning on every Add layer already written, and, through the same
+    /// identifier reaching serde, a `brushes.ron` that no longer parses at
+    /// all. The round trip above moves with the rename and cannot see it;
+    /// text written out here does not move.
+    ///
+    /// As with the history's twin: a mode *added* fails this too, and there
+    /// appending the name is the right fix. A mode *renamed* is the case this
+    /// exists for, and the literal is not the thing to edit first.
+    #[test]
+    fn the_names_written_into_the_blend_attribute_are_these_exact_strings() {
+        let spelled: Vec<String> = BlendMode::ALL.into_iter().map(blend_id).collect();
+        assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
+    }
+
+    /// [`BlendMode::ALL`] is a hand-written array, and a mode missing from it
+    /// is a mode that does not exist as far as three readers are concerned.
+    /// The one this module cares about is [`blend_from_id`], which searches it
+    /// and would answer `None` and fall through to whatever `composite-op`
+    /// says. **It is not the worst of the three**, and saying otherwise would
+    /// be the overclaim this guard exists to prevent: the other two are the
+    /// layer blend dropdown in `panels.rs` and the brush blend dropdown in
+    /// `ui.rs`, both of which build themselves by iterating `ALL`, so a mode
+    /// left out of it is one nobody can select in the first place. That is the
+    /// failure `CLAUDE.md` already names for the brush editor — "adding one
+    /// means adding a control, or the library can use a brush nobody can
+    /// make".
+    ///
+    /// The guard is the exhaustive `match`, which fails the **build** when a
+    /// mode is added. That has to be a compile error rather than an assertion,
+    /// because a test that iterates `ALL` can only check the entries that are
+    /// in it and so agrees with itself however short the array is.
+    ///
+    /// It sits here rather than beside the enum because this is where the test
+    /// module that already pins the mode names is, and the two are one
+    /// subject. That is a weaker reason than the twin guard in `history.rs`
+    /// has for sitting beside `EditKind` — if these are ever made consistent,
+    /// beside the enum is the better home for both, since the dropdowns above
+    /// are the bigger consumer and neither lives here.
+    ///
+    /// The arms index `ALL`, so an arm added for a sixth mode the obvious way
+    /// — `BlendMode::ALL[5]` — is an out-of-bounds index into a fixed-size
+    /// array and fails the build a second time when `ALL` was not extended.
+    /// Any arm that does not index its *own* position still slips through,
+    /// for the reason set out at `history::tests::listed_in_all`, which is
+    /// where the hole was measured.
+    #[test]
+    fn all_lists_every_blend_mode() {
+        const fn listed_in_all(mode: BlendMode) -> BlendMode {
+            match mode {
+                BlendMode::Normal => BlendMode::ALL[0],
+                BlendMode::Multiply => BlendMode::ALL[1],
+                BlendMode::Screen => BlendMode::ALL[2],
+                BlendMode::Overlay => BlendMode::ALL[3],
+                BlendMode::Add => BlendMode::ALL[4],
+            }
+        }
+
+        // Each arm has to hand back the mode it was reached by, and no
+        // position may be listed twice — the first catches a *listed* mode's
+        // arm pointing at the wrong entry, which is what a reordered `ALL`
+        // looks like, and the second catches a mode being *replaced* in the
+        // array rather than added to it, which the first cannot see on its own
+        // because the mode that fell out is then never iterated.
+        for mode in BlendMode::ALL {
+            assert_eq!(listed_in_all(mode), mode, "{mode:?} is listed wrongly");
+        }
+        for (i, mode) in BlendMode::ALL.iter().enumerate() {
+            assert!(
+                !BlendMode::ALL[..i].contains(mode),
+                "`BlendMode::ALL` lists {mode:?} twice, so a mode is missing"
+            );
+        }
     }
 
     #[test]
