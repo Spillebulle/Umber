@@ -2836,6 +2836,9 @@ impl UmberApp {
         if actions.cut_selection {
             self.cut_selection();
         }
+        if actions.paste {
+            self.paste();
+        }
         if actions.open_export {
             self.editor.export_form.open = true;
         }
@@ -2905,6 +2908,12 @@ impl UmberApp {
         }
         if actions.reset_zoom {
             self.editor.camera.zoom = 1.0;
+        }
+        if actions.zoom_in {
+            self.editor.zoom_by(ZOOM_KEY_STEP);
+        }
+        if actions.zoom_out {
+            self.editor.zoom_by(1.0 / ZOOM_KEY_STEP);
         }
         if let Some(index) = actions.pick_tab {
             self.switch_document(index);
