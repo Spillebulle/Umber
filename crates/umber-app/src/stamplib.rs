@@ -112,6 +112,21 @@ enum Source {
     Hidden,
 }
 
+impl Source {
+    /// What a cache key calls this half of the list.
+    ///
+    /// Short because it is a key rather than a label, and it exists at all
+    /// because `Yours` and `Hidden` are the two rows that share a **name** and
+    /// carry different pictures. See [`preview`].
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Yours => "y",
+            Self::Shipped => "s",
+            Self::Hidden => "h",
+        }
+    }
+}
+
 /// The picture whose name is being edited, and the name so far.
 ///
 /// The buffer lives here rather than in the row, for `palettelib`'s reason: a
@@ -607,7 +622,10 @@ fn row(
 
     // Outside the frame: `joins` walks a whole tile the first time it is asked
     // and wants the context, not the row's layout.
-    let line = detail(entry, joins(ui, kind, &entry.name, &entry.mask));
+    let line = detail(
+        entry,
+        joins(ui, kind, entry.source, &entry.name, &entry.mask),
+    );
     let renaming = state
         .renaming
         .as_ref()
@@ -633,7 +651,7 @@ fn row(
         .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                preview(ui, p, kind, &entry.name, &entry.mask);
+                preview(ui, p, kind, entry.source, &entry.name, &entry.mask);
                 ui.add_space(10.0);
                 // **The controls claim their room before the text does**, and
                 // the text column is whatever is left. Laid out the other way
@@ -895,11 +913,11 @@ fn joins_id() -> Id {
     Id::new("stamp-library-joins")
 }
 
-fn joins(ui: &Ui, kind: Kind, name: &str, mask: &Arc<TipMask>) -> Option<bool> {
+fn joins(ui: &Ui, kind: Kind, source: Source, name: &str, mask: &Arc<TipMask>) -> Option<bool> {
     if kind != Kind::Papers {
         return None;
     }
-    let key = format!("{}:{name}", kind.title());
+    let key = format!("{}:{}:{name}", kind.title(), source.tag());
     let cached = ui
         .ctx()
         .data(|d| d.get_temp::<Joins>(joins_id()))
@@ -941,19 +959,31 @@ fn preview_id() -> Id {
 /// holds a single slot, and it is drawn from the brush editor's Tip row — which
 /// can be on screen at the same time as this modal, since this is opened from
 /// it. Two consumers of a one-slot cache evict each other's live texture every
-/// frame, which is a `wgpu` validation failure and not merely waste; the key
-/// here therefore carries the *kind and name* as well as the mask, and this
+/// frame, which is a `wgpu` validation failure and not merely waste; this
 /// module's own id keeps it out of that one's way entirely.
+///
+/// **The key carries the *source* as well as the kind and the name**, and the
+/// mask is only the validator. A `Yours` row and the `Hidden` row it shadows
+/// have the same name and different pictures, and the browser draws both in
+/// one pass — so a key of kind-and-name alone had the second row overwrite the
+/// first's entry and drop the last handle to a texture the first had already
+/// queued a `Shape` for. That is `CLAUDE.md`'s "a texture cache keyed on an
+/// address must have the shape it drew in in the key too", and the note there
+/// that comparing and rebuilding on a mismatch *is* the eviction. It survived
+/// as waste rather than a panic only because `app::submit_frame` frees after
+/// the submit; two 96-square box-averages of up to four million texels,
+/// re-uploaded every frame. A rename is a new and *offered* route into the
+/// shadow state, which is why it is fixed here.
 ///
 /// A paper is drawn **tiled two by two**, which is the whole reason the square
 /// is worth looking at: a seam is invisible in one copy of a tile and obvious
 /// the moment it meets itself.
-fn preview(ui: &mut Ui, p: &Palette, kind: Kind, name: &str, mask: &Arc<TipMask>) {
+fn preview(ui: &mut Ui, p: &Palette, kind: Kind, source: Source, name: &str, mask: &Arc<TipMask>) {
     let side = metrics::STAMP_PREVIEW;
     let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
     ui.painter().rect_filled(rect, metrics::RADIUS, p.chrome);
 
-    let key = format!("{}:{name}", kind.title());
+    let key = format!("{}:{}:{name}", kind.title(), source.tag());
     let cached: Option<(Arc<TipMask>, egui::TextureHandle)> = ui
         .ctx()
         .data(|d| d.get_temp::<Previews>(preview_id()))
