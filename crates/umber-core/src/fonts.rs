@@ -220,6 +220,25 @@ fn is_font_file(path: &Path) -> bool {
     )
 }
 
+/// What [`FontLibrary::resolve`] had to change to be able to answer.
+///
+/// `resolve` is total by construction — a preference records names and the
+/// machine it is read back on may have neither — so it can never *refuse*, and
+/// something other than `resolve` has to be what says a substitution happened.
+/// This is that reading, kept beside the rule it reads so the two cannot drift.
+///
+/// Which half was changed matters, because the two are different sentences: a
+/// family that is not here at all is a font to go and install, where a family
+/// that is here without the style asked for is a weight that was never in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Substitution {
+    /// Nothing in the library carries that family, so this is some other
+    /// typeface entirely.
+    Family,
+    /// The family is here and this style within it is not.
+    Style,
+}
+
 /// Where a face's bytes come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -514,6 +533,29 @@ impl FontLibrary {
             .filter(|f| f.family.eq_ignore_ascii_case(family))
             .min_by_key(|f| (f.italic, f.weight.abs_diff(400)));
         nearest.or_else(|| self.faces.first())
+    }
+
+    /// Whether [`Self::resolve`] answered with something other than what was
+    /// asked for, and which half of the name it had to change.
+    ///
+    /// `None` where the pair named a real face, which is the ordinary case and
+    /// the one the interface stays quiet about. It reads `resolve`'s own answer
+    /// rather than re-deciding, so a caller cannot be told there was no
+    /// substitution and then be handed a substitute.
+    ///
+    /// Case-insensitively on both halves, exactly as `resolve` matches: a
+    /// preferences file spells a family however whoever edited it spelled it,
+    /// and reporting "Archivo is not here, using ARCHIVO" would be a notice
+    /// about nothing.
+    pub fn substituted(&self, family: &str, style: &str) -> Option<Substitution> {
+        let face = self.resolve(family, style)?;
+        if !face.family.eq_ignore_ascii_case(family) {
+            Some(Substitution::Family)
+        } else if !face.style.eq_ignore_ascii_case(style) {
+            Some(Substitution::Style)
+        } else {
+            None
+        }
     }
 }
 
@@ -879,6 +921,41 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// `resolve` is total, so something else has to say it substituted — and
+    /// the panel names the face it is *actually* setting in only because this
+    /// answers.
+    ///
+    /// A missing family and a missing style are told apart, because they are
+    /// different sentences: one is a typeface to go and install, the other is a
+    /// weight that was never in the one you have.
+    #[test]
+    fn a_face_that_had_to_be_substituted_says_which_half_of_the_name_moved() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+
+        // The ordinary case is silence.
+        assert_eq!(lib.substituted("Archivo", "Regular"), None);
+        // And spelling is not a substitution: `resolve` matches case
+        // insensitively, so a preferences file written in another capital must
+        // not raise a notice about nothing.
+        assert_eq!(lib.substituted("ARCHIVO", "regular"), None);
+
+        assert_eq!(
+            lib.substituted("Helvetica Neue", "Bold"),
+            Some(Substitution::Family)
+        );
+        assert_eq!(
+            lib.substituted("Archivo", "Ultra Condensed Black Italic"),
+            Some(Substitution::Style)
+        );
+        // Nothing to substitute *with* is not a substitution either — it is the
+        // one case `resolve` refuses, and the panel has nothing to draw.
+        assert_eq!(
+            FontLibrary::default().substituted("Archivo", "Regular"),
+            None
+        );
     }
 
     /// The borrowing iterator and the collecting one answer the same thing.

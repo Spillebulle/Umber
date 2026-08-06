@@ -39,7 +39,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use egui::{Sense, Ui, vec2};
 
 use umber_core::Background;
-use umber_core::fonts::{self, Face, FontLibrary};
+use umber_core::fonts::{self, Face, FontLibrary, Substitution};
 use umber_core::text::{self, Align, TextBlock, TextError};
 
 use crate::controls;
@@ -396,6 +396,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     font_picker(ui, p, ed);
     ui.add_space(2.0);
     style_picker(ui, p, ed);
+    substitution_note(ui, p, ed);
     ui.add_space(6.0);
 
     // The rails write into the block's own fields. Taking a copy and putting it
@@ -587,6 +588,54 @@ fn style_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     if let Some(style) = chosen {
         ed.text.style = style;
     }
+}
+
+/// Say so when the face being set in is not the one the pickers name.
+///
+/// `FontLibrary::resolve` is total on purpose — a preference records names and
+/// the machine it is read back on may have neither — so it always answers, and
+/// its own documentation says the **caller** is what says a substitution
+/// happened. This is that caller, and until now it did not say it.
+///
+/// It is reachable rather than theoretical. The library is replaced wholesale
+/// when the scan lands and again when the font-folder preference changes, so a
+/// family chosen from the old list can simply stop existing; the dropdown goes
+/// on showing the name that was picked while the preview, the measurement and
+/// Place all use something else. Naming both is the import rule applied here.
+///
+/// **The choice is not rewritten to the resolved name.** Somebody who picked a
+/// face and then pointed Umber at a different folder should get their face back
+/// when they point it home again, and a picker that quietly rewrote itself
+/// would have thrown that away with no way to notice.
+fn substitution_note(ui: &mut Ui, p: &Palette, ed: &Editor) {
+    let library = ed.text.fonts.library();
+    let Some(what) = library.substituted(&ed.text.family, &ed.text.style) else {
+        return;
+    };
+    // Not `resolve` again: this has to name the face the *reading* was taken
+    // from, or the sentence could name a third thing.
+    let Some(face) = library.resolve(&ed.text.family, &ed.text.style) else {
+        return;
+    };
+    // Two sentences and not one with a hole in it, because the two are
+    // different pieces of news. A family that is not here is a font to go and
+    // find; a family that is here without the style asked for is a weight the
+    // typeface never had, and telling somebody to install it would send them
+    // looking for something that does not exist.
+    let body = match what {
+        Substitution::Family => format!(
+            "{} is not on this machine. Umber is setting this text in {} {} instead. \
+             Your choice is kept, so the text goes back to it if the font turns up again.",
+            ed.text.family, face.family, face.style
+        ),
+        Substitution::Style => format!(
+            "{} has no {} on this machine. Umber is setting this text in {} instead. \
+             Your choice is kept, so the text goes back to it if the style turns up again.",
+            face.family, ed.text.style, face.style
+        ),
+    };
+    ui.add_space(4.0);
+    controls::note(ui, p, &body);
 }
 
 /// A fingerprint of everything that changes the picture.
@@ -1004,6 +1053,41 @@ mod tests {
         assert_ne!(after, first, "a replaced library kept the old face's bytes");
     }
 
+    /// A face that had to be substituted is named, and one that did not is not.
+    ///
+    /// `resolve` is total, so the panel is the only thing that can say a
+    /// substitution happened — and it did not. Reachable because the library is
+    /// replaced wholesale when a scan lands or the folder preference changes,
+    /// which is what `Fonts::forget` is here to stand in for.
+    #[test]
+    fn a_family_this_machine_does_not_have_is_named_rather_than_swapped_silently() {
+        let ed = Editor::default();
+        let library = ed.text.fonts.library();
+        // The default pair is real, so the panel stays quiet.
+        assert_eq!(library.substituted(&ed.text.family, &ed.text.style), None);
+
+        assert_eq!(
+            library.substituted("A Foundry Face Nobody Has", "Regular"),
+            Some(Substitution::Family)
+        );
+        assert_eq!(
+            library.substituted("Archivo", "Ultra Condensed Black Italic"),
+            Some(Substitution::Style)
+        );
+
+        // And the artist's choice is *kept*, not rewritten to what resolved.
+        // Rewriting is the tempting repair and it throws away the ability to
+        // get the face back when the font turns up again.
+        let mut ed = Editor::default();
+        ed.text.family = "A Foundry Face Nobody Has".to_string();
+        ed.text.block.text = "Umber".to_string();
+        assert!(ed.text.set().is_ok(), "it should still set in something");
+        assert_eq!(
+            ed.text.family, "A Foundry Face Nobody Has",
+            "the picker rewrote itself to the substitute"
+        );
+    }
+
     /// The family filter folds case and matches what the menu will show.
     ///
     /// Both halves read the same predicate, so the figure on the trigger cannot
@@ -1059,27 +1143,44 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/text-panel");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        // The fourth is the one worth looking at: two CJK ideographs Archivo
-        // has no glyph for, so the notice that names them is on screen beside
-        // the preview that does not show them.
-        for (name, text, align) in [
-            ("1-empty", "", Align::Left),
-            ("2-a-caption", "Umber", Align::Left),
+        // The last two are the ones worth looking at, and both are a *notice*
+        // landing in a column that already holds a preview image, three rails,
+        // two dropdowns and a segmented picker — the shape that fits in the
+        // abstract and overruns at `metrics::PANEL`'s real 264 points.
+        //
+        // The fourth has two CJK ideographs Archivo has no glyph for, so the
+        // notice naming them sits beside the preview that does not show them.
+        // The fifth names a family this machine does not have, which is the one
+        // notice drawn between the pickers rather than under the preview.
+        for (name, text, align, family) in [
+            ("1-empty", "", Align::Left, None),
+            ("2-a-caption", "Umber", Align::Left, None),
             (
                 "3-several-lines",
                 "Painted in Umber\non a Tuesday\nafternoon",
                 Align::Centre,
+                None,
             ),
             (
                 "4-a-face-cannot-show-it",
                 "Umber \u{5b57}\u{4f53}",
                 Align::Left,
+                None,
+            ),
+            (
+                "5-a-substituted-face",
+                "Umber",
+                Align::Left,
+                Some("Helvetica Neue"),
             ),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
             ed.text.block.text = text.to_string();
             ed.text.block.align = align;
+            if let Some(family) = family {
+                ed.text.family = family.to_string();
+            }
             let palette = crate::theme::Palette::with_accent(ed.ui.theme, ed.ui.accent);
             let field = vec2(metrics::PANEL, 520.0);
             let rect = Rect::from_min_size(Pos2::ZERO, field);
@@ -1089,6 +1190,6 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 4 shots to {}", dir.display());
+        println!("wrote 5 shots to {}", dir.display());
     }
 }
