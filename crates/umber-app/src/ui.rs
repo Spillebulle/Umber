@@ -39,11 +39,21 @@ pub struct UiActions {
     /// readback *and* on the encode that puts the picture on the machine's
     /// clipboard, and a cut records an undo entry. On a very large region that
     /// is about a second, which `examples/measure-clipboard.rs` measures and
-    /// this button therefore shares. Raised by the selection's overlay strip, which is the only
-    /// control for either; the keyboard reaches the same two methods directly
+    /// this button therefore shares. Raised by the selection's overlay strip
+    /// and by the Edit menu; the keyboard reaches the same two methods directly
     /// rather than through here.
     pub copy_selection: bool,
     pub cut_selection: bool,
+    /// Put whatever is on the clipboard down as a floating transform. The
+    /// caller's, because it uploads a texture and puts any float already up
+    /// down first — and because `sysclip::decide` reads the *desktop's*
+    /// clipboard, which blocks.
+    ///
+    /// Raised by the Edit menu, which is the only control for it: the
+    /// selection's canvas strip offers Deselect, Copy and Cut, and is drawn
+    /// only while a selection is live, so a picture copied in another
+    /// application had nowhere in the interface to be pasted from.
+    pub paste: bool,
     /// Put the Export dialog up. Nothing is written by this: it only asks the
     /// format, and the answer comes back as `export`.
     pub open_export: bool,
@@ -72,6 +82,12 @@ pub struct UiActions {
     pub history_jump: Option<usize>,
     pub fit_view: bool,
     pub reset_zoom: bool,
+    /// Step the zoom in or out about the middle of the view, exactly as
+    /// [`Action::ZoomIn`] and [`Action::ZoomOut`] do from the keyboard. Routed
+    /// through here rather than written on the editor where the View menu draws
+    /// them, so all four of that menu's rows are carried out in one place.
+    pub zoom_in: bool,
+    pub zoom_out: bool,
     /// Set the Text module's block and float it over the canvas. The caller's,
     /// because it blocks on a font file and on the rasteriser and then does
     /// exactly what a paste does — `Clip::place`, `begin_float`, and the
@@ -1186,166 +1202,9 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
         ui.add_space(6.0);
 
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New…").clicked() {
-                    let doc = ed.doc;
-                    ed.canvas_form.open(crate::canvasdlg::Dialog::New, doc);
-                    ui.close();
-                }
-                if ui.button("Open…").clicked() {
-                    actions.open_file = true;
-                    ui.close();
-                }
-                if ui
-                    .button("Canvas settings…")
-                    .on_hover_text("Size, background and resolution of the document in front.")
-                    .clicked()
-                {
-                    let doc = ed.doc;
-                    ed.canvas_form.open(crate::canvasdlg::Dialog::Settings, doc);
-                    ui.close();
-                }
-                // Beside Canvas settings rather than under a new Image menu:
-                // these are the same kind of thing — a change to the document
-                // rather than to the artwork on it — and the menu bar is the
-                // design's, not something to add a heading to for two rows.
-                //
-                // Unlike a resize, a flip keeps the undo history: the canvas
-                // size does not change and the flip is its own inverse, so it
-                // goes in the history as an entry that stores no pixels.
-                // A locked layer refuses the flip *whole* — a picture with some
-                // layers mirrored and some not was never on screen, and a flip
-                // that half happened cannot be undone by flipping again. Said
-                // here rather than only refused in `mirror_document`, so the
-                // menu does not offer what it will not do.
-                let flip_locked = ed.layers.any_locked();
-                for (label, axis, hint) in [
-                    (
-                        "Flip canvas horizontally",
-                        umber_core::FlipAxis::Horizontal,
-                        "Mirror every layer left to right. The canvas size is unchanged.",
-                    ),
-                    (
-                        "Flip canvas vertically",
-                        umber_core::FlipAxis::Vertical,
-                        "Mirror every layer top to bottom. The canvas size is unchanged.",
-                    ),
-                ] {
-                    let action = match axis {
-                        umber_core::FlipAxis::Horizontal => Action::FlipCanvasHorizontal,
-                        umber_core::FlipAxis::Vertical => Action::FlipCanvasVertical,
-                    };
-                    let item = ui.add_enabled_ui(!flip_locked, |ui| menu_item(ui, label, action));
-                    if item
-                        .inner
-                        .on_hover_text(hint)
-                        .on_disabled_hover_text(
-                            "A layer is locked. A flip mirrors every layer at once, so it \
-                             cannot skip one. Unlock it first.",
-                        )
-                        .clicked()
-                    {
-                        actions.flip_canvas = Some(axis);
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                if menu_item(ui, "Save", Action::Save).clicked() {
-                    actions.save = true;
-                    ui.close();
-                }
-                if menu_item(ui, "Save as…", Action::SaveAs).clicked() {
-                    actions.save_as = true;
-                    ui.close();
-                }
-                ui.separator();
-                // Only offered while there is another document to fall back to;
-                // Umber has nowhere to go with nothing open.
-                if ui
-                    .add_enabled(ed.session.len() > 1, egui::Button::new("Close document"))
-                    .on_disabled_hover_text(
-                        "This is the only document open, and Umber has nothing to \
-                         show in its place.",
-                    )
-                    .clicked()
-                {
-                    let index = ed.session.active_index();
-                    if ed.session.active_tab().modified {
-                        ed.ui.close_prompt = Some(index);
-                    } else {
-                        actions.close_tab = Some(index);
-                    }
-                    ui.close();
-                }
-                ui.separator();
-                // Said before the click, like removing a mask and like the
-                // canvas dialog's own line: clearing is the last command that
-                // is not an undoable edit, so it takes the history with it and
-                // there is no way back afterwards.
-                if ui
-                    .add_enabled(
-                        !ed.layers.active_is_locked(),
-                        egui::Button::new("Clear layer"),
-                    )
-                    .on_hover_text("Empties the layer, and clears the undo history with it.")
-                    .on_disabled_hover_text("Unlock the layer to clear it.")
-                    .clicked()
-                {
-                    actions.clear = true;
-                    ui.close();
-                }
-                if menu_item(ui, "Export image…", Action::Export)
-                    .on_hover_text(
-                        "One flattened image for showing people: PNG, JPEG, TIFF, GIF or \
-                         BMP. Save keeps the layers.",
-                    )
-                    .clicked()
-                {
-                    actions.open_export = true;
-                    ui.close();
-                }
-            });
-
-            ui.menu_button("Edit", |ui| {
-                // The history covers painting only, which is why these can be
-                // dead on a document that plainly has layers in it.
-                if ui
-                    .add_enabled(ed.history.can_undo(), egui::Button::new("Undo"))
-                    .on_disabled_hover_text("Nothing painted on this document to undo.")
-                    .clicked()
-                {
-                    actions.undo = true;
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(ed.history.can_redo(), egui::Button::new("Redo"))
-                    .on_disabled_hover_text("Nothing undone to put back.")
-                    .clicked()
-                {
-                    actions.redo = true;
-                    ui.close();
-                }
-                ui.separator();
-                // Under Edit rather than Window, which is where Windows and
-                // most Linux desktops put preferences. Window is about the
-                // arrangement of the workspace; these are settings for the
-                // application.
-                if ui.button("Settings…").clicked() {
-                    ed.ui.settings_open = true;
-                    ui.close();
-                }
-            });
-
-            ui.menu_button("View", |ui| {
-                if ui.button("Fit to window").clicked() {
-                    actions.fit_view = true;
-                    ui.close();
-                }
-                if ui.button("Actual size").clicked() {
-                    actions.reset_zoom = true;
-                    ui.close();
-                }
-            });
+            ui.menu_button("File", |ui| file_menu(ui, ed, actions));
+            ui.menu_button("Edit", |ui| edit_menu(ui, ed, actions));
+            ui.menu_button("View", |ui| view_menu(ui, actions));
 
             ui.menu_button("Window", |ui| {
                 panels::window_menu(ui, ed);
@@ -1416,6 +1275,257 @@ fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAct
     });
 }
 
+/// The File menu's rows.
+///
+/// The three menus that carry [`Action`]s are functions of their own rather
+/// than closures inside [`menu_bar`], so a test can draw one into a plain `Ui`
+/// and read back what it says. Opening a real popup headlessly means
+/// synthesising a click at a position nothing reports, and what the test is
+/// after is the rows rather than the popup.
+fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
+    if ui.button("New…").clicked() {
+        let doc = ed.doc;
+        ed.canvas_form.open(crate::canvasdlg::Dialog::New, doc);
+        ui.close();
+    }
+    if ui.button("Open…").clicked() {
+        actions.open_file = true;
+        ui.close();
+    }
+    if ui
+        .button("Canvas settings…")
+        .on_hover_text("Size, background and resolution of the document in front.")
+        .clicked()
+    {
+        let doc = ed.doc;
+        ed.canvas_form.open(crate::canvasdlg::Dialog::Settings, doc);
+        ui.close();
+    }
+    // Beside Canvas settings rather than under a new Image menu:
+    // these are the same kind of thing — a change to the document
+    // rather than to the artwork on it — and the menu bar is the
+    // design's, not something to add a heading to for two rows.
+    //
+    // Unlike a resize, a flip keeps the undo history: the canvas
+    // size does not change and the flip is its own inverse, so it
+    // goes in the history as an entry that stores no pixels.
+    // A locked layer refuses the flip *whole* — a picture with some
+    // layers mirrored and some not was never on screen, and a flip
+    // that half happened cannot be undone by flipping again. Said
+    // here rather than only refused in `mirror_document`, so the
+    // menu does not offer what it will not do.
+    let flip_locked = ed.layers.any_locked();
+    for (axis, hint) in [
+        (
+            umber_core::FlipAxis::Horizontal,
+            "Mirror every layer left to right. The canvas size is unchanged.",
+        ),
+        (
+            umber_core::FlipAxis::Vertical,
+            "Mirror every layer top to bottom. The canvas size is unchanged.",
+        ),
+    ] {
+        let action = match axis {
+            umber_core::FlipAxis::Horizontal => Action::FlipCanvasHorizontal,
+            umber_core::FlipAxis::Vertical => Action::FlipCanvasVertical,
+        };
+        if menu_item(ui, action, !flip_locked)
+            .on_hover_text(hint)
+            .on_disabled_hover_text(
+                "A layer is locked. A flip mirrors every layer at once, so it \
+                 cannot skip one. Unlock it first.",
+            )
+            .clicked()
+        {
+            actions.flip_canvas = Some(axis);
+            ui.close();
+        }
+    }
+    ui.separator();
+    if menu_item(ui, Action::Save, true).clicked() {
+        actions.save = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::SaveAs, true).clicked() {
+        actions.save_as = true;
+        ui.close();
+    }
+    ui.separator();
+    // Only offered while there is another document to fall back to;
+    // Umber has nowhere to go with nothing open.
+    if ui
+        .add_enabled(ed.session.len() > 1, egui::Button::new("Close document"))
+        .on_disabled_hover_text(
+            "This is the only document open, and Umber has nothing to \
+             show in its place.",
+        )
+        .clicked()
+    {
+        let index = ed.session.active_index();
+        if ed.session.active_tab().modified {
+            ed.ui.close_prompt = Some(index);
+        } else {
+            actions.close_tab = Some(index);
+        }
+        ui.close();
+    }
+    ui.separator();
+    // Said before the click, like removing a mask and like the
+    // canvas dialog's own line: clearing is the last command that
+    // is not an undoable edit, so it takes the history with it and
+    // there is no way back afterwards.
+    if ui
+        .add_enabled(
+            !ed.layers.active_is_locked(),
+            egui::Button::new("Clear layer"),
+        )
+        .on_hover_text("Empties the layer, and clears the undo history with it.")
+        .on_disabled_hover_text("Unlock the layer to clear it.")
+        .clicked()
+    {
+        actions.clear = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::Export, true)
+        .on_hover_text(
+            "One flattened image for showing people: PNG, JPEG, TIFF, GIF or \
+             BMP. Save keeps the layers.",
+        )
+        .clicked()
+    {
+        actions.open_export = true;
+        ui.close();
+    }
+}
+
+/// The Edit menu's rows: the two history commands, the four that move pixels
+/// on and off the clipboard, and Settings.
+fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
+    // The history covers strokes, transforms, canvas flips and
+    // changes to the layer stack, which is what the History panel's
+    // own note says. It used to cover painting alone, and these two
+    // lines went on saying so long after the six structural edits
+    // were recorded — a menu contradicting a panel about the same
+    // list. Clearing a layer and resizing the canvas are still
+    // outside it, and both still clear the list.
+    // "in the history" and not "to this document": clearing a layer and
+    // resizing the canvas both empty the list, so a document twenty strokes
+    // deep can reach this line, and a sentence claiming nothing had been done
+    // to it would be flatly false in exactly the case the paragraph above
+    // names.
+    if menu_item(ui, Action::Undo, ed.history.can_undo())
+        .on_disabled_hover_text("Nothing in the history to undo.")
+        .clicked()
+    {
+        actions.undo = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::Redo, ed.history.can_redo())
+        .on_disabled_hover_text("Nothing undone to put back.")
+        .clicked()
+    {
+        actions.redo = true;
+        ui.close();
+    }
+    ui.separator();
+    // Deselect, Copy, Cut and Paste. All four are bound and all four
+    // are dispatched; only Copy and Cut had a control, on the
+    // selection's canvas strip, which is drawn only while a
+    // selection is live. So Paste had nowhere in the interface to be
+    // found at all: somebody who copied a picture in another
+    // application had a keystroke and no menu row.
+    if menu_item(ui, Action::Deselect, ed.selection.is_some())
+        .on_hover_text("Let edits reach the whole layer again.")
+        .on_disabled_hover_text("Nothing is selected, so edits already reach the whole layer.")
+        .clicked()
+    {
+        ed.deselect();
+        ui.close();
+    }
+    // Cut, Copy, Paste, in that order, because that is the order every desktop
+    // draws them and the order the keys sit in on the bottom row.
+    //
+    // **Both say what they do with nothing selected, and Cut needs to.**
+    // `take_region` falls back to the whole layer, so a Cut here with no
+    // marquee standing clears the picture — which was reachable before only by
+    // Ctrl+X, since the canvas strip that carries the other Cut is drawn only
+    // while a selection is live. A new way in to a destructive command is the
+    // wrong place to say less than the old one did.
+    //
+    // Gated on the lock, matching that strip's Cut button and the gate inside
+    // `App::cut_selection`: a cut takes pixels off the layer, so a locked one
+    // refuses it, and the row says so before the click rather than answering
+    // with a notice.
+    if menu_item(ui, Action::Cut, !ed.layers.active_is_locked())
+        .on_hover_text(
+            "Takes the selection onto the clipboard. Cuts the whole layer if nothing is selected.",
+        )
+        .on_disabled_hover_text("Unlock the layer to cut from it.")
+        .clicked()
+    {
+        actions.cut_selection = true;
+        ui.close();
+    }
+    // Never disabled: it writes nothing.
+    if menu_item(ui, Action::Copy, true)
+        .on_hover_text("Copies the selection. Copies the whole layer if nothing is selected.")
+        .clicked()
+    {
+        actions.copy_selection = true;
+        ui.close();
+    }
+    // **Never disabled, and `ed.clipboard.is_none()` is the wrong
+    // test to reach for.** What a paste puts down is
+    // `sysclip::decide`'s answer, read at paste time from the
+    // *desktop's* clipboard as well as Umber's own — so a screenshot
+    // taken in another application pastes perfectly well with
+    // Umber's clip empty, and a row disabled on that field would
+    // refuse it. Reading the desktop's clipboard every frame to find
+    // out is not an option either: it blocks.
+    if menu_item(ui, Action::Paste, true).clicked() {
+        actions.paste = true;
+        ui.close();
+    }
+    ui.separator();
+    // Under Edit rather than Window, which is where Windows and
+    // most Linux desktops put preferences. Window is about the
+    // arrangement of the workspace; these are settings for the
+    // application.
+    if ui.button("Settings…").clicked() {
+        ed.ui.settings_open = true;
+        ui.close();
+    }
+}
+
+/// The View menu's rows.
+///
+/// It takes no [`Editor`], which is the shape of the whole menu: all four rows
+/// are requests the caller carries out, so there is nothing here to write.
+fn view_menu(ui: &mut egui::Ui, actions: &mut UiActions) {
+    // Four rows for the four bound View actions. Zoom in and Zoom
+    // out had none, and the other two showed no key and named
+    // themselves: "Fit to window" here against "Fit to view" on the
+    // Shortcuts page, for one command. Every label is now
+    // `Action::label`'s.
+    if menu_item(ui, Action::FitView, true).clicked() {
+        actions.fit_view = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::ActualSize, true).clicked() {
+        actions.reset_zoom = true;
+        ui.close();
+    }
+    ui.separator();
+    if menu_item(ui, Action::ZoomIn, true).clicked() {
+        actions.zoom_in = true;
+        ui.close();
+    }
+    if menu_item(ui, Action::ZoomOut, true).clicked() {
+        actions.zoom_out = true;
+        ui.close();
+    }
+}
+
 /// A way to look at each of the update dialog's screens without a release to
 /// install.
 ///
@@ -1483,19 +1593,39 @@ fn update_rehearsal(ui: &mut egui::Ui, ed: &mut Editor) {
 #[cfg(not(debug_assertions))]
 fn update_rehearsal(_ui: &mut egui::Ui, _ed: &mut Editor) {}
 
-/// A menu entry that shows the chord currently bound to it.
+/// A menu entry standing for one bindable command: its own name, and the chord
+/// currently bound to it.
 ///
-/// Read out of the live binding table rather than typed next to the label, so a
-/// rebind in the settings dialog reaches the menu as well — and an action left
-/// unbound shows no chord instead of a stale one. `published` clones the table,
-/// which is only ever paid while a menu is open.
-fn menu_item(ui: &mut egui::Ui, label: &str, action: shortcuts::Action) -> egui::Response {
+/// **The label comes from the action, never from the call site.** A menu row and
+/// the Shortcuts page are two views of one command, and typing the name here as
+/// well made them disagree: `Action::FitView` is "Fit to view" in the settings
+/// list and was drawn as "Fit to window" in the View menu, which is two names
+/// for one thing in an interface that has a search field for the other one. It
+/// is the rule `shortcuts` already states about the bindings themselves —
+/// enumerable data rather than a `match` — applied to the names as well. A row
+/// that is *not* a command (New…, Open…, Canvas settings…, Close document,
+/// Clear layer, Settings…, About) has no action to take a name from and is
+/// still written out where it is drawn.
+///
+/// The chord is read out of the live binding table rather than typed next to the
+/// label, so a rebind in the settings dialog reaches the menu as well — and an
+/// action left unbound shows no chord instead of a stale one. `published` clones
+/// the table, which is only ever paid while a menu is open.
+///
+/// `enabled` is a parameter rather than an `add_enabled_ui` around the call, so
+/// a row can be both dead and labelled with its key. Undo and Redo were built as
+/// bare buttons for exactly that reason, which left `Ctrl+Z` named nowhere in
+/// the interface outside the Shortcuts page.
+fn menu_item(ui: &mut egui::Ui, action: shortcuts::Action, enabled: bool) -> egui::Response {
     let chord = shortcuts::published()
         .iter()
         .find(|b| b.action == action)
         .map(|b| b.chord().display())
         .unwrap_or_default();
-    ui.add(egui::Button::new(label).shortcut_text(chord))
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(action.label()).shortcut_text(chord),
+    )
 }
 
 /// What each optional group on the tool options strip costs, in points.
@@ -1530,6 +1660,68 @@ mod strip_budget {
     pub const SELECT_OP: f32 = 105.0;
     /// The feather rail, its label and its readout.
     pub const FEATHER: f32 = 165.0;
+    // Pan's and Zoom's second sentence are budgeted per tool, on
+    // `navigate_hint`'s own third field, because the two lines are a third
+    // apart in width and one figure for both drops Pan's while it still fits.
+}
+
+/// What the Pan and Zoom tools do, and how to reach the same thing without
+/// putting the brush down.
+///
+/// Both used to draw the words "drag on the canvas", which is four lowercase
+/// words saying nothing a painter had not already guessed from the icon — and
+/// neither named the gesture that actually matters. Pan and Zoom are the two
+/// tools most people never select, because holding Space and rolling the wheel
+/// under the primary modifier do the same job mid-stroke; the strip is where
+/// that is worth saying, since a held modifier is part of a gesture rather than
+/// a command and is therefore deliberately not in the rebindable table. Same
+/// reasoning as [`combine_hint`], which is also why this is a `const fn`
+/// returning `&'static str` rather than a `format!` per frame: the strip is
+/// painted every frame and neither line can change at run time, because
+/// neither gesture is bindable.
+///
+/// **The modifier is spelled out here rather than taken from
+/// [`shortcuts::primary_modifier_name`], and that is a `const fn` limitation
+/// rather than a preference.** A `const fn` cannot concatenate, so the choice
+/// was between writing "Cmd"/"Ctrl" under the same `cfg!` that function uses,
+/// or building the line at run time on the drawing path. [`combine_hint`] made
+/// the same trade and says so; this is the third place that spelling lives, and
+/// if it ever becomes a fourth it should be a `concat!` under `#[cfg]` off one
+/// constant instead.
+///
+/// The third field is what the second sentence costs, so the strip can drop it
+/// on its own terms: it is one unwrapped row, and a sentence that does not fit
+/// runs off the end rather than reflowing. Per tool rather than one figure for
+/// both, because Zoom's line is a third longer than Pan's and a shared budget
+/// takes Pan's away at a width that would have held it comfortably. Measured
+/// off `options_strip_preview`'s shots and pinned by
+/// `neither_navigation_hint_overruns_the_strip_it_is_drawn_on`.
+///
+/// **Exhaustive over [`Tool`] rather than a wildcard**, for the reason
+/// `panels::edit_icon` is exhaustive over `EditKind`: ten of the design's
+/// sixteen tools are not built, and the first navigation tool added would
+/// otherwise silently draw Pan's two sentences. The four that never reach this
+/// branch are named so that `Tool` growing is a compile error and not a wrong
+/// sentence — `options_strip` handles them above, and if one ever fell through
+/// to here saying nothing is better than saying something false.
+const fn navigate_hint(tool: Tool) -> (&'static str, &'static str, f32) {
+    match tool {
+        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform => ("", "", f32::INFINITY),
+        Tool::Zoom => (
+            "Drag right or up to zoom in, left or down to zoom out.",
+            if cfg!(target_os = "macos") {
+                "Hold Cmd and roll the wheel to zoom at the pointer with any tool in hand."
+            } else {
+                "Hold Ctrl and roll the wheel to zoom at the pointer with any tool in hand."
+            },
+            370.0,
+        ),
+        Tool::Pan => (
+            "Drag on the canvas to move the picture.",
+            "Hold Space to do the same with any tool in hand.",
+            250.0,
+        ),
+    }
 }
 
 /// How to add to, subtract from and intersect a selection, named for this
@@ -1723,11 +1915,26 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 }
             }
         } else {
+            // Pan and Zoom. Two sentences in the Transform hint's register
+            // rather than a control, because like Transform there is nothing
+            // here to set: the whole gesture is the pointer's.
+            let (does, instead, budget) = navigate_hint(ed.ui.tool);
             ui.label(
-                egui::RichText::new("drag on the canvas")
+                egui::RichText::new(does)
                     .size(text::SMALL)
                     .color(p.text_dim),
             );
+            // Read afresh rather than against the room measured earlier, for
+            // the reason the selection tool's combine line reads it afresh: the
+            // sentence above is drawn unconditionally and is in no budget.
+            if ui.available_width() >= budget {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(instead)
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                );
+            }
         }
     });
 }
@@ -3144,10 +3351,541 @@ fn curve_column(
 
 #[cfg(test)]
 mod tests {
+    use super::UiActions;
     use crate::brushlib;
     use crate::editor::{BrushTab, Editor};
+    use crate::shortcuts::{self, Action};
     use crate::theme::{Palette, ThemeKind, metrics};
     use egui::{Rect, pos2, vec2};
+
+    /// Which of the three menus that carry commands is being drawn.
+    ///
+    /// The bodies are drawn straight into a plain `Ui` rather than through a
+    /// real popup: opening one headlessly means synthesising a click on a menu
+    /// button whose rectangle nothing reports, and the rows are what these
+    /// tests are about. It is the same function the menu bar calls, so nothing
+    /// stands in for anything.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Menu {
+        File,
+        Edit,
+        View,
+    }
+
+    impl Menu {
+        /// The menu a command of this category belongs in.
+        ///
+        /// Read off [`Action::category`] rather than listed here, so an action
+        /// added to a category is an action these tests immediately demand a
+        /// row for. "Image" is the two canvas flips, which sit in File beside
+        /// Canvas settings rather than under an Image menu of their own.
+        fn of_category(category: &str) -> Option<Menu> {
+            match category {
+                "File" | "Image" => Some(Menu::File),
+                "Edit" => Some(Menu::Edit),
+                "View" => Some(Menu::View),
+                _ => None,
+            }
+        }
+
+        fn draw(self, ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
+            match self {
+                Menu::File => super::file_menu(ui, ed, actions),
+                Menu::Edit => super::edit_menu(ui, ed, actions),
+                Menu::View => super::view_menu(ui, actions),
+            }
+        }
+    }
+
+    /// A piece of text the interface drew, and the rectangle it occupies.
+    ///
+    /// The rectangle rather than only a point, because two tests want different
+    /// things from it: the menu tests aim a click at its centre and match rows
+    /// by its baseline, and the strip test asks whether its right edge is still
+    /// on the strip.
+    #[derive(Clone, Debug)]
+    struct Drawn {
+        text: String,
+        rect: egui::Rect,
+    }
+
+    impl Drawn {
+        /// Where a click on this string lands.
+        fn at(&self) -> egui::Pos2 {
+            self.rect.center()
+        }
+    }
+
+    /// Every string a shape tree paints, with the rectangle it paints into.
+    ///
+    /// A `Shape::Vec` is what a widget's own painting comes back as, so this
+    /// recurses rather than reading the top level.
+    fn strings_in(shape: &egui::Shape, out: &mut Vec<Drawn>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(Drawn {
+                text: text.galley.text().to_owned(),
+                rect: egui::Rect::from_min_size(text.pos, text.galley.size()),
+            }),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    strings_in(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A context with Umber's own font and spacing, which is what decides how
+    /// wide a row is and therefore whether its shortcut text is drawn at all.
+    fn menu_context() -> (egui::Context, Palette) {
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        (ctx, palette)
+    }
+
+    fn menu_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 700.0))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Draw a menu's rows and report every string on them.
+    ///
+    /// Twice, because the first pass through a fresh context builds the font
+    /// atlas and text measured against a half-built one is not the text that
+    /// settles.
+    fn menu_strings(menu: Menu, ed: &mut Editor) -> Vec<Drawn> {
+        let (ctx, _) = menu_context();
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            drawn.clear();
+            let mut actions = UiActions::default();
+            let output = ctx.run_ui(menu_input(Vec::new()), |ui| {
+                // A narrow column laid out top-down, which is the shape a menu
+                // popup gives its contents. A row's width decides whether egui
+                // finds room for the shortcut text beside the label.
+                ui.vertical(|ui| {
+                    ui.set_max_width(260.0);
+                    menu.draw(ui, ed, &mut actions);
+                });
+            });
+            for clipped in &output.shapes {
+                strings_in(&clipped.shape, &mut drawn);
+            }
+        }
+        drawn
+    }
+
+    /// Press and release on the row carrying `label`, and report what the menu
+    /// asked the caller for.
+    ///
+    /// A disabled row swallows the click, so this is also how "that row is
+    /// live" is asserted without reading a colour off a shape.
+    fn click_menu_row(menu: Menu, ed: &mut Editor, label: &str) -> UiActions {
+        let (ctx, _) = menu_context();
+        let mut actions = UiActions::default();
+        let mut at = None;
+        // Lay out, aim, press, release. The press and the release are separate
+        // frames because that is what a hand does, and egui settles a click on
+        // the release.
+        for frame in 0..4 {
+            let events = match (frame, at) {
+                (2, Some(at)) => vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                (3, Some(at)) => vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                _ => Vec::new(),
+            };
+            actions = UiActions::default();
+            let output = ctx.run_ui(menu_input(events), |ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(260.0);
+                    menu.draw(ui, ed, &mut actions);
+                });
+            });
+            let mut drawn = Vec::new();
+            for clipped in &output.shapes {
+                strings_in(&clipped.shape, &mut drawn);
+            }
+            if frame == 1 {
+                at = Some(
+                    drawn
+                        .iter()
+                        .find(|d| d.text == label)
+                        .unwrap_or_else(|| {
+                            panic!("the {menu:?} menu draws no row called {label:?}")
+                        })
+                        .at(),
+                );
+            }
+        }
+        actions
+    }
+
+    /// Every command filed under File, Image, Edit or View has a menu row.
+    ///
+    /// Six did not. `Deselect`, `Copy`, `Cut` and `Paste` were bound and
+    /// dispatched and appeared in no menu — Paste in no control anywhere, since
+    /// the selection's canvas strip is drawn only while a selection is live, so
+    /// a picture copied in another application could only be pasted by somebody
+    /// who already knew the key. `ZoomIn` and `ZoomOut` were bound with no row
+    /// either.
+    ///
+    /// The set is read off [`Action::category`] rather than written out here,
+    /// which is what makes this a test rather than a second copy of the menu:
+    /// filing a new command under one of those four categories fails this until
+    /// it has somewhere to be clicked.
+    #[test]
+    fn every_file_edit_and_view_command_has_a_menu_row() {
+        let mut demanded = 0;
+        for menu in [Menu::File, Menu::Edit, Menu::View] {
+            let mut ed = Editor::default();
+            let drawn = menu_strings(menu, &mut ed);
+            for action in Action::ALL {
+                if Menu::of_category(action.category()) != Some(menu) {
+                    continue;
+                }
+                assert!(
+                    drawn.iter().any(|d| d.text == action.label()),
+                    "the {menu:?} menu has no row for {:?}; it draws {:?}",
+                    action.label(),
+                    drawn.iter().map(|d| &d.text).collect::<Vec<_>>()
+                );
+                demanded += 1;
+            }
+        }
+        // A floor, because the *whole* selling point of this test is that it
+        // reads the set off `Action::category` rather than listing it — and
+        // `Menu::of_category` answers `None` for a string it does not know, so
+        // a renamed category would quietly stop being demanded and leave this
+        // green over an empty loop. Fifteen rows are demanded today.
+        // `no_command_category_is_skipped_by_accident` catches the same decay
+        // from the other side; this catches it if that list is widened
+        // carelessly.
+        assert!(
+            demanded >= 15,
+            "only {demanded} rows were demanded, so a category has stopped being routed"
+        );
+    }
+
+    /// A menu row standing for a command is named as the command is named.
+    ///
+    /// `Action::FitView` is "Fit to view" on the Shortcuts page and the View
+    /// menu drew it as "Fit to window": one command with two names, in an
+    /// interface whose other view of it has a search field. The label now comes
+    /// from the action and the call site cannot supply one.
+    ///
+    /// A row is found by the **chord** it draws rather than by its label, which
+    /// is the whole point — the chord is put there by `menu_item` from the
+    /// action, so it says a row for that command exists without assuming
+    /// anything about what the row is called. Chords shared by two commands are
+    /// skipped, since either label would satisfy them.
+    ///
+    /// **The label has to be on the chord's own row**, matched by the shared
+    /// baseline `menu_item` draws both on. Asserting only that the label
+    /// appears *somewhere* in the menu was the first draft and a review found
+    /// it hollow: swapping two rows' labels leaves every label and every chord
+    /// present, so Copy wearing Cut's name and Cut wearing Copy's would have
+    /// passed. `mutating_a_menu_row_is_caught_by_the_label_test` drives that
+    /// exact swap through the same comparison.
+    #[test]
+    fn a_menu_row_standing_for_a_command_carries_the_commands_own_name() {
+        for menu in [Menu::File, Menu::Edit, Menu::View] {
+            let mut ed = Editor::default();
+            let drawn = menu_strings(menu, &mut ed);
+            let checked = check_rows_are_named_for_their_chords(menu, &drawn)
+                .unwrap_or_else(|complaint| panic!("{complaint}"));
+            // Otherwise a menu that drew no chords at all would pass in
+            // silence. Counted per menu rather than over all three, so one
+            // going quiet cannot be made up for by the other two.
+            assert!(
+                checked >= 2,
+                "only {checked} rows of the {menu:?} menu carried a chord to check"
+            );
+        }
+    }
+
+    /// The label test's rule, as a function, so the mutation it exists to catch
+    /// can be driven through it rather than described in a comment.
+    ///
+    /// `Ok(n)` having checked `n` rows, `Err` naming the first row whose label
+    /// is not its chord's.
+    fn check_rows_are_named_for_their_chords(menu: Menu, drawn: &[Drawn]) -> Result<usize, String> {
+        let bound: Vec<(Action, String)> = Action::ALL
+            .into_iter()
+            .filter_map(|a| shortcuts::first_chord(a).map(|c| (a, c)))
+            .collect();
+        let mut checked = 0;
+        for (action, chord) in &bound {
+            if bound.iter().filter(|(_, c)| c == chord).count() != 1 {
+                continue;
+            }
+            let Some(row) = drawn.iter().find(|d| &d.text == chord) else {
+                continue;
+            };
+            // A row's label and its chord are drawn on one baseline, so the
+            // label is whichever string shares this chord's y. Half a line of
+            // slack, because the two galleys are different sizes and their
+            // centres need not agree to the last bit of an f32.
+            let named = drawn
+                .iter()
+                .any(|d| d.text == action.label() && (d.at().y - row.at().y).abs() < 6.0);
+            if !named {
+                return Err(format!(
+                    "the {menu:?} menu draws {chord} on a row that is not called {:?}; \
+                     it draws {:?}",
+                    action.label(),
+                    drawn.iter().map(|d| &d.text).collect::<Vec<_>>()
+                ));
+            }
+            checked += 1;
+        }
+        Ok(checked)
+    }
+
+    /// Two rows wearing each other's names is caught.
+    ///
+    /// The mutation a review found the first draft of the label test blind to:
+    /// every label and every chord is still present, so an assertion that only
+    /// asks whether the label appears in the menu passes. This builds that
+    /// state directly — the same strings the Edit menu draws, with Cut's and
+    /// Copy's labels swapped onto each other's baselines — and requires the
+    /// rule to refuse it.
+    #[test]
+    fn mutating_a_menu_row_is_caught_by_the_label_test() {
+        let mut ed = Editor::default();
+        let honest = menu_strings(Menu::Edit, &mut ed);
+        check_rows_are_named_for_their_chords(Menu::Edit, &honest)
+            .expect("the Edit menu as drawn is honest");
+
+        // Each label keeps its own text and moves onto the other's row, which
+        // is what a call site handing `menu_item` the wrong label would draw.
+        let row_of = |label: &str| {
+            honest
+                .iter()
+                .find(|d| d.text == label)
+                .unwrap_or_else(|| panic!("the Edit menu draws no {label:?}"))
+                .rect
+        };
+        let (cut, copy) = (row_of(Action::Cut.label()), row_of(Action::Copy.label()));
+        let swapped: Vec<Drawn> = honest
+            .iter()
+            .map(|d| {
+                if d.text == Action::Cut.label() {
+                    Drawn {
+                        text: Action::Copy.label().to_owned(),
+                        rect: cut,
+                    }
+                } else if d.text == Action::Copy.label() {
+                    Drawn {
+                        text: Action::Cut.label().to_owned(),
+                        rect: copy,
+                    }
+                } else {
+                    d.clone()
+                }
+            })
+            .collect();
+        assert!(
+            check_rows_are_named_for_their_chords(Menu::Edit, &swapped).is_err(),
+            "two rows wearing each other's names went unnoticed"
+        );
+    }
+
+    /// Neither navigation hint runs off the strip it is drawn on.
+    ///
+    /// The strip is a single unwrapped row, so a sentence too long for it does
+    /// not reflow — it carries on past the right edge, off the window. That is
+    /// what `navigate_hint`'s budget exists to prevent, and the budget is a
+    /// hand-measured number, which is exactly the kind that goes stale when
+    /// somebody edits a sentence.
+    ///
+    /// **Asserted rather than left to the picture test.** The first version of
+    /// this said an assertion about a string's width would be a claim about a
+    /// font; it is a claim about *Archivo*, which Umber ships and
+    /// `theme::install_fonts` installs, and three tests in this crate already
+    /// make it — `a_number_row_is_no_wider_than_the_column_it_is_drawn_in` is
+    /// the pattern. `options_strip_preview` still shoots 740 and 720 because a
+    /// picture answers a different question: whether the line reads well, not
+    /// whether it fits.
+    ///
+    /// Swept rather than sampled, because a budget is wrong over a *range* of
+    /// widths: too small a figure draws the sentence at every width between the
+    /// budget and what the sentence costs, and a two-point sample can miss the
+    /// whole band. This walks every 5 points from far too narrow to far too
+    /// wide and requires the content to stay inside the strip at each.
+    #[test]
+    fn neither_navigation_hint_overruns_the_strip_it_is_drawn_on() {
+        use crate::editor::Tool;
+
+        for tool in [Tool::Pan, Tool::Zoom] {
+            let ctx = egui::Context::default();
+            let palette = Palette::of(ThemeKind::Graphite);
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply(&ctx, &palette);
+            let mut widest_overrun: Option<(f32, f32)> = None;
+            let mut ever_drew_the_second = false;
+            for step in 0..140 {
+                let width = 200.0 + step as f32 * 5.0;
+                let mut ed = Editor::default();
+                ed.ui.tool = tool;
+                // Two passes: the first through a fresh context builds the font
+                // atlas, and text measured against a half-built one is not the
+                // width it settles at.
+                let mut drawn = Vec::new();
+                for _ in 0..2 {
+                    drawn.clear();
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(width, metrics::OPTIONS_STRIP),
+                        )),
+                        ..Default::default()
+                    };
+                    let output = ctx.run_ui(input, |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                            .show(ui, |ui| {
+                                ui.set_height(metrics::OPTIONS_STRIP);
+                                super::options_strip(ui, &palette, &mut ed);
+                            });
+                    });
+                    for clipped in &output.shapes {
+                        strings_in(&clipped.shape, &mut drawn);
+                    }
+                }
+                let (_, instead, _) = super::navigate_hint(tool);
+                if let Some(second) = drawn.iter().find(|d| d.text == instead) {
+                    ever_drew_the_second = true;
+                    // The galley's own right edge, read back off the shape
+                    // rather than computed from a character count, which is the
+                    // whole point of measuring instead of estimating.
+                    if second.rect.right() > width {
+                        widest_overrun = Some((width, second.rect.right()));
+                    }
+                }
+            }
+            assert!(
+                ever_drew_the_second,
+                "{tool:?}'s second sentence was never drawn at any width, so \
+                 this test proved nothing"
+            );
+            assert!(
+                widest_overrun.is_none(),
+                "{tool:?}'s second sentence runs to {:.0} points on a {:.0} point strip",
+                widest_overrun.unwrap().1,
+                widest_overrun.unwrap().0
+            );
+        }
+    }
+
+    /// Every category [`Action::category`] can answer with is either a menu
+    /// this test knows or a category deliberately not on the menu bar.
+    ///
+    /// [`Menu::of_category`] answers `None` for anything it does not recognise,
+    /// and `None` means "needs no row" — the unsafe default. Without this, a
+    /// command filed under a new category would be skipped by the coverage test
+    /// in silence, which is the failure that test exists to prevent.
+    #[test]
+    fn no_command_category_is_skipped_by_accident() {
+        // Tools, Brush and Colour are reached from the rail, the brush editor
+        // and the colour panel. They are deliberately not menu bar commands,
+        // and a category leaving this list has to be decided about rather than
+        // fall through `of_category`'s wildcard.
+        const OFF_THE_MENU_BAR: [&str; 3] = ["Tools", "Brush", "Colour"];
+        for action in Action::ALL {
+            let category = action.category();
+            assert!(
+                Menu::of_category(category).is_some() || OFF_THE_MENU_BAR.contains(&category),
+                "{:?} is filed under {category:?}, which is neither a menu nor \
+                 named as off the menu bar",
+                action.label()
+            );
+        }
+    }
+
+    /// Paste is offered with Umber's own clipboard empty.
+    ///
+    /// **`Editor::clipboard` being `None` is not "nothing to paste", and
+    /// disabling the row on it is the mistake this guards.** What a paste puts
+    /// down is `sysclip::decide`'s answer, and that reads the *desktop's*
+    /// clipboard as well: a screenshot taken in another application pastes
+    /// perfectly well while Umber holds nothing. Nor could the row ask — reading
+    /// the desktop's clipboard blocks, and this is drawn every frame the menu is
+    /// open.
+    ///
+    /// Asserted by clicking the row rather than by reading a colour off it: a
+    /// disabled row swallows the click, so the request coming back is the proof.
+    #[test]
+    fn paste_is_offered_even_with_umbers_own_clipboard_empty() {
+        let mut ed = Editor::default();
+        assert!(
+            ed.clipboard.is_none(),
+            "a fresh editor is supposed to hold no clip"
+        );
+        let actions = click_menu_row(Menu::Edit, &mut ed, Action::Paste.label());
+        assert!(
+            actions.paste,
+            "clicking Paste with an empty clip asked for nothing"
+        );
+    }
+
+    /// Copy is never refused and Cut is refused by a locked layer.
+    ///
+    /// The pair the selection's canvas strip already draws that way, and the
+    /// gate `App::cut_selection` already keeps: a cut takes pixels off the
+    /// layer, a copy writes nothing. Two rows in one test because the risk is
+    /// getting them the same way round.
+    ///
+    /// **Cut is clicked on an unlocked layer as well as a locked one**, and the
+    /// first draft was not. A review pointed out that asserting only the
+    /// refusal is satisfied by a Cut that is dead in every state — mutating the
+    /// gate to a plain `false` left it green — so what it proved was "Cut is
+    /// dead when locked" rather than "Cut answers to the lock". It also makes
+    /// the negative half mean something: a click that missed the row entirely
+    /// would satisfy `!cut_selection` for the wrong reason, and the unlocked
+    /// case is what says the aim is good.
+    #[test]
+    fn cut_answers_to_the_lock_and_copy_does_not() {
+        let mut ed = Editor::default();
+        ed.layers.active_mut().locked = true;
+        let actions = click_menu_row(Menu::Edit, &mut ed, Action::Cut.label());
+        assert!(
+            !actions.cut_selection,
+            "Cut was live on a locked layer, which `cut_selection` would then refuse"
+        );
+        let actions = click_menu_row(Menu::Edit, &mut ed, Action::Copy.label());
+        assert!(
+            actions.copy_selection,
+            "Copy was refused by a lock, though it writes nothing"
+        );
+
+        let mut ed = Editor::default();
+        assert!(
+            !ed.layers.active_is_locked(),
+            "a fresh editor's layer is supposed to be unlocked"
+        );
+        let actions = click_menu_row(Menu::Edit, &mut ed, Action::Cut.label());
+        assert!(
+            actions.cut_selection,
+            "Cut was dead on an unlocked layer, so the row answers to nothing"
+        );
+    }
 
     /// What the footer is asked to hold, beyond the six sections.
     ///
@@ -3360,13 +4098,21 @@ mod tests {
         println!("wrote 7 shots to {}", dir.display());
     }
 
-    /// The tool options strip, with the brush in hand and at three widths.
+    /// The tool options strip, at three widths, with the brush in hand and then
+    /// with each of the two tools whose strip is a sentence.
     ///
     /// The stabiliser is a third `widgets::inline_slider` beside size and
     /// opacity rather than the `widgets::chip` it was, and the two things worth
     /// looking at are whether three rails on a 36-point strip read as three
     /// controls and whether the budget that drops them one at a time drops them
     /// where it says it does.
+    ///
+    /// **Pan and Zoom are shot for a different reason**: the strip is a single
+    /// unwrapped row, so a sentence too long for it does not reflow, it runs off
+    /// the right edge. Their second half is behind
+    /// [`strip_budget::NAVIGATE_MORE`], and only a picture says whether the
+    /// budget is the right size — an assertion about a string's length would be
+    /// a claim about a font.
     ///
     /// ```sh
     /// cargo test -p umber-app options_strip_preview -- --ignored --nocapture
@@ -3376,6 +4122,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn options_strip_preview() {
         use crate::docshot;
+        use crate::editor::Tool;
 
         let Some(mut stage) = docshot::Stage::new() else {
             eprintln!("no GPU adapter: nothing to draw into. Skipped.");
@@ -3385,24 +4132,36 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        // Wide enough for all three, for two of them, and for one.
-        for (n, width) in [900.0_f32, 560.0, 380.0].into_iter().enumerate() {
-            let mut ed = Editor::default();
-            ed.layout = crate::dock::Layout::default();
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
-            let field = vec2(width, metrics::OPTIONS_STRIP);
-            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
-                    .show(root, |ui| {
-                        ui.set_height(metrics::OPTIONS_STRIP);
-                        super::options_strip(ui, &palette, &mut ed);
-                    });
-            });
-            let name = format!("strip-{}-{width:.0}.png", n + 1);
-            docshot::write_png(&dir.join(name), &image).expect("write the png");
+        let mut written = 0;
+        for tool in [Tool::Brush, Tool::Pan, Tool::Zoom] {
+            // The three rail widths, plus the pair either side of where Zoom's
+            // second sentence has to come off: 740 is the narrowest strip that
+            // holds it whole and 720 is the widest that drops it, so a budget
+            // edited to a number that overruns shows up as text running off the
+            // right of one of these two rather than as nothing at all.
+            for (n, width) in [900.0_f32, 740.0, 720.0, 560.0, 380.0]
+                .into_iter()
+                .enumerate()
+            {
+                let mut ed = Editor::default();
+                ed.layout = crate::dock::Layout::default();
+                ed.ui.tool = tool;
+                let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+                let field = vec2(width, metrics::OPTIONS_STRIP);
+                let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(root, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                let name = format!("strip-{tool:?}-{}-{width:.0}.png", n + 1).to_lowercase();
+                docshot::write_png(&dir.join(name), &image).expect("write the png");
+                written += 1;
+            }
         }
-        println!("wrote 3 strips to {}", dir.display());
+        println!("wrote {written} strips to {}", dir.display());
     }
 
     /// The canvas scrollbars in the three states that matter, over a canvas
