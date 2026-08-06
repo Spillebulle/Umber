@@ -84,6 +84,23 @@ pub enum Press {
 }
 
 impl Press {
+    /// Every variant.
+    ///
+    /// Anything reasoning over the whole enum iterates this rather than a list
+    /// written out where it is used, which is exactly what a variant added
+    /// later does not appear in — a test walking a hand-written array is a
+    /// test that silently stops covering the thing it names.
+    pub const ALL: [Press; 8] = [
+        Press::Ignored,
+        Press::Pan,
+        Press::Zoom,
+        Press::Paint,
+        Press::Select,
+        Press::Transform,
+        Press::Eyedropper,
+        Press::ResizeBrush,
+    ];
+
     /// A short name for Settings → Input & pen, which records which gesture a
     /// press was resolved to.
     pub fn label(self) -> &'static str {
@@ -176,13 +193,49 @@ pub fn press(p: Pointer) -> Press {
 /// `close_document`, `float_a_clip` and `take_region` all call `finish_stroke`.
 /// Do not unify the two.
 ///
-/// [`Press::Paint`] is excluded because it *is* a stroke, and
-/// [`Press::Ignored`] because the canvas never sees it. Neither is reachable
-/// while a stroke runs — one mouse cannot press left twice, and a finger
-/// landing on a panel is a [`Contact::Pinch`] — so both are stated as the rule
-/// they follow rather than left to be worked out from what cannot happen.
+/// Two are excluded, and the reason is what each one *is* rather than any claim
+/// that it cannot arrive:
+///
+/// * [`Press::Ignored`] is a press the canvas never sees, and cancelling on it
+///   was a real bug — see the [`Contact::Pinch`] arm in `app.rs`: "one finger
+///   on a panel is not a gesture, and cancelling the stroke there threw away a
+///   stroke the other hand was in the middle of". That is exactly this case,
+///   and it *is* reachable, because `Editor::touches` is empty while a **mouse**
+///   stroke runs, so a finger going down answers [`Contact::Press`] rather than
+///   `Pinch`.
+/// * [`Press::Paint`] is the stroke itself, and ending one stroke to start
+///   another would be a commit and a history entry for every spurious press.
+///
+/// **The same mouse-and-pen crossing leaves one gap this does not close**, and
+/// it is pre-existing rather than anything the supersession introduced: a pen
+/// coming down while a mouse stroke is live resolves to `Paint`, so
+/// `start_stroke` runs on an already-active builder and its unconditional
+/// `clear_stroke` discards the mouse stroke's dabs with no history entry.
+/// Making `Paint` supersede would close it — the call site is guarded on
+/// `stroke.is_active()`, so the ordinary case is untouched — and it is left
+/// alone here deliberately, because the honest fix for the whole class is for
+/// `pointer_released` to end a stroke on `stroke.is_active()` rather than on
+/// `Interaction`, which is where the authority actually lives.
+///
+/// The `match` is exhaustive and has **no wildcard arm**, which is the point of
+/// it: a `_ => true` would silently answer for a variant nobody had thought
+/// about, which is what a negative `matches!` did here and is the reason this
+/// was rewritten. [`Press::ALL`] is the other half — the compiler catches a new
+/// variant not answering, and the test walking `ALL` catches one that answers
+/// but was never exercised.
 pub fn supersedes_stroke(decision: Press) -> bool {
-    !matches!(decision, Press::Paint | Press::Ignored)
+    match decision {
+        // It is the stroke itself.
+        Press::Paint => false,
+        // A press the canvas never sees.
+        Press::Ignored => false,
+        Press::Pan
+        | Press::Zoom
+        | Press::Select
+        | Press::Transform
+        | Press::Eyedropper
+        | Press::ResizeBrush => true,
+    }
 }
 
 /// What a `WindowEvent::Touch` turns out to be.
@@ -422,25 +475,30 @@ mod tests {
             ..mouse(Tool::Brush)
         })));
 
-        // Stated over the whole enum rather than over the two cases the mouse
-        // can currently produce, because a `Press` added later must arrive
-        // having answered this. Paint is the stroke itself and Ignored is a
-        // press the canvas never sees; everything else supersedes.
-        for decision in [
-            Press::Pan,
-            Press::Zoom,
-            Press::Select,
-            Press::Transform,
-            Press::Eyedropper,
-            Press::ResizeBrush,
-        ] {
-            assert!(
-                supersedes_stroke(decision),
-                "{decision:?} left a stroke running"
-            );
+        // Over `Press::ALL`, never a list written out here: a variant added
+        // later does not appear in a hand-written array, so such a test goes on
+        // passing while quietly covering less than its name claims.
+        //
+        // Two halves guard this, and neither covers the other. The exhaustive
+        // `match` in `supersedes_stroke` is what the *compiler* catches — a new
+        // variant cannot be added without answering. The length assertion below
+        // is what catches `ALL` being left short, which the compiler cannot see
+        // because a fixed-size array with the right number of elements in it
+        // compiles whatever those elements are. That is the whole of what the
+        // two claim between them.
+        assert_eq!(Press::ALL.len(), 8, "a variant is missing from Press::ALL");
+        for decision in Press::ALL {
+            let superseded = supersedes_stroke(decision);
+            match decision {
+                // The stroke itself, and a press the canvas never sees. See
+                // `supersedes_stroke` for why each is excluded, and for the one
+                // gap `Paint` leaves open.
+                Press::Paint | Press::Ignored => {
+                    assert!(!superseded, "{decision:?} must not end a stroke")
+                }
+                _ => assert!(superseded, "{decision:?} left a stroke running"),
+            }
         }
-        assert!(!supersedes_stroke(Press::Paint));
-        assert!(!supersedes_stroke(Press::Ignored));
     }
 
     #[test]
