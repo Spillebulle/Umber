@@ -527,12 +527,95 @@ fn from_t(t: f32, lo: f32, hi: f32, log: bool) -> f32 {
     }
 }
 
+/// Which of the two gestures a rail answers to landed on it.
+///
+/// The distinction only matters for a value that lies outside the rail's own
+/// span — see [`track_value`] — but it is named here rather than passed as a
+/// pair of booleans, because "tapped and dragged" is not a state and a caller
+/// should not be able to describe one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grab {
+    /// The pointer went down and came up again without travelling.
+    Tap,
+    /// The pointer is being dragged along the rail.
+    Drag,
+}
+
+/// A rail's span, and how a value is laid along it.
+///
+/// One argument rather than four, so [`track_value`] stays inside clippy's
+/// argument budget and so the four numbers that have to agree travel together.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    lo: f32,
+    hi: f32,
+    log: bool,
+    /// The multiple a drag is pulled onto, in the value's own units. Zero —
+    /// what every rail but [`number_row`]'s passes — is the exact identity:
+    /// [`snapped`] returns its argument untouched, so nothing that did not ask
+    /// for a snap pays a rounding step for one.
+    snap: f32,
+}
+
+/// What a gesture on a rail makes of the value under it, or `None` where the
+/// rail should leave the value alone.
+///
+/// **Separated from [`drag_track`] because the decision is testable and the
+/// plumbing is not.** An `egui::Response` cannot be honestly fabricated, so a
+/// rule buried in one is a rule nobody checks; this is the same extraction
+/// `gesture::press`, `install::detect`, `sysclip::decide`, `Clip::place`,
+/// `update::flow`, `ScrollSpan` and `overlay::place_strip` all make, and each
+/// says so where it is defined. What it buys here in particular is that "this
+/// is a no-op for every rail whose value is in span" is an assertion rather
+/// than a sentence in a commit message.
+///
+/// **A stationary tap does not write while the value lies outside the span.**
+/// A rail cannot express such a value: [`to_t`] clamps, so the knob is painted
+/// pinned at whichever end the value is past, and a tap there — the one spot
+/// that looks as though it will do nothing, because the knob is already
+/// there — used to set the value to that end. That is how a 1045 px brush
+/// became a 400 px one, and it is not confined to brush size: of the 252
+/// shipped presets, 15 carry a `size` past its rail, 4 an airbrush rate of
+/// 300/s past a rail stopping at 100, 2 a spacing of 1.47 and 5.12 past one
+/// stopping at 0.5 — spacings `docs`' dab-shape rule calls deliberate — and 13
+/// a stroke span outside `1..=500` in *both* directions, down to 0.61 and up to
+/// 2779. Hence the test against `lo` as well as `hi`.
+///
+/// [`crate::tweaks::Tweak::range`] already states the principle this restores:
+/// "a rail's span is not a bound on the value". This is the one place the
+/// codebase failed to implement it.
+///
+/// **The cost, and the way round it: a deliberate stationary tap at mid-rail is
+/// ignored too, and the painter drags instead** — a drag writes from the track
+/// at once, so an oversized value is always one short sweep from being brought
+/// into the span. Nothing becomes unreachable or read-only, which would be a
+/// different lie. The tighter alternative is to refuse a tap only within the
+/// knob's radius of the pinned end, leaving mid-rail taps live; it is rejected
+/// because the knob's size is [`slider_row`]'s and [`inline_slider`]'s own and
+/// would have to be threaded into a hub function with four callers, and because
+/// refusing a change is recoverable where destroying a preset's setting is not.
+fn track_value(grab: Grab, at: f32, track: Rect, value: f32, span: Span) -> Option<f32> {
+    if grab == Grab::Tap && (value < span.lo || value > span.hi) {
+        return None;
+    }
+    let t = ((at - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+    let next = snapped(
+        from_t(t, span.lo, span.hi, span.log),
+        span.snap,
+        span.lo,
+        span.hi,
+    );
+    // Unchanged is reported as no change, so a caller that repaints on `true`
+    // does not repaint for a tap that landed on the value already held.
+    (next != value).then_some(next)
+}
+
 /// Drag a track and report whether the value moved.
 ///
-/// `snap` is the multiple a drag is pulled onto, in the value's own units, and
-/// zero — what every rail but [`number_row`]'s passes — is the exact identity:
-/// [`snapped`] returns its argument untouched, so nothing that did not ask for
-/// a snap pays a rounding step for one.
+/// [`track_value`] is the rule; this is the `egui::Response` around it. A drag
+/// wins over a click where egui reports both in one frame, which is the safe
+/// reading: a drag is the deliberate gesture, and for a value inside the span
+/// the two arms compute the identical figure anyway.
 fn drag_track(
     response: &Response,
     track: Rect,
@@ -542,17 +625,20 @@ fn drag_track(
     log: bool,
     snap: f32,
 ) -> bool {
-    if !(response.dragged() || response.clicked()) {
+    let grab = if response.dragged() {
+        Grab::Drag
+    } else if response.clicked() {
+        Grab::Tap
+    } else {
         return false;
-    }
+    };
     let Some(pos) = response.interact_pointer_pos() else {
         return false;
     };
-    let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
-    let next = snapped(from_t(t, lo, hi, log), snap, lo, hi);
-    if next == *value {
+    let span = Span { lo, hi, log, snap };
+    let Some(next) = track_value(grab, pos.x, track, *value, span) else {
         return false;
-    }
+    };
     *value = next;
     true
 }
@@ -2599,6 +2685,137 @@ pub fn pressure_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 100-point track starting at x = 10, which every [`track_value`] test
+    /// below reads positions against.
+    fn a_track() -> Rect {
+        Rect::from_min_size(pos2(10.0, 0.0), vec2(100.0, 3.0))
+    }
+
+    /// A linear span with no snap, which is what every rail but
+    /// [`number_row`]'s asks for.
+    fn plain(lo: f32, hi: f32) -> Span {
+        Span {
+            lo,
+            hi,
+            log: false,
+            snap: 0.0,
+        }
+    }
+
+    /// Refusing a tap must not have changed a single rail whose value is where
+    /// its rail can express it.
+    ///
+    /// This is the claim that makes a change inside a hub with four callers
+    /// safe, and it is the whole reason [`track_value`] is a function rather
+    /// than four lines inside [`drag_track`]: the old behaviour is "the value
+    /// under the pointer, whichever gesture put it there", and it is asserted
+    /// here over the whole track, both gestures, both mappings and a snap,
+    /// rather than argued in a commit message.
+    #[test]
+    fn a_value_inside_its_rails_span_reads_exactly_what_it_used_to() {
+        let track = a_track();
+        for span in [
+            plain(0.0, 1.0),
+            plain(-3.0, 3.0),
+            Span {
+                lo: 1.0,
+                hi: 400.0,
+                log: true,
+                snap: 0.0,
+            },
+            Span {
+                lo: 0.0,
+                hi: 360.0,
+                log: false,
+                snap: 45.0,
+            },
+        ] {
+            // Every twentieth of the track, plus a point off each end, since
+            // the mapping clamps rather than refusing.
+            for step in -2..=22 {
+                let at = track.left() + track.width() * step as f32 / 20.0;
+                // What the rail did before this change, spelled out here rather
+                // than called, so a later edit to `track_value` cannot quietly
+                // redefine what "unchanged" means.
+                let t = ((at - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+                let was = snapped(
+                    from_t(t, span.lo, span.hi, span.log),
+                    span.snap,
+                    span.lo,
+                    span.hi,
+                );
+                for value in [span.lo, span.hi, (span.lo + span.hi) * 0.5] {
+                    let expected = (was != value).then_some(was);
+                    for grab in [Grab::Tap, Grab::Drag] {
+                        assert_eq!(
+                            track_value(grab, at, track, value, span),
+                            expected,
+                            "{grab:?} at {at} on {span:?} holding {value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A tap on a rail that cannot express the value it is showing writes
+    /// nothing.
+    ///
+    /// The knob is painted pinned at the end the value is past, so a tap there
+    /// is the gesture least likely to be meant as a change — and it used to set
+    /// the value to that end. Both ends, because a shipped stroke span of 0.61
+    /// sits below its rail's 1.0 exactly as a 1045 px brush sits above its
+    /// rail's 400.
+    #[test]
+    fn a_tap_cannot_haul_a_value_back_inside_a_rail_that_cannot_show_it() {
+        let track = a_track();
+        let span = plain(1.0, 400.0);
+        for (value, at) in [
+            // Past the top: the knob is pinned right, and so is the tap.
+            (1045.0, track.right()),
+            (1045.0, track.left()),
+            (1045.0, track.center().x),
+            // Below the bottom: pinned left.
+            (0.61, track.left()),
+            (0.61, track.right()),
+        ] {
+            assert_eq!(
+                track_value(Grab::Tap, at, track, value, span),
+                None,
+                "a tap at {at} rewrote {value}"
+            );
+        }
+    }
+
+    /// A drag still writes, so an out-of-span value is never stuck.
+    ///
+    /// The refusal above is only defensible while there is a gesture that does
+    /// reach: a value a rail cannot show must still be a value a rail can
+    /// change, or the control has stopped being one.
+    #[test]
+    fn a_drag_still_brings_an_out_of_span_value_back_onto_its_rail() {
+        let track = a_track();
+        let span = plain(1.0, 400.0);
+        for value in [1045.0, 0.61] {
+            assert_eq!(
+                track_value(Grab::Drag, track.left(), track, value, span),
+                Some(1.0),
+                "a drag to the left end left {value} alone"
+            );
+            assert_eq!(
+                track_value(Grab::Drag, track.right(), track, value, span),
+                Some(400.0),
+                "a drag to the right end left {value} alone"
+            );
+            let middle = track_value(Grab::Drag, track.center().x, track, value, span)
+                .expect("a drag mid-rail sets the value");
+            assert!(
+                (middle - 200.5).abs() < 0.01,
+                "a drag to the middle of 1..400 gave {middle}"
+            );
+        }
+    }
 
     /// A stamp's thumbnail has to show what it will paint.
     ///
