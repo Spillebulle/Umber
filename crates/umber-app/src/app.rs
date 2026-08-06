@@ -3997,11 +3997,46 @@ impl ApplicationHandler<Wake> for UmberApp {
                 }
             }
 
-            // A modifier released while another window has the keyboard never
-            // reaches us, so Alt can be "held" for ever after an Alt-Tab. The
-            // resize gesture would then still be live — and its circle still on
-            // the canvas — when the window came back.
-            WindowEvent::Focused(false) => self.set_brush_resize(false),
+            // Losing the window ends every gesture, because **no gesture may
+            // be left in a state only a release could end** — and after this
+            // event no release is coming. A modifier let go of while another
+            // window has the keyboard never reaches us, and neither does a
+            // button.
+            WindowEvent::Focused(false) => {
+                // Alt can otherwise be "held" for ever after an Alt-Tab, so the
+                // resize would still be live — and its circle still on the
+                // canvas — when the window came back.
+                self.set_brush_resize(false);
+                // Space is the identical failure by a route `shortcuts::direct`
+                // structurally cannot see: that rule keeps a *release* always
+                // landing, and here there is no release at all. Come back from
+                // an Alt-Tab and the pan override is armed with no key down.
+                self.editor.space_down = false;
+                // A stroke is the expensive one. Alt-Tab mid-stroke and
+                // `Interaction::Drawing` and `stroke.is_active()` both stay set
+                // for ever: `render`'s `quiet` requires both to be clear and
+                // `Autosave::next_due` answers `None` while it is not, so **the
+                // document is never autosaved again for the rest of the
+                // session** — silently, with its tab still showing an unsaved
+                // dot. Finish rather than cancel, for the reason
+                // `gesture::supersedes_stroke` gives: the artist drew a visible
+                // mark.
+                self.finish_stroke();
+                // And the gestures that carry no stroke behind them. `quiet`
+                // reads `Interaction` as well, so a pan or a zoom abandoned by
+                // an Alt-Tab stalls the autosave exactly as a stroke does —
+                // `finish_stroke` clears this itself, but only when there was a
+                // stroke to finish.
+                //
+                // Deliberately *not* `cancel_selection_draft`: that takes the
+                // draft away, and a polygon spans several clicks, so Alt-Tabbing
+                // to look at a reference is precisely when somebody has one
+                // half-drawn. Idle with a draft standing is an ordinary state
+                // rather than a broken one — it is what a middle-drag to pan
+                // already produces, and `pointer_moved`'s `Idle` arm keeps the
+                // rubber band following the pointer.
+                self.editor.interaction = Interaction::Idle;
+            }
 
             // Switching input language changes what every key prints, and
             // therefore what every shortcut label should say. Taking the window

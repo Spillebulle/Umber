@@ -193,29 +193,35 @@ pub fn press(p: Pointer) -> Press {
 /// `close_document`, `float_a_clip` and `take_region` all call `finish_stroke`.
 /// Do not unify the two.
 ///
-/// Two are excluded, and the reason is what each one *is* rather than any claim
-/// that it cannot arrive:
+/// **[`Press::Paint`] supersedes too, and the reason is a second lost stroke.**
+/// It looks like the one press that should be excluded — it *is* a stroke, so
+/// ending one to begin another reads like churn — and that reasoning was wrong,
+/// because it assumed a `Paint` press cannot arrive while a stroke runs. It
+/// can. `Editor::touches` is written only by the touch arm, so it is empty
+/// while a **mouse** stroke is live, and a pen coming down then answers
+/// [`Contact::Press`] rather than [`Contact::Pinch`] and resolves to `Paint`.
+/// What followed was `start_stroke` on an already-active builder, whose
+/// unconditional `clear_stroke` **discarded the mouse stroke with no history
+/// entry** — silently, and not undoable. Finishing it instead commits it with
+/// its entry and *then* begins the new one, which is strictly better than
+/// losing it.
 ///
-/// * [`Press::Ignored`] is a press the canvas never sees, and cancelling on it
-///   was a real bug — see the [`Contact::Pinch`] arm in `app.rs`: "one finger
-///   on a panel is not a gesture, and cancelling the stroke there threw away a
-///   stroke the other hand was in the middle of". That is exactly this case,
-///   and it *is* reachable, because `Editor::touches` is empty while a **mouse**
-///   stroke runs, so a finger going down answers [`Contact::Press`] rather than
-///   `Pinch`.
-/// * [`Press::Paint`] is the stroke itself, and ending one stroke to start
-///   another would be a commit and a history entry for every spurious press.
+/// The ordinary one-pointer case is untouched, and what guarantees that is the
+/// call site's `&& self.editor.stroke.is_active()`: a press arrives once per
+/// gesture and no stroke is live when it does. This does not double-finish
+/// anything.
 ///
-/// **The same mouse-and-pen crossing leaves one gap this does not close**, and
-/// it is pre-existing rather than anything the supersession introduced: a pen
-/// coming down while a mouse stroke is live resolves to `Paint`, so
-/// `start_stroke` runs on an already-active builder and its unconditional
-/// `clear_stroke` discards the mouse stroke's dabs with no history entry.
-/// Making `Paint` supersede would close it — the call site is guarded on
-/// `stroke.is_active()`, so the ordinary case is untouched — and it is left
-/// alone here deliberately, because the honest fix for the whole class is for
-/// `pointer_released` to end a stroke on `stroke.is_active()` rather than on
-/// `Interaction`, which is where the authority actually lives.
+/// [`Press::Ignored`] is the one exclusion left, and it is excluded for what it
+/// *is* rather than for being unreachable — it is reachable by the same
+/// crossing. A press the canvas never sees must not end a stroke, and acting on
+/// one was a real bug: see the [`Contact::Pinch`] arm in `app.rs`, "one finger
+/// on a panel is not a gesture, and cancelling the stroke there threw away a
+/// stroke the other hand was in the middle of". That is exactly this case.
+///
+/// The honest fix for the whole class is still owed: `pointer_released` should
+/// end a stroke on `stroke.is_active()` rather than on `Interaction`, which is
+/// where the authority actually lives. With that in place no future `Press`
+/// variant and no new writer of `Interaction` could strand a stroke at all.
 ///
 /// The `match` is exhaustive and has **no wildcard arm**, which is the point of
 /// it: a `_ => true` would silently answer for a variant nobody had thought
@@ -225,11 +231,12 @@ pub fn press(p: Pointer) -> Press {
 /// but was never exercised.
 pub fn supersedes_stroke(decision: Press) -> bool {
     match decision {
-        // It is the stroke itself.
-        Press::Paint => false,
-        // A press the canvas never sees.
+        // A press the canvas never sees. The one exclusion.
         Press::Ignored => false,
-        Press::Pan
+        // Paint included: a pen landing during a mouse stroke is a `Paint`
+        // press with a stroke running, and discarding it is a lost mark.
+        Press::Paint
+        | Press::Pan
         | Press::Zoom
         | Press::Select
         | Press::Transform
@@ -490,15 +497,39 @@ mod tests {
         for decision in Press::ALL {
             let superseded = supersedes_stroke(decision);
             match decision {
-                // The stroke itself, and a press the canvas never sees. See
-                // `supersedes_stroke` for why each is excluded, and for the one
-                // gap `Paint` leaves open.
-                Press::Paint | Press::Ignored => {
-                    assert!(!superseded, "{decision:?} must not end a stroke")
-                }
+                // The only press the canvas never sees, and the only one that
+                // may leave a stroke running. See `supersedes_stroke`.
+                Press::Ignored => assert!(!superseded, "a press on a panel ended a stroke"),
                 _ => assert!(superseded, "{decision:?} left a stroke running"),
             }
         }
+    }
+
+    #[test]
+    fn a_pen_landing_during_a_mouse_stroke_does_not_discard_it() {
+        // `Paint` looks like the one press that should be excluded — it is a
+        // stroke, so ending one to begin another reads like churn — and that
+        // reasoning assumed a `Paint` press cannot arrive with a stroke
+        // already running. It can, and this is the sequence.
+        //
+        // `Editor::touches` is written only by the touch arm, so it is empty
+        // while a *mouse* stroke is live. A pen coming down is therefore the
+        // first contact, which `contact` reads as a press and not a pinch...
+        assert_eq!(
+            contact(TouchPhase::Started, 1, false, false),
+            Contact::Press,
+            "a mouse stroke leaves `touches` empty, so the pen is contact one"
+        );
+        // ...and `press` resolves that to `Paint`, with the brush in hand.
+        assert_eq!(press(pen(Tool::Brush)), Press::Paint);
+        // Which must end the mouse stroke rather than let `start_stroke` run
+        // on an already-active builder: its unconditional `clear_stroke`
+        // discarded that stroke with no history entry, silently and not
+        // undoably.
+        assert!(
+            supersedes_stroke(Press::Paint),
+            "a pen landing mid-stroke discards the stroke it interrupts"
+        );
     }
 
     #[test]
