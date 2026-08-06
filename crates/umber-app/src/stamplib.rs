@@ -39,7 +39,7 @@ use std::sync::Arc;
 use egui::{Align, Frame, Id, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 use umber_core::TipMask;
-use umber_core::preset::Removed;
+use umber_core::preset::{Removed, Renamed};
 
 use crate::brushlib::{self, Notice};
 use crate::controls;
@@ -112,6 +112,20 @@ enum Source {
     Hidden,
 }
 
+/// The picture whose name is being edited, and the name so far.
+///
+/// The buffer lives here rather than in the row, for `palettelib`'s reason: a
+/// `TextEdit`'s text belongs to the caller and the row is rebuilt every frame,
+/// so a local copy would lose a character per frame.
+#[derive(Clone)]
+struct Renaming {
+    /// The name the picture has *now*, which is what the model is asked to
+    /// rename and what tells one row's field from another's.
+    name: String,
+    text: String,
+    focus: bool,
+}
+
 #[derive(Clone, Default)]
 struct State {
     open: Option<Kind>,
@@ -120,6 +134,9 @@ struct State {
     /// The name whose Remove has been pressed once. Removing a picture cannot
     /// be undone — the history covers painting only — so it asks.
     confirming: Option<String>,
+    /// The row whose name is being edited. A rename **is** undoable — it is
+    /// another rename — so unlike Remove it is not asked twice.
+    renaming: Option<Renaming>,
 }
 
 fn state_id() -> Id {
@@ -146,6 +163,7 @@ pub fn open(ctx: &egui::Context, kind: Kind) {
     state.open = Some(kind);
     state.notice = None;
     state.confirming = None;
+    state.renaming = None;
     state.query.clear();
     store(ctx, state);
 }
@@ -207,6 +225,7 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
 fn close(ctx: &egui::Context, state: &mut State) {
     state.open = None;
     state.confirming = None;
+    state.renaming = None;
     ctx.data_mut(|d| {
         d.remove::<Previews>(preview_id());
         d.remove::<Joins>(joins_id());
@@ -259,6 +278,7 @@ fn header(ui: &mut Ui, p: &Palette, state: &mut State) {
             // across would show an empty half and no reason for it.
             state.query.clear();
             state.confirming = None;
+            state.renaming = None;
         }
     });
     controls::search_field(ui, p, &mut state.query, "Search by name");
@@ -271,7 +291,42 @@ struct Entry {
     source: Source,
     /// The brushes in the user's library still naming it — empty for a shipped
     /// picture, which no user brush can take away.
+    ///
+    /// **This is the *refusal* set, not the census**, and the difference is
+    /// deliberate: it is what Remove is disabled by, so it holds only what
+    /// removing the picture would leave with nothing — the user's own brushes,
+    /// and the brush in hand. A shipped brush that happens to name a picture
+    /// of the user's falls back to Umber's own when theirs goes, so it belongs
+    /// in [`Self::painting_with`] and must not be in here: counting it would
+    /// make a picture the user imported by accident impossible for them to
+    /// remove, for ever, because a shipped brush is not theirs to edit.
     users: Vec<String>,
+    /// How many brushes in the merged library paint with this picture, or
+    /// `None` where the row is not one a name can resolve to.
+    ///
+    /// The question a painter is asking of a row — and until now the only way
+    /// to learn the answer was to press Remove and be refused, which is the
+    /// control-that-tells-you-afterwards this codebase refuses elsewhere.
+    ///
+    /// Over the **merged** list, shipped presets included, because that is what
+    /// "used by" means and it is the only reading that can be right about a
+    /// shipped row: `tip_users` sees the user's library alone and would put
+    /// "no brush uses it" beside a stamp four shipped brushes stamp with.
+    /// [`Source::Hidden`] answers `None` rather than zero, and by construction
+    /// rather than by exception: nothing can resolve to a picture one of the
+    /// user's has taken the name of, so the row has no figure to give and its
+    /// own sentence already says why.
+    painting_with: Option<usize>,
+    /// Whether the brush the artist is *holding* names this picture.
+    ///
+    /// Beside the figure rather than folded into it, because the two are read
+    /// off different things — [`Self::painting_with`] counts saved presets and
+    /// this reads `Editor::tip_name` — and because the row has to be able to
+    /// say **which**: a picture nothing has been saved with and everything is
+    /// being painted with is the ordinary state of one just imported, and "no
+    /// brush uses it" beside a Remove that is refused for the brush in hand is
+    /// a row disagreeing with its own control.
+    in_hand: bool,
 }
 
 /// Everything in one half of the library, the user's first.
@@ -288,6 +343,29 @@ fn entries(ed: &Editor, state: &State, kind: Kind) -> Vec<Entry> {
     let query = state.query.trim().to_ascii_lowercase();
     let matches = |name: &str| query.is_empty() || name.to_ascii_lowercase().contains(&query);
 
+    // One pass over the merged preset list, not one per row: the list is 245
+    // presets and the modal draws a couple of dozen rows, so counting inside
+    // the row would be six thousand comparisons a frame for a figure that is
+    // the same for every row that shares a name.
+    let mut tally: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for preset in &ed.presets {
+        let named = match kind {
+            Kind::Stamps => preset.tip.as_deref(),
+            Kind::Papers => preset.paper.as_deref(),
+        };
+        if let Some(name) = named {
+            *tally.entry(name).or_default() += 1;
+        }
+    }
+    let counted = |name: &str| tally.get(name).copied().unwrap_or(0);
+    // The one reading of what the brush in hand names, shared by the row's
+    // sentence and by the refusal that disables Remove — two places that must
+    // not be able to disagree about whether it counts.
+    let in_hand = match kind {
+        Kind::Stamps => ed.tip_name.as_deref(),
+        Kind::Papers => ed.paper_name.as_deref(),
+    };
+
     let mut out: Vec<Entry> = Vec::with_capacity(yours.len() + shipped.len());
     for (name, mask) in yours {
         if !matches(name) {
@@ -298,21 +376,31 @@ fn entries(ed: &Editor, state: &State, kind: Kind) -> Vec<Entry> {
             mask: Arc::clone(mask),
             source: Source::Yours,
             users: Vec::new(),
+            painting_with: Some(counted(name)),
+            in_hand: in_hand == Some(name.as_str()),
         });
     }
     for (name, mask) in shipped {
         if !matches(name) {
             continue;
         }
+        let hidden = yours.contains_key(*name);
         out.push(Entry {
             name: (*name).to_owned(),
             mask: Arc::clone(mask),
-            source: if yours.contains_key(*name) {
+            source: if hidden {
                 Source::Hidden
             } else {
                 Source::Shipped
             },
             users: Vec::new(),
+            // Nothing resolves to a hidden picture, so there is no figure to
+            // give — and the *name*'s tally belongs entirely to the user's own
+            // copy, which the row above has already claimed it for. The hand
+            // goes the same way: a name in hand resolves to theirs, never to
+            // this.
+            painting_with: (!hidden).then(|| counted(name)),
+            in_hand: !hidden && in_hand == Some(*name),
         });
     }
     out
@@ -336,10 +424,6 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
     // Who is using each of the user's own, which is what decides whether Remove
     // may be offered. Asked once per frame rather than once per row, and only
     // of the rows that can be removed at all.
-    let in_hand = match kind {
-        Kind::Stamps => ed.tip_name.clone(),
-        Kind::Papers => ed.paper_name.clone(),
-    };
     if let Some(library) = &held {
         for row in rows.iter_mut().filter(|r| r.source == Source::Yours) {
             row.users = match kind {
@@ -350,13 +434,21 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
             // it — `UserLibrary` knows only what has been saved. Without this,
             // the picture under the pointer could be deleted with a cheerful
             // notice and the next stroke would silently change.
-            if in_hand.as_deref() == Some(row.name.as_str()) {
+            if row.in_hand {
                 row.users.push("the brush in your hand".to_owned());
             }
         }
     }
 
+    // **Two slots, not one**, and it is `palettelib`'s reason: a field losing
+    // focus and a button being pressed are one frame's worth of *different*
+    // events, on two different rows. Clicking Rename on a row below one whose
+    // field is open fires both, and a single "last one wins" slot threw the
+    // typed name away with nothing to show for it. `finished` is applied first
+    // below, so the name is kept and the button still does what it was pressed
+    // for.
     let mut action = None;
+    let mut finished = None;
     let area = egui::ScrollArea::vertical()
         .id_salt("stamp-library-list")
         .auto_shrink([false, false])
@@ -392,30 +484,61 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
         area.show_rows(ui, metrics::STAMP_ROW, rows.len(), |ui, visible| {
             ui.spacing_mut().item_spacing.y = ROW_GAP;
             for entry in &rows[visible] {
-                if let Some(chosen) = row(ui, p, ed, state, kind, entry) {
-                    action = Some(chosen);
+                match row(ui, p, ed, state, kind, entry) {
+                    Some(done @ (Action::Rename(_) | Action::CancelRename)) => {
+                        finished = Some(done);
+                    }
+                    Some(chosen) => action = Some(chosen),
+                    None => {}
                 }
             }
         });
     }
 
+    // The open field's answer lands first, whichever row it came from.
+    match finished {
+        Some(Action::Rename(typed)) => {
+            if let Some(field) = state.renaming.take() {
+                rename(ui.ctx(), ed, state, kind, field.name, typed);
+            }
+        }
+        Some(Action::CancelRename) => state.renaming = None,
+        _ => {}
+    }
     match action {
         Some(Action::Use(name)) => choose(ed, state, kind, name),
         Some(Action::Remove(name)) => remove(ui.ctx(), ed, state, kind, name),
-        None => {}
+        Some(Action::StartRename(name)) => {
+            // The field opens on the name it has, because a rename is usually
+            // an edit of it rather than a replacement — `scan-003` wants two
+            // characters changed, not eleven typed.
+            state.renaming = Some(Renaming {
+                text: name.clone(),
+                name,
+                focus: true,
+            });
+            state.confirming = None;
+        }
+        _ => {}
     }
 }
 
 enum Action {
     Use(String),
     Remove(String),
+    /// Open the field on this row.
+    StartRename(String),
+    /// The open field reported: give the picture this name.
+    Rename(String),
+    /// The open field reported: leave the name it has.
+    CancelRename,
 }
 
 fn row(
     ui: &mut Ui,
     p: &Palette,
     ed: &Editor,
-    state: &State,
+    state: &mut State,
     kind: Kind,
     entry: &Entry,
 ) -> Option<Action> {
@@ -432,72 +555,226 @@ fn row(
             .is_some_and(|tile| Arc::ptr_eq(&tile, &entry.mask)),
     } && entry.source != Source::Hidden;
 
+    // Outside the frame: `joins` walks a whole tile the first time it is asked
+    // and wants the context, not the row's layout.
+    let line = detail(entry, joins(ui, kind, &entry.name, &entry.mask));
+    let renaming = state
+        .renaming
+        .as_ref()
+        .is_some_and(|field| field.name == entry.name);
+
+    // The row being renamed is marked as the row being renamed, which is what
+    // `brushlib::rename_overlay` does with the same token: a field standing
+    // where two labels stood is not, on its own, obviously a field.
+    let fill = match (renaming, chosen) {
+        (true, _) => p.control_active,
+        (false, true) => p.control,
+        (false, false) => p.window,
+    };
+    let border = match (renaming, chosen) {
+        (true, _) => p.accent,
+        (false, true) => p.accent_dim,
+        (false, false) => p.border,
+    };
     Frame::NONE
-        .fill(if chosen { p.control } else { p.window })
-        .stroke(Stroke::new(
-            1.0,
-            if chosen { p.accent_dim } else { p.border },
-        ))
+        .fill(fill)
+        .stroke(Stroke::new(1.0, border))
         .corner_radius(metrics::RADIUS)
         .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 preview(ui, p, kind, &entry.name, &entry.mask);
                 ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(
-                        RichText::new(&entry.name)
-                            .size(text::SMALL)
-                            .color(p.text_strong),
-                    );
-                    let joins = joins(ui, kind, &entry.name, &entry.mask);
-                    ui.label(
-                        RichText::new(detail(entry, joins))
-                            .size(text::TINY)
-                            .color(p.text_dim),
-                    );
-                });
+                // **The controls claim their room before the text does**, and
+                // the text column is whatever is left. Laid out the other way
+                // round the labels came first, and a label in a horizontal
+                // layout defaults to `TextWrapMode::Extend` — so `detail`, at
+                // up to sixty-five characters, sized the row rather than being
+                // sized by it and the buttons were drawn over the end of it.
+                // Same failure `notice_bar` records, one modal along.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Remove is the user's own pictures only: a shipped one is
-                    // in the binary and there is nothing on disk to take away.
-                    if entry.source == Source::Yours {
-                        let free = entry.users.is_empty();
-                        let asking = state.confirming.as_deref() == Some(entry.name.as_str());
-                        let label = if asking { "Really?" } else { "Remove" };
-                        let tip = if free {
-                            "Delete this picture from your library"
-                        } else {
-                            // Named rather than counted: "used by 2 brushes" is
-                            // a number somebody then has to go and find.
-                            &format!("Still used by {}", entry.users.join(", "))
-                        };
-                        if controls::text_button(ui, p, label, false, free)
-                            .on_hover_text(tip)
-                            .on_disabled_hover_text(tip)
-                            .clicked()
-                        {
-                            action = Some(Action::Remove(entry.name.clone()));
+                    if renaming {
+                        rename_buttons(ui, p, state, &mut action);
+                    } else {
+                        row_buttons(ui, p, state, kind, entry, chosen, &mut action);
+                    }
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        match state.renaming.as_mut().filter(|_| renaming) {
+                            Some(field) => rename_field(ui, p, field, &mut action),
+                            None => {
+                                // Truncated rather than extending, and with the
+                                // whole line on hover: the column is bounded
+                                // now, so a label that ran past it would be
+                                // drawn over the controls beside it.
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&entry.name)
+                                            .size(text::SMALL)
+                                            .color(p.text_strong),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&line).size(text::TINY).color(p.text_dim),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&line);
+                            }
                         }
-                    }
-                    if entry.source != Source::Hidden
-                        && controls::text_button(ui, p, "Use", chosen, true)
-                            .on_hover_text(kind.use_tip())
-                            .clicked()
-                    {
-                        action = Some(Action::Use(entry.name.clone()));
-                    }
+                    });
                 });
             });
         });
     action
 }
 
-/// The line under a picture's name: how big it is, where it came from, and —
-/// for a paper — whether it joins to itself.
+/// Remove, Use and Rename, right-aligned.
+///
+/// Rename is the user's own pictures only, for Remove's reason turned round: a
+/// shipped picture's name is in the binary and in `tip_table.rs`, and the
+/// presets that resolve through it are shipped too.
+fn row_buttons(
+    ui: &mut Ui,
+    p: &Palette,
+    state: &State,
+    kind: Kind,
+    entry: &Entry,
+    chosen: bool,
+    action: &mut Option<Action>,
+) {
+    // Remove is the user's own pictures only: a shipped one is in the binary
+    // and there is nothing on disk to take away.
+    if entry.source == Source::Yours {
+        let free = entry.users.is_empty();
+        let asking = state.confirming.as_deref() == Some(entry.name.as_str());
+        let label = if asking { "Really?" } else { "Remove" };
+        let tip = if free {
+            "Delete this picture from your library"
+        } else {
+            // Named rather than counted: the row already carries the count, and
+            // what a disabled control owes is which brushes are in the way.
+            &format!("Still used by {}", entry.users.join(", "))
+        };
+        if controls::text_button(ui, p, label, false, free)
+            .on_hover_text(tip)
+            .on_disabled_hover_text(tip)
+            .clicked()
+        {
+            *action = Some(Action::Remove(entry.name.clone()));
+        }
+    }
+    if entry.source != Source::Hidden
+        && controls::text_button(ui, p, "Use", chosen, true)
+            .on_hover_text(kind.use_tip())
+            .clicked()
+    {
+        *action = Some(Action::Use(entry.name.clone()));
+    }
+    if entry.source == Source::Yours
+        && controls::text_button(ui, p, "Rename", false, true)
+            .on_hover_text(match kind {
+                Kind::Stamps => "Rename this stamp. Every brush that stamps with it follows.",
+                Kind::Papers => "Rename this paper. Every brush that paints through it follows.",
+            })
+            .clicked()
+    {
+        *action = Some(Action::StartRename(entry.name.clone()));
+    }
+}
+
+/// Save and Cancel, in the place Remove and Use were.
+///
+/// The row being renamed offers neither of those: Use would choose a picture
+/// whose name is about to change, and Remove would delete the row the field is
+/// standing in.
+fn rename_buttons(ui: &mut Ui, p: &Palette, state: &State, action: &mut Option<Action>) {
+    let typed = state
+        .renaming
+        .as_ref()
+        .map_or("", |field| field.text.trim())
+        .to_owned();
+    let named = !typed.is_empty();
+    if controls::text_button(ui, p, "Cancel", false, true)
+        .on_hover_text("Keep the name it has")
+        .clicked()
+    {
+        *action = Some(Action::CancelRename);
+    }
+    let hint = if named {
+        "Give it this name"
+    } else {
+        "Give it a name first."
+    };
+    if controls::text_button(ui, p, "Save", named, named)
+        .on_hover_text(hint)
+        .on_disabled_hover_text(hint)
+        .clicked()
+    {
+        *action = Some(Action::Rename(typed));
+    }
+}
+
+/// The name being edited, in the place the two labels were.
+fn rename_field(ui: &mut Ui, p: &Palette, field: &mut Renaming, action: &mut Option<Action>) {
+    let width = ui.available_width().max(60.0);
+    // A well of its own, `controls::search_field`'s: egui's own frame is drawn
+    // from the stock style and reads as nothing at all against the row's fill,
+    // which left the name looking like the label it had just replaced.
+    let edit = Frame::NONE
+        .fill(p.window)
+        .stroke(Stroke::new(1.0, p.accent_dim))
+        .corner_radius(metrics::RADIUS)
+        .inner_margin(Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut field.text)
+                    // Salted with the name, so moving the field to another row
+                    // does not inherit the caret and selection of the last one.
+                    .id(Id::new(("stamp-library-rename", &field.name)))
+                    .frame(Frame::NONE)
+                    .desired_width((width - 16.0).max(44.0))
+                    .font(egui::FontId::proportional(text::CONTROL))
+                    .text_color(p.text_strong),
+            )
+        })
+        .inner;
+    if field.focus {
+        edit.request_focus();
+        field.focus = false;
+    }
+    // A button pressed this frame wins over the blur that pressing it caused.
+    // Without the guard, clicking Cancel set `CancelRename` and the field then
+    // overwrote it with the text still in the buffer — a Cancel that renamed.
+    if edit.lost_focus() && action.is_none() {
+        // Escape abandons; Enter, or a click elsewhere, keeps what was typed.
+        // An emptied field is Escape too rather than a nameless picture: the
+        // model would fall back to the stem `tip`, which is nobody's answer to
+        // "what should this be called".
+        let typed = field.text.trim().to_owned();
+        *action = Some(
+            if typed.is_empty() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                Action::CancelRename
+            } else {
+                Action::Rename(typed)
+            },
+        );
+    }
+    controls::note(ui, p, "Every brush that uses it follows.");
+}
+
+/// The line under a picture's name: how big it is, where it came from, how many
+/// brushes paint with it, and — for a paper — whether it joins to itself.
 ///
 /// `joins` is `None` for a stamp, which is never asked the question: it is
 /// stretched over one dab and has no second copy of itself to meet.
+///
+/// **The count is said on the row rather than only when Remove refuses**, which
+/// is where it used to live: pressing a button and being turned away was the
+/// only way to learn that four brushes stamped with a picture. Saying where the
+/// edge is beats letting somebody find it.
 fn detail(entry: &Entry, joins: Option<bool>) -> String {
     let size = format!("{} × {} px", entry.mask.width(), entry.mask.height());
     let source = match entry.source {
@@ -508,10 +785,29 @@ fn detail(entry: &Entry, joins: Option<bool>) -> String {
         // name resolves to the user's copy first.
         Source::Hidden => "shipped, hidden by one of yours with the same name",
     };
-    match joins {
-        Some(false) => format!("{size} · {source} · does not tile, so it draws a grid"),
-        _ => format!("{size} · {source}"),
+    let mut line = format!("{size} · {source}");
+    // **Before the count**, because the column is bounded and the tail is what
+    // truncates: a paper that does not join draws a grid over the whole canvas,
+    // and how many brushes use it is a nicety beside that. Measured against the
+    // real row, not reasoned about — `stamp_library_preview` had the warning
+    // cut off at "does not tile, so…" with the ellipsis in the middle of the
+    // one sentence the row exists to give.
+    if joins == Some(false) {
+        line.push_str(" · does not tile, so it draws a grid");
     }
+    // One phrase for both readings, so the row cannot say "no brush uses it"
+    // beside a Remove that is refused for the brush in hand.
+    if let Some(saved) = entry.painting_with {
+        line.push_str(&match (saved, entry.in_hand) {
+            (0, false) => " · no brush uses it".to_owned(),
+            (0, true) => " · used by the brush in your hand".to_owned(),
+            (1, false) => " · used by 1 brush".to_owned(),
+            (1, true) => " · used by 1 brush and the one in your hand".to_owned(),
+            (n, false) => format!(" · used by {n} brushes"),
+            (n, true) => format!(" · used by {n} brushes and the one in your hand"),
+        });
+    }
+    line
 }
 
 /// Whether a tile joins to itself, worked out once per tile rather than once
@@ -725,6 +1021,90 @@ fn shipped_pattern(name: &str) -> Option<umber_core::GrainPattern> {
     umber_core::GrainPattern::ALL
         .into_iter()
         .find(|pattern| pattern.key() == name)
+}
+
+/// Give a picture another name, and take the brush in hand along with it.
+///
+/// The model moves the file, the map, every *saved* preset and the library's
+/// record of the picture; `brushlib::edit_library` then resyncs, which brings
+/// `Editor::tips` and `Editor::papers` across. What neither can reach is the
+/// brush the artist is **holding**, which names the picture by name and has not
+/// been saved — see [`carry_the_hand`].
+fn rename(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    state: &mut State,
+    kind: Kind,
+    old: String,
+    typed: String,
+) {
+    let done = brushlib::edit_library(ctx, ed, |library| match kind {
+        Kind::Stamps => library.rename_tip(&old, &typed),
+        Kind::Papers => library.rename_paper(&old, &typed),
+    });
+    let notice = match done {
+        Ok(Renamed::Done(new)) => {
+            carry_the_hand(ed, kind, &old, &new);
+            let mut line = format!("Renamed \"{old}\" to \"{new}\".");
+            // The name it *got*, not the name asked for: a picture's name is a
+            // file stem, so it is folded to lower case, hyphenated and made
+            // unique. Somebody who typed "Rough charcoal" and got
+            // "rough-charcoal" should be told which of them the brushes now
+            // name, and somebody who typed a name already in use has to be told
+            // they did not get it.
+            if shipped_holds(kind, &new) {
+                line.push_str(&format!(
+                    " Umber ships a picture called \"{new}\" too, and yours is \
+                     now the one every brush finds."
+                ));
+            }
+            Some(Notice::good(line))
+        }
+        // Nothing happened and nothing is worth saying: this is somebody
+        // pressing Enter on a field they did not change.
+        Ok(Renamed::Unchanged) => None,
+        Ok(Renamed::Unknown) => Some(Notice::bad(format!(
+            "\"{old}\" is no longer in your library."
+        ))),
+        Err(why) => Some(Notice::bad(why)),
+    };
+    if let Some(notice) = notice {
+        state.notice = Some(notice);
+    }
+}
+
+/// Move the name the brush in the artist's hand carries.
+///
+/// `UserLibrary` knows only what has been **saved**, and `resync` brings the
+/// maps across and deliberately not this — the name in hand is not the
+/// library's to know. Leaving it behind is worse than merely stale for a paper:
+/// a tile of the user's that had taken a shipped name resolves to the *shipped*
+/// one the moment theirs is called something else, so the mark would change
+/// under the brush with nothing on screen to say why.
+///
+/// `Editor::tip` is deliberately **not** touched. The library re-inserted the
+/// very same `Arc` under the new name, so the mask in hand is still the mask
+/// the library holds, and handing `set_tip` a different pointer for the same
+/// pixels is the one thing its identity check exists to avoid.
+fn carry_the_hand(ed: &mut Editor, kind: Kind, old: &str, new: &str) {
+    let held = match kind {
+        Kind::Stamps => &mut ed.tip_name,
+        Kind::Papers => &mut ed.paper_name,
+    };
+    if held.as_deref() == Some(old) {
+        *held = Some(new.to_owned());
+    }
+}
+
+/// Whether Umber ships a picture of this name, which the user's own now hides.
+///
+/// Read off the shipped tables rather than a list written out again, for
+/// [`shipped_pattern`]'s reason.
+fn shipped_holds(kind: Kind, name: &str) -> bool {
+    match kind {
+        Kind::Stamps => umber_core::tip::builtin(name).is_some(),
+        Kind::Papers => umber_core::tip::pattern(name).is_some(),
+    }
 }
 
 /// Take a picture out of the library, asking once first.
@@ -954,18 +1334,25 @@ mod tests {
             )
             .expect("add");
 
-        for (name, kind) in [
-            ("1-stamps", Some(Kind::Stamps)),
-            ("2-papers", Some(Kind::Papers)),
+        for (name, kind, renaming) in [
+            ("1-stamps", Some(Kind::Stamps), None),
+            ("2-papers", Some(Kind::Papers), None),
             // The other end of the same feature: the Texture section, whose
             // paper control became a dropdown when the closed set of three
             // stopped being the whole list.
-            ("3-texture-section", None),
+            ("3-texture-section", None, None),
             // And the Brushes header, which now carries four marks in a 264 px
             // panel. `CLAUDE.md` records the layers panel's version of exactly
             // this: controls that fit in the abstract and were drawn over each
             // other at the panel's real width.
-            ("4-brushes-header", None),
+            ("4-brushes-header", None, None),
+            // A row with its field open. It is a *fifth* shot rather than a
+            // variation of the second because the two have to be looked at
+            // side by side: the field and its two buttons stand exactly where
+            // the name, the detail line and three buttons stood, and a row
+            // that changed height when it was renamed would shunt the whole
+            // list under the pointer that opened it.
+            ("5-renaming", Some(Kind::Papers), Some("linen")),
         ] {
             let panel_shot = name == "4-brushes-header";
             let mut ed = Editor::default();
@@ -977,6 +1364,13 @@ mod tests {
 
             let seed = State {
                 open: kind,
+                renaming: renaming.map(|name: &str| Renaming {
+                    name: name.to_owned(),
+                    text: name.to_owned(),
+                    // Not asked for: the shot re-seeds every frame, so a field
+                    // that requested focus each time would never settle.
+                    focus: false,
+                }),
                 ..State::default()
             };
             let palette = Theme::with_accent(ed.ui.theme, ed.ui.accent);
@@ -1011,7 +1405,7 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         let _ = std::fs::remove_dir_all(&scratch);
-        println!("wrote 4 shots to {}", dir.display());
+        println!("wrote 5 shots to {}", dir.display());
     }
 
     /// The list is the merged one and the user's own comes first, which is the
@@ -1108,6 +1502,195 @@ mod tests {
             &ed.paper_tile().expect("theirs"),
             ed.papers.get("tooth").expect("held")
         ));
+    }
+
+    /// A scratch library directory, removed on drop, so a test never touches
+    /// the contributor's own collection.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "umber-stamplib-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn library(&self) -> umber_core::preset::UserLibrary {
+            umber_core::preset::UserLibrary::load_from(&self.0).expect("a scratch library")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The brush the artist is *holding* names its paper by name, and the model
+    /// cannot see it — `UserLibrary` knows only what has been saved.
+    ///
+    /// A rename that left the hand behind is not merely stale on a paper: this
+    /// tile has taken a shipped name, so the moment theirs is called something
+    /// else the old name resolves to **Umber's** tile instead, and the mark
+    /// changes under the brush with nothing on screen to say why. Comparing the
+    /// `Arc` rather than the name is what makes the assertion about the picture
+    /// that will be painted with rather than about the bookkeeping.
+    #[test]
+    fn renaming_a_paper_carries_the_brush_in_hand_off_a_shipped_name() {
+        let scratch = Scratch::new("paper");
+        let mut library = scratch.library();
+        let named = library
+            .add_paper("tooth", (*split_tile(8)).clone())
+            .expect("add");
+        assert_eq!(named, "tooth", "the shadowing case is the one being tested");
+
+        let ctx = egui::Context::default();
+        let mut ed = Editor::default();
+        brushlib::seed_library(&ctx, &mut ed, library);
+        let mut state = State::default();
+
+        choose(&mut ed, &mut state, Kind::Papers, "tooth".to_owned());
+        let before = ed.paper_tile().expect("the brush is painting through it");
+        assert!(Arc::ptr_eq(&before, ed.papers.get("tooth").expect("held")));
+
+        rename(
+            &ctx,
+            &mut ed,
+            &mut state,
+            Kind::Papers,
+            "tooth".to_owned(),
+            "Laid linen".to_owned(),
+        );
+
+        assert_eq!(ed.paper_name.as_deref(), Some("laid-linen"));
+        let after = ed.paper_tile().expect("still painting through something");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the brush in hand quietly changed which picture it paints through"
+        );
+    }
+
+    /// The stamp's half of the same rule, plus the one thing that must *not*
+    /// move: `CanvasRenderer::set_tip` skips the upload when the mask is the
+    /// same `Arc`, so a rename handing it a different pointer for the same
+    /// pixels would put back the cost that check exists to avoid.
+    #[test]
+    fn renaming_a_stamp_moves_the_name_in_hand_and_not_the_mask() {
+        let scratch = Scratch::new("stamp");
+        let mut library = scratch.library();
+        library
+            .add_tip("scan_003", TipMask::new(2, 2, vec![5; 4]).expect("mask"))
+            .expect("add");
+
+        let ctx = egui::Context::default();
+        let mut ed = Editor::default();
+        brushlib::seed_library(&ctx, &mut ed, library);
+        let mut state = State::default();
+
+        choose(&mut ed, &mut state, Kind::Stamps, "scan-003".to_owned());
+        let before = ed.tip.clone().expect("in hand");
+
+        rename(
+            &ctx,
+            &mut ed,
+            &mut state,
+            Kind::Stamps,
+            "scan-003".to_owned(),
+            "Rough charcoal".to_owned(),
+        );
+
+        assert_eq!(ed.tip_name.as_deref(), Some("rough-charcoal"));
+        assert!(Arc::ptr_eq(
+            &before,
+            ed.tip.as_ref().expect("still in hand")
+        ));
+        assert!(Arc::ptr_eq(
+            &before,
+            ed.tips.get("rough-charcoal").expect("and in the library")
+        ));
+    }
+
+    /// How many brushes paint with a picture used to be knowable only by
+    /// pressing Remove and being refused. The figure is over the **merged**
+    /// list, which is the only reading that can be right about a shipped row —
+    /// `tip_users` sees the user's library alone and would put "no brush uses
+    /// it" beside a stamp four shipped brushes stamp with.
+    #[test]
+    fn a_row_says_how_many_brushes_paint_with_the_picture() {
+        use umber_core::preset::BrushPreset;
+
+        // Taken from the shipped table rather than written down here: the table
+        // is generated, and a stamp named in a test is one that silently stops
+        // being tested the day the library is retrimmed.
+        let shipped = umber_core::tip::builtin_tips()
+            .keys()
+            .next()
+            .expect("the shipped table is not empty")
+            .to_string();
+
+        let mut ed = Editor::default();
+        ed.tips.insert(
+            "nib".to_owned(),
+            Arc::new(TipMask::new(2, 2, vec![1; 4]).expect("mask")),
+        );
+        let naming = |name: &str, tip: &str| BrushPreset {
+            tip: Some(tip.to_owned()),
+            ..BrushPreset::unsaved(name, Default::default())
+        };
+        ed.presets = vec![
+            naming("Liner", "nib"),
+            naming("Sketcher", "nib"),
+            naming("Blender", &shipped),
+            BrushPreset::unsaved("Round", Default::default()),
+        ];
+
+        let rows = entries(&ed, &State::default(), Kind::Stamps);
+        let row = |name: &str| rows.iter().find(|r| r.name == name).expect("listed");
+        assert_eq!(row("nib").painting_with, Some(2));
+        assert!(detail(row("nib"), None).contains("used by 2 brushes"));
+        // The shipped row is the one `tip_users` could never answer.
+        assert_eq!(row(&shipped).painting_with, Some(1));
+        assert!(detail(row(&shipped), None).contains("used by 1 brush"));
+
+        // A picture nothing names says so rather than saying nothing, which is
+        // what makes the figure a reading rather than a badge.
+        ed.tips.insert(
+            "spare".to_owned(),
+            Arc::new(TipMask::new(2, 2, vec![2; 4]).expect("mask")),
+        );
+        let rows = entries(&ed, &State::default(), Kind::Stamps);
+        let spare = rows.iter().find(|r| r.name == "spare").expect("listed");
+        assert!(detail(spare, None).contains("no brush uses it"));
+
+        // The brush in hand counts too, or the row says nothing uses a picture
+        // whose Remove is refused for exactly that reason.
+        ed.tip_name = Some("spare".to_owned());
+        let rows = entries(&ed, &State::default(), Kind::Stamps);
+        let spare = rows.iter().find(|r| r.name == "spare").expect("listed");
+        assert!(spare.in_hand);
+        assert!(detail(spare, None).contains("used by the brush in your hand"));
+        ed.tip_name = None;
+
+        // And a shipped picture one of the user's has taken the name of gives
+        // no figure at all: nothing can resolve to it, so any number beside it
+        // would be the *other* row's.
+        ed.tips.insert(
+            shipped.clone(),
+            Arc::new(TipMask::new(2, 2, vec![3; 4]).expect("mask")),
+        );
+        let rows = entries(&ed, &State::default(), Kind::Stamps);
+        let hidden = rows
+            .iter()
+            .find(|r| r.source == Source::Hidden)
+            .expect("listed");
+        assert_eq!(hidden.painting_with, None);
+        let line = detail(hidden, None);
+        assert!(line.contains("hidden"));
+        assert!(!line.contains("brush"), "{line}");
     }
 
     /// The search reaches both halves of the merged list, and folds case and
