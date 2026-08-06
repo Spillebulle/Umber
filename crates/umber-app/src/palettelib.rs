@@ -367,7 +367,21 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         return;
     }
 
-    match swatch_grid(ui, p, ed, &state) {
+    let act = swatch_grid(ui, p, ed, &state);
+
+    // **The field is settled before the grid's click lands, and that ordering
+    // is the whole of it.** A field losing focus and a mark being pressed are
+    // one frame's worth of *different* events — clicking any mark on any swatch
+    // while a name is being typed fires both — and `library_list` records what
+    // happens when one slot has to carry both: the typed name is thrown away
+    // with nothing to show for it. So the name is saved first and the mark
+    // still does what it was pressed for, which is that rule applied one frame
+    // earlier: `naming_field` has already cleared `naming` by the time the arms
+    // below reach for it, so `Act::Name` opens on the next colour, `Act::Remove`
+    // takes one away, and neither costs the name that was in the field.
+    naming_field(ui, p, ed, &mut state);
+
+    match act {
         Some(Act::Take(index)) => {
             if let Some(swatch) = state.current().and_then(|s| s.swatches.get(index)) {
                 let colour = swatch.colour();
@@ -375,10 +389,13 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             }
         }
         Some(Act::Remove(index)) => {
-            // Every position after this one has just moved, so an open field is
-            // pointing at a colour that is no longer the one it was opened on.
-            // Closed rather than re-aimed: the artist asked to remove a colour,
-            // not to start naming its neighbour.
+            // Every position after this one is about to move, so an open field
+            // would point at a colour that is no longer the one it was opened
+            // on. Closed rather than re-aimed: the artist asked to remove a
+            // colour, not to start naming its neighbour. In practice the click
+            // that got here has already taken the keyboard off the field, so
+            // the name is saved above and this clears an empty slot — which is
+            // exactly why it is here, as the case that is left when it has not.
             state.naming = None;
             edit_current(&mut state, ed, "Could not save the palette", |palette| {
                 palette.remove(index);
@@ -397,8 +414,6 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         }
         None => {}
     }
-
-    naming_field(ui, p, ed, &mut state);
 
     store(ui.ctx(), state);
 }
