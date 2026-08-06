@@ -91,7 +91,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // end. See `update::installer` and `update::payload`. Read before the crash
     // reporter only because the two are mutually exclusive and one of them has
     // to be first; neither parser recognises the other's flag.
-    if let Some(job) = update::installer::parse(std::env::args()) {
+    // Setup arrives with **no arguments at all**, because it is double-clicked:
+    // `--install` only ever comes from something spawning this binary
+    // deliberately, and nothing does. So the package on the end of the file is
+    // what tells setup from Umber, and asking the command line alone left the
+    // installer unreachable. Sixteen bytes off our own executable, once, before
+    // any window exists; `umber.exe` carries none and pays a seek to find out.
+    // Which signal wins is `installer::job`'s, not decided here.
+    let carries_payload =
+        std::env::current_exe().is_ok_and(|exe| update::payload::carried_by(&exe));
+    if let Some(job) = update::installer::job(std::env::args(), carries_payload) {
         return update::installwin::show(job);
     }
 

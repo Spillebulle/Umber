@@ -87,6 +87,55 @@ pub fn read(bytes: &[u8]) -> Option<&[u8]> {
     Some(&bytes[start..end])
 }
 
+/// Whether the file at `path` carries a package, read from its last sixteen
+/// bytes alone.
+///
+/// **This is what makes a binary the installer, and an argument is not.** A
+/// setup executable is double-clicked, so it is launched with no command line
+/// at all — `--install` only ever arrives when something spawns it deliberately,
+/// which nothing does. Deciding on the payload instead means the file that
+/// carries a package installs it and the file that does not runs as Umber,
+/// which is the only distinction there actually is between them.
+///
+/// Cheap on purpose, because it runs on **every** ordinary start: a seek and a
+/// sixteen-byte read, never the whole executable. [`read`] does the real
+/// validation once the window is up and can say so; the worst this can do is
+/// send a corrupt setup file to a window that reports the corruption, which is
+/// better than the silence it replaces.
+///
+/// `false` for anything it cannot read. A file that will not open is not an
+/// installer, and refusing to start Umber over it would be the wrong way round.
+pub fn carried_by(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if len < FOOTER as u64 {
+        return false;
+    }
+    if file.seek(SeekFrom::End(-(FOOTER as i64))).is_err() {
+        return false;
+    }
+    let mut footer = [0u8; FOOTER];
+    if file.read_exact(&mut footer).is_err() {
+        return false;
+    }
+    if &footer[..MAGIC.len()] != MAGIC {
+        return false;
+    }
+    let Ok(claimed) = footer[MAGIC.len()..].try_into().map(u64::from_le_bytes) else {
+        return false;
+    };
+    // The same three refusals [`read`] makes, so the two cannot disagree about
+    // what counts as a payload: a zero or absurd length, and one that would
+    // leave no executable in front of the package.
+    claimed != 0 && claimed <= MAX_PACKAGE && claimed + (FOOTER as u64) < len
+}
+
 /// Build the bytes of a setup executable.
 ///
 /// The one place the format is written, used by `examples/make-setup.rs` and
@@ -104,6 +153,61 @@ pub fn append(executable: &[u8], package: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch file of this test's own. Keyed by process id as well as by
+    /// name: several worktrees run `cargo test` at once here, and a fixed path
+    /// is the same file in every checkout.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("umber-payload-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+
+    /// **The signal that makes a binary the installer.**
+    ///
+    /// Setup is double-clicked, so it is launched with no command line at all
+    /// and `installer::parse` answers `None` for it. For a while that was the
+    /// whole of the dispatch, so `umber-setup.exe` started as the application
+    /// and the installer was unreachable — the thing this pins is that the
+    /// payload, and not an argument, is what decides.
+    #[test]
+    fn a_file_carrying_a_package_is_recognised_by_its_last_bytes_alone() {
+        let exe = b"MZ this is a program".to_vec();
+        let package: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+
+        let setup = scratch("setup.exe");
+        std::fs::write(&setup, append(&exe, &package)).expect("write the setup file");
+        assert!(carried_by(&setup), "a setup binary is not recognised");
+
+        // And the ordinary case, which is every launch of Umber itself.
+        let plain = scratch("umber.exe");
+        std::fs::write(&plain, &exe).expect("write the plain file");
+        assert!(!carried_by(&plain), "a plain executable looks like setup");
+
+        // The two answers agree with `read`'s, which is what stops the cheap
+        // probe and the real unpack disagreeing about what a payload is.
+        assert!(read(&append(&exe, &package)).is_some());
+        assert!(read(&exe).is_none());
+
+        // A file that is only a package and a footer has no executable to run,
+        // and both refuse it. Same three refusals, stated once each.
+        let headless = append(b"", &package);
+        let headless_path = scratch("headless.exe");
+        std::fs::write(&headless_path, &headless).expect("write the headless file");
+        assert!(!carried_by(&headless_path));
+        assert!(read(&headless).is_none());
+
+        // A length nothing could satisfy, which is the hostile-footer case.
+        let mut liar = append(&exe, &package);
+        let n = liar.len();
+        liar[n - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let liar_path = scratch("liar.exe");
+        std::fs::write(&liar_path, &liar).expect("write the liar file");
+        assert!(!carried_by(&liar_path));
+        assert!(read(&liar).is_none());
+
+        let _ = std::fs::remove_dir_all(setup.parent().expect("the scratch directory"));
+    }
 
     #[test]
     fn a_package_comes_back_exactly_as_it_went_in() {

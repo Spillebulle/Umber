@@ -86,6 +86,40 @@ pub struct Job {
     pub target: Option<PathBuf>,
 }
 
+impl Job {
+    /// The first-run installer's job.
+    ///
+    /// No package path: setup carries its own on the end of this executable and
+    /// `installwin` lifts it out. Separate from [`parse`] so that the two ways
+    /// in — the flag, and a payload found with no argument at all — build the
+    /// identical job rather than two that have to be kept in step.
+    pub fn setup() -> Self {
+        Self {
+            package: PathBuf::new(),
+            parent: None,
+            version: String::new(),
+            setup: true,
+            target: None,
+        }
+    }
+}
+
+/// What this launch is, from the command line **and** whether this executable
+/// carries a package.
+///
+/// A pure function of two readings, for the reason [`super::install::detect`]
+/// is one of a `Probe`: the interesting rule is which signal wins, and that is
+/// worth testing without a file on disk or a command line to fake. `lib.rs`
+/// supplies the readings and does no deciding.
+///
+/// An argument wins where there is one, because it was asked for deliberately —
+/// an update spawns the helper with `--install-update <package>` and must not
+/// be diverted by the payload a setup binary happens to be carrying. With no
+/// argument, a payload means setup. With neither, this is Umber.
+pub fn job<I: IntoIterator<Item = String>>(args: I, carries_payload: bool) -> Option<Job> {
+    parse(args).or_else(|| carries_payload.then(Job::setup))
+}
+
 /// Read the command line.
 ///
 /// A pure function of the arguments, like [`crate::crash::parse_args`] and
@@ -96,16 +130,18 @@ pub struct Job {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Option<Job> {
     let mut args = args.into_iter().skip(1);
     while let Some(arg) = args.next() {
-        // The first-run installer. No arguments: the package is on the end of
-        // this file and the window asks before it does anything.
+        // The first-run installer, asked for explicitly. The package is on the
+        // end of this file, so the path is empty and the window reads it.
+        //
+        // **This is not how setup normally starts**, and the comment here used
+        // to imply it was. A setup executable is double-clicked, which passes
+        // no command line at all, so this arm never fires for the case it was
+        // written for — Umber simply started as the application and the
+        // installer was unreachable. `payload::carried_by` is the real signal
+        // and `lib.rs` consults it when no argument decides. The flag stays as
+        // a way to ask deliberately, and for the tests below.
         if arg == SETUP_FLAG {
-            return Some(Job {
-                package: PathBuf::new(),
-                parent: None,
-                version: String::new(),
-                setup: true,
-                target: None,
-            });
+            return Some(Job::setup());
         }
         if arg != FLAG {
             continue;
@@ -335,6 +371,52 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// **A setup binary is double-clicked, so it has no command line.**
+    ///
+    /// This is the whole of the bug it pins: dispatch asked the arguments and
+    /// nothing else, `--install` is never passed by anybody, and so
+    /// `umber-setup.exe` started as the application and its installer could not
+    /// be reached at all. Reported from a real machine.
+    ///
+    /// The other three rows are the reason this is a function of two readings
+    /// rather than a second check bolted after the first: an argument has to
+    /// win, or an update's helper would be diverted into setup by the payload
+    /// the setup binary it was copied from is carrying.
+    #[test]
+    fn a_payload_makes_setup_of_a_launch_with_no_arguments() {
+        // The reported bug: no argument, a package on the end.
+        let launch = job(args(&["umber-setup.exe"]), true).expect("setup was not recognised");
+        assert!(launch.setup, "a payload with no argument is not setup");
+        assert_eq!(
+            launch.package,
+            PathBuf::new(),
+            "setup carries its own package"
+        );
+
+        // Ordinary Umber: no argument, no payload.
+        assert!(job(args(&["umber.exe"]), false).is_none());
+
+        // An argument wins over a payload, both ways round.
+        let helper = job(args(&["umber.exe", FLAG, "C:/tmp/umber.msi", "4242"]), true)
+            .expect("the helper's own flag was ignored");
+        assert!(!helper.setup, "a payload diverted an update into setup");
+        assert_eq!(helper.package, PathBuf::from("C:/tmp/umber.msi"));
+        assert_eq!(helper.parent, Some(4242));
+
+        // And the flag still asks for setup deliberately, with no payload seen.
+        assert!(
+            job(args(&["umber.exe", SETUP_FLAG]), false)
+                .expect("the flag stopped working")
+                .setup
+        );
+
+        // Both routes build the identical job, which is why `Job::setup` exists.
+        assert_eq!(
+            job(args(&["umber-setup.exe"]), true).map(|j| j.setup),
+            job(args(&["umber.exe", SETUP_FLAG]), false).map(|j| j.setup),
+        );
     }
 
     /// An ordinary launch is not the installer, and neither is one carrying
