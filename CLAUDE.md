@@ -966,6 +966,36 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   clipping: a build ignoring either shows a picture that is *wrong* — what the
   mask hid comes back, and the clipped layer paints everywhere. Locks and links
   ride along, because ignoring them changes no pixel.
+- **A derived `Debug` or serde spelling that reaches a file is a format, not a
+  name.** `docformat::history::kind_id` and `blend_id` are both
+  `format!("{:?}")`, and `BlendMode` additionally derives `Serialize` because a
+  brush carries one and a brush is what `brushes.ron` holds. The reason for the
+  derive is good — a second hand-written table is a thing that can drift. The
+  cost is that **renaming a variant, a refactor with no intent behind it,
+  changes what is written to disk**, in three places with three blast radii.
+  For `EditKind`, a saved history is dropped whole. For `BlendMode` in an
+  `.ora`, `blend_from_id` answers `None` and the reader falls back to
+  `composite-op`, exact for most modes and approximate for Add, so every Add
+  layer in every saved document quietly downgrades. **And for `BlendMode` in a
+  user's `brushes.ron` it is not a downgrade at all**: `parse` reads with `?`,
+  so an unknown variant is a hard error and the painter's whole collection
+  fails to load. The serialised *preset* is the one nobody thinks about and it
+  is the one that costs most.
+  **Both id sets are therefore pinned as literal strings**, which catches a
+  rename. What that cannot see is a `#[serde(rename = "…")]`, which changes
+  what `brushes.ron` carries while leaving the `Debug` spelling untouched — one
+  guard covering two mechanisms, and covering the second only because the
+  derive and the `Debug` spelling agree today.
+  **The coverage observation is what survives the fix, and it generalises.**
+  `builtin-brushes.ron` is `include_str!`'d and parsed by tests, and carries
+  252 `blend:` fields — every one of them `Normal`. Nothing anywhere serialises
+  a non-default mode. So rename `Normal` and the build goes red; rename
+  `Multiply`, `Screen`, `Overlay` or `Add` and the whole suite passes green
+  while every painter's library breaks. **A fixture compiled into the binary is
+  not a test of the format, it is a test of the fixture**, and a field
+  appearing two hundred and fifty-two times carrying one value is one data
+  point wearing the costume of coverage. Pin the *set*, as literal text, rather
+  than trusting the values a fixture happens to use.
 - **Folders did not move it either, and are baseline ORA rather than an
   extension.** A folder is a nested `<stack>` — the nesting GIMP, Krita and
   MyPaint all write and the one `docimport::openraster` already parsed. A reader
