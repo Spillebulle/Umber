@@ -552,11 +552,17 @@ pub fn suspended() -> bool {
 
 /// A key that answers a gesture rather than running a command.
 ///
-/// Three keys are deliberately outside the binding table. Space is a held
-/// modifier with press *and* release meaning, which a press-resolved table
-/// cannot express; Escape and Enter are answers to "there is a gesture in
-/// progress", and a rebindable Escape that sometimes meant nothing would be a
-/// row in the settings list that lies.
+/// Three keys are decided before the binding table is consulted. Space and
+/// Escape are reserved out of [`BINDABLE`] as well — a held modifier has press
+/// *and* release meaning, which a press-resolved table cannot express, and a
+/// rebindable Escape that sometimes meant nothing would be a row in the
+/// settings list that lies. **Enter is the odd one and is genuinely bindable.**
+/// Nothing binds it by default, and while a draft or a float is up it is
+/// claimed here and a user's own binding does not fire; with neither standing,
+/// [`Direct::Finish`] finds nothing to finish and `handle_keys` falls through
+/// to [`resolve`], so the binding works. That is the behaviour this replaced
+/// and it is left alone deliberately: the alternative is reserving Enter, which
+/// would silently drop a chord somebody had already set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direct {
     /// Space: the held pan override.
@@ -590,6 +596,17 @@ pub enum Direct {
 /// it over the canvas, click into a field, let go, and the pan override stays
 /// armed with no key held and nothing that will clear it. Nothing acts on the
 /// release of Escape or Enter, so neither is reported for one.
+///
+/// **The press side has its own cost and it is accepted rather than
+/// overlooked.** egui keeps a field's focus after the pointer leaves it, so
+/// `ui::draw`'s `set_typing(ctx.text_edit_focused())` is still true: type in the
+/// brush search box, move to the canvas, then hold Space and drag, and you
+/// paint where you used to pan. It self-heals, because the press on the canvas
+/// takes the focus off the field and the second attempt pans. That is a far
+/// better trade than a space typed into a field arming the override — but it is
+/// a real behaviour change and the honest fix is for the suspension to mean
+/// "the interface has the keyboard" rather than "a `TextEdit` is focused",
+/// which is a change to what `set_typing` is told and not to this rule.
 pub fn direct(key: KeyCode, pressed: bool, suspended: bool) -> Option<Direct> {
     let direct = match key {
         KeyCode::Space => Direct::PanModifier,

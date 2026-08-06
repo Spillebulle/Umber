@@ -900,6 +900,13 @@ impl UmberApp {
         }
         // A stroke still in flight belongs to the layer this is about to lift
         // out of, and would otherwise be baked in underneath the hole.
+        //
+        // `pointer_pressed` has already finished it on the one route that
+        // reaches here today — `gesture::supersedes_stroke` answers true for
+        // `Press::Transform` — so this is a no-op on that path. It stays
+        // because the rule it states is `begin_float`'s and not the pointer's:
+        // no float may be lifted with a stroke in flight, whatever route got
+        // here. Delete the other one, not this one.
         self.finish_stroke();
         let rect = self.editor.transform_region();
         if self.begin_float(rect, None) {
@@ -1781,13 +1788,15 @@ impl UmberApp {
     }
 
     fn handle_keys(&mut self, key: KeyCode, pressed: bool) -> bool {
-        // Space, Escape and Enter are outside the binding table and are decided
-        // before it is consulted — but by the same suspension `resolve` answers
-        // to, which is the whole of `shortcuts::direct`. Read that before
-        // changing anything here: all three used to be claimed unconditionally,
-        // so Enter in the Text module's caption field inserted a newline *and*
-        // committed the floating text, and Escape in a typable rail threw away
-        // the float behind it.
+        // Space, Escape and Enter are decided before the binding table is
+        // consulted — but by the same suspension `resolve` answers to, which is
+        // the whole of `shortcuts::direct`. Read that before changing anything
+        // here: all three used to be claimed unconditionally, so Enter in the
+        // Text module's caption field inserted a newline *and* committed the
+        // floating text, and Escape in a typable rail threw away the float
+        // behind it. Note "before the table", not "outside" it — Enter is
+        // genuinely bindable and only shadowed while a draft or a float
+        // stands; see `Direct`.
         match shortcuts::direct(key, pressed, shortcuts::suspended()) {
             // A held modifier with press *and* release meaning, which a
             // press-resolved table cannot express.
