@@ -3323,7 +3323,26 @@ parts that mattered are not the obvious ones.
   merged.** Seven concurrent `CARGO_TARGET_DIR`s came to about 42 GB and the
   machine ran out; one agent had to be told to use another drive, and another's
   critic could not run its gates at all. The symptom is `os error 112` or a
-  linker complaining about disk space, and it reads like a broken change.
+  linker complaining about disk space, and it reads like a broken change. Ten
+  target directories came to about 83 GB in a later session; reclaim them at the
+  end, and note that the worktrees themselves have to be **unlocked** before
+  `git worktree remove --force` will take them.
+- **`git checkout -- <path>` does not work inside `.claude/worktrees/`.** The
+  `.gitignore` rule for that directory matches the path as evaluated from within
+  a worktree that lives there, so git refuses to restore a tracked file and says
+  so in terms that sound like the file is untracked. It bit an agent whose
+  `.github/workflows/*.yml` had gone missing from the working directory while
+  still present in `HEAD`, which fails
+  `the_release_workflow_stages_every_asset_the_installer_names` — a test failure
+  that looks like a real regression and is a missing file. `git cat-file -p
+  HEAD:<path> > <path>` is the way back.
+- **The sync client is a third party to every one of these worktrees.** On a
+  machine where the checkout is inside OneDrive, files vanish and reappear
+  underneath running agents: eleven untracked scratch copies were swept
+  mid-session with nobody running anything, and `.git/worktrees/` held a lock
+  that refused every removal until the target directories were deleted first. If
+  a file reads back differently or `git status` shows something nobody did,
+  suspect the sync before suspecting another agent, and tell the agents so.
 - **Concurrency makes the wall-clock assertions flake, and `CI=1` is the right
   answer *while merging only*.** `a_capture_of_a_large_document_never_costs_a_
   frame` failed for four agents under load and passes alone. Gating a merge on
