@@ -19,8 +19,10 @@ use crate::editor::{Editor, Tool};
 use crate::icons::{self, Icon};
 use crate::layerdrag;
 use crate::palettelib;
+use crate::settings;
 use crate::shortcuts::{self, Action};
 use crate::theme::{Palette, metrics, text};
+use crate::themelib;
 use crate::ui::{UiActions, icon_button};
 use crate::widgets;
 use egui::{
@@ -29,7 +31,7 @@ use egui::{
 };
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::time::Duration;
-use umber_core::{BlendMode, Edit, EditKind, EditTarget, LayerStack, Timestamp};
+use umber_core::{BlendMode, Color, Edit, EditKind, EditTarget, LayerStack, Timestamp};
 
 /// Grab area of a splitter. Wider than the 1 px rule it draws, because a 1 px
 /// target is not something anyone can hit.
@@ -921,17 +923,185 @@ fn colour_body(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 
     ui.add_space(9.0);
     ui.horizontal(|ui| {
-        let [r, g, b, _] = ed.color.to_srgb_u8();
         let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
         ui.painter()
-            .rect_filled(chip, metrics::RADIUS, egui::Color32::from_rgb(r, g, b));
-        ui.label(
-            egui::RichText::new(format!("#{r:02X}{g:02X}{b:02X}"))
-                .monospace()
-                .size(text::TINY)
-                .color(p.text),
-        );
+            .rect_filled(chip, metrics::RADIUS, paint_colour(ed));
+        hex_field(ui, p, ed);
     });
+}
+
+/// The paint colour as egui states it. One place, so the chip and the readout
+/// beside it cannot come to disagree about what is in hand.
+fn paint_colour(ed: &Editor) -> egui::Color32 {
+    let [r, g, b, _] = ed.color.to_srgb_u8();
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// The Colour panel's hex readout, which is a field: the one place a painter
+/// chooses a colour had no way to enter one by number, so a brand colour, a
+/// value read off a reference or one copied out of another application could
+/// only be reached by eye on the wheel.
+///
+/// Every rule here is the theme editor's per-token row, which asks the same
+/// question of the same parser — see `settings::token_row`, whose comments carry
+/// the argument for each. What is different is where the buffer lives and how it
+/// is abandoned, both noted below.
+fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+    let mut state = ui
+        .ctx()
+        .data(|d| d.get_temp::<HexEdit>(hex_field_id()))
+        .unwrap_or_default();
+
+    // Refilled from the colour whenever the field is a *readout* rather than
+    // something somebody is part way through typing. That is what keeps it
+    // following the wheel, the eyedropper, a palette swatch and `X`, exactly as
+    // the label it replaced did; rebuilding it unconditionally every frame would
+    // overwrite `#8` with the full hex on the next one, so nothing could be typed
+    // at all.
+    //
+    // "Part way through" is two passes wider than "has the caret", and that is
+    // not slack: egui reports a blur on the pass after the caret left *or the one
+    // after that*, since a widget drawn before the one that took the focus cannot
+    // learn of it until its next pass — and wiping the buffer on the blur pass
+    // means the short hex somebody typed is gone before it can be taken. The
+    // window is closed explicitly the moment the blur is dealt with, below.
+    //
+    // It is also this rule that answers Escape, which egui's `TextEdit` does not
+    // handle. The field lives in a dock panel that can be closed, undocked or
+    // dragged short, and egui surrenders focus for a widget it did not see this
+    // pass — its own dead-man's switch. Any of those is far more than two passes
+    // ago by the time the panel is drawn again, so half a hex left in the field
+    // is abandoned rather than applied, and the readout comes back holding the
+    // colour that is actually there. No `forget_themes_edit` of its own to
+    // remember to call, because the rule is structural.
+    //
+    // The field's id is stated rather than left to egui's running count of the
+    // widgets drawn before it, and both halves of that were needed. The question
+    // above has to be answered *before* the widget is drawn, because it decides
+    // what the buffer holds — an automatic id is not known until afterwards. And
+    // the automatic one was not stable: on the pass the field held the caret it
+    // came back different, which egui's end-of-pass sweep read as a widget that
+    // had gone and surrendered the focus for, so a single click could not keep
+    // the caret in the field for two frames running.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let typing = ui.ctx().memory(|m| m.has_focus(hex_edit_id()));
+    let settling = state.held.is_some_and(|at| pass <= at + 2);
+    if !typing && !settling {
+        state.text = current_hex(ed);
+    }
+
+    // No `shortcuts::set_capturing` here, and that is not an omission: `ui::draw`
+    // calls `shortcuts::set_typing(ctx.text_edit_focused())` once for the whole
+    // interface, which covers every real `TextEdit`. `set_capturing` belongs to
+    // the chord recorder in Settings alone.
+    let field = settings::inset_field(
+        ui,
+        p,
+        hex_edit_id(),
+        &mut state.text,
+        settings::HEX_FIELD,
+        FontId::monospace(text::TINY),
+    )
+    .on_hover_text("Type a colour as #RRGGBB");
+    if typing {
+        state.held = Some(pass);
+    }
+
+    // Applied live once six digits are in, and on losing focus for any form the
+    // parser takes. Applying on every keystroke would walk the paint colour
+    // through `#CC0088` on the way to `#C08A4E`, because three digits are a legal
+    // short hex; applying only on blur would mean the colour cannot be judged
+    // against the picker above it while it is being typed.
+    let body = state.text.trim().trim_start_matches('#');
+    if field.changed() && body.len() == 6 {
+        apply_hex(ed, &state.text);
+    }
+    if field.lost_focus() {
+        apply_hex(ed, &state.text);
+        // Whichever way that went, the caret has left and the field is a readout
+        // again: normalised where it read, so `#fff` becomes `#FFFFFF` — which is
+        // also what says it was taken — and back to the colour that is actually
+        // there where it did not, because a readout saying `rebeccapurple` beside
+        // a chip that is `#C08A4E` is the control that lies. One line for both,
+        // rather than two that could disagree about what the field ends up
+        // holding.
+        state.text = current_hex(ed);
+        state.held = None;
+    }
+
+    ui.ctx().data_mut(|d| d.insert_temp(hex_field_id(), state));
+}
+
+/// `#RRGGBB` for the colour in hand.
+///
+/// `themelib::hex` rather than a `format!` of its own: it is the formatter the
+/// theme editor's fields already use, and the parser this field reads through is
+/// its neighbour, so the two directions cannot come to disagree about what a
+/// colour looks like written down.
+fn current_hex(ed: &Editor) -> String {
+    themelib::hex(paint_colour(ed))
+}
+
+/// The Colour panel's hex field, held across frames.
+///
+/// In egui's temporary store rather than on `Editor`, for the reason the theme
+/// editor's buffers are: it is what somebody is part way through typing, not a
+/// property of the document or of the workspace, and nothing outside this
+/// function may read it.
+#[derive(Clone, Default)]
+struct HexEdit {
+    /// The buffer the `TextEdit` edits in place. A `TextEdit`'s text belongs to
+    /// the caller and the panel is rebuilt every frame, so a local would lose a
+    /// character per frame.
+    text: String,
+    /// The last pass on which the field held the caret, and `None` once a blur
+    /// has been dealt with. What it bounds is how long the buffer goes on
+    /// belonging to whoever was typing — see `hex_field`.
+    held: Option<u64>,
+}
+
+/// Where the buffer is kept.
+fn hex_field_id() -> Id {
+    Id::new("colour-hex-field")
+}
+
+/// The `TextEdit`'s own id. Separate from the buffer's, because egui keeps the
+/// caret and the focus against this one and would collide with anything else
+/// stored under the same name.
+fn hex_edit_id() -> Id {
+    Id::new("colour-hex-edit")
+}
+
+/// Take what was typed as the painting colour, if it reads as one.
+///
+/// Through `Editor::set_color` and nothing else. Writing `ed.color` directly
+/// would leave `ed.hsv` behind — and HSV is the picker's state rather than a
+/// derivative of the colour, because hue is undefined for greys — so the wheel
+/// would jump the next time it was touched.
+///
+/// `themelib::parse_hex` rather than a second parser: it is what the theme
+/// editor's fields read through, it takes `#RRGGBB`, `RRGGBB` and `#RGB`, and it
+/// answers nothing rather than guessing at anything else.
+///
+/// The field is deliberately *not* normalised here, unlike `settings::set_token`:
+/// writing `#C08A4E` over the six digits somebody has just typed grows the text
+/// by one character under a caret egui holds by index, which lands the caret
+/// between the last two. The caller normalises when the field is let go, which
+/// is late enough and is the only moment it cannot be felt.
+fn apply_hex(ed: &mut Editor, text: &str) {
+    let Some(colour) = themelib::parse_hex(text) else {
+        // Nothing is applied and nothing is refused: while the field has the
+        // caret it keeps what was typed so it can be corrected. A colour panel
+        // that quietly took black for a misread line would be one that paints
+        // in a colour nobody chose.
+        return;
+    };
+    ed.set_color(Color::from_srgb_u8(
+        colour.r(),
+        colour.g(),
+        colour.b(),
+        u8::MAX,
+    ));
 }
 
 /// The blend picker's width on the layer row it shares with the opacity slider.
@@ -2517,6 +2687,303 @@ pub fn window_menu(ui: &mut Ui, ed: &mut Editor) {
 
 #[cfg(test)]
 mod tests {
+    /// A hex field driven the way somebody drives it: focus it, select what is
+    /// in it, type over the top, let it go.
+    ///
+    /// Headless, because the whole of what is being tested is a rule and rules
+    /// are testable without a window — the same division `dock.rs` keeps against
+    /// this file. Focus is taken through egui's own memory rather than by
+    /// clicking, because where the field lands is a layout question and this is
+    /// not a test about layout; the preview shot below is what looks at that.
+    #[cfg(test)]
+    struct Typist {
+        ctx: egui::Context,
+        palette: crate::theme::Palette,
+        ed: crate::editor::Editor,
+    }
+
+    impl Typist {
+        fn new() -> Self {
+            use crate::theme::{Palette, ThemeKind};
+            let mut typist = Self {
+                ctx: egui::Context::default(),
+                palette: Palette::of(ThemeKind::Graphite),
+                ed: crate::editor::Editor::default(),
+            };
+            // One frame with nothing happening, so the field exists and has
+            // recorded its id. Nothing below can ask about focus until it has.
+            typist.frame(Vec::new());
+            typist
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            use egui::{Rect, pos2, vec2};
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(crate::theme::metrics::PANEL, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let palette = self.palette;
+            let ed = &mut self.ed;
+            let _ = self.ctx.run_ui(input, |ui| {
+                super::hex_field(ui, &palette, ed);
+            });
+        }
+
+        fn state(&self) -> super::HexEdit {
+            self.ctx
+                .data(|d| d.get_temp::<super::HexEdit>(super::hex_field_id()))
+                .expect("the field stores its buffer every frame")
+        }
+
+        fn buffer(&self) -> String {
+            self.state().text
+        }
+
+        /// Select the whole field and type over it, in one frame — which is the
+        /// gesture, and is also the only way to reach `changed()` without
+        /// guessing where the caret is.
+        fn types(&mut self, text: &str) {
+            use egui::text::{CCursor, CCursorRange};
+            let id = super::hex_edit_id();
+            let len = self.buffer().chars().count();
+            self.ctx.memory_mut(|m| m.request_focus(id));
+            let mut state =
+                egui::widgets::text_edit::TextEditState::load(&self.ctx, id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(len))));
+            state.store(&self.ctx, id);
+            self.frame(vec![egui::Event::Text(text.to_owned())]);
+        }
+
+        /// Let the field go, and draw the frame that learns it.
+        fn lets_go(&mut self) {
+            self.ctx
+                .memory_mut(|m| m.surrender_focus(super::hex_edit_id()));
+            self.frame(Vec::new());
+        }
+
+        fn srgb(&self) -> [u8; 3] {
+            let [r, g, b, _] = self.ed.color.to_srgb_u8();
+            [r, g, b]
+        }
+    }
+
+    /// One click has to keep the caret in the field, frame after frame.
+    ///
+    /// It did not, and this is why the field's id is stated rather than left to
+    /// egui's running count of the widgets drawn before it: with an automatic
+    /// id the field came back under a *different* one on the pass it held the
+    /// caret, and egui reads a focused widget that was not drawn this pass as
+    /// one that has gone and surrenders the focus for it. The caret survived a
+    /// single frame, so nothing could be typed at all. Found here rather than in
+    /// a window, which is the whole reason this harness exists.
+    #[test]
+    fn the_field_keeps_the_caret_frame_after_frame() {
+        let mut typist = Typist::new();
+        typist
+            .ctx
+            .memory_mut(|m| m.request_focus(super::hex_edit_id()));
+        for gone in 1..=3 {
+            typist.frame(Vec::new());
+            assert!(
+                typist.ctx.memory(|m| m.has_focus(super::hex_edit_id())),
+                "the caret was dropped after {gone} frame(s) with nothing happening"
+            );
+        }
+    }
+
+    /// A colour typed into the Colour panel reaches the paint colour **and** the
+    /// picker, which is the whole reason it goes through `Editor::set_color`.
+    ///
+    /// Writing `ed.color` directly passes the first half and fails the second:
+    /// HSV is the picker's state rather than a derivative of the colour, so the
+    /// wheel would go on holding whatever it held and jump the next time it was
+    /// touched. The grey is the case that rule exists for — hue is undefined
+    /// there, so it must be *kept* rather than reset to red.
+    #[test]
+    fn a_typed_hex_moves_the_paint_colour_and_the_picker_with_it() {
+        let mut typist = Typist::new();
+        typist.types("#C08A4E");
+        assert_eq!(
+            typist.srgb(),
+            [0xC0, 0x8A, 0x4E],
+            "the colour did not follow"
+        );
+        let [r, g, b, _] = typist.ed.hsv.to_color(1.0).to_srgb_u8();
+        assert_eq!(
+            [r, g, b],
+            [0xC0, 0x8A, 0x4E],
+            "the picker disagrees with the colour it is supposed to be holding"
+        );
+
+        // A grey now, with a hue in hand that the grey cannot state.
+        let hue = typist.ed.hsv.h;
+        typist.types("#808080");
+        assert_eq!(typist.srgb(), [0x80, 0x80, 0x80]);
+        assert!(
+            typist.ed.hsv.s < 1e-4,
+            "the picker kept the saturation of a colour that is gone: {:?}",
+            typist.ed.hsv
+        );
+        assert_eq!(
+            typist.ed.hsv.h, hue,
+            "a grey has no hue to read, so the one in hand must be kept"
+        );
+    }
+
+    /// Six digits land as they are typed; a short hex waits for the field to be
+    /// let go.
+    ///
+    /// Both halves are wanted and neither alone does. Applying every keystroke
+    /// walks the paint colour through `#CC0088` on the way to `#C08A4E`, because
+    /// three digits are a legal short hex; applying only on blur means the colour
+    /// cannot be judged against the picker above it while it is being typed.
+    #[test]
+    fn a_short_hex_waits_for_the_field_to_be_let_go() {
+        let mut typist = Typist::new();
+        let before = typist.srgb();
+        typist.types("#C08");
+        assert_eq!(
+            typist.srgb(),
+            before,
+            "three digits are a legal short hex and must not land mid-typing"
+        );
+        typist.lets_go();
+        assert_eq!(
+            typist.srgb(),
+            [0xCC, 0x00, 0x88],
+            "the short hex was dropped"
+        );
+        assert_eq!(
+            typist.buffer(),
+            "#CC0088",
+            "the readout did not normalise once the field was let go"
+        );
+    }
+
+    /// Something that will not read applies nothing, and the readout goes back
+    /// to the colour that is actually there once the field is let go.
+    ///
+    /// While it has the caret it is what somebody is typing and must be left
+    /// alone; once it does not, it is a readout, and a readout saying
+    /// `rebeccapurple` beside a chip that is not is the control that lies.
+    #[test]
+    fn a_hex_that_will_not_read_changes_nothing_and_the_readout_comes_back() {
+        let mut typist = Typist::new();
+        let before = typist.srgb();
+        for bad in ["rebeccapurple", "#12345", "#GG0000"] {
+            typist.types(bad);
+            assert_eq!(typist.srgb(), before, "{bad} moved the paint colour");
+            assert_eq!(
+                typist.buffer(),
+                bad,
+                "{bad} was taken out from under the caret that is still in it"
+            );
+            typist.lets_go();
+            assert_eq!(typist.srgb(), before, "{bad} moved the colour on the blur");
+            let [r, g, b] = before;
+            assert_eq!(
+                typist.buffer(),
+                format!("#{r:02X}{g:02X}{b:02X}"),
+                "{bad} was left standing beside a chip it disagrees with"
+            );
+        }
+    }
+
+    /// The readout follows a colour chosen anywhere else — the wheel, the
+    /// eyedropper, a palette swatch, `X` — exactly as the label it replaced did,
+    /// and stops following while somebody is typing into it.
+    ///
+    /// The second half is what a field costs: a buffer rebuilt from the colour
+    /// every frame would overwrite `#8` with the full hex on the next one, so
+    /// nothing could be typed at all.
+    #[test]
+    fn the_readout_follows_a_colour_chosen_somewhere_else() {
+        use umber_core::Color;
+
+        let mut typist = Typist::new();
+        typist
+            .ed
+            .set_color(Color::from_srgb_u8(0x2E, 0x7D, 0x32, 0xFF));
+        typist.frame(Vec::new());
+        assert_eq!(typist.buffer(), "#2E7D32", "the readout did not follow");
+
+        // With the caret in it, it is a buffer rather than a readout.
+        typist.types("#C0");
+        typist
+            .ed
+            .set_color(Color::from_srgb_u8(0x11, 0x22, 0x33, 0xFF));
+        typist.frame(Vec::new());
+        assert_eq!(
+            typist.buffer(),
+            "#C0",
+            "a colour chosen elsewhere overwrote what was being typed"
+        );
+
+        typist.lets_go();
+        assert_eq!(
+            typist.buffer(),
+            "#112233",
+            "letting the field go must hand it back to the colour"
+        );
+    }
+
+    /// Clicking into the hex field must not move the picker above it.
+    ///
+    /// A framed field is taller than the label it replaced, which is a one-off
+    /// cost; what would be a bug is the row changing height between focused and
+    /// unfocused, because the whole picker sits above it and would shift under
+    /// the pointer that had just clicked the field. Same class as the
+    /// ticked-layers strip inserting a line, below.
+    #[test]
+    fn clicking_into_the_hex_field_does_not_move_the_colour_panel() {
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Rect, pos2, vec2};
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(metrics::PANEL, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut ed = crate::editor::Editor::default();
+        let mut measured = 0.0;
+        let mut height = |ed: &mut crate::editor::Editor| {
+            // Twice, and the second is the one read: the first pass through a
+            // fresh context builds the font atlas, and text laid out against a
+            // half-built one is not the height it will settle at.
+            for _ in 0..2 {
+                let _ = ctx.run_ui(input.clone(), |ui| {
+                    super::colour_body(ui, &palette, ed);
+                    measured = ui.min_rect().height();
+                });
+            }
+            measured
+        };
+
+        let idle = height(&mut ed);
+        ctx.memory_mut(|m| m.request_focus(super::hex_edit_id()));
+        let busy = height(&mut ed);
+        // Or the two measurements are the same measurement and this test says
+        // nothing at all.
+        assert!(
+            ctx.memory(|m| m.has_focus(super::hex_edit_id())),
+            "the field never took the caret, so nothing here was measured"
+        );
+        assert_eq!(
+            busy, idle,
+            "the Colour body changed height when the hex field took the caret"
+        );
+    }
+
     /// Ticking a layer must not move the layer list.
     ///
     /// The six bulk buttons used to be a line of their own *above* the tick
@@ -2721,6 +3188,100 @@ mod tests {
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
         println!("wrote 3 drop marks to {}", dir.display());
+    }
+
+    /// The Colour module, whose readout is now a field rather than a label.
+    ///
+    /// Written rather than asserted for the reason `layers_panel_preview` is: a
+    /// framed field beside a 26 px chip at [`metrics::PANEL`]'s real width is a
+    /// *layout*, and no assertion about widgets catches a well drawn over the
+    /// swatch or a field too narrow to hold `#RRGGBB`. The panel had never had a
+    /// picture taken of it, which is exactly why this went in with the change.
+    ///
+    /// Three states: the readout as it stands, a grey — the case
+    /// `Editor::set_color`'s hue preservation exists for, and the one where the
+    /// wheel and the number are least likely to agree — and the field with the
+    /// caret in it.
+    ///
+    /// ```sh
+    /// cargo test -p umber-app colour_panel_preview -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes preview PNGs and wants a GPU; run deliberately"]
+    #[cfg(debug_assertions)]
+    fn colour_panel_preview() {
+        use crate::dock::{Layout, PanelKind};
+        use crate::docshot;
+        use crate::editor::Editor;
+        use crate::theme::metrics;
+        use egui::{Pos2, Rect, vec2};
+        use umber_core::Color;
+
+        let Some(mut stage) = docshot::Stage::new() else {
+            eprintln!("no GPU adapter: nothing to draw into. Skipped.");
+            return;
+        };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/colour-panel");
+        std::fs::create_dir_all(&dir).expect("create the preview directory");
+
+        // The third is the field part way through being typed into, so its
+        // buffer is seeded rather than left to follow the colour: three digits
+        // is the state where the readout and the chip beside it deliberately
+        // disagree, and it is what says the control is a field at all.
+        for (name, colour, typed) in [
+            (
+                "1-colour",
+                Color::from_srgb_u8(0xC0, 0x8A, 0x4E, 0xFF),
+                None,
+            ),
+            ("2-grey", Color::from_srgb_u8(0x80, 0x80, 0x80, 0xFF), None),
+            (
+                "3-typing",
+                Color::from_srgb_u8(0xC0, 0x8A, 0x4E, 0xFF),
+                Some("#C08"),
+            ),
+        ] {
+            let mut ed = Editor::default();
+            ed.layout = Layout::default();
+            ed.set_color(colour);
+            let palette = ed.palette();
+            // Taller than the Layers shots: the wheel and its two rails take the
+            // whole of a 300 px panel and the row this test exists for is the
+            // one below them.
+            let field = vec2(metrics::PANEL, 560.0);
+            let rect = Rect::from_min_size(Pos2::ZERO, field);
+            let image = stage.shoot(field, 2.0, &palette, palette.dock, |root| {
+                // Asked for on every pass rather than once, because the caret
+                // has to be in the field on whichever pass is the one that gets
+                // photographed — and with it held, the buffer is left alone,
+                // which is what lets the half-typed text stand.
+                if let Some(half) = typed {
+                    root.ctx()
+                        .memory_mut(|m| m.request_focus(super::hex_edit_id()));
+                    root.ctx().data_mut(|d| {
+                        d.insert_temp(
+                            super::hex_field_id(),
+                            super::HexEdit {
+                                text: half.to_owned(),
+                                held: None,
+                            },
+                        );
+                    });
+                }
+                let mut actions = crate::ui::UiActions::default();
+                super::panel(
+                    root,
+                    &palette,
+                    &mut ed,
+                    &mut actions,
+                    PanelKind::Colour,
+                    rect,
+                );
+            });
+            docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
+        }
+        println!("wrote 3 shots to {}", dir.display());
     }
 
     /// The panel dragged narrow, and a locked folder.

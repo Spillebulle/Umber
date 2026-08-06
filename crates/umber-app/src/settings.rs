@@ -232,9 +232,13 @@ const CARD: [f32; 2] = [150.0, 104.0];
 /// off, and the two figures have to be the same one — see `theme_editor`.
 const TOKEN_GAP: f32 = 24.0;
 
-/// The hex field on a token row. Wide enough for `#RRGGBB` in the monospace
-/// face with room for a caret at the end of it.
-const HEX_FIELD: f32 = 56.0;
+/// The width of a hex field. Wide enough for `#RRGGBB` in the monospace face
+/// with room for a caret at the end of it.
+///
+/// Shared with the Colour panel's readout, so the one place somebody types a
+/// colour into a token and the one place they type the paint colour are the
+/// same shape. Parked here beside [`inset_field`] for the reason given there.
+pub(crate) const HEX_FIELD: f32 = 56.0;
 
 /// The name field in the theme editor's heading.
 const NAME_FIELD: f32 = 160.0;
@@ -246,9 +250,26 @@ const NAME_FIELD: f32 = 160.0;
 /// theme editor's box is filled with — so the field read as a label and the one
 /// editable thing on the page looked like the read-only inspector it replaced.
 /// A well of its own, in the same shapes `controls::search_field` uses.
-fn inset_field(
+///
+/// It belongs in `controls.rs`, beside `search_field`, whose shapes it already
+/// borrows — it is parked here only because that file is owned elsewhere while
+/// this is written. What must not happen in the meantime is a second dressed
+/// field: one copy in the wrong module is a move away from being right, and two
+/// copies is the drift this codebase refuses everywhere. So the Colour panel's
+/// hex readout calls this one across the module boundary.
+///
+/// The `id` is the field's own and is stated rather than left to egui's running
+/// count of the widgets before it. Two things want that. A caller has to be able
+/// to ask whether the field holds the caret *before* it draws it — the Colour
+/// panel's readout decides what to put in the buffer on that answer — and an
+/// automatic id is not knowable until afterwards. And it was not stable: a field
+/// drawn inside this frame came back under a different id on the pass it held
+/// the caret, which egui's end-of-pass sweep then read as a widget that had gone
+/// and surrendered the focus for. Measured, in `panels`' `Typist` harness.
+pub(crate) fn inset_field(
     ui: &mut egui::Ui,
     p: &Palette,
+    id: egui::Id,
     buffer: &mut String,
     width: f32,
     font: FontId,
@@ -263,6 +284,7 @@ fn inset_field(
             response = Some(
                 ui.add(
                     egui::TextEdit::singleline(buffer)
+                        .id(id)
                         .frame(egui::Frame::NONE)
                         .desired_width(width)
                         .font(font)
@@ -2131,6 +2153,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
                     let field = inset_field(
                         ui,
                         p,
+                        egui::Id::new("theme-name-field"),
                         &mut state.name,
                         width,
                         FontId::proportional(text::SMALL),
@@ -2415,6 +2438,9 @@ fn token_row(
             let field = inset_field(
                 ui,
                 p,
+                // Per token, so a row's field keeps its identity whatever else
+                // the page draws around it.
+                egui::Id::new(("theme-token-field", token.id())),
                 &mut state.hex[at],
                 HEX_FIELD,
                 FontId::monospace(text::TINY),
