@@ -1444,6 +1444,10 @@ impl TipThumb {
     /// instead is what makes a sparse spatter tip an empty square half the
     /// time.
     fn new(mask: &TipMask) -> Self {
+        // The ink here is arbitrary and needs no cache of its own, unlike
+        // `tip_texture`'s: this reads `.a()` and nothing else, and `tip_image`
+        // writes coverage into alpha whatever the tint — the ink cannot reach
+        // the one channel this looks at.
         let image = tip_image(mask, Color32::WHITE, ROW_TIP_TEXELS);
         Self {
             width: image.width(),
@@ -1825,35 +1829,48 @@ pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage 
 }
 
 /// One mask's thumbnail, uploaded once and kept in egui's temporary store under
-/// the caller's own `slot`.
+/// a slot of `name`'s own.
 ///
 /// **The ink is part of what is compared, not only the mask.** [`tip_image`]
-/// bakes the colour into the picture, so a cache validated on the mask alone
-/// goes on drawing the old theme's ink after the palette moves: `p.text_strong`
-/// is near-white in Graphite and near-black in Paper while the `p.chrome` behind
-/// these squares flips the other way, so the picture was left dark on dark or
-/// light on light and read as a control that had failed to load. It stood until
-/// the mask itself changed. [`preview_texture`] has compared both of its inks
-/// since the brush rows were written; this is that rule for the three picture
-/// squares, stated once instead of three times.
+/// tints a coverage mask with the ink it is handed, so a cache validated on the
+/// mask alone goes on drawing the old theme's colour after the palette moves:
+/// `p.text_strong` is near-white in Graphite and near-black in Paper while the
+/// `p.chrome` behind these squares flips the other way, so the picture was left
+/// dark on dark or light on light and read as a control that had failed to
+/// load. It stood until the mask itself changed. [`preview_texture`] has
+/// compared both of its inks since the brush rows were written; this is that
+/// rule for the picture squares. (A *coloured* stamp shows its own colours and
+/// ignores the ink entirely — see [`tip_image`] — so for one of those this
+/// rebuilds a byte-identical picture. That is a rare waste rather than a wrong
+/// mark, and it is not worth a second comparison to avoid.)
 ///
 /// **Identity for the mask, equality for the ink.** Comparing a megabyte of
 /// coverage is exactly the cost this cache exists to avoid — the rule
 /// `CanvasRenderer::set_tip` keeps — and a `Color32` is four bytes.
 ///
-/// **`slot` is the caller's and every caller needs its own.** The brush editor's
-/// Tip square, its Texture section's paper square and the stamp browser's rows
-/// can all be on screen in one pass, since the browser is opened from the
-/// editor. Two consumers sharing one slot evict each other's live texture every
-/// frame: the second to draw drops the last handle to a texture the first has
-/// already queued a `Shape` against, which `egui_wgpu` destroys outright and
+/// **The ink is *compared* and deliberately not in the key**, which is the
+/// opposite of the rule [`preview_texture`]'s row shape follows, and for a
+/// reason rather than by oversight: a key exists to tell two consumers drawn in
+/// one pass apart, and every square in a pass reads the same palette. Keying on
+/// the ink would leak a store entry per colour ever seen and separate nothing.
+/// The row shape genuinely does distinguish two live consumers, which is why it
+/// is a key there.
+///
+/// **Every caller needs a distinct `name`, because the slot is derived from
+/// it.** The brush editor's Tip square, its Texture section's paper square and
+/// the stamp browser's rows can all be on screen in one pass, since the browser
+/// is opened from the editor. Two consumers sharing a slot now evict each
+/// other's live texture *every frame*: the second to draw finds the first's ink
+/// and mask, rebuilds, and drops the last handle to a texture the first has
+/// already queued a `Shape` against — which `egui_wgpu` destroys outright and
 /// which then fails validation at submit. That is a `wgpu` panic rather than
 /// mere waste, and it is the same failure
-/// `a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws`
-/// pins for the brush rows. One helper, one slot each.
+/// [`tests::a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws`]
+/// pins for the brush rows. One identifier and not two, so a caller cannot get
+/// the debug name and the slot out of step; [`preview_texture`] derives its own
+/// id for the same reason.
 pub(crate) fn tip_texture(
     ctx: &egui::Context,
-    slot: egui::Id,
     name: &str,
     mask: &Arc<TipMask>,
     ink: Color32,
@@ -1861,6 +1878,7 @@ pub(crate) fn tip_texture(
 ) -> egui::TextureHandle {
     type Held = (Arc<TipMask>, Color32, egui::TextureHandle);
 
+    let slot = egui::Id::new(("tip-texture", name));
     let cached: Option<Held> = ctx.data(|d| d.get_temp(slot));
     if let Some((held, held_ink, texture)) = cached
         && Arc::ptr_eq(&held, mask)
@@ -2666,15 +2684,45 @@ mod tests {
         drawn: std::collections::HashSet<egui::TextureId>,
         /// Every texture the same pass handed back.
         freed: Vec<egui::TextureId>,
+        /// Every picture the pass uploaded, by the id it was given.
+        uploaded: Vec<(egui::TextureId, egui::ColorImage)>,
     }
 
-    /// Run one pass over `add` and read the two out of it.
+    impl PassTextures {
+        /// The one picture this pass drew.
+        ///
+        /// Panics unless the pass drew exactly one: a comparison over an empty
+        /// set is vacuously true, so a test reading only ids would pass against
+        /// a square that had stopped drawing altogether.
+        fn only_drawn(&self) -> egui::TextureId {
+            assert_eq!(self.drawn.len(), 1, "expected exactly one picture drawn");
+            *self.drawn.iter().next().expect("one")
+        }
+
+        /// The colour the picture it drew was actually rasterised in.
+        ///
+        /// Only meaningful on a pass that rebuilt: a cache hit uploads nothing,
+        /// so read it where a rebuild is the thing being asserted.
+        fn ink(&self) -> Color32 {
+            let id = self.only_drawn();
+            let image = self
+                .uploaded
+                .iter()
+                .find(|(had, _)| *had == id)
+                .map(|(_, image)| image)
+                .expect("this pass drew a picture it did not upload");
+            let [r, g, b, _] = image.pixels[0].to_srgba_unmultiplied();
+            Color32::from_rgb(r, g, b)
+        }
+    }
+
+    /// Run one pass over `add` and read all three out of it.
     fn pass_textures(
         ctx: &egui::Context,
         field: egui::Vec2,
         add: impl FnMut(&mut Ui),
     ) -> PassTextures {
-        use egui::epaint::Primitive;
+        use egui::epaint::{ImageData, Primitive};
 
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
@@ -2682,6 +2730,15 @@ mod tests {
         };
         let output = ctx.run_ui(input, add);
         let freed = output.textures_delta.free.clone();
+        let uploaded = output
+            .textures_delta
+            .set
+            .iter()
+            .map(|(id, delta)| {
+                let ImageData::Color(image) = &delta.image;
+                (*id, (**image).clone())
+            })
+            .collect();
         let drawn = ctx
             .tessellate(output.shapes, output.pixels_per_point)
             .iter()
@@ -2690,9 +2747,16 @@ mod tests {
                 Primitive::Callback(_) => None,
             })
             // The font atlas is in every pass and says nothing about a picture.
+            // It can never be anything else: egui allocates it first and
+            // asserts it is `TextureId::default()`, and atlas growth is a `set`
+            // against that same id rather than a fresh allocation.
             .filter(|id| *id != egui::TextureId::default())
             .collect();
-        PassTextures { drawn, freed }
+        PassTextures {
+            drawn,
+            freed,
+            uploaded,
+        }
     }
 
     /// A square inked in one theme is redrawn when the theme changes, and is
@@ -2708,22 +2772,25 @@ mod tests {
     /// the cache exists to avoid.
     ///
     /// Read off egui's own texture delta rather than off the store, because what
-    /// matters is which picture the pass actually *drew*. The re-inking pass
-    /// must also not free anything it is drawing: a texture destroyed by the
-    /// frame that names it is the validation failure `app::submit_frame` exists
-    /// for.
+    /// matters is which picture the pass actually *drew* — and the **bytes** are
+    /// read too, or a helper that rasterised one constant colour while
+    /// faithfully comparing the requested one would satisfy every id here. The
+    /// re-inking pass must also not free anything it is drawing: a texture
+    /// destroyed by the frame that names it is the validation failure
+    /// `app::submit_frame` exists for.
     #[test]
     fn a_cached_thumbnail_re_inks_itself_when_the_palette_moves() {
         let ctx = egui::Context::default();
-        let mask = Arc::new(TipMask::new(4, 4, vec![128; 16]).expect("a mask"));
+        // Fully covered, so `tip_image` writes an opaque texel and the ink can
+        // be read straight back out with no un-premultiply to round it.
+        let mask = Arc::new(TipMask::new(4, 4, vec![255; 16]).expect("a mask"));
         let field = vec2(120.0, 120.0);
-        let slot = egui::Id::new("a-thumbnail");
 
         // One mask at one address, exactly as `Editor::tip` and
         // `Editor::paper_tile` hand the same `Arc` over on every frame.
         let pass = |ink| {
             pass_textures(&ctx, field, |ui| {
-                let texture = tip_texture(ui.ctx(), slot, "thumb", &mask, ink, 32);
+                let texture = tip_texture(ui.ctx(), "thumb", &mask, ink, 32);
                 ui.painter().image(
                     texture.id(),
                     Rect::from_min_size(pos2(10.0, 10.0), vec2(48.0, 48.0)),
@@ -2732,24 +2799,37 @@ mod tests {
                 );
             })
         };
+        let graphite_ink = Palette::of(crate::theme::ThemeKind::Graphite).text_strong;
+        let paper_ink = Palette::of(crate::theme::ThemeKind::Paper).text_strong;
+        assert_ne!(
+            graphite_ink, paper_ink,
+            "the two themes ink these squares alike"
+        );
 
-        let light = Palette::of(crate::theme::ThemeKind::Graphite).text_strong;
-        let dark = Palette::of(crate::theme::ThemeKind::Paper).text_strong;
-        assert_ne!(light, dark, "the two themes ink these squares alike");
-
-        let first = pass(light);
-        let again = pass(light);
-        assert!(!first.drawn.is_empty(), "the pass drew no picture at all");
+        let first = pass(graphite_ink);
+        let kept = first.only_drawn();
         assert_eq!(
-            first.drawn, again.drawn,
+            first.ink(),
+            graphite_ink,
+            "drawn in an ink nobody asked for"
+        );
+
+        // Nothing moved, so nothing may be rebuilt: an unconditional rebuild
+        // re-inks correctly and puts back the per-frame upload the cache is for.
+        let again = pass(graphite_ink);
+        assert_eq!(
+            kept,
+            again.only_drawn(),
             "the same mask in the same ink was rasterised twice"
         );
 
-        let other = pass(dark);
-        assert!(
-            other.drawn.is_disjoint(&again.drawn),
-            "the palette moved and the square kept the old ink"
+        let other = pass(paper_ink);
+        assert_ne!(
+            other.only_drawn(),
+            kept,
+            "the palette moved and the square kept the picture it already had"
         );
+        assert_eq!(other.ink(), paper_ink, "rebuilt in the old theme's ink");
         for id in &other.freed {
             assert!(
                 !other.drawn.contains(id),
@@ -3398,14 +3478,7 @@ mod tests {
     /// every frame the browser was open.
     #[test]
     fn a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws() {
-        use egui::epaint::Primitive;
-        use std::collections::HashSet;
-
         let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
-            ..Default::default()
-        };
         let p = Palette::of(crate::theme::ThemeKind::Graphite);
         // One brush at one address, exactly as `Editor::presets` hands the same
         // element to both lists.
@@ -3432,21 +3505,13 @@ mod tests {
         // the failure is a *replacement*, so it needs a pass with something
         // already there to replace.
         for pass in 0..3 {
-            let output = ctx.run_ui(input.clone(), |ui| {
+            let seen = pass_textures(&ctx, vec2(900.0, 600.0), |ui| {
                 row(ui, metrics::BRUSH_ROW);
                 row(ui, metrics::BRUSH_ROW_DETAIL);
             });
-            let drawn: HashSet<egui::TextureId> = ctx
-                .tessellate(output.shapes, output.pixels_per_point)
-                .iter()
-                .filter_map(|job| match &job.primitive {
-                    Primitive::Mesh(mesh) => Some(mesh.texture_id),
-                    Primitive::Callback(_) => None,
-                })
-                .collect();
-            for id in &output.textures_delta.free {
+            for id in &seen.freed {
                 assert!(
-                    !drawn.contains(id),
+                    !seen.drawn.contains(id),
                     "pass {pass}: {id:?} was freed by the pass that drew it"
                 );
             }

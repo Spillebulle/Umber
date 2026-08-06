@@ -2954,9 +2954,10 @@ const PAPER_PREVIEW_TEXELS: u32 = 96;
 /// validated by the tile's `Arc` identity **and by the ink it was drawn in**.
 /// The modal redraws every frame and this would otherwise upload a texture on
 /// each of them, while a cache that forgot the colour would keep a tile drawn in
-/// the old theme's ink until the paper itself changed. Its own slot and its own
-/// id — the browser's rows draw the same tiles through a cache of their own,
-/// because two consumers of a one-slot cache evict each other's live texture.
+/// the old theme's ink until the paper itself changed. `"brush-paper"` is this
+/// square's alone — the name is what the slot is derived from, and the browser
+/// draws the same tiles under names of its own, because two consumers sharing a
+/// slot evict each other's live texture every frame.
 fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
     let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
     ui.painter().rect_filled(rect, metrics::RADIUS, p.chrome);
@@ -2969,7 +2970,6 @@ fn paper_preview(ui: &mut egui::Ui, p: &Palette, ed: &Editor) {
     };
     let texture = widgets::tip_texture(
         ui.ctx(),
-        egui::Id::new("brush-paper-preview"),
         "brush-paper",
         &tile,
         p.text_strong,
