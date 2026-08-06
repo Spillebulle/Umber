@@ -1801,9 +1801,16 @@ once per stroke but must never move into the drawing loop.
   the rule is the bound rather than the count. It is Paint, Erase, Transform,
   the two canvas flips, and the six structural edits — an entry exists where a
   patch was captured, where the edit is its own inverse (the flips), or where
-  the *shape* of the stack can be put back (a delete, an add, a reorder, a
-  rename, a mask added or removed). **"Clear layer" is the one command left
-  that clears the history**, and adding a row for it means making it undoable
+  the *shape* of the stack can be put back (a delete, an add, a reorder,
+  entries gathered into a folder, a mask added or removed). **A layer cannot be
+  renamed at all**, and this line said it could until two agents went looking
+  for `EditKind::Rename` on the strength of it: `Layer::name` is written only
+  where a layer is created or imported, `LayerStack` has no rename method, and
+  `panels.rs` holds no `TextEdit`. `docs/layer-rename.md` is the design and
+  says why it is not free — it needs an `EditBody` arm of its own, because a
+  names table on `StackShape` would revert a name changed *after* a reorder for
+  exactly the reason `Kept` carries no mask. **"Clear layer" is the one command
+  left that clears the history**, and adding a row for it means making it undoable
   first: a row naming an action that clicking it will not undo is worse than
   one the list stays quiet about. The same bound governs the icons:
   `panels::edit_icon` is exhaustive over `EditKind` deliberately, so a new
