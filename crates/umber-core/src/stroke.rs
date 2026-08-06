@@ -737,7 +737,20 @@ impl StrokeBuilder {
 fn tint(rgb: [f32; 3], m: &Modulated) -> [f32; 3] {
     let mut hsv = Color::new(rgb[0], rgb[1], rgb[2], 1.0).to_hsv();
     // MyPaint states hue in turns, so 0.5 is the opposite side of the wheel.
-    hsv.h = (hsv.h + m.hue * 360.0).rem_euclid(360.0);
+    //
+    // Through `wrap_hue` rather than a bare `rem_euclid`, which is the one door
+    // a hue comes through: `NaN.rem_euclid(360.0)` is NaN, and a tiny negative
+    // rounds up to exactly `360.0`, which `to_color` reads as a sixth sextant
+    // that does not exist. Writing the field by struct mutation bypasses
+    // `Hsv::new`, which is where that wrapping otherwise happens.
+    //
+    // Nothing was ever painted magenta by this and no mesh was ever discarded:
+    // `Hsv::to_color` wraps its own field before using it and caught both
+    // cases. So this keeps the one-door rule true rather than repairing a
+    // visible failure — a rule saved only by a downstream call is drift, and
+    // that call is a guarantee somebody could refactor away next month without
+    // ever learning it was load-bearing.
+    hsv.h = crate::color::wrap_hue(hsv.h + m.hue * 360.0);
     hsv.s = (hsv.s + hsv.s * hsv.v * m.saturation).clamp(0.0, 1.0);
     hsv.v = (hsv.v + m.value).clamp(0.0, 1.0);
     let c = hsv.to_color(1.0);
