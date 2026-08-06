@@ -39,6 +39,30 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
 // The first run
 // ---------------------------------------------------------------------------
 
+/// What the startup check sends, and what it does not.
+///
+/// **This sentence is load-bearing for a decision the project has already
+/// made.** The check is on by default, and CLAUDE.md says that is "only
+/// defensible because `notice_seen` holds the first request back until a notice
+/// has been shown and answered". The notice *is* the defence, so its content is
+/// not decoration and it is a `const` for the reason [`UNSIGNED_NOTE`] is: a
+/// literal buried in a drawing function is a claim nothing can hold to.
+///
+/// **The enumeration is the part that matters, not the summary.** "Carries
+/// nothing about you or your work" is vague enough to survive somebody later
+/// widening what the request sends; "no document, no identifier, not even a
+/// count of how often you run it" is not. Naming the three is what makes a
+/// future widening visibly false rather than arguably fine, which is the same
+/// standing instruction CLAUDE.md gives as "do not quietly widen what the
+/// request carries".
+const REQUEST_NOTE: &str = "When Umber starts, it asks GitHub which release is newest and tells \
+     you if there is one. The request carries nothing about you or your work. No document, no \
+     identifier, not even a count of how often you run it.";
+
+/// Where the switch is. Part of the same promise: a notice that says the check
+/// is on and not where to turn it off has told half the story.
+const SETTINGS_NOTE: &str = "You can change this at any time in Settings, General.";
+
 /// Say what the startup check does, once, before it has done it.
 ///
 /// Deliberately answerable in one click either way, and deliberately not
@@ -61,20 +85,9 @@ fn first_run_notice(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             ui.set_width(420.0);
             heading(ui, p, "Umber checks for new versions");
             ui.add_space(10.0);
-            body(
-                ui,
-                p,
-                "When Umber starts, it asks GitHub which release is newest and \
-                 tells you if there is one. The request carries nothing about you \
-                 or your work. No document, no identifier, not even a count \
-                 of how often you run it.",
-            );
+            body(ui, p, REQUEST_NOTE);
             ui.add_space(8.0);
-            body(
-                ui,
-                p,
-                "You can change this at any time in Settings, General.",
-            );
+            body(ui, p, SETTINGS_NOTE);
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if tabs::button(ui, p, "Check for updates", true) {
@@ -401,7 +414,7 @@ pub(crate) fn rule(ui: &mut egui::Ui, p: &Palette) {
 
 #[cfg(test)]
 mod tests {
-    use super::UNSIGNED_NOTE;
+    use super::{REQUEST_NOTE, SETTINGS_NOTE, UNSIGNED_NOTE};
 
     /// Umber does not sign its releases, and nothing it draws may imply
     /// otherwise. `update::flow::no_stage_calls_anything_verified` and
@@ -440,6 +453,60 @@ mod tests {
         assert!(
             said.contains("does not sign"),
             "the About box no longer denies that Umber signs its releases: {UNSIGNED_NOTE:?}"
+        );
+    }
+
+    /// The startup check is on by default, and CLAUDE.md says that is only
+    /// defensible because this notice is shown and answered first. So the
+    /// notice is the defence, and what it must not lose is the **enumeration**.
+    ///
+    /// "Carries nothing about you or your work" is a summary, and a summary
+    /// survives somebody widening what the request sends. The three named
+    /// denials do not: add a usage ping and "not even a count of how often you
+    /// run it" is visibly false, which is the point of naming it. This is the
+    /// mutation-2 failure from `UNSIGNED_NOTE` in its own habitat — trimming a
+    /// sentence for length leaves true words behind and quietly weakens the
+    /// promise, and no word scan can see it.
+    ///
+    /// The one *over*-claim available here is banned rather than required. A
+    /// request to GitHub carries an address it came from, whatever else it does
+    /// not carry, so calling it anonymous would be a stronger statement than
+    /// Umber can make and a different one from "nothing about you or your
+    /// work".
+    #[test]
+    fn the_first_run_notice_still_enumerates_what_the_request_does_not_carry() {
+        let said = REQUEST_NOTE.to_lowercase();
+
+        for promise in [
+            // What it does, before what it does not.
+            "asks github",
+            // The summary, and then the three that give it teeth.
+            "nothing about you",
+            "no document",
+            "no identifier",
+            "how often you run it",
+        ] {
+            assert!(
+                said.contains(promise),
+                "the first-run notice no longer says {promise:?}: {REQUEST_NOTE:?}"
+            );
+        }
+
+        for word in ["anonym", "untraceable"] {
+            assert!(
+                !said.contains(word),
+                "the first-run notice claims {word:?}, which Umber cannot promise \
+                 about a request GitHub can see the origin of: {REQUEST_NOTE:?}"
+            );
+        }
+
+        // A notice saying the check is on, without saying where to turn it off,
+        // has told half the story. `Updates::check_on_startup` is the
+        // preference and Settings, General is where it is drawn.
+        let switch = SETTINGS_NOTE.to_lowercase();
+        assert!(
+            switch.contains("settings") && switch.contains("general"),
+            "the first-run notice no longer says where the switch is: {SETTINGS_NOTE:?}"
         );
     }
 }
