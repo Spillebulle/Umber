@@ -1777,7 +1777,11 @@ mod tests {
 
         let bounds = s.bounds();
         let dabs: Vec<Dab> = s.drain_pending().collect();
-        assert!(dabs.len() > 4, "too few dabs to say anything: {}", dabs.len());
+        assert!(
+            dabs.len() > 4,
+            "too few dabs to say anything: {}",
+            dabs.len()
+        );
         // Or the test would pass on a stroke whose modulation never bit.
         let roundest = dabs.iter().map(|d| d.aspect).fold(f32::MAX, f32::min);
         assert!(
@@ -1979,7 +1983,11 @@ mod tests {
         // wrap is exercised rather than skirted.
         let brush = modulated(&[entry(DabTarget::Hue, DabInput::Random, -50.0, 50.0)]);
         let mut s = StrokeBuilder::new();
-        s.begin(brush, [0.8, 0.2, 0.1], InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.begin(
+            brush,
+            [0.8, 0.2, 0.1],
+            InputPoint::new(Vec2::ZERO, 1.0, 0.0),
+        );
         s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
         let dabs: Vec<Dab> = s.drain_pending().collect();
         assert!(dabs.len() > 4);
