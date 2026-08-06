@@ -966,12 +966,12 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // means the short hex somebody typed is gone before it can be taken. The
     // window is closed explicitly the moment the blur is dealt with, below.
     //
-    // It is also this rule that answers Escape, which egui's `TextEdit` does not
-    // handle. The field lives in a dock panel that can be closed, undocked or
-    // dragged short, and egui surrenders focus for a widget it did not see this
-    // pass — its own dead-man's switch. Any of those is far more than two passes
-    // ago by the time the panel is drawn again, so half a hex left in the field
-    // is abandoned rather than applied, and the readout comes back holding the
+    // It is also this rule that answers the panel going away. The field lives in
+    // a dock panel that can be closed, undocked or dragged short, and egui
+    // surrenders focus for a widget it did not see this pass — its own
+    // dead-man's switch. Any of those is far more than two passes ago by the
+    // time the panel is drawn again, so half a hex left in the field is
+    // abandoned rather than applied, and the readout comes back holding the
     // colour that is actually there. No `forget_themes_edit` of its own to
     // remember to call, because the rule is structural.
     //
@@ -986,8 +986,23 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let pass = ui.ctx().cumulative_pass_nr();
     let typing = ui.ctx().memory(|m| m.has_focus(hex_edit_id()));
     let settling = state.held.is_some_and(|at| pass <= at + 2);
-    if !typing && !settling {
+
+    // Escape abandons what was typed, and it has to be read here rather than
+    // left to the blur below. egui's `TextEdit` handles no `Key::Escape`, but
+    // egui's *focus* does: its default event filter declines to lock Escape, so
+    // the caret is dropped at the start of the pass and the field reads as an
+    // ordinary blur — which would apply the very thing somebody pressed Escape
+    // to be rid of. Guarded on the field having the caret, or having had it
+    // moments ago, because Escape is a key the rest of the application answers
+    // too and this must not reach out and change a colour nobody was typing.
+    let abandoned = (typing || settling) && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if abandoned || (!typing && !settling) {
         state.text = current_hex(ed);
+    }
+    if abandoned {
+        // Settled, so the blur that follows on this pass or the next finds the
+        // colour's own hex in the field and applying it is the identity.
+        state.held = None;
     }
 
     // No `shortcuts::set_capturing` here, and that is not an omission: `ui::draw`
@@ -2760,6 +2775,19 @@ mod tests {
             self.frame(vec![egui::Event::Text(text.to_owned())]);
         }
 
+        /// Press Escape. Nothing here surrenders the focus by hand: egui does
+        /// that itself when it sees the key, which is exactly the behaviour the
+        /// field has to answer.
+        fn presses_escape(&mut self) {
+            self.frame(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }]);
+        }
+
         /// Let the field go, and draw the frame that learns it.
         fn lets_go(&mut self) {
             self.ctx
@@ -2893,6 +2921,37 @@ mod tests {
                 "{bad} was left standing beside a chip it disagrees with"
             );
         }
+    }
+
+    /// Escape abandons what was typed rather than applying it.
+    ///
+    /// It looks like it should be free and is not. egui's `TextEdit` handles no
+    /// `Key::Escape`, but egui's *focus* does — its default event filter
+    /// declines to lock Escape, so the caret is dropped at the start of the pass
+    /// and the field reads as an ordinary blur. Left to that, pressing Escape
+    /// over a half-typed `#C08` would paint the artist `#CC0088`: the control
+    /// doing the one thing the key means it must not.
+    #[test]
+    fn escape_abandons_what_was_typed() {
+        let mut typist = Typist::new();
+        let before = typist.srgb();
+        typist.types("#C08");
+        typist.presses_escape();
+        assert_eq!(
+            typist.srgb(),
+            before,
+            "Escape applied the colour it was pressed to be rid of"
+        );
+        let [r, g, b] = before;
+        assert_eq!(
+            typist.buffer(),
+            format!("#{r:02X}{g:02X}{b:02X}"),
+            "the readout kept what Escape abandoned"
+        );
+        // And the field is settled rather than merely quiet: a later blur must
+        // not find the abandoned text still waiting to be applied.
+        typist.lets_go();
+        assert_eq!(typist.srgb(), before, "the abandoned hex landed later");
     }
 
     /// The readout follows a colour chosen anywhere else — the wheel, the
