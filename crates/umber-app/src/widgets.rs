@@ -1824,6 +1824,59 @@ pub fn tip_image(mask: &TipMask, ink: Color32, texels: u32) -> egui::ColorImage 
     egui::ColorImage::new([w as usize, h as usize], pixels)
 }
 
+/// One mask's thumbnail, uploaded once and kept in egui's temporary store under
+/// the caller's own `slot`.
+///
+/// **The ink is part of what is compared, not only the mask.** [`tip_image`]
+/// bakes the colour into the picture, so a cache validated on the mask alone
+/// goes on drawing the old theme's ink after the palette moves: `p.text_strong`
+/// is near-white in Graphite and near-black in Paper while the `p.chrome` behind
+/// these squares flips the other way, so the picture was left dark on dark or
+/// light on light and read as a control that had failed to load. It stood until
+/// the mask itself changed. [`preview_texture`] has compared both of its inks
+/// since the brush rows were written; this is that rule for the three picture
+/// squares, stated once instead of three times.
+///
+/// **Identity for the mask, equality for the ink.** Comparing a megabyte of
+/// coverage is exactly the cost this cache exists to avoid — the rule
+/// `CanvasRenderer::set_tip` keeps — and a `Color32` is four bytes.
+///
+/// **`slot` is the caller's and every caller needs its own.** The brush editor's
+/// Tip square, its Texture section's paper square and the stamp browser's rows
+/// can all be on screen in one pass, since the browser is opened from the
+/// editor. Two consumers sharing one slot evict each other's live texture every
+/// frame: the second to draw drops the last handle to a texture the first has
+/// already queued a `Shape` against, which `egui_wgpu` destroys outright and
+/// which then fails validation at submit. That is a `wgpu` panic rather than
+/// mere waste, and it is the same failure
+/// `a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws`
+/// pins for the brush rows. One helper, one slot each.
+pub(crate) fn tip_texture(
+    ctx: &egui::Context,
+    slot: egui::Id,
+    name: &str,
+    mask: &Arc<TipMask>,
+    ink: Color32,
+    texels: u32,
+) -> egui::TextureHandle {
+    type Held = (Arc<TipMask>, Color32, egui::TextureHandle);
+
+    let cached: Option<Held> = ctx.data(|d| d.get_temp(slot));
+    if let Some((held, held_ink, texture)) = cached
+        && Arc::ptr_eq(&held, mask)
+        && held_ink == ink
+    {
+        return texture;
+    }
+    let texture = ctx.load_texture(
+        name.to_owned(),
+        tip_image(mask, ink, texels),
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(slot, (Arc::clone(mask), ink, texture.clone())));
+    texture
+}
+
 /// Linear blend of two opaque palette colours.
 fn mix(from: Color32, to: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -2599,6 +2652,111 @@ pub fn pressure_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What one headless pass drew with, and what it gave back.
+    ///
+    /// Reading egui's own texture delta against the pass's tessellated meshes is
+    /// how [`a_preset_drawn_in_two_lists_at_once_frees_no_texture_either_still_draws`]
+    /// settles a question that otherwise only appears as a `wgpu` panic.
+    /// [`tip_texture`] asks the same question in the other direction — did a
+    /// palette change actually rebuild the picture — so the reading is one
+    /// helper rather than two copies of itself.
+    struct PassTextures {
+        /// Every texture the pass drew with, egui's own font atlas aside.
+        drawn: std::collections::HashSet<egui::TextureId>,
+        /// Every texture the same pass handed back.
+        freed: Vec<egui::TextureId>,
+    }
+
+    /// Run one pass over `add` and read the two out of it.
+    fn pass_textures(
+        ctx: &egui::Context,
+        field: egui::Vec2,
+        add: impl FnMut(&mut Ui),
+    ) -> PassTextures {
+        use egui::epaint::Primitive;
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), field)),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, add);
+        let freed = output.textures_delta.free.clone();
+        let drawn = ctx
+            .tessellate(output.shapes, output.pixels_per_point)
+            .iter()
+            .filter_map(|job| match &job.primitive {
+                Primitive::Mesh(mesh) => Some(mesh.texture_id),
+                Primitive::Callback(_) => None,
+            })
+            // The font atlas is in every pass and says nothing about a picture.
+            .filter(|id| *id != egui::TextureId::default())
+            .collect();
+        PassTextures { drawn, freed }
+    }
+
+    /// A square inked in one theme is redrawn when the theme changes, and is
+    /// **not** redrawn when nothing has.
+    ///
+    /// Both halves, because either alone is passed by a broken cache. Comparing
+    /// the mask alone — which all three picture squares did — hands back the old
+    /// theme's ink for as long as the mask keeps its address, and that is not a
+    /// subtle drift: `p.text_strong` is near-white in Graphite and near-black in
+    /// Paper while the `p.chrome` behind these squares flips the other way, so
+    /// the picture came out dark on dark and the control looked empty.
+    /// Rebuilding unconditionally fixes that and puts back the per-frame upload
+    /// the cache exists to avoid.
+    ///
+    /// Read off egui's own texture delta rather than off the store, because what
+    /// matters is which picture the pass actually *drew*. The re-inking pass
+    /// must also not free anything it is drawing: a texture destroyed by the
+    /// frame that names it is the validation failure `app::submit_frame` exists
+    /// for.
+    #[test]
+    fn a_cached_thumbnail_re_inks_itself_when_the_palette_moves() {
+        let ctx = egui::Context::default();
+        let mask = Arc::new(TipMask::new(4, 4, vec![128; 16]).expect("a mask"));
+        let field = vec2(120.0, 120.0);
+        let slot = egui::Id::new("a-thumbnail");
+
+        // One mask at one address, exactly as `Editor::tip` and
+        // `Editor::paper_tile` hand the same `Arc` over on every frame.
+        let pass = |ink| {
+            pass_textures(&ctx, field, |ui| {
+                let texture = tip_texture(ui.ctx(), slot, "thumb", &mask, ink, 32);
+                ui.painter().image(
+                    texture.id(),
+                    Rect::from_min_size(pos2(10.0, 10.0), vec2(48.0, 48.0)),
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            })
+        };
+
+        let light = Palette::of(crate::theme::ThemeKind::Graphite).text_strong;
+        let dark = Palette::of(crate::theme::ThemeKind::Paper).text_strong;
+        assert_ne!(light, dark, "the two themes ink these squares alike");
+
+        let first = pass(light);
+        let again = pass(light);
+        assert!(!first.drawn.is_empty(), "the pass drew no picture at all");
+        assert_eq!(
+            first.drawn, again.drawn,
+            "the same mask in the same ink was rasterised twice"
+        );
+
+        let other = pass(dark);
+        assert!(
+            other.drawn.is_disjoint(&again.drawn),
+            "the palette moved and the square kept the old ink"
+        );
+        for id in &other.freed {
+            assert!(
+                !other.drawn.contains(id),
+                "{id:?} was freed by the pass that drew it"
+            );
+        }
+    }
 
     /// A stamp's thumbnail has to show what it will paint.
     ///
