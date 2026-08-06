@@ -1040,8 +1040,16 @@ fn hex_field(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let body = state.text.trim().trim_start_matches('#');
     if field.changed() {
         state.edited = true;
-        if body.len() == 6 {
-            apply_hex(ed, &state.text);
+        // **Cleared the moment the live apply lands**, because after it the
+        // buffer and the colour agree and the blur owes nothing. Leaving it set
+        // is the wheel-revert bug below narrowed to one case and still live: a
+        // completed hex keeps `edited` true for as long as the caret stays, so
+        // the *next* single click on the wheel, the square, the hue bar, a
+        // harmony swatch or the eyedropper blurs the field, reapplies the typed
+        // hex over the colour just chosen, and only then clears the flag — so
+        // the first click after typing does nothing and the second works.
+        if body.len() == 6 && apply_hex(ed, &state.text) {
+            state.edited = false;
         }
     }
     if field.lost_focus() {
@@ -1144,13 +1152,14 @@ fn hex_edit_id() -> Id {
 /// by one character under a caret egui holds by index, which lands the caret
 /// between the last two. The caller normalises when the field is let go, which
 /// is late enough and is the only moment it cannot be felt.
-fn apply_hex(ed: &mut Editor, text: &str) {
+fn apply_hex(ed: &mut Editor, text: &str) -> bool {
     let Some(colour) = themelib::parse_hex(text) else {
         // Nothing is applied and nothing is refused: while the field has the
         // caret it keeps what was typed so it can be corrected. A colour panel
         // that quietly took black for a misread line would be one that paints
-        // in a colour nobody chose.
-        return;
+        // in a colour nobody chose. `false` so the caller keeps `edited` set:
+        // a buffer that has not parsed still owes the blur an attempt.
+        return false;
     };
     ed.set_color(Color::from_srgb_u8(
         colour.r(),
@@ -1158,6 +1167,7 @@ fn apply_hex(ed: &mut Editor, text: &str) {
         colour.b(),
         u8::MAX,
     ));
+    true
 }
 
 /// The blend picker's width on the layer row it shares with the opacity slider.
@@ -3010,6 +3020,32 @@ mod tests {
     ///
     /// So the buffer is applied on blur only where somebody actually typed into
     /// it. `HexEdit::edited` is that, and this is what holds it.
+    #[test]
+    fn a_colour_chosen_after_a_hex_was_typed_also_survives_the_blur() {
+        use umber_core::Color;
+
+        let mut typist = Typist::new();
+        // Six digits, so the live apply lands and the buffer now names exactly
+        // the colour in hand. The caret stays where it is.
+        typist.types("#C08A4E");
+        assert_eq!(typist.srgb(), [0xC0, 0x8A, 0x4E], "the live apply");
+        // Now the wheel. This is the sibling case with one thing changed: the
+        // buffer was typed rather than inherited, so `edited` was set — and it
+        // used to stay set for as long as the caret did, which made the first
+        // click after typing revert the colour and the second one work.
+        typist
+            .ed
+            .set_color(Color::from_srgb_u8(0x11, 0x22, 0x33, 0xFF));
+        typist.lets_go();
+        assert_eq!(
+            typist.srgb(),
+            [0x11, 0x22, 0x33],
+            "the typed hex was written back over the colour just clicked"
+        );
+    }
+
+    /// A blur applies only what somebody typed, and an untouched buffer is not
+    /// that even when it parses.
     #[test]
     fn a_colour_chosen_while_the_caret_is_in_the_field_survives_the_blur() {
         use umber_core::Color;
