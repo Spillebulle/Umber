@@ -687,6 +687,10 @@ pub fn row<R>(ui: &mut Ui, p: &Palette, label: &str, right: impl FnOnce(&mut Ui)
 }
 
 /// An inset strip carrying a warning and the buttons that answer it.
+///
+/// The wrap is guarded by `a_banner_is_no_wider_than_the_column_it_is_drawn_in`
+/// — see the note there about why an assertion is worth having for one call to
+/// `.wrap()`.
 pub fn banner<R>(ui: &mut Ui, p: &Palette, message: &str, buttons: impl FnOnce(&mut Ui) -> R) {
     egui::Frame::NONE
         .fill(p.window)
@@ -711,4 +715,120 @@ pub fn banner<R>(ui: &mut Ui, p: &Palette, message: &str, buttons: impl FnOnce(&
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ThemeKind;
+
+    /// The longest thing either of these ever carries: an import that dropped
+    /// several features, which is the text `CLAUDE.md` records as having put
+    /// the brush browser wider than the screen.
+    const LONG: &str = "Umber could not read four of the settings in this brush: the tilt \
+                        response, the rotation effector, the fifth input source and the \
+                        wet-edge falloff. The brush was imported without them, so it will \
+                        paint a little differently from the way its author set it up.";
+
+    /// A dialog's width is decided by the dialog, and a strip in it has to live
+    /// inside that.
+    ///
+    /// This is the failure `CLAUDE.md` records as real and
+    /// `brushlib::notice_bar` carries its own comment about: a label in an egui
+    /// **horizontal** layout defaults to `TextWrapMode::Extend`, so it does not
+    /// run onto a second line — it makes the strip wider, and with it the modal
+    /// and the window. [`banner`] lays its message out beside a glyph and a
+    /// button row, which is a horizontal layout, so the `.wrap()` in it is the
+    /// only thing standing between a long sentence and a dialog with its
+    /// corners off the screen. One call to `.wrap()` is exactly the kind of
+    /// line somebody tidies away.
+    ///
+    /// `set_max_width` is deliberately what the column is stated with rather
+    /// than what fixes it: it bounds the `Ui` and an extending label simply
+    /// overruns it, which is why the assertion is on the rectangle the strip
+    /// *claimed* rather than on the one it was offered.
+    ///
+    /// **Two assertions, and the height is the one that is really about
+    /// wrapping.** A strip whose label extends is one line tall and hundreds of
+    /// pixels wide; a strip that wraps is several lines tall and about as wide
+    /// as it was offered. Measuring the height needs no threshold anybody has
+    /// to defend, where a width alone would.
+    ///
+    /// The width is still checked, with **one item spacing** of slack, and that
+    /// slack is a finding rather than a rounding allowance: `banner` puts its
+    /// button row in a trailing `with_layout`, and the row claims its own
+    /// spacing whether or not the closure draws anything — measured at 6.4 px
+    /// past a 320 px column with `|_| {}`, which is what both real call sites
+    /// pass. Small, live, and reported rather than fixed here, because it is
+    /// the caller-visible width of a hub this pass is only allowed to test.
+    #[test]
+    fn a_banner_is_no_wider_than_the_column_it_is_drawn_in() {
+        // The narrower of the two real call sites, `settings`'s updates pane.
+        const COLUMN: f32 = 320.0;
+        each_frame(|ui, p| {
+            let slack = ui.spacing().item_spacing.x;
+            let scope = ui.scope(|ui| {
+                ui.set_max_width(COLUMN);
+                banner(ui, p, LONG, |_| {});
+            });
+            let rect = scope.response.rect;
+            assert!(
+                rect.height() > 40.0,
+                "a wrapped paragraph is several lines tall; this one is {} px",
+                rect.height()
+            );
+            assert!(
+                rect.width() <= COLUMN + slack + 0.5,
+                "the banner claimed {} px of a {COLUMN} px column",
+                rect.width()
+            );
+        });
+    }
+
+    /// The same for the sentence under a control, which is on forty rows of
+    /// this interface and is the one most likely to be handed a paragraph.
+    ///
+    /// [`note`] has no `.wrap()` of its own and does not need one *where it is
+    /// used*: every call site puts it in a vertical layout, whose default wrap
+    /// mode is `Wrap`. So what this pins is that nobody gives it an explicit
+    /// `TextWrapMode::Extend` and nobody moves it into something that cannot
+    /// wrap — and it is worth pinning for the banner's reason, because the
+    /// failure is a *window* the wrong size rather than a label the wrong
+    /// shape, and nothing about the label says so.
+    #[test]
+    fn a_note_is_no_wider_than_the_column_it_is_drawn_in() {
+        const COLUMN: f32 = 240.0;
+        each_frame(|ui, p| {
+            let scope = ui.scope(|ui| {
+                ui.set_max_width(COLUMN);
+                note(ui, p, LONG);
+            });
+            let width = scope.response.rect.width();
+            assert!(
+                width <= COLUMN + 0.5,
+                "the note claimed {width} px of a {COLUMN} px column"
+            );
+            assert!(
+                scope.response.rect.height() > 20.0,
+                "a wrapped paragraph should be several lines tall, not one"
+            );
+        });
+    }
+
+    /// Run `body` in a real `Ui`, twice.
+    ///
+    /// Twice because the first pass through a fresh context builds the font
+    /// atlas, so a galley laid out on it can measure differently from every
+    /// later one — the reason `widgets`' own layout tests loop.
+    fn each_frame(body: impl Fn(&mut Ui, &Palette)) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input.clone(), |ui| body(ui, &palette));
+        }
+    }
 }
