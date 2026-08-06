@@ -2092,6 +2092,42 @@ design shows a whole row of them.
   is what lets the wheel's angle (45°) and the interface scale (25%, shown as a
   percentage of a 0.75..=2.0 value) be the same control. Two implementations of
   "type it or drag it" is how the two end up disagreeing about what Escape does.
+- **A rail's span is not a bound on the value, and `drag_track` is where that
+  has to be true.** `tweaks::Tweak::range` states the principle and the rail
+  broke it. A value outside the span pins the knob at an end, and a stationary
+  tap there — the one spot that looks as though it will do nothing — used to
+  write that end: a click on the size rail took a 1045 px brush to 400. It now
+  writes nothing while a **drag still does**, so nothing becomes read-only.
+  Both ends matter: thirteen shipped presets carry a stroke span *below* its
+  rail, where the mirrored bug raises the value instead. Widening the spans is
+  the tempting fix and was measured and refused — it costs 27% of the
+  granularity at the size a painter actually uses, to prevent a mis-click. The
+  rule lives in `track_value`, a pure function, so "this is a no-op for every
+  value in span" is a test rather than a sentence.
+- **A menu row that stands for an `Action` takes its label and its key from
+  `shortcuts`, never from a string at the call site.** The View menu drew
+  `Action::FitView` as "Fit to window" while the Shortcuts page listed it as
+  "Fit to view" — one command with two names, in an interface whose other view
+  of it has a search field. `menu_item` is the only route and carries an
+  `enabled` flag, so a row can be dead and still name its key; Undo and Redo
+  were disabled *and* silent, which is why Ctrl+Z appeared nowhere outside
+  Settings.
+- **A field applies what was typed, not what it holds, and Escape is not a
+  blur.** Two separate defects with one shape, both in a hex readout. egui's
+  default `EventFilter` has `escape: false`, so `Focus::begin_pass` drops the
+  caret before a `TextEdit` ever sees the key — the field then sees an ordinary
+  blur and *applies* the buffer, so Escape over a half-typed `#C08` painted
+  `#CC0088`. And the blur itself applied whatever the buffer held, which is
+  harmless only while the buffer equals the colour: the click that picks a
+  colour off the wheel **is** the click that blurs the field, and egui
+  surrenders focus inside the field's own `interact`, so the stale hex was
+  written back over the colour just chosen. Re-applying a colour to itself is
+  not the identity either — `set_color` guards hue and copies saturation across
+  unguarded, so clicking into the readout and out again wiped the picker's
+  saturation on a colour dialled to zero value. Gate the write on somebody
+  having actually typed. **`settings::token_row` still has the Escape half and
+  writes the theme file to disk** — `egui::Modal::show` draws its content and
+  *then* consumes Escape, so the pane is drawn with the caret already gone.
 - **A text field in the interface needs no `shortcuts::set_capturing`.**
   `ui::draw` calls `shortcuts::set_typing(ctx.text_edit_focused())` once for the
   whole interface, so any real `TextEdit` is covered. `set_capturing` belongs to
@@ -2253,6 +2289,79 @@ design shows a whole row of them.
   wholesale by every update, so anything the user decides about one cannot live
   where the palette is. Recorded before rather than after, because the failure
   is silent and months late — the argument `Library::collections` already makes.
+- **A palette can be arranged, and a move is a permutation.**
+  `Palette::move_swatch` takes the colour out and puts it back at the index it
+  *lands* at, so every colour survives, none is duplicated, and the `.gpl`
+  written afterwards is the same bytes in a different order. `can_move_swatch`
+  sits beside it sharing the rule, the arrangement `plan_reorder`/`can_reorder`
+  already keeps.
+- **The drag is `swatchdrag.rs`, a model with no drawing in it**, and it is
+  `layerdrag`'s shape with one axis more. It keeps the two hit tests for the
+  same reason — the palette picker is a full-width dropdown directly above the
+  grid, so a press that rounded would turn using it into dragging the first
+  colour. What it does *not* keep is the clamp: **a drop reaches one gap and no
+  further, never the grid's bounding box.** Eleven colours four across leave an
+  empty cell at the end of the last row, inside the box and *exactly*
+  equidistant from the last colour and from the one above it — an exact f32 tie,
+  because `swatch_rect` uses one `step` for both axes — so nearest-cell answered
+  on iteration order and "drop it at the end" put the colour three places from
+  the end. A test found that, which is the right way round.
+- **A press on a corner mark is not a press on the colour.** The marks sit
+  inside the cell, so containment alone accepts one — and **egui calls a press a
+  drag on *time***: `is_decidedly_dragging` is true once `max_click_duration`
+  has passed with the button held, whatever the pointer did. Holding Remove
+  while deciding and letting go a cell over therefore rearranged the palette
+  instead of removing a colour, silently, with the file written on the spot.
+  `drag_origin` subtracts both marks. The layer list has the same shape with the
+  eye inside its row and gets away with it, because a reorder there records an
+  `EditKind::MoveLayer` and **there is no undo for a palette anywhere in
+  Umber**.
+- **The write happens at the drop, and only where something changed.** A
+  `PaletteLibrary` write reaches the disk immediately — that is the whole shape
+  of a directory of `.gpl` files — so a drag that saved as it aimed would be a
+  file write per mouse move. `edit_current` takes the `bool` the model returns
+  and writes nothing on a `false`; ignoring it meant pressing Enter on an
+  unchanged name rewrote the artist's palette.
+- **The drop mark is a dashed accent ring in the gap *around* the cell,
+  square-cornered.** Three departures from `panels::drop_slot`, each forced.
+  Around rather than over, because that wash of the accent would **tint the
+  colour**, and a grid whose colours are not the colours they say is the one
+  thing this panel must never do. Dashed, because the grid already draws a solid
+  accent outline meaning "this is the colour in hand". Square, because at a
+  pixel and a half's offset a rounded ring traces the swatch's own outline.
+  `drop_ring_rect` is the single statement of the geometry **because its guard
+  has to measure what is drawn** — the test recomputed the expression at first,
+  and widening the real ring to swallow the neighbour left every assertion
+  passing.
+- **A colour is named in the panel and not in the library modal.** The modal is
+  the library *of palettes*; its rows are palettes and it draws a palette's
+  colours as a band nobody can point at. The field goes under the grid, which is
+  the last thing in the panel body, so nothing above it moves when it opens.
+  **The field is settled before the grid's click lands** — one slot for a lost
+  focus and a pressed mark is `library_list`'s recorded bug, and here it
+  discarded the typed name on every click. **Only the name mark stays out while
+  it is open**, never the remove mark: that one is destructive with no undo
+  behind it and would sit one slip from the field being typed into.
+- **`Swatch::name` goes through the file writer's own rule on the way in.**
+  `clean_line` is what `to_gpl` writes by, so what the panel shows is what a save
+  and a reopen give back. **Empty is a real answer for a colour and not for a
+  palette**, which is why `one_line` — `clean_line` plus the `UNTITLED` fallback
+  — is a separate function a swatch never uses. Not hypothetical: `to_gpl` used
+  to test the raw name for emptiness *before* cleaning it, and a control
+  character is not whitespace, so a colour named `"\u{7}"` out of somebody
+  else's `.gpl` was written back out called "Untitled palette".
+- **A harmony goes in whole or not at all, and its mark is in this panel's
+  header.** `Palette::add_all` refuses a set that will not fit rather than adding
+  what it can: half a relation is a fragment with nothing on screen to say which
+  members are missing. It is here rather than beside the wheel because
+  `colorpicker` draws pickers and knows nothing about a library. Every member
+  **including the base** comes off `Editor::hsv` and not `Editor::color` — a
+  harmony is a set of hues at one saturation and value, so a base taken from
+  anywhere else would not be on the same wheel as the rest of it.
+- **`Palette::columns` is the one field of this shape still not authorable.**
+  `.gpl` carries it, `grid_columns` honours it as a maximum and the writer
+  writes it back; nothing sets it. Named here so the next person does not
+  rediscover it.
 
 ### The dockable modules
 
