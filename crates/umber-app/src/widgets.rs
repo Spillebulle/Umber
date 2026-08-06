@@ -2072,6 +2072,11 @@ pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     if n.is_empty() {
         return true;
     }
+    // Whereas this is a short circuit and **not** a guard, which the comment
+    // here used to have the wrong way round. `windows(k)` for a `k` past the
+    // length yields nothing rather than panicking or indexing off the end, so
+    // the answer would be `false` either way; this only says so without walking
+    // the haystack first.
     n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
@@ -3088,9 +3093,13 @@ mod tests {
     /// the whole of what can go wrong.
     ///
     /// `windows(0)` panics rather than yielding nothing, so the empty needle
-    /// needs a guard and not merely an early return; and a needle longer than
-    /// the haystack must answer no rather than indexing past the end. Both are
-    /// reachable from a field somebody is typing into, one character at a time.
+    /// needs a real guard and not merely an early return. A needle longer than
+    /// the haystack is the other edge and is **not** the same kind of thing:
+    /// `windows(k)` past the length yields nothing rather than indexing off the
+    /// end, so that check is a short circuit and the answer is `false` with or
+    /// without it. Both are reachable from a field somebody is typing into, one
+    /// character at a time, which is why both are pinned even though only one
+    /// of them is load-bearing.
     #[test]
     fn the_search_folds_case_without_allocating_a_lowered_copy() {
         assert!(contains_ignore_case("Archivo Narrow", "narrow"));
