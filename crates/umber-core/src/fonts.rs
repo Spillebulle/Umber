@@ -547,12 +547,16 @@ impl FontLibrary {
     /// preferences file spells a family however whoever edited it spelled it,
     /// and reporting "Archivo is not here, using ARCHIVO" would be a notice
     /// about nothing.
-    pub fn substituted(&self, family: &str, style: &str) -> Option<Substitution> {
+    /// **The face comes back with the answer**, so the caller naming it in a
+    /// sentence does not have to `resolve` a second time. That is one linear
+    /// scan per frame rather than two on a machine with a few thousand faces,
+    /// and it removes the only way the sentence could name a third thing.
+    pub fn substituted(&self, family: &str, style: &str) -> Option<(Substitution, &Face)> {
         let face = self.resolve(family, style)?;
         if !face.family.eq_ignore_ascii_case(family) {
-            Some(Substitution::Family)
+            Some((Substitution::Family, face))
         } else if !face.style.eq_ignore_ascii_case(style) {
-            Some(Substitution::Style)
+            Some((Substitution::Style, face))
         } else {
             None
         }
@@ -936,25 +940,36 @@ mod tests {
         lib.add_builtin("archivo", TEST_FONT);
 
         // The ordinary case is silence.
-        assert_eq!(lib.substituted("Archivo", "Regular"), None);
+        assert!(lib.substituted("Archivo", "Regular").is_none());
         // And spelling is not a substitution: `resolve` matches case
         // insensitively, so a preferences file written in another capital must
         // not raise a notice about nothing.
-        assert_eq!(lib.substituted("ARCHIVO", "regular"), None);
+        assert!(lib.substituted("ARCHIVO", "regular").is_none());
 
         assert_eq!(
-            lib.substituted("Helvetica Neue", "Bold"),
+            lib.substituted("Helvetica Neue", "Bold").map(|(w, _)| w),
             Some(Substitution::Family)
         );
         assert_eq!(
-            lib.substituted("Archivo", "Ultra Condensed Black Italic"),
+            lib.substituted("Archivo", "Ultra Condensed Black Italic")
+                .map(|(w, _)| w),
             Some(Substitution::Style)
         );
+        // And it hands back the face it read the answer off, so a caller
+        // naming both halves cannot name a third thing by resolving again.
+        let (_, face) = lib
+            .substituted("Helvetica Neue", "Bold")
+            .expect("a substitute");
+        assert!(std::ptr::eq(
+            face,
+            lib.resolve("Helvetica Neue", "Bold").unwrap()
+        ));
         // Nothing to substitute *with* is not a substitution either — it is the
         // one case `resolve` refuses, and the panel has nothing to draw.
-        assert_eq!(
-            FontLibrary::default().substituted("Archivo", "Regular"),
-            None
+        assert!(
+            FontLibrary::default()
+                .substituted("Archivo", "Regular")
+                .is_none()
         );
     }
 
