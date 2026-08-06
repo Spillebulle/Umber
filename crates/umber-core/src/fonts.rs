@@ -25,13 +25,20 @@
 //! 2. **A folder the user points Umber at**, for a foundry licence or a work
 //!    library. Umber reads it and **copies nothing out of it**: the moment it
 //!    did, it would be redistributing, inside somebody's own documents folder.
-//! 3. **What is compiled in**, which today is Archivo alone — the typeface the
+//! 3. **What is compiled in**, which is Archivo alone — the typeface the
 //!    interface is drawn in. It is registered by the caller through
 //!    [`FontLibrary::add_builtin`] rather than included here a third time; the
 //!    bytes are already in the binary twice and a third copy buys nothing.
-//!    `tools/fetch-fonts.*` builds a curated OFL/Apache bundle beside it under
-//!    `assets/fonts/bundled/`, verified from inside each download; wiring that
-//!    into the *binary* is a separate decision and is not made here.
+//!
+//! A curated OFL/Apache bundle beside Archivo is **designed and not built**.
+//! `docs/text-tool.md` §2 has it: ten to twenty families at the measured half a
+//! megabyte each, fetched by a `tools/fetch-fonts` pair on `fetch-brushes`'
+//! pattern, refusing anything whose licence cannot be verified *inside* the
+//! download. That argument is worth keeping, because it is the shape the thing
+//! would have to take. What is on disk today is `assets/fonts/` holding one
+//! typeface: there is no fetch script and no `bundled/` directory, and this
+//! comment claimed both until somebody looked. Wiring a bundle into the
+//! *binary* would be a further decision again, and is not made here.
 //!
 //! # Why this is not `fontdb`
 //!
@@ -211,6 +218,25 @@ fn is_font_file(path: &Path) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "ttf" | "otf" | "ttc" | "otc"
     )
+}
+
+/// What [`FontLibrary::resolve`] had to change to be able to answer.
+///
+/// `resolve` is total by construction — a preference records names and the
+/// machine it is read back on may have neither — so it can never *refuse*, and
+/// something other than `resolve` has to be what says a substitution happened.
+/// This is that reading, kept beside the rule it reads so the two cannot drift.
+///
+/// Which half was changed matters, because the two are different sentences: a
+/// family that is not here at all is a font to go and install, where a family
+/// that is here without the style asked for is a weight that was never in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Substitution {
+    /// Nothing in the library carries that family, so this is some other
+    /// typeface entirely.
+    Family,
+    /// The family is here and this style within it is not.
+    Style,
 }
 
 /// Where a face's bytes come from.
@@ -428,7 +454,14 @@ impl FontLibrary {
         self.faces.is_empty()
     }
 
-    /// Every family name, in the order the list draws them.
+    /// Every family name, in the order the list draws them, **without
+    /// allocating**.
+    ///
+    /// This is the one the drawing path takes. A machine with several hundred
+    /// families is the ordinary case, the Text panel's picker runs on every
+    /// frame it is open, and a `Vec` of several hundred `&str` per frame to
+    /// answer "how many match what has been typed" is exactly the cost the rule
+    /// about the drawing path is written against.
     ///
     /// **Grouped case-insensitively, because that is how the list is sorted.**
     /// Two files naming one typeface with different capitals is an ordinary
@@ -439,17 +472,27 @@ impl FontLibrary {
     /// way through that run, and [`Self::family`] would hand each row only its
     /// own spelling: half a typeface's weights hidden behind a picker that
     /// looked complete. The first spelling met is the one shown.
+    pub fn families_iter(&self) -> impl Iterator<Item = &str> {
+        self.faces.iter().enumerate().filter_map(|(i, face)| {
+            // The run's first face, which is the spelling that gets shown. `i`
+            // rather than a carried "last": a `filter_map` closure that
+            // remembered the previous name would be a second piece of state
+            // saying the same thing as the sort order already does.
+            let starts_a_run =
+                i == 0 || !self.faces[i - 1].family.eq_ignore_ascii_case(&face.family);
+            starts_a_run.then_some(face.family.as_str())
+        })
+    }
+
+    /// [`Self::families_iter`], collected.
+    ///
+    /// Written in terms of it rather than beside it, so the two cannot come to
+    /// disagree about where one typeface's run of spellings begins — which is
+    /// the bug `one_typeface_spelled_two_ways_is_one_family_with_all_its_
+    /// weights` exists for, and it would be invisible if only one of the pair
+    /// were fixed.
     pub fn families(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = Vec::new();
-        for face in &self.faces {
-            if out
-                .last()
-                .is_none_or(|last| !last.eq_ignore_ascii_case(&face.family))
-            {
-                out.push(&face.family);
-            }
-        }
-        out
+        self.families_iter().collect()
     }
 
     /// The faces of one family, in style order.
@@ -490,6 +533,29 @@ impl FontLibrary {
             .filter(|f| f.family.eq_ignore_ascii_case(family))
             .min_by_key(|f| (f.italic, f.weight.abs_diff(400)));
         nearest.or_else(|| self.faces.first())
+    }
+
+    /// Whether [`Self::resolve`] answered with something other than what was
+    /// asked for, and which half of the name it had to change.
+    ///
+    /// `None` where the pair named a real face, which is the ordinary case and
+    /// the one the interface stays quiet about. It reads `resolve`'s own answer
+    /// rather than re-deciding, so a caller cannot be told there was no
+    /// substitution and then be handed a substitute.
+    ///
+    /// Case-insensitively on both halves, exactly as `resolve` matches: a
+    /// preferences file spells a family however whoever edited it spelled it,
+    /// and reporting "Archivo is not here, using ARCHIVO" would be a notice
+    /// about nothing.
+    pub fn substituted(&self, family: &str, style: &str) -> Option<Substitution> {
+        let face = self.resolve(family, style)?;
+        if !face.family.eq_ignore_ascii_case(family) {
+            Some(Substitution::Family)
+        } else if !face.style.eq_ignore_ascii_case(style) {
+            Some(Substitution::Style)
+        } else {
+            None
+        }
     }
 }
 
@@ -855,6 +921,76 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// `resolve` is total, so something else has to say it substituted — and
+    /// the panel names the face it is *actually* setting in only because this
+    /// answers.
+    ///
+    /// A missing family and a missing style are told apart, because they are
+    /// different sentences: one is a typeface to go and install, the other is a
+    /// weight that was never in the one you have.
+    #[test]
+    fn a_face_that_had_to_be_substituted_says_which_half_of_the_name_moved() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+
+        // The ordinary case is silence.
+        assert_eq!(lib.substituted("Archivo", "Regular"), None);
+        // And spelling is not a substitution: `resolve` matches case
+        // insensitively, so a preferences file written in another capital must
+        // not raise a notice about nothing.
+        assert_eq!(lib.substituted("ARCHIVO", "regular"), None);
+
+        assert_eq!(
+            lib.substituted("Helvetica Neue", "Bold"),
+            Some(Substitution::Family)
+        );
+        assert_eq!(
+            lib.substituted("Archivo", "Ultra Condensed Black Italic"),
+            Some(Substitution::Style)
+        );
+        // Nothing to substitute *with* is not a substitution either — it is the
+        // one case `resolve` refuses, and the panel has nothing to draw.
+        assert_eq!(
+            FontLibrary::default().substituted("Archivo", "Regular"),
+            None
+        );
+    }
+
+    /// The borrowing iterator and the collecting one answer the same thing.
+    ///
+    /// They are one implementation now, so this reads as a tautology; it is
+    /// here because they were two, and the case that told them apart is the
+    /// case above — a run of spellings, where a walk that carried the previous
+    /// name and one that indexes backwards are easy to write differently. The
+    /// panel takes the iterator on every frame and the tests take the `Vec`,
+    /// so a difference would show up nowhere either of them looks.
+    #[test]
+    fn the_borrowing_family_list_says_what_the_collected_one_does() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let face = |family: &str, style: &str, weight: u16| Face {
+            family: family.to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from(format!("{family}-{style}.ttf")),
+                index: 0,
+            },
+            variations: Vec::new(),
+        };
+        lib.insert(face("Zapfino", "Regular", 400));
+        lib.insert(face("ZAPFINO", "Bold", 700));
+        lib.insert(face("Bodoni", "Regular", 400));
+
+        let collected = lib.families();
+        let walked: Vec<&str> = lib.families_iter().collect();
+        assert_eq!(walked, collected, "{:?}", lib.faces());
+        assert_eq!(walked.len(), 3, "{walked:?}");
+        // Empty is the answer for an empty library rather than one blank row.
+        assert_eq!(FontLibrary::default().families_iter().count(), 0);
     }
 
     /// The same family in two directories is one row in the list, not two — the

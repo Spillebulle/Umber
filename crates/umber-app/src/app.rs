@@ -1346,37 +1346,18 @@ impl UmberApp {
                 // Every one of these is a finished sentence rather than a code:
                 // the panel is where the artist was looking, and being told
                 // "nothing happened" is the failure a notice exists to prevent.
-                let lines = match err {
-                    umber_core::TextError::Empty => {
-                        "Type something into the Text panel first.".to_string()
-                    }
-                    umber_core::TextError::NoInk => {
-                        "What is typed makes no mark. It is spaces, or characters \
-                         this face has no glyph for."
-                            .to_string()
-                    }
-                    umber_core::TextError::TooLarge { width, height } => format!(
-                        "At this size the text would be {width} × {height} pixels, which is \
-                         more than Umber will rasterise at once. Reduce the size, or the \
-                         amount of text."
-                    ),
-                    umber_core::TextError::Unreadable => {
-                        "The font could not be read. It may have been moved or removed \
-                         since Umber found it; reopen the Text panel to look again."
-                            .to_string()
-                    }
-                    // Its own sentence rather than the one above, which accuses
-                    // the typeface. Not reachable from the rails, which is
-                    // exactly why the wrong sentence would have survived.
-                    umber_core::TextError::NotFinite => {
-                        "The size, line spacing or tracking is not a number. Drag one of \
-                         the rails in the Text panel to set it again."
-                            .to_string()
-                    }
-                };
+                //
+                // The sentences themselves are `textpanel::refusal`'s and there
+                // is one copy of them, because the panel now says the same
+                // things: it draws the refusal under the preview and disables
+                // Place with it as the tooltip, since `build_preview` has
+                // already set the real block and knows the exact error. This
+                // notice stays as the belt to that gate's braces — the gate
+                // catches the click, the notice catches a route that goes round
+                // the gate, exactly as the lock is refused in both places.
                 self.editor.notice = Some(Notice {
                     title: "Nothing was placed".to_string(),
-                    lines: vec![lines],
+                    lines: vec![crate::textpanel::refusal(err)],
                 });
                 return;
             }

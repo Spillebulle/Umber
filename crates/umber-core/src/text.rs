@@ -335,14 +335,12 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
             let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
                 continue;
             };
-            let mut pen = Pen {
-                raster: &mut raster,
-                dx: x0 + glyph.x,
-                baseline: baseline - glyph.y,
-                last: point(0.0, 0.0),
-                start: point(0.0, 0.0),
-                bounds: (bw as f32, line_box as f32),
-            };
+            let mut pen = Pen::new(
+                &mut raster,
+                x0 + glyph.x,
+                baseline - glyph.y,
+                (bw as f32, line_box as f32),
+            );
             // A glyph that will not draw is skipped rather than abandoning the
             // line: a caption missing one letter beats a caption missing all of
             // them, which is `cputext.rs`'s rule and the same one.
@@ -501,17 +499,44 @@ fn trim(cover: Vec<u8>, w: usize, h: usize) -> Result<(Vec<u8>, u32, u32), TextE
 
 /// Feeds glyph outlines to the rasteriser, flipping to y-down as it goes.
 ///
-/// The same shape `cputext::Pen` has, and deliberately not shared with it: that
-/// one lives in `umber-app` because the splash paints before this crate's
-/// consumers exist, and a shared version would mean `umber-app` depending on
-/// `umber-core` for the one thing it draws before `umber-core` is involved.
-struct Pen<'r> {
+/// **`umber-app`'s splash uses this one too, and there is deliberately no
+/// second copy.** There was, in `cputext.rs`, on the reasoning that the splash
+/// paints before this crate's consumers exist and so should not depend on it —
+/// which is not a reason, because `umber-app` names `umber-core` as an
+/// unconditional dependency and the splash is in the same binary. What the two
+/// copies actually bought was drift: the inset in [`Pen::at`] below was found
+/// here and never applied there, so the splash still carries the bug this
+/// comment exists to explain. One `Pen` is the same argument `blend.wgsl` makes
+/// for being `concat!`ed into both passes.
+///
+/// `pub` for that caller. It is a rasteriser adaptor rather than a model, so it
+/// has no `umber-app` in it and nothing here learns about a window.
+pub struct Pen<'r> {
     raster: &'r mut Rasterizer,
     dx: f32,
     baseline: f32,
     last: Point,
     start: Point,
     bounds: (f32, f32),
+}
+
+impl<'r> Pen<'r> {
+    /// Draw into `raster`, with the glyph's origin at `dx` and `baseline` and
+    /// the buffer's own `(width, height)` as `bounds`.
+    ///
+    /// The bounds are what [`Self::at`] clamps against, so they must be the
+    /// dimensions `raster` was built with rather than the region a caller
+    /// happens to be interested in.
+    pub fn new(raster: &'r mut Rasterizer, dx: f32, baseline: f32, bounds: (f32, f32)) -> Self {
+        Self {
+            raster,
+            dx,
+            baseline,
+            last: point(0.0, 0.0),
+            start: point(0.0, 0.0),
+            bounds,
+        }
+    }
 }
 
 impl Pen<'_> {
@@ -976,6 +1001,64 @@ mod tests {
             .find(|px| (60..=200).contains(&px[3]))
             .expect("an antialiased pixel");
         assert!(px[0] < 250, "the colour was not premultiplied: {px:?}");
+    }
+
+    /// A glyph driven outside its box leaves the rows past the clamp **clean**.
+    ///
+    /// This is the whole of why [`Pen::at`] insets by two rather than clamping
+    /// to the buffer's own dimensions, and it is a property of the inset rather
+    /// than of this glyph. No point can go *past* `height - 2`; a span whose
+    /// lower end sits exactly on that boundary contributes to the rows above it
+    /// and not to the row it ends on, so nothing is deposited below row
+    /// `height - 3`. And every delta lands at an `x` of at most `width - 1`,
+    /// which is inside the row it belongs to. So the last two rows can hold
+    /// nothing at all.
+    ///
+    /// Clamped to the dimensions instead, a span that ends at exactly the width
+    /// writes its closing delta at `linestart + width`, which is the first cell
+    /// of the **next row** and perfectly in bounds. `for_each_pixel` carries one
+    /// running sum across the whole flat buffer and takes its absolute value
+    /// with no ceiling, so what is left over paints a faint line across the row
+    /// underneath. Measured on Archivo's `g` at these numbers it is about a
+    /// third of full coverage, right the way across.
+    ///
+    /// A real glyph rather than a hand-built polygon, because a rectangle's own
+    /// edges happen to cancel: the artefact needs a contour whose left and
+    /// right sides span different rows, which is every letter and no test
+    /// shape anybody writes first. `umber-app`'s splash carried its own copy of
+    /// this pen, clamped to the dimensions, until the two were made one.
+    #[test]
+    fn a_glyph_driven_outside_its_box_leaves_the_rows_below_it_clean() {
+        // A box far too small for the size asked for, which is what a tight pad
+        // and an overshooting outline come to.
+        const W: usize = 16;
+        const H: usize = 20;
+        let font = any_font();
+        let location = Location::default();
+        let gid = font.charmap().map('g').expect("Archivo has a g");
+        let outlines = font.outline_glyphs();
+        let outline = outlines.get(gid).expect("an outline");
+
+        let mut raster = Rasterizer::new(W, H);
+        {
+            let mut pen = Pen::new(&mut raster, 6.0, 14.0, (W as f32, H as f32));
+            outline
+                .draw(DrawSettings::unhinted(Size::new(24.0), &location), &mut pen)
+                .expect("the glyph draws");
+        }
+        let mut rows = [0.0f32; H];
+        raster.for_each_pixel_2d(|_, y, coverage| rows[y as usize] += coverage);
+
+        assert!(
+            rows.iter().sum::<f32>() > 1.0,
+            "nothing was drawn, so this test proves nothing: {rows:?}"
+        );
+        for (y, &ink) in rows.iter().enumerate().skip(H - 2) {
+            assert!(
+                ink < 0.01,
+                "row {y} is past the clamp and holds {ink} of coverage: {rows:?}"
+            );
+        }
     }
 
     /// Two lines whose descenders and ascenders meet saturate rather than

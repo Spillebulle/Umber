@@ -1941,6 +1941,34 @@ pub fn elide(painter: &egui::Painter, s: &str, size: f32, width: f32) -> String 
     format!("{}…", &s[..cuts[lo.min(cuts.len() - 1)]])
 }
 
+/// Case-insensitive substring, **without lowering a copy of the haystack**.
+///
+/// What a search field over a long list needs, and the reason it is a function
+/// rather than `haystack.to_lowercase().contains(&needle.to_lowercase())`: the
+/// obvious spelling allocates a `String` per candidate per frame, to answer a
+/// question about the dozen rows anybody can see. The Text panel's font picker
+/// is the worst of them — a real machine has several hundred families, the
+/// picker runs on every frame the panel is open, and it counts the whole list
+/// to say how many the filter is leaving. At that size the naive version shows
+/// up in a frame time, which is the rule the brush library already lives by.
+///
+/// **The fold is ASCII-only**, deliberately. It suits both callers: a family
+/// name's non-ASCII is inside words a search matches identically either way,
+/// and a full Unicode case fold is not a byte-for-byte operation — it changes
+/// length, so it cannot be done without the copy this exists to avoid.
+///
+/// The needle is expected trimmed but *not* lowered; folding both sides is what
+/// keeps the caller from having to allocate for the query either.
+pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    // The empty needle is in everything — and `windows(0)` panics rather than
+    // yielding nothing, so this is a guard and not just an early out.
+    if n.is_empty() {
+        return true;
+    }
+    n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 pub struct LayerRowResponse {
     pub clicked: bool,
     pub eye_clicked: bool,
@@ -2836,6 +2864,31 @@ mod tests {
                 "{id:?} was freed by the pass that drew it"
             );
         }
+    }
+
+    /// A search folds case in place, and the edges of doing it in bytes are
+    /// the whole of what can go wrong.
+    ///
+    /// `windows(0)` panics rather than yielding nothing, so the empty needle
+    /// needs a guard and not merely an early return; and a needle longer than
+    /// the haystack must answer no rather than indexing past the end. Both are
+    /// reachable from a field somebody is typing into, one character at a time.
+    #[test]
+    fn the_search_folds_case_without_allocating_a_lowered_copy() {
+        assert!(contains_ignore_case("Archivo Narrow", "narrow"));
+        assert!(contains_ignore_case("Archivo Narrow", "ARCHIVO"));
+        assert!(contains_ignore_case("DejaVu Sans", "vu s"));
+        assert!(!contains_ignore_case("Archivo", "archivos"));
+        // A query longer than the name must not index past the end.
+        assert!(!contains_ignore_case("", "x"));
+        assert!(contains_ignore_case("anything", ""));
+        // A multi-byte name is matched, not panicked on: the fold is over
+        // bytes, and the non-ASCII ones compare equal to themselves.
+        assert!(contains_ignore_case(
+            "Noto Sans \u{4e2d}\u{6587}",
+            "\u{4e2d}"
+        ));
+        assert!(contains_ignore_case("Ramón Miranda", "RAM"));
     }
 
     /// A stamp's thumbnail has to show what it will paint.
