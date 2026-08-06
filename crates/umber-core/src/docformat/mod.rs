@@ -2154,6 +2154,50 @@ mod tests {
         assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
     }
 
+    /// [`BlendMode::ALL`] is a hand-written array and [`blend_from_id`]
+    /// searches it, so a mode missing from it is one an Umber document can
+    /// name and this build cannot read back — it would answer `None` and fall
+    /// through to whatever `composite-op` says, silently.
+    ///
+    /// The guard is the exhaustive `match`, which fails the **build** when a
+    /// mode is added. That has to be a compile error rather than an assertion,
+    /// because a test that iterates `ALL` can only check the entries that are
+    /// in it and so agrees with itself however short the array is. It lives
+    /// here rather than beside the enum in `layer.rs` deliberately: this is
+    /// the module the array's completeness actually matters to, and `layer.rs`
+    /// stays out of the change.
+    ///
+    /// The arms index `ALL`, so an arm added for a sixth mode the obvious way
+    /// — `BlendMode::ALL[5]` — is an out-of-bounds index into a fixed-size
+    /// array and fails the build a second time when `ALL` was not extended.
+    #[test]
+    fn all_lists_every_blend_mode() {
+        const fn listed_in_all(mode: BlendMode) -> BlendMode {
+            match mode {
+                BlendMode::Normal => BlendMode::ALL[0],
+                BlendMode::Multiply => BlendMode::ALL[1],
+                BlendMode::Screen => BlendMode::ALL[2],
+                BlendMode::Overlay => BlendMode::ALL[3],
+                BlendMode::Add => BlendMode::ALL[4],
+            }
+        }
+
+        // Each arm has to hand back the mode it was reached by, and no
+        // position may be listed twice — the first catches an arm pointing at
+        // the wrong entry, the second catches a mode being *replaced* in the
+        // array rather than added to it, which the first cannot see because
+        // the mode that fell out is then never iterated.
+        for mode in BlendMode::ALL {
+            assert_eq!(listed_in_all(mode), mode, "{mode:?} is listed wrongly");
+        }
+        for (i, mode) in BlendMode::ALL.iter().enumerate() {
+            assert!(
+                !BlendMode::ALL[..i].contains(mode),
+                "`BlendMode::ALL` lists {mode:?} twice, so a mode is missing"
+            );
+        }
+    }
+
     #[test]
     fn save_replaces_the_file_only_once_it_has_written_all_of_it() {
         let dir = std::env::temp_dir().join("umber-docformat-save");
