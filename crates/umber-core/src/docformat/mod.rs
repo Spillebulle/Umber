@@ -738,6 +738,22 @@ pub fn composite_op(mode: BlendMode) -> (&'static str, bool) {
 
 /// Stable name for [`BLEND_ATTR`]. The debug spelling, so it cannot drift out
 /// of step with the enum the way a second hand-written table would.
+///
+/// What "stable" rests on, since the derive cannot enforce it: the variant's
+/// **name in the source is the identifier on disk**. Adding a mode is safe and
+/// is what the derive was chosen for; *renaming* one silently changes the file
+/// format. The damage is milder here than for `history::kind_id` and is worth
+/// stating exactly rather than dramatically. The attribute is written only
+/// where [`composite_op`] reports `!exact`, which is Add alone, so only Add
+/// layers carry one; on a rename [`blend_from_id`] answers `None` and the
+/// reader falls back to `composite-op`, which for such a layer is
+/// `svg:plus` — and `blend::nearest` reads that back as Add. **The mode and
+/// the pixels are unchanged.** What is lost is the fidelity: the import raises
+/// a spurious `BlendApproximated` warning, which is precisely the regression
+/// [`BLEND_ATTR`] exists to prevent, reintroduced on every Add layer in every
+/// document already on disk. `the_names_written_into_the_blend_attribute_are_
+/// these_exact_strings` is what catches it; the round trip against
+/// `blend_from_id` cannot, because both sides move together.
 pub fn blend_id(mode: BlendMode) -> String {
     format!("{mode:?}")
 }
@@ -2122,6 +2138,20 @@ mod tests {
             assert_eq!(blend_from_id(&blend_id(mode)), Some(mode));
         }
         assert_eq!(blend_from_id("Dissolve"), None);
+    }
+
+    /// **These strings are a file format, and what this catches is a rename.**
+    ///
+    /// [`blend_id`] is the derived `Debug` spelling, so what goes into
+    /// [`BLEND_ATTR`] is the variant's name in the source. See that function
+    /// for what a rename costs — briefly, a spurious "blend approximated"
+    /// warning on every Add layer already written, which is the regression the
+    /// attribute exists to prevent. The round trip above moves with the
+    /// rename and cannot see it; text written out here does not move.
+    #[test]
+    fn the_names_written_into_the_blend_attribute_are_these_exact_strings() {
+        let spelled: Vec<String> = BlendMode::ALL.into_iter().map(blend_id).collect();
+        assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
     }
 
     #[test]
