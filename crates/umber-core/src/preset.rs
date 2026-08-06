@@ -712,6 +712,11 @@ pub enum Renamed {
     /// is allocated by, rather than a second one beside it.
     Done(String),
     /// The name asked for is the one it already has. Nothing was written.
+    ///
+    /// "The one it already has" is judged on the *stem* both names reduce to,
+    /// not on the bytes — a picture copied into `tips/` by hand can be called
+    /// `My Nib`, and the field opens prefilled with that, so a byte comparison
+    /// made pressing Enter on an untouched field a full rename to `my-nib`.
     Unchanged,
     /// Nothing of that name, which is not an error.
     Unknown,
@@ -758,6 +763,19 @@ fn named_mut(preset: &mut BrushPreset, which: Picture) -> &mut Option<String> {
         Picture::Tip => &mut preset.tip,
         Picture::Paper => &mut preset.paper,
     }
+}
+
+/// Every name the presets reference, including ones that resolve to nothing.
+///
+/// The third namespace [`free_stem`] has to avoid — see the argument there. A
+/// dangling reference is the whole point of collecting it: a name that
+/// resolves is in the map already, and one that does not is exactly the name
+/// that could be handed to a picture it has nothing to do with.
+fn spoken_for(presets: &[BrushPreset], which: Picture) -> Vec<&str> {
+    presets
+        .iter()
+        .filter_map(|preset| named(preset, which))
+        .collect()
 }
 
 impl UserLibrary {
@@ -963,7 +981,13 @@ impl UserLibrary {
     /// depending on what the user did next, which is the precise failure
     /// `kept_tips` exists to prevent, surviving in the failure path.
     pub fn add_tip(&mut self, desired: &str, mask: TipMask) -> Result<String, PresetError> {
-        let name = free_stem(desired, "tip", &self.tips, &self.tips_dir());
+        let name = free_stem(
+            desired,
+            "tip",
+            &self.tips,
+            &self.tips_dir(),
+            &spoken_for(&self.presets, Picture::Tip),
+        );
         write_mask(&self.tips_dir(), &name, &mask)?;
         self.tips.insert(name.clone(), Arc::new(mask));
         keep(&mut self.kept_tips, &name);
@@ -978,7 +1002,13 @@ impl UserLibrary {
 
     /// The same for a paper, undone the same way. See [`Self::add_tip`].
     pub fn add_paper(&mut self, desired: &str, tile: TipMask) -> Result<String, PresetError> {
-        let name = free_stem(desired, "paper", &self.papers, &self.papers_dir());
+        let name = free_stem(
+            desired,
+            "paper",
+            &self.papers,
+            &self.papers_dir(),
+            &spoken_for(&self.presets, Picture::Paper),
+        );
         write_mask(&self.papers_dir(), &name, &tile)?;
         self.papers.insert(name.clone(), Arc::new(tile));
         keep(&mut self.kept_papers, &name);
@@ -1090,23 +1120,27 @@ impl UserLibrary {
     ///   the kept list have moved, so the sweep that already deletes an orphan
     ///   takes it — one place a picture is deleted rather than two that have to
     ///   agree. Taking it out of the map here would hide it from that sweep and
-    ///   leave the file behind for ever.
+    ///   leave the file behind for ever. **The same sweep judges the new
+    ///   picture**, which is why one nothing referenced is adopted into
+    ///   [`Library::kept_tips`] rather than being left to it; see the comment
+    ///   at that line.
     /// - **A failed write is undone whole**, [`Self::add_tip`]'s rule: the new
     ///   picture comes back off the disk, the map entry goes, and the presets
     ///   go back to naming what they named. A half-applied rename is the one
     ///   outcome worth paying for undo code to avoid, because the artist would
     ///   see brushes painting round and no reason for it.
     ///
-    /// The presets that moved are recorded **by position** rather than by name,
-    /// so the undo puts back exactly what it changed. By name it could not: a
-    /// preset naming a picture that is in neither the map nor the directory —
-    /// a library copied without its `tips/` — may already carry the new name,
-    /// and a name-based undo would rename that one too.
+    /// **Everything that moves is recorded by position**, presets and kept
+    /// records alike, so the undo puts back exactly what it changed. By name it
+    /// could not: a reference to a picture in neither the map nor the
+    /// directory — a library copied without its `tips/` — may already carry the
+    /// new name, and a name-based undo would rewrite that one instead.
     ///
     /// **A shipped picture of the same name is neither consulted nor
     /// protected**, and that is decided rather than overlooked. [`free_stem`]
-    /// answers to the map and the directory, which is the user's own library,
-    /// and `crate::tip::builtin` is consulted only *after* it — so renaming a
+    /// answers to the user's own library — the map, the directory and what the
+    /// presets name — and `crate::tip::builtin` is consulted only *after* it,
+    /// so renaming a
     /// picture onto a shipped name hides the shipped one, and renaming away
     /// from such a name reveals it again. Refusing here would be a second rule:
     /// [`Self::add_tip`] already lets an imported `umber-stipple.png` take that
@@ -1138,17 +1172,33 @@ impl UserLibrary {
         // is made unique — `free_stem` never hands back a name the map holds,
         // so asking afterwards would turn "call it what it is called" into
         // `my-nib-2`.
+        //
+        // Compared against `old` **and against `old`'s own stem**, and the
+        // second is not belt and braces: a name in the map is a *file stem*
+        // read by `read_masks`, so a picture somebody copied into `tips/` by
+        // hand can be called `My Nib`, and the field opens prefilled with
+        // exactly that. Comparing the slug of what was typed against the raw
+        // name made pressing Enter on an untouched field a full rename to
+        // `my-nib` — the one thing this arm exists to prevent, on the one kind
+        // of name it can happen to. It also covers a wholly non-ASCII stem,
+        // where both sides fall back and agree rather than the picture being
+        // silently renamed to `tip`.
         let fallback = which.fallback();
-        let stem = slug(desired);
-        let stem = if stem.is_empty() { fallback } else { &stem };
-        if stem == old {
+        let stem = stem_of(desired, fallback);
+        if stem == old || stem == stem_of(old, fallback) {
             return Ok(Renamed::Unchanged);
         }
         let dir = match which {
             Picture::Tip => self.tips_dir(),
             Picture::Paper => self.papers_dir(),
         };
-        let new = free_stem(stem, fallback, held, &dir);
+        let new = free_stem(
+            &stem,
+            fallback,
+            held,
+            &dir,
+            &spoken_for(&self.presets, which),
+        );
 
         write_mask(&dir, &new, &mask)?;
         match which {
@@ -1169,10 +1219,40 @@ impl UserLibrary {
             Picture::Tip => &mut self.kept_tips,
             Picture::Paper => &mut self.kept_papers,
         };
-        // Replaced in place rather than removed and pushed, so the order the
-        // user imported their pictures in survives a rename.
-        if let Some(slot) = kept.iter_mut().find(|held| *held == old) {
-            *slot = new.clone();
+        // **By position, exactly as the presets are**, and for the same reason
+        // written out above: an undo that found the *new* name by value could
+        // land on a dangling record that already held it, rewriting somebody
+        // else's entry to the old name. Every occurrence, because a
+        // hand-edited `brushes.ron` can carry the same name twice — `keep`
+        // refuses a duplicate but nothing dedupes what is read back — and one
+        // left behind keeps the old picture referenced, so the sweep below
+        // spares it and the library ends up holding one tile under two names.
+        let kept_slots: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| *held == old)
+            .map(|(index, _)| index)
+            .collect();
+        for &index in &kept_slots {
+            kept[index] = new.clone();
+        }
+        // **A picture nothing referenced has to be adopted, or renaming it is
+        // what deletes it.** `prune_*` sweeps every entry in the map that no
+        // preset and no kept record names, so where `old` was in neither, `new`
+        // is in neither either and the write below takes both — returning
+        // `Done` over a picture it has just destroyed. That state is reachable
+        // rather than theoretical: a PNG copied into `tips/` by hand is found
+        // by `read_masks` and recorded nowhere, and the browser lists it and
+        // offers this. Naming it is taken as putting it in the library, which
+        // is what `add_tip` records for a picture arriving by the other door.
+        //
+        // The `any` is what keeps the undo below an exact inverse: `keep`
+        // declines a name the list already holds, so recording that a push
+        // really happened is the only way to know whether to take one off.
+        let adopted =
+            touched.is_empty() && kept_slots.is_empty() && !kept.iter().any(|held| held == &new);
+        if adopted {
+            kept.push(new.clone());
         }
 
         if let Err(e) = self.write() {
@@ -1180,8 +1260,14 @@ impl UserLibrary {
                 Picture::Tip => &mut self.kept_tips,
                 Picture::Paper => &mut self.kept_papers,
             };
-            if let Some(slot) = kept.iter_mut().find(|held| *held == &new) {
-                *slot = old.to_owned();
+            // Last on, first off: the push above is the only thing after the
+            // slots, so taking it back leaves their indices exactly where the
+            // forward pass found them.
+            if adopted {
+                kept.pop();
+            }
+            for &index in &kept_slots {
+                kept[index] = old.to_owned();
             }
             for &index in &touched {
                 *named_mut(&mut self.presets[index], which) = Some(old.to_owned());
@@ -1448,7 +1534,13 @@ impl UserLibrary {
     /// directory unreadable, and a stamp library is something people go and look
     /// at.
     fn store_tip(&mut self, preset_id: &str, mask: TipMask) -> Result<String, PresetError> {
-        let name = free_stem(preset_id, "tip", &self.tips, &self.tips_dir());
+        let name = free_stem(
+            preset_id,
+            "tip",
+            &self.tips,
+            &self.tips_dir(),
+            &spoken_for(&self.presets, Picture::Tip),
+        );
         write_mask(&self.tips_dir(), &name, &mask)?;
         self.tips.insert(name.clone(), Arc::new(mask));
         Ok(name)
@@ -1472,7 +1564,13 @@ impl UserLibrary {
         if let Some((name, _)) = self.papers.iter().find(|(_, held)| ***held == tile) {
             return Ok(name.clone());
         }
-        let name = free_stem(preset_id, "paper", &self.papers, &self.papers_dir());
+        let name = free_stem(
+            preset_id,
+            "paper",
+            &self.papers,
+            &self.papers_dir(),
+            &spoken_for(&self.presets, Picture::Paper),
+        );
         write_mask(&self.papers_dir(), &name, &tile)?;
         self.papers.insert(name.clone(), Arc::new(tile));
         Ok(name)
@@ -1611,6 +1709,17 @@ fn keep(kept: &mut Vec<String>, name: &str) {
 /// again and write over the file. It is a picture nobody can see, which is
 /// exactly why nobody would notice.
 ///
+/// **And so is what the presets name**, which is a third namespace and was
+/// missing. A preset may name a picture that is in neither the map nor the
+/// directory — a library copied without its `tips/`, which
+/// [`BrushPreset::tip`] promises paints round — and handing that name to a
+/// *different* picture makes the brush start stamping with somebody else's
+/// mask, or painting through a paper it never had. Silent, permanent, and
+/// exactly the substitution [`BrushPreset::paper`] refuses to make with a
+/// shipped tile. Both doors pass it: a picture arriving by import can collide
+/// with a dangling name just as a rename can, and two allocators with two
+/// answers is the drift this function exists as one of.
+///
 /// Hyphenated rather than [`unique_name`]'s ` 2`, and deliberately: this is a
 /// **file stem**, not something anybody reads, and the directory is meant to be
 /// openable with whatever opens pictures. Replacing the same brush's tip twice
@@ -1622,19 +1731,37 @@ fn free_stem(
     fallback: &str,
     held: &BTreeMap<String, Arc<TipMask>>,
     dir: &Path,
+    spoken_for: &[&str],
 ) -> String {
-    let stem = slug(desired);
-    let stem = if stem.is_empty() { fallback } else { &stem };
+    let stem = stem_of(desired, fallback);
     let free = |candidate: &str| {
-        !held.contains_key(candidate) && !dir.join(format!("{candidate}.png")).exists()
+        !held.contains_key(candidate)
+            && !spoken_for.contains(&candidate)
+            && !dir.join(format!("{candidate}.png")).exists()
     };
-    let mut candidate = stem.to_string();
+    let mut candidate = stem.clone();
     let mut n = 2;
     while !free(&candidate) {
         candidate = format!("{stem}-{n}");
         n += 1;
     }
     candidate
+}
+
+/// What a picture would be called if the name were free: slugged, and the
+/// fallback where a name has no character [`slug`] keeps.
+///
+/// Separate from [`free_stem`] because the *unique* name is never the right
+/// thing to compare against — `free_stem` cannot hand back a name the map
+/// already holds, so asking it "is this the name it has?" always answers no.
+/// See [`UserLibrary::rename_picture`].
+fn stem_of(desired: &str, fallback: &str) -> String {
+    let stem = slug(desired);
+    if stem.is_empty() {
+        fallback.to_owned()
+    } else {
+        stem
+    }
 }
 
 /// Write one 8-bit greyscale PNG into a library directory, making it first.
@@ -2690,12 +2817,26 @@ mod tests {
         let other = library
             .add_tip("Nib", TipMask::new(2, 2, vec![6; 4]).expect("mask"))
             .expect("add");
+        // A brush stamping with the *other* picture, and a paper beside it, so
+        // the sweep below is a statement about what moved rather than about
+        // everything moving. Without it the filter could be deleted and every
+        // preset renamed unconditionally with nothing to notice.
+        let bystander = library
+            .save(
+                BrushPreset {
+                    tip: Some(other.clone()),
+                    paper: Some("some-paper".to_owned()),
+                    ..BrushPreset::unsaved("Inker", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
 
         let renamed = library.rename_tip(&old, "Rough charcoal").expect("rename");
         assert_eq!(renamed, Renamed::Done("rough-charcoal".to_owned()));
 
-        // Every brush followed, and the picture is the same one.
-        for preset in library.presets() {
+        // Every brush that named it followed, and only those.
+        for preset in library.presets().iter().filter(|p| p.id != bystander) {
             assert_eq!(
                 preset.tip.as_deref(),
                 Some("rough-charcoal"),
@@ -2703,6 +2844,13 @@ mod tests {
                 preset.name
             );
         }
+        let untouched = library.get(&bystander).expect("still there");
+        assert_eq!(untouched.tip.as_deref(), Some(other.as_str()));
+        assert_eq!(
+            untouched.paper.as_deref(),
+            Some("some-paper"),
+            "a tip rename reached the other field"
+        );
         assert_eq!(
             library.tip("rough-charcoal").expect("mask").coverage(),
             [5; 4]
@@ -2723,7 +2871,16 @@ mod tests {
             reloaded
                 .presets()
                 .iter()
+                .filter(|preset| preset.id != bystander)
                 .all(|preset| preset.tip.as_deref() == Some("rough-charcoal"))
+        );
+        assert_eq!(
+            reloaded
+                .get(&bystander)
+                .expect("still there")
+                .tip
+                .as_deref(),
+            Some(other.as_str())
         );
     }
 
@@ -2757,14 +2914,21 @@ mod tests {
         assert!(reloaded.paper("laid-linen").is_some());
     }
 
-    /// Two of the three answers are not failures, and neither writes anything.
+    /// Two of the three answers are not failures, and neither of *those* writes
+    /// anything.
     ///
     /// `Unchanged` is the one that would be easy to get wrong: [`free_stem`]
     /// never hands back a name the map already holds, so asking it for one
     /// would turn "call it what it is called" into `my-nib-2` — a rename
     /// somebody did not ask for, on a picture they were only confirming.
+    ///
+    /// An emptied field is deliberately **not** one of them: the model has to
+    /// be total, so it falls back to the stem a fresh import would take. The
+    /// browser never reaches it — `rename_field` reads an empty field as
+    /// Escape — and the last case here pins the fallback rather than pretending
+    /// it is silent.
     #[test]
-    fn renaming_a_picture_to_the_name_it_has_or_to_nothing_writes_nothing() {
+    fn renaming_a_picture_to_the_name_it_has_writes_nothing() {
         let scratch = Scratch::new("rename-quiet");
         let mut library = UserLibrary::load_from(scratch.path()).expect("load");
         let name = library
@@ -2819,6 +2983,235 @@ mod tests {
         // handing the name straight out would have written over it.
         assert_eq!(library.tip(&held).expect("mask").coverage(), [1; 4]);
         assert_eq!(library.tip("linen-2").expect("mask").coverage(), [2; 4]);
+        // And the one that moved really moved: the old file gone, the record
+        // that keeps it in the library on the new name. Without these the kept
+        // move could be deleted and this test would still pass while the
+        // library held one tile under two names.
+        assert!(!scratch.tip_file(&moving).exists());
+        assert!(library.tip(&moving).is_none());
+    }
+
+    /// A hand-edited `brushes.ron` can name one picture twice, and one record
+    /// left behind keeps the old name referenced — so the sweep spares the old
+    /// file and the library ends up holding one picture under two names.
+    ///
+    /// `keep` refuses a duplicate, but nothing dedupes what is read back, so
+    /// the rename has to move **every** occurrence rather than the first.
+    #[test]
+    fn a_rename_moves_every_record_of_the_picture_not_just_the_first() {
+        let scratch = Scratch::new("dup-kept");
+        fs::create_dir_all(scratch.path()).expect("dir");
+        fs::create_dir_all(scratch.path().join("tips")).expect("dir");
+        fs::write(
+            scratch.tip_file("nib"),
+            TipMask::new(2, 2, vec![2; 4])
+                .expect("mask")
+                .to_png()
+                .expect("png"),
+        )
+        .expect("write");
+        fs::write(
+            scratch.path().join(UserLibrary::FILE_NAME),
+            r#"(version: 1, presets: [], kept_tips: ["nib", "nib"])"#,
+        )
+        .expect("write");
+
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        assert_eq!(
+            library.rename_tip("nib", "Charcoal").expect("rename"),
+            Renamed::Done("charcoal".to_owned())
+        );
+        assert!(
+            !scratch.tip_file("nib").exists(),
+            "a second record left behind kept the old picture alive"
+        );
+        assert!(library.tip("nib").is_none());
+        assert!(scratch.tip_file("charcoal").exists());
+    }
+
+    /// The gesture whose whole purpose is to keep a picture must not be what
+    /// deletes it.
+    ///
+    /// A PNG copied into `tips/` by hand is found by [`read_masks`], listed by
+    /// the browser and recorded in nothing — so after a rename the *new* name
+    /// is as unreferenced as the old one was, and `prune_tips` sweeps both
+    /// while `Renamed::Done` says it worked. Adopting it into
+    /// [`Library::kept_tips`] is what makes naming a picture the same act as
+    /// importing one.
+    #[test]
+    fn renaming_a_picture_nothing_had_recorded_keeps_it_rather_than_sweeping_it() {
+        let scratch = Scratch::new("rename-adopt");
+        let mask = TipMask::new(2, 2, vec![9; 4]).expect("mask");
+        fs::create_dir_all(scratch.path().join("tips")).expect("dir");
+        fs::write(scratch.tip_file("dropped-in"), mask.to_png().expect("png")).expect("write");
+
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        assert!(library.tip("dropped-in").is_some(), "read off the disk");
+
+        assert_eq!(
+            library
+                .rename_tip("dropped-in", "Charcoal")
+                .expect("rename"),
+            Renamed::Done("charcoal".to_owned())
+        );
+        assert!(
+            scratch.tip_file("charcoal").exists(),
+            "the rename deleted the picture it renamed"
+        );
+        assert!(!scratch.tip_file("dropped-in").exists());
+
+        // And it survives the next write, which is the sweep the adoption is
+        // for — and the next launch, which is what makes the record real.
+        library
+            .save(BrushPreset::unsaved("Round", Brush::default()), None)
+            .expect("save");
+        assert!(scratch.tip_file("charcoal").exists());
+        let reloaded = UserLibrary::load_from(scratch.path()).expect("reload");
+        assert!(reloaded.tip("charcoal").is_some());
+    }
+
+    /// A name no picture answers to is still a name, and handing it out is a
+    /// silent substitution.
+    ///
+    /// [`BrushPreset::tip`] promises a name that resolves to nothing paints
+    /// round, so a library copied without its `tips/` is a legitimate state
+    /// full of dangling references. [`free_stem`] used to consult the map and
+    /// the directory alone, so renaming any picture onto one of those names
+    /// made that brush start stamping with a mask it has nothing to do with —
+    /// and on the paper path, painting through a grain its author never chose,
+    /// which is the substitution [`BrushPreset::paper`] refuses to make even
+    /// with a shipped tile.
+    #[test]
+    fn a_name_some_brush_still_dangles_on_is_not_free() {
+        let scratch = Scratch::new("dangling-name");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        // The brush arrived from an export that named a picture this machine
+        // does not have — in no map and in no directory.
+        library
+            .save(
+                BrushPreset {
+                    tip: Some("ghost".to_owned()),
+                    ..BrushPreset::unsaved("Copied", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
+        let moving = library
+            .add_tip("Photo", TipMask::new(2, 2, vec![4; 4]).expect("mask"))
+            .expect("add");
+
+        assert_eq!(
+            library.rename_tip(&moving, "Ghost").expect("rename"),
+            Renamed::Done("ghost-2".to_owned()),
+            "the renamed picture took a name a brush was still waiting on"
+        );
+        let dangling = library.get("user/copied").expect("still there");
+        assert_eq!(dangling.tip.as_deref(), Some("ghost"));
+        assert!(
+            library.tip("ghost").is_none(),
+            "it should still resolve to nothing and paint round"
+        );
+
+        // The same rule at the other door, or an import could do what a rename
+        // may not.
+        let imported = library
+            .add_tip("ghost", TipMask::new(2, 2, vec![5; 4]).expect("mask"))
+            .expect("add");
+        assert_eq!(imported, "ghost-3");
+    }
+
+    /// A picture named by hand keeps the name it was given until somebody
+    /// changes it.
+    ///
+    /// A stem out of [`read_masks`] was never slugged, so it can carry capitals
+    /// and spaces — and the browser's field opens prefilled with exactly that.
+    /// Comparing the slug of what was typed against the raw name made pressing
+    /// Enter on an untouched field a full rename, on the one kind of name where
+    /// nobody would expect it.
+    #[test]
+    fn pressing_enter_on_a_hand_named_picture_writes_nothing() {
+        let scratch = Scratch::new("hand-named");
+        let mask = TipMask::new(2, 2, vec![3; 4]).expect("mask");
+        fs::create_dir_all(scratch.path().join("tips")).expect("dir");
+        for stem in ["My Nib", "日本"] {
+            fs::write(scratch.tip_file(stem), mask.to_png().expect("png")).expect("write");
+        }
+
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        for stem in ["My Nib", "日本"] {
+            assert!(library.tip(stem).is_some(), "`{stem}` should have loaded");
+            assert_eq!(
+                library.rename_tip(stem, stem).expect("rename"),
+                Renamed::Unchanged,
+                "pressing Enter on `{stem}` renamed it"
+            );
+            assert!(scratch.tip_file(stem).exists(), "`{stem}` was moved");
+        }
+        // Typing something else still renames it, so this is a comparison and
+        // not a refusal.
+        assert_eq!(
+            library.rename_tip("My Nib", "Broad nib").expect("rename"),
+            Renamed::Done("broad-nib".to_owned())
+        );
+    }
+
+    /// A rename that cannot be written leaves the library exactly as it was.
+    ///
+    /// The picture goes down under its new name before anything points at it,
+    /// so the failure window is real and the undo is what stands in it: a
+    /// half-applied rename is brushes painting round with nothing to say why.
+    /// The write is made to fail by putting a **directory** where the atomic
+    /// write's temporary file goes, which is the one way to break it that needs
+    /// no permissions and works on every platform.
+    #[test]
+    fn a_rename_that_cannot_be_written_puts_everything_back() {
+        let scratch = Scratch::new("rename-fails");
+        let mut library = UserLibrary::load_from(scratch.path()).expect("load");
+        let old = library
+            .add_tip("Nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+        library
+            .save(
+                BrushPreset {
+                    tip: Some(old.clone()),
+                    ..BrushPreset::unsaved("Liner", Brush::default())
+                },
+                None,
+            )
+            .expect("save");
+
+        fs::create_dir_all(scratch.path().join("brushes.ron.tmp")).expect("block the write");
+        let failed = library.rename_tip(&old, "Charcoal");
+        assert!(failed.is_err(), "the write should not have succeeded");
+
+        // Every one of the four things that move, back where it was.
+        assert!(library.tip(&old).is_some(), "the map lost the picture");
+        assert!(
+            library.tip("charcoal").is_none(),
+            "the map kept the new one"
+        );
+        assert!(
+            !scratch.tip_file("charcoal").exists(),
+            "the new picture was left on the disk"
+        );
+        assert!(scratch.tip_file(&old).exists());
+        assert_eq!(
+            library
+                .get("user/liner")
+                .expect("still there")
+                .tip
+                .as_deref(),
+            Some(old.as_str()),
+            "the brush was left naming a picture that does not exist"
+        );
+
+        // And with the obstruction gone the same gesture works, under the name
+        // that was asked for rather than a suffixed one.
+        fs::remove_dir_all(scratch.path().join("brushes.ron.tmp")).expect("unblock");
+        assert_eq!(
+            library.rename_tip(&old, "Charcoal").expect("rename"),
+            Renamed::Done("charcoal".to_owned())
+        );
     }
 
     /// A picture that will not decode is not in the map and still owns its name
