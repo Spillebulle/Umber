@@ -1781,41 +1781,48 @@ impl UmberApp {
     }
 
     fn handle_keys(&mut self, key: KeyCode, pressed: bool) -> bool {
-        // Space is a held modifier with press *and* release meaning, which a
-        // press-resolved binding table cannot express, so it stays separate.
-        if key == KeyCode::Space {
-            self.editor.space_down = pressed;
-            return true;
+        // Space, Escape and Enter are outside the binding table and are decided
+        // before it is consulted — but by the same suspension `resolve` answers
+        // to, which is the whole of `shortcuts::direct`. Read that before
+        // changing anything here: all three used to be claimed unconditionally,
+        // so Enter in the Text module's caption field inserted a newline *and*
+        // committed the floating text, and Escape in a typable rail threw away
+        // the float behind it.
+        match shortcuts::direct(key, pressed, shortcuts::suspended()) {
+            // A held modifier with press *and* release meaning, which a
+            // press-resolved table cannot express.
+            Some(shortcuts::Direct::PanModifier) => {
+                self.editor.space_down = pressed;
+                return true;
+            }
+            // Escape abandons the outline being drawn, and then the floating
+            // transform — the layer was never written to, so the move costs
+            // nothing to throw away. Each is claimed only while it exists, so
+            // Escape goes on reaching whatever else on the canvas wants it.
+            Some(shortcuts::Direct::Abandon) => {
+                if self.editor.cancel_selection_draft() {
+                    return true;
+                }
+                if self.cancel_transform() {
+                    return true;
+                }
+            }
+            // Enter closes the outline, or puts the floating pixels down. Same
+            // pair, same terms.
+            Some(shortcuts::Direct::Finish) => {
+                if self.editor.selection_draft.is_some() {
+                    self.editor.finish_selection();
+                    return true;
+                }
+                if self.editor.float.is_some() {
+                    self.finish_transform();
+                    return true;
+                }
+            }
+            None => {}
         }
         if !pressed {
             return false;
-        }
-
-        // Escape abandons the outline being drawn and Enter closes it. Neither
-        // is in the binding table: they are answers to "there is a gesture in
-        // progress", not commands, and a rebindable Escape that sometimes
-        // meant nothing would be a row in the settings list that lies. They
-        // are also claimed only while a draft exists, so Escape goes on
-        // reaching whatever else wants it.
-        if matches!(key, KeyCode::Escape) && self.editor.cancel_selection_draft() {
-            return true;
-        }
-        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter)
-            && self.editor.selection_draft.is_some()
-        {
-            self.editor.finish_selection();
-            return true;
-        }
-        // The same pair for a floating transform, and claimed on the same
-        // terms: only while one is up, so Escape goes on reaching whatever
-        // else wants it. Escape throws the move away — the layer was never
-        // written to — and Enter puts the pixels down.
-        if matches!(key, KeyCode::Escape) && self.cancel_transform() {
-            return true;
-        }
-        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter) && self.editor.float.is_some() {
-            self.finish_transform();
-            return true;
         }
 
         let Some(action) = shortcuts::resolve(&self.bindings, key, self.modifiers) else {

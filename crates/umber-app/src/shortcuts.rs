@@ -538,6 +538,74 @@ pub fn resolve(fallback: &[Binding], key: KeyCode, mods: ModifiersState) -> Opti
     }
 }
 
+/// Whether dispatch is suspended: a chord is being captured, or a text field
+/// somewhere in the interface has the keyboard.
+///
+/// The same reading [`resolve`] refuses on, exposed because the three keys
+/// [`direct`] covers are handled *before* the table is consulted and would
+/// otherwise never ask. With nothing published the answer is `false`, exactly
+/// as `resolve` falls through to the caller's own table — a build that has not
+/// read its preferences yet has no text field either.
+pub fn suspended() -> bool {
+    read_live().as_ref().is_some_and(Live::suspended)
+}
+
+/// A key that answers a gesture rather than running a command.
+///
+/// Three keys are deliberately outside the binding table. Space is a held
+/// modifier with press *and* release meaning, which a press-resolved table
+/// cannot express; Escape and Enter are answers to "there is a gesture in
+/// progress", and a rebindable Escape that sometimes meant nothing would be a
+/// row in the settings list that lies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direct {
+    /// Space: the held pan override.
+    PanModifier,
+    /// Escape: abandon the gesture in progress.
+    Abandon,
+    /// Enter: finish the gesture in progress.
+    Finish,
+}
+
+/// Which of the three untabled keys a press is, if any.
+///
+/// **They answer to the same suspension the table does, and that was a bug.**
+/// Being outside the table used to mean being outside [`resolve`] and therefore
+/// outside [`suspended`] as well, so all three reached the canvas while a text
+/// field had the keyboard. Every one of them was reachable: Enter in the Text
+/// module's caption field inserted a newline *and* committed the floating text
+/// into the layer; Escape in a `widgets::number_row` — the typable rail, where
+/// Escape means "abandon the figure I typed" — threw away the floating
+/// transform behind it, which for a paste is unrecoverable; and a space typed
+/// into any field armed the pan override.
+///
+/// The argument the old comment made for claiming them — that they are claimed
+/// only while a draft or a float exists, so they go on reaching whatever else
+/// wants them — is about *other* consumers on the canvas. It says nothing about
+/// a field that has the keyboard, and a float or a draft is exactly what is
+/// standing while somebody types a brush size.
+///
+/// **A release is never refused, only a press.** Letting go of a held modifier
+/// can only ever disarm something, and refusing it is how Space latches: press
+/// it over the canvas, click into a field, let go, and the pan override stays
+/// armed with no key held and nothing that will clear it. Nothing acts on the
+/// release of Escape or Enter, so neither is reported for one.
+pub fn direct(key: KeyCode, pressed: bool, suspended: bool) -> Option<Direct> {
+    let direct = match key {
+        KeyCode::Space => Direct::PanModifier,
+        KeyCode::Escape => Direct::Abandon,
+        KeyCode::Enter | KeyCode::NumpadEnter => Direct::Finish,
+        _ => return None,
+    };
+    if !pressed && direct != Direct::PanModifier {
+        return None;
+    }
+    if pressed && suspended {
+        return None;
+    }
+    Some(direct)
+}
+
 // A poisoned lock here means a previous panic happened while the table was
 // borrowed. The table is a plain `Vec` of `Copy` values, so it cannot be left
 // half-updated; taking the inner value keeps shortcuts working rather than
@@ -1491,7 +1559,10 @@ mod tests {
     ///
     /// Deliberately the *only* test in this file that touches `LIVE`. Every
     /// other one goes through `resolve_in`, so nothing here can race with them;
-    /// a second global test could, and the failure would be a mystery.
+    /// a second global test could, and the failure would be a mystery. The
+    /// untabled keys are checked here rather than in a second global test for
+    /// exactly that reason — they read the same lever through `suspended`, so
+    /// they belong in the same run of it.
     #[test]
     fn either_lever_suspends_dispatch_and_neither_clears_the_other() {
         publish(defaults());
@@ -1500,11 +1571,17 @@ mod tests {
             Some(Action::BrushTool),
             "nothing is suspended yet"
         );
+        assert!(!suspended());
+        assert_eq!(
+            direct(KeyCode::Escape, true, suspended()),
+            Some(Direct::Abandon)
+        );
 
         // A field listening for a chord: pressing B to bind it must not also
         // select the brush.
         set_capturing(true);
         assert_eq!(resolve(&[], KeyCode::KeyB, NONE), None);
+        assert!(suspended());
 
         // A text field takes the keyboard while that field is still listening.
         // Whichever finishes first must not hand dispatch back to the canvas
@@ -1513,9 +1590,91 @@ mod tests {
         set_typing(true);
         set_capturing(false);
         assert_eq!(resolve(&[], KeyCode::KeyB, NONE), None, "still typing");
+        assert!(suspended());
+
+        // And the three keys outside the table are refused by the very same
+        // reading. This is the whole defect: Enter in the Text module's caption
+        // field committed the floating text, and Escape in a typable rail threw
+        // away the transform standing behind it.
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Space,
+        ] {
+            assert_eq!(
+                direct(key, true, suspended()),
+                None,
+                "{key:?} reached the canvas out of a text field"
+            );
+        }
+        // The release of Space still lands, or the pan override latches on for
+        // the rest of the session.
+        assert_eq!(
+            direct(KeyCode::Space, false, suspended()),
+            Some(Direct::PanModifier)
+        );
 
         set_typing(false);
         assert_eq!(resolve(&[], KeyCode::KeyB, NONE), Some(Action::BrushTool));
+        assert!(!suspended());
+    }
+
+    // --- the keys outside the table ----------------------------------------
+
+    #[test]
+    fn the_untabled_keys_are_named_and_nothing_else_is() {
+        for (key, expected) in [
+            (KeyCode::Space, Some(Direct::PanModifier)),
+            (KeyCode::Escape, Some(Direct::Abandon)),
+            (KeyCode::Enter, Some(Direct::Finish)),
+            (KeyCode::NumpadEnter, Some(Direct::Finish)),
+            (KeyCode::KeyB, None),
+            (KeyCode::Tab, None),
+        ] {
+            assert_eq!(direct(key, true, false), expected, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_suspended_press_reaches_nothing_and_a_release_still_disarms() {
+        // The failure this pair exists for: a space pressed over the canvas and
+        // let go of into a field that has taken the keyboard. Gating the
+        // release as well would leave `space_down` true with no key held and
+        // nothing that will ever clear it — the pan override armed for the rest
+        // of the session.
+        assert_eq!(direct(KeyCode::Space, true, true), None);
+        assert_eq!(
+            direct(KeyCode::Space, false, true),
+            Some(Direct::PanModifier)
+        );
+        assert_eq!(
+            direct(KeyCode::Space, false, false),
+            Some(Direct::PanModifier)
+        );
+
+        // Escape and Enter act on the press alone, suspended or not. Reporting
+        // them for a release would run the gesture's answer twice.
+        for key in [KeyCode::Escape, KeyCode::Enter, KeyCode::NumpadEnter] {
+            assert_eq!(direct(key, true, true), None, "{key:?} while typing");
+            assert_eq!(direct(key, false, false), None, "{key:?} released");
+            assert_eq!(direct(key, false, true), None, "{key:?} released, typing");
+        }
+    }
+
+    #[test]
+    fn the_untabled_keys_are_the_ones_the_table_cannot_hold() {
+        // Space and Escape are reserved out of `BINDABLE` — see its docs — so
+        // no rebinding can ever reach them and `direct` is the only thing that
+        // answers for either. Enter *is* bindable, and nothing binds it by
+        // default; if something ever did, this is the test that would say the
+        // two now disagree about one key.
+        assert!(!BINDABLE.contains(&KeyCode::Space));
+        assert!(!BINDABLE.contains(&KeyCode::Escape));
+        assert!(
+            !defaults().iter().any(|b| b.key == KeyCode::Enter),
+            "Enter is claimed by `direct` before the table is consulted"
+        );
     }
 
     #[test]
