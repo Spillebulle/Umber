@@ -16,16 +16,32 @@
 //! `ab_glyph_rasterizer` then turns the outlines into coverage. It is the same
 //! rasteriser egui uses, just addressed directly.
 //!
+//! The pen that feeds it is **`umber_core::text::Pen`**, not one of this
+//! module's own. There was a copy here, and the note beside it said the two
+//! were deliberately apart because the splash paints before `umber-core`'s
+//! consumers exist — which is not a reason, since `umber-app` names
+//! `umber-core` as an unconditional dependency and the splash is in the same
+//! binary. What the copy actually did was miss a fix: `Pen::at` clamps two
+//! pixels inside the buffer, because a point clamped to exactly the width
+//! deposits its closing delta in the first cell of the next row and paints a
+//! faint line across it, and this copy still clamped to the width. Latent
+//! rather than live at the splash's own sizes, which is precisely why nobody
+//! saw it.
+//!
 //! The font bytes are included a second time here rather than shared with
 //! `theme.rs`: that module hands its copy to egui as a `'static` slice inside an
 //! `Arc<FontData>` and never exposes it. A quarter of a megabyte of duplicated
 //! read-only data is the price of not widening `theme.rs`'s interface for one
 //! caller.
 
-use ab_glyph_rasterizer::{Point, Rasterizer, point};
+use ab_glyph_rasterizer::Rasterizer;
 use skrifa::instance::{Location, Size};
-use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::outline::DrawSettings;
 use skrifa::{FontRef, MetadataProvider};
+// The one pen. `Pen` itself, never a bare `use umber_core::text` — `text` in
+// this crate is `theme::text`, the font-size table, and shadowing it here is a
+// trap for whoever reads the next file.
+use umber_core::text::Pen;
 
 /// Archivo, the typeface the design specifies — the same file the interface
 /// loads, under the SIL Open Font License. See `assets/fonts/`.
@@ -120,14 +136,8 @@ impl Font {
             let Some(gid) = charmap.map(ch) else { continue };
             if let Some(glyph) = outlines.get(gid) {
                 let settings = DrawSettings::unhinted(self.size, &self.location);
-                let mut pen = Pen {
-                    raster: &mut raster,
-                    dx: cursor,
-                    baseline,
-                    last: point(0.0, 0.0),
-                    start: point(0.0, 0.0),
-                    bounds: (width as f32, height as f32),
-                };
+                let mut pen =
+                    Pen::new(&mut raster, cursor, baseline, (width as f32, height as f32));
                 // A glyph that will not draw is skipped rather than aborting the
                 // run; a splash missing one letter beats a splash missing all
                 // of them.
@@ -143,68 +153,6 @@ impl Font {
                 plot(ox + px as i32, oy + py as i32, coverage.min(1.0));
             }
         });
-    }
-}
-
-/// Feeds glyph outlines to the rasteriser, flipping to y-down and offsetting to
-/// the run's position as it goes.
-struct Pen<'r> {
-    raster: &'r mut Rasterizer,
-    dx: f32,
-    baseline: f32,
-    last: Point,
-    start: Point,
-    bounds: (f32, f32),
-}
-
-impl Pen<'_> {
-    /// Font space is y-up from the baseline; the rasteriser is y-down from the
-    /// top of its box.
-    ///
-    /// Clamped to the box: `Rasterizer` indexes its accumulation buffer from
-    /// these coordinates, and a glyph whose outline strays outside — which
-    /// happens with overshoot on round letters at small sizes — would otherwise
-    /// be a panic rather than a clipped pixel.
-    fn at(&self, x: f32, y: f32) -> Point {
-        point(
-            (self.dx + x).clamp(0.0, self.bounds.0),
-            (self.baseline - y).clamp(0.0, self.bounds.1),
-        )
-    }
-}
-
-impl OutlinePen for Pen<'_> {
-    fn move_to(&mut self, x: f32, y: f32) {
-        // An unclosed contour would leak coverage across the whole scanline, so
-        // the start is remembered and `close` always joins back to it.
-        self.last = self.at(x, y);
-        self.start = self.last;
-    }
-
-    fn line_to(&mut self, x: f32, y: f32) {
-        let to = self.at(x, y);
-        self.raster.draw_line(self.last, to);
-        self.last = to;
-    }
-
-    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        let ctrl = self.at(cx, cy);
-        let to = self.at(x, y);
-        self.raster.draw_quad(self.last, ctrl, to);
-        self.last = to;
-    }
-
-    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        let c0 = self.at(cx0, cy0);
-        let c1 = self.at(cx1, cy1);
-        let to = self.at(x, y);
-        self.raster.draw_cubic(self.last, c0, c1, to);
-        self.last = to;
-    }
-
-    fn close(&mut self) {
-        self.raster.draw_line(self.last, self.start);
-        self.last = self.start;
     }
 }
 
