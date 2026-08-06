@@ -1775,18 +1775,26 @@ fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
 /// *arithmetic*: that `StrokeBuilder`'s box covers the quad implied by each
 /// dab's own `radius`, `aspect` and `angle`. Neither can see the thing that
 /// actually broke, which was a disagreement between that implied quad and the
-/// one `dab.wgsl` rasterises — so this one needs a device, and it commits
-/// through the **real** pieces the damage mask produced rather than a
-/// hand-supplied rectangle. A commit to a rect written out here would be a test
-/// about the shader alone, and the CPU test already owns the other side.
+/// one `dab.wgsl` rasterises, so that bridge is what needs a device and is the
+/// whole of what this test is for.
 ///
-/// The brush is `mypaint/dieterle/arrow-1`'s shape: `dab_ratio` 10.0 with a
-/// `Ratio` modulation on the `Stroke` input from -9.0, so at the head of a
-/// stroke `aspect` is 1.0 and the dab is *round* while the nominal ratio still
-/// says its short semi-axis is a tenth of the long one. The emitter used to
-/// take the short axis off the nominal ratio, so the box was a 2.4 px sliver
-/// across a mark 24 px wide: the rest stayed in the scratch, redrew as a live
-/// preview, and was baked in by the next stroke in that stroke's colour.
+/// **It does not also exercise the cell mask, and the pieces below are not
+/// evidence that it does.** `DOC` is 64 and `damage::TILE` is 64, so every
+/// stroke in this file marks the single cell `(0, 0)` and
+/// `TileMask::pieces(rect)` provably returns `vec![rect]` — byte for byte what
+/// the neighbouring test writes out by hand. They are read from the real mask
+/// so this test commits by the route `finish_stroke` uses rather than a
+/// reconstruction of it, which is worth having and is *all* it is worth here.
+/// The mask half of "feed both or neither" is
+/// `the_cell_mask_covers_a_dab_a_ratio_modulation_fattened`, on a 512 canvas,
+/// and only there.
+///
+/// The brush is `mypaint/dieterle/arrow-1`'s shape: `dab_ratio` 10.0 against a
+/// `Ratio` modulation reaching -9.0, so `aspect` is 1.0 and the dab is *round*
+/// while the nominal ratio still says its short semi-axis is a tenth of the
+/// long one. Turned 45°, which is what puts the shortfall on **both** axes: a
+/// round dab is unchanged by the rotation but its box is not, and the nominal
+/// reading gives a half-extent of 9.3 px where the dab reaches 12.
 #[test]
 fn a_stamp_a_ratio_modulation_rounded_out_is_committed_across_its_short_axis() {
     let mut h = harness_or_skip!();
@@ -1803,6 +1811,11 @@ fn a_stamp_a_ratio_modulation_rounded_out_is_committed_across_its_short_axis() {
         // against 255 and nothing is bought by insisting on the last bit.
         hardness: 1.0,
         dab_ratio: 10.0,
+        // 45°, so the nominal reading is short on x and y alike and both are
+        // asserted below. A round dab paints the same disc at any angle, but
+        // its *box* does not: `|r cos| + |short sin|` is 9.3 px off the nominal
+        // short axis and 17.0 off the real one.
+        dab_angle: 45.0,
         modulations: [Modulation {
             target: DabTarget::Ratio,
             input: DabInput::Stroke,
@@ -1853,14 +1866,22 @@ fn a_stamp_a_ratio_modulation_rounded_out_is_committed_across_its_short_axis() {
     );
     h.gpu.queue.submit(Some(enc.finish()));
 
-    // Ten pixels below the centre of a round dab of radius 12, so well inside
-    // the quad the shader rasterises and far outside the 1.2 px half-extent the
-    // nominal ratio described. The old box reached y 33; this is y 42.
-    let alpha = h.pixel(32, 42)[3];
-    assert!(
-        alpha >= 254,
-        "the dab's short axis was left out of the committed pieces: alpha {alpha}"
-    );
+    // Ten and a half pixels from the centre of a round dab of radius 12, on
+    // each axis in turn. Both sit inside the disc the shader paints — the
+    // sample is at 0.876 of the radius, inside `smoothstep`'s inner edge of
+    // 0.917, so coverage there is exactly 1 — and both sit outside the 9.3 px
+    // half-extent the nominal ratio described, which reached only pixel 41.
+    //
+    // Both axes, because the nominal reading was short on each: y is the axis
+    // the ratio squashes and x is the one the 45° rotation carries it onto.
+    for (x, y) in [(32, 42), (42, 32)] {
+        let alpha = h.pixel(x, y)[3];
+        assert!(
+            alpha >= 254,
+            "({x}, {y}) is inside the dab and was left out of the committed \
+             pieces: alpha {alpha}"
+        );
+    }
 }
 
 #[test]

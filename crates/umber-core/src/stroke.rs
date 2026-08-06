@@ -657,8 +657,9 @@ impl StrokeBuilder {
         // and a rotated quad's corners reach out to `radius * sqrt(2)`. Any
         // stamp brush with an angle or angle jitter was losing its edges.
         //
-        // Exact for a tip and merely conservative for a round dab, and for an
-        // unrotated ellipse it is *tighter* than the circle was.
+        // Tight for a square tip, conservative for a non-square one and for a
+        // round dab, and for an unrotated ellipse it is *tighter* than the
+        // circle was.
         //
         // The short semi-axis comes from `aspect` — the dab that was actually
         // pushed — and **not** from the nominal `self.brush.dab_ratio`. This
@@ -666,23 +667,40 @@ impl StrokeBuilder {
         // shader builds the quad as `radius / max(aspect, 1.0)`, so wherever a
         // `DabTarget::Ratio` modulation lands negative the real dab is *fatter*
         // than the nominal ratio describes and the box missed its edges — on y
-        // at every angle and on x wherever the dab is turned. It is reachable
-        // from the shipped library rather than hypothetical: thirty presets can
-        // record a short axis smaller than the real one, and two of them
-        // (`tanda/charcoal-04`, `dieterle/arrow-1`) carry `dab_ratio` 10.0 with
-        // a low of -9.0, so `aspect` reaches 1.0 — a round dab described by a
-        // box a tenth of its height.
+        // at every angle and on x wherever the dab is turned.
         //
-        // Two things this deliberately does not touch:
+        // Reachable from the shipped library rather than hypothetical, and
+        // `mypaint/dieterle/arrow-1` is the case worth knowing because the
+        // obvious reading of it is wrong. Its `Ratio` curve is not a ramp but
+        // `(0, 0.5, 1, 0, 0)` against a low of -9.0 and a `dab_ratio` of 10, so
+        // the dab is round at the head of a mark, reaches 10:1 at the *midpoint*
+        // of `stroke_span`, and is round again for the whole second half — and
+        // `stroke_hold` at its 10.0 ceiling means the input never wraps, so a
+        // stroke longer than its span sits at `aspect` 1.0 for the rest of its
+        // length. That is the steady state, not the transient. The one place
+        // the dab reaches its nominal size is the midpoint, which is exactly
+        // where `aspect` is 10 and the error is zero, so quoting the brush's
+        // 25.7 px `size` against a 2.6 px box would be describing two instants
+        // that never coincide. Re-derive from the curve rather than from the
+        // `size` field.
+        //
+        // Three things this deliberately does not touch:
         //
         //   - **`Brush::step_at` still reads the nominal `dab_ratio`**, and must.
         //     Spacing is decided by the nominal ratio and angle, never by
         //     `dab_angle_jitter` or a modulation, or a stroke's spacing would
         //     wander with the RNG. Damage is per dab and has to follow the dab;
-        //     spacing is per stroke and must not.
-        //   - **`tip_scale` is still not in it**, and that stays right: its
-        //     components are at most 1, so the quad the shader builds is never
-        //     larger than this box on that account.
+        //     spacing is per stroke and must not. That bullet sits directly
+        //     above this one in CLAUDE.md and is almost certainly how the defect
+        //     arrived, so the two rules are opposite by design.
+        //   - **`tip_scale` is still not in it**, and that stays right:
+        //     `TipMask::aspect` divides both sides by the longer, so both
+        //     components are at most 1 and the quad the shader builds can only
+        //     be smaller than this box on that account.
+        //   - **`widgets::preview_mark` was never wrong**, and reads
+        //     `dab.aspect` as this now does. The brush list's rasteriser is the
+        //     one duplicate of this geometry CLAUDE.md permits, and the canvas
+        //     was the outlier rather than the reference.
         let (sin, cos) = angle.sin_cos();
         let short = radius / aspect;
         let half = Vec2::new(
@@ -1713,6 +1731,14 @@ mod tests {
     /// This reads the *shader's* construction rather than the emitter's, which
     /// is the point: it is the specification the damaged box has to satisfy, so
     /// a test written against it cannot pass by agreeing with a mistake.
+    ///
+    /// Callers allow a thousandth of a pixel against it rather than demanding
+    /// equality, and that slack is load-bearing twice. Here, because this
+    /// reaches the extent by rotating four corners where the emitter reaches it
+    /// as `|r cos| + |short sin|` — the same number in exact arithmetic, not
+    /// necessarily the same float. And on a device, because WGSL specifies `/`
+    /// to 2.5 ULP rather than correctly rounded, so the shader's own `short`
+    /// need not be bit-identical to this one even given identical operands.
     fn dab_quad(d: &Dab) -> [Vec2; 4] {
         let short = d.radius / d.aspect.max(1.0);
         let (sin, cos) = d.angle.sin_cos();
@@ -1839,10 +1865,18 @@ mod tests {
 
         for d in &dabs {
             let (lo, hi) = quad_box(d);
-            let x0 = lo.x.floor().max(0.0) as u32;
-            let y0 = lo.y.floor().max(0.0) as u32;
-            let x1 = (hi.x.ceil().max(0.0) as u32).min(CANVAS);
-            let y1 = (hi.y.ceil().max(0.0) as u32).min(CANVAS);
+            // Pulled in by a thousandth of a pixel before rounding out to whole
+            // ones. `quad_box` reaches the extent by rotating four corners where
+            // the emitter reaches it as `|r cos| + |short sin|`: the same number
+            // in exact arithmetic and not necessarily the same float, so an edge
+            // that lands within an ULP of an integer could otherwise name a
+            // pixel column the emitter's own rounding put on the other side.
+            // That is a spurious failure about f32, not about the damage rule —
+            // the sibling test above allows the same 1e-3 for the same reason.
+            let x0 = (lo.x + 1e-3).floor().max(0.0) as u32;
+            let y0 = (lo.y + 1e-3).floor().max(0.0) as u32;
+            let x1 = ((hi.x - 1e-3).ceil().max(0.0) as u32).min(CANVAS);
+            let y1 = ((hi.y - 1e-3).ceil().max(0.0) as u32).min(CANVAS);
             for y in y0..y1 {
                 for x in x0..x1 {
                     assert!(
@@ -1868,24 +1902,32 @@ mod tests {
     /// pins that the change costs the rest of the library nothing.
     #[test]
     fn the_damaged_box_is_the_quad_exactly_and_no_larger() {
-        let brush = Brush {
+        let plain = Brush {
             dab_ratio: 6.0,
             dab_angle: 40.0,
             ..unsmoothed(20.0, 0.2)
         };
-        let mut s = StrokeBuilder::new();
-        // A tap, so the box belongs to one dab and equality is meaningful.
-        s.begin(brush, WHITE, InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0));
-        let bounds = s.bounds();
-        let dabs: Vec<Dab> = s.drain_pending().collect();
-        assert_eq!(dabs.len(), 1);
+        // **Both**, and the modulated one is the case that matters. Checking
+        // only `plain` would leave the whole fix untested here, because with no
+        // ratio modulation the new arithmetic is bit-identical to the old — a
+        // fudge written as `if m.ratio != 0.0 { half *= 1.05 }` would satisfy
+        // it and satisfy `the_box_never_widens_...` too.
+        for brush in [plain, flattening_chisel()] {
+            let mut s = StrokeBuilder::new();
+            // A tap, so the box belongs to one dab and equality is meaningful.
+            s.begin(brush, WHITE, InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0));
+            let bounds = s.bounds();
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            assert_eq!(dabs.len(), 1);
 
-        let (lo, hi) = quad_box(&dabs[0]);
-        assert!(
-            (bounds.min - lo).abs().max_element() < 1e-3
-                && (bounds.max - hi).abs().max_element() < 1e-3,
-            "box {bounds:?} is not the quad's bound {lo}..{hi}"
-        );
+            let (lo, hi) = quad_box(&dabs[0]);
+            assert!(
+                (bounds.min - lo).abs().max_element() < 1e-3
+                    && (bounds.max - hi).abs().max_element() < 1e-3,
+                "box {bounds:?} is not the quad's bound {lo}..{hi} (aspect {})",
+                dabs[0].aspect
+            );
+        }
     }
 
     /// The box the superseded arithmetic recorded: the short semi-axis taken
@@ -1964,21 +2006,32 @@ mod tests {
         assert_ne!(got, was, "the box should be strictly tighter, not equal");
     }
 
-    /// Named for the invariant and not for a bug, because there is no bug here
-    /// to catch: `tint` used a bare `rem_euclid`, which gets NaN and a tiny
-    /// negative wrong, and `Hsv::to_color` wrapped the hue again on its way out
-    /// and caught both. Nothing magenta and no discarded mesh ever reached a
-    /// canvas.
+    /// An end-to-end check that the dab colour path — smudge mix, `tint`,
+    /// `Hsv::to_color` — lands a real colour in the instance buffer, where a
+    /// non-finite component would be a stamp the rasteriser draws as anything
+    /// at all.
     ///
-    /// What it pins is that a hue leaving `tint` is a hue — finite, and a
-    /// colour when it lands on the dab. The bare `rem_euclid` was drift rather
-    /// than damage: the field is written by struct mutation, which bypasses
-    /// `Hsv::new`'s wrapping, so the property was resting entirely on a
-    /// downstream call somebody could refactor away without ever learning it
-    /// was load-bearing. This holds whichever of the two doors is standing,
-    /// which is the point of having both.
+    /// **No assertion on `tint`'s output can distinguish the bare `rem_euclid`
+    /// this replaced, and that is proved rather than assumed.** `wrap_hue`
+    /// sends non-finite input to `0.0` and a wrapped value of exactly `360.0`
+    /// to `0.0`, so for finite input it lands in `[0, 360)` and is idempotent —
+    /// hence `wrap_hue(x.rem_euclid(360.0)) == wrap_hue(x)` for *every* `x`,
+    /// the NaN and infinity cases included, since both routes reach `0.0`.
+    /// `tint` returns a colour rather than a hue and `Hsv::to_color` opens with
+    /// `wrap_hue(self.h)`, reading the field nowhere else, so the two spellings
+    /// are observationally identical. Confirmed by mutation, not only by the
+    /// argument: with `tint` reverted to `rem_euclid`, a hue driven to a tiny
+    /// negative and a hue driven to NaN both still come out of `tint` as
+    /// exactly `[1.0, 0.0, 0.0]`.
+    ///
+    /// The fact worth carrying away is the one that argument yields:
+    /// **removing `Hsv::to_color`'s own `wrap_hue` would break `tint`.**
+    /// Somebody tidying `to_color` has no other way to learn that `tint` was
+    /// standing on it — which is exactly why `tint` should not have been
+    /// standing on it, and now does not. The door itself is tested where the
+    /// door is, in `color.rs`; this says the path through it is joined up.
     #[test]
-    fn a_hue_modulation_goes_through_the_one_door() {
+    fn a_hue_modulation_still_lands_a_colour_on_the_dab() {
         // Fifty turns either way: far past anything a brush asks for, so the
         // wrap is exercised rather than skirted.
         let brush = modulated(&[entry(DabTarget::Hue, DabInput::Random, -50.0, 50.0)]);
