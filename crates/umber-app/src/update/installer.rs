@@ -213,14 +213,32 @@ impl Command {
     /// The arguments as one string, for `ShellExecuteExW`, which takes the
     /// parameters as a single line rather than as a vector.
     ///
-    /// Each is quoted, because a package under `C:\Users\Someone Else\...` has
-    /// a space in it and an unquoted path would be read as two arguments — an
-    /// installer that reports a missing file on exactly the machines whose
-    /// owner has a space in their name.
+    /// **A path is quoted and a switch never is**, and that asymmetry is
+    /// `msiexec`'s rather than a style. A package under
+    /// `C:\Users\Someone Else\...` has a space in it and an unquoted path is
+    /// read as two arguments — an installer that reports a missing file on
+    /// exactly the machines whose owner has a space in their name. But
+    /// `msiexec` parses its own command line instead of going through
+    /// `CommandLineToArgvW`, and it does not recognise a **quoted** switch: it
+    /// saw no `/i` and no `/qn`, put up its usage dialog, and then waited to be
+    /// dismissed. Under elevation that dialog is on another desktop's window
+    /// list and effectively invisible, so the install sat at nothing for ever
+    /// while `WaitForSingleObject` waited on it. That was the symptom reported
+    /// from a real machine: consent given, and then nothing at all.
+    ///
+    /// Leading `/` is the test because that is what `msiexec` itself treats as
+    /// a switch. Everything else is a path and gets its quotes.
     pub fn parameters(&self) -> String {
         self.args
             .iter()
-            .map(|a| format!("\"{}\"", a.to_string_lossy()))
+            .map(|a| {
+                let text = a.to_string_lossy();
+                if text.starts_with('/') {
+                    text.into_owned()
+                } else {
+                    format!("\"{text}\"")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -510,16 +528,42 @@ mod tests {
         }
     }
 
-    /// A path with a space in it is one argument, not two.
+    /// A path with a space in it is one argument, and a switch is bare.
+    ///
+    /// This test used to assert the opposite of its second half — it required
+    /// `"/i"` quoted, and so held the defect in place rather than catching it.
+    /// `msiexec` parses its own command line and does not recognise a quoted
+    /// switch: it saw no `/i` and no `/qn`, raised its usage dialog where an
+    /// elevated process's window could not be seen, and waited there. The
+    /// install sat at nothing for ever after consent was given.
     #[test]
-    fn every_parameter_is_quoted() {
+    fn a_path_is_quoted_and_a_switch_is_not() {
         let cmd = Command::for_package(Path::new("C:\\Users\\Some One\\umber.msi"));
         let line = cmd.parameters();
+
+        // The reason quoting exists at all.
         assert!(
             line.contains("\"C:\\Users\\Some One\\umber.msi\""),
-            "{line}"
+            "the package path lost its quotes: {line}"
         );
-        assert!(line.starts_with("\"/i\""), "{line}");
+        assert!(
+            line.contains("\"C:\\Users\\Some One\\umber.log\""),
+            "the log path lost its quotes: {line}"
+        );
+
+        // And the half that was backwards. Every switch bare, none of them
+        // wearing quotes msiexec would refuse to read.
+        for switch in ["/i", "/qn", "/norestart", "/l*v"] {
+            assert!(
+                line.contains(&format!(" {switch} ")) || line.starts_with(&format!("{switch} ")),
+                "{switch} is missing or quoted: {line}"
+            );
+            assert!(
+                !line.contains(&format!("\"{switch}\"")),
+                "{switch} is quoted, which msiexec will not read: {line}"
+            );
+        }
+        assert!(line.starts_with("/i "), "{line}");
     }
 
     /// **A successful install is never reported as a failure**, however the

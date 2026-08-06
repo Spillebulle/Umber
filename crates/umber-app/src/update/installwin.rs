@@ -254,7 +254,15 @@ struct Installer {
 
 impl Page for Installer {
     fn title(&self) -> String {
-        "Umber update".to_string()
+        // Setup is not an update, and the title bar said it was. Somebody
+        // installing Umber for the first time had never had a version of it to
+        // update, so the one piece of chrome Windows shows in the task bar and
+        // in Alt-Tab named something that had not happened.
+        if self.job.setup {
+            "Install Umber".to_string()
+        } else {
+            "Umber update".to_string()
+        }
     }
 
     fn size(&self) -> [f32; 2] {
