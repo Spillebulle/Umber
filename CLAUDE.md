@@ -562,6 +562,50 @@ all** — the straight-alpha sRGB RGBA8 it already held is exactly
   it is reachable only from `MimeType::Autodetect` and arboard names an explicit
   type on every call — **an arboard bump has to re-check that.**
 
+### Text
+
+`umber-core::text` sets it, `umber-core::fonts` finds the faces, `textpanel.rs`
+draws the module and `cputext.rs` is the splash's own use of the same `Pen`.
+
+- **Placing text is literally a paste, and that is the whole design.** The set
+  lines go through `Clip::place` and `begin_float` — the same two Ctrl+V uses —
+  so the transform tool's handles move, scale, turn and flip it, Escape abandons
+  it, and one undo takes it back off as an ordinary `EditKind::Transform`. No
+  new float kind, no new undo variant, no second placer.
+- **Nothing is kept as text, and the panel says so rather than letting somebody
+  find out at the save.** The moment it goes down it is paint in the layer; the
+  string, the face and the size are recorded nowhere. `umber-version` did not
+  move and no byte of the format changed, which is the honest consequence of the
+  bullet above rather than an omission. Re-editable text objects are a different
+  feature and would need all three.
+- **A loss is named in the panel, not discovered.** Lines break only where the
+  artist breaks them, a line mixing left-to-right and right-to-left writing is
+  shaped but not reordered, and a character the face has no glyph for is left
+  blank and named by codepoint rather than borrowed silently from another font.
+  Same rule the importers keep: subtly wrong output is worse than a refusal that
+  sends somebody somewhere else.
+- **It is a module, not a tool**, and it is deliberately not in `DEFAULT_DOCK` —
+  see `PanelKind::ALL` versus the shipped arrangement, and why adding to the
+  second is the change that would need a version bump.
+- **There is one `Pen`, in `umber-core::text`, and `cputext` uses it.** There
+  used to be two, on the reasoning that the splash paints before `umber-core`'s
+  consumers exist — false, since `umber-app` names `umber-core` as an
+  unconditional dependency — and the copies had **already drifted**. Its `at`
+  clamps two pixels inside the buffer, and what that buys was measured *after*
+  the comment claimed otherwise: **nothing visible.** The displaced delta lands
+  at `(0, row+1)` and `ab_glyph_rasterizer`'s prefix sum cancels it there, so
+  the worst spurious pixel is 1.047 with the inset and 1.047 without. The
+  artefact is a property of clamping a contour at all, not of where it clamps
+  to. The **cost** is real — 22.9 of coverage truncated on Archivo's `g` at
+  24 px in a 16x20 box against 0.06 un-inset — and is invisible only because
+  both callers pad by a whole em. **If anybody tightens that padding, the inset
+  is the first thing to reconsider.** `4f537c0`'s commit message states the
+  false mechanism and cannot be amended.
+- **`theme::text` and `umber_core::text` collide by name**, and the first is
+  the font-size table used in about eighteen files under `umber-app`. Import the
+  item, never the module: `use umber_core::text::Pen;` and never a bare
+  `use umber_core::text`.
+
 ### Layers
 
 Layers occupy slices ("slots") of one texture array, and the whole stack
