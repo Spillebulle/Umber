@@ -25,13 +25,20 @@
 //! 2. **A folder the user points Umber at**, for a foundry licence or a work
 //!    library. Umber reads it and **copies nothing out of it**: the moment it
 //!    did, it would be redistributing, inside somebody's own documents folder.
-//! 3. **What is compiled in**, which today is Archivo alone — the typeface the
+//! 3. **What is compiled in**, which is Archivo alone — the typeface the
 //!    interface is drawn in. It is registered by the caller through
 //!    [`FontLibrary::add_builtin`] rather than included here a third time; the
 //!    bytes are already in the binary twice and a third copy buys nothing.
-//!    `tools/fetch-fonts.*` builds a curated OFL/Apache bundle beside it under
-//!    `assets/fonts/bundled/`, verified from inside each download; wiring that
-//!    into the *binary* is a separate decision and is not made here.
+//!
+//! A curated OFL/Apache bundle beside Archivo is **designed and not built**.
+//! `docs/text-tool.md` §2 has it: ten to twenty families at the measured half a
+//! megabyte each, fetched by a `tools/fetch-fonts` pair on `fetch-brushes`'
+//! pattern, refusing anything whose licence cannot be verified *inside* the
+//! download. That argument is worth keeping, because it is the shape the thing
+//! would have to take. What is on disk today is `assets/fonts/` holding one
+//! typeface: there is no fetch script and no `bundled/` directory, and this
+//! comment claimed both until somebody looked. Wiring a bundle into the
+//! *binary* would be a further decision again, and is not made here.
 //!
 //! # Why this is not `fontdb`
 //!
