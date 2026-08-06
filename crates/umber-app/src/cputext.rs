@@ -21,12 +21,17 @@
 //! were deliberately apart because the splash paints before `umber-core`'s
 //! consumers exist — which is not a reason, since `umber-app` names
 //! `umber-core` as an unconditional dependency and the splash is in the same
-//! binary. What the copy actually did was miss a fix: `Pen::at` clamps two
-//! pixels inside the buffer, because a point clamped to exactly the width
-//! deposits its closing delta in the first cell of the next row and paints a
-//! faint line across it, and this copy still clamped to the width. Latent
-//! rather than live at the splash's own sizes, which is precisely why nobody
-//! saw it.
+//! binary. What the copy actually did was rasterise the same outline
+//! differently: `text::Pen::at` clamps two pixels inside the buffer and this
+//! one clamped to the buffer's own dimensions.
+//!
+//! Neither reading is visible here, and the numbers are in `Pen::at`'s own
+//! comment rather than repeated: the splash's box is `width(text) + 2·ppem`
+//! by `2.5·ppem`, so the smallest right margin it ever draws with is a whole
+//! em against an inset of two, and nothing it draws comes within two pixels of
+//! an edge at any scale. Sharing the pen is therefore about there being one of
+//! it, which is the argument `blend.wgsl` makes for being `concat!`ed into
+//! both passes, and not about a bug that was fixed here.
 //!
 //! The font bytes are included a second time here rather than shared with
 //! `theme.rs`: that module hands its copy to egui as a `'static` slice inside an
@@ -136,8 +141,7 @@ impl Font {
             let Some(gid) = charmap.map(ch) else { continue };
             if let Some(glyph) = outlines.get(gid) {
                 let settings = DrawSettings::unhinted(self.size, &self.location);
-                let mut pen =
-                    Pen::new(&mut raster, cursor, baseline, (width as f32, height as f32));
+                let mut pen = Pen::new(&mut raster, cursor, baseline);
                 // A glyph that will not draw is skipped rather than aborting the
                 // run; a splash missing one letter beats a splash missing all
                 // of them.
