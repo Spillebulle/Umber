@@ -1409,8 +1409,13 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     // were recorded — a menu contradicting a panel about the same
     // list. Clearing a layer and resizing the canvas are still
     // outside it, and both still clear the list.
+    // "in the history" and not "to this document": clearing a layer and
+    // resizing the canvas both empty the list, so a document twenty strokes
+    // deep can reach this line, and a sentence claiming nothing had been done
+    // to it would be flatly false in exactly the case the paragraph above
+    // names.
     if menu_item(ui, Action::Undo, ed.history.can_undo())
-        .on_disabled_hover_text("Nothing has been done to this document yet.")
+        .on_disabled_hover_text("Nothing in the history to undo.")
         .clicked()
     {
         actions.undo = true;
@@ -1438,21 +1443,36 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         ed.deselect();
         ui.close();
     }
-    // Never disabled. It writes nothing, and with nothing selected
-    // it copies the whole layer.
-    if menu_item(ui, Action::Copy, true).clicked() {
-        actions.copy_selection = true;
-        ui.close();
-    }
-    // Gated on the lock, matching the canvas strip's Cut button and
-    // the gate inside `App::cut_selection`: a cut takes pixels off
-    // the layer, so a locked one refuses it, and the row says so
-    // before the click rather than answering with a notice.
+    // Cut, Copy, Paste, in that order, because that is the order every desktop
+    // draws them and the order the keys sit in on the bottom row.
+    //
+    // **Both say what they do with nothing selected, and Cut needs to.**
+    // `take_region` falls back to the whole layer, so a Cut here with no
+    // marquee standing clears the picture — which was reachable before only by
+    // Ctrl+X, since the canvas strip that carries the other Cut is drawn only
+    // while a selection is live. A new way in to a destructive command is the
+    // wrong place to say less than the old one did.
+    //
+    // Gated on the lock, matching that strip's Cut button and the gate inside
+    // `App::cut_selection`: a cut takes pixels off the layer, so a locked one
+    // refuses it, and the row says so before the click rather than answering
+    // with a notice.
     if menu_item(ui, Action::Cut, !ed.layers.active_is_locked())
+        .on_hover_text(
+            "Takes the selection onto the clipboard. Cuts the whole layer if nothing is selected.",
+        )
         .on_disabled_hover_text("Unlock the layer to cut from it.")
         .clicked()
     {
         actions.cut_selection = true;
+        ui.close();
+    }
+    // Never disabled: it writes nothing.
+    if menu_item(ui, Action::Copy, true)
+        .on_hover_text("Copies the selection. Copies the whole layer if nothing is selected.")
+        .clicked()
+    {
+        actions.copy_selection = true;
         ui.close();
     }
     // **Never disabled, and `ed.clipboard.is_none()` is the wrong
@@ -1641,16 +1661,9 @@ mod strip_budget {
     pub const SELECT_OP: f32 = 105.0;
     /// The feather rail, its label and its readout.
     pub const FEATHER: f32 = 165.0;
-    /// The second sentence for the Pan and Zoom tools — the one naming the
-    /// gesture that reaches the same thing with any tool in hand. Measured
-    /// against what is *left* after the first sentence, exactly as [`COMBINE`]
-    /// is, because the first is drawn unconditionally and is in no budget.
-    /// Wide enough for the longer of the two, which is Zoom's — measured off
-    /// `options_strip_preview`'s shots rather than guessed, because this one is
-    /// a whole sentence and a budget below its real cost draws it half off the
-    /// edge instead of not drawing it. 280 was that mistake: it let Zoom's line
-    /// start at a strip width of about 630, where it needs 365.
-    pub const NAVIGATE_MORE: f32 = 370.0;
+    // Pan's and Zoom's second sentence are budgeted per tool, on
+    // `navigate_hint`'s own third field, because the two lines are a third
+    // apart in width and one figure for both drops Pan's while it still fits.
 }
 
 /// What the Pan and Zoom tools do, and how to reach the same thing without
@@ -1663,16 +1676,38 @@ mod strip_budget {
 /// under the primary modifier do the same job mid-stroke; the strip is where
 /// that is worth saying, since a held modifier is part of a gesture rather than
 /// a command and is therefore deliberately not in the rebindable table. Same
-/// reasoning as [`combine_hint`], and it is why these are `const fn`s over
-/// [`shortcuts::primary_modifier_name`] rather than `format!` per frame: the
-/// modifier is named for the platform, and neither line can change at run time
-/// because neither gesture is bindable.
+/// reasoning as [`combine_hint`], which is also why this is a `const fn`
+/// returning `&'static str` rather than a `format!` per frame: the strip is
+/// painted every frame and neither line can change at run time, because
+/// neither gesture is bindable.
 ///
-/// The second half of each is behind [`strip_budget::NAVIGATE_MORE`]: the strip
-/// is one unwrapped row, so a sentence that does not fit runs off the end of it
-/// rather than reflowing.
-const fn navigate_hint(tool: Tool) -> (&'static str, &'static str) {
+/// **The modifier is spelled out here rather than taken from
+/// [`shortcuts::primary_modifier_name`], and that is a `const fn` limitation
+/// rather than a preference.** A `const fn` cannot concatenate, so the choice
+/// was between writing "Cmd"/"Ctrl" under the same `cfg!` that function uses,
+/// or building the line at run time on the drawing path. [`combine_hint`] made
+/// the same trade and says so; this is the third place that spelling lives, and
+/// if it ever becomes a fourth it should be a `concat!` under `#[cfg]` off one
+/// constant instead.
+///
+/// The third field is what the second sentence costs, so the strip can drop it
+/// on its own terms: it is one unwrapped row, and a sentence that does not fit
+/// runs off the end rather than reflowing. Per tool rather than one figure for
+/// both, because Zoom's line is a third longer than Pan's and a shared budget
+/// takes Pan's away at a width that would have held it comfortably. Measured
+/// off `options_strip_preview`'s shots and pinned by
+/// `neither_navigation_hint_overruns_the_strip_it_is_drawn_on`.
+///
+/// **Exhaustive over [`Tool`] rather than a wildcard**, for the reason
+/// `panels::edit_icon` is exhaustive over `EditKind`: ten of the design's
+/// sixteen tools are not built, and the first navigation tool added would
+/// otherwise silently draw Pan's two sentences. The four that never reach this
+/// branch are named so that `Tool` growing is a compile error and not a wrong
+/// sentence — `options_strip` handles them above, and if one ever fell through
+/// to here saying nothing is better than saying something false.
+const fn navigate_hint(tool: Tool) -> (&'static str, &'static str, f32) {
     match tool {
+        Tool::Brush | Tool::Eraser | Tool::Select | Tool::Transform => ("", "", f32::INFINITY),
         Tool::Zoom => (
             "Drag right or up to zoom in, left or down to zoom out.",
             if cfg!(target_os = "macos") {
@@ -1680,13 +1715,12 @@ const fn navigate_hint(tool: Tool) -> (&'static str, &'static str) {
             } else {
                 "Hold Ctrl and roll the wheel to zoom at the pointer with any tool in hand."
             },
+            370.0,
         ),
-        // Pan's, and every tool that is not Zoom: the branch this sits in is
-        // reached by Pan and Zoom alone, and a wildcard keeps the function
-        // total without a panic nobody could ever see.
-        _ => (
+        Tool::Pan => (
             "Drag on the canvas to move the picture.",
             "Hold Space to do the same with any tool in hand.",
+            250.0,
         ),
     }
 }
@@ -1885,7 +1919,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // Pan and Zoom. Two sentences in the Transform hint's register
             // rather than a control, because like Transform there is nothing
             // here to set: the whole gesture is the pointer's.
-            let (does, instead) = navigate_hint(ed.ui.tool);
+            let (does, instead, budget) = navigate_hint(ed.ui.tool);
             ui.label(
                 egui::RichText::new(does)
                     .size(text::SMALL)
@@ -1894,7 +1928,7 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             // Read afresh rather than against the room measured earlier, for
             // the reason the selection tool's combine line reads it afresh: the
             // sentence above is drawn unconditionally and is in no budget.
-            if ui.available_width() >= strip_budget::NAVIGATE_MORE {
+            if ui.available_width() >= budget {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(instead)
@@ -3369,14 +3403,26 @@ mod tests {
         }
     }
 
-    /// A piece of text a menu drew, and where it drew it.
+    /// A piece of text the interface drew, and the rectangle it occupies.
+    ///
+    /// The rectangle rather than only a point, because two tests want different
+    /// things from it: the menu tests aim a click at its centre and match rows
+    /// by its baseline, and the strip test asks whether its right edge is still
+    /// on the strip.
     #[derive(Clone, Debug)]
     struct Drawn {
         text: String,
-        at: egui::Pos2,
+        rect: egui::Rect,
     }
 
-    /// Every string a shape tree paints, with its centre.
+    impl Drawn {
+        /// Where a click on this string lands.
+        fn at(&self) -> egui::Pos2 {
+            self.rect.center()
+        }
+    }
+
+    /// Every string a shape tree paints, with the rectangle it paints into.
     ///
     /// A `Shape::Vec` is what a widget's own painting comes back as, so this
     /// recurses rather than reading the top level.
@@ -3384,7 +3430,7 @@ mod tests {
         match shape {
             egui::Shape::Text(text) => out.push(Drawn {
                 text: text.galley.text().to_owned(),
-                at: text.pos + text.galley.size() * 0.5,
+                rect: egui::Rect::from_min_size(text.pos, text.galley.size()),
             }),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -3490,7 +3536,7 @@ mod tests {
                         .unwrap_or_else(|| {
                             panic!("the {menu:?} menu draws no row called {label:?}")
                         })
-                        .at,
+                        .at(),
                 );
             }
         }
@@ -3512,6 +3558,7 @@ mod tests {
     /// it has somewhere to be clicked.
     #[test]
     fn every_file_edit_and_view_command_has_a_menu_row() {
+        let mut demanded = 0;
         for menu in [Menu::File, Menu::Edit, Menu::View] {
             let mut ed = Editor::default();
             let drawn = menu_strings(menu, &mut ed);
@@ -3525,8 +3572,21 @@ mod tests {
                     action.label(),
                     drawn.iter().map(|d| &d.text).collect::<Vec<_>>()
                 );
+                demanded += 1;
             }
         }
+        // A floor, because the *whole* selling point of this test is that it
+        // reads the set off `Action::category` rather than listing it — and
+        // `Menu::of_category` answers `None` for a string it does not know, so
+        // a renamed category would quietly stop being demanded and leave this
+        // green over an empty loop. Fifteen rows are demanded today.
+        // `no_command_category_is_skipped_by_accident` catches the same decay
+        // from the other side; this catches it if that list is widened
+        // carelessly.
+        assert!(
+            demanded >= 15,
+            "only {demanded} rows were demanded, so a category has stopped being routed"
+        );
     }
 
     /// A menu row standing for a command is named as the command is named.
@@ -3541,35 +3601,228 @@ mod tests {
     /// action, so it says a row for that command exists without assuming
     /// anything about what the row is called. Chords shared by two commands are
     /// skipped, since either label would satisfy them.
+    ///
+    /// **The label has to be on the chord's own row**, matched by the shared
+    /// baseline `menu_item` draws both on. Asserting only that the label
+    /// appears *somewhere* in the menu was the first draft and a review found
+    /// it hollow: swapping two rows' labels leaves every label and every chord
+    /// present, so Copy wearing Cut's name and Cut wearing Copy's would have
+    /// passed. `mutating_a_menu_row_is_caught_by_the_label_test` drives that
+    /// exact swap through the same comparison.
     #[test]
     fn a_menu_row_standing_for_a_command_carries_the_commands_own_name() {
+        for menu in [Menu::File, Menu::Edit, Menu::View] {
+            let mut ed = Editor::default();
+            let drawn = menu_strings(menu, &mut ed);
+            let checked = check_rows_are_named_for_their_chords(menu, &drawn)
+                .unwrap_or_else(|complaint| panic!("{complaint}"));
+            // Otherwise a menu that drew no chords at all would pass in
+            // silence. Counted per menu rather than over all three, so one
+            // going quiet cannot be made up for by the other two.
+            assert!(
+                checked >= 2,
+                "only {checked} rows of the {menu:?} menu carried a chord to check"
+            );
+        }
+    }
+
+    /// The label test's rule, as a function, so the mutation it exists to catch
+    /// can be driven through it rather than described in a comment.
+    ///
+    /// `Ok(n)` having checked `n` rows, `Err` naming the first row whose label
+    /// is not its chord's.
+    fn check_rows_are_named_for_their_chords(menu: Menu, drawn: &[Drawn]) -> Result<usize, String> {
         let bound: Vec<(Action, String)> = Action::ALL
             .into_iter()
             .filter_map(|a| shortcuts::first_chord(a).map(|c| (a, c)))
             .collect();
         let mut checked = 0;
-        for menu in [Menu::File, Menu::Edit, Menu::View] {
-            let mut ed = Editor::default();
-            let drawn = menu_strings(menu, &mut ed);
-            for (action, chord) in &bound {
-                if bound.iter().filter(|(_, c)| c == chord).count() != 1 {
-                    continue;
-                }
-                if !drawn.iter().any(|d| &d.text == chord) {
-                    continue;
-                }
-                assert!(
-                    drawn.iter().any(|d| d.text == action.label()),
+        for (action, chord) in &bound {
+            if bound.iter().filter(|(_, c)| c == chord).count() != 1 {
+                continue;
+            }
+            let Some(row) = drawn.iter().find(|d| &d.text == chord) else {
+                continue;
+            };
+            // A row's label and its chord are drawn on one baseline, so the
+            // label is whichever string shares this chord's y. Half a line of
+            // slack, because the two galleys are different sizes and their
+            // centres need not agree to the last bit of an f32.
+            let named = drawn
+                .iter()
+                .any(|d| d.text == action.label() && (d.at().y - row.at().y).abs() < 6.0);
+            if !named {
+                return Err(format!(
                     "the {menu:?} menu draws {chord} on a row that is not called {:?}; \
                      it draws {:?}",
                     action.label(),
                     drawn.iter().map(|d| &d.text).collect::<Vec<_>>()
-                );
-                checked += 1;
+                ));
             }
+            checked += 1;
         }
-        // Otherwise a menu that drew no chords at all would pass in silence.
-        assert!(checked >= 8, "only {checked} rows carried a chord to check");
+        Ok(checked)
+    }
+
+    /// Two rows wearing each other's names is caught.
+    ///
+    /// The mutation a review found the first draft of the label test blind to:
+    /// every label and every chord is still present, so an assertion that only
+    /// asks whether the label appears in the menu passes. This builds that
+    /// state directly — the same strings the Edit menu draws, with Cut's and
+    /// Copy's labels swapped onto each other's baselines — and requires the
+    /// rule to refuse it.
+    #[test]
+    fn mutating_a_menu_row_is_caught_by_the_label_test() {
+        let mut ed = Editor::default();
+        let honest = menu_strings(Menu::Edit, &mut ed);
+        check_rows_are_named_for_their_chords(Menu::Edit, &honest)
+            .expect("the Edit menu as drawn is honest");
+
+        // Each label keeps its own text and moves onto the other's row, which
+        // is what a call site handing `menu_item` the wrong label would draw.
+        let row_of = |label: &str| {
+            honest
+                .iter()
+                .find(|d| d.text == label)
+                .unwrap_or_else(|| panic!("the Edit menu draws no {label:?}"))
+                .rect
+        };
+        let (cut, copy) = (row_of(Action::Cut.label()), row_of(Action::Copy.label()));
+        let swapped: Vec<Drawn> = honest
+            .iter()
+            .map(|d| {
+                if d.text == Action::Cut.label() {
+                    Drawn {
+                        text: Action::Copy.label().to_owned(),
+                        rect: cut,
+                    }
+                } else if d.text == Action::Copy.label() {
+                    Drawn {
+                        text: Action::Cut.label().to_owned(),
+                        rect: copy,
+                    }
+                } else {
+                    d.clone()
+                }
+            })
+            .collect();
+        assert!(
+            check_rows_are_named_for_their_chords(Menu::Edit, &swapped).is_err(),
+            "two rows wearing each other's names went unnoticed"
+        );
+    }
+
+    /// Neither navigation hint runs off the strip it is drawn on.
+    ///
+    /// The strip is a single unwrapped row, so a sentence too long for it does
+    /// not reflow — it carries on past the right edge, off the window. That is
+    /// what `navigate_hint`'s budget exists to prevent, and the budget is a
+    /// hand-measured number, which is exactly the kind that goes stale when
+    /// somebody edits a sentence.
+    ///
+    /// **Asserted rather than left to the picture test.** The first version of
+    /// this said an assertion about a string's width would be a claim about a
+    /// font; it is a claim about *Archivo*, which Umber ships and
+    /// `theme::install_fonts` installs, and three tests in this crate already
+    /// make it — `a_number_row_is_no_wider_than_the_column_it_is_drawn_in` is
+    /// the pattern. `options_strip_preview` still shoots 740 and 720 because a
+    /// picture answers a different question: whether the line reads well, not
+    /// whether it fits.
+    ///
+    /// Swept rather than sampled, because a budget is wrong over a *range* of
+    /// widths: too small a figure draws the sentence at every width between the
+    /// budget and what the sentence costs, and a two-point sample can miss the
+    /// whole band. This walks every 5 points from far too narrow to far too
+    /// wide and requires the content to stay inside the strip at each.
+    #[test]
+    fn neither_navigation_hint_overruns_the_strip_it_is_drawn_on() {
+        use crate::editor::Tool;
+
+        for tool in [Tool::Pan, Tool::Zoom] {
+            let ctx = egui::Context::default();
+            let palette = Palette::of(ThemeKind::Graphite);
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply(&ctx, &palette);
+            let mut widest_overrun: Option<(f32, f32)> = None;
+            let mut ever_drew_the_second = false;
+            for step in 0..140 {
+                let width = 200.0 + step as f32 * 5.0;
+                let mut ed = Editor::default();
+                ed.ui.tool = tool;
+                // Two passes: the first through a fresh context builds the font
+                // atlas, and text measured against a half-built one is not the
+                // width it settles at.
+                let mut drawn = Vec::new();
+                for _ in 0..2 {
+                    drawn.clear();
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(width, metrics::OPTIONS_STRIP),
+                        )),
+                        ..Default::default()
+                    };
+                    let output = ctx.run_ui(input, |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                            .show(ui, |ui| {
+                                ui.set_height(metrics::OPTIONS_STRIP);
+                                super::options_strip(ui, &palette, &mut ed);
+                            });
+                    });
+                    for clipped in &output.shapes {
+                        strings_in(&clipped.shape, &mut drawn);
+                    }
+                }
+                let (_, instead, _) = super::navigate_hint(tool);
+                if let Some(second) = drawn.iter().find(|d| d.text == instead) {
+                    ever_drew_the_second = true;
+                    // The galley's own right edge, read back off the shape
+                    // rather than computed from a character count, which is the
+                    // whole point of measuring instead of estimating.
+                    if second.rect.right() > width {
+                        widest_overrun = Some((width, second.rect.right()));
+                    }
+                }
+            }
+            assert!(
+                ever_drew_the_second,
+                "{tool:?}'s second sentence was never drawn at any width, so \
+                 this test proved nothing"
+            );
+            assert!(
+                widest_overrun.is_none(),
+                "{tool:?}'s second sentence runs to {:.0} points on a {:.0} point strip",
+                widest_overrun.unwrap().1,
+                widest_overrun.unwrap().0
+            );
+        }
+    }
+
+    /// Every category [`Action::category`] can answer with is either a menu
+    /// this test knows or a category deliberately not on the menu bar.
+    ///
+    /// [`Menu::of_category`] answers `None` for anything it does not recognise,
+    /// and `None` means "needs no row" — the unsafe default. Without this, a
+    /// command filed under a new category would be skipped by the coverage test
+    /// in silence, which is the failure that test exists to prevent.
+    #[test]
+    fn no_command_category_is_skipped_by_accident() {
+        // Tools, Brush and Colour are reached from the rail, the brush editor
+        // and the colour panel. They are deliberately not menu bar commands,
+        // and a category leaving this list has to be decided about rather than
+        // fall through `of_category`'s wildcard.
+        const OFF_THE_MENU_BAR: [&str; 3] = ["Tools", "Brush", "Colour"];
+        for action in Action::ALL {
+            let category = action.category();
+            assert!(
+                Menu::of_category(category).is_some() || OFF_THE_MENU_BAR.contains(&category),
+                "{:?} is filed under {category:?}, which is neither a menu nor \
+                 named as off the menu bar",
+                action.label()
+            );
+        }
     }
 
     /// Paste is offered with Umber's own clipboard empty.
@@ -3604,6 +3857,15 @@ mod tests {
     /// gate `App::cut_selection` already keeps: a cut takes pixels off the
     /// layer, a copy writes nothing. Two rows in one test because the risk is
     /// getting them the same way round.
+    ///
+    /// **Cut is clicked on an unlocked layer as well as a locked one**, and the
+    /// first draft was not. A review pointed out that asserting only the
+    /// refusal is satisfied by a Cut that is dead in every state — mutating the
+    /// gate to a plain `false` left it green — so what it proved was "Cut is
+    /// dead when locked" rather than "Cut answers to the lock". It also makes
+    /// the negative half mean something: a click that missed the row entirely
+    /// would satisfy `!cut_selection` for the wrong reason, and the unlocked
+    /// case is what says the aim is good.
     #[test]
     fn cut_answers_to_the_lock_and_copy_does_not() {
         let mut ed = Editor::default();
@@ -3617,6 +3879,17 @@ mod tests {
         assert!(
             actions.copy_selection,
             "Copy was refused by a lock, though it writes nothing"
+        );
+
+        let mut ed = Editor::default();
+        assert!(
+            !ed.layers.active_is_locked(),
+            "a fresh editor's layer is supposed to be unlocked"
+        );
+        let actions = click_menu_row(Menu::Edit, &mut ed, Action::Cut.label());
+        assert!(
+            actions.cut_selection,
+            "Cut was dead on an unlocked layer, so the row answers to nothing"
         );
     }
 

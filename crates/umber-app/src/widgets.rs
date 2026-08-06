@@ -535,9 +535,17 @@ fn from_t(t: f32, lo: f32, hi: f32, log: bool) -> f32 {
 /// should not be able to describe one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Grab {
-    /// The pointer went down and came up again without travelling.
+    /// egui settled this as a click: `Response::clicked`.
+    ///
+    /// **Not "a press that did not travel", and the difference matters where
+    /// this is read.** egui promotes a motionless press to a drag once it
+    /// outlives its click duration, so a slow, stationary press on a rail
+    /// arrives as [`Grab::Drag`] and still writes. What the out-of-span refusal
+    /// therefore stops is a *quick* tap, which is the gesture that was
+    /// destroying values by accident; a press deliberately held on the spot is
+    /// read as the deliberate thing it is.
     Tap,
-    /// The pointer is being dragged along the rail.
+    /// `Response::dragged` — including a press held still for long enough.
     Drag,
 }
 
@@ -579,7 +587,10 @@ struct Span {
 /// 300/s past a rail stopping at 100, 2 a spacing of 1.47 and 5.12 past one
 /// stopping at 0.5 — spacings `docs`' dab-shape rule calls deliberate — and 13
 /// a stroke span outside `1..=500` in *both* directions, down to 0.61 and up to
-/// 2779. Hence the test against `lo` as well as `hi`.
+/// 2779. Hence the test against `lo` as well as `hi`. Those four are the
+/// *shipped* library; a brush somebody saved or imported can be out of span on
+/// any rail at all, so this is a rule about rails rather than a list of four
+/// fields, and it is written that way deliberately.
 ///
 /// [`crate::tweaks::Tweak::range`] already states the principle this restores:
 /// "a rail's span is not a bound on the value". This is the one place the
@@ -2712,6 +2723,16 @@ mod tests {
     /// under the pointer, whichever gesture put it there", and it is asserted
     /// here over the whole track, both gestures, both mappings and a snap,
     /// rather than argued in a commit message.
+    ///
+    /// **It is a golden copy, and that is its honest limit.** The expected
+    /// figure is the old arithmetic written out again rather than the old code
+    /// called, so it catches a later *change* to the mapping and could not have
+    /// caught a mis-transcription made in the same edit by the same hand. What
+    /// it does prove outright is the part that mattered: it drives `span.lo`
+    /// and `span.hi` themselves under `Grab::Tap`, so the guard's comparison is
+    /// pinned as strict at both ends and a `<=` or `>=` slip — which would make
+    /// a rail refuse a tap on a value sitting exactly on its own limit — fails
+    /// it.
     #[test]
     fn a_value_inside_its_rails_span_reads_exactly_what_it_used_to() {
         let track = a_track();
