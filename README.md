@@ -316,11 +316,16 @@ a speed-derived approximation, and a mouse always paints at full pressure.
 ## What is not there yet
 
 - **Ten of the sixteen tools**, shapes among them.
-- **Three things about text**, each of which the panel tells you about rather
-  than letting you find out later. Lines break where you break them and nothing
-  wraps. A line mixing left-to-right and right-to-left writing is shaped but not
-  reordered. A character the chosen face has no glyph for is left blank rather
-  than borrowed from another font.
+- **Text becomes paint the moment you place it.** It is not kept as text, so
+  reopening a document gives you the picture and not the words, and fixing a
+  typo means undoing and typing it again. Everything up to placing it is live:
+  the face, the size and the setting can all be changed while you are still in
+  the panel.
+- **Three more things about text**, each of which the panel tells you about
+  rather than letting you find out later. Lines break where you break them and
+  nothing wraps. A line mixing left-to-right and right-to-left writing is shaped
+  but not reordered. A character the chosen face has no glyph for is left blank
+  rather than borrowed from another font.
 - **Two commands still throw the undo history away**: clearing a layer, and
   resizing the canvas. Both say so before you do them. Everything else is
   undoable, including deleting a layer.
