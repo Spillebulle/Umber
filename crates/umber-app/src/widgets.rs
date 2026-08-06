@@ -3107,6 +3107,14 @@ mod tests {
             "\u{4e2d}"
         ));
         assert!(contains_ignore_case("Ramón Miranda", "RAM"));
+        // **The fold is ASCII and stops there**, pinned rather than described:
+        // `Ö` and `ö` are two different bytes and this does not fold them, so a
+        // Norwegian or German family name matches only on the case it is
+        // written in. Stated as assertions so that widening the fold turns a
+        // test green and asks for a decision, rather than needing somebody to
+        // notice a paragraph saying it used to be true.
+        assert!(!contains_ignore_case("Öffentlich", "öffentlich"));
+        assert!(contains_ignore_case("Öffentlich", "ffentlich"));
     }
 
     /// A drag still writes, so an out-of-span value is never stuck.
