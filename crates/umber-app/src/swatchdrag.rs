@@ -208,8 +208,13 @@ mod tests {
     use super::*;
     use egui::{pos2, vec2};
 
-    const SIZE: f32 = 26.0;
-    const GAP: f32 = 4.0;
+    use crate::theme::metrics;
+    use umber_core::palette::{Palette, Swatch};
+
+    /// The grid the panel actually draws, so a change to either figure is felt
+    /// here rather than silently diverging from what `palettelib` lays out.
+    const SIZE: f32 = metrics::PALETTE_SWATCH;
+    const GAP: f32 = metrics::PALETTE_SWATCH_GAP;
     const STEP: f32 = SIZE + GAP;
     const ORIGIN: Pos2 = pos2(10.0, 20.0);
 
@@ -241,9 +246,20 @@ mod tests {
     }
 
     /// `Palette::can_move_swatch` with the source bound, over a palette of
-    /// `len`. The real predicate is the model's, which is the point.
+    /// `len` colours.
+    ///
+    /// **The model's own predicate, called**, not a restatement of it. This
+    /// used to be `to < len && to != from`, which is the same answer written a
+    /// second time — and a second statement of a rule is a second thing to keep
+    /// in step, which is exactly what taking the predicate as an argument
+    /// exists to avoid. `umber-app` depends on `umber-core`, so there was never
+    /// a reason to copy it.
     fn moving(from: usize, len: usize) -> impl Fn(usize) -> bool {
-        move |to| to < len && to != from
+        let mut palette = Palette::new("Test");
+        for n in 0..len {
+            palette.add(Swatch::new([n as u8, 0, 0]));
+        }
+        move |to| palette.can_move_swatch(from, to)
     }
 
     #[test]

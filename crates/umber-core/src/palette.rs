@@ -175,6 +175,13 @@ impl std::error::Error for PaletteError {}
 /// The name may be empty. `.gpl` allows it, and a colour picked off the canvas
 /// has no name anybody chose — inventing "Untitled" for it would put a word in
 /// every cell of a grid that is meant to be colours.
+///
+/// **Set it through [`Palette::name_swatch`] and not on the field.** The field
+/// is public because the whole struct is plain data, but the line format has no
+/// escaping, so [`Palette::to_gpl`] cleans on the way out; a name written
+/// straight onto the field can therefore differ from what a save and a reopen
+/// give back. `name_swatch` applies the writer's own rule at the point the name
+/// arrives, which is what makes the two agree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Swatch {
     /// sRGB, opaque. See the module docs for why this is not a [`Color`].

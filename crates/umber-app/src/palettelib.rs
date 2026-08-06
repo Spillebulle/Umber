@@ -353,6 +353,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
 
     if !state.writable() {
+        forget_gesture(ui.ctx(), &mut state);
         controls::note(ui, p, state.why_not());
         store(ui.ctx(), state);
         return;
@@ -362,6 +363,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     ui.add_space(8.0);
 
     if state.current().is_none() {
+        forget_gesture(ui.ctx(), &mut state);
         empty_library(ui, p, ed, &mut state);
         store(ui.ctx(), state);
         return;
@@ -398,7 +400,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             // exactly why it is here, as the case that is left when it has not.
             state.naming = None;
             edit_current(&mut state, ed, "Could not save the palette", |palette| {
-                palette.remove(index);
+                palette.remove(index).is_some()
             });
         }
         Some(Act::Move { from, to }) => {
@@ -406,7 +408,7 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
             // The one write a drag makes, at the release. See the module docs:
             // a save reaches the disk immediately, so aiming must not write.
             edit_current(&mut state, ed, "Could not save the palette", |palette| {
-                palette.move_swatch(from, to);
+                palette.move_swatch(from, to)
             });
         }
         Some(Act::Name(index)) => {
@@ -434,6 +436,25 @@ fn naming_for(state: &State, index: usize) -> Option<Naming> {
     })
 }
 
+/// Whether an open naming field still names the colour it was opened on.
+///
+/// A pure function of the state rather than a condition written inline where
+/// the field is drawn, because [`Naming`] calls this its structural guard and a
+/// guard nothing can check is a claim rather than a guard. Same division the
+/// rest of this module keeps: the rule is testable without a window.
+///
+/// Three things have to hold — the palette in front is the one the field was
+/// opened on, the index still names a colour, and that colour is still the one
+/// that was there. The third is what catches a remove having shifted every
+/// position after it.
+fn naming_is_live(state: &State, naming: &Naming) -> bool {
+    state.selected.as_deref() == Some(naming.palette.as_str())
+        && state
+            .current()
+            .and_then(|palette| palette.swatches.get(naming.index))
+            .is_some_and(|swatch| swatch.rgb == naming.rgb)
+}
+
 /// The colour chip beside the naming field: which colour is being named, said
 /// by showing it rather than by a word.
 const NAMING_CHIP: f32 = 16.0;
@@ -446,13 +467,10 @@ fn naming_field(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     // Nothing at all unless the field is open, on the palette in front, and
     // still over the colour it was opened on. See [`Naming`]: the alternative
     // is a name written onto a colour nobody was naming.
-    let live = state.naming.as_ref().is_some_and(|naming| {
-        state.selected.as_deref() == Some(naming.palette.as_str())
-            && state
-                .current()
-                .and_then(|q| q.swatches.get(naming.index))
-                .is_some_and(|swatch| swatch.rgb == naming.rgb)
-    });
+    let live = state
+        .naming
+        .as_ref()
+        .is_some_and(|naming| naming_is_live(state, naming));
     if !live {
         state.naming = None;
         return;
@@ -483,7 +501,10 @@ fn naming_field(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
             Stroke::new(1.0, p.border),
             StrokeKind::Inside,
         );
-        shown.on_hover_text(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+        // `Swatch::hex` and not a `format!` written here: there is one
+        // statement of what a colour reads as, and the grid's own tooltip four
+        // hundred lines up uses it.
+        shown.on_hover_text(Swatch::new(rgb).hex());
 
         let field = ui.add(
             egui::TextEdit::singleline(&mut naming.text)
@@ -514,7 +535,7 @@ fn naming_field(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
         state.naming = None;
         if let Some(name) = typed {
             edit_current(state, ed, "Could not save the palette", |palette| {
-                palette.name_swatch(index, &name);
+                palette.name_swatch(index, &name)
             });
         }
     }
@@ -639,15 +660,27 @@ fn name_rect(cell: Rect) -> Rect {
     )
 }
 
-/// The dash rhythm the dock's drop indicator and the layer list's drop slot are
-/// both drawn with, so the three read as one mark rather than three.
-const DROP_DASH: f32 = 5.0;
-const DROP_GAP: f32 = 4.0;
+/// The rectangle the drop mark is drawn on, given the cell it names.
+///
+/// Its own function, and the *only* statement of it, because the test that says
+/// the mark covers no colour and reaches no neighbour has to measure what
+/// [`drop_ring`] actually draws. A test that recomputed this expression would
+/// be checking its own arithmetic: widen it here to eat the neighbour and every
+/// assertion would still pass. That is the failure CLAUDE.md records as a guard
+/// covering a copy of the code rather than the code, and it is worth a function
+/// to close.
+///
+/// Half the gap either side, less half the stroke, is exactly the room
+/// `PALETTE_SWATCH_GAP` leaves between two colours.
+fn drop_ring_rect(cell: Rect) -> Rect {
+    cell.expand(metrics::PALETTE_SWATCH_GAP * 0.5 - 0.5)
+}
 
 /// Where a dragged colour would land: a dashed accent ring in the gap **around**
 /// the cell it would take.
 ///
-/// Three decisions, and each is against something the layer list does.
+/// Two decisions about the *mark*, and each is against something the layer list
+/// does.
 ///
 /// **Around rather than over.** `panels::drop_slot` washes the row it names
 /// with a tenth of the accent. A swatch cannot take one: the wash would tint
@@ -663,14 +696,20 @@ const DROP_GAP: f32 = 4.0;
 /// failure `drop_slot` was written to record: borrowing the selected row's fill
 /// made "this lands here" and "this is selected" indistinguishable.
 ///
-/// **Square-cornered**, which is where this departs from the rounded house
-/// mark. At a 1.5 px offset a rounded ring traces the swatch's own outline and
-/// reads as a thicker copy of it; square corners make it legibly a frame
-/// *round* the colour rather than a second edge *on* it. It is also why this is
-/// five points handed to egui's own `dashed_line` rather than a rounded outline
-/// restated — there is no arc here to get wrong.
+/// **Square-cornered**, because at a pixel and a half's offset a rounded ring
+/// traces the swatch's own outline and reads as a thicker copy of it.
+///
+/// **This should be `panels::dashed_rect` and is not, and the reason is not a
+/// design one.** That function at a radius below half a pixel returns these
+/// five points exactly — see `panels::rounded_outline`, which short-circuits to
+/// the four corners — so `dashed_rect(painter, ring, 0.0, …)` draws the
+/// identical mark. It is private to `panels`, and the change that would fix
+/// this is one word on its signature. Until that is made, `metrics::DASH` and
+/// `metrics::DASH_GAP` are at least the one statement of the rhythm, so the
+/// dock's indicator, the layer list's slot and this cannot come to disagree
+/// about what a dashed mark in this interface looks like.
 fn drop_ring(painter: &egui::Painter, p: &Palette, cell: Rect) {
-    let ring = cell.expand(metrics::PALETTE_SWATCH_GAP * 0.5 - 0.5);
+    let ring = drop_ring_rect(cell);
     let corners = [
         ring.left_top(),
         ring.right_top(),
@@ -681,9 +720,34 @@ fn drop_ring(painter: &egui::Painter, p: &Palette, cell: Rect) {
     painter.extend(egui::Shape::dashed_line(
         &corners,
         Stroke::new(2.0, p.accent),
-        DROP_DASH,
-        DROP_GAP,
+        metrics::DASH,
+        metrics::DASH_GAP,
     ));
+}
+
+/// Which colour a press at `at` picks up, if any.
+///
+/// [`swatchdrag::cell_pressed`] with the two corner marks taken out, and that
+/// subtraction is not tidiness. A mark sits *inside* its swatch, so the plain
+/// containment test accepts a press on one — and egui calls a press a drag on
+/// **time** alone: `is_decidedly_dragging` is true once `max_click_duration`
+/// (six tenths of a second) has passed with the button held, whatever the
+/// pointer did. So holding Remove while deciding, and letting go a cell over,
+/// used to rearrange the palette instead of removing a colour — silently, with
+/// the `.gpl` written on the spot and no undo for a palette anywhere in Umber.
+///
+/// The layer list has the same shape with the eye toggle inside its row and
+/// gets away with it, because a reorder there records an `EditKind::MoveLayer`
+/// and this records nothing.
+///
+/// A pure function of the cells and a point, so the rule is checkable without a
+/// window — which is the only way anything about a drag begun by *waiting* can
+/// be checked at all.
+fn drag_origin(cells: &[swatchdrag::Cell], at: egui::Pos2) -> Option<usize> {
+    let index = swatchdrag::cell_pressed(cells, at)?;
+    let cell = cells.iter().find(|cell| cell.index == index)?;
+    let on_a_mark = remove_rect(cell.rect).contains(at) || name_rect(cell.rect).contains(at);
+    (!on_a_mark).then_some(index)
 }
 
 /// Where the colour being carried is kept between frames.
@@ -692,6 +756,23 @@ fn drop_ring(painter: &egui::Painter, p: &Palette, cell: Rect) {
 /// drag's is: it belongs to this grid, not to a document.
 fn drag_id() -> Id {
     Id::new("palette-swatch-drag")
+}
+
+/// Abandon whatever gesture the grid was in the middle of.
+///
+/// Called wherever the grid stops being drawn — the module removed from the
+/// layout, the library gone, an empty palette selected — and both halves are
+/// needed for the same reason. A `Drag` in the store outlives the grid that
+/// made it: it can never *act*, because [`swatchdrag::Drag::palette`] guards
+/// that, but it is an entry that would sit in egui's memory for the rest of the
+/// session. An open naming field is worse than untidy: the widget is not drawn
+/// while the module is closed, so egui drops its focus without the field ever
+/// reporting `lost_focus`, and reopening the module brings back a field that is
+/// unfocused, cannot report a focus it never lost, and can therefore never
+/// commit what is typed into it.
+fn forget_gesture(ctx: &egui::Context, state: &mut State) {
+    state.naming = None;
+    ctx.data_mut(|d| d.remove::<swatchdrag::Drag>(drag_id()));
 }
 
 fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<Act> {
@@ -818,7 +899,8 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
         // Not while a colour is being carried: the marks sit under the pointer
         // for the whole of a drag, and two chips flickering over the grid say
         // nothing about where the colour is going.
-        if (pointer_inside && !dragging) || named == Some(index) {
+        let revealed = pointer_inside && !dragging;
+        if revealed {
             ui.painter().rect_filled(mark, metrics::RADIUS, p.popover);
             crate::icons::draw(
                 ui.painter(),
@@ -830,6 +912,15 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
                     p.text_dim
                 },
             );
+        }
+        // The name mark alone stays out while the field below is open, so there
+        // is something on the grid saying which colour that field belongs to.
+        // **The remove mark deliberately does not**: it is destructive, there is
+        // no undo for a palette, and leaving it standing would park a live
+        // delete one pixel-slip from the field somebody is typing into. A mark
+        // that is only there to identify a colour has no business being the one
+        // that can throw it away.
+        if revealed || named == Some(index) {
             ui.painter().rect_filled(naming, metrics::RADIUS, p.popover);
             crate::icons::draw(
                 ui.painter(),
@@ -884,7 +975,7 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     if drag.is_none()
         && down
         && deciding
-        && let Some(index) = origin.and_then(|at| swatchdrag::cell_pressed(&cells, at))
+        && let Some(index) = origin.and_then(|at| drag_origin(&cells, at))
     {
         drag = Some(swatchdrag::Drag::new(id, index));
     }
@@ -943,38 +1034,57 @@ fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Change the palette in front, and write it out.
+/// Change the palette in front, and write it out — **if it changed**.
 ///
 /// One door, so every edit reads the palette, changes it and saves it in the
-/// same order — and so the write's failure is reported once rather than at four
+/// same order, and so the write's failure is reported once rather than at five
 /// call sites.
+///
+/// `change` answers whether it did anything, and a `false` writes nothing. That
+/// is not an optimisation: a `PaletteLibrary` write reaches the disk on the
+/// spot, and every one of the five model methods behind this already returns
+/// exactly that answer — a full palette refusing a colour, a move the model
+/// declined, a name typed identical to the one already there, a field that lost
+/// focus with nothing typed into it. Ignoring the answer meant pressing Enter
+/// on an unchanged name rewrote the artist's file. It also lets the callers
+/// stop guarding by hand: `keep_harmony` had a second room check for precisely
+/// this reason and no longer needs one.
 fn edit_current(
     state: &mut State,
     ed: &mut Editor,
     what: &str,
-    change: impl FnOnce(&mut ColourPalette),
+    change: impl FnOnce(&mut ColourPalette) -> bool,
 ) {
     let Some(mut palette) = state.current().cloned() else {
         return;
     };
-    change(&mut palette);
+    if !change(&mut palette) {
+        return;
+    }
     write(state, ed, what, |library| library.save(palette));
 }
 
 fn add_current_colour(state: &mut State, ed: &mut Editor) {
     let swatch = Swatch::of(ed.color);
     edit_current(state, ed, "Could not save the palette", |palette| {
-        palette.add(swatch);
+        palette.add(swatch)
     });
 }
 
 /// Put the harmony of the colour in hand into the palette in front.
 ///
 /// **The whole set or none of it** — `Palette::add_all` is the rule and the
-/// argument. The mark above is disabled where it will not fit, so this second
-/// gate is for the palette having changed between the frame the mark was drawn
-/// and the click; without it `edit_current` would write the file to say nothing
-/// happened.
+/// argument, and there is deliberately no second gate here. The mark above is
+/// disabled where the set will not fit, and where the palette has changed
+/// between that frame and the click `add_all` refuses and [`edit_current`]
+/// writes nothing, because it takes the answer rather than assuming one.
+///
+/// **A colour already in the palette goes in again**, including the base, which
+/// is always a member — `Harmony::offsets` puts the hue in hand first. Pressing
+/// the mark twice therefore puts the set in twice. That is `Palette::add`'s own
+/// rule and it is right for the same reason: a duplicate is something the
+/// artist can see and take out, where a control that silently did less than it
+/// said is something they would have to work out.
 ///
 /// Built from the picker's own [`Hsv`] and not from `Editor::color`, **including
 /// the member that is the colour in hand**. A harmony is a set of hues at one
@@ -997,14 +1107,8 @@ fn keep_harmony(state: &mut State, ed: &mut Editor) {
         .iter()
         .map(|hue| Swatch::of(Hsv::new(*hue, hsv.s, hsv.v).to_color(1.0)))
         .collect();
-    if !state
-        .current()
-        .is_some_and(|palette| palette.room_for(swatches.len()))
-    {
-        return;
-    }
     edit_current(state, ed, "Could not save the palette", |palette| {
-        palette.add_all(&swatches);
+        palette.add_all(&swatches)
     });
 }
 
@@ -1139,6 +1243,13 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
         return;
     }
     let mut state = load(root.ctx(), ed);
+    // This runs every frame whether or not the panel is in the layout, which
+    // makes it the one place that can see the module leave. A gesture left
+    // half-made cannot survive that: see `forget_gesture` for what an open
+    // naming field does when its widget stops being drawn.
+    if !ed.layout.is_open(crate::dock::PanelKind::Palette) {
+        forget_gesture(root.ctx(), &mut state);
+    }
     if !state.library_open {
         store(root.ctx(), state);
         return;
@@ -1835,23 +1946,32 @@ mod tests {
 
     /// The drop ring is drawn in the gap *around* the cell it names, so it may
     /// not reach a neighbour: a mark saying "the colour lands here" over the
-    /// colour beside the one it means is worse than no mark. Half the gap each
-    /// side, less half a pixel for the stroke, is what leaves it clear.
+    /// colour beside the one it means is worse than no mark. And it must not
+    /// cover the colour it names either — that is the whole reason it is a ring
+    /// rather than the layer list's wash of the accent, since the fill would
+    /// tint the swatch and this panel's one job is to show colours as they are.
     ///
-    /// And it must not cover the colour either. That is the whole reason it is
-    /// a ring rather than the layer list's wash of the accent — the fill would
-    /// tint the swatch, and this panel's one job is to show colours as they
-    /// are.
+    /// Measured against `drop_ring_rect`, which is what `drop_ring` actually
+    /// draws on. Recomputing the expression here would leave this checking its
+    /// own arithmetic: widening the real one to eat the neighbour would not
+    /// fail a single line below.
     #[test]
     fn the_drop_ring_covers_no_colour_and_reaches_no_neighbour() {
         let origin = pos2(10.0, 20.0);
         for columns in 1..=8usize {
             let cells: Vec<Rect> = (0..17).map(|i| swatch_rect(origin, i, columns)).collect();
             for (index, cell) in cells.iter().enumerate() {
-                let ring = cell.expand(metrics::PALETTE_SWATCH_GAP * 0.5 - 0.5);
+                let ring = drop_ring_rect(*cell);
+                // Outside the colour on every side, so nothing is painted over
+                // it. Stated as four strict inequalities rather than
+                // `contains_rect`, which a ring drawn *inside* the cell — the
+                // failure this is really about — would also satisfy.
                 assert!(
-                    ring.contains_rect(*cell),
-                    "{columns} columns, swatch {index}: the ring is inside the colour"
+                    ring.left() < cell.left()
+                        && ring.top() < cell.top()
+                        && ring.right() > cell.right()
+                        && ring.bottom() > cell.bottom(),
+                    "{columns} columns, swatch {index}: {ring:?} is not outside {cell:?}"
                 );
                 for (other, neighbour) in cells.iter().enumerate() {
                     if other != index {
@@ -1863,5 +1983,151 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A press on either corner mark must not pick the colour up.
+    ///
+    /// The marks are inside the cell, so the plain "is the press inside a
+    /// swatch" test accepts one — and egui calls a press a drag on **time**
+    /// alone once `max_click_duration` has passed, with no movement at all. So
+    /// holding Remove for six tenths of a second and letting go a cell over
+    /// silently rearranged the palette instead of removing a colour, and wrote
+    /// the file on the spot. There is no undo for a palette.
+    #[test]
+    fn a_press_on_a_corner_mark_does_not_pick_the_colour_up() {
+        let origin = pos2(10.0, 20.0);
+        let cells: Vec<swatchdrag::Cell> = (0..12)
+            .map(|index| swatchdrag::Cell {
+                index,
+                rect: swatch_rect(origin, index, 4),
+            })
+            .collect();
+        for cell in &cells {
+            for mark in [remove_rect(cell.rect), name_rect(cell.rect)] {
+                assert_eq!(
+                    drag_origin(&cells, mark.center()),
+                    None,
+                    "swatch {}: a press on {mark:?} started a drag",
+                    cell.index
+                );
+            }
+            // The colour itself still picks up, or the marks would have made
+            // the whole top of every swatch dead to a drag.
+            assert_eq!(drag_origin(&cells, cell.rect.center()), Some(cell.index));
+        }
+        // And a press on nothing is still nothing.
+        assert_eq!(drag_origin(&cells, pos2(0.0, 0.0)), None);
+    }
+
+    /// The naming field's own guard, which its doc calls structural. It is a
+    /// pure function of the state so that this can exist at all: written inline
+    /// in the drawing code it would have been a rule nothing could check, which
+    /// is the division CLAUDE.md draws everywhere else.
+    #[test]
+    fn a_naming_field_whose_colour_moved_under_it_names_nothing() {
+        let dir = std::env::temp_dir().join("umber-palette-naming");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = PaletteLibrary::load_from(&dir);
+        let id = library.create("Ochres").expect("made");
+        let mut palette = library.get(&id).expect("there").clone();
+        for rgb in [[1, 2, 3], [4, 5, 6], [7, 8, 9]] {
+            palette.add(umber_core::Swatch::new(rgb));
+        }
+        library.save(palette).expect("saved");
+
+        let mut state = State {
+            store: Store::Ready(Arc::new(library)),
+            selected: Some(id.clone()),
+            library_open: false,
+            renaming: None,
+            naming: None,
+            confirming: None,
+        };
+        state.naming = naming_for(&state, 1);
+        let naming = state.naming.clone().expect("a field on the middle colour");
+        assert_eq!(naming.rgb, [4, 5, 6]);
+        assert!(naming_is_live(&state, &naming));
+
+        // The colour it names taken out from under it: position 1 now holds
+        // what position 2 held, and a field that still believed its index would
+        // write the typed name onto a colour nobody was naming.
+        let mut moved = state.current().expect("there").clone();
+        assert!(moved.remove(0).is_some());
+        if let Store::Ready(library) = &mut state.store {
+            Arc::make_mut(library).save(moved).expect("saved");
+        }
+        assert!(
+            !naming_is_live(&state, &naming),
+            "the field survived the colour under it changing"
+        );
+
+        // A field belonging to another palette is not this one's either, and
+        // an index past the end names nothing at all.
+        let elsewhere = Naming {
+            palette: "somewhere-else".to_owned(),
+            ..naming.clone()
+        };
+        assert!(!naming_is_live(&state, &elsewhere));
+        let past = Naming {
+            index: 99,
+            ..naming
+        };
+        assert!(!naming_is_live(&state, &past));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disabled control says why, and the three reasons are not
+    /// interchangeable: "there is nowhere to keep palettes on this system" is
+    /// not "make a palette first", and neither is "this one is full". A tooltip
+    /// naming the wrong one is the control lying about itself, which is the
+    /// failure the whole disabled-with-a-reason arrangement exists to avoid.
+    #[test]
+    fn a_dead_adding_mark_gives_the_reason_it_is_dead() {
+        let dir = std::env::temp_dir().join("umber-palette-reasons");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = PaletteLibrary::load_from(&dir);
+        let id = library.create("Ochres").expect("made");
+
+        let mut state = State {
+            store: Store::Broken("this system has no user data directory".to_owned()),
+            selected: None,
+            library_open: false,
+            renaming: None,
+            naming: None,
+            confirming: None,
+        };
+        // Nowhere to write beats everything, and the wording is the library's
+        // own rather than one invented here.
+        assert_eq!(no_room_because(&state, 1), state.why_not());
+        assert_eq!(no_room_because(&state, 3), state.why_not());
+
+        // A library with nothing selected: make one first, whatever the count.
+        state.store = Store::Ready(Arc::new(library.clone()));
+        state.selected = None;
+        for count in [1, 3] {
+            assert!(
+                no_room_because(&state, count).starts_with("Make a palette first"),
+                "{count}: {}",
+                no_room_because(&state, count)
+            );
+        }
+
+        // A palette that is full: the single mark says the palette is full and
+        // the harmony's says how many would not fit, because "already holds
+        // 4096 colours" does not tell somebody adding four whether one of them
+        // would have gone in.
+        let mut full = library.get(&id).expect("there").clone();
+        for _ in 0..palette::MAX_SWATCHES {
+            assert!(full.add(umber_core::Swatch::new([0, 0, 0])));
+        }
+        library.save(full).expect("saved");
+        state.store = Store::Ready(Arc::new(library));
+        state.selected = Some(id);
+        assert!(no_room_because(&state, 1).contains(&palette::MAX_SWATCHES.to_string()));
+        assert_eq!(
+            no_room_because(&state, 3),
+            "There is not room for 3 more colours in this palette"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
