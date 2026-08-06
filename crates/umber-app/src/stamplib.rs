@@ -344,6 +344,13 @@ struct Entry {
 /// afford: the merged list is at most a few dozen entries, against the 239
 /// presets the brush browser refuses to rebuild per frame. It is not on the
 /// drawing path — the modal is not open while anybody is painting.
+///
+/// The tally of who paints with what is one pass over the merged preset list
+/// per frame, and it is here rather than in the row for the reason the rest of
+/// this is: 245 presets against a couple of dozen rows is six thousand string
+/// comparisons a frame for a figure that is the same for every row sharing a
+/// name. It borrows out of `ed.presets`, so the pass allocates one map and no
+/// strings.
 fn entries(ed: &Editor, state: &State, kind: Kind) -> Vec<Entry> {
     let (yours, shipped): (&std::collections::BTreeMap<_, _>, _) = match kind {
         Kind::Stamps => (&ed.tips, umber_core::tip::builtin_tips()),
