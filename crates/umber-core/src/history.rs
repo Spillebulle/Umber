@@ -199,16 +199,41 @@ impl EditKind {
     ///
     /// Read by the writer, which cannot yet put one in a file — see
     /// `docformat::history::SaveHistory::new`.
+    ///
+    /// **An exhaustive `match` rather than the `matches!` this used to be**,
+    /// and what it is guarding is the arms that answer `false`. Under
+    /// `matches!` a variant added later answers `false` in silence, and the
+    /// silence is expensive: `SaveHistory::new` skips structural entries, so
+    /// one wrongly read as non-structural falls through to
+    /// `edit.patches().first()`, which is `None` for an [`EditBody::Structure`]
+    /// — and the writer emits `SaveBody::Flip` with `layer = 0` and a zero
+    /// rectangle. That does *not* come back as a canvas flip: on reload
+    /// [`EditKind::flip_axis`] correctly answers `None`, so the entry misses
+    /// the flip branch, reaches the bounds check with `w == 0` and is refused
+    /// as "an area outside the canvas" — discarding the **whole** history. An
+    /// afternoon's undo lost under a corruption diagnosis, for a file that is
+    /// merely newer than the reader. `docimport::history` has a refusal
+    /// written precisely for that case; this is what keeps the refusal
+    /// reachable. The other branch is no better: a future variant that does
+    /// carry a patch but is wrongly non-structural would be written as a
+    /// `Pixels` entry and its slot resolved against the saved stack.
+    ///
+    /// Nothing in the tree adds a variant today, so this prevents a failure
+    /// that is not currently reachable. Do not "simplify" it back.
     pub fn is_structural(self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::AddLayer
-                | Self::DeleteLayer
-                | Self::MoveLayer
-                | Self::Group
-                | Self::AddMask
-                | Self::RemoveMask
-        )
+            | Self::DeleteLayer
+            | Self::MoveLayer
+            | Self::Group
+            | Self::AddMask
+            | Self::RemoveMask => true,
+            Self::Paint
+            | Self::Erase
+            | Self::Transform
+            | Self::FlipHorizontal
+            | Self::FlipVertical => false,
+        }
     }
 
     /// Does undoing this put a layer's **pixels** back in the stack?
@@ -223,8 +248,29 @@ impl EditKind {
     /// everything around them is saved whole — which matters, because dragging
     /// a layer in the panel is one of the commonest things an artist does and
     /// cutting the history there would silently discard the morning.
+    ///
+    /// Exhaustive for the reason [`EditKind::is_structural`] is, and the
+    /// difference is only that today's silent answer happens to be the safe
+    /// one — **conservative rather than correct**. A variant added to a
+    /// `matches!` answers `false`; if it genuinely did put pixels back, `cut`
+    /// would be left too low, a patch naming a parked slot would reach the
+    /// `find_map(...)?` in `SaveHistory::new` and the whole history would be
+    /// refused. Loud rather than silent, still wrong, and safe by accident.
+    /// Accident is not a property that survives somebody adding a variant in a
+    /// hurry, which is what the arms below are for.
     pub fn resurrects_pixels(self) -> bool {
-        matches!(self, Self::DeleteLayer | Self::RemoveMask)
+        match self {
+            Self::DeleteLayer | Self::RemoveMask => true,
+            Self::Paint
+            | Self::Erase
+            | Self::Transform
+            | Self::FlipHorizontal
+            | Self::FlipVertical
+            | Self::AddLayer
+            | Self::MoveLayer
+            | Self::Group
+            | Self::AddMask => false,
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -912,6 +958,70 @@ mod tests {
         h.record(edit(8, 8, 2));
         while h.take_undo().is_some() {}
         assert_eq!(h.used_bytes(), 0);
+    }
+
+    /// Every variant, fetched out of [`EditKind::ALL`] by the position it is
+    /// listed at. This exists to make that array impossible to forget.
+    ///
+    /// The `match` is exhaustive, so **adding a variant fails the build here**
+    /// — which is the whole guard, and it has to be a build failure rather
+    /// than an assertion. A test that iterates `ALL` can only check the
+    /// entries that are in it, so it agrees with itself however short the
+    /// array is; that is exactly why the round trip in `docformat::history`
+    /// has never been able to catch this.
+    ///
+    /// What it costs to forget: `docformat::history::kind_from_id` searches
+    /// `ALL`, so a kind missing from it answers `None`, and
+    /// `docimport::history` turns that into "one of its entries records
+    /// something this build cannot undo" and drops the **whole** history.
+    ///
+    /// The arms index `ALL` rather than naming the variant a second time, so
+    /// the second half of the mistake is caught too: an arm added for a
+    /// twelfth variant the obvious way, `EditKind::ALL[11]`, is an
+    /// out-of-bounds index into a fixed-size array and fails the build again
+    /// when `ALL` was not extended with it. An arm pointing at some *other*
+    /// position instead is what `all_lists_every_edit_kind` reads back.
+    const fn listed_in_all(kind: EditKind) -> EditKind {
+        match kind {
+            EditKind::Paint => EditKind::ALL[0],
+            EditKind::Erase => EditKind::ALL[1],
+            EditKind::Transform => EditKind::ALL[2],
+            EditKind::FlipHorizontal => EditKind::ALL[3],
+            EditKind::FlipVertical => EditKind::ALL[4],
+            EditKind::AddLayer => EditKind::ALL[5],
+            EditKind::DeleteLayer => EditKind::ALL[6],
+            EditKind::MoveLayer => EditKind::ALL[7],
+            EditKind::Group => EditKind::ALL[8],
+            EditKind::AddMask => EditKind::ALL[9],
+            EditKind::RemoveMask => EditKind::ALL[10],
+        }
+    }
+
+    /// The runtime half of the guard above: each arm has to hand back the
+    /// variant it was reached by, and no position may be listed twice.
+    ///
+    /// Neither is a tautology. The first catches an arm pointing at the wrong
+    /// entry of `ALL` — the one route past both compile-time halves — and the
+    /// second catches a variant being *replaced* in the array rather than
+    /// added to it, which the round trip alone cannot see because the variant
+    /// that fell out is then never iterated.
+    #[test]
+    fn all_lists_every_edit_kind() {
+        for kind in EditKind::ALL {
+            assert_eq!(
+                listed_in_all(kind),
+                kind,
+                "{kind:?}'s arm of `listed_in_all` points at the wrong entry \
+                 of `EditKind::ALL`"
+            );
+        }
+        for (i, kind) in EditKind::ALL.iter().enumerate() {
+            assert!(
+                !EditKind::ALL[..i].contains(kind),
+                "`EditKind::ALL` lists {kind:?} twice, so some variant is \
+                 missing from it"
+            );
+        }
     }
 
     /// A list of the history has to name what each entry was, and an eraser
