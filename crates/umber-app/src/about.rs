@@ -168,6 +168,24 @@ fn dialog(root: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     }
 }
 
+/// The honest limit of what Umber can promise about a download, said out loud.
+///
+/// Said here rather than left to be inferred. The download is fetched over TLS
+/// from an address the release API gave, and checked against the length that
+/// API reported, and that is the whole of it. Release signing is not built; see
+/// CLAUDE.md.
+///
+/// **A `const` rather than a literal at the call site so a test can read it.**
+/// `update::flow` and `update::installer` each fail the build when a stage or a
+/// step label claims a check Umber does not perform; this is the third place
+/// Umber speaks to the user about an update and it had no such guard. A
+/// sentence that is correct with nothing holding it correct is one refactor
+/// from being a security claim Umber cannot support — and unlike the other two,
+/// what this paragraph must not lose is the *denial*.
+const UNSIGNED_NOTE: &str = "Umber does not sign its releases. A download is fetched over HTTPS \
+     from GitHub and checked against the size GitHub reports, which is not the same as a \
+     signature.";
+
 /// The update half of the About dialog: a button, whatever the last check said,
 /// and the honest limit of what Umber can promise about a download.
 ///
@@ -261,19 +279,11 @@ fn update_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     }
 
     ui.add_space(10.0);
-    // Said here rather than left to be inferred. The download is fetched over
-    // TLS from an address the release API gave, and checked against the length
-    // that API reported — and that is the whole of it. Release signing is not
-    // built; see CLAUDE.md.
     ui.label(
-        egui::RichText::new(
-            "Umber does not sign its releases. A download is fetched over HTTPS \
-             from GitHub and checked against the size GitHub reports, which is \
-             not the same as a signature.",
-        )
-        .size(9.5)
-        .color(p.text_dim.gamma_multiply(0.85))
-        .line_height(Some(12.5)),
+        egui::RichText::new(UNSIGNED_NOTE)
+            .size(9.5)
+            .color(p.text_dim.gamma_multiply(0.85))
+            .line_height(Some(12.5)),
     );
 
     if check {
@@ -387,4 +397,49 @@ fn link_row(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str) -> bool {
 pub(crate) fn rule(ui: &mut egui::Ui, p: &Palette) {
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(line, 0.0, p.border);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UNSIGNED_NOTE;
+
+    /// Umber does not sign its releases, and nothing it draws may imply
+    /// otherwise. `update::flow::no_stage_calls_anything_verified` and
+    /// `update::installer::no_step_calls_anything_verified` fail the build over
+    /// it; About is the third place Umber speaks to the user about an update
+    /// and it had no guard at all.
+    ///
+    /// **The word list here is deliberately not the other two's, and copying
+    /// theirs would delete the disclaimer.** They ban "signed" and "signature"
+    /// outright, which is right for what they cover: a stage label reading
+    /// "Installing…" has no business mentioning signing, so any occurrence is a
+    /// claim. This paragraph has to name a signature in order to *deny* one, so
+    /// the same list would fail on the correct sentence. What is banned here is
+    /// the vocabulary of a claim; what is required is the denial itself.
+    ///
+    /// That asymmetry is also the answer to whether the three should share one
+    /// scanner: they should not. A shared helper would either force About to
+    /// stop mentioning signatures or weaken the two that can afford the
+    /// stricter rule.
+    #[test]
+    fn the_about_box_makes_no_claim_it_cannot_keep_and_keeps_its_denial() {
+        let said = UNSIGNED_NOTE.to_lowercase();
+
+        // A word a reader would take for a check Umber does not perform.
+        for word in ["verif", "authentic", "secure"] {
+            assert!(
+                !said.contains(word),
+                "the About box's update note says {word:?}: {UNSIGNED_NOTE:?}"
+            );
+        }
+
+        // And the denial, which is the whole reason the paragraph exists.
+        // Losing it is the likelier failure: trimmed to "fetched over HTTPS and
+        // checked against the size GitHub reports", it states two facts and
+        // lets the reader infer a third.
+        assert!(
+            said.contains("does not sign"),
+            "the About box no longer denies that Umber signs its releases: {UNSIGNED_NOTE:?}"
+        );
+    }
 }
