@@ -1334,7 +1334,7 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
             .on_hover_text(hint)
             .on_disabled_hover_text(
                 "A layer is locked. A flip mirrors every layer at once, so it \
-                             cannot skip one. Unlock it first.",
+                 cannot skip one. Unlock it first.",
             )
             .clicked()
         {
@@ -1358,7 +1358,7 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
         .add_enabled(ed.session.len() > 1, egui::Button::new("Close document"))
         .on_disabled_hover_text(
             "This is the only document open, and Umber has nothing to \
-                         show in its place.",
+             show in its place.",
         )
         .clicked()
     {
@@ -1390,7 +1390,7 @@ fn file_menu(ui: &mut egui::Ui, ed: &mut Editor, actions: &mut UiActions) {
     if menu_item(ui, Action::Export, true)
         .on_hover_text(
             "One flattened image for showing people: PNG, JPEG, TIFF, GIF or \
-                         BMP. Save keeps the layers.",
+             BMP. Save keeps the layers.",
         )
         .clicked()
     {
