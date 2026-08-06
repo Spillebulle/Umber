@@ -304,6 +304,21 @@ struct Preview {
     /// picture's smaller twin — so the figure and the notices cannot come from
     /// a different block than the one on screen.
     measured: Option<(u32, u32)>,
+    /// Why the real block would not set, where it would not.
+    ///
+    /// **The exact refusal, kept rather than discarded**, and that is the whole
+    /// of what the panel used to get wrong. `build_preview` already sets the
+    /// real block at its real size, so by the time anything is drawn the answer
+    /// is known — and it was thrown away. A block past `text::MAX_PIXELS` then
+    /// drew a *picture* anyway, because the preview rasterises at
+    /// [`PREVIEW_EM`] and 26 pixels succeeds where 900 does not, silently
+    /// dropped the "N × M px on the canvas" line, left Place live, and told
+    /// nobody until they clicked it. A font moved off the disk since the scan
+    /// said nothing at all.
+    ///
+    /// The exact complement of [`Self::measured`]: one of the two is always
+    /// `Some`, because they come from the two arms of one `Result`.
+    error: Option<TextError>,
     missing: Vec<char>,
     mixed: bool,
 }
@@ -638,6 +653,42 @@ fn substitution_note(ui: &mut Ui, p: &Palette, ed: &Editor) {
     controls::note(ui, p, &body);
 }
 
+/// What to tell the artist about a block that would not set.
+///
+/// **One statement of these five sentences**, because there are two places they
+/// have to be said from and two hand-written copies of a notice is how the two
+/// come to disagree about what went wrong. The panel draws it under the preview
+/// and disables Place with it as the tooltip; `UmberApp::place_text` raises it
+/// as a notice, which is the belt to the panel's braces — the gate catches the
+/// click, the notice catches a route that goes round the gate.
+///
+/// [`TextError::Empty`] has an arm here and the panel never asks for it: the
+/// preview returns early on an empty block and `place_row` refuses on the same
+/// reading, so the panel's answer to "nothing typed" is a disabled button and
+/// no sentence at all. `place_text` still needs one.
+pub fn refusal(err: TextError) -> String {
+    match err {
+        TextError::Empty => "Type something into the Text panel first.".to_string(),
+        TextError::NoInk => "What is typed makes no mark. It is spaces, or characters \
+             this face has no glyph for."
+            .to_string(),
+        TextError::TooLarge { width, height } => format!(
+            "At this size the text would be {width} × {height} pixels, which is \
+             more than Umber will rasterise at once. Reduce the size, or the \
+             amount of text."
+        ),
+        TextError::Unreadable => "The font could not be read. It may have been moved or removed \
+             since Umber found it; reopen the Text panel to look again."
+            .to_string(),
+        // Its own sentence rather than the one above, which accuses the
+        // typeface. Not reachable from the rails, which is exactly why the
+        // wrong sentence would have survived.
+        TextError::NotFinite => "The size, line spacing or tracking is not a number. Drag one of \
+             the rails in the Text panel to set it again."
+            .to_string(),
+    }
+}
+
 /// A fingerprint of everything that changes the picture.
 ///
 /// A hash rather than a stored copy of the block: the block holds a `String`
@@ -693,10 +744,15 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
     // once per keystroke — a CJK collection is sixteen megabytes, and this runs
     // on every character typed.
     let Some((face, data)) = ed.text.face_and_data() else {
+        // The same answer `TextState::set` gives when the bytes will not come:
+        // a face `resolve` still names whose file has gone since the scan. Said
+        // here rather than left blank, or the panel is silent and Place is the
+        // first thing to mention it.
         return Preview {
             key,
             picture: None,
             measured: None,
+            error: Some(TextError::Unreadable),
             missing: Vec::new(),
             mixed: false,
         };
@@ -728,18 +784,21 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
     // the two agree today, and reading them from the picture would make the
     // notice a statement about the preview rather than about what is going on
     // the canvas.
-    let (measured, missing, mixed) = match text::set(&face, data, &block) {
+    let (measured, error, missing, mixed) = match text::set(&face, data, &block) {
         Ok(setting) => (
             Some((setting.width, setting.height)),
+            None,
             setting.missing,
             setting.mixed_directions,
         ),
-        Err(_) => (None, Vec::new(), false),
+        // Kept, not discarded. See `Preview::error`.
+        Err(err) => (None, Some(err), Vec::new(), false),
     };
     Preview {
         key,
         picture,
         measured,
+        error,
         missing,
         mixed,
     }
@@ -764,7 +823,12 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let Some(cache) = ed.text.preview.as_ref() else {
         return;
     };
-    let (measured, missing, mixed) = (cache.measured, cache.missing.as_slice(), cache.mixed);
+    let (measured, error, missing, mixed) = (
+        cache.measured,
+        cache.error,
+        cache.missing.as_slice(),
+        cache.mixed,
+    );
 
     if let Some(handle) = &cache.picture {
         let [w, h] = handle.size();
@@ -787,12 +851,29 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         ui.add_space(4.0);
     }
 
-    if let Some((w, h)) = measured {
-        ui.label(
-            egui::RichText::new(format!("{w} × {h} px on the canvas"))
-                .size(texttokens::TINY)
-                .color(p.text_dim),
-        );
+    match measured {
+        Some((w, h)) => {
+            ui.label(
+                egui::RichText::new(format!("{w} × {h} px on the canvas"))
+                    .size(texttokens::TINY)
+                    .color(p.text_dim),
+            );
+        }
+        // **The refusal goes where the measurement would have been.** It is the
+        // same slot answering the same question — what happens if I click
+        // Place — and the whole failure this replaces was the line simply
+        // vanishing while a picture stayed on screen beside a live button.
+        //
+        // A picture may well still be drawn above it, and that is right: the
+        // preview is rasterised at `PREVIEW_EM`, so it is an honest picture of
+        // the face and the line breaks even for a block far past the cap. What
+        // it cannot say is that the block will not go on the canvas, which is
+        // what this says.
+        None => {
+            if let Some(err) = error {
+                controls::note(ui, p, &refusal(err));
+            }
+        }
     }
 
     // Both of these are the import rule applied here: an operation that loses
@@ -885,17 +966,44 @@ fn plate(ui: &Ui, p: &Palette, rect: egui::Rect, background: Background) {
 /// known — the rule "Clear layer" and the selection's Cut both follow. The lock
 /// and the folder are still gated for real in `begin_float`, so a shortcut
 /// cannot go round this.
+///
+/// **The block itself is one of the answers already known**, and it used not to
+/// be read here. `build_preview` sets the real block at its real size on the
+/// way to drawing the panel, so the exact [`TextError`] is sitting in the cache
+/// by the time this row is drawn; a live button over it is precisely the
+/// dialog-after-the-click this rule exists to prevent, and past
+/// `text::MAX_PIXELS` it was a live button under a preview picture that had
+/// rasterised perfectly well at [`PREVIEW_EM`].
 fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
     let locked = ed.layers.active_is_locked();
     let folder = ed.layers.active_slot().is_none();
     let empty = ed.text.block.text.trim().is_empty();
-    let enabled = !locked && !folder && !empty;
+    // Read only when something is typed. `preview` returns early on an empty
+    // block rather than rebuilding, so the cache beside it may still describe
+    // whatever was there before it was deleted — and `empty` is the answer for
+    // that case anyway.
+    let refused = if empty {
+        None
+    } else {
+        ed.text.preview.as_ref().and_then(|c| c.error)
+    };
+    let enabled = !locked && !folder && !empty && refused.is_none();
+    // The lock and the folder come first: they are refusals about *where* the
+    // text would go, and somebody whose layer is locked is not helped by being
+    // told about the size as well.
+    let refusal_line;
     let tooltip = if locked {
         "The layer is locked. Unlock it in the Layers panel, or select another."
     } else if folder {
         "A folder is selected. A folder holds no pixels, so select a layer."
     } else if empty {
         "Type something first."
+    } else if let Some(err) = refused {
+        // The same sentence the note under the preview draws, from the same
+        // function, so the tooltip and the panel cannot say different things
+        // about one block.
+        refusal_line = refusal(err);
+        &refusal_line
     } else {
         "Put the text on the canvas, where the transform tool can move, scale \
          and turn it before it is committed"
@@ -1053,6 +1161,78 @@ mod tests {
         assert_ne!(after, first, "a replaced library kept the old face's bytes");
     }
 
+    /// A block the engine will refuse is a refusal the panel can state, for
+    /// every error there is.
+    ///
+    /// The panel's job here is to know *before* the click, and the only way it
+    /// can is by keeping what `build_preview` already found out. Exhaustive
+    /// over `TextError` on purpose: a variant added later without a sentence
+    /// would be a Place button that is disabled with nothing said, which is the
+    /// worse half of the failure this fixes.
+    #[test]
+    fn every_reason_a_block_will_not_set_has_a_finished_sentence() {
+        for err in [
+            TextError::Empty,
+            TextError::NoInk,
+            TextError::TooLarge {
+                width: 9000,
+                height: 9000,
+            },
+            TextError::Unreadable,
+            TextError::NotFinite,
+        ] {
+            let line = refusal(err);
+            assert!(line.ends_with('.'), "{err:?} is not a sentence: {line:?}");
+            assert!(
+                line.len() > 20,
+                "{err:?} is a code, not a sentence: {line:?}"
+            );
+            // No em-dash in anything the interface draws.
+            assert!(!line.contains('—'), "{err:?} carries an em-dash: {line:?}");
+        }
+        // The one that names what was asked for rather than saying "too big".
+        let line = refusal(TextError::TooLarge {
+            width: 9000,
+            height: 4000,
+        });
+        assert!(line.contains("9000") && line.contains("4000"), "{line:?}");
+    }
+
+    /// A block past the cap **draws a picture and still refuses**, and the
+    /// panel knows which before anybody clicks.
+    ///
+    /// This is the defect in one test. The preview rasterises at `PREVIEW_EM`,
+    /// which is 26 pixels and succeeds where the real size does not, so the
+    /// artist saw a perfectly good picture of their caption; the measurement
+    /// line silently vanished, Place stayed live, and the first news of the
+    /// refusal was a notice after the click.
+    #[test]
+    fn a_block_past_the_cap_is_refused_where_the_panel_can_say_so() {
+        let mut ed = Editor::default();
+        ed.text.block.text = "M".repeat(4000);
+        ed.text.block.size = text::MAX_SIZE;
+
+        // The engine refuses it, which is what the panel has to be able to
+        // report rather than discover.
+        let err = ed.text.set().expect_err("past the cap");
+        assert!(matches!(err, TextError::TooLarge { .. }), "{err:?}");
+
+        // And the small preview genuinely does set, which is why the panel used
+        // to draw a picture and say nothing at all.
+        let mut small = ed.text.block.clone();
+        small.size = PREVIEW_EM;
+        let (face, data) = {
+            let face = ed.text.face().expect("a face").clone();
+            let data = face.load().expect("bytes");
+            (face, data)
+        };
+        assert!(
+            text::set(&face, &data, &small).is_ok(),
+            "the preview no longer draws a picture for a block past the cap, \
+             so this test is guarding nothing"
+        );
+    }
+
     /// A face that had to be substituted is named, and one that did not is not.
     ///
     /// `resolve` is total, so the panel is the only thing that can say a
@@ -1143,34 +1323,48 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/text-panel");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        // The last two are the ones worth looking at, and both are a *notice*
-        // landing in a column that already holds a preview image, three rails,
-        // two dropdowns and a segmented picker — the shape that fits in the
-        // abstract and overruns at `metrics::PANEL`'s real 264 points.
+        // The last three are the ones worth looking at, and all three are a
+        // *notice* landing in a column that already holds a preview image,
+        // three rails, two dropdowns and a segmented picker — which is the
+        // shape that fits in the abstract and overruns at `metrics::PANEL`'s
+        // real 264 points.
         //
         // The fourth has two CJK ideographs Archivo has no glyph for, so the
         // notice naming them sits beside the preview that does not show them.
-        // The fifth names a family this machine does not have, which is the one
-        // notice drawn between the pickers rather than under the preview.
-        for (name, text, align, family) in [
-            ("1-empty", "", Align::Left, None),
-            ("2-a-caption", "Umber", Align::Left, None),
+        // The fifth is past `text::MAX_PIXELS`: the small preview rasterises
+        // perfectly well at `PREVIEW_EM`, so there is a picture, and the
+        // refusal has to be readable under it with Place disabled. The sixth
+        // names a family this machine does not have, which is the one notice
+        // that is drawn between the pickers rather than under the preview.
+        for (name, text, align, size, family) in [
+            ("1-empty", "", Align::Left, 72.0, None),
+            ("2-a-caption", "Umber", Align::Left, 72.0, None),
             (
                 "3-several-lines",
                 "Painted in Umber\non a Tuesday\nafternoon",
                 Align::Centre,
+                72.0,
                 None,
             ),
             (
                 "4-a-face-cannot-show-it",
                 "Umber \u{5b57}\u{4f53}",
                 Align::Left,
+                72.0,
                 None,
             ),
             (
-                "5-a-substituted-face",
+                "5-past-the-cap",
+                "A caption nobody could fit on a canvas",
+                Align::Left,
+                text::MAX_SIZE,
+                None,
+            ),
+            (
+                "6-a-substituted-face",
                 "Umber",
                 Align::Left,
+                72.0,
                 Some("Helvetica Neue"),
             ),
         ] {
@@ -1178,6 +1372,7 @@ mod tests {
             ed.layout = Layout::default();
             ed.text.block.text = text.to_string();
             ed.text.block.align = align;
+            ed.text.block.size = size;
             if let Some(family) = family {
                 ed.text.family = family.to_string();
             }
@@ -1190,6 +1385,6 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 5 shots to {}", dir.display());
+        println!("wrote 6 shots to {}", dir.display());
     }
 }
