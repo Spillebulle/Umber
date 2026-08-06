@@ -1919,13 +1919,30 @@ mod tests {
         // ratio modulation the new arithmetic is bit-identical to the old — a
         // fudge written as `if m.ratio != 0.0 { half *= 1.05 }` would satisfy
         // it and satisfy `the_box_never_widens_...` too.
-        for brush in [plain, flattening_chisel()] {
+        //
+        // Each carries the `aspect` it must not exceed, and the modulated one's
+        // ceiling is the guard its two siblings already have. It rests on a
+        // *single* seeded draw — one tap, one `unit()` — which today is 0.3166
+        // and gives an aspect of 3.85. Nothing pins that stream: change
+        // `stroke_count`'s multiplier, `Rng`'s mixing, or the order of the
+        // guarded draws upstream, and a draw above 0.9 would put this dab back
+        // near its nominal 10 and silently degenerate the case into the
+        // identity `plain` already covers. That is this very defect returning
+        // through the test instead of through the code, which is the failure
+        // the "every random draw is guarded" rule exists to make loud.
+        for (brush, ceiling) in [(plain, 6.0_f32), (flattening_chisel(), 9.0_f32)] {
             let mut s = StrokeBuilder::new();
             // A tap, so the box belongs to one dab and equality is meaningful.
             s.begin(brush, WHITE, InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0));
             let bounds = s.bounds();
             let dabs: Vec<Dab> = s.drain_pending().collect();
             assert_eq!(dabs.len(), 1);
+            assert!(
+                dabs[0].aspect <= ceiling,
+                "aspect {} is above {ceiling}: the ratio modulation did not \
+                 bite, so this case is testing the unmodulated identity twice",
+                dabs[0].aspect
+            );
 
             let (lo, hi) = quad_box(&dabs[0]);
             assert!(
