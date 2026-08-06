@@ -192,6 +192,15 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let width = full_width.min(available.x - 48.0).max(360.0);
     let height = list_height.min(available.y - 200.0).max(160.0);
 
+    // Read **before** the body, because the body is what clears it. Escape
+    // makes a `TextEdit` surrender focus, so a rename in progress is cancelled
+    // by the field itself on the very frame `should_close` also answers yes —
+    // and one keystroke that both abandoned the name and shut the browser is
+    // Escape doing two things at once. It cancels the innermost thing first,
+    // which is what it means everywhere else, and the same rule
+    // `Flow::holds_work` keeps for a modal with work in flight.
+    let editing = state.renaming.is_some();
+
     let response = egui::Modal::new(Id::new("stamp-library-browser"))
         .frame(
             Frame::NONE
@@ -209,7 +218,7 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
             footer(ui, p, ed, state, kind);
         });
 
-    if response.should_close() {
+    if response.should_close() && !editing {
         close(root.ctx(), state);
     }
 }
@@ -1612,6 +1621,92 @@ mod tests {
             &before,
             ed.tips.get("rough-charcoal").expect("and in the library")
         ));
+    }
+
+    /// Escape means "cancel the innermost thing", and here two things answer to
+    /// it on the same frame.
+    ///
+    /// A `TextEdit` surrenders focus on Escape, so the field reports its own
+    /// cancellation on exactly the frame `egui::Modal::should_close` also
+    /// answers yes — one keystroke abandoning the name *and* shutting the
+    /// browser. Nothing is lost either way, which is what makes this the kind
+    /// of thing that ships: it is only wrong in the way a control is wrong when
+    /// it does more than it says.
+    #[test]
+    fn escape_cancels_a_rename_before_it_shuts_the_browser() {
+        let scratch = Scratch::new("escape");
+        let mut library = scratch.library();
+        library
+            .add_tip("nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+
+        let ctx = egui::Context::default();
+        let mut ed = Editor::default();
+        brushlib::seed_library(&ctx, &mut ed, library);
+        let palette = Palette::of(crate::theme::ThemeKind::Graphite);
+        store(
+            &ctx,
+            State {
+                open: Some(Kind::Stamps),
+                renaming: Some(Renaming {
+                    name: "nib".to_owned(),
+                    text: "something else".to_owned(),
+                    focus: true,
+                }),
+                ..State::default()
+            },
+        );
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0));
+        let frame = |ctx: &egui::Context, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| dialogs(ui, &palette, ed));
+        };
+
+        // One frame to lay the field out and let it take the focus it asked
+        // for, then the keystroke.
+        frame(&ctx, &mut ed, Vec::new());
+        frame(
+            &ctx,
+            &mut ed,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        let state = load(&ctx);
+        assert!(
+            state.open.is_some(),
+            "Escape shut the browser as well as the rename"
+        );
+        assert!(state.renaming.is_none(), "the rename was not cancelled");
+        assert!(
+            ed.tips.contains_key("nib"),
+            "the name should not have moved"
+        );
+        assert!(!ed.tips.contains_key("something-else"));
+
+        // And a second Escape, with no field open, does shut it.
+        frame(
+            &ctx,
+            &mut ed,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(load(&ctx).open.is_none(), "the browser would not shut");
     }
 
     /// How many brushes paint with a picture used to be knowable only by
