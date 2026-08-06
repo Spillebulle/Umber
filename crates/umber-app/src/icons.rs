@@ -173,6 +173,13 @@ pub enum Icon {
     /// reason: this takes one specific thing off, and the mark has to say
     /// which.
     MaskOff,
+    /// A colour wheel with three of its hues marked: the set of related
+    /// colours the Colour panel's Harmony mode is showing, kept.
+    ///
+    /// Appended rather than filed beside [`Icon::Grid`] for the reason the two
+    /// above give: this enum is shared, and inserting into the middle of it is
+    /// a merge that compiles and draws the wrong marks.
+    Harmony,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -733,6 +740,24 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 mesh.indices.extend_from_slice(&[hub, k, k + 1]);
             }
             painter.add(Shape::mesh(mesh));
+        }
+
+        Icon::Harmony => {
+            // A wheel with three of its hues marked on it. Filled discs rather
+            // than a second ring inside the first: at 18 px a ring within a
+            // ring is a blur, and what this has to say is "several colours,
+            // related round the wheel" — the marks are the relation.
+            //
+            // Three of them, and at 120°, because a triad is the harmony whose
+            // shape reads at this size; two would be a pair of dots and four
+            // would sit on the axes and read as a compass. The mark names the
+            // idea rather than whichever relation happens to be chosen.
+            painter.circle_stroke(at(12.0, 12.0), 7.5 * scale, stroke);
+            for k in 0..3 {
+                let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
+                let (s, c) = a.sin_cos();
+                painter.circle_filled(at(12.0 + c * 7.5, 12.0 + s * 7.5), 2.4 * scale, colour);
+            }
         }
     }
 }
