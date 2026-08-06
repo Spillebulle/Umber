@@ -2049,10 +2049,19 @@ pub fn elide(painter: &egui::Painter, s: &str, size: f32, width: f32) -> String 
 /// to say how many the filter is leaving. At that size the naive version shows
 /// up in a frame time, which is the rule the brush library already lives by.
 ///
-/// **The fold is ASCII-only**, deliberately. It suits both callers: a family
-/// name's non-ASCII is inside words a search matches identically either way,
-/// and a full Unicode case fold is not a byte-for-byte operation — it changes
-/// length, so it cannot be done without the copy this exists to avoid.
+/// **The fold is ASCII-only, and that is a real if narrow loss.** A Cyrillic or
+/// Greek family name typed in the other case no longer matches, where
+/// `to_lowercase().contains()` would have found it. Two tempting defences are
+/// both false and are written down so nobody rebuilds them: it is *not* true
+/// that the non-ASCII in a name only ever sits inside words that match either
+/// way — that is `brushlib`'s argument about author names, and it does not
+/// carry to a font list — and it is *not* true that a full Unicode fold needs
+/// an allocation, since `str::chars().flat_map(char::to_lowercase)` streams.
+/// What is true is that a streaming fold on both sides is a substring search
+/// nobody here has written, for a case a Latin-scripted search field meets
+/// rarely; matching by prefix is unaffected because UTF-8 is self-synchronising
+/// and a needle's first byte is never a continuation byte, so the failure is a
+/// missed match rather than a wrong one.
 ///
 /// The needle is expected trimmed but *not* lowered; folding both sides is what
 /// keeps the caller from having to allocate for the query either.

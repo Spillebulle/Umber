@@ -33,6 +33,7 @@
 //! `Transform` like a paste's, and the preview is byte for byte what commits.
 //! Nothing new reaches the GPU and nothing new reaches the file.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -92,24 +93,32 @@ pub struct Fonts {
     /// answers with, while Place uses the new one; the two disagree silently
     /// until something else the key hashes happens to move.
     generation: u64,
-    /// `library.faces().len()`, as the string the dropdown draws.
+    /// How many **families** the library holds, as the string the dropdown
+    /// draws beside the family name.
+    ///
+    /// Families and not faces, and that is a fix rather than a detail. The
+    /// figure used to be `faces().len()` while the *filtered* figure beside it
+    /// counted families, so typing one character into the search field took the
+    /// trigger from 45 to 1 on a library holding one typeface and put it back
+    /// on backspace. Two quantities in one readout is the control that lies,
+    /// and the menu under it lists families, so families is the honest one.
     ///
     /// Kept rather than formatted, because the dropdown draws it on every frame
     /// the panel is open and the figure changes twice in a session.
-    count: String,
+    families: String,
 }
 
 impl Default for Fonts {
     fn default() -> Self {
         let mut library = FontLibrary::default();
         library.add_builtin(BUILTIN, crate::cputext::ARCHIVO);
-        let count = library.faces().len().to_string();
+        let families = library.families_iter().count().to_string();
         Self {
             library,
             pending: None,
             started: false,
             generation: 0,
-            count,
+            families,
         }
     }
 }
@@ -136,9 +145,9 @@ impl Fonts {
         self.pending.is_some()
     }
 
-    /// How many faces there are, as the dropdown draws it.
-    pub fn count(&self) -> &str {
-        &self.count
+    /// How many families there are, as the dropdown draws it. See the field.
+    pub fn family_count(&self) -> &str {
+        &self.families
     }
 
     /// Which library this is. See the field.
@@ -148,7 +157,7 @@ impl Fonts {
 
     /// Take a new library and tell everything cached off the old one.
     fn adopt(&mut self, library: FontLibrary) {
-        self.count = library.faces().len().to_string();
+        self.families = library.families_iter().count().to_string();
         self.library = library;
         self.generation += 1;
     }
@@ -300,27 +309,48 @@ struct Preview {
     /// `None` where the block would not set at all — nothing typed, no ink, or
     /// past the cap. The panel then draws no picture and no figure.
     picture: Option<egui::TextureHandle>,
-    /// What it will measure on the canvas, from the same call that made the
-    /// picture's smaller twin — so the figure and the notices cannot come from
-    /// a different block than the one on screen.
-    measured: Option<(u32, u32)>,
-    /// Why the real block would not set, where it would not.
+    /// What it will measure on the canvas, or why it would not set at all —
+    /// from the same call that made the picture's smaller twin, so the figure
+    /// and the notices cannot come from a different block than the one on
+    /// screen.
     ///
-    /// **The exact refusal, kept rather than discarded**, and that is the whole
-    /// of what the panel used to get wrong. `build_preview` already sets the
-    /// real block at its real size, so by the time anything is drawn the answer
-    /// is known — and it was thrown away. A block past `text::MAX_PIXELS` then
+    /// **The refusal is kept rather than discarded**, and that is the whole of
+    /// what the panel used to get wrong. `build_preview` already sets the real
+    /// block at its real size, so by the time anything is drawn the answer is
+    /// known — and it was thrown away. A block past `text::MAX_PIXELS` then
     /// drew a *picture* anyway, because the preview rasterises at
-    /// [`PREVIEW_EM`] and 26 pixels succeeds where 900 does not, silently
+    /// [`PREVIEW_EM`] and 26 pixels succeeds where 1000 does not, silently
     /// dropped the "N × M px on the canvas" line, left Place live, and told
     /// nobody until they clicked it. A font moved off the disk since the scan
     /// said nothing at all.
     ///
-    /// The exact complement of [`Self::measured`]: one of the two is always
-    /// `Some`, because they come from the two arms of one `Result`.
-    error: Option<TextError>,
+    /// One `Result` rather than two `Option`s documented as complementary:
+    /// they come from the two arms of one, and this way there is no fourth
+    /// state for a reader to have to draw nothing for.
+    measured: Result<(u32, u32), Refused>,
     missing: Vec<char>,
     mixed: bool,
+}
+
+/// A refusal and the sentence for it, worked out once.
+///
+/// The sentence is cached beside the error for the reason everything else in
+/// [`Preview`] is. It is drawn under the preview *and* handed to the disabled
+/// button as its tooltip, on every frame the panel is open, and [`refusal`]
+/// builds a `String`: twice a frame for as long as somebody leaves the panel up
+/// is the per-frame allocation the rest of this module is careful about.
+struct Refused {
+    err: TextError,
+    line: String,
+}
+
+impl Refused {
+    fn new(err: TextError) -> Self {
+        Self {
+            err,
+            line: refusal(err),
+        }
+    }
 }
 
 impl Default for TextState {
@@ -472,10 +502,16 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     );
 
     ui.add_space(10.0);
-    preview(ui, p, ed);
+    // The refusal is *handed* to the row rather than read back out of the
+    // cache. `preview` is the only thing that knows whether the cache it just
+    // drew from describes what is typed now — it returns early on an empty
+    // block without rebuilding — so passing the answer along is one statement
+    // where reading `Editor::text.preview` again would be a second, correct
+    // only for as long as these two calls stay in this order.
+    let refused = preview(ui, p, ed);
 
     ui.add_space(8.0);
-    place_row(ui, p, ed, actions);
+    place_row(ui, p, ed, refused, actions);
 }
 
 /// Which family: a search field, and under it the dropdown this interface has
@@ -508,14 +544,19 @@ fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         search,
         ..
     } = &ed.text;
-    // **Nothing here allocates on a frame that changes nothing**, and a real
-    // machine is what makes that matter: several hundred families, a panel that
-    // is open for as long as somebody is composing, and a body that runs every
-    // frame. This used to build a `Vec` of every family name, a lowered
-    // `String` per family, a lowered `String` for the query, and a `String` of
-    // a figure `Fonts::count` is cached as a `String` precisely so it need not
-    // be formatted — per frame, all of it, and the count was computed and
-    // thrown away whenever the field was empty.
+    // **Nothing here allocates while the search field is empty**, which is the
+    // state a panel left open sits in, and a real machine is what makes that
+    // matter: several hundred families, and a body that runs every frame for as
+    // long as somebody is composing. This used to build a `Vec` of every family
+    // name, a lowered `String` per family, a lowered `String` for the query,
+    // and a `String` of a figure `Fonts` caches as a `String` precisely so it
+    // need not be formatted — per frame, all of it, and the count was computed
+    // and thrown away whenever the field was empty.
+    //
+    // With a query typed there is one `String` a frame, for the figure, and
+    // that is left rather than cached: it changes with every keystroke, so a
+    // cache would be a second copy of the filter to keep in step for one small
+    // allocation while somebody is actively typing.
     let query = search.trim();
     // Only counted when there is something to count. With the field empty the
     // answer is the cached figure, and walking the library to arrive at the
@@ -531,7 +572,7 @@ fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     // The figure is what the filter is leaving rather than what the machine
     // holds, because the filter is now a control somebody can see above it —
     // a count that did not move as they typed would say the field did nothing.
-    let count: &str = matching.as_deref().unwrap_or_else(|| fonts.count());
+    let count: &str = matching.as_deref().unwrap_or_else(|| fonts.family_count());
     let mut chosen: Option<String> = None;
     widgets::dropdown(
         ui,
@@ -624,12 +665,10 @@ fn style_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 /// would have thrown that away with no way to notice.
 fn substitution_note(ui: &mut Ui, p: &Palette, ed: &Editor) {
     let library = ed.text.fonts.library();
-    let Some(what) = library.substituted(&ed.text.family, &ed.text.style) else {
-        return;
-    };
-    // Not `resolve` again: this has to name the face the *reading* was taken
-    // from, or the sentence could name a third thing.
-    let Some(face) = library.resolve(&ed.text.family, &ed.text.style) else {
+    // The face comes back with the answer, so this names the one the reading
+    // was actually taken from rather than resolving a second time and hoping
+    // the two agree.
+    let Some((what, face)) = library.substituted(&ed.text.family, &ed.text.style) else {
         return;
     };
     // Two sentences and not one with a hole in it, because the two are
@@ -751,8 +790,7 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
         return Preview {
             key,
             picture: None,
-            measured: None,
-            error: Some(TextError::Unreadable),
+            measured: Err(Refused::new(TextError::Unreadable)),
             missing: Vec::new(),
             mixed: false,
         };
@@ -784,30 +822,34 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
     // the two agree today, and reading them from the picture would make the
     // notice a statement about the preview rather than about what is going on
     // the canvas.
-    let (measured, error, missing, mixed) = match text::set(&face, data, &block) {
+    let (measured, missing, mixed) = match text::set(&face, data, &block) {
         Ok(setting) => (
-            Some((setting.width, setting.height)),
-            None,
+            Ok((setting.width, setting.height)),
             setting.missing,
             setting.mixed_directions,
         ),
-        // Kept, not discarded. See `Preview::error`.
-        Err(err) => (None, Some(err), Vec::new(), false),
+        // Kept, not discarded. See `Preview::measured`.
+        Err(err) => (Err(Refused::new(err)), Vec::new(), false),
     };
     Preview {
         key,
         picture,
         measured,
-        error,
         missing,
         mixed,
     }
 }
 
-/// What the block will look like, in the face it will be set in.
-fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+/// What the block will look like, in the face it will be set in, and why it
+/// would not go on the canvas where it would not.
+///
+/// Returning the refusal is what lets [`place_row`] be right without reading
+/// the cache itself: this is the one place that knows whether what is cached
+/// describes what is typed *now*, because the empty case returns before
+/// rebuilding it.
+fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) -> Option<TextError> {
     if ed.text.block.text.trim().is_empty() {
-        return;
+        return None;
     }
 
     let key = preview_key(ed);
@@ -820,12 +862,9 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     if ed.text.preview.as_ref().map(|c| c.key) != Some(key) {
         ed.text.preview = Some(build_preview(ui, ed, key));
     }
-    let Some(cache) = ed.text.preview.as_ref() else {
-        return;
-    };
-    let (measured, error, missing, mixed) = (
-        cache.measured,
-        cache.error,
+    let cache = ed.text.preview.as_ref()?;
+    let (measured, missing, mixed) = (
+        cache.measured.as_ref(),
         cache.missing.as_slice(),
         cache.mixed,
     );
@@ -852,7 +891,7 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     }
 
     match measured {
-        Some((w, h)) => {
+        Ok(&(w, h)) => {
             ui.label(
                 egui::RichText::new(format!("{w} × {h} px on the canvas"))
                     .size(texttokens::TINY)
@@ -869,11 +908,7 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         // the face and the line breaks even for a block far past the cap. What
         // it cannot say is that the block will not go on the canvas, which is
         // what this says.
-        None => {
-            if let Some(err) = error {
-                controls::note(ui, p, &refusal(err));
-            }
-        }
+        Err(refused) => controls::note(ui, p, &refused.line),
     }
 
     // Both of these are the import rule applied here: an operation that loses
@@ -916,6 +951,7 @@ fn preview(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
              order.",
         );
     }
+    measured.err().map(|refused| refused.err)
 }
 
 /// What the preview sits on: **this document's own background**.
@@ -974,49 +1010,84 @@ fn plate(ui: &Ui, p: &Palette, rect: egui::Rect, background: Background) {
 /// dialog-after-the-click this rule exists to prevent, and past
 /// `text::MAX_PIXELS` it was a live button under a preview picture that had
 /// rasterised perfectly well at [`PREVIEW_EM`].
-fn place_row(ui: &mut Ui, p: &Palette, ed: &Editor, actions: &mut UiActions) {
-    let locked = ed.layers.active_is_locked();
-    let folder = ed.layers.active_slot().is_none();
-    let empty = ed.text.block.text.trim().is_empty();
-    // Read only when something is typed. `preview` returns early on an empty
-    // block rather than rebuilding, so the cache beside it may still describe
-    // whatever was there before it was deleted — and `empty` is the answer for
-    // that case anyway.
-    let refused = if empty {
-        None
-    } else {
-        ed.text.preview.as_ref().and_then(|c| c.error)
-    };
-    let enabled = !locked && !folder && !empty && refused.is_none();
-    // The lock and the folder come first: they are refusals about *where* the
-    // text would go, and somebody whose layer is locked is not helped by being
-    // told about the size as well.
-    let refusal_line;
-    let tooltip = if locked {
-        "The layer is locked. Unlock it in the Layers panel, or select another."
-    } else if folder {
-        "A folder is selected. A folder holds no pixels, so select a layer."
-    } else if empty {
-        "Type something first."
-    } else if let Some(err) = refused {
-        // The same sentence the note under the preview draws, from the same
-        // function, so the tooltip and the panel cannot say different things
-        // about one block.
-        refusal_line = refusal(err);
-        &refusal_line
-    } else {
-        "Put the text on the canvas, where the transform tool can move, scale \
-         and turn it before it is committed"
-    };
+fn place_row(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &Editor,
+    refused: Option<TextError>,
+    actions: &mut UiActions,
+) {
+    let state = place_state(
+        ed.layers.active_is_locked(),
+        ed.layers.active_slot().is_none(),
+        ed.text.block.text.trim().is_empty(),
+        refused,
+    );
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = controls::text_button(ui, p, "Place", true, enabled);
+            let response = controls::text_button(ui, p, "Place", true, state.enabled);
             if response.clicked() {
                 actions.place_text = true;
             }
-            response.on_hover_text(tooltip);
+            response.on_hover_text(state.tooltip.as_ref());
         });
     });
+}
+
+/// Whether Place may be pressed, and what to say about it.
+///
+/// A pure function of four readings, and separate from [`place_row`] for the
+/// reason `gesture::press` and `dock`'s drop rules are separate from what draws
+/// them: this is the whole of the decision, and the decision is the part that
+/// was wrong. Reading it out of a running window is not a test anybody can run
+/// on CI.
+struct Place {
+    enabled: bool,
+    tooltip: Cow<'static, str>,
+}
+
+/// See [`Place`].
+///
+/// The order of the refusals is deliberate. The lock and the folder come first
+/// because they are about *where* the text would go, and somebody whose layer
+/// is locked is not helped by also being told about the size; `empty` comes
+/// before the block's own refusal because the preview does not rebuild for an
+/// empty block, so `refused` may be describing what was there a keystroke ago.
+fn place_state(locked: bool, folder: bool, empty: bool, refused: Option<TextError>) -> Place {
+    if locked {
+        return Place {
+            enabled: false,
+            tooltip: "The layer is locked. Unlock it in the Layers panel, or select another."
+                .into(),
+        };
+    }
+    if folder {
+        return Place {
+            enabled: false,
+            tooltip: "A folder is selected. A folder holds no pixels, so select a layer.".into(),
+        };
+    }
+    if empty {
+        return Place {
+            enabled: false,
+            tooltip: "Type something first.".into(),
+        };
+    }
+    if let Some(err) = refused {
+        // The same sentence the note under the preview draws, from the same
+        // function, so the tooltip and the panel cannot say different things
+        // about one block.
+        return Place {
+            enabled: false,
+            tooltip: refusal(err).into(),
+        };
+    }
+    Place {
+        enabled: true,
+        tooltip: "Put the text on the canvas, where the transform tool can move, scale \
+                  and turn it before it is committed"
+            .into(),
+    }
 }
 
 #[cfg(test)]
@@ -1165,10 +1236,13 @@ mod tests {
     /// every error there is.
     ///
     /// The panel's job here is to know *before* the click, and the only way it
-    /// can is by keeping what `build_preview` already found out. Exhaustive
-    /// over `TextError` on purpose: a variant added later without a sentence
-    /// would be a Place button that is disabled with nothing said, which is the
-    /// worse half of the failure this fixes.
+    /// can is by keeping what `build_preview` already found out.
+    ///
+    /// **What forces a sentence for a new variant is `refusal`'s wildcard-free
+    /// `match`, not this array**, which is hand-written and would happily go on
+    /// passing. This checks the shape of what comes out: a finished sentence
+    /// rather than a code, and no em-dash, which is the house rule for anything
+    /// the interface draws.
     #[test]
     fn every_reason_a_block_will_not_set_has_a_finished_sentence() {
         for err in [
@@ -1196,6 +1270,178 @@ mod tests {
             height: 4000,
         });
         assert!(line.contains("9000") && line.contains("4000"), "{line:?}");
+    }
+
+    /// Every sentence the real panel body draws, for a block in a given state.
+    ///
+    /// The panel is run headlessly through `Context::run_ui` and its text is
+    /// read back off the shapes it emitted, which is the only way to assert
+    /// that a notice is *drawn* rather than merely that some function would
+    /// return it. Without this, deleting the `controls::note` call under the
+    /// preview or the `substitution_note` call altogether leaves every test in
+    /// the workspace green — which is exactly what a critic found, and it was
+    /// true of the two fixes this whole branch exists for.
+    ///
+    /// Twice, because the first pass through a fresh context builds the font
+    /// atlas: `panels.rs`'s `ticking_a_layer_does_not_move_the_layer_list`
+    /// takes the second reading for the same reason.
+    fn panel_text(prepare: impl Fn(&mut Editor)) -> String {
+        use egui::{Rect, pos2, vec2};
+
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                vec2(crate::theme::metrics::PANEL, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut ed = Editor::default();
+        // No scan: it would spawn a thread per pass and, worse, a machine that
+        // actually has the family a case asks for would draw a different panel.
+        ed.text.fonts.hold_at_builtin();
+        prepare(&mut ed);
+        let palette = crate::theme::Palette::of(ed.ui.theme);
+        let mut text = String::new();
+        for _ in 0..2 {
+            text.clear();
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let mut actions = UiActions::default();
+                panel(ui, &palette, &mut ed, &mut actions);
+            });
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut text);
+            }
+        }
+        text
+    }
+
+    /// The panel says why a block will not go on the canvas, in the sentence
+    /// `place_text` would have raised after the click.
+    ///
+    /// The failure this pins is specific and was live: a block past
+    /// `text::MAX_PIXELS` drew a preview picture, because the preview
+    /// rasterises at `PREVIEW_EM` and 26 pixels succeeds where 1000 does not,
+    /// and then silently dropped the size line and left Place enabled.
+    #[test]
+    fn the_panel_draws_the_refusal_for_a_block_that_will_not_set() {
+        let ordinary = panel_text(|ed| {
+            ed.text.block.text = "Umber".to_string();
+            ed.text.block.size = 72.0;
+        });
+        assert!(
+            ordinary.contains("px on the canvas"),
+            "no size line on an ordinary block: {ordinary}"
+        );
+        assert!(
+            !ordinary.contains("more than Umber will rasterise"),
+            "an ordinary block was refused: {ordinary}"
+        );
+
+        let past_the_cap = panel_text(|ed| {
+            ed.text.block.text = "A caption nobody could fit on a canvas".to_string();
+            ed.text.block.size = text::MAX_SIZE;
+        });
+        assert!(
+            past_the_cap.contains("more than Umber will rasterise at once"),
+            "the panel said nothing about a block past the cap: {past_the_cap}"
+        );
+        assert!(
+            !past_the_cap.contains("px on the canvas"),
+            "a refused block still claimed a size: {past_the_cap}"
+        );
+    }
+
+    /// The panel names a substituted face, and stays quiet when there is none.
+    ///
+    /// `FontLibrary::resolve` is total, so without this sentence the dropdown
+    /// shows one family while the preview, the measurement and Place all use
+    /// another.
+    #[test]
+    fn the_panel_names_a_face_it_had_to_substitute() {
+        let honest = panel_text(|ed| ed.text.block.text = "Umber".to_string());
+        assert!(
+            !honest.contains("is not on this machine"),
+            "a face that resolved exactly was reported as substituted: {honest}"
+        );
+
+        // A name no scan can find, so this reads the same on every machine —
+        // "Helvetica Neue" would be installed on any Mac and the case would
+        // quietly stop testing anything there.
+        let substituted = panel_text(|ed| {
+            ed.text.block.text = "Umber".to_string();
+            ed.text.family = "A Foundry Face Nobody Has".to_string();
+        });
+        assert!(
+            substituted.contains("A Foundry Face Nobody Has is not on this machine"),
+            "the substitution was silent: {substituted}"
+        );
+        assert!(
+            substituted.contains("Archivo"),
+            "the substitute was not named: {substituted}"
+        );
+    }
+
+    /// Place is offered exactly when the block will actually go down.
+    ///
+    /// Every cell of the matrix, because the defect was one missing conjunct:
+    /// the button was live over a block the engine had already refused, and
+    /// the only way to find out was to click it.
+    #[test]
+    fn place_is_refused_for_every_reason_it_should_be() {
+        let too_large = TextError::TooLarge {
+            width: 9000,
+            height: 9000,
+        };
+        for (locked, folder, empty, refused) in [
+            (true, false, false, None),
+            (false, true, false, None),
+            (false, false, true, None),
+            (false, false, false, Some(too_large)),
+            (false, false, false, Some(TextError::NoInk)),
+            (false, false, false, Some(TextError::Unreadable)),
+            (true, true, true, Some(too_large)),
+        ] {
+            let state = place_state(locked, folder, empty, refused);
+            assert!(
+                !state.enabled,
+                "Place was live for ({locked}, {folder}, {empty}, {refused:?})"
+            );
+            assert!(!state.tooltip.is_empty());
+        }
+
+        // And the one case that must be live.
+        let state = place_state(false, false, false, None);
+        assert!(state.enabled, "Place was refused with nothing wrong");
+        assert!(state.tooltip.contains("Put the text on the canvas"));
+
+        // The refusal's tooltip is the note's sentence, from `refusal`, so the
+        // two cannot say different things about one block.
+        assert_eq!(
+            place_state(false, false, false, Some(too_large)).tooltip,
+            refusal(too_large)
+        );
+        // A lock outranks the size: the artist is not helped by being told
+        // about both, and the layer is the thing to fix first.
+        assert_eq!(
+            place_state(true, false, false, Some(too_large)).tooltip,
+            place_state(true, false, false, None).tooltip
+        );
     }
 
     /// A block past the cap **draws a picture and still refuses**, and the
@@ -1244,14 +1490,22 @@ mod tests {
         let ed = Editor::default();
         let library = ed.text.fonts.library();
         // The default pair is real, so the panel stays quiet.
-        assert_eq!(library.substituted(&ed.text.family, &ed.text.style), None);
+        assert!(
+            library
+                .substituted(&ed.text.family, &ed.text.style)
+                .is_none()
+        );
 
         assert_eq!(
-            library.substituted("A Foundry Face Nobody Has", "Regular"),
+            library
+                .substituted("A Foundry Face Nobody Has", "Regular")
+                .map(|(what, _)| what),
             Some(Substitution::Family)
         );
         assert_eq!(
-            library.substituted("Archivo", "Ultra Condensed Black Italic"),
+            library
+                .substituted("Archivo", "Ultra Condensed Black Italic")
+                .map(|(what, _)| what),
             Some(Substitution::Style)
         );
 
@@ -1290,9 +1544,16 @@ mod tests {
         }
         assert_eq!(matching("helvetica"), 0);
         // An empty query is not a filter, so the figure falls back to the
-        // cached count rather than being recomputed — and the two agree.
+        // cached count rather than being recomputed. **The two have to be the
+        // same quantity**, which they were not: the cached one counted faces
+        // and the filtered one counts families, so typing a character took the
+        // trigger from the number of styles to the number of typefaces.
         assert_eq!(matching(""), library.families().len());
-        assert_eq!(ed.text.fonts.count(), library.faces().len().to_string());
+        assert_eq!(
+            ed.text.fonts.family_count(),
+            library.families().len().to_string(),
+            "the unfiltered figure counts something other than the filtered one"
+        );
     }
 
     /// The Text module at the panel's real width, in the states it can be in.
@@ -1365,11 +1626,16 @@ mod tests {
                 "Umber",
                 Align::Left,
                 72.0,
-                Some("Helvetica Neue"),
+                Some("A Foundry Face Nobody Has"),
             ),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
+            // No scan, for `hold_at_builtin`'s own reason: a committed shot
+            // whose face count is the number of fonts on a contributor's
+            // machine is a picture of that machine, and case 6 would find its
+            // "missing" family on a machine that happens to have it.
+            ed.text.fonts.hold_at_builtin();
             ed.text.block.text = text.to_string();
             ed.text.block.align = align;
             ed.text.block.size = size;
