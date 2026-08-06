@@ -1915,6 +1915,62 @@ once per stroke but must never move into the drawing loop.
   answers to the in-memory budget, so a file written by a build with a larger
   one cannot hand this process more than it allows. See "The document format".
 
+### Partial exhaustiveness is worse than none
+
+**An enum matched exhaustively at some call sites and by `matches!` at others
+is more dangerous than one matched loosely everywhere**, because the compiler
+appears to have your back and only half does. This is a habit here rather than
+a slip — four instances were found independently in one day, in three files,
+and the fourth was in the guard written to fix the first three.
+
+`EditKind` is the worked example. Three consumers fail the build when a variant
+is added — `label`, `flip_axis` and `panels::edit_icon`, all exhaustive with no
+catch-all. Three did not: `is_structural` and `resurrects_pixels` were
+`matches!`, which answers **false** for a variant it has never heard of, and
+`ALL` was a hand-written `[EditKind; 11]` that still compiled at the wrong
+length. `gesture::supersedes_stroke` was the same shape in a third file, a
+*negative* `matches!` whose doc comment claimed it was stated over the whole
+`Press` enum.
+
+**The silent half is the half that damages a document, and it is worth
+following one all the way down.** `SaveHistory::new` skips an entry when
+`is_structural()`; one it does not skip falls through
+`match edit.patches().first()` to `None => SaveBody::Flip`. So a new bodiless
+variant is written into the `.ora` **as a canvas flip**. On reload,
+`docimport::history` has a deliberate guard against exactly that outcome —
+whose comment spells out the failure, "a corruption diagnosis for a file that
+is merely newer than this reader" — and **that guard is gated on
+`is_structural` too**, so it does not fire, the entry fails the `w == 0` bound
+check, and the whole saved history is discarded. Somebody anticipated this
+precisely, wrote the defence, and hung it on the one predicate that goes quiet
+in that case.
+
+The rules, and they are cheap:
+
+- **Where a `match` would fail the build, do not write `matches!`.** Six arms
+  cost nothing and turn a silent wrong answer into a compile error.
+- **An `ALL` array is guarded by an exhaustive match in a test, never by
+  iterating itself** — a test that walks `ALL` can only ever check what is in
+  it. Having the arms index `ALL` makes a short array an out-of-bounds panic,
+  which is better; it is still not total, because an arm that does not index
+  its own position compiles and passes. That was *measured* rather than
+  assumed, and the comment names the hole instead of claiming the array cannot
+  be forgotten. The only complete fix is a macro deriving the enum and `ALL`
+  from one list, judged against this codebase's taste for per-variant rustdoc.
+- **A guard's comment must not claim more reach than the mutation
+  demonstrates.** Two of the four carried a doc comment promising exhaustiveness
+  the code did not have, and the guard's own first draft made the same mistake
+  one level up. The claim is easier to write than the guard.
+- **A `None` returned into a `.flatten()` is not a refusal, it is a silence.**
+  `SaveHistory::new` answers `None` when a patch names a slot no layer holds,
+  and its call site reads
+  `self.editor.ui.save_history.then(|| SaveHistory::new(…)).flatten()` — so the
+  save succeeds, the history is dropped, and nothing is said. `SaveWarning` has
+  one variant and it is about blend modes. The refusal reads as loud at the
+  site that *produces* it, which is the trap: whether a `None` is a diagnostic
+  or a shrug is decided by its **caller**. Check the call site before
+  describing a refusal as a failure somebody will see.
+
 ## Interface
 
 Layout and tokens come from the **"Umber app"** screen of the Umber design
