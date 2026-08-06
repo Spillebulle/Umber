@@ -1007,10 +1007,12 @@ mod tests {
     ///
     /// This is the whole of why [`Pen::at`] insets by two rather than clamping
     /// to the buffer's own dimensions, and it is a property of the inset rather
-    /// than of this glyph: no point can reach `height - 2`, a span therefore
-    /// deposits nothing below `height - 3`, and every delta lands at an `x` of
-    /// at most `width - 1` — inside the row it belongs to. So the last two rows
-    /// can hold nothing at all.
+    /// than of this glyph. No point can go *past* `height - 2`; a span whose
+    /// lower end sits exactly on that boundary contributes to the rows above it
+    /// and not to the row it ends on, so nothing is deposited below row
+    /// `height - 3`. And every delta lands at an `x` of at most `width - 1`,
+    /// which is inside the row it belongs to. So the last two rows can hold
+    /// nothing at all.
     ///
     /// Clamped to the dimensions instead, a span that ends at exactly the width
     /// writes its closing delta at `linestart + width`, which is the first cell
