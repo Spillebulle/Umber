@@ -626,16 +626,22 @@ impl StrokeBuilder {
         }
         angle += m.angle.to_radians();
 
+        // Below 1.0 the long and short axes swap, so a modulation that dips
+        // under a round dab would turn the ellipse a quarter turn rather than
+        // flattening it back out.
+        //
+        // Bound to a name because the *damage* below is derived from it. It
+        // used to be written inline and the box was computed from the nominal
+        // `dab_ratio` instead — see the note there.
+        let aspect = (self.brush.dab_ratio + m.ratio).max(1.0);
+
         self.pending.push(Dab {
             pos: [centre.x, centre.y],
             radius,
             hardness: (self.brush.hardness_at(pressure) + m.hardness).clamp(0.0, 1.0),
             coverage,
             color: self.dab_color(&m),
-            // Below 1.0 the long and short axes swap, so a modulation that
-            // dips under a round dab would turn the ellipse a quarter turn
-            // rather than flattening it back out.
-            aspect: (self.brush.dab_ratio + m.ratio).max(1.0),
+            aspect,
             angle,
         });
 
@@ -653,8 +659,32 @@ impl StrokeBuilder {
         //
         // Exact for a tip and merely conservative for a round dab, and for an
         // unrotated ellipse it is *tighter* than the circle was.
+        //
+        // The short semi-axis comes from `aspect` — the dab that was actually
+        // pushed — and **not** from the nominal `self.brush.dab_ratio`. This
+        // was the same under-tight rect a fourth time: `dab.wgsl`'s vertex
+        // shader builds the quad as `radius / max(aspect, 1.0)`, so wherever a
+        // `DabTarget::Ratio` modulation lands negative the real dab is *fatter*
+        // than the nominal ratio describes and the box missed its edges — on y
+        // at every angle and on x wherever the dab is turned. It is reachable
+        // from the shipped library rather than hypothetical: thirty presets can
+        // record a short axis smaller than the real one, and two of them
+        // (`tanda/charcoal-04`, `dieterle/arrow-1`) carry `dab_ratio` 10.0 with
+        // a low of -9.0, so `aspect` reaches 1.0 — a round dab described by a
+        // box a tenth of its height.
+        //
+        // Two things this deliberately does not touch:
+        //
+        //   - **`Brush::step_at` still reads the nominal `dab_ratio`**, and must.
+        //     Spacing is decided by the nominal ratio and angle, never by
+        //     `dab_angle_jitter` or a modulation, or a stroke's spacing would
+        //     wander with the RNG. Damage is per dab and has to follow the dab;
+        //     spacing is per stroke and must not.
+        //   - **`tip_scale` is still not in it**, and that stays right: its
+        //     components are at most 1, so the quad the shader builds is never
+        //     larger than this box on that account.
         let (sin, cos) = angle.sin_cos();
-        let short = radius / self.brush.dab_ratio.max(1.0);
+        let short = radius / aspect;
         let half = Vec2::new(
             (radius * cos).abs() + (short * sin).abs(),
             (radius * sin).abs() + (short * cos).abs(),
@@ -1657,6 +1687,298 @@ mod tests {
         // Never inside out: below 1.0 the long and short axes swap and the
         // ellipse would turn a quarter turn rather than flattening back out.
         assert!(lo >= 1.0, "aspect went below a circle: {lo}");
+    }
+
+    /// The quad `dab.wgsl`'s vertex shader builds for one dab, built the same
+    /// way it does: the box `(±radius, ±short)` with `short = radius /
+    /// max(aspect, 1)`, rotated by the dab's angle about its centre.
+    ///
+    /// `tip_scale` is left out because it is `(1, 1)` for a tipless stroke, and
+    /// because its components are at most 1 in any case — it can only ever make
+    /// the quad smaller, never larger than the box being checked against.
+    ///
+    /// This reads the *shader's* construction rather than the emitter's, which
+    /// is the point: it is the specification the damaged box has to satisfy, so
+    /// a test written against it cannot pass by agreeing with a mistake.
+    fn dab_quad(d: &Dab) -> [Vec2; 4] {
+        let short = d.radius / d.aspect.max(1.0);
+        let (sin, cos) = d.angle.sin_cos();
+        let pos = vec2(d.pos[0], d.pos[1]);
+        let corners = [
+            vec2(-1.0, -1.0),
+            vec2(1.0, -1.0),
+            vec2(-1.0, 1.0),
+            vec2(1.0, 1.0),
+        ];
+        corners.map(|c| {
+            let s = vec2(c.x * d.radius, c.y * short);
+            pos + vec2(s.x * cos - s.y * sin, s.x * sin + s.y * cos)
+        })
+    }
+
+    /// The axis-aligned box of a dab's quad.
+    fn quad_box(d: &Dab) -> (Vec2, Vec2) {
+        let q = dab_quad(d);
+        (
+            q.iter().copied().reduce(Vec2::min).unwrap(),
+            q.iter().copied().reduce(Vec2::max).unwrap(),
+        )
+    }
+
+    /// A chisel whose ratio modulation can round it right out.
+    ///
+    /// `dab_ratio` 10.0 against a `Ratio` mapping reaching -9.0 is not invented:
+    /// it is `mypaint/tanda/charcoal-04` and `mypaint/dieterle/arrow-1`, both
+    /// shipped. `aspect` then reaches 1.0 — a round dab — while the nominal
+    /// ratio still says the short axis is a tenth of the long one. Turned by
+    /// 30° so the box is wrong on x as well as on y.
+    fn flattening_chisel() -> Brush {
+        Brush {
+            dab_ratio: 10.0,
+            dab_angle: 30.0,
+            ..modulated(&[entry(DabTarget::Ratio, DabInput::Random, -9.0, 0.0)])
+        }
+    }
+
+    /// The damaged box has to describe the dab that was *emitted*, not the one
+    /// the nominal settings describe.
+    ///
+    /// It did not: the box took its short semi-axis from `Brush::dab_ratio`
+    /// while the dab carried a modulated `aspect`, so a mapping that dipped the
+    /// ellipticity — 30 of the shipped presets can — left the real quad taller
+    /// than the rectangle recorded for it. That is the under-tight damaged rect
+    /// this project has been bitten by three times before: the coverage outside
+    /// it stays in the scratch, redraws as a live preview so the stroke appears
+    /// to hang, and is then baked in by the *next* stroke wearing that stroke's
+    /// colour. It also puts pixels outside the undo patch, since the commit is
+    /// scissored to the same cells the patch was captured from.
+    #[test]
+    fn the_damaged_box_covers_a_dab_a_ratio_modulation_fattened() {
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            flattening_chisel(),
+            WHITE,
+            InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(300.0, 240.0), 1.0, 0.1));
+
+        let bounds = s.bounds();
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert!(dabs.len() > 4, "too few dabs to say anything: {}", dabs.len());
+        // Or the test would pass on a stroke whose modulation never bit.
+        let roundest = dabs.iter().map(|d| d.aspect).fold(f32::MAX, f32::min);
+        assert!(
+            roundest < 2.0,
+            "no dab was rounded out, so nothing was tested: narrowest aspect {roundest}"
+        );
+
+        for d in &dabs {
+            for c in dab_quad(d) {
+                assert!(
+                    c.x >= bounds.min.x - 1e-3
+                        && c.x <= bounds.max.x + 1e-3
+                        && c.y >= bounds.min.y - 1e-3
+                        && c.y <= bounds.max.y + 1e-3,
+                    "a corner the shader rasterises is outside the damaged box: \
+                     corner {c}, box {bounds:?}, aspect {}, radius {}",
+                    d.aspect,
+                    d.radius
+                );
+            }
+        }
+    }
+
+    /// Feed both or neither: the cell mask is what the undo patch and the
+    /// commit are cut to, so a mask that did not cover what the box covers is
+    /// the same bug back again and much harder to see.
+    #[test]
+    fn the_cell_mask_covers_a_dab_a_ratio_modulation_fattened() {
+        const CANVAS: u32 = 512;
+
+        let mut s = StrokeBuilder::new();
+        s.begin(
+            flattening_chisel(),
+            WHITE,
+            InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0),
+        );
+        s.extend(InputPoint::new(vec2(300.0, 240.0), 1.0, 0.1));
+
+        // The rect a patch would be cut to, exactly as the commit builds it.
+        let rect = s
+            .bounds()
+            .to_pixels_clamped(glam::UVec2::splat(CANVAS))
+            .expect("the stroke damaged nothing");
+        let pieces = s.damage().pieces(rect);
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+
+        let mut covered = vec![false; (CANVAS * CANVAS) as usize];
+        for p in &pieces {
+            for y in p.y..p.y + p.height {
+                for x in p.x..p.x + p.width {
+                    covered[(y * CANVAS + x) as usize] = true;
+                }
+            }
+        }
+
+        for d in &dabs {
+            let (lo, hi) = quad_box(d);
+            let x0 = lo.x.floor().max(0.0) as u32;
+            let y0 = lo.y.floor().max(0.0) as u32;
+            let x1 = (hi.x.ceil().max(0.0) as u32).min(CANVAS);
+            let y1 = (hi.y.ceil().max(0.0) as u32).min(CANVAS);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    assert!(
+                        covered[(y * CANVAS + x) as usize],
+                        "pixel ({x}, {y}) is under the dab's quad and in no damage \
+                         piece: aspect {}, radius {}",
+                        d.aspect,
+                        d.radius
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of the rule, and the reason there is no fudge factor in
+    /// the box: it is the quad's axis-aligned bound *exactly*, not a widened
+    /// one. The tiling argument rests on the pixels a patch keeps being a
+    /// subset of what the box held, so a box grown "to be safe" would make
+    /// every small mark cost more than it used to.
+    ///
+    /// A brush with no ratio modulation is where the fix is an identity — the
+    /// dab's `aspect` is `dab_ratio.max(1.0)` by construction — so this also
+    /// pins that the change costs the rest of the library nothing.
+    #[test]
+    fn the_damaged_box_is_the_quad_exactly_and_no_larger() {
+        let brush = Brush {
+            dab_ratio: 6.0,
+            dab_angle: 40.0,
+            ..unsmoothed(20.0, 0.2)
+        };
+        let mut s = StrokeBuilder::new();
+        // A tap, so the box belongs to one dab and equality is meaningful.
+        s.begin(brush, WHITE, InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0));
+        let bounds = s.bounds();
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert_eq!(dabs.len(), 1);
+
+        let (lo, hi) = quad_box(&dabs[0]);
+        assert!(
+            (bounds.min - lo).abs().max_element() < 1e-3
+                && (bounds.max - hi).abs().max_element() < 1e-3,
+            "box {bounds:?} is not the quad's bound {lo}..{hi}"
+        );
+    }
+
+    /// The box the superseded arithmetic recorded: the short semi-axis taken
+    /// off the brush's *nominal* ratio rather than off the dab that was
+    /// emitted. Written out because what is being pinned below is a relation
+    /// between the two rules, so the old one has to be somewhere to compare to.
+    fn nominal_box(dabs: &[Dab], dab_ratio: f32) -> Rect {
+        let mut r = Rect::empty();
+        for d in dabs {
+            let (sin, cos) = d.angle.sin_cos();
+            let short = d.radius / dab_ratio.max(1.0);
+            r.union_box(
+                vec2(d.pos[0], d.pos[1]),
+                vec2(
+                    (d.radius * cos).abs() + (short * sin).abs(),
+                    (d.radius * sin).abs() + (short * cos).abs(),
+                ),
+            );
+        }
+        r
+    }
+
+    /// What the fix costs a brush that never flattened: nothing, and for some
+    /// of them less than nothing. Pinned rather than merely argued, because a
+    /// documented-and-unenforced invariant is how this defect arrived.
+    ///
+    /// Three cases, and between them the reason the short axis must not be
+    /// "simplified" back onto the nominal ratio later:
+    ///
+    /// * **No `Ratio` modulation.** `m.ratio` is 0, so `(dab_ratio +
+    ///   0.0).max(1.0)` is the identical expression to `dab_ratio.max(1.0)` and
+    ///   the box is byte for byte what it was. That is 216 of the 258 shipped
+    ///   presets and every hand-written brush.
+    /// * **A positive one.** The real dab is *narrower* than nominal, so the
+    ///   new box is strictly tighter and the undo patch strictly smaller.
+    /// * **A negative one.** The box widens, to what the shader was already
+    ///   painting. That is the bug, and the only case that costs anything.
+    #[test]
+    fn the_box_never_widens_for_a_brush_that_does_not_flatten() {
+        let run = |brush: Brush| {
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(vec2(200.0, 200.0), 1.0, 0.0));
+            s.extend(InputPoint::new(vec2(300.0, 240.0), 1.0, 0.1));
+            let got = s.bounds();
+            let dabs: Vec<Dab> = s.drain_pending().collect();
+            (got, nominal_box(&dabs, brush.dab_ratio), dabs)
+        };
+
+        // Nothing modulates the ratio: identical, and not merely contained.
+        let plain = Brush {
+            dab_ratio: 8.0,
+            dab_angle: 25.0,
+            ..unsmoothed(20.0, 0.2)
+        };
+        let (got, was, _) = run(plain);
+        assert_eq!(got, was, "an unmodulated brush's damaged box moved");
+
+        // Positive only, so every dab is narrower than its nominal ratio says.
+        let narrowing = Brush {
+            dab_ratio: 4.0,
+            dab_angle: 25.0,
+            ..modulated(&[entry(DabTarget::Ratio, DabInput::Random, 0.0, 6.0)])
+        };
+        let (got, was, dabs) = run(narrowing);
+        assert!(
+            dabs.iter().any(|d| d.aspect > 4.5),
+            "the modulation never bit, so nothing was tested"
+        );
+        assert!(
+            got.min.x >= was.min.x
+                && got.min.y >= was.min.y
+                && got.max.x <= was.max.x
+                && got.max.y <= was.max.y,
+            "a positive ratio modulation widened the box: {got:?} against {was:?}"
+        );
+        assert_ne!(got, was, "the box should be strictly tighter, not equal");
+    }
+
+    /// Named for the invariant and not for a bug, because there is no bug here
+    /// to catch: `tint` used a bare `rem_euclid`, which gets NaN and a tiny
+    /// negative wrong, and `Hsv::to_color` wrapped the hue again on its way out
+    /// and caught both. Nothing magenta and no discarded mesh ever reached a
+    /// canvas.
+    ///
+    /// What it pins is that a hue leaving `tint` is a hue — finite, and a
+    /// colour when it lands on the dab. The bare `rem_euclid` was drift rather
+    /// than damage: the field is written by struct mutation, which bypasses
+    /// `Hsv::new`'s wrapping, so the property was resting entirely on a
+    /// downstream call somebody could refactor away without ever learning it
+    /// was load-bearing. This holds whichever of the two doors is standing,
+    /// which is the point of having both.
+    #[test]
+    fn a_hue_modulation_goes_through_the_one_door() {
+        // Fifty turns either way: far past anything a brush asks for, so the
+        // wrap is exercised rather than skirted.
+        let brush = modulated(&[entry(DabTarget::Hue, DabInput::Random, -50.0, 50.0)]);
+        let mut s = StrokeBuilder::new();
+        s.begin(brush, [0.8, 0.2, 0.1], InputPoint::new(Vec2::ZERO, 1.0, 0.0));
+        s.extend(InputPoint::new(vec2(200.0, 0.0), 1.0, 0.1));
+        let dabs: Vec<Dab> = s.drain_pending().collect();
+        assert!(dabs.len() > 4);
+        for d in &dabs {
+            for c in d.color {
+                assert!(
+                    c.is_finite() && (0.0..=1.0).contains(&c),
+                    "dab colour {:?} is not a colour",
+                    d.color
+                );
+            }
+        }
     }
 
     /// One stroke still has to redraw identically with the new random input in
