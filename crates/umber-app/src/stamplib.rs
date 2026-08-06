@@ -137,6 +137,20 @@ struct State {
     /// The row whose name is being edited. A rename **is** undoable — it is
     /// another rename — so unlike Remove it is not asked twice.
     renaming: Option<Renaming>,
+    /// Whether the field was actually **drawn** on the last frame, which is not
+    /// the same question as whether one is open.
+    ///
+    /// [`browser`] refuses Escape and the backdrop click while a rename is in
+    /// flight, and "in flight" has to mean *reachable*: `show_rows` culls the
+    /// rows outside the view, so a field scrolled out of sight is one nothing
+    /// can report a blur for — and reading `renaming.is_some()` there left the
+    /// modal refusing every way out but the ✕, with nothing on screen to say
+    /// why. One wheel flick, on a list six rows tall against the whole shipped
+    /// table.
+    ///
+    /// Written by [`list`] and read by [`browser`] *after* the body, which is
+    /// the whole reason it is a field rather than a local.
+    field_drawn: bool,
 }
 
 fn state_id() -> Id {
@@ -192,15 +206,6 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     let width = full_width.min(available.x - 48.0).max(360.0);
     let height = list_height.min(available.y - 200.0).max(160.0);
 
-    // Read **before** the body, because the body is what clears it. Escape
-    // makes a `TextEdit` surrender focus, so a rename in progress is cancelled
-    // by the field itself on the very frame `should_close` also answers yes —
-    // and one keystroke that both abandoned the name and shut the browser is
-    // Escape doing two things at once. It cancels the innermost thing first,
-    // which is what it means everywhere else, and the same rule
-    // `Flow::holds_work` keeps for a modal with work in flight.
-    let editing = state.renaming.is_some();
-
     let response = egui::Modal::new(Id::new("stamp-library-browser"))
         .frame(
             Frame::NONE
@@ -218,7 +223,19 @@ fn browser(root: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
             footer(ui, p, ed, state, kind);
         });
 
-    if response.should_close() && !editing {
+    // Escape makes a `TextEdit` surrender focus, so a rename in progress is
+    // cancelled by the field itself on the very frame `should_close` also
+    // answers yes — and one keystroke that both abandoned the name and shut the
+    // browser is Escape doing two things at once. It cancels the innermost
+    // thing first, which is what it means everywhere else and the rule
+    // `Flow::holds_work` already keeps for a modal with work in flight.
+    //
+    // Read **after** the body and off what was *drawn*, not off what the state
+    // says is open. `show_rows` culls the rows outside the view, so a field
+    // scrolled out of sight can report nothing — and a guard reading
+    // `renaming.is_some()` there refused Escape, refused the backdrop and left
+    // the ✕ as the only way out of a modal that looked idle.
+    if response.should_close() && !state.field_drawn {
         close(root.ctx(), state);
     }
 }
@@ -437,6 +454,17 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
     // second — a flash nobody could account for.
     let held = brushlib::library(ui.ctx(), ed).ok();
     let mut rows = entries(ed, state, kind);
+    // A field on a row the search has just hidden has no Save and no Cancel, so
+    // it is abandoned rather than left standing. `field_drawn` below covers the
+    // row that is merely scrolled out of view — that one comes back with what
+    // was typed still in it — but a row that is not in the list at all is one
+    // the artist has navigated away from.
+    if let Some(field) = &state.renaming
+        && !rows.iter().any(|row| row.name == field.name)
+    {
+        state.renaming = None;
+    }
+    state.field_drawn = false;
     // Who is using each of the user's own, which is what decides whether Remove
     // may be offered. Asked once per frame rather than once per row, and only
     // of the rows that can be removed at all.
@@ -495,8 +523,10 @@ fn list(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State, kind: Kind
         // is the cost `brushlib`'s own list refuses at 201 presets. The caches
         // make every *later* frame free; this is what makes the first one
         // bearable. It is legal here because every row is the same height by
-        // construction — a fixed square and two lines beside it, neither of
-        // which wraps.
+        // construction: a fixed square, and beside it either two lines that
+        // truncate rather than wrap or a single-line field. **Nothing in a row
+        // may wrap** — a row taller than `STAMP_ROW` shifts every row under it
+        // while the scroll area goes on reserving the old figure.
         area.show_rows(ui, metrics::STAMP_ROW, rows.len(), |ui, visible| {
             ui.spacing_mut().item_spacing.y = ROW_GAP;
             for entry in &rows[visible] {
@@ -559,6 +589,10 @@ fn row(
     entry: &Entry,
 ) -> Option<Action> {
     let mut action = None;
+    // Set only where the field really reaches the screen — `show_rows` never
+    // calls this for a culled row, so a `false` here is exactly the "nothing
+    // can report a blur" case `State::field_drawn` exists for.
+    let mut drawn = false;
     // Which row the brush is actually painting with. A paper is compared by the
     // **tile**, not by the name: one of the shipped three can be in force
     // either as `Brush::grain_pattern` or as a name, and a name comparison
@@ -617,12 +651,19 @@ fn row(
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         match state.renaming.as_mut().filter(|_| renaming) {
-                            Some(field) => rename_field(ui, p, field, &mut action),
+                            Some(field) => {
+                                rename_field(ui, p, field, &mut action);
+                                drawn = true;
+                            }
                             None => {
-                                // Truncated rather than extending, and with the
-                                // whole line on hover: the column is bounded
-                                // now, so a label that ran past it would be
-                                // drawn over the controls beside it.
+                                // Truncated rather than extending, and **both**
+                                // with the whole of themselves on hover: the
+                                // column is bounded now, so a label that ran
+                                // past it would be drawn over the controls
+                                // beside it — and the name is the one thing on
+                                // this row that a preset actually resolves
+                                // through, so a name cut short with no way to
+                                // read it is worse than a cut detail line.
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&entry.name)
@@ -630,7 +671,8 @@ fn row(
                                             .color(p.text_strong),
                                     )
                                     .truncate(),
-                                );
+                                )
+                                .on_hover_text(&entry.name);
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&line).size(text::TINY).color(p.text_dim),
@@ -644,6 +686,9 @@ fn row(
                 });
             });
         });
+    if drawn {
+        state.field_drawn = true;
+    }
     action
 }
 
@@ -778,7 +823,14 @@ fn rename_field(ui: &mut Ui, p: &Palette, field: &mut Renaming, action: &mut Opt
             },
         );
     }
-    controls::note(ui, p, "Every brush that uses it follows.");
+    // **No sentence under the field**, and it was there. `show_rows` reserves
+    // `metrics::STAMP_ROW` for every row and lays out only the visible ones, so
+    // a row taller than that shifts everything below it while the scroll area
+    // keeps reserving the old figure. `controls::note` wraps — it is in a
+    // `top_down` layout — and at `browser`'s clamped minimum width the text
+    // column is about 170 px against a 145 px sentence, so one wider glyph made
+    // it two lines. The Rename button's tooltip already says what a rename does
+    // to the brushes, before it is pressed, which is where it is useful.
 }
 
 /// The line under a picture's name: how big it is, where it came from, how many
@@ -1098,10 +1150,21 @@ fn rename(
 /// one the moment theirs is called something else, so the mark would change
 /// under the brush with nothing on screen to say why.
 ///
-/// `Editor::tip` is deliberately **not** touched. The library re-inserted the
-/// very same `Arc` under the new name, so the mask in hand is still the mask
-/// the library holds, and handing `set_tip` a different pointer for the same
-/// pixels is the one thing its identity check exists to avoid.
+/// **A stamp has a second direction and a paper does not**, and it is the one
+/// easy to miss. `Editor::paper_name` is resolved live by `paper_tile`, so
+/// moving the name is the whole of it there. `Editor::tip` is resolved *once*,
+/// by `apply_preset` or `set_tip` — so a rename that lands **onto** the name
+/// the hand is holding changes what that name means for every saved preset and
+/// leaves the mask in hand alone. That is reachable: `free_stem` answers to the
+/// user's own map and directory and not to the shipped table, so renaming a
+/// picture onto `umber-stipple` succeeds while the hand goes on stamping
+/// Umber's. The notice on exactly that path says yours is now the one every
+/// brush finds, and it would have been false for the one being held.
+///
+/// Where the name did *not* move, `Editor::tip` keeps its `Arc` — the library
+/// re-inserted the very same one under the new name, and handing `set_tip` a
+/// different pointer for the same pixels is what its identity check exists to
+/// avoid.
 fn carry_the_hand(ed: &mut Editor, kind: Kind, old: &str, new: &str) {
     let held = match kind {
         Kind::Stamps => &mut ed.tip_name,
@@ -1109,6 +1172,19 @@ fn carry_the_hand(ed: &mut Editor, kind: Kind, old: &str, new: &str) {
     };
     if held.as_deref() == Some(old) {
         *held = Some(new.to_owned());
+    }
+    // The user's library first and the shipped table second, which is
+    // `Editor::apply_preset`'s order and has to be, or the hand would resolve a
+    // name differently from every preset that names it.
+    if kind == Kind::Stamps
+        && ed.tip_name.as_deref() == Some(new)
+        && let Some(mask) = ed
+            .tips
+            .get(new)
+            .cloned()
+            .or_else(|| umber_core::tip::builtin(new).cloned())
+    {
+        ed.tip = Some(mask);
     }
 }
 
@@ -1714,6 +1790,133 @@ mod tests {
             }],
         );
         assert!(load(&ctx).open.is_none(), "the browser would not shut");
+    }
+
+    /// The modal refuses Escape while a rename is in flight, and "in flight"
+    /// has to mean *reachable*.
+    ///
+    /// `show_rows` culls the rows outside the view, so a field the artist has
+    /// scrolled away from is one nothing can report a blur for — and a guard
+    /// reading `state.renaming.is_some()` there refused Escape, refused the
+    /// backdrop and left the ✕ as the only way out of a modal that looked idle.
+    /// The search is the other door onto the same state and is the half a test
+    /// can reach: a row that is not in the list is not drawn either.
+    #[test]
+    fn a_field_on_a_row_that_is_not_drawn_does_not_trap_the_browser() {
+        let scratch = Scratch::new("trap");
+        let mut library = scratch.library();
+        library
+            .add_tip("nib", TipMask::new(2, 2, vec![1; 4]).expect("mask"))
+            .expect("add");
+
+        let ctx = egui::Context::default();
+        let mut ed = Editor::default();
+        brushlib::seed_library(&ctx, &mut ed, library);
+        let palette = Palette::of(crate::theme::ThemeKind::Graphite);
+        store(
+            &ctx,
+            State {
+                open: Some(Kind::Stamps),
+                // A search that leaves the renamed row out of the list, which
+                // is what a scrolled-away row looks like to the guard.
+                query: "nothing matches this".to_owned(),
+                renaming: Some(Renaming {
+                    name: "nib".to_owned(),
+                    text: "half typed".to_owned(),
+                    focus: true,
+                }),
+                ..State::default()
+            },
+        );
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0));
+        let frame = |ctx: &egui::Context, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| dialogs(ui, &palette, ed));
+        };
+
+        frame(&ctx, &mut ed, Vec::new());
+        let state = load(&ctx);
+        assert!(!state.field_drawn, "no field can have been drawn");
+        assert!(
+            state.renaming.is_none(),
+            "a field on a row the list does not hold is abandoned"
+        );
+
+        frame(
+            &ctx,
+            &mut ed,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            load(&ctx).open.is_none(),
+            "Escape could not shut a browser whose field was nowhere on screen"
+        );
+        assert!(ed.tips.contains_key("nib"), "and nothing was renamed");
+    }
+
+    /// Renaming a picture **onto** the name the hand is holding is the second
+    /// direction, and only a stamp has it.
+    ///
+    /// `Editor::paper_name` is resolved live by `paper_tile`, but `Editor::tip`
+    /// is resolved once — so moving the name is not enough here. `free_stem`
+    /// answers to the user's own library and not to the shipped table, so this
+    /// rename succeeds and changes what that name means for every saved preset;
+    /// leaving the hand alone would have it stamping Umber's picture under the
+    /// notice that says yours is now the one every brush finds.
+    #[test]
+    fn renaming_onto_the_name_in_hand_puts_the_new_picture_in_it() {
+        let shipped = umber_core::tip::builtin_tips()
+            .keys()
+            .next()
+            .expect("the shipped table is not empty")
+            .to_string();
+
+        let scratch = Scratch::new("onto");
+        let mut library = scratch.library();
+        library
+            .add_tip("scan_003", TipMask::new(2, 2, vec![7; 4]).expect("mask"))
+            .expect("add");
+
+        let ctx = egui::Context::default();
+        let mut ed = Editor::default();
+        brushlib::seed_library(&ctx, &mut ed, library);
+        let mut state = State::default();
+
+        // The hand is holding the shipped picture, by name.
+        choose(&mut ed, &mut state, Kind::Stamps, shipped.clone());
+        let umbers = ed.tip.clone().expect("in hand");
+        assert!(Arc::ptr_eq(
+            &umbers,
+            umber_core::tip::builtin(&shipped).expect("shipped")
+        ));
+
+        rename(
+            &ctx,
+            &mut ed,
+            &mut state,
+            Kind::Stamps,
+            "scan-003".to_owned(),
+            shipped.clone(),
+        );
+
+        assert_eq!(ed.tip_name.as_deref(), Some(shipped.as_str()));
+        let now = ed.tip.clone().expect("still in hand");
+        assert!(
+            Arc::ptr_eq(&now, ed.tips.get(&shipped).expect("theirs")),
+            "the hand kept stamping Umber's picture under a name that is now theirs"
+        );
+        assert_eq!(now.coverage(), [7; 4]);
     }
 
     /// How many brushes paint with a picture used to be knowable only by
