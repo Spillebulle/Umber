@@ -138,6 +138,24 @@ impl Drag {
     pub fn destination(&self) -> Option<usize> {
         self.to
     }
+
+    /// A drag already aiming somewhere, for a test that has to draw one.
+    ///
+    /// The panel's preview shot needs a drag in flight without a pointer to
+    /// make one, and [`Drag::aim`] wants the cells — which only exist once the
+    /// grid has been drawn. Deliberately not a general constructor: outside a
+    /// test the only thing that may set a destination is `aim`, or the ring on
+    /// the grid could name somewhere the model was never asked about. Exactly
+    /// [`crate::layerdrag::Drag::aiming_for_test`]'s rule, and never compiled
+    /// into the application.
+    #[cfg(test)]
+    pub fn aiming_for_test(palette: impl Into<String>, from: usize, to: usize) -> Self {
+        Self {
+            palette: palette.into(),
+            from,
+            to: Some(to),
+        }
+    }
 }
 
 /// Which cell a pointer at `pointer` is actually on, with nothing clamped.
@@ -232,7 +250,11 @@ mod tests {
     fn a_pointer_finds_the_cell_it_is_inside() {
         let cells = grid(11, 4);
         for index in 0..11 {
-            assert_eq!(cell_at(&cells, centre(index, 4), GAP), Some(index), "{index}");
+            assert_eq!(
+                cell_at(&cells, centre(index, 4), GAP),
+                Some(index),
+                "{index}"
+            );
             assert_eq!(
                 cell_pressed(&cells, centre(index, 4)),
                 Some(index),

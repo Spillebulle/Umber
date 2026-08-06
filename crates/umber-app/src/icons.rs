@@ -752,11 +752,14 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             // shape reads at this size; two would be a pair of dots and four
             // would sit on the axes and read as a compass. The mark names the
             // idea rather than whichever relation happens to be chosen.
-            painter.circle_stroke(at(12.0, 12.0), 7.5 * scale, stroke);
+            // The discs are small against the ring's radius on purpose: at 2.4
+            // they merged into the stroke and the mark read as a clover rather
+            // than as a wheel with points on it.
+            painter.circle_stroke(at(12.0, 12.0), 8.0 * scale, stroke);
             for k in 0..3 {
                 let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
                 let (s, c) = a.sin_cos();
-                painter.circle_filled(at(12.0 + c * 7.5, 12.0 + s * 7.5), 2.4 * scale, colour);
+                painter.circle_filled(at(12.0 + c * 8.0, 12.0 + s * 8.0), 2.0 * scale, colour);
             }
         }
     }

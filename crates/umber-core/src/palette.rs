@@ -1128,7 +1128,11 @@ mod tests {
                     moved, planned,
                     "{from} -> {to}: the plan and the operation disagree"
                 );
-                assert_eq!(palette.len(), start.len(), "{from} -> {to} changed the count");
+                assert_eq!(
+                    palette.len(),
+                    start.len(),
+                    "{from} -> {to} changed the count"
+                );
                 // A permutation: the same colours, in some order.
                 let mut before = start.clone();
                 let mut after = palette.swatches.clone();
@@ -1241,7 +1245,11 @@ mod tests {
         let text = palette.to_gpl();
         assert!(!text.contains(UNTITLED), "{text}");
         assert_eq!(
-            read_gpl(&text, &here()).expect("a palette").palette.swatches[1].name,
+            read_gpl(&text, &here())
+                .expect("a palette")
+                .palette
+                .swatches[1]
+                .name,
             ""
         );
         // An index naming nothing is a refusal, not a panic.
