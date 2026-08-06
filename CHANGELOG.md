@@ -12,6 +12,68 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.0.9 — 2026-08-06
+
+The Windows installer works. `umber-setup.exe` opened Umber instead of
+installing it, and if you found your way past that it asked for permission and
+then sat at nothing for ever. Both are fixed, and the window no longer opens at
+twice the height of what is in it.
+
+Colours can be typed. Stamps, papers and palettes can be named and rearranged.
+And several ways of losing a stroke, a colour or a picture have gone.
+
+### New
+
+- **Type a colour.** The Colour panel's hex readout is a field now: `#RRGGBB`,
+  `RRGGBB` or `#RGB`.
+- **Arrange a palette.** Drag a swatch where you want it, give it a name, and
+  drop a whole harmony in at once. Names and column count survive a save,
+  because `.gpl` always carried them and nothing could set them.
+- **Rename a stamp or a paper**, in the browser, and every brush that paints
+  with one follows. Each row says how many brushes use it, so you can see what
+  a delete would take with it.
+- **Cut, Copy, Paste and Deselect are on the Edit menu**, and Zoom in and Zoom
+  out on the View menu. Paste had no control anywhere before this: it could
+  only be reached by somebody who already knew the key.
+- Menu rows show their keyboard shortcut, including Undo and Redo.
+- The Pan and Zoom tools say what they do, and name the gestures that reach
+  them with a brush still in hand.
+
+### Fixed
+
+- **`umber-setup.exe` opened Umber rather than installing it.** It decided from
+  a command-line flag that nothing passes when you double-click a file. It now
+  goes by the package it carries.
+- **Installing stopped at nothing after you gave permission.** Windows
+  Installer was handed its switches in quotes, which it will not read, so it
+  raised a dialog where an elevated program's windows cannot be seen and waited
+  there.
+- **The installer window was about twice as tall as what it showed.** It now
+  fits the step it is on.
+- **Brushes whose shape changes as you draw left part of the mark behind.** The
+  missing edge stayed on screen until the next stroke, then arrived in that
+  stroke's colour, and undo could not take it back. Thirty of the shipped
+  brushes were affected. The charcoals were worst: they draw round at the start
+  of a stroke, and only a tenth of the mark was being kept.
+- **A brush wider than its size rail was shrunk by a click on that rail.**
+  Fifteen shipped brushes are wider than the rail goes, the largest by more
+  than twice. Some spacings, airbrush rates and stroke spans are outside their
+  rails too, in both directions.
+- **Three ways to lose a stroke.** A second mouse button pressed mid-stroke, a
+  pen touching down while a mouse stroke was live, and Alt-Tabbing away while
+  drawing all left the stroke unfinished. The last also stopped that document
+  being saved automatically for the rest of the session, while its tab still
+  showed unsaved work.
+- **Escape in the colour field applied what you typed instead of abandoning
+  it**, and picking a colour off the wheel put the old one straight back.
+- **Renaming a stamp could delete it**, if it was a picture you had copied into
+  the folder yourself rather than imported.
+- Stamp and paper previews stayed in the old theme's ink after a theme change,
+  which left them dark on dark.
+- The font picker's count changed the moment you typed, because the two figures
+  were counting different things. It named a face you have as one you do not.
+- One command, one name: the View menu called "Fit to view" "Fit to window".
+
 ## 0.0.8 — 2026-08-05
 
 Brushes now paint the way their authors drew them. Markers, calligraphy pens
