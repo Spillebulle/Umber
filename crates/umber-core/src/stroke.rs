@@ -669,20 +669,27 @@ impl StrokeBuilder {
         // than the nominal ratio describes and the box missed its edges — on y
         // at every angle and on x wherever the dab is turned.
         //
-        // Reachable from the shipped library rather than hypothetical, and
-        // `mypaint/dieterle/arrow-1` is the case worth knowing because the
-        // obvious reading of it is wrong. Its `Ratio` curve is not a ramp but
-        // `(0, 0.5, 1, 0, 0)` against a low of -9.0 and a `dab_ratio` of 10, so
-        // the dab is round at the head of a mark, reaches 10:1 at the *midpoint*
-        // of `stroke_span`, and is round again for the whole second half — and
+        // Reachable from the shipped library rather than hypothetical.
+        // `mypaint/tanda/charcoal-04` is the plain case: `dab_ratio` 10.0, a
+        // `Ratio` modulation on `Random` over -9.0..9.0 and 360° of angle
+        // jitter, so `aspect` is redrawn uniformly over 1..19 for every dab
+        // under a random rotation. The box was under-tight by `10 / aspect` —
+        // ten-fold at the bottom of that range — which on its 3.00 px radius is
+        // a miss of up to 2.70 px per side, and it lands on a different axis
+        // each dab.
+        //
+        // `mypaint/dieterle/arrow-1` is the case worth reading carefully,
+        // because the obvious account of it is wrong. Its `Ratio` curve is not
+        // a ramp but `(0, 0.5, 1, 0, 0)` against the same low and ratio, so the
+        // dab is round at the head of a mark, reaches 10:1 at the *midpoint* of
+        // `stroke_span`, and is round again for the whole second half — and
         // `stroke_hold` at its 10.0 ceiling means the input never wraps, so a
         // stroke longer than its span sits at `aspect` 1.0 for the rest of its
-        // length. That is the steady state, not the transient. The one place
-        // the dab reaches its nominal size is the midpoint, which is exactly
-        // where `aspect` is 10 and the error is zero, so quoting the brush's
-        // 25.7 px `size` against a 2.6 px box would be describing two instants
-        // that never coincide. Re-derive from the curve rather than from the
-        // `size` field.
+        // length. That is the steady state rather than a transient. The one
+        // instant the dab reaches its nominal 25.7 px `size` is the midpoint,
+        // which is exactly where `aspect` is 10 and the error is zero, so
+        // quoting that width against the sliver names two moments that never
+        // coincide. Re-derive from the curve, never from the `size` field.
         //
         // Three things this deliberately does not touch:
         //
