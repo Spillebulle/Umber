@@ -214,9 +214,7 @@ impl EditKind {
     /// afternoon's undo lost under a corruption diagnosis, for a file that is
     /// merely newer than the reader. `docimport::history` has a refusal
     /// written precisely for that case; this is what keeps the refusal
-    /// reachable. The other branch is no better: a future variant that does
-    /// carry a patch but is wrongly non-structural would be written as a
-    /// `Pixels` entry and its slot resolved against the saved stack.
+    /// reachable.
     ///
     /// Nothing in the tree adds a variant today, so this prevents a failure
     /// that is not currently reachable. Do not "simplify" it back.
@@ -255,9 +253,16 @@ impl EditKind {
     /// `matches!` answers `false`; if it genuinely did put pixels back, `cut`
     /// would be left too low, a patch naming a parked slot would reach the
     /// `find_map(...)?` in `SaveHistory::new` and the whole history would be
-    /// refused. Loud rather than silent, still wrong, and safe by accident.
-    /// Accident is not a property that survives somebody adding a variant in a
-    /// hurry, which is what the arms below are for.
+    /// refused.
+    ///
+    /// **Refused is not the same as reported, and it is worth being exact
+    /// about which.** `SaveHistory::new` answers `None`, the caller flattens
+    /// that into no history at all, and nothing is raised: `SaveWarning` has
+    /// one variant and it is about blend modes. So the save succeeds, the
+    /// document is written without its history, and the artist is told
+    /// nothing — the same silence [`EditKind::is_structural`] is guarded
+    /// against, reached by a different route. Safe by accident, and accident
+    /// is not a property that survives somebody adding a variant in a hurry.
     pub fn resurrects_pixels(self) -> bool {
         match self {
             Self::DeleteLayer | Self::RemoveMask => true,
@@ -961,7 +966,8 @@ mod tests {
     }
 
     /// Every variant, fetched out of [`EditKind::ALL`] by the position it is
-    /// listed at. This exists to make that array impossible to forget.
+    /// listed at, so that forgetting to extend that array is caught rather
+    /// than compiled. Caught, not *impossible* — the hole is named below.
     ///
     /// The `match` is exhaustive, so **adding a variant fails the build here**
     /// — which is the whole guard, and it has to be a build failure rather
@@ -983,16 +989,24 @@ mod tests {
     /// mutation reports "this operation will panic at runtime: index out of
     /// bounds: the length is 11 but the index is 11".
     ///
-    /// **What is left uncovered, stated rather than glossed:** an arm for an
-    /// unlisted variant pointing at some *valid* index instead — writing
-    /// `EditKind::ALL[0]` for the twelfth variant — compiles and passes,
-    /// because a variant absent from `ALL` is never iterated and so its arm is
-    /// never called. That was checked too. It is the one route through, it
-    /// requires ignoring the pattern every other arm follows, and the two
-    /// compile errors above have already fired by then. What
-    /// `all_lists_every_edit_kind` does read back is the arm of a variant that
-    /// *is* listed, which is the case that catches `ALL` being reordered or a
-    /// variant being swapped out of it.
+    /// **What is left uncovered, stated rather than glossed:** any arm that
+    /// does not index its *own* position in `ALL` slips through, because a
+    /// variant absent from `ALL` is never iterated and so its arm is never
+    /// called. Writing `EditKind::ALL[0]` for the twelfth variant compiles and
+    /// passes — that was measured, not reasoned about — and so does the
+    /// likelier `EditKind::Rename => EditKind::Rename`, which a developer
+    /// clearing a non-exhaustive-match error in a function of this shape may
+    /// well reach for first, since it is not an index at all. The two compile
+    /// errors above say an arm is *required*; neither says it must index its
+    /// own position. So this is a real hole and the convention is what closes
+    /// it, not the type system.
+    ///
+    /// What `all_lists_every_edit_kind` does read back is the arm of a variant
+    /// that *is* listed. If an airtight version is ever wanted, the way there
+    /// is to stop hand-writing `ALL` — a `macro_rules!` declaring the enum and
+    /// the array from one variant list makes it a derivation rather than a
+    /// copy, and this whole apparatus goes away. It costs the per-variant
+    /// rustdoc above, which is why it was not taken.
     const fn listed_in_all(kind: EditKind) -> EditKind {
         match kind {
             EditKind::Paint => EditKind::ALL[0],
@@ -1012,13 +1026,16 @@ mod tests {
     /// The runtime half of the guard above: each arm has to hand back the
     /// variant it was reached by, and no position may be listed twice.
     ///
-    /// Neither is a tautology. The first catches a *listed* variant's arm
-    /// pointing at the wrong entry of `ALL`, which is what `ALL` being
-    /// reordered looks like; the second catches a variant being *replaced* in
-    /// the array rather than added to it, which the first cannot see on its
-    /// own because the variant that fell out is then never iterated. See
-    /// [`listed_in_all`] for the one route neither covers and why the two
-    /// compile-time halves make it unreachable in practice.
+    /// Neither is a tautology, and neither is worth more than it is worth.
+    /// The first catches a *listed* variant's arm pointing at the wrong entry,
+    /// which is what a reordered `ALL` looks like — though for `EditKind` a
+    /// reorder breaks nothing on its own, since the only reader is
+    /// `kind_from_id`'s linear search, and the literal test in
+    /// `docformat::history` already pins the order with a clearer message. The
+    /// second catches the copy-paste flavour of replacing a variant rather
+    /// than adding one, where the new entry duplicates a listed one; a swap
+    /// that leaves eleven *distinct* variants with one of them dropped passes
+    /// both loops, which is the same hole [`listed_in_all`] names.
     #[test]
     fn all_lists_every_edit_kind() {
         for kind in EditKind::ALL {
