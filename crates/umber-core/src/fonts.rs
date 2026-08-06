@@ -435,7 +435,14 @@ impl FontLibrary {
         self.faces.is_empty()
     }
 
-    /// Every family name, in the order the list draws them.
+    /// Every family name, in the order the list draws them, **without
+    /// allocating**.
+    ///
+    /// This is the one the drawing path takes. A machine with several hundred
+    /// families is the ordinary case, the Text panel's picker runs on every
+    /// frame it is open, and a `Vec` of several hundred `&str` per frame to
+    /// answer "how many match what has been typed" is exactly the cost the rule
+    /// about the drawing path is written against.
     ///
     /// **Grouped case-insensitively, because that is how the list is sorted.**
     /// Two files naming one typeface with different capitals is an ordinary
@@ -446,17 +453,27 @@ impl FontLibrary {
     /// way through that run, and [`Self::family`] would hand each row only its
     /// own spelling: half a typeface's weights hidden behind a picker that
     /// looked complete. The first spelling met is the one shown.
+    pub fn families_iter(&self) -> impl Iterator<Item = &str> {
+        self.faces.iter().enumerate().filter_map(|(i, face)| {
+            // The run's first face, which is the spelling that gets shown. `i`
+            // rather than a carried "last": a `filter_map` closure that
+            // remembered the previous name would be a second piece of state
+            // saying the same thing as the sort order already does.
+            let starts_a_run =
+                i == 0 || !self.faces[i - 1].family.eq_ignore_ascii_case(&face.family);
+            starts_a_run.then_some(face.family.as_str())
+        })
+    }
+
+    /// [`Self::families_iter`], collected.
+    ///
+    /// Written in terms of it rather than beside it, so the two cannot come to
+    /// disagree about where one typeface's run of spellings begins — which is
+    /// the bug `one_typeface_spelled_two_ways_is_one_family_with_all_its_
+    /// weights` exists for, and it would be invisible if only one of the pair
+    /// were fixed.
     pub fn families(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = Vec::new();
-        for face in &self.faces {
-            if out
-                .last()
-                .is_none_or(|last| !last.eq_ignore_ascii_case(&face.family))
-            {
-                out.push(&face.family);
-            }
-        }
-        out
+        self.families_iter().collect()
     }
 
     /// The faces of one family, in style order.
@@ -862,6 +879,41 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The borrowing iterator and the collecting one answer the same thing.
+    ///
+    /// They are one implementation now, so this reads as a tautology; it is
+    /// here because they were two, and the case that told them apart is the
+    /// case above — a run of spellings, where a walk that carried the previous
+    /// name and one that indexes backwards are easy to write differently. The
+    /// panel takes the iterator on every frame and the tests take the `Vec`,
+    /// so a difference would show up nowhere either of them looks.
+    #[test]
+    fn the_borrowing_family_list_says_what_the_collected_one_does() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let face = |family: &str, style: &str, weight: u16| Face {
+            family: family.to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from(format!("{family}-{style}.ttf")),
+                index: 0,
+            },
+            variations: Vec::new(),
+        };
+        lib.insert(face("Zapfino", "Regular", 400));
+        lib.insert(face("ZAPFINO", "Bold", 700));
+        lib.insert(face("Bodoni", "Regular", 400));
+
+        let collected = lib.families();
+        let walked: Vec<&str> = lib.families_iter().collect();
+        assert_eq!(walked, collected, "{:?}", lib.faces());
+        assert_eq!(walked.len(), 3, "{walked:?}");
+        // Empty is the answer for an empty library rather than one blank row.
+        assert_eq!(FontLibrary::default().families_iter().count(), 0);
     }
 
     /// The same family in two directories is one row in the list, not two — the

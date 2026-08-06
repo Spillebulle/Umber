@@ -492,32 +492,41 @@ fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         search,
         ..
     } = &ed.text;
-    let query = search.trim().to_lowercase();
-    let matching = fonts
-        .library()
-        .families()
-        .into_iter()
-        .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
-        .count();
+    // **Nothing here allocates on a frame that changes nothing**, and a real
+    // machine is what makes that matter: several hundred families, a panel that
+    // is open for as long as somebody is composing, and a body that runs every
+    // frame. This used to build a `Vec` of every family name, a lowered
+    // `String` per family, a lowered `String` for the query, and a `String` of
+    // a figure `Fonts::count` is cached as a `String` precisely so it need not
+    // be formatted — per frame, all of it, and the count was computed and
+    // thrown away whenever the field was empty.
+    let query = search.trim();
+    // Only counted when there is something to count. With the field empty the
+    // answer is the cached figure, and walking the library to arrive at the
+    // same number is the work this line exists not to do.
+    let matching = (!query.is_empty()).then(|| {
+        fonts
+            .library()
+            .families_iter()
+            .filter(|name| widgets::contains_ignore_case(name, query))
+            .count()
+            .to_string()
+    });
     // The figure is what the filter is leaving rather than what the machine
     // holds, because the filter is now a control somebody can see above it —
     // a count that did not move as they typed would say the field did nothing.
-    let count = if query.is_empty() {
-        fonts.count().to_string()
-    } else {
-        matching.to_string()
-    };
+    let count: &str = matching.as_deref().unwrap_or_else(|| fonts.count());
     let mut chosen: Option<String> = None;
     widgets::dropdown(
         ui,
         p,
         widgets::Dropdown::new(family)
             .icon(Icon::Text)
-            .trailing(&count)
+            .trailing(count)
             .width(DropdownWidth::Fill),
         |ui| {
-            for name in fonts.library().families() {
-                if !query.is_empty() && !name.to_lowercase().contains(&query) {
+            for name in fonts.library().families_iter() {
+                if !widgets::contains_ignore_case(name, query) {
                     continue;
                 }
                 if ui
@@ -993,6 +1002,33 @@ mod tests {
             .as_ref()
             .map(|(f, s, g, _)| (f.clone(), s.clone(), *g));
         assert_ne!(after, first, "a replaced library kept the old face's bytes");
+    }
+
+    /// The family filter folds case and matches what the menu will show.
+    ///
+    /// Both halves read the same predicate, so the figure on the trigger cannot
+    /// promise a number of rows the list then does not draw — and neither of
+    /// them lowers a copy of anything. See `widgets::contains_ignore_case`.
+    #[test]
+    fn the_font_search_folds_case_and_the_figure_matches_the_list() {
+        let ed = Editor::default();
+        let library = ed.text.fonts.library();
+        let matching = |query: &str| {
+            library
+                .families_iter()
+                .filter(|name| widgets::contains_ignore_case(name, query))
+                .count()
+        };
+        // The shipped library is Archivo alone, in whatever capitals the font
+        // states, so every fold of it has to find the one family.
+        for query in ["Archivo", "archivo", "ARCHIVO", "chi"] {
+            assert_eq!(matching(query), 1, "{query}");
+        }
+        assert_eq!(matching("helvetica"), 0);
+        // An empty query is not a filter, so the figure falls back to the
+        // cached count rather than being recomputed — and the two agree.
+        assert_eq!(matching(""), library.families().len());
+        assert_eq!(ed.text.fonts.count(), library.faces().len().to_string());
     }
 
     /// The Text module at the panel's real width, in the states it can be in.
