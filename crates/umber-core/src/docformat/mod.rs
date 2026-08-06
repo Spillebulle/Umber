@@ -2170,6 +2170,12 @@ mod tests {
     /// The arms index `ALL`, so an arm added for a sixth mode the obvious way
     /// — `BlendMode::ALL[5]` — is an out-of-bounds index into a fixed-size
     /// array and fails the build a second time when `ALL` was not extended.
+    /// An arm for an unlisted mode pointing at a *valid* index instead is the
+    /// one route through, and it compiles: a mode absent from `ALL` is never
+    /// iterated, so its arm is never called. It requires ignoring the pattern
+    /// every other arm follows, and the compile error above has already fired
+    /// by then. Said out loud rather than glossed, because the same hole was
+    /// measured on `EditKind`'s copy of this guard.
     #[test]
     fn all_lists_every_blend_mode() {
         const fn listed_in_all(mode: BlendMode) -> BlendMode {
@@ -2183,10 +2189,11 @@ mod tests {
         }
 
         // Each arm has to hand back the mode it was reached by, and no
-        // position may be listed twice — the first catches an arm pointing at
-        // the wrong entry, the second catches a mode being *replaced* in the
-        // array rather than added to it, which the first cannot see because
-        // the mode that fell out is then never iterated.
+        // position may be listed twice — the first catches a *listed* mode's
+        // arm pointing at the wrong entry, which is what a reordered `ALL`
+        // looks like, and the second catches a mode being *replaced* in the
+        // array rather than added to it, which the first cannot see on its own
+        // because the mode that fell out is then never iterated.
         for mode in BlendMode::ALL {
             assert_eq!(listed_in_all(mode), mode, "{mode:?} is listed wrongly");
         }

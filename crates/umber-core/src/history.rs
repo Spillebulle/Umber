@@ -979,8 +979,20 @@ mod tests {
     /// the second half of the mistake is caught too: an arm added for a
     /// twelfth variant the obvious way, `EditKind::ALL[11]`, is an
     /// out-of-bounds index into a fixed-size array and fails the build again
-    /// when `ALL` was not extended with it. An arm pointing at some *other*
-    /// position instead is what `all_lists_every_edit_kind` reads back.
+    /// when `ALL` was not extended with it. Measured, not assumed — the
+    /// mutation reports "this operation will panic at runtime: index out of
+    /// bounds: the length is 11 but the index is 11".
+    ///
+    /// **What is left uncovered, stated rather than glossed:** an arm for an
+    /// unlisted variant pointing at some *valid* index instead — writing
+    /// `EditKind::ALL[0]` for the twelfth variant — compiles and passes,
+    /// because a variant absent from `ALL` is never iterated and so its arm is
+    /// never called. That was checked too. It is the one route through, it
+    /// requires ignoring the pattern every other arm follows, and the two
+    /// compile errors above have already fired by then. What
+    /// `all_lists_every_edit_kind` does read back is the arm of a variant that
+    /// *is* listed, which is the case that catches `ALL` being reordered or a
+    /// variant being swapped out of it.
     const fn listed_in_all(kind: EditKind) -> EditKind {
         match kind {
             EditKind::Paint => EditKind::ALL[0],
@@ -1000,11 +1012,13 @@ mod tests {
     /// The runtime half of the guard above: each arm has to hand back the
     /// variant it was reached by, and no position may be listed twice.
     ///
-    /// Neither is a tautology. The first catches an arm pointing at the wrong
-    /// entry of `ALL` — the one route past both compile-time halves — and the
-    /// second catches a variant being *replaced* in the array rather than
-    /// added to it, which the round trip alone cannot see because the variant
-    /// that fell out is then never iterated.
+    /// Neither is a tautology. The first catches a *listed* variant's arm
+    /// pointing at the wrong entry of `ALL`, which is what `ALL` being
+    /// reordered looks like; the second catches a variant being *replaced* in
+    /// the array rather than added to it, which the first cannot see on its
+    /// own because the variant that fell out is then never iterated. See
+    /// [`listed_in_all`] for the one route neither covers and why the two
+    /// compile-time halves make it unreachable in practice.
     #[test]
     fn all_lists_every_edit_kind() {
         for kind in EditKind::ALL {
