@@ -2038,8 +2038,17 @@ mod tests {
     use super::*;
 
     /// A scratch directory of this test's own.
+    ///
+    /// Keyed by process id as well as by name, because the name alone is the
+    /// same path in every checkout: several worktrees running `cargo test` at
+    /// once — which is how this project is worked on — then share one
+    /// directory, and the `remove_dir_all` below wipes it out from under
+    /// another run. The symptom is a reaper reporting `Access is denied
+    /// (os error 5)` on a file it did create, which reads as a bug in the
+    /// code under test rather than in the harness.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("umber-autosave-{name}"));
+        let dir =
+            std::env::temp_dir().join(format!("umber-autosave-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch directory");
         dir

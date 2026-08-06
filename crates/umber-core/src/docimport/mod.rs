@@ -877,7 +877,12 @@ mod tests {
         // The one test that exercises the whole public entry point: extension
         // dispatch, reading, decoding, and building the engine state the UI
         // will be handed.
-        let path = std::env::temp_dir().join("umber-docimport-end-to-end.ora");
+        // Named by process id: a fixed name is the same file in every
+        // checkout, and concurrent worktrees then write over each other.
+        let path = std::env::temp_dir().join(format!(
+            "umber-docimport-end-to-end-{}.ora",
+            std::process::id()
+        ));
         std::fs::write(
             &path,
             fixtures::ora(

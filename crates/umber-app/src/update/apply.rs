@@ -354,7 +354,11 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("umber-update-test-{name}"));
+            // Process id as well as name: the name alone collides between
+            // concurrent worktrees, and the wipe below then takes another
+            // run's scratch with it.
+            let dir = std::env::temp_dir()
+                .join(format!("umber-update-test-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("create the scratch directory");
             Self(dir)
