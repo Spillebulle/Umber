@@ -52,6 +52,7 @@ mod shortcuts;
 mod splash;
 mod stamplib;
 mod swapchain;
+mod swatchdrag;
 mod sysclip;
 mod syscursor;
 mod tabs;

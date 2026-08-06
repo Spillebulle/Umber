@@ -175,6 +175,13 @@ impl std::error::Error for PaletteError {}
 /// The name may be empty. `.gpl` allows it, and a colour picked off the canvas
 /// has no name anybody chose — inventing "Untitled" for it would put a word in
 /// every cell of a grid that is meant to be colours.
+///
+/// **Set it through [`Palette::name_swatch`] and not on the field.** The field
+/// is public because the whole struct is plain data, but the line format has no
+/// escaping, so [`Palette::to_gpl`] cleans on the way out; a name written
+/// straight onto the field can therefore differ from what a save and a reopen
+/// give back. `name_swatch` applies the writer's own rule at the point the name
+/// arrives, which is what makes the two agree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Swatch {
     /// sRGB, opaque. See the module docs for why this is not a [`Color`].
@@ -247,7 +254,20 @@ impl Palette {
     /// Whether another colour will fit. The panel's Add control reads this and
     /// is *disabled* when it is false, rather than being live and refusing.
     pub fn has_room(&self) -> bool {
-        self.swatches.len() < MAX_SWATCHES
+        self.room_for(1)
+    }
+
+    /// Whether `count` more colours will fit, all of them.
+    ///
+    /// [`Self::has_room`] is written in terms of this rather than beside it, so
+    /// the two cannot come to disagree about where the limit is.
+    ///
+    /// `saturating_sub` because [`Self::swatches`] is a public field: nothing
+    /// in this module can take a palette past [`MAX_SWATCHES`], and a caller
+    /// that pushed straight onto the `Vec` could, and an overflow here would be
+    /// a panic on a control's enablement rather than a refusal.
+    pub fn room_for(&self, count: usize) -> bool {
+        MAX_SWATCHES.saturating_sub(self.swatches.len()) >= count
     }
 
     /// Append a colour. Returns false when the palette is full, which is the
@@ -265,10 +285,91 @@ impl Palette {
         true
     }
 
+    /// Append a whole set, or none of it.
+    ///
+    /// **All or nothing, deliberately.** The caller is a harmony: three, four
+    /// or five colours that only mean anything together. A loop of [`Self::add`]
+    /// would put two of five in and stop at the limit, leaving a fragment of a
+    /// relation with nothing on screen to say which members are missing — and
+    /// the artist would have to count the wheel to find out. The control that
+    /// offers this reads [`Self::room_for`] and is *disabled* when the whole set
+    /// will not fit, exactly as the single Add reads [`Self::has_room`]; this is
+    /// the gate behind it rather than a second answer.
+    pub fn add_all(&mut self, swatches: &[Swatch]) -> bool {
+        if !self.room_for(swatches.len()) {
+            return false;
+        }
+        self.swatches.extend_from_slice(swatches);
+        true
+    }
+
     /// Take one out. Out of range is `None` rather than a panic: the index came
     /// from a grid drawn against last frame's palette.
     pub fn remove(&mut self, index: usize) -> Option<Swatch> {
         (index < self.swatches.len()).then(|| self.swatches.remove(index))
+    }
+
+    /// Whether moving the colour at `from` to position `to` would do anything.
+    ///
+    /// Beside [`Self::move_swatch`] and sharing its rule, which is the
+    /// arrangement `LayerStack`'s `can_reorder`/`reorder` pair keeps and for the
+    /// same reason: the drag draws a "it lands here" mark from this, so a mark
+    /// cannot light up promising a move the model will then decline.
+    ///
+    /// Out of range answers false rather than panicking, for the reason
+    /// [`Self::remove`] gives — the index came from a grid drawn against last
+    /// frame's palette, and a palette can change under a drag that outlives a
+    /// frame.
+    pub fn can_move_swatch(&self, from: usize, to: usize) -> bool {
+        from < self.swatches.len() && to < self.swatches.len() && from != to
+    }
+
+    /// Move the colour at `from` so that it ends up at position `to`.
+    ///
+    /// `to` is where the colour *lands*, not a gap between two others: take it
+    /// out and put it back in at that index, so everything between the two
+    /// shifts by one and nothing else moves. That is what makes this a
+    /// permutation — every colour survives, none is duplicated, and the `.gpl`
+    /// written afterwards holds exactly the same bytes in a different order —
+    /// and it is what lets the drop mark be an outline over the cell the colour
+    /// will occupy. A gap-based reading would need a mark in a four-pixel
+    /// space, and would have to answer what "the gap after the last one" means
+    /// twice over.
+    ///
+    /// The move is its own inverse in the obvious way: `move_swatch(a, b)`
+    /// followed by `move_swatch(b, a)` restores the palette exactly.
+    pub fn move_swatch(&mut self, from: usize, to: usize) -> bool {
+        if !self.can_move_swatch(from, to) {
+            return false;
+        }
+        let swatch = self.swatches.remove(from);
+        self.swatches.insert(to, swatch);
+        true
+    }
+
+    /// Give a colour a name, or take its name off. False where nothing changed.
+    ///
+    /// The name goes through **the file writer's own rule** on the way in, so
+    /// what a palette holds is exactly what [`Self::to_gpl`] would write and
+    /// [`read_gpl`] would hand back. A tab in a name is what separates a colour
+    /// from its name, and a newline would make the next line of the file be
+    /// read as a colour; cleaning only at the write would leave the panel
+    /// showing a name that a save and a reopen quietly change.
+    ///
+    /// **An empty name is a real answer**, unlike a palette's — see [`Swatch`].
+    /// A colour picked off the canvas has none, `.gpl` allows a line without
+    /// one, and clearing the field is how a name is taken off again. So this
+    /// cannot go through [`one_line`], which substitutes [`UNTITLED`].
+    pub fn name_swatch(&mut self, index: usize, name: &str) -> bool {
+        let Some(swatch) = self.swatches.get_mut(index) else {
+            return false;
+        };
+        let cleaned = clean_line(name);
+        if swatch.name == cleaned {
+            return false;
+        }
+        swatch.name = cleaned;
+        true
     }
 
     /// Serialise to `.gpl`.
@@ -293,9 +394,15 @@ impl Palette {
                 "{:3} {:3} {:3}",
                 swatch.rgb[0], swatch.rgb[1], swatch.rgb[2]
             ));
-            if !swatch.name.trim().is_empty() {
+            // Cleaned first and *then* tested for emptiness, not the other way
+            // round. `"\0".trim()` is `"\0"` — a control character is not
+            // whitespace — so testing the raw name let a swatch named with one
+            // through to `one_line`, which answered "Untitled palette" and
+            // wrote a palette's fallback name onto a colour.
+            let name = clean_line(&swatch.name);
+            if !name.is_empty() {
                 out.push('\t');
-                out.push_str(&one_line(&swatch.name));
+                out.push_str(&name);
             }
             out.push('\n');
         }
@@ -303,20 +410,34 @@ impl Palette {
     }
 }
 
-/// A name with anything that would break the line format taken out.
+/// A name with anything that would break the line format taken out, trimmed.
 ///
 /// `.gpl` is line-oriented with no escaping, so a newline in a name would
 /// produce a file whose next line is read as a colour — or, worse, silently
 /// truncate the palette there. Tabs go too, because a tab is what separates a
-/// colour from its name.
-fn one_line(text: &str) -> String {
+/// colour from its name. Trimmed because [`parse_entry`] trims what it reads,
+/// so an untrimmed name would not survive its own round trip.
+///
+/// Empty is left empty. That is the difference between this and [`one_line`],
+/// and it is the whole reason the two are separate: a *palette* with no name
+/// falls back to something a reader can show, where a *colour* with no name is
+/// the ordinary case.
+fn clean_line(text: &str) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| if c.is_control() || c == '\t' { ' ' } else { c })
         .collect();
-    match cleaned.trim() {
-        "" => UNTITLED.to_owned(),
-        trimmed => trimmed.to_owned(),
+    cleaned.trim().to_owned()
+}
+
+/// [`clean_line`], with [`UNTITLED`] where nothing is left.
+///
+/// For a palette's own name, which every reader shows and which therefore
+/// cannot be blank.
+fn one_line(text: &str) -> String {
+    match clean_line(text) {
+        empty if empty.is_empty() => UNTITLED.to_owned(),
+        named => named,
     }
 }
 
@@ -983,6 +1104,197 @@ mod tests {
         assert_eq!(read.palette.swatches.len(), 1);
         assert_eq!(read.palette.swatches[0].name, "a name with breaks");
         assert_eq!(read.skipped, 0);
+    }
+
+    /// A palette a painter can build but not arrange is a palette in click
+    /// order for ever. A move has to be a **permutation**: every colour
+    /// survives, none is duplicated, and only the run between the two ends
+    /// shifts. Driven over every ordered pair rather than a couple of examples,
+    /// because the failure — one colour quietly lost or doubled — is invisible
+    /// in a grid of squares.
+    #[test]
+    fn moving_a_colour_rearranges_the_palette_and_loses_none_of_it() {
+        let start: Vec<Swatch> = (0..7u8)
+            .map(|n| Swatch {
+                rgb: [n, n * 2, 255 - n],
+                name: format!("c{n}"),
+            })
+            .collect();
+        for from in 0..start.len() {
+            for to in 0..start.len() {
+                let mut palette = Palette::new("Ordered");
+                palette.swatches = start.clone();
+                // The plan is read *before* the move, and the operation has to
+                // answer the same thing — that is the whole of what a `can_`
+                // beside an operation is for, and a mark drawn from one while
+                // the other declines is the lying control the pair exists to
+                // prevent.
+                let planned = palette.can_move_swatch(from, to);
+                let moved = palette.move_swatch(from, to);
+                assert_eq!(
+                    moved, planned,
+                    "{from} -> {to}: the plan and the operation disagree"
+                );
+                assert_eq!(
+                    palette.len(),
+                    start.len(),
+                    "{from} -> {to} changed the count"
+                );
+                // A permutation: the same colours, in some order.
+                let mut before = start.clone();
+                let mut after = palette.swatches.clone();
+                before.sort_by_key(|s| s.rgb);
+                after.sort_by_key(|s| s.rgb);
+                assert_eq!(before, after, "{from} -> {to} is not a permutation");
+                if from == to {
+                    assert!(!moved, "moving a colour onto itself is not a move");
+                    assert_eq!(palette.swatches, start, "{from} -> {to} moved something");
+                    continue;
+                }
+                assert_eq!(
+                    palette.swatches[to], start[from],
+                    "{from} -> {to} did not land where it was aimed"
+                );
+                // And back again is the identity, byte for byte — which is what
+                // makes an accidental drag free to undo by hand.
+                assert!(palette.move_swatch(to, from));
+                assert_eq!(palette.swatches, start, "{from} -> {to} does not reverse");
+            }
+        }
+    }
+
+    /// The `.gpl` written after a move is the same bytes in a different order,
+    /// and reading it back gives exactly the palette that was moved. The whole
+    /// point of holding a swatch in the form it is stored in is that this is
+    /// true by construction; a move is the one edit that could break it by
+    /// dropping a name on the way past.
+    #[test]
+    fn a_moved_palette_still_writes_and_reads_itself_exactly() {
+        let mut palette = Palette::new("Ochres");
+        palette.columns = 4;
+        palette.swatches = vec![
+            Swatch::new([0, 0, 0]),
+            Swatch {
+                rgb: [204, 119, 34],
+                name: "Ochre".into(),
+            },
+            Swatch::new([255, 255, 255]),
+            Swatch {
+                rgb: [12, 34, 56],
+                name: "Night".into(),
+            },
+        ];
+        assert!(palette.move_swatch(3, 0));
+        let read = read_gpl(&palette.to_gpl(), &here()).expect("its own output");
+        assert_eq!(read.skipped, 0);
+        assert_eq!(read.palette.swatches, palette.swatches);
+        assert_eq!(read.palette.swatches[0].name, "Night");
+        assert_eq!(read.palette.columns, 4);
+    }
+
+    /// An index out of range answers rather than panicking, for the reason
+    /// `remove` does: it came from a grid drawn against last frame's palette,
+    /// and a drag outlives a frame. Nothing may change on the way to the
+    /// refusal.
+    #[test]
+    fn an_index_that_names_nothing_moves_nothing() {
+        let mut palette = Palette::new("Two");
+        palette.swatches = vec![Swatch::new([1, 2, 3]), Swatch::new([4, 5, 6])];
+        let before = palette.swatches.clone();
+        for (from, to) in [(0, 2), (2, 0), (9, 9), (usize::MAX, 0), (0, usize::MAX)] {
+            assert!(!palette.can_move_swatch(from, to), "{from} -> {to}");
+            assert!(!palette.move_swatch(from, to), "{from} -> {to}");
+            assert_eq!(palette.swatches, before, "{from} -> {to} changed something");
+        }
+        // And on an empty palette there is nothing any pair could name.
+        let mut empty = Palette::new("None");
+        assert!(!empty.move_swatch(0, 0));
+        assert!(empty.is_empty());
+    }
+
+    /// A name set through the interface has to go through the *writer's* rule,
+    /// or the panel shows a name that a save and a reopen quietly change. And
+    /// an empty name is a real answer here where it is not for a palette: a
+    /// colour off the canvas has none, and clearing the field is how one is
+    /// taken off.
+    #[test]
+    fn a_swatch_name_is_cleaned_by_the_rule_the_file_is_written_by() {
+        let mut palette = Palette::new("Named");
+        palette.swatches = vec![Swatch::new([1, 2, 3]), Swatch::new([4, 5, 6])];
+
+        assert!(palette.name_swatch(0, "  Warm\tochre\nagain  "));
+        assert_eq!(palette.swatches[0].name, "Warm ochre again");
+        // What is held is exactly what a round trip gives back, which is the
+        // property cleaning at the write alone would not deliver.
+        let read = read_gpl(&palette.to_gpl(), &here()).expect("a palette");
+        assert_eq!(read.palette.swatches, palette.swatches);
+        assert_eq!(read.skipped, 0);
+
+        // Setting the same name again changes nothing, so a field that loses
+        // focus twice does not report an edit twice.
+        assert!(!palette.name_swatch(0, "Warm ochre again"));
+        // Taking a name off is clearing the field, and the file then holds a
+        // bare colour line — not "Untitled palette", which is what routing this
+        // through `one_line` would have written onto a colour.
+        assert!(palette.name_swatch(0, "   "));
+        assert_eq!(palette.swatches[0].name, "");
+        assert!(!palette.to_gpl().contains(UNTITLED));
+        // Setting a name that cleans to nothing is the same as clearing it.
+        assert!(palette.name_swatch(1, "Blue"));
+        assert!(palette.name_swatch(1, "\u{7}"));
+        assert_eq!(palette.swatches[1].name, "");
+        // And the *writer* has to agree, because a name made only of a control
+        // character can still arrive on the field directly — out of a `.gpl`,
+        // where `parse_entry` trims and `"\u{7}".trim()` is not empty. It used
+        // to reach `one_line` there and write a palette's fallback name onto a
+        // colour.
+        palette.swatches[1].name = "\u{7}".to_owned();
+        let text = palette.to_gpl();
+        assert!(!text.contains(UNTITLED), "{text}");
+        assert_eq!(
+            read_gpl(&text, &here())
+                .expect("a palette")
+                .palette
+                .swatches[1]
+                .name,
+            ""
+        );
+        // An index naming nothing is a refusal, not a panic.
+        assert!(!palette.name_swatch(9, "Nowhere"));
+    }
+
+    /// A whole set goes in or none of it does. Half a harmony is a fragment
+    /// with nothing on screen to say which members are missing.
+    #[test]
+    fn a_set_too_big_for_the_palette_is_refused_whole() {
+        let mut palette = Palette::new("Nearly full");
+        for _ in 0..MAX_SWATCHES - 2 {
+            palette.add(Swatch::new([0, 0, 0]));
+        }
+        assert!(palette.room_for(2));
+        assert!(!palette.room_for(3));
+        let four = [
+            Swatch::new([1, 0, 0]),
+            Swatch::new([2, 0, 0]),
+            Swatch::new([3, 0, 0]),
+            Swatch::new([4, 0, 0]),
+        ];
+        assert!(!palette.add_all(&four), "four into two is refused");
+        assert_eq!(
+            palette.len(),
+            MAX_SWATCHES - 2,
+            "a refused set left part of itself behind"
+        );
+        assert!(palette.add_all(&four[..2]));
+        assert_eq!(palette.len(), MAX_SWATCHES);
+        // The single-colour control reads the same rule, so the two cannot
+        // disagree about where the limit is.
+        assert!(!palette.has_room());
+        assert!(!palette.room_for(1));
+        // Adding nothing always fits, even at the limit — a caller that asked
+        // for an empty set must not be told the palette is full.
+        assert!(palette.room_for(0));
+        assert!(palette.add_all(&[]));
     }
 
     /// A palette read out of a file with no `Name:` takes the filename, which

@@ -628,6 +628,18 @@ pub mod metrics {
     pub const PANEL_PAD: i8 = 12;
     pub const RADIUS: f32 = 5.0;
     pub const RADIUS_LARGE: f32 = 6.0;
+    /// A dash, and the gap after it, wherever this interface draws a dashed
+    /// mark: the dock's "dock here" indicator, the layer list's drop slot and
+    /// the palette grid's drop ring.
+    ///
+    /// Here rather than beside any one of them, because dashed is how this
+    /// interface spells "not a real piece of chrome, a place something is
+    /// going" — three marks saying one thing, which they only do for as long
+    /// as the rhythm is the same. `panels.rs` still holds a private pair of
+    /// its own with these values in it; folding it into this is the whole of
+    /// what is left to do here.
+    pub const DASH: f32 = 5.0;
+    pub const DASH_GAP: f32 = 4.0;
     /// The canvas scrollbars, along the bottom and right of the document
     /// region. Thin, because they sit over the picture rather than beside it.
     pub const SCROLLBAR: f32 = 11.0;
