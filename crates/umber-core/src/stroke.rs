@@ -1918,7 +1918,17 @@ mod tests {
         // only `plain` would leave the whole fix untested here, because with no
         // ratio modulation the new arithmetic is bit-identical to the old — a
         // fudge written as `if m.ratio != 0.0 { half *= 1.05 }` would satisfy
-        // it and satisfy `the_box_never_widens_...` too.
+        // it, since `plain` never takes that branch.
+        //
+        // `the_box_never_widens_...` *does* catch such a fudge — spliced in and
+        // run, both fail — because its positive-modulation case has a non-zero
+        // `m.ratio` and asserts containment. But it catches it by containment
+        // where this catches it by equality, and the exact guard is the one the
+        // tiling argument needs. Said precisely because an earlier draft of this
+        // comment claimed the fudge passed both, which the author had already
+        // measured to be false: a comment that understates a guard is the same
+        // fault as one that overstates it, and this branch exists to remove
+        // that fault from three other places.
         //
         // Each carries the `aspect` it must not exceed, and the modulated one's
         // ceiling is the guard its two siblings already have. It rests on a
