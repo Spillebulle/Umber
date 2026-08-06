@@ -900,6 +900,13 @@ impl UmberApp {
         }
         // A stroke still in flight belongs to the layer this is about to lift
         // out of, and would otherwise be baked in underneath the hole.
+        //
+        // `pointer_pressed` has already finished it on the one route that
+        // reaches here today — `gesture::supersedes_stroke` answers true for
+        // `Press::Transform` — so this is a no-op on that path. It stays
+        // because the rule it states is `begin_float`'s and not the pointer's:
+        // no float may be lifted with a stroke in flight, whatever route got
+        // here. Delete the other one, not this one.
         self.finish_stroke();
         let rect = self.editor.transform_region();
         if self.begin_float(rect, None) {
@@ -1781,41 +1788,50 @@ impl UmberApp {
     }
 
     fn handle_keys(&mut self, key: KeyCode, pressed: bool) -> bool {
-        // Space is a held modifier with press *and* release meaning, which a
-        // press-resolved binding table cannot express, so it stays separate.
-        if key == KeyCode::Space {
-            self.editor.space_down = pressed;
-            return true;
+        // Space, Escape and Enter are decided before the binding table is
+        // consulted — but by the same suspension `resolve` answers to, which is
+        // the whole of `shortcuts::direct`. Read that before changing anything
+        // here: all three used to be claimed unconditionally, so Enter in the
+        // Text module's caption field inserted a newline *and* committed the
+        // floating text, and Escape in a typable rail threw away the float
+        // behind it. Note "before the table", not "outside" it — Enter is
+        // genuinely bindable and only shadowed while a draft or a float
+        // stands; see `Direct`.
+        match shortcuts::direct(key, pressed, shortcuts::suspended()) {
+            // A held modifier with press *and* release meaning, which a
+            // press-resolved table cannot express.
+            Some(shortcuts::Direct::PanModifier) => {
+                self.editor.space_down = pressed;
+                return true;
+            }
+            // Escape abandons the outline being drawn, and then the floating
+            // transform — the layer was never written to, so the move costs
+            // nothing to throw away. Each is claimed only while it exists, so
+            // Escape goes on reaching whatever else on the canvas wants it.
+            Some(shortcuts::Direct::Abandon) => {
+                if self.editor.cancel_selection_draft() {
+                    return true;
+                }
+                if self.cancel_transform() {
+                    return true;
+                }
+            }
+            // Enter closes the outline, or puts the floating pixels down. Same
+            // pair, same terms.
+            Some(shortcuts::Direct::Finish) => {
+                if self.editor.selection_draft.is_some() {
+                    self.editor.finish_selection();
+                    return true;
+                }
+                if self.editor.float.is_some() {
+                    self.finish_transform();
+                    return true;
+                }
+            }
+            None => {}
         }
         if !pressed {
             return false;
-        }
-
-        // Escape abandons the outline being drawn and Enter closes it. Neither
-        // is in the binding table: they are answers to "there is a gesture in
-        // progress", not commands, and a rebindable Escape that sometimes
-        // meant nothing would be a row in the settings list that lies. They
-        // are also claimed only while a draft exists, so Escape goes on
-        // reaching whatever else wants it.
-        if matches!(key, KeyCode::Escape) && self.editor.cancel_selection_draft() {
-            return true;
-        }
-        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter)
-            && self.editor.selection_draft.is_some()
-        {
-            self.editor.finish_selection();
-            return true;
-        }
-        // The same pair for a floating transform, and claimed on the same
-        // terms: only while one is up, so Escape goes on reaching whatever
-        // else wants it. Escape throws the move away — the layer was never
-        // written to — and Enter puts the pixels down.
-        if matches!(key, KeyCode::Escape) && self.cancel_transform() {
-            return true;
-        }
-        if matches!(key, KeyCode::Enter | KeyCode::NumpadEnter) && self.editor.float.is_some() {
-            self.finish_transform();
-            return true;
         }
 
         let Some(action) = shortcuts::resolve(&self.bindings, key, self.modifiers) else {
@@ -3416,6 +3432,17 @@ impl UmberApp {
         // `inputlog`.
         self.editor.input.note_gesture(decision);
 
+        // A press that begins something *else* ends the stroke that is running,
+        // and it has to happen here rather than at the call sites: a pan takes
+        // `Interaction` over, and `pointer_released` dispatches on
+        // `Interaction`, so the button that was drawing comes up and never
+        // reaches `finish_stroke` at all. Finish rather than cancel, and not
+        // what `Contact::Pinch` does — `gesture::supersedes_stroke` has the
+        // whole argument and both failure modes.
+        if gesture::supersedes_stroke(decision) && self.editor.stroke.is_active() {
+            self.finish_stroke();
+        }
+
         // Every press ends the brush-size drag except the one that is carrying
         // it on. A mouse press is never a contact, so `press` can never answer
         // `ResizeBrush` for one and this stays exactly the rule it always was:
@@ -3970,11 +3997,46 @@ impl ApplicationHandler<Wake> for UmberApp {
                 }
             }
 
-            // A modifier released while another window has the keyboard never
-            // reaches us, so Alt can be "held" for ever after an Alt-Tab. The
-            // resize gesture would then still be live — and its circle still on
-            // the canvas — when the window came back.
-            WindowEvent::Focused(false) => self.set_brush_resize(false),
+            // Losing the window ends every gesture, because **no gesture may
+            // be left in a state only a release could end** — and after this
+            // event no release is coming. A modifier let go of while another
+            // window has the keyboard never reaches us, and neither does a
+            // button.
+            WindowEvent::Focused(false) => {
+                // Alt can otherwise be "held" for ever after an Alt-Tab, so the
+                // resize would still be live — and its circle still on the
+                // canvas — when the window came back.
+                self.set_brush_resize(false);
+                // Space is the identical failure by a route `shortcuts::direct`
+                // structurally cannot see: that rule keeps a *release* always
+                // landing, and here there is no release at all. Come back from
+                // an Alt-Tab and the pan override is armed with no key down.
+                self.editor.space_down = false;
+                // A stroke is the expensive one. Alt-Tab mid-stroke and
+                // `Interaction::Drawing` and `stroke.is_active()` both stay set
+                // for ever: `render`'s `quiet` requires both to be clear and
+                // `Autosave::next_due` answers `None` while it is not, so **the
+                // document is never autosaved again for the rest of the
+                // session** — silently, with its tab still showing an unsaved
+                // dot. Finish rather than cancel, for the reason
+                // `gesture::supersedes_stroke` gives: the artist drew a visible
+                // mark.
+                self.finish_stroke();
+                // And the gestures that carry no stroke behind them. `quiet`
+                // reads `Interaction` as well, so a pan or a zoom abandoned by
+                // an Alt-Tab stalls the autosave exactly as a stroke does —
+                // `finish_stroke` clears this itself, but only when there was a
+                // stroke to finish.
+                //
+                // Deliberately *not* `cancel_selection_draft`: that takes the
+                // draft away, and a polygon spans several clicks, so Alt-Tabbing
+                // to look at a reference is precisely when somebody has one
+                // half-drawn. Idle with a draft standing is an ordinary state
+                // rather than a broken one — it is what a middle-drag to pan
+                // already produces, and `pointer_moved`'s `Idle` arm keeps the
+                // rubber band following the pointer.
+                self.editor.interaction = Interaction::Idle;
+            }
 
             // Switching input language changes what every key prints, and
             // therefore what every shortcut label should say. Taking the window
@@ -4053,9 +4115,19 @@ impl ApplicationHandler<Wake> for UmberApp {
                     // flick of the wrist would silently rescale the brush.
                     (true, _) => self.set_brush_resize(false),
                     // The middle button pans and nothing else, so its release
-                    // has nothing to finish.
+                    // has nothing to finish — but it may only end the pan it
+                    // began. Writing `Idle` unconditionally is the same defect
+                    // `gesture::supersedes_stroke` fixes, arriving from the
+                    // other direction: middle-press to pan, left-press to draw,
+                    // then let the middle button go, and this cleared the
+                    // `Drawing` the stroke was dispatching on, so the left
+                    // button coming up never finished it. That fix is what
+                    // repairs the sequence; this is what stops the arm being
+                    // able to break it again.
                     (false, MouseButton::Middle) => {
-                        self.editor.interaction = Interaction::Idle;
+                        if self.editor.interaction == Interaction::Panning {
+                            self.editor.interaction = Interaction::Idle;
+                        }
                     }
                     (false, MouseButton::Left) => self.pointer_released(pos, false),
                     (false, _) => {}

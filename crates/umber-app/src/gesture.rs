@@ -84,6 +84,23 @@ pub enum Press {
 }
 
 impl Press {
+    /// Every variant.
+    ///
+    /// Anything reasoning over the whole enum iterates this rather than a list
+    /// written out where it is used, which is exactly what a variant added
+    /// later does not appear in — a test walking a hand-written array is a
+    /// test that silently stops covering the thing it names.
+    pub const ALL: [Press; 8] = [
+        Press::Ignored,
+        Press::Pan,
+        Press::Zoom,
+        Press::Paint,
+        Press::Select,
+        Press::Transform,
+        Press::Eyedropper,
+        Press::ResizeBrush,
+    ];
+
     /// A short name for Settings → Input & pen, which records which gesture a
     /// press was resolved to.
     pub fn label(self) -> &'static str {
@@ -142,6 +159,89 @@ pub fn press(p: Pointer) -> Press {
         Tool::Transform => Press::Transform,
         Tool::Pan => Press::Pan,
         Tool::Zoom => Press::Zoom,
+    }
+}
+
+/// Whether a press that resolved to `decision` must end a stroke already in
+/// flight.
+///
+/// **A second button going down mid-stroke used to strand the stroke in a state
+/// nothing ended.** Hold the left button and draw, then press the middle one:
+/// [`press`] answers [`Press::Pan`] and `pointer_pressed` sets
+/// `Interaction::Panning` over the top of `Interaction::Drawing`. The left
+/// button coming up then falls through `pointer_released`'s `_` arm — it
+/// dispatches on the interaction, which is no longer `Drawing` — so
+/// `finish_stroke` is never called at all. Three things follow, and the last is
+/// the worst:
+///
+/// * The dabs already stamped stay in the scratch texture and go on being
+///   composited, so a half-stroke hangs on the canvas that is in no layer. Save
+///   or export in that state and the file disagrees with the screen.
+/// * `render`'s `quiet` test requires `!stroke.is_active()`, and the builder
+///   still is, so **the autosave stops for the rest of the session** until some
+///   later stroke happens to begin and end properly.
+/// * The next `start_stroke` clears the scratch, so the hanging mark silently
+///   vanishes rather than being baked in — which is the one mercy here, and is
+///   why this is a lost stroke rather than a wrong-coloured one.
+///
+/// The answer is **finish, not cancel**, and the asymmetry with
+/// [`Contact::Pinch`] is deliberate rather than an oversight: a second finger
+/// means the first contact was never a stroke, so those dabs must never reach
+/// the canvas, where a second *button* arrives after the artist has drawn a
+/// visible mark with the first. Every other "something else is happening now"
+/// path in `app.rs` commits too — `switch_document`, `apply_canvas`,
+/// `close_document`, `float_a_clip` and `take_region` all call `finish_stroke`.
+/// Do not unify the two.
+///
+/// **[`Press::Paint`] supersedes too, and the reason is a second lost stroke.**
+/// It looks like the one press that should be excluded — it *is* a stroke, so
+/// ending one to begin another reads like churn — and that reasoning was wrong,
+/// because it assumed a `Paint` press cannot arrive while a stroke runs. It
+/// can. `Editor::touches` is written only by the touch arm, so it is empty
+/// while a **mouse** stroke is live, and a pen coming down then answers
+/// [`Contact::Press`] rather than [`Contact::Pinch`] and resolves to `Paint`.
+/// What followed was `start_stroke` on an already-active builder, whose
+/// unconditional `clear_stroke` **discarded the mouse stroke with no history
+/// entry** — silently, and not undoable. Finishing it instead commits it with
+/// its entry and *then* begins the new one, which is strictly better than
+/// losing it.
+///
+/// The ordinary one-pointer case is untouched, and what guarantees that is the
+/// call site's `&& self.editor.stroke.is_active()`: a press arrives once per
+/// gesture and no stroke is live when it does. This does not double-finish
+/// anything.
+///
+/// [`Press::Ignored`] is the one exclusion left, and it is excluded for what it
+/// *is* rather than for being unreachable — it is reachable by the same
+/// crossing. A press the canvas never sees must not end a stroke, and acting on
+/// one was a real bug: see the [`Contact::Pinch`] arm in `app.rs`, "one finger
+/// on a panel is not a gesture, and cancelling the stroke there threw away a
+/// stroke the other hand was in the middle of". That is exactly this case.
+///
+/// The honest fix for the whole class is still owed: `pointer_released` should
+/// end a stroke on `stroke.is_active()` rather than on `Interaction`, which is
+/// where the authority actually lives. With that in place no future `Press`
+/// variant and no new writer of `Interaction` could strand a stroke at all.
+///
+/// The `match` is exhaustive and has **no wildcard arm**, which is the point of
+/// it: a `_ => true` would silently answer for a variant nobody had thought
+/// about, which is what a negative `matches!` did here and is the reason this
+/// was rewritten. [`Press::ALL`] is the other half — the compiler catches a new
+/// variant not answering, and the test walking `ALL` catches one that answers
+/// but was never exercised.
+pub fn supersedes_stroke(decision: Press) -> bool {
+    match decision {
+        // A press the canvas never sees. The one exclusion.
+        Press::Ignored => false,
+        // Paint included: a pen landing during a mouse stroke is a `Paint`
+        // press with a stroke running, and discarding it is a lost mark.
+        Press::Paint
+        | Press::Pan
+        | Press::Zoom
+        | Press::Select
+        | Press::Transform
+        | Press::Eyedropper
+        | Press::ResizeBrush => true,
     }
 }
 
@@ -367,6 +467,68 @@ mod tests {
             }),
             Press::Ignored,
             "nor may a contact on a panel resize the brush"
+        );
+    }
+
+    #[test]
+    fn every_press_but_a_stroke_of_its_own_ends_the_stroke_it_interrupts() {
+        // The reported sequence: hold left and draw, then press middle. The
+        // pan takes `Interaction` over, and `pointer_released` dispatches on
+        // `Interaction` — so without this the left button coming up never
+        // reaches `finish_stroke`, the dabs hang in the scratch, and the
+        // autosave stops for the rest of the session.
+        assert!(supersedes_stroke(press(Pointer {
+            pan_button: true,
+            ..mouse(Tool::Brush)
+        })));
+
+        // Over `Press::ALL`, never a list written out here: a variant added
+        // later does not appear in a hand-written array, so such a test goes on
+        // passing while quietly covering less than its name claims.
+        //
+        // Two halves guard this, and neither covers the other. The exhaustive
+        // `match` in `supersedes_stroke` is what the *compiler* catches — a new
+        // variant cannot be added without answering. The length assertion below
+        // is what catches `ALL` being left short, which the compiler cannot see
+        // because a fixed-size array with the right number of elements in it
+        // compiles whatever those elements are. That is the whole of what the
+        // two claim between them.
+        assert_eq!(Press::ALL.len(), 8, "a variant is missing from Press::ALL");
+        for decision in Press::ALL {
+            let superseded = supersedes_stroke(decision);
+            match decision {
+                // The only press the canvas never sees, and the only one that
+                // may leave a stroke running. See `supersedes_stroke`.
+                Press::Ignored => assert!(!superseded, "a press on a panel ended a stroke"),
+                _ => assert!(superseded, "{decision:?} left a stroke running"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pen_landing_during_a_mouse_stroke_does_not_discard_it() {
+        // `Paint` looks like the one press that should be excluded — it is a
+        // stroke, so ending one to begin another reads like churn — and that
+        // reasoning assumed a `Paint` press cannot arrive with a stroke
+        // already running. It can, and this is the sequence.
+        //
+        // `Editor::touches` is written only by the touch arm, so it is empty
+        // while a *mouse* stroke is live. A pen coming down is therefore the
+        // first contact, which `contact` reads as a press and not a pinch...
+        assert_eq!(
+            contact(TouchPhase::Started, 1, false, false),
+            Contact::Press,
+            "a mouse stroke leaves `touches` empty, so the pen is contact one"
+        );
+        // ...and `press` resolves that to `Paint`, with the brush in hand.
+        assert_eq!(press(pen(Tool::Brush)), Press::Paint);
+        // Which must end the mouse stroke rather than let `start_stroke` run
+        // on an already-active builder: its unconditional `clear_stroke`
+        // discarded that stroke with no history entry, silently and not
+        // undoably.
+        assert!(
+            supersedes_stroke(Press::Paint),
+            "a pen landing mid-stroke discards the stroke it interrupts"
         );
     }
 
