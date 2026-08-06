@@ -1767,6 +1767,102 @@ fn a_rotated_stamp_is_committed_all_the_way_into_its_corners() {
     );
 }
 
+/// The aspect twin of the test above, and the pair is the point.
+///
+/// That one pins the *angle* half of the rule: a turned quad reaches into
+/// corners a circle does not. `stroke.rs`'s
+/// `the_damaged_box_covers_a_dab_a_ratio_modulation_fattened` pins the
+/// *arithmetic*: that `StrokeBuilder`'s box covers the quad implied by each
+/// dab's own `radius`, `aspect` and `angle`. Neither can see the thing that
+/// actually broke, which was a disagreement between that implied quad and the
+/// one `dab.wgsl` rasterises — so this one needs a device, and it commits
+/// through the **real** pieces the damage mask produced rather than a
+/// hand-supplied rectangle. A commit to a rect written out here would be a test
+/// about the shader alone, and the CPU test already owns the other side.
+///
+/// The brush is `mypaint/dieterle/arrow-1`'s shape: `dab_ratio` 10.0 with a
+/// `Ratio` modulation on the `Stroke` input from -9.0, so at the head of a
+/// stroke `aspect` is 1.0 and the dab is *round* while the nominal ratio still
+/// says its short semi-axis is a tenth of the long one. The emitter used to
+/// take the short axis off the nominal ratio, so the box was a 2.4 px sliver
+/// across a mark 24 px wide: the rest stayed in the scratch, redrew as a live
+/// preview, and was baked in by the next stroke in that stroke's colour.
+#[test]
+fn a_stamp_a_ratio_modulation_rounded_out_is_committed_across_its_short_axis() {
+    let mut h = harness_or_skip!();
+
+    let brush = Brush {
+        size: 24.0,
+        spacing: 1.0,
+        stabilization: 0.0,
+        pressure_size: false,
+        // Hard, so the coverage at the pixel asserted on below is only ever 0
+        // or 1 and comparing an exact byte is legitimate — the rule
+        // `a_hard_edged_rectangular_lift_is_exact` follows. One level of slack
+        // is allowed anyway, because the discrimination wanted here is 0
+        // against 255 and nothing is bought by insisting on the last bit.
+        hardness: 1.0,
+        dab_ratio: 10.0,
+        modulations: [Modulation {
+            target: DabTarget::Ratio,
+            input: DabInput::Stroke,
+            low: -9.0,
+            high: 0.0,
+            curve: ResponseCurve::LINEAR,
+        }]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    // A tap, at the head of the stroke where the `Stroke` input reads zero.
+    let mut s = StrokeBuilder::new();
+    s.begin(
+        brush,
+        [1.0, 1.0, 1.0],
+        InputPoint::new(Vec2::new(32.0, 32.0), 1.0, 0.0),
+    );
+    let bounds = s.bounds();
+    let dabs: Vec<Dab> = s.drain_pending().collect();
+    assert_eq!(dabs.len(), 1);
+    // Says the premise held rather than assuming it: if the modulation stopped
+    // rounding the dab out, everything below would pass while testing nothing.
+    assert!(
+        (dabs[0].aspect - 1.0).abs() < 1e-3,
+        "the dab was not rounded out, so nothing is being tested: aspect {}",
+        dabs[0].aspect
+    );
+
+    h.stamp(&dabs);
+    let rect = bounds.to_pixels_clamped(UVec2::splat(DOC)).expect("rect");
+    // The real pieces, off the stroke's own mask — the same ones `finish_stroke`
+    // hands to both the undo capture and the commit.
+    let pieces = s.damage().pieces(rect);
+    let mut enc = h.encoder();
+    h.canvas.commit_stroke(
+        &h.gpu.device,
+        &h.gpu.queue,
+        &mut enc,
+        0,
+        rect,
+        &pieces,
+        StrokeStyle {
+            color: Color::WHITE,
+            ..Default::default()
+        },
+    );
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    // Ten pixels below the centre of a round dab of radius 12, so well inside
+    // the quad the shader rasterises and far outside the 1.2 px half-extent the
+    // nominal ratio described. The old box reached y 33; this is y 42.
+    let alpha = h.pixel(32, 42)[3];
+    assert!(
+        alpha >= 254,
+        "the dab's short axis was left out of the committed pieces: alpha {alpha}"
+    );
+}
+
 #[test]
 fn clearing_the_tip_restores_the_round_brush() {
     // Tips are per stroke, so going back to a round brush has to actually go
