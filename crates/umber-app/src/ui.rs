@@ -1641,6 +1641,54 @@ mod strip_budget {
     pub const SELECT_OP: f32 = 105.0;
     /// The feather rail, its label and its readout.
     pub const FEATHER: f32 = 165.0;
+    /// The second sentence for the Pan and Zoom tools — the one naming the
+    /// gesture that reaches the same thing with any tool in hand. Measured
+    /// against what is *left* after the first sentence, exactly as [`COMBINE`]
+    /// is, because the first is drawn unconditionally and is in no budget.
+    /// Wide enough for the longer of the two, which is Zoom's — measured off
+    /// `options_strip_preview`'s shots rather than guessed, because this one is
+    /// a whole sentence and a budget below its real cost draws it half off the
+    /// edge instead of not drawing it. 280 was that mistake: it let Zoom's line
+    /// start at a strip width of about 630, where it needs 365.
+    pub const NAVIGATE_MORE: f32 = 370.0;
+}
+
+/// What the Pan and Zoom tools do, and how to reach the same thing without
+/// putting the brush down.
+///
+/// Both used to draw the words "drag on the canvas", which is four lowercase
+/// words saying nothing a painter had not already guessed from the icon — and
+/// neither named the gesture that actually matters. Pan and Zoom are the two
+/// tools most people never select, because holding Space and rolling the wheel
+/// under the primary modifier do the same job mid-stroke; the strip is where
+/// that is worth saying, since a held modifier is part of a gesture rather than
+/// a command and is therefore deliberately not in the rebindable table. Same
+/// reasoning as [`combine_hint`], and it is why these are `const fn`s over
+/// [`shortcuts::primary_modifier_name`] rather than `format!` per frame: the
+/// modifier is named for the platform, and neither line can change at run time
+/// because neither gesture is bindable.
+///
+/// The second half of each is behind [`strip_budget::NAVIGATE_MORE`]: the strip
+/// is one unwrapped row, so a sentence that does not fit runs off the end of it
+/// rather than reflowing.
+const fn navigate_hint(tool: Tool) -> (&'static str, &'static str) {
+    match tool {
+        Tool::Zoom => (
+            "Drag right or up to zoom in, left or down to zoom out.",
+            if cfg!(target_os = "macos") {
+                "Hold Cmd and roll the wheel to zoom at the pointer with any tool in hand."
+            } else {
+                "Hold Ctrl and roll the wheel to zoom at the pointer with any tool in hand."
+            },
+        ),
+        // Pan's, and every tool that is not Zoom: the branch this sits in is
+        // reached by Pan and Zoom alone, and a wildcard keeps the function
+        // total without a panic nobody could ever see.
+        _ => (
+            "Drag on the canvas to move the picture.",
+            "Hold Space to do the same with any tool in hand.",
+        ),
+    }
 }
 
 /// How to add to, subtract from and intersect a selection, named for this
@@ -1834,11 +1882,26 @@ fn options_strip(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
                 }
             }
         } else {
+            // Pan and Zoom. Two sentences in the Transform hint's register
+            // rather than a control, because like Transform there is nothing
+            // here to set: the whole gesture is the pointer's.
+            let (does, instead) = navigate_hint(ed.ui.tool);
             ui.label(
-                egui::RichText::new("drag on the canvas")
+                egui::RichText::new(does)
                     .size(text::SMALL)
                     .color(p.text_dim),
             );
+            // Read afresh rather than against the room measured earlier, for
+            // the reason the selection tool's combine line reads it afresh: the
+            // sentence above is drawn unconditionally and is in no budget.
+            if ui.available_width() >= strip_budget::NAVIGATE_MORE {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(instead)
+                        .size(text::SMALL)
+                        .color(p.text_dim),
+                );
+            }
         }
     });
 }
@@ -3768,13 +3831,21 @@ mod tests {
         println!("wrote 7 shots to {}", dir.display());
     }
 
-    /// The tool options strip, with the brush in hand and at three widths.
+    /// The tool options strip, at three widths, with the brush in hand and then
+    /// with each of the two tools whose strip is a sentence.
     ///
     /// The stabiliser is a third `widgets::inline_slider` beside size and
     /// opacity rather than the `widgets::chip` it was, and the two things worth
     /// looking at are whether three rails on a 36-point strip read as three
     /// controls and whether the budget that drops them one at a time drops them
     /// where it says it does.
+    ///
+    /// **Pan and Zoom are shot for a different reason**: the strip is a single
+    /// unwrapped row, so a sentence too long for it does not reflow, it runs off
+    /// the right edge. Their second half is behind
+    /// [`strip_budget::NAVIGATE_MORE`], and only a picture says whether the
+    /// budget is the right size — an assertion about a string's length would be
+    /// a claim about a font.
     ///
     /// ```sh
     /// cargo test -p umber-app options_strip_preview -- --ignored --nocapture
@@ -3784,6 +3855,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn options_strip_preview() {
         use crate::docshot;
+        use crate::editor::Tool;
 
         let Some(mut stage) = docshot::Stage::new() else {
             eprintln!("no GPU adapter: nothing to draw into. Skipped.");
@@ -3793,24 +3865,36 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/brush-editor");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        // Wide enough for all three, for two of them, and for one.
-        for (n, width) in [900.0_f32, 560.0, 380.0].into_iter().enumerate() {
-            let mut ed = Editor::default();
-            ed.layout = crate::dock::Layout::default();
-            let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
-            let field = vec2(width, metrics::OPTIONS_STRIP);
-            let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
-                    .show(root, |ui| {
-                        ui.set_height(metrics::OPTIONS_STRIP);
-                        super::options_strip(ui, &palette, &mut ed);
-                    });
-            });
-            let name = format!("strip-{}-{width:.0}.png", n + 1);
-            docshot::write_png(&dir.join(name), &image).expect("write the png");
+        let mut written = 0;
+        for tool in [Tool::Brush, Tool::Pan, Tool::Zoom] {
+            // The three rail widths, plus the pair either side of where Zoom's
+            // second sentence has to come off: 740 is the narrowest strip that
+            // holds it whole and 720 is the widest that drops it, so a budget
+            // edited to a number that overruns shows up as text running off the
+            // right of one of these two rather than as nothing at all.
+            for (n, width) in [900.0_f32, 740.0, 720.0, 560.0, 380.0]
+                .into_iter()
+                .enumerate()
+            {
+                let mut ed = Editor::default();
+                ed.layout = crate::dock::Layout::default();
+                ed.ui.tool = tool;
+                let palette = Palette::with_accent(ed.ui.theme, ed.ui.accent);
+                let field = vec2(width, metrics::OPTIONS_STRIP);
+                let image = stage.shoot(field, 2.0, &palette, palette.chrome, |root| {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(metrics::STRIP_PAD, 0))
+                        .show(root, |ui| {
+                            ui.set_height(metrics::OPTIONS_STRIP);
+                            super::options_strip(ui, &palette, &mut ed);
+                        });
+                });
+                let name = format!("strip-{tool:?}-{}-{width:.0}.png", n + 1).to_lowercase();
+                docshot::write_png(&dir.join(name), &image).expect("write the png");
+                written += 1;
+            }
         }
-        println!("wrote 3 strips to {}", dir.display());
+        println!("wrote {written} strips to {}", dir.display());
     }
 
     /// The canvas scrollbars in the three states that matter, over a canvas
