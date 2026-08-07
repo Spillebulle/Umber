@@ -1478,9 +1478,19 @@ impl UmberApp {
     /// `SlotPool::give_back` can compact. So where the live stack itself
     /// reaches the ceiling, no eviction whatever can help, and without the
     /// guard `free_until` would empty the undo stack, drain the redo stack and
-    /// then answer false. On a legal document — 64 layers each with a mask — a
+    /// then answer false. The document that used to demonstrate it was 64
+    /// layers each with a mask: 128 slices against a ceiling of 129, so a
     /// single pen-down with the transform tool in hand would have destroyed the
     /// whole session's history and refused the transform anyway.
+    ///
+    /// **That example no longer reaches the ceiling**, and the guard stays.
+    /// `LayerStack::MAX_SLOTS` is 257 now, because it carries a slice per
+    /// possible effect draw as well as one per layer and one per mask — so the
+    /// live stack cannot reach it out of layers and masks alone, and this
+    /// second `if` is dormant until an effect claims a slice. Deleting it
+    /// because nothing reaches it today would be removing the guard exactly
+    /// one feature before it is needed, and what it guards against is
+    /// unrecoverable: a session's history spent to answer no.
     fn free_headroom(&mut self) -> bool {
         let room = self.editor.layers.room();
         if room.has_headroom() {
