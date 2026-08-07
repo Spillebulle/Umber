@@ -146,13 +146,37 @@ Jump flooding's known weakness is that it is approximate for a small number of
 seeds; against a dense coverage field it is essentially exact, which is this
 case.
 
+**Measured, it is the expensive effect — not the shadow — and that was the wrong
+way round in the first draft of this document.** §3.4 has the figures. The short
+version is that a jump flood at 10000² costs 19 ms at radius 64 and holds 1.6 GB
+of ping-pong buffers, against 3 ms and 1 GB for a downsampled shadow of the same
+radius. So the choice between jump flooding and blur-and-threshold is no longer
+a question of corner quality alone; it is 6x the time and twice the memory, and
+§13 now weighs it that way.
+
 ### 3.2 The blur
 
 **A tent from two box passes per axis**, which is exactly what
-`umber-core::selection`'s feather already is, for exactly the reasons stated
-there: linear in the area whatever the radius, and separable.
+`umber-core::selection`'s feather already is, and separable for the same reason.
 
-Two things follow that are easy to get wrong:
+**But not "linear in the area whatever the radius", and this document said so
+before it was measured.** That property belongs to the feather's *running
+sums*, and a fragment shader has none: a box pass there is `2r + 1` taps per
+texel, so the cost scales with the radius after all. Measured at 10000², a
+full-resolution tent goes from 8.5 ms at radius 4 to 83 ms at radius 64 — ten
+times, for a claim that predicted no change at all. Borrowing an algorithm's
+complexity across a change of execution model is the mistake; the kernel
+carried over and the bound did not.
+
+**So the blur is done on a 4x downsample and bilinearly upsampled**, which is
+what makes it affordable and nearly radius-independent: 2.0 ms to 3.2 ms across
+the same sweep, and 0.36 ms to 0.45 ms at 2048². Sixteen times fewer texels at
+a quarter of the radius is ~64x less work, and the quality cost falls only on a
+hard edge — which a shadow, a glow and a soft stroke do not have. An effect that
+genuinely needs a hard edge is the one that must not take this path, and at a
+hard edge the radius is small and the full-resolution pass is cheap. §3.4.
+
+Two more things follow that are easy to get wrong:
 
 - **The intermediate must be linear, not sRGB.** The layer array is
   `Rgba8UnormSrgb`. A separable blur that lands its horizontal pass in an sRGB
@@ -196,6 +220,59 @@ flag — is the kind of thing that gets forgotten and reintroduced as a uniform.
 It is written here so it is not.
 
 ---
+
+### 3.4 Measured
+
+`examples/measure-effects.rs`, in `umber-render` because it needs a device.
+**Re-run it before quoting any of these**, which is the rule
+`measure-clipboard.rs` records having learned the hard way when figures three
+times too slow got written into the docs by a machine that was building six
+other things at the time.
+
+Median wall-clock around `submit` plus a blocking poll, seven runs after three
+warm-ups. Not a GPU timestamp — `Features::TIMESTAMP_QUERY` is not among the
+features Umber requests, and asking for it would measure a device Umber never
+creates. It over-states by whatever the submit and the fence cost, which is the
+safe direction.
+
+**RTX 3080, Vulkan.** Milliseconds; `!` is over a 60 Hz frame.
+
+| canvas | radius | shadow, full res | shadow, quarter res | stroke, jump flood |
+|---|---|---|---|---|
+| 2048² | 4 px | 0.64 | **0.36** | 0.66 |
+| 2048² | 16 px | 1.25 | **0.38** | 0.89 |
+| 2048² | 64 px | 3.77 | **0.45** | 1.13 |
+| 10000² | 4 px | 8.50 | **2.05** | 9.04 |
+| 10000² | 16 px | 22.46 ! | **2.26** | 14.01 |
+| 10000² | 64 px | 83.05 ! | **3.23** | 19.40 ! |
+
+Textures held at once: 44 MB at 2048² and **1,049 MB at 10000²** for the
+shadow; 68 MB and **1,621 MB** for the stroke, whose two `Rg16Uint` seed buffers
+are 400 MB each on the large canvas.
+
+**The software rasteriser brackets it from below.** The same sweep on
+`Choice::Fallback` — WARP, a CPU — is roughly 100x slower: a quarter-resolution
+shadow at 1024² is 8.0 ms and at 2048² is 26.4 ms. That is not a mobile GPU and
+must not be read as one; it is the floor, and a real integrated part lands
+somewhere between. It is recorded because a number from a discrete card alone is
+exactly the kind of evidence `downlevel_defaults` exists to distrust.
+
+Four readings, and the third and fourth are the ones that changed this design:
+
+- **At ordinary canvas sizes everything is cheap.** Every bake at 2048² is
+  under 1.2 ms on the 3080 and the downsampled shadow is under half a
+  millisecond at every radius. A live rebake during a stroke is affordable
+  there, which §5.1 assumed it might not be.
+- **At 10000² the downsampled shadow still fits and the full-resolution one does
+  not**, by a factor of twenty-six at radius 64. Downsampling is not an
+  optimisation to add later; it is the only version of this that works.
+- **The stroke is the expensive effect, not the shadow.** The design had it
+  backwards. Jump flooding is the one bake that fails a frame at 10000², and it
+  is the one whose memory — 1.6 GB — is a harder wall than its time.
+- **Memory bites before time does.** A gigabyte of transient texture per
+  effected layer is not something to hold at canvas scale whatever the frame
+  budget says, and it is what makes §6.1's byte budget and stage 3's region
+  bounding load-bearing rather than tidy.
 
 ## 4. An effect is a `LayerDraw`
 
@@ -285,19 +362,26 @@ Three answers:
   Honest but poor: drawing an outlined shape and not seeing the outline until you
   lift is the kind of thing that makes a feature unusable rather than merely
   limited.
-- **Bake every frame from layer + scratch.** Right on screen, and the cost is the
-  whole effect pipeline at canvas resolution per frame. At 2048² that is a
-  handful of full-target passes over 4 M texels and is plausibly ~1 ms; at
-  10000², over 100 M texels, it is not.
+- **Bake every frame from layer + scratch.** Right on screen, at the cost of the
+  whole pipeline at canvas resolution every frame.
 - **Bake every frame, over the damaged region only.** The stroke's damage is
   already accumulated as a `damage::TileMask` on a 64-pixel grid, for the undo
   patch. Dilate that by the effect's reach — spread plus softness plus the
   offset — and the rebake is bounded by the mark being made rather than by the
   canvas.
 
-The third is the answer, and **this is the reason the effect cache has to be
-region-aware; memory is only the second reason.** It is also why §6 is a stage of
-its own rather than an optimisation.
+**§3.4 measured this and the answer splits by canvas size, which the first draft
+did not anticipate.** At 2048² a downsampled shadow bakes in 0.4 ms and a stroke
+in about 1 ms, so the *second* answer is affordable and the live shadow can ship
+without any region machinery at all. At 10000² the shadow still fits at 3.2 ms
+and the stroke does not, at 19 ms — and both hold about a gigabyte while they
+do it.
+
+So the third answer is still where this ends up, and the reason has moved: it is
+**memory at canvas scale and the stroke's distance field**, not the shadow and
+not the frame budget. That is a narrower claim than "the cache has to be
+region-aware", and it is what lets stage 1 ship a live shadow rather than a
+lagging one.
 
 ### 5.2 The float is the same problem wearing a different hat
 
@@ -459,6 +543,13 @@ mechanism exists.
 So: **effects raise `umber-version`.** And because a stroke can carry a picture —
 outlined text against a busy background is illegible without it — the "plainer"
 reading is weaker here than the folder case it borrows from.
+
+**This was put to the author as an open judgement and confirmed**, which is why
+it is stated here as a decision rather than a lean. It was the one call in this
+document that could reasonably have gone the other way, and it is recorded as
+having been made rather than assumed — because the consequence, an older Umber
+*refusing* a document rather than opening it plainly, is a heavy hammer and the
+next person to read this will want to know somebody chose it on purpose.
 
 **Which number, and the collision with group compositing.**
 `docs/group-compositing.md` §4.3 also proposes 3. Only one of them can have it.
@@ -666,49 +757,54 @@ over it — which means stage 0 ships *disabled*, behind the effect set being
 empty. Every CPU test in §11 lands here. This is where the risk is bought down:
 everything structural, nothing to see.
 
-**Stage 1 — the bake, canvas-sized, at commit.** The distance field, the blur,
-the knockout, the two effects. Effects refresh when the layer's slice revision
-moves — so at pointer-up, not during the stroke. This is a usable feature at
-ordinary canvas sizes and an honest one: the limitation is nameable and the
-picture is never wrong, only late. The GPU tests land here.
+**Stage 1 — the bake, canvas-sized, live.** The distance field, the
+**downsampled** blur, the knockout, the two effects. §3.4 says a canvas-sized
+rebake is 0.4 ms to 1 ms at 2048², so this rebakes every frame from layer plus
+scratch and the shadow follows the brush — which the plan before the measurement
+had deferred to stage 3. Above a canvas size the bake cannot hold, it falls back
+to rebaking at commit and says nothing, because a shadow one stroke late is
+still the right picture. The GPU tests land here.
 
 **Stage 2 — the interface.** The module, the layer-row mark, Apply to pixels.
 Deliberately after stage 1 rather than beside it, because "do not add UI for
 features that do not work" cuts both ways and a control drawn against a bake that
 is still moving is a control that gets redrawn.
 
-**Stage 3 — regions, and liveness.** The `TileMask`-dilated rebake, the live
-shadow during a stroke and during a float, and the byte budget that stops a large
-canvas from being the case that breaks it. This is the stage with a measurement
-in it and the only one whose cost cannot be settled by reading. Measure the
-canvas-sized bake first — if 2048² is comfortably inside a frame, stage 1 already
-covers most documents and stage 3 becomes about large canvases rather than about
-liveness.
+**Stage 3 — regions, for memory and for the stroke.** The `TileMask`-dilated
+rebake and the byte budget. The measurement moved what this stage is *for*: not
+liveness, which stage 1 now has at ordinary sizes, but the gigabyte of transient
+texture a canvas-scale bake holds and the jump flood that costs 19 ms at 10000².
+Both are large-canvas problems, and both are real.
 
-**Is there a useful first piece?** Stages 0 and 1 together, which is a working
-drop shadow and a working stroke that refresh at pointer-up. Stage 0 alone ships
-nothing. **Do not start with the interface**, and do not start with more than two
-effect kinds: the second kind is what proves §3's unification and the fourth
-proves nothing.
+**Is there a useful first piece?** Stages 0 and 1 together, which is a live drop
+shadow and a live stroke at ordinary canvas sizes. Stage 0 alone ships nothing.
+**Do not start with the interface**, and do not start with more than two effect
+kinds: the second kind is what proves §3's unification and the fourth proves
+nothing.
 
 ---
 
 ## 13. Not settled
 
-- **Whether the canvas-sized bake fits a frame at ordinary sizes**, which decides
-  whether stage 3 is about liveness or only about large canvases. Nothing here
-  can answer it by reading. `gpu_pipeline.rs` composites into an offscreen target
-  and is where the number comes from; not on CI, per the rule about wall-clock
-  assertions on a runner nobody chose.
-- **Whether jump flooding is worth it over blur-and-threshold** at the widths
-  people actually use. §3.1 argues for it on corners; a picture of a 20 px stroke
-  by each method settles it faster than the argument does.
+**Settled by §3.4 and struck from this list:** whether a canvas-sized bake fits a
+frame. It does at 2048² and, downsampled, at 10000²; the naive full-resolution
+blur does not, and the claim that it would was wrong. What is left:
+
+- **Whether jump flooding is worth it over blur-and-threshold.** This was a
+  question about corner quality and is now mostly a question about cost: §3.4
+  puts the flood at 19 ms and 1.6 GB at 10000²/64 px against ~3 ms and 1 GB for
+  a blur, and the blur is already being built for the shadow. **The likely answer
+  is now blur-and-threshold**, with the flood kept for a hard-edged stroke at a
+  small radius where it is cheap. A picture of a 20 px stroke by each method
+  settles it faster than the argument does, and it should be made before stage 1
+  writes either one.
+- **What an integrated or mobile GPU does.** §3.4 has a discrete card and a
+  software rasteriser and nothing between, and they are 100x apart. The
+  downsampled shadow has enough headroom that it is probably safe either way;
+  the flood plainly does not. Anyone with a laptop should re-run the example
+  before stage 1 fixes the algorithm.
 - **Which version number**, 3 or 4, against `docs/group-compositing.md`. §8.2.
   Decided by which lands first and must be written down when it does.
-- **Whether effects should raise the version at all.** §8.2 argues yes on the
-  round-trip loss and states the counter-argument fairly. It is the one judgement
-  in this document that a reasonable person could take the other way, and it is
-  worth a second opinion before stage 0 writes it into `required_version`.
 - **Whether `Effect` belongs on `Layer` or beside the stack.** On `Layer` by the
   argument `picked` and `link` both make — a set beside the stack has to be kept
   in step with reordering and deletion by hand. But `Layer` is `Clone` and cheap
