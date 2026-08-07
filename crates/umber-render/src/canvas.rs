@@ -1356,7 +1356,7 @@ pub struct CanvasRenderer {
     ///
     /// Indexed by slot, and long enough for [`MAX_SLOTS`] from the start:
     /// growing it in step with the texture array would be a second place for
-    /// the capacity to be got wrong. Two kilobytes — 257 `u64` is 2,056 bytes.
+    /// the capacity to be got wrong. Two kilobytes — 256 `u64` is 2,048 bytes.
     /// This used to say "half a kilobyte", which was wrong by a factor of two
     /// at 129 slots as well; the figure is worth stating only because it is
     /// what makes allocating the whole thing up front obviously cheap.

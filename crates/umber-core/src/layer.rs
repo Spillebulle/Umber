@@ -166,7 +166,7 @@ impl SlotPool {
     /// from — and every alternative is worse in a different direction: failing
     /// closed loses a slice for ever, and failing open once had
     /// `slot_capacity_needed` answering `MAX_SLOTS`, which would ask the
-    /// renderer for 257 canvas-sized slices.
+    /// renderer for 256 canvas-sized slices.
     fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
         pool.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -645,7 +645,7 @@ impl LayerStack {
             let slot = self.take_slot();
             // An import is bounded at [`LayerStack::MAX`] entries by
             // `ImportedDocument::validate`, so 64 layers and 64 masks is 128
-            // slices against [`LayerStack::MAX_SLOTS`]'s 257 and the pool cannot
+            // slices against [`LayerStack::MAX_SLOTS`]'s 256 and the pool cannot
             // run dry here. Nothing parks a slice during an import either — a
             // freshly opened document has no history. Said out loud because the
             // failure would be a layer with no slice and `folder` false, which
@@ -1953,8 +1953,8 @@ impl StackShape {
     /// canvas-sized texture slice, which is 16 MB at 2048² and 400 MB at
     /// 10000². Counting only the rows would leave the one figure the user sets
     /// to bound undo blind to the whole cost of the feature, and a session of
-    /// deleting and adding layers would walk the layer array to its 257-slice
-    /// ceiling — 4.31 GB at 2048², 102.8 GB at 10000² — with the budget
+    /// deleting and adding layers would walk the layer array to its 256-slice
+    /// ceiling — 4.29 GB at 2048², 102.4 GB at 10000² — with the budget
     /// reporting a few kilobytes. `LayerStack::slot_capacity_needed` never
     /// falls while a slice is parked, and `CanvasRenderer::ensure_slots` never
     /// shrinks, so that memory is allocated and stays allocated.
