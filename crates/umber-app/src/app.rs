@@ -854,14 +854,22 @@ impl UmberApp {
                 // only true when the slice that comes free happens to be the
                 // one at the top of the range.
                 lines: vec![
-                    // No figure. It used to say "of 129", which was the slice
-                    // ceiling; that ceiling now carries headroom for effect
-                    // slices too, so a count naming it would be a number the
-                    // painter cannot check against anything on screen.
+                    // No figure: it used to say "of 129", and the ceiling now
+                    // carries headroom for effect slices, so a count naming it
+                    // is a number the painter cannot check against anything on
+                    // screen.
+                    //
+                    // And no "fewer layers, or fewer masks", which is what this
+                    // said until the comment above was read against it. That is
+                    // precisely the remedy that does not work — a delete and a
+                    // `remove_mask` both *park* the slice — so it was the
+                    // control-that-lies this project refuses, in the one place
+                    // somebody is already stuck. Reopening genuinely works: the
+                    // stack is rebuilt from a fresh pool and the numbering
+                    // packs back down from zero.
                     "A transform needs a spare texture slice to preview into, and \
-                     this document is using every one Umber has. A layer takes one \
-                     and a mask takes another. Fewer layers, or fewer masks, will \
-                     make room."
+                     this document is using every one Umber has. Saving and \
+                     reopening the document will pack them back down."
                         .to_string(),
                 ],
             });
@@ -1478,19 +1486,21 @@ impl UmberApp {
     /// `SlotPool::give_back` can compact. So where the live stack itself
     /// reaches the ceiling, no eviction whatever can help, and without the
     /// guard `free_until` would empty the undo stack, drain the redo stack and
-    /// then answer false. The document that used to demonstrate it was 64
-    /// layers each with a mask: 128 slices against a ceiling of 129, so a
-    /// single pen-down with the transform tool in hand would have destroyed the
-    /// whole session's history and refused the transform anyway.
+    /// then answer false.
     ///
-    /// **That example no longer reaches the ceiling**, and the guard stays.
-    /// `LayerStack::MAX_SLOTS` is 257 now, because it carries a slice per
-    /// possible effect draw as well as one per layer and one per mask — so the
-    /// live stack cannot reach it out of layers and masks alone, and this
-    /// second `if` is dormant until an effect claims a slice. Deleting it
-    /// because nothing reaches it today would be removing the guard exactly
-    /// one feature before it is needed, and what it guards against is
-    /// unrecoverable: a session's history spent to answer no.
+    /// **`live_slot_ceiling` is one past the highest slot *number* a live layer
+    /// holds, not a count of live layers**, and reading it as a count is the
+    /// mistake to avoid here. Parked slices push the numbering up and
+    /// `SlotPool::give_back` compacts only the *tail*, so a layer created while
+    /// most of the range is parked takes a number near the top and holds it
+    /// there however much history is then given up. Two live layers are enough.
+    /// This is why the guard is not made redundant by the slice ceiling being
+    /// far above what a stack can claim on its own.
+    ///
+    /// The document this used to be described with was 64 layers each with a
+    /// mask, and that was **already** wrong: 128 slices against the ceiling of
+    /// 129 left `has_headroom` true, so the first `if` returned and the guard
+    /// never ran. It is further from the ceiling now, at 256.
     fn free_headroom(&mut self) -> bool {
         let room = self.editor.layers.room();
         if room.has_headroom() {

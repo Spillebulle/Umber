@@ -20,12 +20,13 @@
 //
 // This is deliberately not `LayerStack::MAX`, which is 64 and bounds *stack
 // entries*. A draw is not a stack entry: a layer's effects each composite as a
-// draw of their own, so one entry can produce several. The difference, 128, is
-// the document's effect-draw budget.
+// draw of their own, so one entry can produce several. The difference, 127, is
+// the document's effect-draw budget — derived on the Rust side from the layer
+// array's 256-slice ceiling, because an effect draw reads an effect slice.
 //
 // The loop below is bounded by `layer_count`, never by this, so raising it
 // costs uniform bytes and the upload and nothing per fragment.
-const MAX_DRAWS: u32 = 192u;
+const MAX_DRAWS: u32 = 191u;
 
 struct View {
     // doc = screen * scale + offset

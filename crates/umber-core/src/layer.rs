@@ -562,16 +562,32 @@ impl LayerStack {
     ///
     /// Distinct from [`LayerStack::MAX`], which bounds *stack entries*. A mask
     /// occupies no stack entry, so the two numbers genuinely differ; conflating
-    /// them would have capped a document at 32 masked layers. The trailing 128
-    /// is `MAX_DRAWS − MAX` in `umber-render`'s `canvas.rs` — a baked effect is
-    /// an ordinary slice of the same array, so the effect-draw budget is also a
-    /// slice budget.
+    /// them would have capped a document at 32 masked layers. The rest is the
+    /// effect-draw budget, because a baked effect is an ordinary slice of the
+    /// same array.
+    ///
+    /// **It is a flat 256 because that is a hardware guarantee, and everything
+    /// else is derived from it rather than the other way round.** `Gpu::new`
+    /// requests wgpu's `downlevel_defaults`, which leaves
+    /// `max_texture_array_layers` at 256; a 257th slice is a `create_texture`
+    /// validation error, and a validation error is fatal. So the ceiling is
+    /// the input: 64 layers, 64 masks and the float's spare take 129, and the
+    /// **127** left over are the effect budget — which is where
+    /// `umber-render`'s `MAX_DRAWS` of 191 comes from, since an effect draw
+    /// reads an effect slice. `docs/layer-effects.md` §6.3 asked for 257 and
+    /// 192 without checking the limit.
+    ///
+    /// `canvas.rs` carries the whole argument and a `const` assertion against
+    /// the limit, because that is where wgpu can be seen. `umber-core` may not
+    /// see it, which is exactly why the number is written out here rather than
+    /// derived — and why the two are pinned against each other by
+    /// `the_slice_ceiling_agrees_with_umber_core`.
     ///
     /// Nothing is allocated by raising it. `CanvasRenderer` starts at
     /// `INITIAL_SLOTS` of four and `ensure_slots` doubles towards what the
     /// stack actually claims, so a document with no masks and no effects pays
     /// for the headroom in nothing but this pool's ceiling.
-    pub const MAX_SLOTS: u32 = Self::MAX as u32 * 2 + 1 + 128;
+    pub const MAX_SLOTS: u32 = 256;
 
     /// How many independent link groups a document may hold.
     ///
@@ -985,8 +1001,12 @@ impl LayerStack {
     /// is no however much undo history is given up, because the tail cannot be
     /// compacted past a slice a layer is holding — and a caller that spent the
     /// history finding that out would have destroyed an afternoon for nothing.
-    /// 64 layers each with a mask is exactly that state and is a legal
-    /// document.
+    ///
+    /// **It is a slot number and not a count**, which is what makes the state
+    /// reachable at all: a layer added while most of the range is parked takes
+    /// a number near the top and keeps it. This used to say "64 layers each
+    /// with a mask is exactly that state", which was never true — that is 128
+    /// slices, and the ceiling has never been that low.
     pub fn live_slot_ceiling(&self) -> u32 {
         self.layers
             .iter()
@@ -2227,11 +2247,15 @@ mod tests {
     /// conflating either with `MAX` would have quietly halved how many layers
     /// could carry a mask.
     ///
-    /// The inequality below is therefore slack rather than tight now, and that
-    /// is what it is asserting: a fully masked stack leaves room for the float.
+    /// **What is asserted is the question `begin_float` asks, not the
+    /// arithmetic.** `slot_capacity_needed() < MAX_SLOTS` is a restatement of
+    /// the formula and would hold at 200, at 256 or with the float's `+ 1`
+    /// deleted; `has_headroom` is the thing a transform actually needs, and it
+    /// is false in exactly the cases that matter.
     #[test]
     fn the_slot_ceiling_covers_a_fully_masked_stack_and_the_floats_spare() {
         let mut s = LayerStack::new();
+        let room = s.room();
         while s.len() < LayerStack::MAX {
             s.add().unwrap();
         }
@@ -2240,8 +2264,8 @@ mod tests {
         }
         assert_eq!(s.slot_capacity_needed(), LayerStack::MAX as u32 * 2);
         assert!(
-            s.slot_capacity_needed() < LayerStack::MAX_SLOTS,
-            "no slice left for a floating transform to preview into"
+            room.has_headroom(),
+            "a fully masked stack left a floating transform nowhere to preview"
         );
     }
 
