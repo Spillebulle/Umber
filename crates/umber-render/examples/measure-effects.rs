@@ -73,7 +73,7 @@
 //!
 //! # The pictures
 //!
-//! One shape, drawn at 512 square, carrying the four places the two methods can
+//! One shape, drawn at 768 square, carrying the places the two methods can
 //! disagree: a sharp convex corner, an acute apex, a diagonal edge, a limb
 //! narrower than the stroke, and holes smaller than it. A picture without those
 //! proves nothing, because on a straight axis-aligned edge the two methods are
@@ -84,9 +84,19 @@
 //! is the original edge, not a grown one; the amount a lower threshold grows by
 //! depends on the kernel. So the blur path does not threshold at all — it
 //! *inverts* the tent kernel's own cumulative distribution to recover a
-//! distance, and then hands that to the same `smoothstep(w - 1, w)` the flood
+//! distance, and then hands that to the same softening the flood's own resolve
 //! uses. Both methods therefore mean the same thing by "20 px", exactly, on an
 //! axis-aligned edge; everywhere else the difference is the measurement.
+//!
+//! **And the kernel width is swept rather than chosen**, which is the other way
+//! this could have been a rigged test. How good blur-and-threshold is turns
+//! almost entirely on one number — the box radius as a multiple of the stroke's
+//! width — and the trade runs the opposite way to the intuition: a *tighter*
+//! kernel is better, and cheaper. At `h = 2w` a 20 px stroke puts a
+//! right-angled corner 8.6 px out where a disc puts it at 20; at `h = 1.25w`
+//! the same corner reaches 16.6 and the thin limb, which had no stroke at all,
+//! comes back exactly right. Reporting the loose setting alone would have been
+//! a straw man, and the first draft of this measurement was one.
 //!
 //! # The thing this was written to check
 //!
@@ -1186,7 +1196,7 @@ impl<'a> Shadow<'a> {
     /// payment. The shadow may run its blur on a quarter-resolution copy and a
     /// stroke has a hard edge, which §3.2 names as the one thing that must not.
     fn time_stroke_blur(&self, gpu: &Gpu, width: u32) -> f64 {
-        let r = blur_radius_for(width);
+        let r = blur_radius_for(width, BLUR_FACTOR);
         let cfg = |radius: i32, axis: u32| cfg_blur(self.size, radius, axis);
         let mut resolve = cfg(0, 0);
         resolve.width = width as f32;
@@ -1236,7 +1246,7 @@ impl<'a> Shadow<'a> {
     /// The same, with the blur on a quarter-resolution copy.
     fn time_stroke_blur_quarter(&self, gpu: &Gpu, width: u32) -> f64 {
         let small = (self.size / 4).max(1);
-        let r = blur_radius_for(width).div_euclid(4).max(1);
+        let r = blur_radius_for(width, BLUR_FACTOR).div_euclid(4).max(1);
         let cfg = |size: u32, radius: i32, axis: u32| cfg_blur(size, radius, axis);
         let mut resolve = cfg(self.size, 0, 0);
         resolve.width = width as f32;
@@ -1419,20 +1429,36 @@ enum Pipe {
     Shape,
 }
 
-/// The box half-width a stroke of this width needs, in full-resolution texels.
+/// The box half-width a stroke of this width needs, in full-resolution texels,
+/// as a multiple of the width.
 ///
-/// Two box passes per axis make a tent of half support `2r`, and the recovered
-/// distance can never exceed that — so `r` has to be at least `w/2` or the
-/// stroke's own contour falls outside the kernel's reach and the stroke simply
-/// stops. `r = w` puts the contour at the midpoint of the support, where the
-/// tent's cumulative distribution is `0.125` and its gradient is still steep
-/// enough to resolve. Smaller is cheaper and sharper and kills a thin limb
-/// sooner; larger is smoother and rounds a corner more. This is the middle of
-/// the useful range rather than the end of it, which is what makes the pictures
-/// a fair test of the method rather than of a setting.
-fn blur_radius_for(width: u32) -> i32 {
-    (width as i32).max(1)
+/// **This one number decides how good blur-and-threshold is, and reporting the
+/// method at one value of it would be a straw man.** Two box passes per axis
+/// make a tent of half support `2r + 1`, and the recovered distance can never
+/// exceed that, so `r` has to clear `w/2` or the stroke's own contour falls
+/// outside the kernel and there is nothing to find. Above that floor the
+/// trade runs the *opposite* way to the intuition: a **tighter** kernel is
+/// better, because it puts the contour further into the tail where a corner's
+/// `F(-d/sqrt2)^2` and an edge's `F(-d)` are closer together. The arithmetic,
+/// for a tent of half support `h = rho * w`, is that a right-angled corner
+/// reaches `sqrt2 * h * (1 - sqrt(sqrt2 * (1 - 1/rho)))` — 0.45w at `rho = 2`,
+/// 0.83w at 1.25, and about 1.0w at 1.1. `pictures::draw` sweeps it rather
+/// than trusting that.
+///
+/// The floor is `w/2 + 1` and not `w/2`: at exactly the support the contour
+/// sits where the field is identically zero and the stroke has no outer edge to
+/// antialias.
+fn blur_radius_for(width: u32, factor: f32) -> i32 {
+    let floor = (width as f32 / 2.0).ceil() as i32 + 1;
+    ((width as f32 * factor).round() as i32).max(floor)
 }
+
+/// The factor the timed columns and the headline pictures use.
+///
+/// Chosen off the sweep `pictures::draw` prints: it is the tightest kernel that
+/// still resolves, which is both the best the method does on shape and the
+/// cheapest it runs.
+const BLUR_FACTOR: f32 = 0.6;
 
 fn cfg_blur(size: u32, radius: i32, axis: u32) -> Cfg {
     Cfg {
@@ -1818,8 +1844,8 @@ mod pictures {
             width: u32,
             wide: bool,
             reach: f32,
+            r: i32,
         ) -> (Field, Field) {
-            let r = blur_radius_for(width);
             let (pipe, a, b) = if wide {
                 (Pipe::BoxWide, &self.wide_a, &self.wide_b)
             } else {
@@ -1858,9 +1884,16 @@ mod pictures {
 
         /// The version that really does reuse the shadow's own blur: the same
         /// tent, run on a quarter-resolution copy and bilinearly upsampled.
-        fn blur_quarter(&self, gpu: &Gpu, bench: &Bench, width: u32, reach: f32) -> (Field, Field) {
+        fn blur_quarter(
+            &self,
+            gpu: &Gpu,
+            bench: &Bench,
+            width: u32,
+            reach: f32,
+            full_r: i32,
+        ) -> (Field, Field) {
             let small = SIZE / 4;
-            let r = blur_radius_for(width).div_euclid(4).max(1);
+            let r = full_r.div_euclid(4).max(1);
             let mut resolve = cfg_blur(SIZE, 0, 0);
             resolve.width = width as f32;
             resolve.reach = reach;
@@ -2222,6 +2255,51 @@ mod pictures {
         );
     }
 
+    /// Kernel widths swept, as a multiple of the stroke's own width.
+    ///
+    /// The floor `blur_radius_for` enforces is about 0.5, so 0.6 is nearly as
+    /// tight as the method can be run and 2.0 is a generously smooth setting.
+    const FACTORS: [f32; 6] = [0.6, 0.7, 0.85, 1.0, 1.5, 2.0];
+
+    /// What blur-and-threshold does across the one setting that decides it.
+    ///
+    /// Reporting the method at a single kernel width would be a straw man, and
+    /// the direction of the trade is not the one anybody guesses: the tighter
+    /// the kernel, the *better* the corner and the thin limb, because the
+    /// stroke's contour then sits deep in the kernel's tail where a corner's
+    /// blurred value and an edge's have not yet diverged. It is also cheaper
+    /// there. What bounds it is the floor at `w/2`, below which the recovered
+    /// distance cannot reach the contour at all.
+    fn radius_sweep(gpu: &Gpu, bench: &Bench, t: &Targets, flat: &Targets, w: u32) {
+        println!("  {w} px, blur 16-bit at full resolution, across kernel widths:");
+        println!(
+            "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7}",
+            "h/w", "box r", "axis", "corner", "apex", "diagonal", "limb span", "hole", "mean d",
+        );
+        let (jfa, _) = t.jfa(gpu, bench, w);
+        for factor in FACTORS {
+            let r = blur_radius_for(w, factor);
+            let reach = calibrate(w, 2.0 * r as f32 + 1.0, |k| {
+                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0, w)
+            });
+            let (f, _) = t.blur(gpu, bench, w, true, reach, r);
+            let p = probe(&f, w);
+            let (_, _, mean) = difference(&jfa, &f);
+            println!(
+                "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7}",
+                format!("{:.2}", (2 * r + 1) as f32 / w as f32),
+                r,
+                px(p.axis),
+                px(p.corner),
+                px(p.apex),
+                px(p.diagonal),
+                px(p.limb_span),
+                format!("{:.2}", p.hole_fill),
+                format!("{mean:.4}"),
+            );
+        }
+    }
+
     pub(super) fn draw(gpu: &Gpu, bench: &Bench, dir: &std::path::Path, ok: bool) {
         if !ok {
             println!("pictures: skipped, this device cannot render one of the two paths\n");
@@ -2262,24 +2340,26 @@ mod pictures {
         );
 
         for w in WIDTHS {
-            let r = blur_radius_for(w);
+            radius_sweep(gpu, bench, &t, &flat, w);
+
+            let r = blur_radius_for(w, BLUR_FACTOR);
             let full_guess = 2.0 * r as f32 + 1.0;
             let small_guess = 8.0 * r.div_euclid(4).max(1) as f32 + 8.0;
             let wide_reach = calibrate(w, full_guess, |k| {
-                flat_contour(&flat.blur(gpu, bench, w, true, k).0, w)
+                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0, w)
             });
             let byte_reach = calibrate(w, full_guess, |k| {
-                flat_contour(&flat.blur(gpu, bench, w, false, k).0, w)
+                flat_contour(&flat.blur(gpu, bench, w, false, k, r).0, w)
             });
             let quarter_reach = calibrate(w, small_guess, |k| {
-                flat_contour(&flat.blur_quarter(gpu, bench, w, k).0, w)
+                flat_contour(&flat.blur_quarter(gpu, bench, w, k, r).0, w)
             });
             let flood_flat = flat_contour(&flat.jfa(gpu, bench, w).0, w);
 
             let (jfa, cov) = t.jfa(gpu, bench, w);
-            let (blur, _) = t.blur(gpu, bench, w, true, wide_reach);
-            let (blur8, _) = t.blur(gpu, bench, w, false, byte_reach);
-            let (quarter, _) = t.blur_quarter(gpu, bench, w, quarter_reach);
+            let (blur, _) = t.blur(gpu, bench, w, true, wide_reach, r);
+            let (blur8, _) = t.blur(gpu, bench, w, false, byte_reach, r);
+            let (quarter, _) = t.blur_quarter(gpu, bench, w, quarter_reach, r);
 
             let jfa_rgb = compose(&jfa, &cov);
             let blur_rgb = compose(&blur, &cov);
@@ -2339,8 +2419,9 @@ mod pictures {
                 format!("{:.2}", ideal_hole_fill(w)),
             );
             println!(
-                "          half-plane: flood {}, reach tuned to full {wide_reach:.1} \
-                 (analytic {full_guess:.1}), 8-bit {byte_reach:.1}, quarter {quarter_reach:.1}",
+                "          box r {r} (factor {BLUR_FACTOR}); half-plane: flood {}, reach tuned to \
+                 full {wide_reach:.1} (analytic {full_guess:.1}), 8-bit {byte_reach:.1}, \
+                 quarter {quarter_reach:.1}",
                 px(flood_flat),
             );
             println!();
