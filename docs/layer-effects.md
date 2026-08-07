@@ -422,6 +422,34 @@ its effects budget, naming the figure and where to change it — exactly the
 treatment the undo panel gives "Earlier edits discarded", which exists because
 the silent version was read as a bug.
 
+### 6.1a Two budgets, and only one of them may refuse
+
+There is a cap on *adding* an effect and a cap on *drawing* one, they are
+different numbers, and the distinction is what stops an undo being refused.
+
+- **Adding is gated.** `LayerStack::set_effect` consults the slice budget and
+  declines, with a `can_set_effect` beside it sharing the plan, so a control
+  cannot light up promising what the model will refuse. A refusal changes
+  nothing at all.
+- **Overflow is not gated, because an undo may not be refused.**
+  `LayerStack::restore_shape` puts a deleted layer back with the effects it had,
+  and there is no answer to "your undo does not fit" that is better than doing
+  it. The same goes for an import, for a document opened from a file, and for a
+  layer moved out of a folder. So a document *can* hold more enabled effects
+  than it has slices or bytes for.
+
+**Therefore the draw path must degrade visibly rather than truncate silently**,
+and that is one rule serving both budgets. Effects are dropped in a stated order
+— the ones furthest down the stack first, so the layer being worked on keeps
+its own — the document is said to be over budget, and nothing is quietly
+different from what the panel shows. Truncating the draw list at `MAX_DRAWS`
+instead would be the silent version, and it is refused for the reason
+`group-compositing.md` §2.3 gives about a list cut off mid-group.
+
+The tempting simplification is to make `restore_shape` refuse, which is one `if`
+and is wrong: an undo that declines to undo is worse than a picture that is
+missing a shadow and says so.
+
 ### 6.2 Draws
 
 `LayerStack::MAX` is 64 and `MAX_LAYERS` in `composite.wgsl` sizes the uniform
@@ -488,7 +516,19 @@ MAX_DRAWS         = MAX + MAX_EFFECT_SLICES       // = 191
 ```
 
 One slice per layer, one per mask, one spare for the float — 129 — and the
-remaining **127** are the document's effects. Sitting exactly on the device's
+remaining **127** are the document's effects.
+
+**127 rather than 128 is what makes the cap reachable at all**, which is worth
+recording because the first draft's 128 made it dead arithmetic. Two kinds, one
+of each per layer, `LayerStack::MAX` of 64: the most a legal document can enable
+is 128. Against a budget of 128 that is exactly the ceiling and never over it, so
+the refusal could only be exercised by building a stack the model otherwise
+forbids — a test that pins a synthetic shape and proves nothing about a document.
+Against 127 the last effect on a fully doubled stack is refused for real. The
+budget should be re-checked for reachability whenever a kind is added, and the
+guard should say so rather than the next person rediscovering it.
+
+Sitting exactly on the device's
 figure is safe **only because it is derived from that figure and asserted against
 it**, so the assertion is the load-bearing part and not a formality:
 
@@ -769,6 +809,13 @@ Without a GPU, in `umber-core` and `umber-app`:
   against `Limits::downlevel_defaults().max_texture_array_layers`, which is the
   guard §6.3 exists for and the one whose absence would have shipped a fatal
   validation error.
+- **The budget is reachable by a legal document**, so the refusal is exercised
+  through an ordinary stack rather than a synthetic one — §6.3, and it was not
+  true at the first draft's figure.
+- **An undo is never refused for want of budget.** `restore_shape` puts a
+  deleted layer back with its effects even when that goes over, and the draw
+  path drops effects in a stated order and says so. §6.1a — the one rule that
+  keeps two budgets from becoming two behaviours.
 - **An effect past the budget is refused** and the refusal changes nothing at all, the shape
   `can_reorder`/`plan_reorder` already keeps.
 - **Effect order is stable**: outer effects below the layer, inner above, in the
