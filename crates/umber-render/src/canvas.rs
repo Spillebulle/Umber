@@ -119,6 +119,14 @@ const _: () = assert!(
 /// [`MAX_DRAWS`] with it instead of leaving three numbers to be changed by
 /// hand. The float's spare is inside the subtraction and never gives way — a
 /// transform must always have somewhere to preview.
+///
+/// **127 rather than 128 is also what makes the cap reachable**, which
+/// `docs/layer-effects.md` §6.3 records and is worth repeating where the number
+/// is: with two effect kinds and one of each per layer, 64 layers can enable at
+/// most 128, so against a budget of 128 the refusal sits exactly on the ceiling
+/// and can only be exercised by a stack the model forbids. Against 127 the last
+/// effect on a fully doubled stack is refused for real. **Re-check that when an
+/// effect kind is added** — the arithmetic moves and nothing here will say so.
 const MAX_EFFECT_SLICES: usize = MAX_SLOTS - (MAX_LAYERS * 2 + 1);
 
 /// Entries the composite pass's two uniform arrays carry, mirrored by
