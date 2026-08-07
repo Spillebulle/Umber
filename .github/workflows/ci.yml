@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run it again without a commit. `release.yml` has had this from the start as
+  # its rehearsal; this one needed it for the opposite reason — a run that never
+  # finishes. During a GitHub Actions outage the run for a commit was left
+  # queued for hours and could be neither cancelled nor re-run ("cannot cancel a
+  # completed run" and "already running", about the same run). `release.sh`
+  # waits for CI on the exact commit it is about to tag, so a wedged run is a
+  # release that cannot be cut at all, and the only way out was a commit whose
+  # sole purpose was to push something.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
