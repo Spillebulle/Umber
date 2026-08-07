@@ -854,10 +854,14 @@ impl UmberApp {
                 // only true when the slice that comes free happens to be the
                 // one at the top of the range.
                 lines: vec![
+                    // No figure. It used to say "of 129", which was the slice
+                    // ceiling; that ceiling now carries headroom for effect
+                    // slices too, so a count naming it would be a number the
+                    // painter cannot check against anything on screen.
                     "A transform needs a spare texture slice to preview into, and \
                      this document is using every one Umber has. A layer takes one \
-                     and a mask takes another, of 129. Fewer layers, or fewer \
-                     masks, will make room."
+                     and a mask takes another. Fewer layers, or fewer masks, will \
+                     make room."
                         .to_string(),
                 ],
             });

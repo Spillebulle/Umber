@@ -166,7 +166,7 @@ impl SlotPool {
     /// from — and every alternative is worse in a different direction: failing
     /// closed loses a slice for ever, and failing open once had
     /// `slot_capacity_needed` answering `MAX_SLOTS`, which would ask the
-    /// renderer for 129 canvas-sized slices.
+    /// renderer for 257 canvas-sized slices.
     fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
         pool.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1933,8 +1933,8 @@ impl StackShape {
     /// canvas-sized texture slice, which is 16 MB at 2048² and 400 MB at
     /// 10000². Counting only the rows would leave the one figure the user sets
     /// to bound undo blind to the whole cost of the feature, and a session of
-    /// deleting and adding layers would walk the layer array to its 129-slice
-    /// ceiling — 2.16 GB at 2048², 51.6 GB at 10000° — with the budget
+    /// deleting and adding layers would walk the layer array to its 257-slice
+    /// ceiling — 4.31 GB at 2048², 102.8 GB at 10000² — with the budget
     /// reporting a few kilobytes. `LayerStack::slot_capacity_needed` never
     /// falls while a slice is parked, and `CanvasRenderer::ensure_slots` never
     /// shrinks, so that memory is allocated and stays allocated.

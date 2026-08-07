@@ -1960,7 +1960,7 @@ mod tests {
     /// `LayerStack::slot_capacity_needed` never falls while a slice is parked,
     /// and `CanvasRenderer::ensure_slots` doubles and never shrinks — so a
     /// session of deleting and adding layers walks the layer array to its
-    /// 129-slice ceiling, which is 2.16 GB at 2048² and 51.6 GB at 10000°,
+    /// 257-slice ceiling, which is 4.31 GB at 2048² and 102.8 GB at 10000²,
     /// with a budget that reported a few kilobytes and evicted nothing. An
     /// allocation failure there is an uncaptured device error, which is fatal.
     ///
