@@ -115,10 +115,24 @@ const _: () = assert!(
 /// What is left of [`MAX_SLOTS`] once every layer, every mask and the float's
 /// spare have their slice: **127**.
 ///
-/// Derived rather than written down, so raising [`MAX_LAYERS`] takes it and
-/// [`MAX_DRAWS`] with it instead of leaving three numbers to be changed by
-/// hand. The float's spare is inside the subtraction and never gives way — a
-/// transform must always have somewhere to preview.
+/// Derived rather than written down, so a change to [`MAX_LAYERS`] carries
+/// through instead of leaving numbers to be edited by hand. The float's spare
+/// is inside the subtraction and never gives way — a transform must always have
+/// somewhere to preview.
+///
+/// **Raising [`MAX_LAYERS`] *lowers* this, and lowers [`MAX_DRAWS`] with it.**
+/// The ceiling is fixed by the device, so every layer added takes two slices
+/// out of the effect budget: `MAX_DRAWS` is `MAX_SLOTS - MAX_LAYERS - 1`, which
+/// is 155 at a stack cap of 100 and **1** at 127. That is the opposite of what
+/// "derived" suggests and nothing fails when it happens — `MAX_DRAWS >=
+/// MAX_LAYERS` still holds everywhere the const assertion above allows. Anyone
+/// raising the stack cap has to decide whether the effect budget left is one
+/// worth having.
+///
+/// It also does not carry through to the shader, which holds `MAX_DRAWS` as a
+/// literal `191u`. That is a fourth number and it is changed by hand;
+/// `the_three_draw_capacities_agree` is what makes forgetting it a red test
+/// rather than a silent uniform mismatch.
 ///
 /// **127 rather than 128 is also what makes the cap reachable**, which
 /// `docs/layer-effects.md` §6.3 records and is worth repeating where the number
@@ -127,7 +141,7 @@ const _: () = assert!(
 /// and can only be exercised by a stack the model forbids. Against 127 the last
 /// effect on a fully doubled stack is refused for real. **Re-check that when an
 /// effect kind is added** — the arithmetic moves and nothing here will say so.
-const MAX_EFFECT_SLICES: usize = MAX_SLOTS - (MAX_LAYERS * 2 + 1);
+const MAX_EFFECT_SLICES: usize = effect_slices(MAX_LAYERS, MAX_SLOTS);
 
 /// Entries the composite pass's two uniform arrays carry, mirrored by
 /// `MAX_DRAWS` in `composite.wgsl`: **191**.
@@ -148,6 +162,22 @@ const MAX_EFFECT_SLICES: usize = MAX_SLOTS - (MAX_LAYERS * 2 + 1);
 /// fragment: the loop in `composite.wgsl` is bounded by `layer_count`. The
 /// bytes are counted in [`ViewUniforms`].
 const MAX_DRAWS: usize = MAX_LAYERS + MAX_EFFECT_SLICES;
+
+/// Slices left for effects once a stack of `layers`, all masked, and the
+/// float's spare have theirs, under a ceiling of `ceiling`.
+///
+/// **A `const fn` rather than an expression inline in [`MAX_EFFECT_SLICES`],
+/// and that is what makes the derivation testable at all.** A test that
+/// recomputes `ceiling - (layers * 2 + 1)` for itself and then asserts
+/// `layers * 2 + 1 + that == ceiling` has written `a - b + b == a`, which holds
+/// for every function body there is — that was the second draft of
+/// `the_slice_ceiling_agrees_with_umber_core` and it tested nothing. Calling
+/// *this* turns the same assertion into a statement about the rule: a body
+/// correct at 64 and wrong elsewhere fails it, which was checked by writing
+/// one.
+const fn effect_slices(layers: usize, ceiling: usize) -> usize {
+    ceiling - (layers * 2 + 1)
+}
 
 /// Texture-array slices allocated up front. Growth doubles this, so a typical
 /// document never pays for a copy.
@@ -2075,7 +2105,22 @@ impl CanvasRenderer {
     /// Growth reallocates the array and copies every existing slice, so it
     /// doubles rather than growing by one — a document that reaches eight
     /// layers pays for two copies, not eight.
+    ///
+    /// **The `.min` below fails open and the assertion is what stops it.**
+    /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
+    /// growth line naming it, and returns as though it had done what it was
+    /// asked — after which every slot at or above the ceiling indexes off the
+    /// end of the array. It is unreachable today, because `SlotPool` hands out
+    /// at most slot 255 and `begin_float` refuses at the ceiling; but this
+    /// clamp is the *only* thing standing between those two guarantees and
+    /// silently wrong pixels, and `LayerStack::MAX_SLOTS` lives in a different
+    /// crate, where it can be raised on its own with only one test in this one
+    /// to notice. A named failure is worth the debug build's comparison.
     pub fn ensure_slots(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
+        debug_assert!(
+            needed <= MAX_SLOTS as u32,
+            "asked for {needed} slices against a ceiling of {MAX_SLOTS}"
+        );
         if needed <= self.layers.capacity {
             return;
         }
@@ -5742,33 +5787,43 @@ mod tests {
     /// The one number here that is not ours, and the two that come out of it.
     ///
     /// **The derivation is what is tested, at inputs other than the shipped
-    /// ones.** Asserting `MAX_SLOTS == MAX_LAYERS * 2 + 1 + (MAX_DRAWS -
-    /// MAX_LAYERS)` is a copy of the formula and cannot fail when the formula
-    /// is wrong, which is what the first draft of this test did. What has to
-    /// hold is the *property*: the ceiling is exactly accounted for, and the
-    /// draw budget is the slice budget, whatever `MAX_LAYERS` is later set to.
+    /// ones, and it is tested by *calling* it.** Asserting `MAX_SLOTS ==
+    /// MAX_LAYERS * 2 + 1 + (MAX_DRAWS - MAX_LAYERS)` is a copy of the formula
+    /// and cannot fail when the formula is wrong. Nor is it enough to recompute
+    /// the subtraction in the test and check it against itself: `a - b + b ==
+    /// a` holds whatever [`effect_slices`] does. Both drafts of this test made
+    /// one of those two mistakes. What runs below is the real
+    /// [`effect_slices`] and [`draws`], and the claims are about *them*.
     #[test]
     fn the_slice_ceiling_agrees_with_umber_core() {
         assert_eq!(MAX_SLOTS as u32, umber_core::LayerStack::MAX_SLOTS);
         assert_eq!(MAX_LAYERS, umber_core::LayerStack::MAX);
 
-        // Every slice is spoken for: a layer, a mask, the float's spare, or an
-        // effect. None left over and none double-counted.
-        assert_eq!(MAX_LAYERS * 2 + 1 + MAX_EFFECT_SLICES, MAX_SLOTS);
-        // One effect draw reads one effect slice, so the draw budget above the
-        // stack is exactly the slice budget. A draw with nowhere to read from
-        // is what 192 would have been.
+        // The shipped constants really are what the derivation answers, so
+        // everything proved about the functions is proved about them.
+        assert_eq!(MAX_EFFECT_SLICES, effect_slices(MAX_LAYERS, MAX_SLOTS));
         assert_eq!(MAX_DRAWS - MAX_LAYERS, MAX_EFFECT_SLICES);
+        assert_eq!(MAX_EFFECT_SLICES, 127);
+        assert_eq!(MAX_DRAWS, 191);
 
-        // The same derivation at other stack caps, because it is the
-        // derivation rather than today's numbers that has to survive a change
-        // to `MAX_LAYERS`. The ceiling is fixed by the device in every case.
+        // The ceiling is fixed by the device, so it is the one input that does
+        // not vary. `MAX_LAYERS` is ours and may move, which is the whole
+        // reason these are functions.
         for layers in [1usize, 8, 32, 64, 100, 127] {
-            let effects = MAX_SLOTS - (layers * 2 + 1);
-            let draws = layers + effects;
+            let effects = effect_slices(layers, MAX_SLOTS);
+            // One draw per layer and one per effect slice, which is how
+            // `MAX_DRAWS` is built.
+            let total = layers + effects;
+
+            // Every slice is spoken for exactly once: a layer, a mask, the
+            // float's spare, or an effect. Drop the `+ 1` from
+            // `effect_slices` and this is the assertion that goes red — and so
+            // does a body that is right at 64 and wrong at 1, which is the
+            // mutation this loop exists for.
             assert_eq!(layers * 2 + 1 + effects, MAX_SLOTS, "{layers} layers");
-            assert_eq!(draws - layers, effects, "{layers} layers");
-            assert!(draws >= layers, "{layers} layers");
+            // The draw list can never outrun the array it draws from, which is
+            // the promise 192 broke.
+            assert!(total <= MAX_SLOTS, "{layers} layers: {total} draws");
         }
 
         // Raising it allocates nothing: the array starts at `INITIAL_SLOTS` and

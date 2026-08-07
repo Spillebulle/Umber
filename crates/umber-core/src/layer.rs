@@ -2247,11 +2247,17 @@ mod tests {
     /// conflating either with `MAX` would have quietly halved how many layers
     /// could carry a mask.
     ///
-    /// **What is asserted is the question `begin_float` asks, not the
-    /// arithmetic.** `slot_capacity_needed() < MAX_SLOTS` is a restatement of
-    /// the formula and would hold at 200, at 256 or with the float's `+ 1`
-    /// deleted; `has_headroom` is the thing a transform actually needs, and it
-    /// is false in exactly the cases that matter.
+    /// It asks `has_headroom` rather than `slot_capacity_needed() <
+    /// MAX_SLOTS`, and **that is readability and not strength**: `has_headroom`
+    /// *is* `next < MAX_SLOTS` and `slot_capacity_needed` returns `next`, so
+    /// the two are the identical comparison on the identical field. What it
+    /// buys is that the assertion is spelled as the question `begin_float`
+    /// asks. An earlier draft of this comment claimed the swap made the test
+    /// harder to satisfy, which was false — the check is exactly as slack
+    /// either way, and it would still pass with the float's `+ 1` removed from
+    /// the ceiling. That `+ 1` is pinned in `umber-render`'s
+    /// `the_slice_ceiling_agrees_with_umber_core`, which can call the
+    /// derivation; nothing reachable from here can.
     #[test]
     fn the_slot_ceiling_covers_a_fully_masked_stack_and_the_floats_spare() {
         let mut s = LayerStack::new();

@@ -867,9 +867,18 @@ impl UmberApp {
                     // somebody is already stuck. Reopening genuinely works: the
                     // stack is rebuilt from a fresh pool and the numbering
                     // packs back down from zero.
+                    //
+                    // **And it names what that costs**, because it costs
+                    // something: `SaveHistory::new` skips structural entries,
+                    // which are exactly the ones holding parked slices, so the
+                    // reopened document cannot undo the deletes that got it
+                    // here. An advice that works and quietly throws away undo
+                    // history is the same class of failure as one that does
+                    // not work — the artist has to be able to weigh it.
                     "A transform needs a spare texture slice to preview into, and \
                      this document is using every one Umber has. Saving and \
-                     reopening the document will pack them back down."
+                     reopening the document will pack them back down, though \
+                     deleted layers cannot be brought back afterwards."
                         .to_string(),
                 ],
             });
