@@ -430,39 +430,95 @@ array at 64. `group-compositing.md` §7 shows the equality
 
 Effects break it outright: 64 layers each with three effects is 256 draws.
 
-The uniform can afford it. `ViewUniforms` is 2160 bytes at 64 entries — two
-`array<vec4<f32>, 64>` at 1024 each, plus 112 of scalars and vectors — against
-`downlevel_defaults`' `max_uniform_buffer_binding_size` of 16 KiB. At **192
-entries** the two arrays are 3072 each, so 6256 bytes, leaving room for the third
-array a later feature might want. Raising the array does **not** lengthen the
-loop, which is bounded by `layer_count`; the cost is uniform bytes and the upload,
-both of which are noise.
+The uniform can afford it, and this is the one capacity question that is not
+tight. `ViewUniforms` is 2,160 bytes at 64 entries — two `array<vec4<f32>, 64>`
+at 1,024 each, plus 112 of scalars and vectors — against `downlevel_defaults`'
+`max_uniform_buffer_binding_size` of 16 KiB. At **191 entries** the two arrays
+are 3,056 each, so **6,224** bytes, leaving room for the third array a later
+feature might want. Raising the array does **not** lengthen the loop, which is
+bounded by `layer_count`; the cost is uniform bytes and the upload, both of
+which are noise.
 
-So: `MAX_DRAWS = 192`, `LayerStack::MAX` stays 64, and the difference — 128 — is
-the document's effect-draw budget. A 129th enabled effect is **refused with a
-tooltip saying so**, which is the treatment `LayerStack::LINK_GROUPS` already
-gives a seventh link group, and is far better than a cap that truncates the draw
-list silently. Truncation must stay unreachable for the reason
-`group-compositing.md` §2.3 gives: a list cut off mid-group leaves an accumulator
-open.
+**The uniform's headroom is what made this look easy, and it is the wrong limit
+to have been looking at.** There is 10 KiB spare here and the real ceiling was
+somewhere else entirely — §6.3.
+
+So `LayerStack::MAX` stays 64 and a separate `MAX_DRAWS` sizes the arrays. **What
+that number is, is decided in §6.3 and not here** — an effect draw reads an
+effect slice, so the draw budget cannot exceed the slice budget, and the slice
+budget turns out to be the binding constraint. It is **191**.
+
+An effect past the budget is **refused with a tooltip saying so**, which is the
+treatment `LayerStack::LINK_GROUPS` already gives a seventh link group, and is
+far better than a cap that truncates the draw list silently. Truncation must
+stay unreachable for the reason `group-compositing.md` §2.3 gives: a list cut off
+mid-group leaves an accumulator open.
 
 Three numbers now have to agree instead of two — `LayerStack::MAX`, `MAX_DRAWS`
-in `canvas.rs`, `MAX_DRAWS` in `composite.wgsl` — and a CPU test should say so,
+in `canvas.rs`, `MAX_DRAWS` in `composite.wgsl` — and a CPU test must say so,
 because it is exactly the kind of equality a later change to any one of them
-breaks in silence.
+breaks in silence. **Pin the array *declarations*, not only the constant**: leave
+the constant right and write `array<vec4<f32>, 64>` and the WGSL struct is
+merely smaller than the bound buffer, which validates — and the composite then
+reads `extra` as `layers` past index 63, silently.
 
-### 6.3 Slots
+### 6.3 Slots — and the ceiling this document got wrong
 
-`LayerStack::MAX_SLOTS` is `MAX × 2 + 1` = 129: one per layer, one per mask, one
-spare for the float. Effects add up to `MAX_DRAWS − MAX` = 128 more, so
-`MAX_SLOTS` becomes 257. Nothing is allocated by raising it — `INITIAL_SLOTS` is
-four and growth doubles — so a document with no effects pays nothing, which is
-the argument the mask's own headroom already makes.
+**`MAX_SLOTS` may not exceed 256, and the first draft of this section proposed
+257.** That is a fatal error and it is worth keeping the wreckage visible.
 
-`slot_revisions` is `vec![0; MAX_SLOTS]` of `u64`, so it goes from 1,032 bytes to
-2,056. Its doc comment calls it "half a kilobyte", which is **already wrong by a
-factor of two** at 129 slots — correct it in passing rather than doubling a
-figure that was not right to begin with.
+The limits Umber requests are `Limits::downlevel_defaults().using_resolution(…)`.
+`downlevel_defaults()` names seven fields and `max_texture_array_layers` is not
+among them, so it inherits `Limits::defaults()`' **256**; and `using_resolution`
+raises the three texture *dimension* limits and nothing else. So every device
+Umber creates guarantees exactly 256 array layers. Asking for 257 is a
+`create_texture` validation error, and `crash::device_error` makes that fatal —
+a painting application killed by adding a layer.
+
+The trap is that the number reads as unbounded. `using_resolution` is right there
+raising limits from the adapter, and it looks as though it raises this one.
+It does not.
+
+So the ceiling is stated as what it is and everything else is derived from it:
+
+```
+MAX_SLOTS         = 256                           // the guaranteed ceiling
+MAX_EFFECT_SLICES = MAX_SLOTS − (MAX × 2 + 1)     // = 127
+MAX_DRAWS         = MAX + MAX_EFFECT_SLICES       // = 191
+```
+
+One slice per layer, one per mask, one spare for the float — 129 — and the
+remaining **127** are the document's effects. Sitting exactly on the device's
+figure is safe **only because it is derived from that figure and asserted against
+it**, so the assertion is the load-bearing part and not a formality:
+
+```rust
+const _: () = assert!(
+    LayerStack::MAX_SLOTS <= wgpu::Limits::downlevel_defaults().max_texture_array_layers
+);
+```
+
+Its comment has to say *why* — that this limit is inherited rather than named,
+and that `using_resolution` does not touch it — because the comment is the only
+thing that stops the next person making the same reading.
+
+Deriving rather than typing also means a later change to `MAX` re-derives the
+budget instead of silently overrunning: raise `MAX` to 100 and the effect budget
+goes to 55 on its own, and the assertion fails if it would go negative.
+
+Nothing is allocated by raising `MAX_SLOTS` — `INITIAL_SLOTS` is four and growth
+doubles — so a document with no effects pays nothing, which is the argument the
+mask's own headroom already makes. **Except one thing, which is eager:**
+`slot_revisions` is `vec![0; MAX_SLOTS]` and is paid per open document.
+
+At `u64` each it goes from 1,032 bytes to 2,048. Its doc comment calls it "half a
+kilobyte", which is **already wrong by a factor of two** at 129 slots — correct
+it to be right rather than doubling a figure that was not right to begin with.
+
+**A budget in slices is not a budget in bytes**, and §6.1's is the one that bites
+first: 127 effect slices at 10000² would be 50 GB. The slice count is a hard
+ceiling the device imposes; the byte budget is what a document actually spends
+against. Both are needed and neither implies the other.
 
 ---
 
@@ -709,7 +765,11 @@ Without a GPU, in `umber-core` and `umber-app`:
 - **The three numbers agree** — `LayerStack::MAX`, `MAX_DRAWS` in `canvas.rs`,
   `MAX_DRAWS` in `composite.wgsl` — and `draws ≤ MAX_DRAWS` on a full stack with
   every effect enabled.
-- **A 129th effect is refused** and the refusal changes nothing at all, the shape
+- **`MAX_SLOTS` does not exceed what the device guarantees.** A `const` assertion
+  against `Limits::downlevel_defaults().max_texture_array_layers`, which is the
+  guard §6.3 exists for and the one whose absence would have shipped a fatal
+  validation error.
+- **An effect past the budget is refused** and the refusal changes nothing at all, the shape
   `can_reorder`/`plan_reorder` already keeps.
 - **Effect order is stable**: outer effects below the layer, inner above, in the
   order §4 lists, for every subset of them enabled.
