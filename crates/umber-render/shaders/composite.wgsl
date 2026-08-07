@@ -14,8 +14,18 @@
 // stroke visibly jumps at pointer-up when the preview is replaced by the
 // committed result.
 
-// Mirrored by `LayerStack::MAX` in umber-core. Raising one means raising both.
-const MAX_LAYERS: u32 = 64u;
+// How many *draws* the uniform arrays below can carry, mirrored by `MAX_DRAWS`
+// in `canvas.rs`. Raising one means raising both, and a CPU test parses this
+// line to say so.
+//
+// This is deliberately not `LayerStack::MAX`, which is 64 and bounds *stack
+// entries*. A draw is not a stack entry: a layer's effects each composite as a
+// draw of their own, so one entry can produce several. The difference, 128, is
+// the document's effect-draw budget.
+//
+// The loop below is bounded by `layer_count`, never by this, so raising it
+// costs uniform bytes and the upload and nothing per fragment.
+const MAX_DRAWS: u32 = 192u;
 
 struct View {
     // doc = screen * scale + offset
@@ -65,11 +75,11 @@ struct View {
     // This one took the place of the padding word that was already here, so
     // the block is the same size it always was.
     stroke_blend: u32,
-    // Per stack position, bottom first: (opacity, blend mode, slot, visible).
-    // Packed as floats to dodge std140's array-stride rules; every value is a
-    // small integer or a 0..1 float, so the round trip is exact.
-    layers: array<vec4<f32>, MAX_LAYERS>,
-    // The rest of each stack position: (mask slot, has mask, clipped, unused).
+    // Per draw, bottom first: (opacity, blend mode, slot, visible). Packed as
+    // floats to dodge std140's array-stride rules; every value is a small
+    // integer or a 0..1 float, so the round trip is exact.
+    layers: array<vec4<f32>, MAX_DRAWS>,
+    // The rest of each draw: (mask slot, has mask, clipped, unused).
     //
     // A second array rather than four more bits packed into `layers[i].w`. The
     // mask *slot* does not fit in a flag, and a bit field would have to be
@@ -79,7 +89,7 @@ struct View {
     //
     // `mask slot` is the layer's own slot where there is no mask, so the index
     // is always inside the array whether or not the sample is taken.
-    extra: array<vec4<f32>, MAX_LAYERS>,
+    extra: array<vec4<f32>, MAX_DRAWS>,
 };
 
 @group(0) @binding(0) var<uniform> v: View;

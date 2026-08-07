@@ -2101,28 +2101,43 @@ mod tests {
         let mut h = History::default();
         let room = stack.room();
 
-        // A full document: 64 layers each with a mask, which is 128 slices and
-        // exactly the documented maximum.
-        while stack.len() < LayerStack::MAX {
-            stack.add().expect("room for 64 layers");
+        // Claim every slice but the last, parking each one in the history as
+        // we go so nothing comes back. Written against `MAX_SLOTS` rather than
+        // as "64 layers each with a mask": that was 128 slices and exactly the
+        // ceiling until the effect-draw headroom was added to `MAX_SLOTS`, and
+        // a live stack cannot reach 256 slices out of layers and masks alone.
+        // What the test needs is the *top of the range held live*, and this
+        // reaches it however the ceiling is later set.
+        //
+        // Counted rather than a bare `while`, for the reason the loop above is:
+        // an eviction giving a parked slice back would otherwise be a hang
+        // instead of a failed assertion.
+        for _ in 0..LayerStack::MAX_SLOTS {
+            if stack.slot_capacity_needed() >= LayerStack::MAX_SLOTS - 1 {
+                break;
+            }
+            stack.add().expect("room below the ceiling");
+            let before = stack.shape(SLICE_BYTES);
+            let gone = stack
+                .remove_many(&[stack.active_index()])
+                .expect("the bottom layer stays");
+            h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
         }
-        for i in 0..stack.len() {
-            stack.add_mask(i).expect("room for 64 masks");
-        }
-        assert_eq!(stack.slot_capacity_needed(), LayerStack::MAX_SLOTS - 1);
+        assert_eq!(
+            stack.slot_capacity_needed(),
+            LayerStack::MAX_SLOTS - 1,
+            "the fixture did not fill the pool"
+        );
 
         // A patch or two of ordinary history, to be destroyed.
         h.record(Edit::new(EditKind::Paint, patch(4, 4, 1)));
         h.record(Edit::new(EditKind::Paint, patch(4, 4, 2)));
         let held = h.len();
 
-        // Delete one layer and add another. The deleted one parks its two
-        // slices, so the new layer cannot have them and takes the last number
-        // in the range — which a *live* layer now holds, for good.
-        let before = stack.shape(SLICE_BYTES);
-        let gone = stack.remove_many(&[5]).expect("the other 63 stay");
-        h.record(Edit::new(EditKind::DeleteLayer, before.with_removed(gone)));
-        stack.add().expect("a slice above the parked pair");
+        // The last number in the range, taken by a *live* layer, for good: the
+        // parked slices below it can all be given back and the tail still
+        // cannot compact past this one.
+        stack.add().expect("the last slice above the parked ones");
 
         assert!(
             !room.has_headroom(),
