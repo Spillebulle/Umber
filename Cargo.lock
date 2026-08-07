@@ -3070,6 +3070,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "log",
+ "png",
  "pollster 1.0.1",
  "umber-core",
  "wgpu",

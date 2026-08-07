@@ -15,3 +15,8 @@ log = { workspace = true }
 
 [dev-dependencies]
 pollster = { workspace = true }
+# `examples/measure-effects.rs` writes the pictures that settle how a layer
+# effect's stroke gets its distance. The same crate `umber-core` already uses
+# for export, so this adds nothing to the tree, and it is a dev-dependency
+# because nothing shipped in `umber-render` writes a file.
+png = { workspace = true }
