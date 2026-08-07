@@ -1445,20 +1445,31 @@ enum Pipe {
 /// 0.83w at 1.25, and about 1.0w at 1.1. `pictures::draw` sweeps it rather
 /// than trusting that.
 ///
-/// The floor is `w/2 + 1` and not `w/2`: at exactly the support the contour
-/// sits where the field is identically zero and the stroke has no outer edge to
-/// antialias.
+/// The floor is `ceil(w/2)`, which is the smallest `r` with `2r + 1 > w`. Right
+/// at it the contour sits in the last texel of the kernel's support, where the
+/// field is a few thousandths and about to be nothing at all; the sweep runs
+/// down to it deliberately, because that is where the arithmetic says the
+/// corner comes out exact and it is worth seeing whether anything else breaks
+/// on the way.
 fn blur_radius_for(width: u32, factor: f32) -> i32 {
-    let floor = (width as f32 / 2.0).ceil() as i32 + 1;
-    ((width as f32 * factor).round() as i32).max(floor)
+    let floor = (width as f32 / 2.0).ceil() as i32;
+    ((width as f32 * factor).round() as i32).max(floor).max(1)
 }
 
 /// The factor the timed columns and the headline pictures use.
 ///
-/// Chosen off the sweep `pictures::draw` prints: it is the tightest kernel that
-/// still resolves, which is both the best the method does on shape and the
-/// cheapest it runs.
-const BLUR_FACTOR: f32 = 0.6;
+/// **Chosen off the sweep, and it is a minimum rather than an end of the
+/// range** — which matters, because "the tightest setting" would be a
+/// suspicious answer and this is not it. Below about `h = 1.1w` the corner
+/// stops being cut and starts *bulging*: at `h = 1.02w` a 64 px stroke puts a
+/// right angle 78.7 px out where a disc puts it at 64. 0.55 lands on `h/w` of
+/// 1.11 to 1.15 across 8, 20 and 64 px, and at every one of those it is the
+/// smallest mean difference from the flood the sweep finds.
+///
+/// It is also the cheapest useful setting, since a box pass is `2r + 1` taps —
+/// so the method is timed at its best rather than at its worst, which is the
+/// only way the cost column means anything.
+const BLUR_FACTOR: f32 = 0.55;
 
 fn cfg_blur(size: u32, radius: i32, axis: u32) -> Cfg {
     Cfg {
@@ -2257,9 +2268,10 @@ mod pictures {
 
     /// Kernel widths swept, as a multiple of the stroke's own width.
     ///
-    /// The floor `blur_radius_for` enforces is about 0.5, so 0.6 is nearly as
-    /// tight as the method can be run and 2.0 is a generously smooth setting.
-    const FACTORS: [f32; 6] = [0.6, 0.7, 0.85, 1.0, 1.5, 2.0];
+    /// 0.5 is the floor `blur_radius_for` enforces and 2.0 is a generously
+    /// smooth setting; the bottom of the range is sampled finely because that
+    /// is where the answer moves fastest.
+    const FACTORS: [f32; 8] = [0.5, 0.55, 0.6, 0.7, 0.85, 1.0, 1.5, 2.0];
 
     /// What blur-and-threshold does across the one setting that decides it.
     ///
