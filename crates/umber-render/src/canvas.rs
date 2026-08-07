@@ -5673,18 +5673,27 @@ mod tests {
     /// binding a device Umber will run on has to offer.
     #[test]
     fn the_view_uniform_fits_the_smallest_binding_a_device_must_offer() {
-        let size = std::mem::size_of::<ViewUniforms>();
-        // 112 bytes of head, then two `MAX_DRAWS`-long arrays of `vec4<f32>`.
-        assert_eq!(size, 112 + MAX_DRAWS * 32);
-        assert_eq!(size, 6256);
-        // `vec4<f32>` is 16-aligned in WGSL, and so is the struct. If the head
-        // ever stops being a multiple of 16 the shader inserts padding the
-        // `#[repr(C)]` side does not, and the buffer comes out short.
+        // The head is **measured**, not restated. `112 % 16 == 0` written as a
+        // literal is a tautology that cannot fail; what has to be true is that
+        // the offset Rust actually gives `layers` is 16-aligned, because WGSL
+        // aligns an `array<vec4<f32>>` to 16 and would insert padding there
+        // that `#[repr(C)]` does not — leaving the buffer short by however
+        // much, and every draw after the gap reading the wrong entry.
+        let head = std::mem::offset_of!(ViewUniforms, layers);
+        assert_eq!(head, 112, "the scalar head of the block changed size");
+        assert_eq!(head % 16, 0, "WGSL would pad where Rust does not");
         assert_eq!(
-            112 % 16,
-            0,
-            "the arrays would not start where Rust puts them"
+            std::mem::offset_of!(ViewUniforms, extra),
+            head + MAX_DRAWS * 16,
+            "the two arrays are not back to back"
         );
+
+        let size = std::mem::size_of::<ViewUniforms>();
+        assert_eq!(size, head + MAX_DRAWS * 32);
+        assert_eq!(size, 6256, "the figure in the doc comment is stale");
+        // The struct's own alignment in WGSL is 16, so its size rounds up to a
+        // multiple of it. Rust's is 4, and a mismatch here would be tail
+        // padding on one side only.
         assert_eq!(size % 16, 0);
 
         // `Gpu::new` asks for `downlevel_defaults`, and `using_resolution`
