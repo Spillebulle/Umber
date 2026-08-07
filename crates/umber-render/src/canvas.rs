@@ -79,9 +79,14 @@ const MAX_LAYERS: usize = 64;
 const MAX_DRAWS: usize = 192;
 
 /// Every stack entry produces at least one draw, so the draw array can never be
-/// the shorter of the two. A compile-time assertion rather than a test, because
-/// [`MAX_SLOTS`] below subtracts one from the other and would underflow — which
-/// on a `usize` is a panic in debug and a colossal texture array in release.
+/// the shorter of the two.
+///
+/// A compile-time assertion rather than a test, and not because the failure
+/// would otherwise be silent — [`MAX_SLOTS`] below subtracts one from the
+/// other, and a `usize` underflow in a const context is already a hard compile
+/// error. It is here because that error names an arithmetic overflow in an
+/// expression, which says nothing about *which* of two capacities was set
+/// wrong. This one fails first and says so.
 const _: () = assert!(MAX_DRAWS >= MAX_LAYERS);
 
 /// How deep the layer texture array may grow.
