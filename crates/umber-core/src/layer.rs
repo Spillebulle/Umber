@@ -103,6 +103,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
+use crate::effect::{self, Effect, EffectKind};
 
 /// The slices of one document's layer array: which are in use, and which
 /// number the next one would take.
@@ -417,6 +418,21 @@ pub struct Layer {
     /// Slice holding this layer's mask, when it has one. Another slot of the
     /// same array — see the module docs.
     mask: Option<SlotClaim>,
+    /// Non-destructive marks derived from this layer's own alpha — a stroke, a
+    /// drop shadow. See [`crate::effect`] and `docs/layer-effects.md`.
+    ///
+    /// **Private, and written only through [`LayerStack::set_effect`] and
+    /// [`LayerStack::remove_effect`]**, because it carries two invariants no
+    /// caller should have to remember: at most one effect per kind, and always
+    /// in composite order. A `pub` field is one `push` away from a layer wearing
+    /// two drop shadows and a draw list in an order nobody chose — and the cap
+    /// in [`effect::MAX_ENABLED`] is a property of the *document*, which a layer
+    /// cannot see, so the gate could not live here even if the field were
+    /// public.
+    ///
+    /// Empty for every layer that has none, which is nearly all of them, and an
+    /// empty `Vec` allocates nothing.
+    effects: Vec<Effect>,
 }
 
 impl Layer {
@@ -444,6 +460,42 @@ impl Layer {
         self.mask.is_some()
     }
 
+    /// This layer's effects, **already in composite order**, bottom to top.
+    ///
+    /// Read-only: see the field for why there is no `effects_mut`. Enabled and
+    /// disabled alike, because the panel draws a row for both.
+    pub fn effects(&self) -> &[Effect] {
+        &self.effects
+    }
+
+    /// This layer's effect of `kind`, if it has one.
+    pub fn effect(&self, kind: EffectKind) -> Option<&Effect> {
+        self.effects.iter().find(|e| e.kind == kind)
+    }
+
+    /// How many of this layer's effects would produce a draw.
+    ///
+    /// The unit [`effect::MAX_ENABLED`] is counted in, which is why it is the
+    /// layer's own arithmetic rather than something the stack open-codes.
+    pub fn enabled_effect_count(&self) -> usize {
+        self.effects.iter().filter(|e| e.enabled).count()
+    }
+
+    /// The enabled effects that composite **under** this layer, bottom to top.
+    ///
+    /// Nothing reads this yet — stage 0 emits no draws — and it is here because
+    /// it is the half of `docs/layer-effects.md` §4 that is a rule rather than a
+    /// rendering, so it belongs where it can be tested without a device.
+    pub fn effects_below(&self) -> impl Iterator<Item = &Effect> {
+        self.effects.iter().filter(|e| e.enabled && e.is_outer())
+    }
+
+    /// The enabled effects that composite **over** this layer, bottom to top.
+    /// See [`Layer::effects_below`].
+    pub fn effects_above(&self) -> impl Iterator<Item = &Effect> {
+        self.effects.iter().filter(|e| e.enabled && e.is_inner())
+    }
+
     /// A fresh layer holding `slot`, with every flag at the value a layer
     /// nobody has touched has.
     ///
@@ -466,6 +518,7 @@ impl Layer {
             id,
             slot,
             mask: None,
+            effects: Vec::new(),
         }
     }
 
@@ -1081,6 +1134,134 @@ impl LayerStack {
     /// The mask slice of the selected layer, if it has one.
     pub fn active_mask(&self) -> Option<u32> {
         self.layers[self.active].mask()
+    }
+
+    /// How many effects in this document would produce a draw.
+    ///
+    /// What the panel reads to say a document is at its effects budget, and what
+    /// [`LayerStack::plan_set_effect`] counts against [`effect::MAX_ENABLED`].
+    pub fn enabled_effect_count(&self) -> usize {
+        self.layers.iter().map(Layer::enabled_effect_count).sum()
+    }
+
+    /// The effects the entry at `index` would then hold, in composite order, or
+    /// `None` where the change is refused.
+    ///
+    /// Shared by [`LayerStack::set_effect`] and [`LayerStack::can_set_effect`],
+    /// so a control cannot light up promising something the model will decline —
+    /// the arrangement `plan_group`/`can_group` and `plan_reorder`/`can_reorder`
+    /// already keep. Returning the whole vector rather than a verdict is what
+    /// makes "a refusal changes nothing at all" **structural**: the layer is not
+    /// touched until there is a plan to install, so there is no half-applied
+    /// state for a refusal to leave behind.
+    ///
+    /// Three refusals:
+    ///
+    /// * An index off the end.
+    /// * **A folder** (`docs/layer-effects.md` §9.5). A folder holds no slot and
+    ///   its contents composite in place, so there is no coverage to derive an
+    ///   effect from; the honest input is the group's composited result, and
+    ///   that does not exist until `docs/group-compositing.md` is built. The
+    ///   control is drawn and disabled with a tooltip saying so, which is the
+    ///   treatment a folder's blend and opacity already get.
+    /// * The document's effect budget, [`effect::MAX_ENABLED`]. Counted with the
+    ///   change applied, so replacing an enabled effect with another enabled one
+    ///   is free and switching a disabled one on is not.
+    ///
+    /// Deliberately **not** gated on the layer's lock. An effect's parameters
+    /// are a value on a layer with no pixels behind them, exactly as its opacity
+    /// is, and a layer's opacity is not lock-gated today either — see the lock's
+    /// list of gates in `CLAUDE.md`. Nor is it an undoable edit
+    /// (`docs/layer-effects.md` §7): no [`crate::EditKind`] variant, no
+    /// `history::VERSION` bump.
+    fn plan_set_effect(&self, index: usize, effect: Effect) -> Option<Vec<Effect>> {
+        let layer = self.layers.get(index)?;
+        if layer.folder {
+            return None;
+        }
+
+        // At most one per kind: whatever was there of this kind is replaced
+        // rather than joined.
+        let mut planned: Vec<Effect> = layer
+            .effects
+            .iter()
+            .copied()
+            .filter(|e| e.kind != effect.kind)
+            .collect();
+        planned.push(effect);
+        effect::sort_into_composite_order(&mut planned);
+
+        let elsewhere = self.enabled_effect_count() - layer.enabled_effect_count();
+        let here = planned.iter().filter(|e| e.enabled).count();
+        effect::within_budget(elsewhere + here).then_some(planned)
+    }
+
+    /// Would [`LayerStack::set_effect`] do it? See [`LayerStack::
+    /// plan_set_effect`] for the refusals.
+    pub fn can_set_effect(&self, index: usize, effect: Effect) -> bool {
+        self.plan_set_effect(index, effect).is_some()
+    }
+
+    /// Give the entry at `index` this effect, replacing whatever it held of the
+    /// same kind. `false` where it is refused.
+    pub fn set_effect(&mut self, index: usize, effect: Effect) -> bool {
+        match self.plan_set_effect(index, effect) {
+            Some(planned) => {
+                self.layers[index].effects = planned;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Switch an effect the entry at `index` already holds on or off.
+    ///
+    /// A read-modify-write through [`LayerStack::set_effect`] rather than beside
+    /// it, so switching one **on** meets the budget at the same gate everything
+    /// else does. `false` where the layer has no effect of that kind, or where
+    /// the gate refuses. Its `can_` twin is
+    /// [`LayerStack::can_set_effect_enabled`].
+    pub fn set_effect_enabled(&mut self, index: usize, kind: EffectKind, enabled: bool) -> bool {
+        match self.planned_toggle(index, kind, enabled) {
+            Some(effect) => self.set_effect(index, effect),
+            None => false,
+        }
+    }
+
+    /// Would [`LayerStack::set_effect_enabled`] do it?
+    pub fn can_set_effect_enabled(&self, index: usize, kind: EffectKind, enabled: bool) -> bool {
+        match self.planned_toggle(index, kind, enabled) {
+            Some(effect) => self.can_set_effect(index, effect),
+            None => false,
+        }
+    }
+
+    /// The effect a toggle would write, shared by the pair above so the button
+    /// and the operation read the same one.
+    fn planned_toggle(&self, index: usize, kind: EffectKind, enabled: bool) -> Option<Effect> {
+        let mut effect = *self.layers.get(index)?.effect(kind)?;
+        effect.enabled = enabled;
+        Some(effect)
+    }
+
+    /// Take an effect off the entry at `index`, handing it back.
+    ///
+    /// No `can_` beside it and no plan: a removal can only lower the enabled
+    /// count, so there is nothing for the budget to refuse, and it cannot leave
+    /// the remaining effects out of order because a subsequence of an ordered
+    /// list is ordered.
+    ///
+    /// **The slice the effect was baked into is freed rather than parked**
+    /// (`docs/layer-effects.md` §4.2), unlike a deleted layer's or a removed
+    /// mask's — no [`crate::PixelPatch`] can ever name it, because effect pixels
+    /// are derived, are never read back and are never captured into the undo
+    /// history. Nothing here holds one yet; the rule is recorded so that stage 1
+    /// does not reach for `SlotClaim` on the reasoning that everything else in
+    /// this file does.
+    pub fn remove_effect(&mut self, index: usize, kind: EffectKind) -> Option<Effect> {
+        let effects = &mut self.layers.get_mut(index)?.effects;
+        let at = effects.iter().position(|e| e.kind == kind)?;
+        Some(effects.remove(at))
     }
 
     /// Remove a layer, handing it over.
@@ -3277,5 +3458,295 @@ mod tests {
         );
         assert_eq!(s.subtree(1), 0..2);
         assert_eq!(s.subtree(3), 2..4);
+    }
+
+    // --- effects -----------------------------------------------------------
+
+    use crate::effect::OutlinePosition;
+
+    /// Every entry's effects, for the tests that have to say a refusal changed
+    /// **nothing at all** rather than nothing they happened to look at.
+    fn effects_of(stack: &LayerStack) -> Vec<Vec<Effect>> {
+        stack
+            .layers()
+            .iter()
+            .map(|l| l.effects().to_vec())
+            .collect()
+    }
+
+    fn inside_outline() -> Effect {
+        Effect {
+            position: OutlinePosition::Inside,
+            ..Effect::outline()
+        }
+    }
+
+    #[test]
+    fn a_fresh_layer_carries_no_effects() {
+        let s = LayerStack::new();
+        assert!(s.get(0).unwrap().effects().is_empty());
+        assert_eq!(s.enabled_effect_count(), 0);
+    }
+
+    /// The invariant is the stack's to keep, not the caller's: whichever order
+    /// they are handed over in, the layer holds them in the order they
+    /// composite.
+    #[test]
+    fn effects_land_in_composite_order_however_they_arrived() {
+        let mut s = LayerStack::new();
+        assert!(s.set_effect(0, inside_outline()));
+        assert!(s.set_effect(0, Effect::drop_shadow()));
+
+        let kinds: Vec<EffectKind> = s.get(0).unwrap().effects().iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [EffectKind::DropShadow, EffectKind::Outline]);
+
+        // And the split at the layer is what §4 says: the shadow under it, an
+        // inside outline over it.
+        let below: Vec<EffectKind> = s.get(0).unwrap().effects_below().map(|e| e.kind).collect();
+        let above: Vec<EffectKind> = s.get(0).unwrap().effects_above().map(|e| e.kind).collect();
+        assert_eq!(below, [EffectKind::DropShadow]);
+        assert_eq!(above, [EffectKind::Outline]);
+    }
+
+    /// Moving an outline from outside to inside moves its draw across the
+    /// layer, which is the one parameter that reorders the list — and the
+    /// reason the ordering cannot be established once when an effect is added.
+    #[test]
+    fn moving_an_outline_inside_moves_its_draw_over_the_layer() {
+        let mut s = LayerStack::new();
+        assert!(s.set_effect(0, Effect::outline()));
+        assert!(s.set_effect(0, Effect::drop_shadow()));
+        assert_eq!(s.get(0).unwrap().effects_above().count(), 0);
+
+        assert!(s.set_effect(0, inside_outline()));
+        let above: Vec<EffectKind> = s.get(0).unwrap().effects_above().map(|e| e.kind).collect();
+        assert_eq!(above, [EffectKind::Outline]);
+        assert_eq!(s.get(0).unwrap().effects().len(), 2, "still one of each");
+    }
+
+    #[test]
+    fn a_layer_holds_at_most_one_effect_of_each_kind() {
+        let mut s = LayerStack::new();
+        assert!(s.set_effect(0, Effect::drop_shadow()));
+        let mut second = Effect::drop_shadow();
+        second.distance = 42.0;
+        assert!(s.set_effect(0, second));
+
+        assert_eq!(s.get(0).unwrap().effects(), [second]);
+        assert_eq!(s.enabled_effect_count(), 1);
+    }
+
+    /// `docs/layer-effects.md` §9.5: a folder holds no slot and its contents
+    /// composite in place, so there is no coverage to derive an effect from
+    /// until group compositing exists.
+    #[test]
+    fn a_folder_is_refused_an_effect_and_the_refusal_changes_nothing() {
+        let mut s = LayerStack::new();
+        s.add();
+        assert_eq!(s.group(&[0]), Some(1));
+        assert!(s.get(1).unwrap().is_folder());
+        assert!(
+            s.set_effect(2, Effect::drop_shadow()),
+            "the layer above it is fine"
+        );
+
+        let before = effects_of(&s);
+        assert!(!s.can_set_effect(1, Effect::drop_shadow()));
+        assert!(!s.set_effect(1, Effect::drop_shadow()));
+        assert!(!s.can_set_effect_enabled(1, EffectKind::DropShadow, true));
+        assert_eq!(effects_of(&s), before);
+        assert_eq!(s.enabled_effect_count(), 1);
+    }
+
+    #[test]
+    fn an_index_off_the_end_is_refused_an_effect() {
+        let mut s = LayerStack::new();
+        let before = effects_of(&s);
+        assert!(!s.can_set_effect(9, Effect::outline()));
+        assert!(!s.set_effect(9, Effect::outline()));
+        assert_eq!(s.remove_effect(9, EffectKind::Outline), None);
+        assert_eq!(effects_of(&s), before);
+    }
+
+    /// **The budget is exactly reachable and never exceeded, today.**
+    ///
+    /// Two effect kinds, one of each per layer, [`LayerStack::MAX`] layers:
+    /// 64 × 2 is [`effect::MAX_ENABLED`] on the nose. So the refusal in
+    /// [`LayerStack::plan_set_effect`] cannot fire in any document the model
+    /// permits, and the test below has to build one it does not.
+    ///
+    /// This assertion is here so that the day a third kind arrives — an outer
+    /// glow, an inner shadow, a colour overlay — the build goes red and
+    /// whoever added it reads [`effect::MAX_ENABLED`] and
+    /// `docs/layer-effects.md` §6.2 rather than discovering the ceiling by
+    /// truncating somebody's draw list.
+    #[test]
+    fn the_effect_budget_is_exactly_reachable_and_no_more() {
+        assert_eq!(
+            LayerStack::MAX * EffectKind::ALL.len(),
+            effect::MAX_ENABLED,
+            "the effect budget is no longer exactly the reachable maximum; \
+             see docs/layer-effects.md §6.2 and the note on effect::MAX_ENABLED"
+        );
+
+        // And a full stack really does reach it, through the real gate.
+        let mut s = LayerStack::new();
+        while s.len() < LayerStack::MAX {
+            assert!(s.add().is_some());
+        }
+        for i in 0..s.len() {
+            assert!(s.set_effect(i, Effect::drop_shadow()), "layer {i}");
+            assert!(s.set_effect(i, Effect::outline()), "layer {i}");
+        }
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+    }
+
+    /// One past the budget is refused, and the refusal changes nothing at all.
+    ///
+    /// **The stack this builds is larger than [`LayerStack::MAX`] and that is
+    /// deliberate**, because the test above shows the cap is otherwise out of
+    /// reach: with two kinds a legal document tops out exactly at it. Rather
+    /// than let the guard be vacuous, this reaches past `add`'s bound through
+    /// `push_imported` — whose own bound is its caller's, `ImportedDocument::
+    /// validate` — to produce the one document shape that can ask for a 129th
+    /// draw. What it exercises is the arithmetic and the single exit
+    /// `plan_set_effect` refuses through, which is the same exit the folder and
+    /// the out-of-range cases take; it does not claim that the over-large stack
+    /// is a state Umber can otherwise be in.
+    #[test]
+    fn the_effect_budget_refuses_the_one_past_it_and_changes_nothing() {
+        let mut s = LayerStack::empty();
+        for i in 0..=effect::MAX_ENABLED {
+            s.push_imported(false, 0, format!("Layer {i}"));
+        }
+        assert_eq!(s.len(), effect::MAX_ENABLED + 1);
+
+        for i in 0..effect::MAX_ENABLED {
+            assert!(s.set_effect(i, Effect::drop_shadow()), "layer {i}");
+        }
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        let before = effects_of(&s);
+        let last = effect::MAX_ENABLED;
+        assert!(!s.can_set_effect(last, Effect::drop_shadow()));
+        assert!(!s.set_effect(last, Effect::drop_shadow()));
+        assert_eq!(effects_of(&s), before, "a refusal changed the stack");
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        // A *disabled* effect produces no draw, so it is not charged and it is
+        // not refused — and switching it on afterwards is.
+        let mut off = Effect::drop_shadow();
+        off.enabled = false;
+        assert!(s.set_effect(last, off));
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        let before = effects_of(&s);
+        assert!(!s.can_set_effect_enabled(last, EffectKind::DropShadow, true));
+        assert!(!s.set_effect_enabled(last, EffectKind::DropShadow, true));
+        assert_eq!(effects_of(&s), before);
+
+        // Give one back anywhere in the document and it fits.
+        assert_eq!(
+            s.remove_effect(0, EffectKind::DropShadow).map(|e| e.kind),
+            Some(EffectKind::DropShadow)
+        );
+        assert!(s.set_effect_enabled(last, EffectKind::DropShadow, true));
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+    }
+
+    /// Replacing an enabled effect with another enabled one is free, even at
+    /// the budget: the count does not move, so it must not be refused.
+    #[test]
+    fn editing_an_effect_at_the_budget_is_not_refused() {
+        let mut s = LayerStack::new();
+        while s.len() < LayerStack::MAX {
+            s.add();
+        }
+        for i in 0..s.len() {
+            s.set_effect(i, Effect::drop_shadow());
+            s.set_effect(i, Effect::outline());
+        }
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        let mut wider = Effect::outline();
+        wider.spread = 12.0;
+        assert!(s.can_set_effect(0, wider));
+        assert!(s.set_effect(0, wider));
+        assert_eq!(s.get(0).unwrap().effect(EffectKind::Outline), Some(&wider));
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+    }
+
+    #[test]
+    fn switching_an_effect_off_gives_its_draw_back_and_keeps_its_settings() {
+        let mut s = LayerStack::new();
+        let mut shadow = Effect::drop_shadow();
+        shadow.distance = 17.0;
+        assert!(s.set_effect(0, shadow));
+        assert_eq!(s.enabled_effect_count(), 1);
+
+        assert!(s.set_effect_enabled(0, EffectKind::DropShadow, false));
+        assert_eq!(s.enabled_effect_count(), 0);
+        assert_eq!(
+            s.get(0).unwrap().effects().len(),
+            1,
+            "the row is still there"
+        );
+        assert_eq!(
+            s.get(0)
+                .unwrap()
+                .effect(EffectKind::DropShadow)
+                .unwrap()
+                .distance,
+            17.0
+        );
+        assert_eq!(
+            s.get(0).unwrap().effects_below().count(),
+            0,
+            "and draws nothing"
+        );
+
+        assert!(s.set_effect_enabled(0, EffectKind::DropShadow, true));
+        assert_eq!(
+            s.get(0).unwrap().effect(EffectKind::DropShadow),
+            Some(&shadow)
+        );
+    }
+
+    #[test]
+    fn toggling_an_effect_a_layer_does_not_have_is_refused() {
+        let mut s = LayerStack::new();
+        assert!(!s.can_set_effect_enabled(0, EffectKind::Outline, false));
+        assert!(!s.set_effect_enabled(0, EffectKind::Outline, false));
+        assert!(s.get(0).unwrap().effects().is_empty());
+    }
+
+    #[test]
+    fn removing_an_effect_leaves_the_rest_in_order() {
+        let mut s = LayerStack::new();
+        s.set_effect(0, inside_outline());
+        s.set_effect(0, Effect::drop_shadow());
+
+        assert_eq!(
+            s.remove_effect(0, EffectKind::DropShadow).map(|e| e.kind),
+            Some(EffectKind::DropShadow)
+        );
+        assert_eq!(s.get(0).unwrap().effects(), [inside_outline()]);
+        assert_eq!(s.remove_effect(0, EffectKind::DropShadow), None);
+        assert_eq!(s.enabled_effect_count(), 1);
+    }
+
+    /// Effects belong to the layer, exactly as its slice and its mask do, so
+    /// reordering carries them — the property that makes them a field rather
+    /// than a table beside the stack keyed by something that moves.
+    #[test]
+    fn effects_follow_their_layer_through_a_reorder() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        s.set_effect(2, Effect::outline());
+        s.reorder(2, 0);
+        assert_eq!(s.get(0).unwrap().effects(), [Effect::outline()]);
+        assert!(s.get(1).unwrap().effects().is_empty());
+        assert!(s.get(2).unwrap().effects().is_empty());
     }
 }
