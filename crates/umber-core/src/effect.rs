@@ -78,30 +78,48 @@ use crate::layer::BlendMode;
 
 /// How many **enabled** effects one document may hold.
 ///
-/// `docs/layer-effects.md` §6.2's arithmetic: the composite's uniform array is
-/// to be sized at `MAX_DRAWS = 192` entries, `LayerStack::MAX` stays 64, and the
-/// difference is what is left for effect draws. Those two numbers live in
-/// `canvas.rs` and `composite.wgsl` and **all three have to agree** — a
+/// `docs/layer-effects.md` §6.3's arithmetic, and **the device's guarantee is
+/// what it starts from** rather than anything Umber chose:
+///
+/// ```text
+/// MAX_SLOTS         = 256                        // max_texture_array_layers
+/// MAX_EFFECT_SLICES = MAX_SLOTS − (MAX × 2 + 1)  // = 127
+/// MAX_DRAWS         = MAX + MAX_EFFECT_SLICES    // = 191
+/// ```
+///
+/// `downlevel_defaults()` inherits `max_texture_array_layers` from `defaults()`
+/// and `using_resolution` raises only the three texture *dimension* limits, so
+/// 256 is the ceiling and a 257th slice is a `create_texture` validation error —
+/// which `crash::device_error` makes fatal. An effect draw reads an effect slice
+/// one for one, which is why the draw budget can never exceed the slice budget.
+///
+/// **Written as a literal because this branch cannot see the other half yet.**
+/// `LayerStack::MAX_SLOTS` is still 129 here and `MAX_EFFECT_SLICES` is being
+/// added to that consts block on another branch; deriving from what this tree
+/// holds would give nonsense. In the merged tree the two are pinned together by
+/// a test, and `MAX_DRAWS` in `canvas.rs` and in `composite.wgsl` join them — a
 /// truncated draw list is the one outcome that must stay unreachable, because a
 /// list cut off mid-group leaves an accumulator open.
 ///
 /// A *disabled* effect costs nothing: it produces no draw, so it is not counted.
 ///
-/// **Nothing can reach this today and that is not an oversight.** There are two
-/// kinds and a layer holds at most one of each, so a full stack of 64 layers is
-/// exactly 128 enabled effects — the cap, met and never exceeded. It is written
-/// and enforced anyway, because the moment a third kind lands the ceiling is 192
-/// and the refusal is live; `the_effect_budget_is_exactly_reachable_and_no_more`
-/// fails the build at that point so that whoever adds the kind reads this.
+/// **The cap is live in an ordinary document.** Two kinds, one of each per
+/// layer, 64 layers: a full stack asks for 128 and the 128th is refused. It was
+/// 128 in the first draft of this module — from a `MAX_DRAWS` of 192 that the
+/// device could not have supplied — and at that figure nothing could reach it,
+/// because `64 × 2` was exactly the cap. The corrected number is one lower and
+/// that is the whole difference between a guard nothing exercises and a refusal
+/// somebody will meet.
 ///
-/// **`LayerStack::restore_shape` does not consult it, and that is the gap to
-/// close first when a third kind arrives.** Undoing a delete puts a layer back
-/// with the effects it left holding, and an undo cannot be refused — so the
-/// honest answer there is not a gate but a decision about what to do with the
-/// overflow, which is a question stage 2 has to answer with a control rather
-/// than one this file can answer with an `if`. Nothing else writes an effect
-/// except [`LayerStack::set_effect`], which is the gate.
-pub const MAX_ENABLED: usize = 128;
+/// **Exceeding it by *undo* is legal and is handled downstream.** The cap
+/// governs *adding* an effect; overflow is the draw path's, on §6.1's rule for
+/// the byte budget — the effect stays enabled and the document is said to be
+/// over its budget, rather than an effect silently vanishing.
+/// `LayerStack::restore_shape` therefore does **not** consult this and must not:
+/// an undo puts a deleted layer back with the effects it left holding, and an
+/// undo cannot be refused. [`LayerStack::set_effect`] is the gate, and it is the
+/// only thing that writes an effect.
+pub const MAX_ENABLED: usize = 127;
 
 /// Where the layer's own draw sits in `docs/layer-effects.md` §4's numbering.
 ///
@@ -112,8 +130,7 @@ pub const LAYER_RANK: u8 = 4;
 /// Is a document holding `enabled` enabled effects within its budget?
 ///
 /// A free function so that the boundary is a test rather than a sentence, for
-/// the reason `widgets::track_value` is one: the arithmetic is trivial and the
-/// case that matters is the one nothing can currently construct.
+/// the reason `widgets::track_value` is one.
 pub fn within_budget(enabled: usize) -> bool {
     enabled <= MAX_ENABLED
 }
@@ -433,10 +450,13 @@ mod linear_rgba {
 /// draw list anywhere near it. A stable sort on [`Effect::rank`], which is total
 /// over every subset because a rank is a function of the effect alone.
 ///
-/// Nothing outside this crate should have to call it: [`crate::Layer`] holds its
-/// effects in this order at all times, and that invariant is maintained at the
-/// one gate that writes them rather than by the callers.
-pub fn sort_into_composite_order(effects: &mut [Effect]) {
+/// `pub(crate)` rather than `pub`, and the visibility is the enforcement of the
+/// sentence rather than a decoration on it: [`crate::Layer`] holds its effects
+/// in this order at all times, so nothing outside can need it, and the wider
+/// visibility would grant something for nothing. What a consumer reads instead
+/// is `Layer::effects_below` and `Layer::effects_above`, which are already the
+/// split a draw list wants.
+pub(crate) fn sort_into_composite_order(effects: &mut [Effect]) {
     effects.sort_by_key(|e| e.rank());
 }
 

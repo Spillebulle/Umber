@@ -3583,102 +3583,96 @@ mod tests {
         assert_eq!(effects_of(&s), before);
     }
 
-    /// **The budget is exactly reachable and never exceeded, today.**
+    /// A stack of [`LayerStack::MAX`] layers, every effect switched on: as far
+    /// as the budget lets it go, and one short of what was asked for.
     ///
-    /// Two effect kinds, one of each per layer, [`LayerStack::MAX`] layers:
-    /// 64 × 2 is [`effect::MAX_ENABLED`] on the nose. So the refusal in
-    /// [`LayerStack::plan_set_effect`] cannot fire in any document the model
-    /// permits, and the test below has to build one it does not.
+    /// Shared by the tests below, which are all about what happens *at* the
+    /// budget and would otherwise each restate how to get there.
+    fn stack_at_the_budget() -> LayerStack {
+        let mut s = LayerStack::new();
+        while s.len() < LayerStack::MAX {
+            assert!(s.add().is_some(), "a fresh document holds MAX layers");
+        }
+        for i in 0..s.len() {
+            for effect in [Effect::drop_shadow(), Effect::outline()] {
+                s.set_effect(i, effect);
+            }
+        }
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+        s
+    }
+
+    /// **The budget is met by an ordinary document, and the next effect is
+    /// refused.**
     ///
-    /// This assertion is here so that the day a third kind arrives — an outer
-    /// glow, an inner shadow, a colour overlay — the build goes red and
-    /// whoever added it reads [`effect::MAX_ENABLED`] and
-    /// `docs/layer-effects.md` §6.2 rather than discovering the ceiling by
-    /// truncating somebody's draw list.
+    /// Two kinds, one of each per layer, 64 layers: 128 asked for against
+    /// [`effect::MAX_ENABLED`]'s 127, so exactly one is declined and it is the
+    /// last one attempted. No synthetic stack and nothing past
+    /// [`LayerStack::MAX`] — this is a document somebody could build.
     ///
-    /// **What it pins is the reachability, not §6.2's identity.** The budget's
-    /// own derivation is `MAX_DRAWS − LayerStack::MAX` — 192 − 64 — and it is a
-    /// coincidence of there being exactly two kinds that `64 × 2` is also 128.
-    /// The real identity cannot be pinned here at all, because `MAX_DRAWS` does
-    /// not exist yet; it belongs beside `canvas.rs`'s constant, with the third
-    /// statement in `composite.wgsl`, and that test is §11's and not this one.
+    /// **It could not always be written this way.** The budget was 128 in the
+    /// first draft, from a `MAX_DRAWS` of 192 the device could not have
+    /// supplied, and at that figure `64 × 2` *was* the cap: the refusal was
+    /// unreachable and this test had to reach past `add`'s bound through
+    /// `push_imported` to exercise it at all. §6.3's corrected derivation off
+    /// `max_texture_array_layers` — 256 slices, less the 129 layers and masks
+    /// and the float's spare — put it at 127, and one lower is the whole
+    /// difference between a guard nothing meets and a refusal somebody will.
     #[test]
-    fn the_effect_budget_is_exactly_reachable_and_no_more() {
-        assert_eq!(
-            LayerStack::MAX * EffectKind::ALL.len(),
-            effect::MAX_ENABLED,
-            "a full stack no longer reaches exactly the effect budget, so the \
-             refusal in `plan_set_effect` is now live in an ordinary document. \
-             Read effect::MAX_ENABLED and docs/layer-effects.md §6.2, check \
-             MAX_DRAWS - LayerStack::MAX still describes the budget, and check \
-             LayerStack::restore_shape, which does not consult it."
+    fn the_effect_budget_is_met_by_an_ordinary_document() {
+        assert!(
+            LayerStack::MAX * EffectKind::ALL.len() > effect::MAX_ENABLED,
+            "a full stack no longer asks for more than the budget, so every \
+             test below is vacuous. Read effect::MAX_ENABLED and \
+             docs/layer-effects.md §6.3."
         );
 
-        // And a full stack really does reach it, through the real gate.
         let mut s = LayerStack::new();
         while s.len() < LayerStack::MAX {
             assert!(s.add().is_some());
         }
+        let mut refused = Vec::new();
         for i in 0..s.len() {
-            assert!(s.set_effect(i, Effect::drop_shadow()), "layer {i}");
-            assert!(s.set_effect(i, Effect::outline()), "layer {i}");
+            for effect in [Effect::drop_shadow(), Effect::outline()] {
+                if !s.set_effect(i, effect) {
+                    refused.push((i, effect.kind));
+                }
+            }
         }
         assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+        assert_eq!(
+            refused,
+            [(LayerStack::MAX - 1, EffectKind::Outline)],
+            "exactly the last effect asked for is the one declined"
+        );
     }
 
-    /// One past the budget is refused, and the refusal changes nothing at all.
-    ///
-    /// **The stack this builds is larger than [`LayerStack::MAX`] and that is
-    /// deliberate**, because the test above shows the cap is otherwise out of
-    /// reach: with two kinds a legal document tops out exactly at it. Rather
-    /// than let the guard be vacuous, this reaches past `add`'s bound through
-    /// `push_imported` — whose own bound is its caller's, `ImportedDocument::
-    /// validate` — to produce the one document shape that can ask for a 129th
-    /// draw. What it exercises is the arithmetic and the single exit
-    /// `plan_set_effect` refuses through, which is the same exit the folder and
-    /// the out-of-range cases take; it does not claim that the over-large stack
-    /// is a state Umber can otherwise be in.
+    /// One past the budget is refused, and the refusal changes **nothing at
+    /// all** — the property [`LayerStack::plan_set_effect`] returning the
+    /// vector to install rather than a verdict is what makes structural.
     #[test]
     fn the_effect_budget_refuses_the_one_past_it_and_changes_nothing() {
-        // The stack this needs is one layer per effect plus one more, and each
-        // layer takes a slice. Stated rather than assumed, because the two
-        // numbers are unrelated and `push_imported`'s own `debug_assert` for
-        // running the pool dry names *imports*, which would be a baffling
-        // failure for a test about effects.
-        let wanted = effect::MAX_ENABLED + 1;
-        assert!(
-            wanted <= LayerStack::MAX_SLOTS as usize,
-            "this test needs a slice per layer; MAX_SLOTS is too small for it"
-        );
-
-        let mut s = LayerStack::empty();
-        for i in 0..wanted {
-            s.push_imported(false, 0, format!("Layer {i}"));
-        }
-        assert_eq!(s.len(), wanted);
-
-        for i in 0..effect::MAX_ENABLED {
-            assert!(s.set_effect(i, Effect::drop_shadow()), "layer {i}");
-        }
-        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+        let mut s = stack_at_the_budget();
+        // The one layer the budget left short of a full pair.
+        let last = LayerStack::MAX - 1;
+        assert_eq!(s.get(last).unwrap().effects().len(), 1);
 
         let before = effects_of(&s);
-        let last = effect::MAX_ENABLED;
-        assert!(!s.can_set_effect(last, Effect::drop_shadow()));
-        assert!(!s.set_effect(last, Effect::drop_shadow()));
+        assert!(!s.can_set_effect(last, Effect::outline()));
+        assert!(!s.set_effect(last, Effect::outline()));
         assert_eq!(effects_of(&s), before, "a refusal changed the stack");
         assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
 
         // A *disabled* effect produces no draw, so it is not charged and it is
         // not refused — and switching it on afterwards is.
-        let mut off = Effect::drop_shadow();
+        let mut off = Effect::outline();
         off.enabled = false;
         assert!(s.set_effect(last, off));
         assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
 
         let before = effects_of(&s);
-        assert!(!s.can_set_effect_enabled(last, EffectKind::DropShadow, true));
-        assert!(!s.set_effect_enabled(last, EffectKind::DropShadow, true));
+        assert!(!s.can_set_effect_enabled(last, EffectKind::Outline, true));
+        assert!(!s.set_effect_enabled(last, EffectKind::Outline, true));
         assert_eq!(effects_of(&s), before);
 
         // Give one back anywhere in the document and it fits.
@@ -3686,7 +3680,7 @@ mod tests {
             s.remove_effect(0, EffectKind::DropShadow).map(|e| e.kind),
             Some(EffectKind::DropShadow)
         );
-        assert!(s.set_effect_enabled(last, EffectKind::DropShadow, true));
+        assert!(s.set_effect_enabled(last, EffectKind::Outline, true));
         assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
     }
 
@@ -3694,15 +3688,7 @@ mod tests {
     /// the budget: the count does not move, so it must not be refused.
     #[test]
     fn editing_an_effect_at_the_budget_is_not_refused() {
-        let mut s = LayerStack::new();
-        while s.len() < LayerStack::MAX {
-            s.add();
-        }
-        for i in 0..s.len() {
-            s.set_effect(i, Effect::drop_shadow());
-            s.set_effect(i, Effect::outline());
-        }
-        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+        let mut s = stack_at_the_budget();
 
         let mut wider = Effect::outline();
         wider.spread = 12.0;
@@ -3710,6 +3696,37 @@ mod tests {
         assert!(s.set_effect(0, wider));
         assert_eq!(s.get(0).unwrap().effect(EffectKind::Outline), Some(&wider));
         assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+    }
+
+    /// An undo may take a document *over* the budget, and must.
+    ///
+    /// [`effect::MAX_ENABLED`] governs adding an effect; the overflow is the
+    /// draw path's, on `docs/layer-effects.md` §6.1's rule — the effect stays
+    /// enabled and the document is said to be over its budget. Refusing here
+    /// would mean an undo that silently dropped somebody's effects, which is
+    /// worse than either.
+    #[test]
+    fn undoing_a_delete_may_take_a_document_over_the_effect_budget() {
+        let mut s = stack_at_the_budget();
+        // Delete a layer carrying two effects, exactly as `app.rs` records it:
+        // the shape before, with what left folded in afterwards.
+        let before = s.shape(0);
+        let gone = s.remove(0).unwrap();
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED - 2);
+
+        // Two draws freed, so the layer the budget had left short can have its
+        // pair completed and there is still one to spare.
+        let last = s.len() - 1;
+        assert!(s.set_effect(last, Effect::outline()));
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED - 1);
+
+        s.restore_shape(before.with_removed(gone));
+        assert_eq!(
+            s.enabled_effect_count(),
+            effect::MAX_ENABLED + 1,
+            "an undo puts back what was deleted, budget or no budget"
+        );
+        assert!(!effect::within_budget(s.enabled_effect_count()));
     }
 
     #[test]
