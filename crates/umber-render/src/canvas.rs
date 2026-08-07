@@ -53,22 +53,131 @@ const STROKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// even the fastest flick can produce.
 const MAX_DABS_PER_FRAME: usize = 65_536;
 
-/// Mirrored by `MAX_LAYERS` in `composite.wgsl` and `LayerStack::MAX` in
-/// umber-core. All three must agree.
+/// Stack entries a document may hold. Mirrored by `LayerStack::MAX`.
+///
+/// It no longer sizes anything in `composite.wgsl` — see [`MAX_DRAWS`], which
+/// does. What it bounds is the *stack*: layers and folders, the thing the
+/// layers panel lists.
 const MAX_LAYERS: usize = 64;
 
-/// How deep the layer texture array may grow.
+/// How deep the layer texture array may grow — **and the number every other
+/// capacity in this block is derived from, because it is the only one that is
+/// not ours to pick.**
 ///
-/// **Not** [`MAX_LAYERS`], and the difference is the point: that one bounds
-/// *stack positions*, because it sizes a uniform array in `composite.wgsl`,
-/// while this one bounds *slices*, and a slice is a layer, a layer's mask, or
-/// the spare a floating transform previews into. Mirrored by
-/// `LayerStack::MAX_SLOTS`.
+/// A slice is a layer, a layer's mask, the spare a floating transform previews
+/// into, or one baked effect. Mirrored by `LayerStack::MAX_SLOTS`.
 ///
-/// Nothing is allocated up front by raising it — [`INITIAL_SLOTS`] is still
-/// four and growth still doubles — so a document with no masks pays nothing for
-/// the headroom.
-const MAX_SLOTS: usize = MAX_LAYERS * 2 + 1;
+/// `Gpu::new` requests `Limits::downlevel_defaults().using_resolution(…)`.
+/// `downlevel_defaults` names the three texture *dimensions*, four buffer and
+/// shader limits, and then falls through to `Limits::defaults()` — so
+/// `max_texture_array_layers` is **256**, and `using_resolution` copies only
+/// those three dimensions and cannot raise it. A 257th slice is a
+/// `create_texture` validation error, and a validation error reaches
+/// `crash::device_error`, which is fatal with a painting on screen.
+///
+/// `docs/layer-effects.md` §6.3 derived 257 — 64 layers, 64 masks, one float
+/// spare and 128 effects — without checking that. It is one over, which is
+/// exactly why nobody had looked: the previous ceiling of 129 sat 127 clear.
+/// The assertion below is therefore the load-bearing part of this block, not
+/// the comment.
+const MAX_SLOTS: usize = 256;
+
+/// **The ceiling is the device's, so it is read from the device's own limits
+/// rather than restated.**
+///
+/// `Limits::downlevel_defaults` is a `const fn`, which is what lets this be a
+/// compile error instead of a test. It has to be one: what it catches is not a
+/// red test run but `create_texture` failing validation inside
+/// [`CanvasRenderer::ensure_slots`], which goes through `on_uncaptured_error`
+/// and takes the process down.
+const _: () = assert!(
+    MAX_SLOTS <= wgpu::Limits::downlevel_defaults().max_texture_array_layers as usize,
+    "the layer array would be deeper than downlevel_defaults guarantees"
+);
+
+/// A full stack of masked layers and the float's spare must fit under the
+/// ceiling, or [`MAX_EFFECT_SLICES`] underflows.
+///
+/// The underflow would already be a compile error, since these are consts, and
+/// this does not claim to be reported first — both items are evaluated and
+/// rustc chooses. What it adds is a *message*, where an arithmetic-overflow
+/// diagnostic against an expression says nothing about which of two capacities
+/// was set wrong.
+///
+/// Written `* 2 <` rather than the `* 2 + 1 <=` the sentence above describes,
+/// because clippy's `int_plus_one` rejects the second spelling. They are the
+/// same predicate on integers; the `+ 1` is the float's spare.
+const _: () = assert!(
+    MAX_LAYERS * 2 < MAX_SLOTS,
+    "no room under the ceiling for a fully masked stack and a float"
+);
+
+/// What is left of [`MAX_SLOTS`] once every layer, every mask and the float's
+/// spare have their slice: **127**.
+///
+/// Derived rather than written down, so a change to [`MAX_LAYERS`] carries
+/// through instead of leaving numbers to be edited by hand. The float's spare
+/// is inside the subtraction and never gives way — a transform must always have
+/// somewhere to preview.
+///
+/// **Raising [`MAX_LAYERS`] *lowers* this, and lowers [`MAX_DRAWS`] with it.**
+/// The ceiling is fixed by the device, so every layer added takes two slices
+/// out of the effect budget: `MAX_DRAWS` is `MAX_SLOTS - MAX_LAYERS - 1`, which
+/// is 155 at a stack cap of 100 and **1** at 127. That is the opposite of what
+/// "derived" suggests and nothing fails when it happens — `MAX_DRAWS >=
+/// MAX_LAYERS` still holds everywhere the const assertion above allows. Anyone
+/// raising the stack cap has to decide whether the effect budget left is one
+/// worth having.
+///
+/// It also does not carry through to the shader, which holds `MAX_DRAWS` as a
+/// literal `191u`. That is a fourth number and it is changed by hand;
+/// `the_three_draw_capacities_agree` is what makes forgetting it a red test
+/// rather than a silent uniform mismatch.
+///
+/// **127 rather than 128 is also what makes the cap reachable**, which
+/// `docs/layer-effects.md` §6.3 records and is worth repeating where the number
+/// is: with two effect kinds and one of each per layer, 64 layers can enable at
+/// most 128, so against a budget of 128 the refusal sits exactly on the ceiling
+/// and can only be exercised by a stack the model forbids. Against 127 the last
+/// effect on a fully doubled stack is refused for real. **Re-check that when an
+/// effect kind is added** — the arithmetic moves and nothing here will say so.
+const MAX_EFFECT_SLICES: usize = effect_slices(MAX_LAYERS, MAX_SLOTS);
+
+/// Entries the composite pass's two uniform arrays carry, mirrored by
+/// `MAX_DRAWS` in `composite.wgsl`: **191**.
+///
+/// **A draw is not a stack entry**, which is why this is not [`MAX_LAYERS`].
+/// One layer composites as one draw today; a layer carrying effects composites
+/// as several, each with its own slot, opacity and blend mode, because a shadow
+/// at Multiply has to multiply against what is *under* the layer.
+/// `docs/layer-effects.md` §6.2 has the argument.
+///
+/// **It is `MAX_LAYERS + MAX_EFFECT_SLICES` and not a round number**, because
+/// an effect draw reads an effect *slice* — one draw, one slice — so the draw
+/// budget cannot exceed the slice budget. §6.2 says 192, which was derived from
+/// the 257 the ceiling refuses; a 192nd entry would be a draw with nowhere to
+/// read from.
+///
+/// The cost of raising it is uniform bytes and the upload, and nothing per
+/// fragment: the loop in `composite.wgsl` is bounded by `layer_count`. The
+/// bytes are counted in [`ViewUniforms`].
+const MAX_DRAWS: usize = MAX_LAYERS + MAX_EFFECT_SLICES;
+
+/// Slices left for effects once a stack of `layers`, all masked, and the
+/// float's spare have theirs, under a ceiling of `ceiling`.
+///
+/// **A `const fn` rather than an expression inline in [`MAX_EFFECT_SLICES`],
+/// and that is what makes the derivation testable at all.** A test that
+/// recomputes `ceiling - (layers * 2 + 1)` for itself and then asserts
+/// `layers * 2 + 1 + that == ceiling` has written `a - b + b == a`, which holds
+/// for every function body there is — that was the second draft of
+/// `the_slice_ceiling_agrees_with_umber_core` and it tested nothing. Calling
+/// *this* turns the same assertion into a statement about the rule: a body
+/// correct at 64 and wrong elsewhere fails it, which was checked by writing
+/// one.
+const fn effect_slices(layers: usize, ceiling: usize) -> usize {
+    ceiling - (layers * 2 + 1)
+}
 
 /// Texture-array slices allocated up front. Growth doubles this, so a typical
 /// document never pays for a copy.
@@ -924,6 +1033,19 @@ impl DabUniforms {
     }
 }
 
+/// Mirrors `View` in `composite.wgsl`, byte for byte.
+///
+/// The arithmetic, because it is the one uniform here large enough for the
+/// answer to be in doubt. Four `vec2<f32>` (32) + three `vec4<f32>` (48) +
+/// eight scalars (32) = **112 bytes** of head, which is 16-aligned, so
+/// `layers` starts there with no padding inserted. Each array is
+/// `MAX_DRAWS × 16`, so the whole block is `112 + 2 × 191 × 16` = **6224
+/// bytes**, against `downlevel_defaults`' `max_uniform_buffer_binding_size` of
+/// 16 KiB. `the_view_uniform_fits_the_smallest_binding_a_device_must_offer`
+/// measures all of it rather than trusting the sum written here.
+///
+/// It was 2160 bytes while the arrays held 64; the growth is the effect-draw
+/// budget and is paid in bytes uploaded per frame, not per fragment.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ViewUniforms {
@@ -949,11 +1071,11 @@ struct ViewUniforms {
     /// place of the padding word that was here, so the block is the size it
     /// always was — see the WGSL struct.
     stroke_blend: u32,
-    /// (opacity, blend, slot, visible) per stack position.
-    layers: [[f32; 4]; MAX_LAYERS],
-    /// (mask slot, has mask, clipped, unused) per stack position. See the WGSL
-    /// struct for why this is a second array rather than bits in the first.
-    extra: [[f32; 4]; MAX_LAYERS],
+    /// (opacity, blend, slot, visible) per draw.
+    layers: [[f32; 4]; MAX_DRAWS],
+    /// (mask slot, has mask, clipped, unused) per draw. See the WGSL struct for
+    /// why this is a second array rather than bits in the first.
+    extra: [[f32; 4]; MAX_DRAWS],
 }
 
 /// Mirrors `Xf` in `transform.wgsl`. Every member is a `vec2<f32>`, which is
@@ -1270,9 +1392,12 @@ pub struct CanvasRenderer {
     /// "an invariant enforced at five call sites is one that will be forgotten
     /// at the sixth" written out in advance.
     ///
-    /// Indexed by slot, and long enough for [`MAX_SLOTS`] from the start: it is
-    /// half a kilobyte, and growing it in step with the texture array would be
-    /// a second place for the capacity to be got wrong.
+    /// Indexed by slot, and long enough for [`MAX_SLOTS`] from the start:
+    /// growing it in step with the texture array would be a second place for
+    /// the capacity to be got wrong. Two kilobytes — 256 `u64` is 2,048 bytes.
+    /// This used to say "half a kilobyte", which was wrong by a factor of two
+    /// at 129 slots as well; the figure is worth stating only because it is
+    /// what makes allocating the whole thing up front obviously cheap.
     slot_revisions: Vec<u64>,
     /// The thumbnail being read back, if any. See [`ThumbJob`].
     thumb: Option<ThumbJob>,
@@ -1980,7 +2105,22 @@ impl CanvasRenderer {
     /// Growth reallocates the array and copies every existing slice, so it
     /// doubles rather than growing by one — a document that reaches eight
     /// layers pays for two copies, not eight.
+    ///
+    /// **The `.min` below fails open and the assertion is what stops it.**
+    /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
+    /// growth line naming it, and returns as though it had done what it was
+    /// asked — after which every slot at or above the ceiling indexes off the
+    /// end of the array. It is unreachable today, because `SlotPool` hands out
+    /// at most slot 255 and `begin_float` refuses at the ceiling; but this
+    /// clamp is the *only* thing standing between those two guarantees and
+    /// silently wrong pixels, and `LayerStack::MAX_SLOTS` lives in a different
+    /// crate, where it can be raised on its own with only one test in this one
+    /// to notice. A named failure is worth the debug build's comparison.
     pub fn ensure_slots(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
+        debug_assert!(
+            needed <= MAX_SLOTS as u32,
+            "asked for {needed} slices against a ceiling of {MAX_SLOTS}"
+        );
         if needed <= self.layers.capacity {
             return;
         }
@@ -2567,9 +2707,12 @@ impl CanvasRenderer {
         // the input path uses — if they disagree, strokes land off the cursor.
         let offset = params.camera.center - params.pivot * scale;
 
-        let mut packed = [[0.0f32; 4]; MAX_LAYERS];
-        let mut extra = [[0.0f32; 4]; MAX_LAYERS];
-        let count = params.layers.len().min(MAX_LAYERS);
+        // Against [`MAX_DRAWS`], not [`MAX_LAYERS`]: `params.layers` is the
+        // *draw* list the app flattened folders out of, which a layer's effects
+        // will each add an entry to.
+        let mut packed = [[0.0f32; 4]; MAX_DRAWS];
+        let mut extra = [[0.0f32; 4]; MAX_DRAWS];
+        let count = params.layers.len().min(MAX_DRAWS);
         for ((dst, ext), src) in packed
             .iter_mut()
             .zip(extra.iter_mut())
@@ -3261,10 +3404,10 @@ impl CanvasRenderer {
         self.end_float();
         // Against [`MAX_SLOTS`], not [`MAX_LAYERS`]: `reserved` counts *slices*
         // — a layer, a layer's mask — and the array holds twice the stack's
-        // positions plus one. That `+ 1` is this preview's spare. Comparing
-        // against 64 refused every document past its 64th slice: 33 masked
-        // layers could not be transformed at all, with 63 slices free, under a
-        // notice that said Umber had run out.
+        // entries, plus one, plus the effect-draw headroom. That `+ 1` is this
+        // preview's spare. Comparing against 64 refused every document past its
+        // 64th slice: 33 masked layers could not be transformed at all, with 63
+        // slices free, under a notice that said Umber had run out.
         //
         // **This is reachable**, and used not to be. `reserved` is one past the
         // highest slice *claimed*, and structural undo parks a deleted layer's
@@ -3272,7 +3415,10 @@ impl CanvasRenderer {
         // the range. The caller gives entries up before asking; `App::
         // free_headroom` is that release, and it declines to spend the history
         // where the live stack itself reaches the ceiling, because no eviction
-        // can help there. 64 layers each with a mask is that state.
+        // can help there. That state needs a live layer holding a slot *number*
+        // at the top of the range, which parking puts it there; it is not "64
+        // layers each with a mask", which is 128 slices and has never reached
+        // any ceiling this constant has had.
         if reserved as usize >= MAX_SLOTS {
             log::error!("no room for a transform preview beside {reserved} layer slices");
             return None;
@@ -5550,6 +5696,181 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `MAX_DRAWS` the shader compiles, as an integer.
+    ///
+    /// Parsed out of the WGSL text because that is the only way to read it: the
+    /// shader is a string until naga sees it, so nothing in Rust can name the
+    /// constant. Deliberately strict about the shape of the line — a parse that
+    /// quietly failed and answered a default would be a guard that agrees with
+    /// whatever it is compared against.
+    fn shader_max_draws() -> usize {
+        const NEEDLE: &str = "const MAX_DRAWS: u32 = ";
+        let at = COMPOSITE_WGSL
+            .find(NEEDLE)
+            .expect("composite.wgsl no longer declares `const MAX_DRAWS: u32 = ...`");
+        let rest = &COMPOSITE_WGSL[at + NEEDLE.len()..];
+        let end = rest
+            .find("u;")
+            .expect("`MAX_DRAWS` is no longer a `u32` literal ending in `u;`");
+        rest[..end]
+            .trim()
+            .parse()
+            .expect("`MAX_DRAWS` is not a plain decimal literal")
+    }
+
+    /// The shader text alone. **Not** [`COMPOSITE_SHADER`], which has
+    /// `blend.wgsl` concatenated in front of it — the needles below want the
+    /// one file the constant and the arrays are declared in.
+    const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
+
+    /// Every length the shader declares a `vec4<f32>` array at.
+    ///
+    /// **Reading the constant is not enough**, and this is the gap the first
+    /// draft had. `shader_max_draws` proves what `MAX_DRAWS` *is*, not that the
+    /// arrays use it: leave the constant at 191 and write
+    /// `array<vec4<f32>, 64>` and the WGSL struct is 2160 bytes against a
+    /// 6224-byte buffer. That direction **passes validation** — a binding may
+    /// be larger than the struct — and the composite then reads `extra` as
+    /// `layers` for every draw past the 63rd. The reverse fails loudly, which
+    /// is why only this one needed catching.
+    fn shader_array_lengths() -> Vec<&'static str> {
+        const OPEN: &str = "array<vec4<f32>, ";
+        COMPOSITE_WGSL
+            .match_indices(OPEN)
+            .map(|(at, _)| {
+                let rest = &COMPOSITE_WGSL[at + OPEN.len()..];
+                let end = rest.find('>').expect("an unterminated array type");
+                rest[..end].trim()
+            })
+            .collect()
+    }
+
+    /// **Three numbers have to agree, and this is what says so.**
+    ///
+    /// `LayerStack::MAX` bounds stack entries; [`MAX_DRAWS`] here and
+    /// `MAX_DRAWS` in `composite.wgsl` size the composite pass's two uniform
+    /// arrays, and must be the same or the Rust struct and the WGSL one stop
+    /// matching byte for byte. There used to be two, all equal; a layer's
+    /// effects each composite as a draw of their own, so the stack cap and the
+    /// draw cap are now different quantities. A later change to any one of the
+    /// three is exactly the kind of thing that breaks in silence.
+    #[test]
+    fn the_three_draw_capacities_agree() {
+        assert_eq!(
+            MAX_LAYERS,
+            umber_core::LayerStack::MAX,
+            "the stack cap here and in umber-core have drifted"
+        );
+        assert_eq!(
+            MAX_DRAWS,
+            shader_max_draws(),
+            "MAX_DRAWS in canvas.rs and composite.wgsl have drifted"
+        );
+
+        // And that the arrays are declared at it, not merely that the constant
+        // holds it. See `shader_array_lengths` for the failure this catches.
+        let lengths = shader_array_lengths();
+        assert_eq!(
+            lengths.len(),
+            2,
+            "composite.wgsl no longer declares exactly two vec4 arrays: {lengths:?}"
+        );
+        for len in lengths {
+            assert_eq!(
+                len, "MAX_DRAWS",
+                "a uniform array is sized by something other than MAX_DRAWS"
+            );
+        }
+    }
+
+    /// The one number here that is not ours, and the two that come out of it.
+    ///
+    /// **The derivation is what is tested, at inputs other than the shipped
+    /// ones, and it is tested by *calling* it.** Asserting `MAX_SLOTS ==
+    /// MAX_LAYERS * 2 + 1 + (MAX_DRAWS - MAX_LAYERS)` is a copy of the formula
+    /// and cannot fail when the formula is wrong. Nor is it enough to recompute
+    /// the subtraction in the test and check it against itself: `a - b + b ==
+    /// a` holds whatever [`effect_slices`] does. Both drafts of this test made
+    /// one of those two mistakes. What runs below is the real
+    /// [`effect_slices`] and [`draws`], and the claims are about *them*.
+    #[test]
+    fn the_slice_ceiling_agrees_with_umber_core() {
+        assert_eq!(MAX_SLOTS as u32, umber_core::LayerStack::MAX_SLOTS);
+        assert_eq!(MAX_LAYERS, umber_core::LayerStack::MAX);
+
+        // The shipped constants really are what the derivation answers, so
+        // everything proved about the functions is proved about them.
+        assert_eq!(MAX_EFFECT_SLICES, effect_slices(MAX_LAYERS, MAX_SLOTS));
+        assert_eq!(MAX_DRAWS - MAX_LAYERS, MAX_EFFECT_SLICES);
+        assert_eq!(MAX_EFFECT_SLICES, 127);
+        assert_eq!(MAX_DRAWS, 191);
+
+        // The ceiling is fixed by the device, so it is the one input that does
+        // not vary. `MAX_LAYERS` is ours and may move, which is the whole
+        // reason these are functions.
+        for layers in [1usize, 8, 32, 64, 100, 127] {
+            let effects = effect_slices(layers, MAX_SLOTS);
+            // One draw per layer and one per effect slice, which is how
+            // `MAX_DRAWS` is built.
+            let total = layers + effects;
+
+            // Every slice is spoken for exactly once: a layer, a mask, the
+            // float's spare, or an effect. Drop the `+ 1` from
+            // `effect_slices` and this is the assertion that goes red — and so
+            // does a body that is right at 64 and wrong at 1, which is the
+            // mutation this loop exists for.
+            assert_eq!(layers * 2 + 1 + effects, MAX_SLOTS, "{layers} layers");
+            // The draw list can never outrun the array it draws from, which is
+            // the promise 192 broke.
+            assert!(total <= MAX_SLOTS, "{layers} layers: {total} draws");
+        }
+
+        // Raising it allocates nothing: the array starts at `INITIAL_SLOTS` and
+        // `ensure_slots` doubles towards what is actually claimed.
+        assert!(INITIAL_SLOTS < MAX_SLOTS as u32);
+    }
+
+    /// The composite uniform is the one block here large enough for the
+    /// question to be worth asking, and raising [`MAX_DRAWS`] is what makes it
+    /// so. Both halves are checked: the size the arithmetic in
+    /// [`ViewUniforms`]' doc comment claims, and that it clears the smallest
+    /// binding a device Umber will run on has to offer.
+    #[test]
+    fn the_view_uniform_fits_the_smallest_binding_a_device_must_offer() {
+        // The head is **measured**, not restated. `112 % 16 == 0` written as a
+        // literal is a tautology that cannot fail; what has to be true is that
+        // the offset Rust actually gives `layers` is 16-aligned, because WGSL
+        // aligns an `array<vec4<f32>>` to 16 and would insert padding there
+        // that `#[repr(C)]` does not — leaving the buffer short by however
+        // much, and every draw after the gap reading the wrong entry.
+        let head = std::mem::offset_of!(ViewUniforms, layers);
+        assert_eq!(head, 112, "the scalar head of the block changed size");
+        assert_eq!(head % 16, 0, "WGSL would pad where Rust does not");
+        assert_eq!(
+            std::mem::offset_of!(ViewUniforms, extra),
+            head + MAX_DRAWS * 16,
+            "the two arrays are not back to back"
+        );
+
+        let size = std::mem::size_of::<ViewUniforms>();
+        assert_eq!(size, head + MAX_DRAWS * 32);
+        assert_eq!(size, 6224, "the figure in the doc comment is stale");
+        // The struct's own alignment in WGSL is 16, so its size rounds up to a
+        // multiple of it. Rust's is 4, and a mismatch here would be tail
+        // padding on one side only.
+        assert_eq!(size % 16, 0);
+
+        // `Gpu::new` asks for `downlevel_defaults`, and `using_resolution`
+        // raises only the texture dimensions, so this is the limit in force on
+        // every adapter Umber accepts.
+        let limit = wgpu::Limits::downlevel_defaults().max_uniform_buffer_binding_size as usize;
+        assert_eq!(limit, 16 << 10, "downlevel_defaults moved under us");
+        assert!(
+            size <= limit,
+            "the composite uniform is {size} bytes against a {limit}-byte binding limit"
+        );
+    }
 
     #[test]
     fn a_band_is_the_whole_document_when_it_fits() {

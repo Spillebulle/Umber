@@ -166,7 +166,7 @@ impl SlotPool {
     /// from — and every alternative is worse in a different direction: failing
     /// closed loses a slice for ever, and failing open once had
     /// `slot_capacity_needed` answering `MAX_SLOTS`, which would ask the
-    /// renderer for 129 canvas-sized slices.
+    /// renderer for 256 canvas-sized slices.
     fn locked(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
         pool.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -530,16 +530,23 @@ impl Default for LayerStack {
 }
 
 impl LayerStack {
-    /// Mirrored by `MAX_LAYERS` in `composite.wgsl`, which sizes a uniform
-    /// array. Raising it means raising both.
+    /// How many **stack entries** a document may hold, folders included.
     ///
-    /// It bounds **stack entries**, folders included, not the layers that hold
-    /// pixels. A pass-through folder reaches the shader as nothing at all — it
-    /// is flattened away in the app's `layer_draws` — so counting it here is
-    /// stricter than the array needs today. It is counted anyway, because a
-    /// folder that composites its contents as a group *will* occupy an entry in
-    /// that array, and a cap that had to be tightened later would shut documents
-    /// this build had already written.
+    /// Mirrored by `MAX_LAYERS` in `umber-render`'s `canvas.rs`. It no longer
+    /// sizes anything in `composite.wgsl`: that array is sized by `MAX_DRAWS`,
+    /// which is larger, because *a draw is not a stack entry* — a layer
+    /// carrying effects composites as several draws, each with its own slot,
+    /// opacity and blend mode. See `docs/layer-effects.md` §6.2, and
+    /// `the_three_draw_capacities_agree` in `canvas.rs`, which pins the three
+    /// numbers against each other.
+    ///
+    /// It bounds entries rather than the layers that hold pixels. A
+    /// pass-through folder reaches the shader as nothing at all — it is
+    /// flattened away in the app's `layer_draws` — so counting it here is
+    /// stricter than the draw array needs today. It is counted anyway, because
+    /// a folder that composites its contents as a group *will* occupy a draw,
+    /// and a cap that had to be tightened later would shut documents this build
+    /// had already written.
     pub const MAX: usize = 64;
 
     /// The deepest a folder may be nested: eight levels, 0 through 7.
@@ -551,13 +558,36 @@ impl LayerStack {
     pub const MAX_DEPTH: u8 = 7;
 
     /// Slices the renderer may have to allocate: one per layer, one per mask,
-    /// and one spare for a floating transform's preview.
+    /// one spare for a floating transform's preview, and one per effect draw.
     ///
-    /// Distinct from [`LayerStack::MAX`], which bounds *stack positions* and is
-    /// what sizes the uniform array in `composite.wgsl`. A mask occupies no
-    /// stack position, so the two numbers genuinely differ; conflating them
-    /// would have capped a document at 32 masked layers.
-    pub const MAX_SLOTS: u32 = Self::MAX as u32 * 2 + 1;
+    /// Distinct from [`LayerStack::MAX`], which bounds *stack entries*. A mask
+    /// occupies no stack entry, so the two numbers genuinely differ; conflating
+    /// them would have capped a document at 32 masked layers. The rest is the
+    /// effect-draw budget, because a baked effect is an ordinary slice of the
+    /// same array.
+    ///
+    /// **It is a flat 256 because that is a hardware guarantee, and everything
+    /// else is derived from it rather than the other way round.** `Gpu::new`
+    /// requests wgpu's `downlevel_defaults`, which leaves
+    /// `max_texture_array_layers` at 256; a 257th slice is a `create_texture`
+    /// validation error, and a validation error is fatal. So the ceiling is
+    /// the input: 64 layers, 64 masks and the float's spare take 129, and the
+    /// **127** left over are the effect budget — which is where
+    /// `umber-render`'s `MAX_DRAWS` of 191 comes from, since an effect draw
+    /// reads an effect slice. `docs/layer-effects.md` §6.3 asked for 257 and
+    /// 192 without checking the limit.
+    ///
+    /// `canvas.rs` carries the whole argument and a `const` assertion against
+    /// the limit, because that is where wgpu can be seen. `umber-core` may not
+    /// see it, which is exactly why the number is written out here rather than
+    /// derived — and why the two are pinned against each other by
+    /// `the_slice_ceiling_agrees_with_umber_core`.
+    ///
+    /// Nothing is allocated by raising it. `CanvasRenderer` starts at
+    /// `INITIAL_SLOTS` of four and `ensure_slots` doubles towards what the
+    /// stack actually claims, so a document with no masks and no effects pays
+    /// for the headroom in nothing but this pool's ceiling.
+    pub const MAX_SLOTS: u32 = 256;
 
     /// How many independent link groups a document may hold.
     ///
@@ -615,7 +645,7 @@ impl LayerStack {
             let slot = self.take_slot();
             // An import is bounded at [`LayerStack::MAX`] entries by
             // `ImportedDocument::validate`, so 64 layers and 64 masks is 128
-            // slices against [`LayerStack::MAX_SLOTS`]'s 129 and the pool cannot
+            // slices against [`LayerStack::MAX_SLOTS`]'s 256 and the pool cannot
             // run dry here. Nothing parks a slice during an import either — a
             // freshly opened document has no history. Said out loud because the
             // failure would be a layer with no slice and `folder` false, which
@@ -971,8 +1001,12 @@ impl LayerStack {
     /// is no however much undo history is given up, because the tail cannot be
     /// compacted past a slice a layer is holding — and a caller that spent the
     /// history finding that out would have destroyed an afternoon for nothing.
-    /// 64 layers each with a mask is exactly that state and is a legal
-    /// document.
+    ///
+    /// **It is a slot number and not a count**, which is what makes the state
+    /// reachable at all: a layer added while most of the range is parked takes
+    /// a number near the top and keeps it. This used to say "64 layers each
+    /// with a mask is exactly that state", which was never true — that is 128
+    /// slices, and the ceiling has never been that low.
     pub fn live_slot_ceiling(&self) -> u32 {
         self.layers
             .iter()
@@ -1919,8 +1953,8 @@ impl StackShape {
     /// canvas-sized texture slice, which is 16 MB at 2048² and 400 MB at
     /// 10000². Counting only the rows would leave the one figure the user sets
     /// to bound undo blind to the whole cost of the feature, and a session of
-    /// deleting and adding layers would walk the layer array to its 129-slice
-    /// ceiling — 2.16 GB at 2048², 51.6 GB at 10000° — with the budget
+    /// deleting and adding layers would walk the layer array to its 256-slice
+    /// ceiling — 4.29 GB at 2048², 102.4 GB at 10000² — with the budget
     /// reporting a few kilobytes. `LayerStack::slot_capacity_needed` never
     /// falls while a slice is parked, and `CanvasRenderer::ensure_slots` never
     /// shrinks, so that memory is allocated and stays allocated.
@@ -2206,14 +2240,28 @@ mod tests {
     // --- masks -------------------------------------------------------------
 
     /// The two ceilings are different numbers and have to stay so: a mask
-    /// occupies a slice and no stack position, so a full stack of masked layers
+    /// occupies a slice and no stack entry, so a full stack of masked layers
     /// needs twice `MAX` slices, plus the one a floating transform previews
-    /// into. `MAX_SLOTS` in `umber-render` is the same arithmetic and caps the
-    /// texture array; conflating either with `MAX` would have quietly halved
-    /// how many layers could carry a mask.
+    /// into, plus the effect-draw headroom above that. `MAX_SLOTS` in
+    /// `umber-render` is the same arithmetic and caps the texture array;
+    /// conflating either with `MAX` would have quietly halved how many layers
+    /// could carry a mask.
+    ///
+    /// It asks `has_headroom` rather than `slot_capacity_needed() <
+    /// MAX_SLOTS`, and **that is readability and not strength**: `has_headroom`
+    /// *is* `next < MAX_SLOTS` and `slot_capacity_needed` returns `next`, so
+    /// the two are the identical comparison on the identical field. What it
+    /// buys is that the assertion is spelled as the question `begin_float`
+    /// asks. An earlier draft of this comment claimed the swap made the test
+    /// harder to satisfy, which was false — the check is exactly as slack
+    /// either way, and it would still pass with the float's `+ 1` removed from
+    /// the ceiling. That `+ 1` is pinned in `umber-render`'s
+    /// `the_slice_ceiling_agrees_with_umber_core`, which can call the
+    /// derivation; nothing reachable from here can.
     #[test]
     fn the_slot_ceiling_covers_a_fully_masked_stack_and_the_floats_spare() {
         let mut s = LayerStack::new();
+        let room = s.room();
         while s.len() < LayerStack::MAX {
             s.add().unwrap();
         }
@@ -2222,8 +2270,8 @@ mod tests {
         }
         assert_eq!(s.slot_capacity_needed(), LayerStack::MAX as u32 * 2);
         assert!(
-            s.slot_capacity_needed() < LayerStack::MAX_SLOTS,
-            "no slice left for a floating transform to preview into"
+            room.has_headroom(),
+            "a fully masked stack left a floating transform nowhere to preview"
         );
     }
 

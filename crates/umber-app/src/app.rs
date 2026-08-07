@@ -854,10 +854,31 @@ impl UmberApp {
                 // only true when the slice that comes free happens to be the
                 // one at the top of the range.
                 lines: vec![
+                    // No figure: it used to say "of 129", and the ceiling now
+                    // carries headroom for effect slices, so a count naming it
+                    // is a number the painter cannot check against anything on
+                    // screen.
+                    //
+                    // And no "fewer layers, or fewer masks", which is what this
+                    // said until the comment above was read against it. That is
+                    // precisely the remedy that does not work — a delete and a
+                    // `remove_mask` both *park* the slice — so it was the
+                    // control-that-lies this project refuses, in the one place
+                    // somebody is already stuck. Reopening genuinely works: the
+                    // stack is rebuilt from a fresh pool and the numbering
+                    // packs back down from zero.
+                    //
+                    // **And it names what that costs**, because it costs
+                    // something: `SaveHistory::new` skips structural entries,
+                    // which are exactly the ones holding parked slices, so the
+                    // reopened document cannot undo the deletes that got it
+                    // here. An advice that works and quietly throws away undo
+                    // history is the same class of failure as one that does
+                    // not work — the artist has to be able to weigh it.
                     "A transform needs a spare texture slice to preview into, and \
-                     this document is using every one Umber has. A layer takes one \
-                     and a mask takes another, of 129. Fewer layers, or fewer \
-                     masks, will make room."
+                     this document is using every one Umber has. Saving and \
+                     reopening the document will pack them back down, though \
+                     deleted layers cannot be brought back afterwards."
                         .to_string(),
                 ],
             });
@@ -1474,9 +1495,21 @@ impl UmberApp {
     /// `SlotPool::give_back` can compact. So where the live stack itself
     /// reaches the ceiling, no eviction whatever can help, and without the
     /// guard `free_until` would empty the undo stack, drain the redo stack and
-    /// then answer false. On a legal document — 64 layers each with a mask — a
-    /// single pen-down with the transform tool in hand would have destroyed the
-    /// whole session's history and refused the transform anyway.
+    /// then answer false.
+    ///
+    /// **`live_slot_ceiling` is one past the highest slot *number* a live layer
+    /// holds, not a count of live layers**, and reading it as a count is the
+    /// mistake to avoid here. Parked slices push the numbering up and
+    /// `SlotPool::give_back` compacts only the *tail*, so a layer created while
+    /// most of the range is parked takes a number near the top and holds it
+    /// there however much history is then given up. Two live layers are enough.
+    /// This is why the guard is not made redundant by the slice ceiling being
+    /// far above what a stack can claim on its own.
+    ///
+    /// The document this used to be described with was 64 layers each with a
+    /// mask, and that was **already** wrong: 128 slices against the ceiling of
+    /// 129 left `has_headroom` true, so the first `if` returned and the guard
+    /// never ran. It is further from the ceiling now, at 256.
     fn free_headroom(&mut self) -> bool {
         let room = self.editor.layers.room();
         if room.has_headroom() {
