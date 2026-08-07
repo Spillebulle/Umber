@@ -12,6 +12,12 @@
 //! effects produces exactly the draw list it produced before, entry for entry,
 //! because nothing reads any of this yet.
 //!
+//! §12 describes stage 0 as emitting `LayerDraw`s that point at slices holding
+//! nothing, shipped disabled behind an empty effect set. **Nothing here emits a
+//! draw at all**, which is the same guarantee with one fewer moving part: an
+//! empty set is a state a control could leave, where a module the composite has
+//! never heard of cannot be. The draws arrive with the bake.
+//!
 //! # `Outline` in code, "Stroke" in the interface
 //!
 //! **`Stroke` is already taken four times over**: [`crate::stroke`] is the brush
@@ -22,7 +28,9 @@
 //! same files.
 //!
 //! So the effect is [`EffectKind::Outline`] here and **no type, variant, field
-//! or function under `umber-core` or `umber-render` may spell it "Stroke"**. The
+//! or function under `umber-core` or `umber-render` may spell a *layer effect*
+//! "Stroke"** — the four above keep the name for the brush stroke, which is
+//! exactly the collision this avoids rather than an exception to it. The
 //! interface must say Stroke, because that is the name painters know it by from
 //! Photoshop and from Krita's layer styles, and the one place that word appears
 //! is [`EffectKind::label`] — a string rather than an identifier, which is
@@ -85,6 +93,14 @@ use crate::layer::BlendMode;
 /// and enforced anyway, because the moment a third kind lands the ceiling is 192
 /// and the refusal is live; `the_effect_budget_is_exactly_reachable_and_no_more`
 /// fails the build at that point so that whoever adds the kind reads this.
+///
+/// **`LayerStack::restore_shape` does not consult it, and that is the gap to
+/// close first when a third kind arrives.** Undoing a delete puts a layer back
+/// with the effects it left holding, and an undo cannot be refused — so the
+/// honest answer there is not a gate but a decision about what to do with the
+/// overflow, which is a question stage 2 has to answer with a control rather
+/// than one this file can answer with an `if`. Nothing else writes an effect
+/// except [`LayerStack::set_effect`], which is the gate.
 pub const MAX_ENABLED: usize = 128;
 
 /// Where the layer's own draw sits in `docs/layer-effects.md` §4's numbering.
@@ -172,26 +188,37 @@ impl OutlinePosition {
 /// Distances are in **document** pixels, like a brush's, so an effect looks the
 /// same at every zoom. Angles are in degrees.
 ///
-/// Every field carries `#[serde(default)]` through the container attribute, for
-/// the reason [`crate::Brush`]'s do: a file written before a parameter existed
-/// still loads. The cost is that a file omitting `kind` reads as the default's
-/// kind rather than being refused, which is worth naming because it is the one
-/// field where the default is arbitrary — Umber always writes it, and a reader
-/// wanting to refuse a file that does not is welcome to check before it gets
-/// here.
+/// **The serde defaults are per field and `kind` deliberately has none**, which
+/// is where this differs from [`crate::Brush`]'s container `#[serde(default)]`
+/// and the difference is not stylistic. A `Brush` has one kind, so one `Default`
+/// describes it; an `Effect` is a flat struct over two, and no single default
+/// can be right for both. Filling an absent field from a whole-struct default
+/// meant an *outline* written before a parameter existed loading with the drop
+/// shadow's value for it — a blurred, Multiply outline the artist never set,
+/// silently, on the day the parameter was added. So each field defaults to its
+/// own **neutral**: nothing grown, nothing softened, nothing displaced, Normal,
+/// opaque, black. A file that omits `kind` is *refused* rather than read as an
+/// arbitrary one.
+///
+/// What the defaults are for is unchanged and is the reason `Brush` has them: a
+/// file written before a parameter existed still loads. The direction that
+/// matters is a newer build reading an older effect — an older build never sees
+/// one at all, because effects raise `umber-version` and it refuses the whole
+/// document.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Effect {
     pub kind: EffectKind,
     /// Off means no draw and no bake, and therefore nothing charged against
     /// [`MAX_ENABLED`]. The parameters are kept, so switching it back on gives
     /// back the effect that was dialled rather than a fresh one.
+    #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     /// Written down by [`linear_rgba`], which is the one statement of an effect
     /// colour's serialised form.
-    #[serde(with = "linear_rgba")]
+    #[serde(default = "black", with = "linear_rgba")]
     pub color: Color,
     /// `0.0..=1.0`, applied to the effect's own draw.
+    #[serde(default = "full_opacity")]
     pub opacity: f32,
     /// How the effect's draw combines with what is under it.
     ///
@@ -199,33 +226,52 @@ pub struct Effect {
     /// of an effect being a draw of its own rather than pixels baked into the
     /// layer's slice, and it is what makes a drop shadow at Multiply do what
     /// Photoshop's default does.
+    #[serde(default)]
     pub blend: BlendMode,
     /// How far the shape is grown before it is softened, in document pixels.
     ///
     /// The outline's width; Photoshop's *Spread* on a shadow.
+    #[serde(default)]
     pub spread: f32,
     /// Blur radius, in document pixels. Photoshop's *Size*.
     ///
     /// **Zero is the exact identity** — the rule the selection's feather and the
     /// brush's grain both keep, and the one the bake has to hold to.
+    #[serde(default)]
     pub softness: f32,
     /// Where the light is, in degrees anticlockwise from the right.
     ///
     /// Photoshop's and Krita's convention, and the one a dial in the interface
     /// will show. The shadow falls *away* from it — see [`Effect::offset`],
     /// which is the only place that is worked out.
+    #[serde(default)]
     pub angle: f32,
     /// How far the shadow is displaced, in document pixels.
+    #[serde(default)]
     pub distance: f32,
     /// Read by [`EffectKind::Outline`] alone, and carried by every effect for
     /// the reason the module docs give.
+    #[serde(default)]
     pub position: OutlinePosition,
 }
 
-impl Default for Effect {
-    fn default() -> Self {
-        Self::drop_shadow()
-    }
+// The three neutral defaults whose types cannot supply their own. `f32`,
+// `BlendMode` and `OutlinePosition` already default to the neutral value — zero,
+// Normal, Outside — and take a bare `#[serde(default)]`. **There is deliberately
+// no `impl Default for Effect`**: see the struct's docs. An effect with no kind
+// is not a thing, and a whole-struct default is what made an outline load
+// wearing a drop shadow's parameters.
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn full_opacity() -> f32 {
+    1.0
+}
+
+fn black() -> Color {
+    Color::BLACK
 }
 
 impl Effect {
@@ -521,14 +567,58 @@ mod tests {
         assert_eq!(back.color.to_array(), effect.color.to_array());
     }
 
-    /// The container `#[serde(default)]` is what lets a parameter be added later
-    /// without every effect already written becoming unreadable.
+    /// **The field names are a file format too, and this is the guard that was
+    /// missing.** `umber/effects/<n>.ron` carries every one of them, so a
+    /// rename — `color` to `colour`, say, in a codebase whose stated convention
+    /// is British spelling — changes what is written to disk exactly as
+    /// renaming a variant does. It is *worse* than the variant case: the
+    /// per-field `#[serde(default)]`s turn a field the reader does not
+    /// recognise into a **silence**, so an old file loads with no error and the
+    /// colour quietly gone.
+    ///
+    /// A round trip cannot see any of this — it is self-consistent under any
+    /// rename — and neither can a fixture. Only text that does not move can.
+    /// The `color:(…)` tuple pins [`linear_rgba`]'s shape at the same time:
+    /// swapping it for four named components, or for sRGB bytes, fails here.
     #[test]
-    fn an_effect_written_before_a_parameter_existed_still_loads() {
+    fn an_effect_is_written_with_these_exact_field_names() {
+        let text = ron::to_string(&Effect::outline()).unwrap();
+        assert_eq!(
+            text,
+            "(kind:Outline,enabled:true,color:(0.0,0.0,0.0,1.0),opacity:1.0,\
+             blend:Normal,spread:3.0,softness:0.0,angle:0.0,distance:0.0,\
+             position:Outside)"
+        );
+    }
+
+    /// A parameter added later must not make every effect already written
+    /// unreadable — and the value an absent field takes must be **neutral**,
+    /// not some other kind's.
+    ///
+    /// This test asserted the bug before a critic measured it: with a container
+    /// `#[serde(default)]` filling from `Effect::default()`, this outline came
+    /// back at the drop shadow's opacity, blend, softness and distance. It now
+    /// reads what an outline that had never been told about those fields should
+    /// read.
+    #[test]
+    fn an_effect_written_before_a_parameter_existed_loads_at_the_neutral() {
         let back: Effect = ron::from_str("(kind: Outline, spread: 8.0)").unwrap();
         assert_eq!(back.kind, EffectKind::Outline);
         assert_eq!(back.spread, 8.0);
-        assert_eq!(back.opacity, Effect::default().opacity);
+        assert!(back.enabled, "an effect in the file is one somebody made");
+        assert_eq!(back.opacity, 1.0);
+        assert_eq!(back.blend, BlendMode::Normal);
+        assert_eq!(back.color, Color::BLACK);
+        assert_eq!(back.softness, 0.0, "not the drop shadow's 5.0");
+        assert_eq!(back.distance, 0.0, "not the drop shadow's 5.0");
+        assert_eq!(back.angle, 0.0);
+        assert_eq!(back.position, OutlinePosition::Outside);
+    }
+
+    /// An effect with no kind is refused rather than read as an arbitrary one.
+    #[test]
+    fn an_effect_with_no_kind_is_not_read() {
+        assert!(ron::from_str::<Effect>("(spread: 8.0)").is_err());
     }
 
     /// §4's order, for every subset of the effects that exist.
@@ -568,6 +658,36 @@ mod tests {
         sort_into_composite_order(&mut one);
         assert_eq!(one, [inside]);
         sort_into_composite_order(&mut []);
+    }
+
+    /// **No effect may rank at [`LAYER_RANK`] itself, and this is the hole the
+    /// exhaustive `match` in [`Effect::rank`] does not close.** That `match`
+    /// forces a third kind to be given a *number*; it cannot force a legal one,
+    /// and 4 is the most plausible slip because §4's own list — which the arms
+    /// are written straight off — puts *the layer* at 4. An effect ranked there
+    /// is silently neither inner nor outer: [`crate::Layer::effects_below`] and
+    /// `effects_above` both skip it and it never draws at all. Exactly the
+    /// silent-false failure `CLAUDE.md`'s "Partial exhaustiveness" section
+    /// hunts, in numeric form rather than `matches!` form.
+    ///
+    /// Over both `ALL`s, so a kind or a position added is covered without this
+    /// test being touched — unlike the hand-written list below it.
+    #[test]
+    fn no_effect_ranks_where_the_layer_does() {
+        for kind in EffectKind::ALL {
+            for position in OutlinePosition::ALL {
+                let effect = Effect {
+                    position,
+                    ..Effect::of(kind)
+                };
+                assert_ne!(effect.rank(), LAYER_RANK, "{kind:?}/{position:?}");
+                assert_ne!(
+                    effect.is_inner(),
+                    effect.is_outer(),
+                    "{kind:?}/{position:?} is neither over nor under the layer"
+                );
+            }
+        }
     }
 
     /// Which side of the layer each effect falls, which is what decides whether

@@ -1221,6 +1221,13 @@ impl LayerStack {
     /// else does. `false` where the layer has no effect of that kind, or where
     /// the gate refuses. Its `can_` twin is
     /// [`LayerStack::can_set_effect_enabled`].
+    ///
+    /// This is the one thing about an effect that touches the slice pool, and
+    /// `docs/layer-effects.md` §7 is where it is decided: switching off frees a
+    /// slice and switching on claims one, and **neither parks and neither
+    /// clears the undo history** — see [`LayerStack::remove_effect`] for why an
+    /// effect slice is the exception to parking. Stage 0 holds no slices, so
+    /// nothing here does either.
     pub fn set_effect_enabled(&mut self, index: usize, kind: EffectKind, enabled: bool) -> bool {
         match self.planned_toggle(index, kind, enabled) {
             Some(effect) => self.set_effect(index, effect),
@@ -1251,13 +1258,13 @@ impl LayerStack {
     /// the remaining effects out of order because a subsequence of an ordered
     /// list is ordered.
     ///
-    /// **The slice the effect was baked into is freed rather than parked**
-    /// (`docs/layer-effects.md` §4.2), unlike a deleted layer's or a removed
-    /// mask's — no [`crate::PixelPatch`] can ever name it, because effect pixels
-    /// are derived, are never read back and are never captured into the undo
-    /// history. Nothing here holds one yet; the rule is recorded so that stage 1
-    /// does not reach for `SlotClaim` on the reasoning that everything else in
-    /// this file does.
+    /// **It frees no slice, because stage 0 bakes into none.** When one exists,
+    /// `docs/layer-effects.md` §4.2 says it goes straight back on the free list
+    /// rather than being parked — unlike a deleted layer's or a removed mask's,
+    /// because no [`crate::PixelPatch`] can ever name it: effect pixels are
+    /// derived, are never read back and are never captured into the undo
+    /// history. Recorded here so that stage 1 does not reach for a `SlotClaim`
+    /// on the reasoning that everything else in this file holds one.
     pub fn remove_effect(&mut self, index: usize, kind: EffectKind) -> Option<Effect> {
         let effects = &mut self.layers.get_mut(index)?.effects;
         let at = effects.iter().position(|e| e.kind == kind)?;
@@ -2134,7 +2141,15 @@ impl StackShape {
                 .iter()
                 .map(|e| match e {
                     ShapeEntry::Kept { .. } => 0,
-                    ShapeEntry::Gone { layer } => std::mem::size_of::<Layer>() + layer.name.len(),
+                    // The layer's own bytes plus what it owns on the heap. Both
+                    // are noise beside a parked slice, and both are counted for
+                    // the reason `name.len()` always was: a figure that skips
+                    // the parts it thinks are small is one nobody can check.
+                    ShapeEntry::Gone { layer } => {
+                        std::mem::size_of::<Layer>()
+                            + layer.name.len()
+                            + layer.effects.len() * std::mem::size_of::<Effect>()
+                    }
                 })
                 .sum::<usize>()
             + self.masks.len() * std::mem::size_of::<(u32, Option<SlotClaim>)>()
@@ -3580,13 +3595,23 @@ mod tests {
     /// whoever added it reads [`effect::MAX_ENABLED`] and
     /// `docs/layer-effects.md` §6.2 rather than discovering the ceiling by
     /// truncating somebody's draw list.
+    ///
+    /// **What it pins is the reachability, not §6.2's identity.** The budget's
+    /// own derivation is `MAX_DRAWS − LayerStack::MAX` — 192 − 64 — and it is a
+    /// coincidence of there being exactly two kinds that `64 × 2` is also 128.
+    /// The real identity cannot be pinned here at all, because `MAX_DRAWS` does
+    /// not exist yet; it belongs beside `canvas.rs`'s constant, with the third
+    /// statement in `composite.wgsl`, and that test is §11's and not this one.
     #[test]
     fn the_effect_budget_is_exactly_reachable_and_no_more() {
         assert_eq!(
             LayerStack::MAX * EffectKind::ALL.len(),
             effect::MAX_ENABLED,
-            "the effect budget is no longer exactly the reachable maximum; \
-             see docs/layer-effects.md §6.2 and the note on effect::MAX_ENABLED"
+            "a full stack no longer reaches exactly the effect budget, so the \
+             refusal in `plan_set_effect` is now live in an ordinary document. \
+             Read effect::MAX_ENABLED and docs/layer-effects.md §6.2, check \
+             MAX_DRAWS - LayerStack::MAX still describes the budget, and check \
+             LayerStack::restore_shape, which does not consult it."
         );
 
         // And a full stack really does reach it, through the real gate.
@@ -3615,11 +3640,22 @@ mod tests {
     /// is a state Umber can otherwise be in.
     #[test]
     fn the_effect_budget_refuses_the_one_past_it_and_changes_nothing() {
+        // The stack this needs is one layer per effect plus one more, and each
+        // layer takes a slice. Stated rather than assumed, because the two
+        // numbers are unrelated and `push_imported`'s own `debug_assert` for
+        // running the pool dry names *imports*, which would be a baffling
+        // failure for a test about effects.
+        let wanted = effect::MAX_ENABLED + 1;
+        assert!(
+            wanted <= LayerStack::MAX_SLOTS as usize,
+            "this test needs a slice per layer; MAX_SLOTS is too small for it"
+        );
+
         let mut s = LayerStack::empty();
-        for i in 0..=effect::MAX_ENABLED {
+        for i in 0..wanted {
             s.push_imported(false, 0, format!("Layer {i}"));
         }
-        assert_eq!(s.len(), effect::MAX_ENABLED + 1);
+        assert_eq!(s.len(), wanted);
 
         for i in 0..effect::MAX_ENABLED {
             assert!(s.set_effect(i, Effect::drop_shadow()), "layer {i}");
