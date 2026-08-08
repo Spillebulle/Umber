@@ -681,7 +681,13 @@ impl StrokeBuilder {
                 self.brush.step_at(pressure, off),
                 self.brush.reach_at(pressure, off),
                 hardness,
-                radius,
+                // The **short** semi-axis, because that is what `dab.wgsl` puts in
+                // `VsOut.radius` and therefore what its antialiasing margin is a
+                // pixel of. Handing over the long one makes an elliptical dab look
+                // harder than it is drawn: measured at 17.6 levels of 255 on a
+                // 10:1 chisel. `aspect` is the dab's own, so this is the same
+                // number the vertex shader builds the quad from.
+                radius / aspect.max(1.0),
             );
             tip::per_dab_for_stroke(mark, depth)
         } else {
@@ -1533,11 +1539,22 @@ mod tests {
     fn mark_at(dabs: &[Dab], at: Vec2, build_up: bool) -> f32 {
         let mut alpha = 0.0f32;
         for dab in dabs {
-            let d = (at - vec2(dab.pos[0], dab.pos[1])).length() / dab.radius;
+            // Into the dab's own frame, where the ellipse is the unit circle, so
+            // `aspect` is in the reading. It used not to be, and then every one of
+            // these simulations agreed with a conversion that had the same gap.
+            let short = dab.radius / dab.aspect.max(1.0);
+            let (sin, cos) = dab.angle.sin_cos();
+            let rel = at - vec2(dab.pos[0], dab.pos[1]);
+            let local = vec2(
+                (rel.x * cos + rel.y * sin) / dab.radius,
+                (rel.y * cos - rel.x * sin) / short,
+            );
+            let d = local.length();
             if d >= 1.0 {
                 continue;
             }
-            let aa = (1.0 / dab.radius.max(1.0)).clamp(0.001, 0.5);
+            // `dab.wgsl` takes `aa` from `VsOut.radius`, which is the short axis.
+            let aa = (1.0 / short.max(1.0)).clamp(0.001, 0.5);
             let inner = dab.hardness.clamp(0.0, 1.0 - aa);
             let t = if inner >= 1.0 {
                 0.0
@@ -1576,6 +1593,12 @@ mod tests {
     /// so; a version of both that ignored the margin agreed with itself and
     /// disagreed with the canvas by tens of levels.
     ///
+    /// **`dab_ratio` is in the sweep**, because `dab.wgsl` takes its antialiasing
+    /// margin from the dab's *short* semi-axis: handing `stack_depth` the long one
+    /// makes a chisel look harder than it is drawn, worth 17.6 levels of 255 at
+    /// 10:1, and every CPU simulation of the dab pass had the same gap so they all
+    /// agreed with it. Mutating `emit` to pass `radius` fails this.
+    ///
     /// Measured worst case 0.0369, which is 9.4 levels of 255, on a fully soft
     /// 6 px dab at a 25% spacing — the shape difference between a flat stack and
     /// a stack of falloffs, which is `per_dab_for_stroke`'s own documented
@@ -1589,59 +1612,63 @@ mod tests {
             for size in [2.0, 6.0, 20.0, 80.0] {
                 for spacing in [0.02, 0.05, 0.1, 0.25] {
                     for hardness in [0.0, 0.5, 1.0] {
-                        let brush = Brush {
-                            hardness,
-                            pressure_opacity: true,
-                            opacity_curve: ResponseCurve::LINEAR,
-                            build_up,
-                            ..unsmoothed(size, spacing)
-                        };
-                        for step in 0..=8 {
-                            let pressure = step as f32 / 8.0;
-                            let mut s = StrokeBuilder::new();
-                            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
-                            s.extend(InputPoint::new(vec2(200.0, 0.0), pressure, 0.1));
-                            let dabs: Vec<Dab> = s.drain_pending().collect();
-                            // At a dab's own centre half way along, so the point
-                            // is covered from both sides and no end of the stroke
-                            // is in the reading. **A dab's centre and not an
-                            // arbitrary point**: a soft dab's falloff has already
-                            // begun a quarter of a radius out, so a `max` stroke
-                            // read between two centres is legitimately below its
-                            // own coverage and the reading would measure that
-                            // instead of this.
-                            let mid = dabs[dabs.len() / 2];
-                            let got = mark_at(&dabs, vec2(mid.pos[0], mid.pos[1]), build_up);
-                            let want = brush.coverage_at(pressure);
-                            // The faintest mark this many dabs of one level can
-                            // build to. Below it `tip::per_dab_for_stroke` answers
-                            // that floor rather than the target, deliberately and
-                            // with its own guard, so measuring here would measure
-                            // the `R8Unorm` scratch's width instead of this. It is
-                            // 0.175 at size 80 and a 2% spacing, which is where
-                            // this used to read as a conversion error.
-                            let off = brush.off_heading(Vec2::X);
-                            let floor = 1.0
-                                - (1.0 - tip::SCRATCH_LEVEL).powf(tip::stack_depth(
-                                    brush.step_at(pressure, off),
-                                    brush.reach_at(pressure, off),
-                                    brush.hardness_at(pressure),
-                                    brush.radius_at(pressure),
-                                ));
-                            if build_up && want <= floor {
-                                // What it must *not* do is vanish — unless the
-                                // curve asked for nothing, which every ramp
-                                // reaching zero does at zero pressure.
-                                assert!(
-                                    got > 0.0 || want <= 0.0,
-                                    "size {size} spacing {spacing} at pressure {pressure} asked {want} and painted nothing"
-                                );
-                                continue;
-                            }
-                            let error = (got - want).abs();
-                            if error > worst {
-                                worst = error;
-                                worst_at = (build_up, size, spacing, hardness, pressure);
+                        for dab_ratio in [1.0, 4.0, 10.0] {
+                            let brush = Brush {
+                                hardness,
+                                dab_ratio,
+                                pressure_opacity: true,
+                                opacity_curve: ResponseCurve::LINEAR,
+                                build_up,
+                                ..unsmoothed(size, spacing)
+                            };
+                            for step in 0..=8 {
+                                let pressure = step as f32 / 8.0;
+                                let mut s = StrokeBuilder::new();
+                                s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                                s.extend(InputPoint::new(vec2(200.0, 0.0), pressure, 0.1));
+                                let dabs: Vec<Dab> = s.drain_pending().collect();
+                                // At a dab's own centre half way along, so the point
+                                // is covered from both sides and no end of the stroke
+                                // is in the reading. **A dab's centre and not an
+                                // arbitrary point**: a soft dab's falloff has already
+                                // begun a quarter of a radius out, so a `max` stroke
+                                // read between two centres is legitimately below its
+                                // own coverage and the reading would measure that
+                                // instead of this.
+                                let mid = dabs[dabs.len() / 2];
+                                let got = mark_at(&dabs, vec2(mid.pos[0], mid.pos[1]), build_up);
+                                let want = brush.coverage_at(pressure);
+                                // The faintest mark this many dabs of one level can
+                                // build to. Below it `tip::per_dab_for_stroke` answers
+                                // that floor rather than the target, deliberately and
+                                // with its own guard, so measuring here would measure
+                                // the `R8Unorm` scratch's width instead of this. It is
+                                // 0.175 at size 80 and a 2% spacing, which is where
+                                // this used to read as a conversion error.
+                                let off = brush.off_heading(Vec2::X);
+                                let floor = 1.0
+                                    - (1.0 - tip::SCRATCH_LEVEL).powf(tip::stack_depth(
+                                        brush.step_at(pressure, off),
+                                        brush.reach_at(pressure, off),
+                                        brush.hardness_at(pressure),
+                                        brush.radius_at(pressure),
+                                    ));
+                                if build_up && want <= floor {
+                                    // Below the floor the mark is the floor, which
+                                    // `tip.rs`'s `the_floor_is_a_cap_and_these_are_
+                                    // its_numbers` measures. Nothing to assert here:
+                                    // `mark_at` accumulates in exact `f32`, so a
+                                    // `got > 0.0` test can never fail however small the
+                                    // dab is, and a guard that cannot fail is worse
+                                    // than none. The stored reading lives in the
+                                    // example and in that test.
+                                    continue;
+                                }
+                                let error = (got - want).abs();
+                                if error > worst {
+                                    worst = error;
+                                    worst_at = (build_up, size, spacing, hardness, pressure);
+                                }
                             }
                         }
                     }

@@ -1042,13 +1042,17 @@ fn centre_line_falloffs(step: f32, inner: f32) -> impl Iterator<Item = f32> {
 ///
 /// The shader keeps at least a pixel of falloff whatever the hardness, because
 /// small brushes alias badly without it, and a pixel is a large fraction of a
-/// small dab — at a radius of 3 a hardness of 0.81 is drawn as 0.67, and at a
-/// radius of 1.5 as 0.34. **That is not a softening confined to the rim**, which
-/// is what the comment in [`dab_stack_alpha`] used to say, and it is worth tens
-/// of levels to anything reading the stack's depth off the nominal hardness: a
-/// stroke of a small soft dab piles up far less than the count of overlapping
-/// dabs suggests, so a conversion that ignored it over-corrected and painted
-/// the mark faint.
+/// small dab — at a radius of 3 a hardness of 0.81 is drawn as 0.67, and at 1.5
+/// the shader's own clamp on `aa` takes over and it is drawn as 0.5, which is as
+/// soft as the margin is ever allowed to make anything. **That is not a softening
+/// confined to the rim**, which is what the comment in [`dab_stack_alpha`] used
+/// to say, and it is worth tens of levels to anything reading the stack's depth
+/// off the nominal hardness: a stroke of a small soft dab piles up far less than
+/// the count of overlapping dabs suggests, so a conversion that ignored it
+/// over-corrected and painted the mark faint.
+///
+/// `radius` is the shader's `VsOut.radius`, which is the **short** semi-axis —
+/// see [`stack_depth`], whose caller is the one place that has to get that right.
 ///
 /// Stated here rather than inline so the shader has one counterpart in
 /// `umber-core` rather than two that can drift.
@@ -1072,24 +1076,37 @@ fn dab_inner(hardness: f32, radius: f32) -> f32 {
 ///   pixel. On a 2 px brush at 2% spacing that floor decides the step, and a
 ///   depth read off the spacing was six times too deep — 152 levels of 255 out,
 ///   the largest error in the sweep.
-/// - `radius` because [`dab_inner`]'s margin is a pixel of it, so a brush whose
-///   size follows pressure stacks to a different depth at each end of its own
-///   ramp. The light end of the reported brush drew dabs of radius 1.5, where a
-///   hardness of 0.81 renders as 0.34.
+/// - `short` — the dab's **short** semi-axis, not its long one — because
+///   [`dab_inner`]'s margin is a pixel of whatever `dab.wgsl` puts in
+///   `VsOut.radius`, and that is `min(radius · tip_scale.x, short · tip_scale.y)`.
+///   A brush whose size follows pressure therefore stacks to a different depth at
+///   each end of its own ramp: the light end of the reported brush drew dabs of
+///   radius 1.5, where a hardness of 0.81 is rendered as 0.5 — the clamp, which
+///   is as soft as the margin is allowed to make anything. Reading the *long*
+///   axis instead makes an elliptical dab look harder than it is drawn and was
+///   measured at 17.6 levels of 255 on a 10:1 chisel. The tip's own proportions
+///   are not in it, for the reason `Brush::step_at` does not have them either:
+///   `Brush` cannot see the mask. With no tip this is exactly what the shader
+///   computes, since `aspect` is at least 1.
 /// - `hardness` after its own modulation, for the same reason.
 ///
 /// So it is on the drawing path, and cheap enough to be: one pass over the
 /// overlapping dabs, no allocation, and `emit` pays it only for a brush that
-/// builds up. [`centre_line_falloffs`] clamps the count rather than trusting the
-/// spacing rail — which is not a bound on the value, since a hand-written
-/// `brushes.ron` may say anything — so the worst case is a thousand adds for a
-/// brush that is also emitting a thousand times as many dabs.
+/// builds up. The walk is bounded by the *step*, not by the spacing:
+/// `step / reach` is at least `max(2 · spacing, 0.25 / reach)`, so any spacing at
+/// or above 1% — which is every importer's floor — caps it at 101 iterations
+/// whatever the brush's size, measured at 46 ns per dab at 20 px and 10% and
+/// 216 ns at 1000 px and 1%. [`centre_line_falloffs`] clamps at 2001 for the
+/// hand-written `brushes.ron` that says 0.0001, which is 4.2 µs per dab and the
+/// one case where this is not free. Do not restate the bound in terms of dabs
+/// emitted: `step_at`'s quarter-pixel floor caps those at four per pixel while
+/// this walk keeps growing, so the two do not scale together.
 ///
 /// At least one, because a dab always covers its own centre; exactly one for a
 /// brush whose dabs do not overlap at all, which makes the conversion the
 /// identity.
-pub fn stack_depth(step: f32, reach: f32, hardness: f32, radius: f32) -> f32 {
-    centre_line_falloffs(step / reach.max(1e-4), dab_inner(hardness, radius))
+pub fn stack_depth(step: f32, reach: f32, hardness: f32, short: f32) -> f32 {
+    centre_line_falloffs(step / reach.max(1e-4), dab_inner(hardness, short))
         .sum::<f32>()
         .max(1.0)
 }
@@ -1121,9 +1138,10 @@ pub fn stack_depth(step: f32, reach: f32, hardness: f32, radius: f32) -> f32 {
 /// composite every dab, and only the MyPaint reader converts. Under build-up the
 /// unconverted number was being *read* as a per-dab one by accident, because the
 /// accumulation compounded it — which for a Krita brush is what Krita draws. Five
-/// shipped presets are Krita's and are affected, so their marks are now lighter
-/// through the middle of the ramp than Krita's own, and a Clip Studio import is
-/// the same. The counter-argument does not survive contact with the numbers —
+/// shipped presets take the conversion and **four** of those are Krita's, so their
+/// marks are now lighter through the middle of the ramp than Krita's own, and a
+/// Clip Studio import is the same. The fifth, `umber/stipple-chalk`, is Umber's own
+/// and has no other application to be faithful to. The counter-argument does not survive contact with the numbers —
 /// `deevad/c2-mechanical-pencil-detail` reached 0.61 of the layer at a tenth of
 /// the pressure and 0.96 at a quarter, which is not a detail pencil in any
 /// application — but the honest statement is that the fix belongs in both places
@@ -1160,25 +1178,59 @@ pub fn stack_depth(step: f32, reach: f32, hardness: f32, radius: f32) -> f32 {
 /// does not move the accumulator and a *constant* one below it never will. A
 /// 1000 px brush at a 1% spacing is 100 dabs deep, and a mark of 2% asked for
 /// 0.0002 per dab — a twentieth of a level, an invisible stroke where the
-/// unconverted brush had merely been too dark. Measured before the floor: 34 of
-/// the sweep's marks came out blank and the worst was 79.9 levels. So the floor
-/// is not a tidy-up, and it is honest rather than exact — what it says is that a
-/// building stroke cannot make a mark fainter than `1 − (1 − 1/255)^depth`, which
-/// is a property of the target it commits into and not of this function. Above
-/// that the conversion is what the paragraphs above describe.
+/// unconverted brush had merely been too dark. Measured before the floor existed,
+/// 34 of the sweep's marks came out blank.
 ///
-/// **The floor bounds the dab's own coverage and not what reaches the scratch**,
-/// and that limit is real: `dab.wgsl` multiplies by the tip, the paper and the
-/// selection *after* `in.coverage`, so a uniformly faint stamp can take a floored
-/// dab back under half a level and the very bottom of such a brush's ramp comes
-/// out blank where the unconverted version was merely too dark. Nothing here can
-/// see the tip — the renderer binds it, and `StrokeBuilder` never holds one — so
-/// this is stated rather than compensated, and it is the same eight-bit limit the
-/// masks themselves live under: `TipMask` is `R8Unorm` too and has no stored value
-/// below one level either. It needs the ramp to be within a level or two of the
-/// floor already; a peaky tip or grain, which is every real one, keeps its peaks
-/// above it, which is why `Sketch.sut`'s own mark survives at 0.040 through a tile
-/// of mean 0.272.
+/// **The floor is a light-end cap and its cost is quoted rather than hidden**,
+/// because that is the shape of the very defect this function exists to remove.
+/// A floored dab builds to `1 − (1 − 1/255)^depth` or to the point where
+/// `cov · (1 − a)` falls under half a level, whichever comes first, so a curve
+/// asking for less than that gets that: **9 levels of 255 at a 10% spacing, 47 at
+/// 2% and 76 at 1%**, which is the tightest the rails and every importer allow —
+/// so at the tight end the cap is the same order as the 68-level defect above it,
+/// and only its direction has changed.
+/// `a_converted_dab_is_never_fainter_than_the_scratch_can_hold` measures it and
+/// `the_floor_is_a_cap_and_these_are_its_numbers` pins those three figures, so it
+/// cannot drift quietly.
+///
+/// **One level and not half of one, deliberately.** The smallest per-dab value the
+/// accumulator registers at all is a shade *above* `0.5/255` — measured, that
+/// reaches exactly one level at every depth from 10 to 200, which would take all
+/// three figures above to 1. It is rejected because the window is about
+/// `0.003` of a level wide and sits on a tie: a UNORM store rounds to nearest with
+/// ties implementation-defined, so a device that breaks them downwards paints
+/// nothing at all. That is a promise about rounding rather than about pixels, which
+/// is the trade `flip.wgsl` and the commit scissor both refuse.
+///
+/// The honest remedy is a wider scratch, not a finer floor.
+///
+/// **The floor bounds the dab's own coverage and not what reaches the scratch, and
+/// this is the sharpest limit on the whole conversion.** `dab.wgsl` multiplies by
+/// the tip, the paper and the selection *after* `in.coverage`, so a multiplier
+/// below `0.5/255 ÷ cov` takes the increment under half a level and — because a
+/// grain is anchored to the document and a selection mask does not move — that
+/// pixel is **exactly zero for the whole stroke**, not dithered. Measured, the
+/// multiplier a pixel has to beat is 0.48 at depth 10 asking for 0.04, and **0.50
+/// at depth 20 or more**, against 0.049 and 0.020 before the conversion. So it is
+/// not "the very bottom of the ramp": at depth 50 a target of a tenth of the way
+/// up a linear ramp blanks every pixel below half the tile's range, and the wash
+/// becomes a speckle at the tile's peaks. That is what "`Sketch.sut`'s mark
+/// survives at 0.040 through a tile of mean 0.272" actually describes — the peaks
+/// survive, the mean does not.
+///
+/// Nothing here can see the tip or the paper — the renderer binds them, and
+/// `StrokeBuilder` never holds either — so this is stated rather than compensated,
+/// and it is the same eight-bit limit the masks live under, `TipMask` being
+/// `R8Unorm` too.
+///
+/// **A selection is the case that is not merely a faint mark, and it is not
+/// covered by that argument.** `selection_mask` multiplies last, so a building
+/// brush at depth 20 or more takes a feather's whole ramp below 0.5 coverage to
+/// zero: a soft edge becomes a hard one at its own 50% contour, which is the
+/// opposite of what the feather section promises and of what a `max` brush does
+/// through the same mask. Halving the floor would halve the threshold and not
+/// remove it. This is a known gap rather than a decision, and the remedy is the
+/// wider scratch named above.
 ///
 /// `canvas.rs`'s note on the scratch says the pathological case "needs a constant
 /// faint coverage on one pixel for a hundred dabs, which a bitmap tip cannot
@@ -2029,11 +2081,13 @@ mod tests {
                 }
             }
         }
-        // Measured: 0.0419, which is 10.7 levels of 255, on a wide soft dab at
-        // the one spacing where three dabs of very unequal weight overlap. At the
-        // 10% spacing and mid hardness a brush is likely to carry it is 2.9
-        // levels, and a hardness of 1.0 on a dab wide enough to need no margin is
-        // exact to a float.
+        // Measured: 0.0419, which is 10.7 levels of 255, at spacing 0.31 and
+        // hardness 0.0 on a radius of 0.5 — `radius_at`'s own floor, the
+        // *narrowest* dab in the sweep, at the one spacing where three dabs of very
+        // unequal weight overlap. At the 10% spacing and mid hardness a brush is
+        // actually likely to carry it is 0.80 levels. There is no dab this is exact
+        // on: `dab_inner(1.0, r) < 1.0` for every radius, which the margin's own
+        // test asserts, so the best case here is 0.012 of a level rather than zero.
         assert!(
             worst < 0.05,
             "worst round trip {worst} at spacing/hardness/radius/target {worst_at:?}"
@@ -2131,6 +2185,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The floor is a cap, and these are the levels it costs.** A guard rather
+    /// than a note, because it is the same shape as the defect this whole
+    /// conversion removes and the only defence against it going quiet is a figure
+    /// somebody has to update on purpose.
+    ///
+    /// The accumulation is `R8Unorm`'s: round after every dab. A floored dab
+    /// climbs until `cov · (1 − a)` falls under half a level and then stalls, so
+    /// the faintest mark a building stroke can make is whichever comes first of
+    /// that and the depth running out.
+    #[test]
+    fn the_floor_is_a_cap_and_these_are_its_numbers() {
+        let stored = |per_dab: f32, depth: usize| {
+            let mut a = 0.0f32;
+            for _ in 0..depth {
+                a += per_dab * (1.0 - a);
+                a = (a * 255.0).round() / 255.0;
+            }
+            a
+        };
+        // A 20 px brush at each spacing, which is where `stack_depth` puts the
+        // depth: about half the reciprocal of the spacing, weighted.
+        for (spacing, want_levels) in [(0.1, 9.0), (0.02, 47.0), (0.01, 76.0)] {
+            let reach = 10.0f32;
+            let depth = stack_depth((reach * 2.0 * spacing).max(0.25), reach, 1.0, reach);
+            // Ask for far below the floor and see where it lands.
+            let got = stored(per_dab_for_stroke(0.001, depth), depth.round() as usize);
+            let levels = got * 255.0;
+            assert!(
+                (levels - want_levels).abs() < 2.0,
+                "spacing {spacing}: depth {depth}, floor {levels} levels, expected {want_levels}"
+            );
+        }
+
+        // And half a level would take all three to one level — which is why the
+        // constant is a decision and not an accident. Rejected because the window
+        // sits on a tie a UNORM store may break either way.
+        assert!(stored(0.5001 / 255.0, 100) * 255.0 < 2.0);
+        assert!(stored(SCRATCH_LEVEL, 100) * 255.0 > 40.0);
     }
 
     /// `step_at`'s quarter-pixel floor reaches the depth, which is the largest
