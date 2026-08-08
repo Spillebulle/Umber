@@ -68,10 +68,28 @@ use super::{
 use crate::color::Color;
 use crate::docformat;
 use crate::document::Background;
-use crate::effect::Effect;
+use crate::effect::{self, Effect};
 use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
+
+/// Largest `umber/effects/<n>.ron` this reader will decompress.
+///
+/// **Derived from what a legal record can hold, not picked.** One layer may
+/// carry at most one effect per kind, and a *document* may carry at most
+/// `effect::MAX_ENABLED` enabled ones — so no honest record is longer than
+/// every effect Umber can draw. Measured, `docformat::encode_effects` writes a
+/// two-effect record in 546 bytes, so about 273 bytes each; 127 of them is
+/// under 35 KB and this is 64 KiB, which is nearly double the largest record
+/// the model permits and leaves room for parameters not yet invented.
+///
+/// The bound exists because effects are the first archive entry whose size
+/// follows a *count* rather than the canvas — see
+/// [`container::read_optional_entry_bounded`] for the measured bomb it refuses.
+/// It is deliberately not `MAX_ENABLED * some_bytes_per_effect`: that would be
+/// a second statement of the serialised form, which changes whenever a
+/// parameter is added, and would turn a generous margin into a tripwire.
+const MAX_EFFECTS_BYTES: u64 = 64 * 1024;
 
 /// A `<layer>` as `stack.xml` describes it, with its groups' effects already
 /// folded in. Collected before any PNG is decoded so the layer count can be
@@ -174,10 +192,15 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
     }
 
     // A document can name more enabled effects than Umber can draw, and it has
-    // to open anyway. Settled here rather than at the install, where the
-    // refusal would have nowhere to be reported — see
-    // `disable_effects_over_budget`.
-    disable_effects_over_budget(&mut layers, &mut warnings);
+    // to open anyway. `ImportedDocument::open` calls this too, for the
+    // guarantee; here is the only place there is a `warnings` to say so in.
+    let disabled = disable_effects_over_budget(&mut layers);
+    if disabled > 0 {
+        warnings.push(ImportWarning::EffectsOverBudget {
+            disabled,
+            max: effect::MAX_ENABLED,
+        });
+    }
 
     // The undo history, when the document says it has one. Read last, and
     // against the layers that actually *loaded* rather than against the specs:
@@ -553,8 +576,12 @@ fn load_layer(
 /// `Vec<Effect>`'s *shape* rather than by the input, and an [`Effect`] is a
 /// flat struct of scalars — so a million open brackets is refused at the
 /// second one, "Expected opening `(` for struct `Effect`", without descending
-/// at all. The entry's size is bounded by [`container::read_optional_entry`],
-/// exactly as a layer's PNG and a mask's are.
+/// at all.
+///
+/// **It cannot be a decompression bomb either, and that needed a bound of its
+/// own** — see [`MAX_EFFECTS_BYTES`]. Every other entry in the archive is a
+/// canvas and answers to `ImportedDocument::MAX_TOTAL_BYTES`; a record's size
+/// follows how many effects it names, which the *format* does not bound at all.
 fn load_effects(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
@@ -564,7 +591,7 @@ fn load_effects(
         return Vec::new();
     };
     let mut read = || -> Result<Vec<Effect>, String> {
-        let bytes = container::read_optional_entry(zip, src, FORMAT)
+        let bytes = container::read_optional_entry_bounded(zip, src, FORMAT, MAX_EFFECTS_BYTES)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("`{src}` is not in the file"))?;
         let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;

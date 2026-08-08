@@ -164,10 +164,22 @@ parameters are the whole feature: a build that has never heard of the attribute
 opens the document, saves it, and `umber/effects/` is gone for good. That is the
 same property masks and clipping were refused for.
 
-Saving an effected layer raises a warning, because no other OpenRaster
-application can read the record and the layer will look plain everywhere else.
-Umber's own reader loses nothing: a record comes back as the effects it was
-written from, parameter for parameter, with a colour that does not move.
+Saving an effected layer raises a warning, once for the document, because no
+other OpenRaster application can read the record and those layers will look
+plain everywhere else. Umber's own reader loses nothing: a record comes back as
+the effects it was written from, parameter for parameter, with a colour that
+does not move.
+
+**The writer is not yet connected, and this section describes the format rather
+than the running application.** `docformat` writes the record and `docimport`
+reads it, and both are under test — but the two places that build a `SaveLayer`,
+in `app.rs` and in `autosave.rs`, do not yet pass a layer's effects, so no save
+this build makes writes `umber/effects/` and no save raises the warning. Reading
+is wired, which means a document carrying effects opens with them and is saved
+without them. Nothing in the interface can create an effect yet, so no painting
+is at risk today; the two writers have to be connected together, because
+connecting Save alone would leave the autosave stripping effects off a modified
+document every five minutes.
 
 `docs/layer-effects.md` is the whole design.
 

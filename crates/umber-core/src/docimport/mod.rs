@@ -319,10 +319,30 @@ impl ImportedDocument {
     /// `LayerStack` deliberately holds no pixel data — it holds slots, and the
     /// pixels live on the GPU. The caller writes each `LayerUpload` into its
     /// slot and the document is open.
-    pub fn open(self) -> Opened {
+    pub fn open(mut self) -> Opened {
         let document = self.document();
         let mut stack = LayerStack::empty();
         let mut uploads = Vec::with_capacity(self.layers.len());
+
+        // **The budget is settled here as well as in the reader, and that is
+        // what makes it total.** `openraster::read` calls this too and turns
+        // what it disables into an `ImportWarning`, which is the only place a
+        // warning can be raised; but `ImportedLayer::effects` is a public field
+        // on a public struct, so a second importer, or a caller building an
+        // `ImportedDocument` by hand, can arrive over budget without ever going
+        // through that reader. Left to `set_effect` alone the excess would be
+        // refused by a `bool` nobody reads — the shrug CLAUDE.md's "Partial
+        // exhaustiveness" section ends on, one level up from where this diff
+        // already avoided it.
+        //
+        // Calling it twice costs nothing and cannot double-count: it is
+        // idempotent by construction, because after it runs the enabled count
+        // is within the budget and a second pass finds nothing to disable.
+        // `an_over_budget_document_is_trimmed_by_open_even_with_no_reader_
+        // between` is the guard.
+
+        disable_effects_over_budget(&mut self.layers);
+
         let saved_history = self.history;
 
         // Built entry by entry rather than by adding layers and then correcting
@@ -358,14 +378,24 @@ impl ImportedDocument {
             // written by a build that ordered them differently still comes back
             // right.
             //
-            // A refusal cannot bite here and is asserted rather than assumed:
-            // the budget was settled by `disable_effects_over_budget` before
-            // this ran, the index is the one the entry was just pushed at, and
-            // a folder carries none because `parse_stack` only reads the
-            // attribute off a `<layer>`. What is left is the release-build
-            // behaviour of a caller that built an `ImportedDocument` by hand and
-            // put an effect on a folder, which loses that effect and nothing
-            // else.
+            // Two ways this can lose an effect, and neither is left to a `bool`
+            // nobody reads.
+            //
+            // `set_effect` answers `false` for a folder, for an index off the
+            // end and for the budget. The budget was settled above, for every
+            // caller and not only for the ORA reader; the index is the one the
+            // entry was just pushed at; so what is left is a folder, which
+            // `parse_stack` cannot produce because it reads the attribute off a
+            // `<layer>` alone. A caller that hand-built one gets the assertion.
+            //
+            // The second is worse and does *not* show up as `false`:
+            // `set_effect` **replaces** whatever the layer held of that kind and
+            // answers `true`, so a record naming two drop shadows would install
+            // one and say nothing. `openraster::load_effects` refuses such a
+            // record, and this counts what actually landed so that a *second*
+            // producer of an `ImportedLayer` cannot reintroduce it quietly. The
+            // real fix is a `LayerStack` method that takes the whole set and
+            // refuses duplicates; that is `layer.rs`'s to add.
             for effect in layer.effects.iter().copied() {
                 let installed = stack.set_effect(i, effect);
                 debug_assert!(
@@ -373,6 +403,11 @@ impl ImportedDocument {
                     "an imported effect was refused by the stack it was read for"
                 );
             }
+            debug_assert_eq!(
+                stack.get(i).map_or(0, |l| l.effects().len()),
+                layer.effects.len(),
+                "an imported effect replaced another instead of joining it"
+            );
             // A folder holds no pixels and takes no slice, so there is nothing
             // to upload and nothing to clear.
             let Some(slot) = slot else { continue };
@@ -592,9 +627,17 @@ pub enum ImportWarning {
     /// number would be the noise that stops this list being read.
     ///
     /// **Switched off, not removed.** The parameters stay in the layer and in
-    /// the next save, so the artist can turn one off and another on; deleting
-    /// them would be the silent loss, and `Effect::enabled` already means "no
-    /// draw and no bake, and therefore nothing charged against the budget".
+    /// the next save, so nothing is lost and one can be traded for another the
+    /// day there is a control to trade them with; deleting them would be the
+    /// silent loss, and `Effect::enabled` already means "no draw and no bake,
+    /// and therefore nothing charged against the budget".
+    ///
+    /// The sentence therefore states what happened and does **not** tell the
+    /// artist to switch one off — there is no control that does, because
+    /// nothing in `umber-app` draws effects yet. A notice that instructs an
+    /// action the interface cannot perform is the lying control this project
+    /// refuses everywhere else, and it is easy to write months before the
+    /// control exists.
     EffectsOverBudget { disabled: usize, max: usize },
     /// A layer could not be brought across at all.
     LayerSkipped { layer: String, reason: String },
@@ -653,8 +696,8 @@ impl fmt::Display for ImportWarning {
             Self::EffectsOverBudget { disabled, max } => write!(
                 f,
                 "This document has more layer effects than Umber can draw at once, so \
-                 {disabled} of them were switched off. The limit is {max}; switch one off to \
-                 turn another back on."
+                 {disabled} of them were switched off. Umber draws up to {max}. Their \
+                 settings were kept and are saved with the document."
             ),
             Self::LayerSkipped { layer, reason } => {
                 write!(f, "Layer “{layer}” could not be imported: {reason}.")
@@ -788,18 +831,33 @@ impl std::error::Error for ImportError {
 /// *adding* an effect and an undo, a paste and a layer leaving a folder can
 /// each arrive over it (`docs/layer-effects.md` §6.1).
 ///
-/// **Why here rather than at the install.** [`ImportedDocument::open`] is where
-/// effects reach a [`LayerStack`], and `LayerStack::set_effect` would refuse
-/// the excess all by itself — by returning `false`, into a caller with nowhere
-/// to put a warning, which is precisely the `None`-into-`.flatten()` silence
-/// CLAUDE.md's "Partial exhaustiveness" section ends on. Whether a refusal is a
-/// diagnostic or a shrug is decided by its *caller*. So the decision is made
-/// here, where `warnings` is in hand, and `open` is handed a set that fits.
+/// **Not at the install, and not only at the reader.** [`ImportedDocument::
+/// open`] is where effects reach a [`LayerStack`], and `LayerStack::set_effect`
+/// would refuse the excess all by itself — by returning `false`, into a caller
+/// with nowhere to put a warning, which is precisely the
+/// `None`-into-`.flatten()` silence CLAUDE.md's "Partial exhaustiveness"
+/// section ends on. Whether a refusal is a diagnostic or a shrug is decided by
+/// its *caller*.
+///
+/// So this is called from **both** ends, and each takes what it can use.
+/// `openraster::read` has `warnings` in hand and turns the count into an
+/// [`ImportWarning::EffectsOverBudget`]; `open` has nowhere to say anything and
+/// calls it for the *guarantee* — that `set_effect` cannot then refuse for the
+/// budget, whoever built the document. `ImportedLayer::effects` is a public
+/// field on a public struct, so "only the ORA reader produces effects" is the
+/// kind of thing a later change makes false in silence, which is the argument
+/// `autosave::Reaper`'s containment already makes for itself.
+///
+/// **Calling it twice cannot double-count**, because it is idempotent by
+/// construction: after it runs the enabled count is within the budget, so a
+/// second pass disables nothing and returns zero. That is what lets the
+/// guarantee and the diagnostic be the same function rather than two that have
+/// to agree.
 ///
 /// The order is bottom to top and, within a layer, composite order — the order
 /// the stack itself is in, so it is stable across a save and a reopen rather
 /// than depending on which layer happened to be read first.
-fn disable_effects_over_budget(layers: &mut [ImportedLayer], warnings: &mut Vec<ImportWarning>) {
+fn disable_effects_over_budget(layers: &mut [ImportedLayer]) -> usize {
     let mut kept = 0usize;
     let mut disabled = 0usize;
     for layer in layers.iter_mut() {
@@ -815,12 +873,7 @@ fn disable_effects_over_budget(layers: &mut [ImportedLayer], warnings: &mut Vec<
             }
         }
     }
-    if disabled > 0 {
-        warnings.push(ImportWarning::EffectsOverBudget {
-            disabled,
-            max: effect::MAX_ENABLED,
-        });
-    }
+    disabled
 }
 
 /// Reject canvases and stacks an import could never open, before decoding any
@@ -1089,14 +1142,14 @@ mod tests {
         let asked: usize = layers.iter().map(|l| l.effects.len()).sum();
         assert_eq!(asked, effect::MAX_ENABLED + 1, "the fixture is one over");
 
-        let mut warnings = Vec::new();
-        disable_effects_over_budget(&mut layers, &mut warnings);
+        assert_eq!(disable_effects_over_budget(&mut layers), 1);
+
+        // Idempotent, which is what lets `open` call it again for the
+        // guarantee without double-counting — see the function's docs.
         assert_eq!(
-            warnings,
-            vec![ImportWarning::EffectsOverBudget {
-                disabled: 1,
-                max: effect::MAX_ENABLED
-            }]
+            disable_effects_over_budget(&mut layers),
+            0,
+            "a second pass must find nothing left to disable"
         );
 
         // Nothing was thrown away: every layer still holds both, and exactly
@@ -1127,7 +1180,7 @@ mod tests {
             background: Background::Transparent,
             dpi: None,
             history: None,
-            warnings,
+            warnings: Vec::new(),
         };
         let opened = doc.open();
         assert_eq!(
@@ -1149,10 +1202,56 @@ mod tests {
         only.effects = vec![crate::effect::Effect::outline()];
         let mut layers = vec![only];
 
-        let mut warnings = Vec::new();
-        disable_effects_over_budget(&mut layers, &mut warnings);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(disable_effects_over_budget(&mut layers), 0);
         assert!(layers[0].effects[0].enabled);
+    }
+
+    /// **`open` trims for itself, so the guarantee does not depend on which
+    /// reader produced the document.**
+    ///
+    /// `openraster::read` is the only caller that raises the warning, and
+    /// `ImportedLayer::effects` is a public field on a public struct — so a
+    /// second importer, or a caller building an `ImportedDocument` by hand, can
+    /// reach `open` over budget without ever passing through that reader.
+    /// Without the trim inside `open`, `LayerStack::set_effect` would refuse
+    /// the excess by returning `false` into a loop with nowhere to report it:
+    /// the silence CLAUDE.md's "Partial exhaustiveness" section ends on, one
+    /// level up from where this module already avoided it.
+    ///
+    /// Deliberately built by hand rather than read out of an archive, because
+    /// going through the reader is exactly the path this is *not* testing.
+    #[test]
+    fn an_over_budget_document_is_trimmed_by_open_even_with_no_reader_between() {
+        use crate::effect::Effect;
+
+        let size = UVec2::new(1, 1);
+        let layers: Vec<ImportedLayer> = (0..LayerStack::MAX)
+            .map(|i| {
+                let mut l = layer(&format!("L{i}"), size);
+                l.effects = vec![Effect::drop_shadow(), Effect::outline()];
+                l
+            })
+            .collect();
+        let asked: usize = layers.iter().map(|l| l.effects.len()).sum();
+        assert_eq!(asked, effect::MAX_ENABLED + 1, "the fixture is one over");
+
+        let opened = ImportedDocument {
+            format: SourceFormat::Krita,
+            size,
+            layers,
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings: Vec::new(),
+        }
+        .open();
+
+        assert_eq!(opened.stack.enabled_effect_count(), effect::MAX_ENABLED);
+        assert!(
+            opened.stack.layers().iter().all(|l| l.effects().len() == 2),
+            "trimming switches an effect off, it does not remove one"
+        );
     }
 
     /// A **disabled** effect is not charged against the budget, so a document
@@ -1181,9 +1280,7 @@ mod tests {
             })
             .collect();
 
-        let mut warnings = Vec::new();
-        disable_effects_over_budget(&mut layers, &mut warnings);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(disable_effects_over_budget(&mut layers), 0);
         assert!(layers.iter().all(|l| l.effects[0].enabled));
     }
 
