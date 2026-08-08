@@ -5,7 +5,9 @@ a stroke, a drop shadow, a glow. The layer's pixels are not touched, the
 parameters stay editable, and the file carries the parameters rather than the
 result.
 
-Nothing here is built.
+**Partly built.** Stage 0's model, the draw capacity and the algorithm
+decision are on `main`; nothing bakes, nothing draws, and nothing reaches a
+file. Each section says where it stands where that is not obvious.
 
 `docs/layer-folders.md` and `docs/group-compositing.md` are assumed: what a
 folder is, why the stack is a flat `Vec`, and why `composite.wgsl` walks it in
@@ -472,8 +474,8 @@ the layer — makes that fall out rather than needing a rule.
 
 A canvas-sized `Rgba8UnormSrgb` slice is 16 MB at 2048² and **400 MB at
 10000²** — the same as a layer, which is the arithmetic CLAUDE.md's parked-slice
-bullet already warns about with "51.6 GB at 10000², with the budget reporting
-kilobytes".
+bullet already warns about, now stated there as 102.4 GB at 10000² against a
+ceiling of 256 slices.
 
 So the cache is **budgeted in bytes and not in count**, the way the undo history
 is, and for the same reason: a count is right on one canvas size and absurd on
@@ -598,10 +600,20 @@ figure is safe **only because it is derived from that figure and asserted agains
 it**, so the assertion is the load-bearing part and not a formality:
 
 ```rust
+// In `umber-render`, because this is where wgpu can be seen.
 const _: () = assert!(
-    LayerStack::MAX_SLOTS <= wgpu::Limits::downlevel_defaults().max_texture_array_layers
+    MAX_SLOTS <= wgpu::Limits::downlevel_defaults().max_texture_array_layers as usize,
 );
 ```
+
+**It cannot be written against `LayerStack::MAX_SLOTS`**, which is what an
+earlier draft of this section showed: `umber-core` may not depend on wgpu, which
+is the same boundary this document leans on elsewhere. So the assertion lives in
+`canvas.rs` beside that crate's own `MAX_SLOTS`, and the two constants are tied
+by `the_slice_ceiling_agrees_with_umber_core` — a **test**, not a compile error,
+which is the weaker of the two and worth knowing. `umber-core`'s own
+`effect::BUDGET_DERIVATION` is a compile error, but it asserts against a literal
+ceiling rather than against the device.
 
 Its comment has to say *why* — that this limit is inherited rather than named,
 and that `using_resolution` does not touch it — because the comment is the only
@@ -923,11 +935,16 @@ On the GPU, through `gpu_pipeline.rs`:
 
 **Stage 0 — the model, with no pixels.** `Effect`, the parameter sets, the
 ordering rule, the refusals, serialisation, `required_version`, and the reader
-and writer. `LayerDraw`s are emitted for enabled effects and point at slots
-holding nothing, so the shipped behaviour is a layer with a blank effect draw
-over it — which means stage 0 ships *disabled*, behind the effect set being
-empty. Every CPU test in §11 lands here. This is where the risk is bought down:
-everything structural, nothing to see.
+and writer. This is where the risk is bought down: everything structural,
+nothing to see.
+
+**What was built departs from that in one way, deliberately.** The plan had
+stage 0 emitting `LayerDraw`s at slots holding nothing, shipped disabled behind
+an empty effect set. It emits **none at all** instead — the same guarantee with
+one fewer moving part, and no window in which a draw points at a slice nobody
+has written. The model, the capacity and the algorithm decision are on `main`;
+the reader and the writer are the remainder, and until they land an effect
+reaches no file, so nothing may offer to create one.
 
 **Stage 1 — the bake, canvas-sized, live.** The distance field, the
 **downsampled** blur, the knockout, the two effects. §3.4 says a canvas-sized
@@ -985,11 +1002,5 @@ not like for like** — see §3.1a, which is the more useful record.
   §3.2 actually proposes for the shadow.
 - **Which version number**, 3 or 4, against `docs/group-compositing.md`. §8.2.
   Decided by which lands first and must be written down when it does.
-- **Whether `Effect` belongs on `Layer` or beside the stack.** On `Layer` by the
-  argument `picked` and `link` both make — a set beside the stack has to be kept
-  in step with reordering and deletion by hand. But `Layer` is `Clone` and cheap
-  today, and a parameter set per effect kind is not `Copy`; whether that matters
-  to `StackShape` and the structural undo entries wants checking against
-  `docs/structural-undo.md` before stage 0.
 - **Reading `.psd` layer effects.** §8.3. A coherent later piece, blocked on the
   same crate limit `.psd` masks are.

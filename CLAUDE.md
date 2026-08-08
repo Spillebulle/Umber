@@ -643,8 +643,10 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   smaller than the buffer, which validates, and the composite then reads `extra`
   as `layers` past index 63. **Raising the array lengthens no loop** (bounded by
   `layer_count`); it costs 6,224 uniform bytes against 16 KiB. And note
-  **raising `MAX_LAYERS` *lowers* the effect budget**, two slices a layer,
-  silently.
+  **raising `MAX_LAYERS` *lowers* the effect budget**, two slices a layer —
+  which is caught, by `effect::BUDGET_DERIVATION`, as a compile error naming
+  the reason. `canvas.rs` says "nothing fails when it happens" and that was
+  true on the branch it was written on and is false now.
 - **Deleting a layer parks its slice rather than recycling it**, which is what
   lets the undo history survive a delete. A `PixelPatch` names a slot, so a
   patch recorded against a *freed* slot would be replayed into whichever layer
@@ -989,8 +991,10 @@ are the contiguous run immediately below it whose `depth` is greater.
   read as an arbitrary one. There is no `impl Default for Effect`.
 - **A struct's *field names* are a format too, not only its variant names.** The
   rule already recorded for `BlendMode` covers half the mechanism. `Effect`'s
-  ten field names reach `umber/effects/<n>.ron`, a round trip is self-consistent
-  under any rename, and the per-field defaults turn an unrecognised field into a
+  ten field names are **destined for** `umber/effects/<n>.ron` — the writer is
+  not built yet, so today the round trip is tests only, and the pin was put in
+  before the format rather than after. A round trip is self-consistent under any
+  rename, and the per-field defaults turn an unrecognised field into a
   **silence** rather than an error — so `#[serde(rename = "colour")]` on
   `color`, the likely rename in a codebase whose convention is British spelling,
   left every test green while an old file loaded with the colour gone. Pin the
@@ -1127,13 +1131,15 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   what `brushes.ron` carries while leaving the `Debug` spelling untouched — one
   guard covering two mechanisms, and covering the second only because the
   derive and the `Debug` spelling agree today.
-  **The serde spelling now reaches a *document* as well, and the gap was real
-  until it did.** An `Effect` carries a `BlendMode` into
-  `umber/effects/<n>.ron`, where an unknown variant is a **hard parse error**
-  rather than a downgrade, and Multiply is the drop shadow's own default. Before
-  that, the only serde text anywhere was `builtin-brushes.ron`'s 252 `blend:`
-  fields — all `Normal` — so `#[serde(rename = "Mult")]` on `Multiply` left all
-  866 tests green. That was demonstrated by mutation, not argued.
+  **The serde spelling is about to reach a *document* as well, and the gap was
+  real until it was pinned.** An `Effect` carries a `BlendMode`, and once the
+  writer lands that spelling goes into `umber/effects/<n>.ron`, where an unknown
+  variant is a **hard parse error** rather than a downgrade — and Multiply is
+  the drop shadow's own default. Until then the only serde text anywhere was
+  `builtin-brushes.ron`'s 252 `blend:` fields, all `Normal`, so
+  `#[serde(rename = "Mult")]` on `Multiply` left all 866 tests green. That was
+  demonstrated by mutation, not argued, and pinning it *before* the format
+  exists is the cheap direction.
   `the_serialised_names_of_a_blend_mode_are_these_exact_strings` is the pin, and
   it is the remedy this paragraph already prescribed applied to the mechanism it
   already warned about.
