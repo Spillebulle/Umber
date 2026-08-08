@@ -253,28 +253,36 @@ const EFFECT_FULL_RES_SOFTNESS: f32 = 32.0;
 ///
 /// | | 2048² | 10000² |
 /// |---|---|---|
-/// | shadow at its default 5 px | 0.54 | 7.82 |
-/// | shadow at 64 px | 0.38 | 4.05 |
-/// | outline 16 px wide | 1.04 | **20.39** |
+/// | shadow at its default 5 px | 0.6 | 7.6 |
+/// | shadow at 64 px | 0.3 | 4.1 |
+/// | outline 16 px, outside | 1.2 | **20.0** |
+/// | outline 16 px, centre | 1.8 | **33.9** |
+///
+/// **One decimal at 2048², because §3.4's own caveat is that back-to-back runs
+/// vary by 4x at those magnitudes** — that is a property of timing a submit and a
+/// fence, not of the code. What the column says is that every bake there is
+/// comfortably inside a frame.
+///
+/// The centred outline is the worst there is because it floods **twice** — the
+/// outward distance and the inward one — which is the shape a knockout per side
+/// of the stack hid, since Centre was then an Outside of half the width.
 ///
 /// So 2048² is free and 10000² is not, which is the split §3.4 predicted. 4096²
 /// is where the line is drawn and it is a judgement rather than a reading:
 /// nothing has been measured between those two sizes and the flood scales with
-/// the area, which puts a 4096² outline at roughly 3 ms.
+/// the area, which puts a 4096² outline at roughly 3 ms and a centred one at 6.
 ///
-/// **One gate on the canvas rather than a gate per effect, and §5.1 would allow
-/// the second.** Its corrected claim is that what cannot hold at canvas scale is
-/// "memory at canvas scale and the stroke's distance field, not the shadow and
-/// not the frame budget" — and the table above bears that out: at 10000² the
-/// outline is over a 60 Hz frame and neither shadow is. A per-effect gate would
-/// therefore keep the live shadow on the largest canvas Umber supports. It is
-/// **not** what this does, on the grounds that 7.94 ms every frame is half of a
-/// 60 Hz frame before the composite, the dab pass and the interface have had any
-/// of it, and a stroke drawn at thirty frames a second is a worse thing to hand
-/// an artist than a shadow that arrives when they lift the pen. It is a judgement
-/// against the design's lean and it is recorded as one; a full-resolution blur at
-/// 31 px is 22.45 ms at that size, which is the case a per-effect gate would also
-/// have to cover.
+/// **This bounds the canvas; [`CanvasRenderer::effect_bakes_live`] is the gate,
+/// and it asks per effect.** §5.1's corrected claim is that what cannot hold at
+/// canvas scale is "memory at canvas scale and the stroke's distance field, not
+/// the shadow and not the frame budget", and the table bears it out: at 10000²
+/// both outlines are over a 60 Hz frame and neither shadow is.
+///
+/// A single gate on the canvas is what shipped first and is worse in a way an
+/// artist cannot see — one expensive outline anywhere in the stack would switch
+/// the live rebake off for a cheap shadow on another layer, so a shadow following
+/// the brush would depend on a setting somewhere else in the document. Above this
+/// figure the per-effect gate keeps exactly the bakes that fit.
 ///
 /// Stage 3's region-bounded rebake is what removes the need for any of it.
 const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
