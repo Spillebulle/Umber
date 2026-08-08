@@ -5918,6 +5918,118 @@ fn a_live_stroke_bakes_the_shadow_the_commit_would() {
     }
 }
 
+/// A dragged float carries its own effects, and puts them down where the pixels
+/// landed.
+///
+/// §5.2's whole case, and the reason the cache is keyed on the slot the *draw*
+/// carries rather than on the layer: during a drag the draw carries the preview
+/// slice, so the effect baked from it is a different entry from the one baked
+/// from the layer's own — and the commit swaps back to an entry that is stale for
+/// the ordinary reason. No rule about floats anywhere in the cache.
+///
+/// It caught a real defect. `render_float` writes the preview slice and did not
+/// move its revision, so the outline baked at the moment the pixels were picked
+/// up stayed there for the whole drag — a shadow left behind by a dragged object,
+/// which is the exact failure §5.2 names.
+#[test]
+fn a_dragged_float_carries_the_effect_derived_from_it() {
+    let mut h = harness_or_skip!();
+    let block = PixelRect {
+        x: 8,
+        y: 8,
+        width: 10,
+        height: 10,
+    };
+    h.write_block(0, block, [255, 255, 255, 255]);
+
+    let mut xf = Transform::identity(block);
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: block,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+    // `Editor::effected_draws` substitutes the preview slice for the layer's, so
+    // the bake is handed exactly what the composite is handed.
+    let dragged = LayerDraw {
+        slot: preview,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    let ring = [outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+
+    // A frame of the drag at identity first. A *lift* takes the pixels out of the
+    // preview, so until something has been drawn into it the preview holds only
+    // the hole — and an outline of nothing is nothing, which would make the
+    // assertions below pass for the wrong reason.
+    let at_rest = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &at_rest);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let baked = h.bake(&[effected(dragged, &ring)], preview + 1);
+    let slot = baked.draws[0].slot;
+    assert_ne!(slot, preview, "the effect took the float's own slice");
+    assert!(
+        slice_alpha(&h, slot, 8, 5) > 0,
+        "the outline is missing where the picture is"
+    );
+
+    // Drag it clean across the canvas.
+    xf.offset = Vec2::splat(28.0);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    h.bake(&[effected(dragged, &ring)], preview + 1);
+    assert!(
+        slice_alpha(&h, slot, 36, 33) > 0,
+        "the effect did not follow the float"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 8, 5),
+        0,
+        "the effect was left behind where the picture used to be"
+    );
+
+    // The commit puts the pixels in the layer and the draw goes back to the
+    // layer's own slice, which is a different cache key and stale for the
+    // ordinary reason — the commit moved that slice's revision.
+    let damage = xf.damage(UVec2::splat(DOC), true).expect("something to do");
+    let mut enc = h.encoder();
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float();
+
+    let settled = layer(0, 1.0, BlendMode::Normal);
+    let after = h.bake(&[effected(settled, &ring)], preview + 1);
+    let slot = after.draws[0].slot;
+    assert!(
+        slice_alpha(&h, slot, 36, 33) > 0,
+        "the committed picture has no outline"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 8, 5),
+        0,
+        "the outline of where the picture came from survived the commit"
+    );
+}
+
 /// A spread wider than the canvas, and one that is not a number at all, are
 /// baked rather than crashed on.
 ///

@@ -4479,6 +4479,7 @@ impl CanvasRenderer {
         let (preview_slot, last) = (float.preview_slot, float.last_dest);
         if let Some(restore) = span(last, params.dest) {
             self.render_float(queue, encoder, preview_slot, restore, params);
+            self.touch_slot(preview_slot);
         }
         if let Some(float) = self.float.as_mut() {
             float.last_dest = params.dest;
