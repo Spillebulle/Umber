@@ -136,23 +136,67 @@ screen, independent of the radius after the log. The alternatives lose:
   disc. On a diagonal edge the corner is out by `r(√2 − 1)` — 41% of the radius.
   Visible on any stroke wide enough to want.
 - **An exact disc** is O(r²) taps. At r = 20 that is 1,257 per fragment.
-- **Blur and threshold** is cheap, reuses the blur, and rounds corners by an
-  amount that depends on the radius — so a 2 px stroke is sharp and a 20 px
-  stroke has visibly rounded corners the artist did not ask for. It is what
-  several real implementations do and it is the fallback if jump flooding
-  measures badly, but it should not be the first attempt.
+- **Blur and threshold** is cheap and reuses the blur the shadow needs anyway.
+  It was measured against the flood on a shape carrying a sharp corner, a
+  diagonal, a thin limb and a small hole, and **it lost** — §3.1a.
 
 Jump flooding's known weakness is that it is approximate for a small number of
 seeds; against a dense coverage field it is essentially exact, which is this
 case.
 
-**Measured, it is the expensive effect — not the shadow — and that was the wrong
-way round in the first draft of this document.** §3.4 has the figures. The short
-version is that a jump flood at 10000² costs 19 ms at radius 64 and holds 1.6 GB
-of ping-pong buffers, against 3 ms and 1 GB for a downsampled shadow of the same
-radius. So the choice between jump flooding and blur-and-threshold is no longer
-a question of corner quality alone; it is 6x the time and twice the memory, and
-§13 now weighs it that way.
+### 3.1a Blur-and-threshold was measured and refused
+
+**Two wrong reasons were offered for refusing it before the right one was
+found**, and they are recorded because each is the kind of thing that reads as
+settled:
+
+1. "The blur cannot draw a stroke." False — that was a badly chosen kernel.
+2. "It cuts every convex corner." Also false at a good kernel: within 1.1 px at
+   20 px and 0.8 px at 64.
+
+**What actually survives is that a separable tent has *square* support.** Its
+projection onto a 45° normal is not the tent the inversion assumes, so the
+corner and the diagonal cannot both be right at any kernel width and they move
+in opposite directions: at 20 px the corner is exact near `h/w = 1.10` where the
+diagonal is +2.8, and the diagonal is exact near 1.32 where the corner is 4.5
+short. An acute apex is ~40% short from 20 px upward at every setting. In the
+pictures this reads as round caps coming out flat-sided and a pointed beak drawn
+to a point where the flood caps it.
+
+**And "blur and threshold" does not dilate at all.** A symmetric kernel's 0.5
+contour is the edge it started from, so the method has to threshold lower by an
+amount that is a property of the kernel, or invert the kernel's own CDF. A
+comparison that skips this is not drawing the same width in the two panels and
+is void — which is the first thing to check on any repeat of this measurement.
+
+At its own best kernel per width, worst error against a true disc:
+
+| width | best box r | worst error | apex, blur / flood |
+|---|---|---|---|
+| 2 | 1 | 0.43 | 0.36 / — |
+| 8 | 4 | 1.90 | 5.74 / 3.00 |
+| 20 | 11 | 1.75 | 9.11 / 15.00 |
+| 32 | 18 | 2.53 | 13.93 / 27.00 |
+| 48 | 26 | 5.64 | 27.03 / 43.00 |
+| 64 | 35 | 7.18 | 35.07 / 59.00 |
+
+The flood's own worst is 0.2–0.4 px at every width, which is the probe's
+residual.
+
+**There is no window in which the blur is both cheaper and better.** Shape error
+crosses ~3 px between 32 and 48 px; the cost crossover is at about 16 px of
+radius. Below 16 it is cheaper and accurate, 16 to 32 accurate and dearer, above
+32 neither. So **stage 1 writes the flood and only the flood** — not even as a
+small-radius special case, because a second implementation to build and keep is
+the cost, and at 4 px on a 10000² canvas the saving it buys is 3 ms and 381 MB
+on a bake that is already affordable.
+
+**The first draft of this document leaned the other way, on a comparison that
+was not like for like**: it put a *quarter-resolution* blur against a
+*full-resolution* flood, when §3.2 says in its own words that a hard edge is the
+one thing that must not be downsampled. Comparing a soft shadow's cost against a
+hard stroke's requirement is the error, and it is easy to make because both
+numbers sit in the same table.
 
 ### 3.2 The blur
 
@@ -172,9 +216,20 @@ carried over and the bound did not.
 what makes it affordable and nearly radius-independent: 2.0 ms to 3.2 ms across
 the same sweep, and 0.36 ms to 0.45 ms at 2048². Sixteen times fewer texels at
 a quarter of the radius is ~64x less work, and the quality cost falls only on a
-hard edge — which a shadow, a glow and a soft stroke do not have. An effect that
-genuinely needs a hard edge is the one that must not take this path, and at a
-hard edge the radius is small and the full-resolution pass is cheap. §3.4.
+hard edge — which a shadow and a glow do not have. §3.4.
+
+**"A hard edge must not take this path" is confirmed and is stronger than it
+sounds.** The quarter-resolution blur will not calibrate to a 20 px stroke at
+all, and where it does calibrate it over-reaches by 40–75%; in the pictures it
+bleeds across the whole panel. This is a shadow-and-glow path, not a general
+one.
+
+**For anything recovering a *distance*, the intermediate must also be wider than
+8 bits, not merely linear.** Reading a distance back out of a coverage field
+magnifies that field's quantisation by roughly `reach / sqrt(2b)` — about `4w`
+at the contour — so the measured 8-bit path is 2.4 px out at the corner at 64 px
+with its own calibration drifting to 63.5. That does not bite a shadow, whose
+output *is* the field; it bites anything that thresholds one.
 
 Two more things follow that are easy to get wrong:
 
@@ -237,18 +292,28 @@ safe direction.
 
 **RTX 3080, Vulkan.** Milliseconds; `!` is over a 60 Hz frame.
 
-| canvas | radius | shadow, full res | shadow, quarter res | stroke, jump flood |
-|---|---|---|---|---|
-| 2048² | 4 px | 0.64 | **0.36** | 0.66 |
-| 2048² | 16 px | 1.25 | **0.38** | 0.89 |
-| 2048² | 64 px | 3.77 | **0.45** | 1.13 |
-| 10000² | 4 px | 8.50 | **2.05** | 9.04 |
-| 10000² | 16 px | 22.46 ! | **2.26** | 14.01 |
-| 10000² | 64 px | 83.05 ! | **3.23** | 19.40 ! |
+| canvas | radius | shadow, full res | shadow, quarter res | stroke, jump flood | stroke, blur |
+|---|---|---|---|---|---|
+| 2048² | 4 px | 0.6 | **0.4** | 0.5 | 0.4 |
+| 2048² | 16 px | 1.3 | **0.4** | 0.9 | 0.8 |
+| 2048² | 64 px | 3.8 | **0.5** | 1.1 | 2.1 |
+| 10000² | 4 px | 8.5 | **2.1** | 8.9 | 5.8 |
+| 10000² | 16 px | 22.3 ! | **2.3** | 14.0 | 14.2 |
+| 10000² | 64 px | 82.4 ! | **3.2** | 19.4 ! | 45.6 ! |
+
+**Do not quote the 2048² figures to two decimals** — back-to-back runs vary by
+4x at those magnitudes, which is a property of measuring a submit-and-fence and
+not of the code.
 
 Textures held at once: 44 MB at 2048² and **1,049 MB at 10000²** for the
-shadow; 68 MB and **1,621 MB** for the stroke, whose two `Rg16Uint` seed buffers
-are 400 MB each on the large canvas.
+shadow; 68 MB and **1,621 MB** for the stroke's flood, whose two `Rg16Uint` seed
+buffers are 400 MB each on the large canvas, against 1,240 MB for the blur.
+
+**Two caveats without which these do not reproduce.** They only hold when 10000²
+is measured in a process that has **not** just measured 2048² — the default
+invocation drifts the flood to 27 ms. And they are taken on a **zero-initialised
+layer**, where the flood's inner branch is never taken; with content
+(`--filled`) the flood is 14–21% slower, at 10.1 / 16.2 / 23.8.
 
 **The software rasteriser brackets it from below.** The same sweep on
 `Choice::Fallback` — WARP, a CPU — is roughly 100x slower: a quarter-resolution
@@ -897,19 +962,27 @@ nothing.
 frame. It does at 2048² and, downsampled, at 10000²; the naive full-resolution
 blur does not, and the claim that it would was wrong. What is left:
 
-- **Whether jump flooding is worth it over blur-and-threshold.** This was a
-  question about corner quality and is now mostly a question about cost: §3.4
-  puts the flood at 19 ms and 1.6 GB at 10000²/64 px against ~3 ms and 1 GB for
-  a blur, and the blur is already being built for the shadow. **The likely answer
-  is now blur-and-threshold**, with the flood kept for a hard-edged stroke at a
-  small radius where it is cheap. A picture of a 20 px stroke by each method
-  settles it faster than the argument does, and it should be made before stage 1
-  writes either one.
+**Settled by §3.1a and struck from this list:** whether jump flooding is worth
+it over blur-and-threshold. It is. Like for like the blur is cheaper only below
+about 16 px of radius and is 2.4x dearer at 64; it holds 1,240 MB against 1,621,
+not half; and at its own best kernel its shape error crosses three pixels
+between 32 and 48 px while an acute apex is 40% short from 20 px up. There is no
+radius at which it is both cheaper and better, so stage 1 writes the flood and
+only the flood. **This document leaned the other way on a comparison that was
+not like for like** — see §3.1a, which is the more useful record.
+
 - **What an integrated or mobile GPU does.** §3.4 has a discrete card and a
   software rasteriser and nothing between, and they are 100x apart. The
   downsampled shadow has enough headroom that it is probably safe either way;
   the flood plainly does not. Anyone with a laptop should re-run the example
   before stage 1 fixes the algorithm.
+- **Whether the quarter-resolution blur can be calibrated at 20 px.** It
+  converges at 2, 8, 32, 48 and 64 and fails only there, and whether that is a
+  real property of the composite kernel — downsample box ⊛ tent ⊛ bilinear
+  upsample is not a tent, so the inversion's *shape* is wrong and not merely its
+  scale — or a harness limit is unsettled. It does not block the recommendation,
+  because where it does converge it over-reaches by 40–75%, but it is the path
+  §3.2 actually proposes for the shadow.
 - **Which version number**, 3 or 4, against `docs/group-compositing.md`. §8.2.
   Decided by which lands first and must be written down when it does.
 - **Whether `Effect` belongs on `Layer` or beside the stack.** On `Layer` by the
