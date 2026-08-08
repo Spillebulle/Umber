@@ -253,9 +253,9 @@ const EFFECT_FULL_RES_SOFTNESS: f32 = 32.0;
 ///
 /// | | 2048² | 10000² |
 /// |---|---|---|
-/// | shadow at its default 5 px | 0.59 | 7.94 |
-/// | shadow at 64 px | 0.41 | 4.54 |
-/// | outline 16 px wide | 1.03 | **20.36** |
+/// | shadow at its default 5 px | 0.54 | 7.82 |
+/// | shadow at 64 px | 0.38 | 4.05 |
+/// | outline 16 px wide | 1.04 | **20.39** |
 ///
 /// So 2048² is free and 10000² is not, which is the split §3.4 predicted. 4096²
 /// is where the line is drawn and it is a judgement rather than a reading:
