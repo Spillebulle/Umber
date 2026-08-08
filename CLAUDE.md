@@ -615,12 +615,36 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
 - **A layer's slot never changes.** Stack order is the `Vec` order, so
   reordering is a pointer shuffle, not a texture copy. Anything indexing layers
   by position must not assume position equals slot.
-- **`LayerStack::MAX`, `MAX_LAYERS` in `canvas.rs`, and `MAX_LAYERS` in
-  `composite.wgsl` must agree.** The last one sizes a uniform array. It bounds
-  stack **entries**, folders included — stricter than the array needs while
-  folders are flattened away, and deliberately so, because a folder that
-  composites as a group *will* occupy a slot in that array and a cap tightened
-  later would shut documents this build had already written.
+- **`LayerStack::MAX` bounds stack entries; `MAX_DRAWS` sizes the uniform
+  arrays; `MAX_SLOTS` is the device's and everything else is derived from it.**
+  They were one number and are now three. `MAX` and `MAX_LAYERS` in `canvas.rs`
+  are 64 and bound **entries**, folders included — still stricter than the draw
+  array needs while folders are flattened away, and still deliberate, because a
+  folder compositing as a group *will* occupy a draw. `MAX_DRAWS` is 191 and
+  sizes the two `array<vec4<f32>>` in `composite.wgsl`, because **a draw is not
+  a stack entry**: a layer's effects each composite as a draw of their own so a
+  shadow at Multiply multiplies against the backdrop.
+  **`MAX_SLOTS` is 256 and is not a choice.** `downlevel_defaults` never names
+  `max_texture_array_layers`, so it inherits `Limits::defaults()`' 256, and
+  `using_resolution` raises only the three texture dimensions — the trap being
+  that it is right there raising limits from the adapter and looks as though it
+  raises this one. A 257th slice is a validation error, which is fatal. The
+  design asked for 257 and it would have shipped. So the ceiling is the *input*:
+  64 layers, 64 masks and the float's spare take 129, and the 127 left are the
+  effect budget — which is where 191 comes from, since an effect draw reads an
+  effect slice. **127 rather than 128 is also what makes the cap reachable** by
+  a legal document.
+  Sitting exactly on the device's figure is safe **only because it is asserted
+  against it**: `Limits::downlevel_defaults` is a `const fn`, so that is a
+  compile error rather than a test, and the comment has to say why the limit is
+  inherited rather than named. `the_three_draw_capacities_agree` pins the rest,
+  and **pins the array *declarations* and not only the constant** — leave the
+  constant right and write `array<vec4<f32>, 64>` and the WGSL struct is merely
+  smaller than the buffer, which validates, and the composite then reads `extra`
+  as `layers` past index 63. **Raising the array lengthens no loop** (bounded by
+  `layer_count`); it costs 6,224 uniform bytes against 16 KiB. And note
+  **raising `MAX_LAYERS` *lowers* the effect budget**, two slices a layer,
+  silently.
 - **Deleting a layer parks its slice rather than recycling it**, which is what
   lets the undo history survive a delete. A `PixelPatch` names a slot, so a
   patch recorded against a *freed* slot would be replayed into whichever layer
@@ -630,9 +654,10 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   no readback, no GPU work: the pixels never move at all.
 - **A parked slice is charged to the undo budget**, and the design said it cost
   nothing until a critic proved otherwise. `slot_capacity_needed` is one past
-  the highest slice ever *claimed* and `ensure_slots` never shrinks, so 128
-  delete-then-add cycles took the layer array to 129 slices and left it there —
-  2.16 GB at 2048², **51.6 GB at 10000²**, with the budget reporting kilobytes.
+  the highest slice ever *claimed* and `ensure_slots` never shrinks, so enough
+  delete-then-add cycles take the layer array to its ceiling and leave it there
+  — at `MAX_SLOTS`'s 256 that is 4.29 GB at 2048² and **102.4 GB at 10000²**,
+  with the budget reporting kilobytes.
   `StackShape::byte_len` puts a parked slice in the same currency as a patch,
   which is what makes eviction able to reach it.
 - **A recycled slot still holds the old layer's pixels** — clear it on the GPU
@@ -645,8 +670,8 @@ composites in a **single pass** — `composite.wgsl` loops bottom to top. Do not
   capture, patch width and history revision, six paths duplicating six that
   exist. A layer without a mask allocates nothing and fetches nothing: the
   sample is behind a **uniform** branch on `has_mask`, which is legal because
-  `textureSampleLevel` takes no derivatives. `MAX_SLOTS` is therefore *not*
-  `MAX_LAYERS` — the latter still sizes the uniform array.
+  `textureSampleLevel` takes no derivatives. `MAX_SLOTS` is therefore neither
+  `MAX_LAYERS` nor `MAX_DRAWS`; the second is what sizes the uniform array.
 - **Removing a mask parks its slice too**, for exactly the reason deleting a
   layer does: the slice would otherwise go back on the free list, and a patch
   naming a freed slot would replay into whatever inherited it. Both go through
@@ -910,6 +935,78 @@ are the contiguous run immediately below it whose `depth` is greater.
   of one document's array, so slot 3 is a different layer in every tab. And a
   slot that leaves the stack loses its picture, because slots are recycled.
 
+#### Layer effects
+
+`umber-core::effect` is the model and `docs/layer-effects.md` is the design.
+**Stage 0 only: nothing bakes, nothing draws.**
+
+- **`Outline` in code, "Stroke" in the interface.** `Stroke` is taken four times
+  over — `umber-core::stroke`, `StrokeBuilder`, `StrokeStyle`, and four
+  `stroke_*` fields of the composite's uniform — so no type, variant, field or
+  function under `umber-core` or `umber-render` may spell a *layer effect*
+  Stroke. The one place the interface's word appears is `EffectKind::label`, a
+  string rather than an identifier, which is what makes the rule enforceable.
+- **`Effect` is one flat `Copy` struct over every kind, not a variant per
+  kind.** That settles what effects cost a `Layer: Clone` and a structural undo
+  entry: a layer holds at most one per kind and each is a few dozen bytes with
+  no allocation in it. The cost is a field a kind ignores, which is what lets
+  the panel keep a shadow's angle while the row is switched to an outline and
+  back.
+- **`Layer::effects` is private and the invariant is the stack's.** At most one
+  per kind, always in composite order, maintained in `LayerStack::set_effect`
+  and `remove_effect`. Moving an outline from outside to inside moves its draw
+  *across* the layer, so the order cannot be settled once when an effect is
+  added; it is re-derived at the one gate that writes the field.
+- **`plan_set_effect` returns the vector to install rather than a verdict**,
+  with `can_set_effect` beside it — which makes "a refusal changes nothing at
+  all" structural rather than disciplined. It refuses an index off the end, a
+  **folder** (no coverage to derive from until group compositing lands), and the
+  budget. It is deliberately **not** gated on the lock: an effect's parameters
+  are a value on a layer exactly as its opacity is, and a layer's opacity is
+  neither lock-gated nor undoable.
+- **The cap governs *adding*; overflow is the draw path's.** `restore_shape`
+  puts a deleted layer back with its effects and consults no budget, because an
+  undo that refuses to undo is worse than a picture missing a shadow — and an
+  import, an open and a layer leaving a folder can all arrive over budget too.
+  So the draw path drops effects in a stated order and says the document is over
+  budget. `undoing_a_delete_may_take_a_document_over_the_effect_budget` pins it.
+- **`effect::MAX_ENABLED` is 127 and it is live in an ordinary document.** 64
+  layers × 2 kinds asks for 128 and the last is refused. It was 128 in the first
+  draft, from a `MAX_DRAWS` of 192 the device could not supply, and at that
+  figure nothing could reach it — one lower is the whole difference between a
+  guard nothing meets and a refusal somebody will. The derivation is a `const`
+  assert and not a comment, because the failure is **directional**: raising
+  `MAX` leaves the literal over the device's guarantee while only the harmless
+  direction trips an explained assertion.
+- **A flat struct over several kinds may not take a container
+  `#[serde(default)]`, and this is the generalisable one.** `Brush` can, because
+  it has one kind and one `Default` describes it. `Effect` cannot: filling an
+  absent field from a whole-struct default meant an *outline* written before a
+  parameter existed loading with the drop shadow's blend, softness and distance
+  — a blurred, Multiply outline the artist never set, silently, on the day the
+  parameter was added. Each field defaults to its own **neutral** instead, and
+  `kind` has no default at all, so a file that omits it is refused rather than
+  read as an arbitrary one. There is no `impl Default for Effect`.
+- **A struct's *field names* are a format too, not only its variant names.** The
+  rule already recorded for `BlendMode` covers half the mechanism. `Effect`'s
+  ten field names reach `umber/effects/<n>.ron`, a round trip is self-consistent
+  under any rename, and the per-field defaults turn an unrecognised field into a
+  **silence** rather than an error — so `#[serde(rename = "colour")]` on
+  `color`, the likely rename in a codebase whose convention is British spelling,
+  left every test green while an old file loaded with the colour gone. Pin the
+  whole serialised text as a literal.
+- **`Color` derives no serde and `effect::linear_rgba` is why it still does
+  not.** A derive there would make its four field names a format for every
+  future struct that happens to hold a colour, granted in advance to code nobody
+  has written. Linear `f32` rather than `Swatch`'s sRGB bytes, because an
+  effect's colour is painted with rather than stored — the same question the
+  palette asked and answered the other way.
+- **No `EditKind` variant and no `history::VERSION` bump.** An effect's
+  parameters are a value on a layer with no pixels behind them, exactly as a
+  layer's opacity is. `docs/layer-rename.md` is the standing design for the
+  `EditBody` arm that would make a layer's *values* undoable; if it is built,
+  effects join it.
+
 ### Documents
 
 Several documents are open at once. `Session` (`umber-app/src/session.rs`) holds
@@ -1030,6 +1127,16 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   what `brushes.ron` carries while leaving the `Debug` spelling untouched — one
   guard covering two mechanisms, and covering the second only because the
   derive and the `Debug` spelling agree today.
+  **The serde spelling now reaches a *document* as well, and the gap was real
+  until it did.** An `Effect` carries a `BlendMode` into
+  `umber/effects/<n>.ron`, where an unknown variant is a **hard parse error**
+  rather than a downgrade, and Multiply is the drop shadow's own default. Before
+  that, the only serde text anywhere was `builtin-brushes.ron`'s 252 `blend:`
+  fields — all `Normal` — so `#[serde(rename = "Mult")]` on `Multiply` left all
+  866 tests green. That was demonstrated by mutation, not argued.
+  `the_serialised_names_of_a_blend_mode_are_these_exact_strings` is the pin, and
+  it is the remedy this paragraph already prescribed applied to the mechanism it
+  already warned about.
   **The coverage observation is what survives the fix, and it generalises.**
   `builtin-brushes.ron` is `include_str!`'d and parsed by tests, and carries
   252 `blend:` fields — every one of them `Normal`. Nothing anywhere serialises
@@ -2023,6 +2130,15 @@ The rules, and they are cheap:
 
 - **Where a `match` would fail the build, do not write `matches!`.** Six arms
   cost nothing and turn a silent wrong answer into a compile error.
+- **An exhaustive `match` that returns a number forces a number, not a legal
+  one**, and the rule above does not cover it. `Effect::rank` is exhaustive over
+  kind and position, so a third kind cannot be added without giving it a rank —
+  and giving it rank 4 is the plausible slip, since `docs/layer-effects.md` §4's
+  own list puts *the layer* at 4. It would then be silently neither inner nor
+  outer, skipped by both `effects_below` and `effects_above`, and draw nothing.
+  `no_effect_ranks_where_the_layer_does` runs over both `ALL`s. This is the same
+  failure in numeric form: the compiler forced an answer and had no opinion
+  about which.
 - **An `ALL` array is guarded by an exhaustive match in a test, never by
   iterating itself** — a test that walks `ALL` can only ever check what is in
   it. Having the arms index `ALL` makes a short array an out-of-bounds panic,
