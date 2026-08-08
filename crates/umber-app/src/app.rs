@@ -1672,6 +1672,14 @@ impl UmberApp {
         // every point, so nothing already on the canvas moves by a millionth of
         // a pixel.
         let mut xf = was.placement.transform();
+        // **Where the old text is, taken before the reseat and not after.**
+        // `reseat` leaves the *map* identical for every point and deliberately
+        // changes the source rectangle, so `dest_rect` afterwards is the bounding
+        // box of the **new** block — which for a caption somebody shortened is
+        // smaller than the one on the canvas, and every letter outside it would
+        // be left standing. This is the rectangle to clear, so it has to be the
+        // one the old text occupies.
+        let old_rect = xf.dest_rect(doc);
         let source = umber_core::PixelRect {
             x: was.placement.source.x,
             y: was.placement.source.y,
@@ -1714,7 +1722,6 @@ impl UmberApp {
         // Everywhere the old text was and everywhere the new one is going. Too
         // tight on the first half leaves letters of the old caption standing;
         // too tight on the second is a mark that is never written.
-        let old_rect = xf.dest_rect(doc);
         let union = match old_rect {
             Some(old) => union_rect(old, new_rect),
             None => new_rect,
