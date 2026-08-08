@@ -5834,14 +5834,27 @@ fn an_inner_outline_is_confined_to_the_layers_own_alpha() {
 ///
 /// Width 8 throughout, so Centre reaches 4 each side and the three are told apart
 /// by where the band sits rather than by how wide it is.
+///
+/// **On a shape 48 texels across rather than [`SHAPE`]'s 16, and that is the whole
+/// reason this test caught anything.** A band of 8 inwards *fills* a 16-wide
+/// square — every interior texel is within 8 of some edge — so an Inside
+/// assertion against that shape cannot tell a band from a fill, and the middle
+/// assertion below would be vacuous. It is also why each span is checked to be a
+/// band and not merely to start in the right place.
 #[test]
 fn each_outline_position_draws_the_band_it_claims() {
     let mut h = harness_or_skip!();
-    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let wide = PixelRect {
+        x: 8,
+        y: 8,
+        width: 48,
+        height: 48,
+    };
+    h.write_block(0, wide, [255, 255, 255, 255]);
     let draw = layer(0, 1.0, BlendMode::Normal);
 
     // The run of texels along y = 32, up to the middle of the canvas, where the
-    // effect has alpha. The **left half only**: the square has a right edge with a
+    // effect has alpha. The **left half only**: the shape has a right edge with a
     // band of its own, and reading the whole row would report the two bands and
     // the gap between them as one span.
     let span = |h: &Harness, slot: u32| -> Option<(u32, u32)> {
@@ -5857,30 +5870,72 @@ fn each_outline_position_draws_the_band_it_claims() {
     let outside = span(&h, baked.draws[0].slot).expect("an outside band");
     assert_eq!(
         outside,
-        (16, 23),
-        "an outside band of 8 should run 16..23, up to but not into the shape"
+        (0, 7),
+        "an outside band of 8 should run 0..7, up to but not into the shape"
     );
 
-    // Centre: half in and half out, so it straddles x = 24. Four each side.
+    // Centre: half in and half out, so it straddles x = 8. Four each side.
     let ring = [outline(Color::WHITE, 8.0, OutlinePosition::Centre)];
     let baked = h.bake(&[effected(draw, &ring)], 1);
     let centre = span(&h, baked.draws[0].slot).expect("a centred band");
     assert_eq!(
         centre,
-        (20, 27),
-        "a centred band of 8 should straddle the edge at 24, four each side — \
-         a band of (16, 23) is an Outside wearing Centre's name, which is what a \
+        (4, 11),
+        "a centred band of 8 should straddle the edge at 8, four each side — a \
+         band of (0, 7) is an Outside wearing Centre's name, which is what a \
          blanket knockout forced"
     );
 
-    // Inside: entirely within the shape.
+    // Inside: entirely within the shape — and **the last draw, not the first.**
+    //
+    // An inside outline is the one position that composites *above* its layer, so
+    // `draws` is `[the layer, the effect]` where the other two are
+    // `[the effect, the layer]`. Reading `draws[0]` here reads the layer's own
+    // slice, whose first lit texel is the shape's own edge — which is the number
+    // this assertion wanted. **It passed by coincidence**, and marking
+    // `fs_grow`'s `SHAPE_INNER` arm with a constant is what proved it: the output
+    // did not move at all. A test that reads the wrong texture and agrees anyway
+    // is worth more scars than one that fails.
     let ring = [outline(Color::WHITE, 8.0, OutlinePosition::Inside)];
     let baked = h.bake(&[effected(draw, &ring)], 1);
-    let inside = span(&h, baked.draws[0].slot).expect("an inside band");
+    assert_eq!(baked.draws[0].slot, 0, "the layer composites first");
+    let slot = baked.draws[1].slot;
+    assert_ne!(slot, 0, "the inner effect has a slice of its own");
+    let inside: Vec<u32> = (8..32)
+        .filter(|x| slice_alpha(&h, slot, *x, 32) > 128)
+        .collect();
     assert_eq!(
-        inside,
-        (24, 31),
-        "an inside band of 8 should run 24..31, from the edge inwards"
+        (inside[0], *inside.last().expect("an inside band")),
+        (8, 15),
+        "an inside band of 8 should run 8..15, from the edge inwards"
+    );
+    // **A band and not a fill**, which is the assertion a 16-wide shape could not
+    // make: 32 is 24 texels from either edge, so an inward band of 8 must not
+    // reach it.
+    assert_eq!(
+        slice_alpha(&h, slot, 32, 32),
+        0,
+        "the inward band filled the shape instead of tracing its edge"
+    );
+
+    // **And the slice is deliberately lit *outside* the shape**, which is not a
+    // defect and is why the scan above starts at the edge. `SHAPE_INNER` returns
+    // the inward band whole: the flood is seeded on the *complement*, so an
+    // uncovered texel seeds itself, reads a distance of zero and comes out at full
+    // coverage. `LayerDraw::clipped` is what bounds it — the asymmetry §3.3's
+    // reversal keeps — and multiplying by the coverage here as well would apply
+    // the layer's alpha twice. `an_inner_outline_is_confined_to_the_layers_own_
+    // alpha` is the composite half of this and asserts the band does not escape.
+    assert_eq!(
+        slice_alpha(&h, slot, 2, 32),
+        255,
+        "the inward band is unconfined in the slice; the clip flag is what \
+         bounds it, and a slice that were already bounded would be applying the \
+         layer's alpha twice"
+    );
+    assert!(
+        baked.draws[1].clipped,
+        "and nothing bounds it unless the draw carries the clip"
     );
 }
 
