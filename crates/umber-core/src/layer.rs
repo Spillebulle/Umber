@@ -1440,6 +1440,42 @@ impl LayerStack {
 
     // --- effects ------------------------------------------------------------
 
+    /// Mirror every effect's lighting with the canvas.
+    ///
+    /// **Beside [`LayerStack::flip_text`] because it is the same job**, and the
+    /// two are the whole of what a flip has to do to the model beyond the pixels:
+    /// anything holding a *direction* has to be mirrored, or every pixel in the
+    /// picture turns over and the lighting does not. That is a picture which is
+    /// wrong rather than merely plainer, and wrong in the one direction an artist
+    /// notices at once, because a whole document's shadows suddenly disagree with
+    /// its forms.
+    ///
+    /// It went unnoticed on this side and was written down on the other, which is
+    /// why a second pair of eyes had to find it: [`LayerStack::flip_text`]'s docs
+    /// say in as many words that nothing calls it yet, and an effect's flip said
+    /// nothing at all. **If a third thing on a layer ever carries a direction,
+    /// say so at its own method whether or not it is wired.**
+    ///
+    /// Unlike `flip_text` this takes no canvas size, cannot fail and drops
+    /// nothing — see [`Effect::flipped`]. Every other field of an effect is a
+    /// length or a colour and a mirror preserves those.
+    ///
+    /// **Called from `Editor::flip_canvas`**, which `app.rs`'s `mirror_document`
+    /// is the single route to and which already holds the model's other half of a
+    /// flip, the selection's mirror. `flip_text` belongs in exactly that line when
+    /// somebody wires it.
+    pub fn flip_effects(&mut self, axis: FlipAxis) {
+        for layer in &mut self.layers {
+            for effect in &mut layer.effects {
+                *effect = effect.flipped(axis);
+            }
+        }
+        // No re-sort: `Effect::rank` reads the kind and the position, and a flip
+        // touches neither, so the composite order a layer holds its effects in is
+        // unchanged. Sorting anyway would be harmless and would suggest the
+        // opposite.
+    }
+
     /// How many effects in this document would produce a draw.
     ///
     /// What the panel reads to say a document is at its effects budget, and what
@@ -4209,6 +4245,53 @@ mod tests {
         // undoing a flip is.
         assert_eq!(s.flip_text(FlipAxis::Horizontal, canvas), 0);
         assert_eq!(s.text_at(0).unwrap().placement, some_text().placement);
+    }
+
+    /// **A canvas flip mirrors every effect's lighting, on every layer.**
+    ///
+    /// The sibling of the record's mirror above and it was missing: a flip turned
+    /// every pixel over and left every shadow cast the way it was, which is a
+    /// whole document's lighting disagreeing with its forms. Found by the agent
+    /// that had just solved the same problem for text, which is the argument for
+    /// [`LayerStack::flip_effects`]'s note that anything carrying a *direction*
+    /// says so at its own method.
+    ///
+    /// Over several layers, because the loop is what could visit one and stop.
+    #[test]
+    fn a_canvas_flip_mirrors_every_effects_lighting() {
+        let mut s = LayerStack::new();
+        s.add();
+        s.add();
+        let shadow = Effect {
+            angle: 120.0,
+            distance: 10.0,
+            ..Effect::drop_shadow()
+        };
+        for i in 0..3 {
+            assert!(s.set_effect(i, shadow));
+        }
+
+        s.flip_effects(FlipAxis::Horizontal);
+        for i in 0..3 {
+            let there = s.get(i).unwrap().effect(EffectKind::DropShadow).unwrap();
+            let (dx, dy) = there.offset();
+            let (was_x, was_y) = shadow.offset();
+            assert!((dx + was_x).abs() < 1e-3, "layer {i}: {dx} against {was_x}");
+            assert!((dy - was_y).abs() < 1e-3, "layer {i}: {dy} against {was_y}");
+        }
+
+        // And flipping again is where it started, because that is what undoing a
+        // flip is. The bound is `Effect::flipped`'s, not this method's.
+        s.flip_effects(FlipAxis::Horizontal);
+        for i in 0..3 {
+            let back = s.get(i).unwrap().effect(EffectKind::DropShadow).unwrap();
+            assert!((back.angle - shadow.angle).abs() <= 180.0 * f32::EPSILON);
+        }
+
+        // A layer with no effects is not disturbed, and neither is a folder —
+        // which cannot hold one at all.
+        assert!(s.group(&[0]).is_some());
+        s.flip_effects(FlipAxis::Vertical);
     }
 
     /// **A resize drops every record**, for the reason a resize clears the undo

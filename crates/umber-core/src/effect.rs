@@ -5,18 +5,20 @@
 //! parameters stay editable, and the file carries the parameters rather than the
 //! result. `docs/layer-effects.md` is the design and has the whole argument.
 //!
-//! **This is stage 0 and it is inert.** Nothing here produces a draw, allocates
-//! a slice or reaches a shader; what it is for is that everything structural —
-//! the parameter set, the ordering, the refusals and the serialised spelling —
-//! is settled and testable before a single pass is written. A document with no
-//! effects produces exactly the draw list it produced before, entry for entry,
-//! because nothing reads any of this yet.
+//! **This is the model and nothing here reaches a shader**, which is what makes
+//! the parameter set, the ordering, the refusals and the serialised spelling
+//! settled and testable without a device. It used to say the whole feature was
+//! inert, and that was true of stage 0 and is not true now: `umber-render`'s
+//! `bake_effects` reads [`Effect`] and produces a `LayerDraw` per enabled one, so
+//! everything below is live. The interface that would let somebody *make* one is
+//! stage 2 and is not built, so today an effect arrives from a file.
 //!
 //! §12 describes stage 0 as emitting `LayerDraw`s that point at slices holding
-//! nothing, shipped disabled behind an empty effect set. **Nothing here emits a
-//! draw at all**, which is the same guarantee with one fewer moving part: an
-//! empty set is a state a control could leave, where a module the composite has
-//! never heard of cannot be. The draws arrive with the bake.
+//! nothing, shipped disabled behind an empty effect set. It never did: a document
+//! with no effects produced exactly the draw list it produced before, entry for
+//! entry, and still does — the same guarantee with one fewer moving part, since
+//! an empty set is a state a control could leave where a module the composite has
+//! never heard of cannot be.
 //!
 //! # `Outline` in code, "Stroke" in the interface
 //!
@@ -447,6 +449,48 @@ impl Effect {
         let (sin, cos) = self.angle.to_radians().sin_cos();
         (-self.distance * cos, self.distance * sin)
     }
+
+    /// This effect as it should be on a canvas mirrored about `axis`.
+    ///
+    /// **A flip mirrors every pixel in the picture and it has to mirror the
+    /// lighting with them.** Nothing else on an [`Effect`] is geometry — a spread,
+    /// a softness and a distance are lengths and a mirror preserves lengths — so
+    /// the whole of it is the angle, and there is no way for this to fail and no
+    /// canvas size to pass in. That is what makes it a plain `Self` where
+    /// [`crate::textobj::Placement::flipped`] is an `Option`: a text record
+    /// carries a *rectangle*, which can be outside a canvas it is asked to mirror
+    /// inside, and an effect carries a direction, which cannot.
+    ///
+    /// The derivation, once, because getting it backwards is a whole document's
+    /// shadows disagreeing with its forms and nothing in the code would say so.
+    /// [`Effect::offset`] is `(-d·cos a, d·sin a)`. A mirror about the **x** axis
+    /// negates the displacement's `x`, so `cos a' = -cos a` and `sin a' = sin a`,
+    /// which is `a' = 180 - a`; a mirror about **y** negates its `y`, giving
+    /// `cos a' = cos a` and `sin a' = -sin a`, which is `a' = -a`.
+    ///
+    /// **Exactness is the requirement rather than a nicety, for the reason
+    /// `flip.wgsl` is an exact texel permutation: undoing a flip *is* another
+    /// flip**, so anything lost here has no other route back. The vertical case
+    /// meets it — a negation is exact for every `f32` there is. **The horizontal
+    /// case does not**, and that was measured rather than assumed: `180 - a` is
+    /// exact only for `a` in `[90, 360]`, so `180.0 - (180.0 - 0.1)` is
+    /// `0.100006`. The error is at most half an ulp of 180, does not compound, and
+    /// comes to a hundredth of a pixel over the longest displacement a canvas can
+    /// hold. `flipping_a_canvas_twice_restores_an_effects_angle` states the bound
+    /// and says why the exact alternative — negating the angle *and* the distance,
+    /// both exact — was rejected.
+    ///
+    /// Nothing about a *selection*'s flip applies: that one re-rasterises rings
+    /// and keeps a hard mirror so a feather cannot dissolve the rebuilt shape.
+    /// An effect is derived from the layer's own coverage every frame, so the
+    /// mirrored pixels are the mirrored input and there is nothing to rebuild.
+    pub fn flipped(self, axis: crate::geom::FlipAxis) -> Self {
+        let angle = match axis {
+            crate::geom::FlipAxis::Horizontal => 180.0 - self.angle,
+            crate::geom::FlipAxis::Vertical => -self.angle,
+        };
+        Self { angle, ..self }
+    }
 }
 
 /// How an [`Effect`]'s colour is written down: the four **linear** components,
@@ -848,6 +892,130 @@ mod tests {
             ..shadow
         };
         assert_eq!(still.offset(), (0.0, 0.0));
+    }
+
+    /// A flip mirrors the lighting, and the displacement it produces is the
+    /// mirror of the one it produced before.
+    ///
+    /// Stated over [`Effect::offset`] rather than over the angle, because the
+    /// angle is a *spelling* of the displacement and the displacement is what the
+    /// bake reads — an assertion on the number would pass for a convention that
+    /// had been silently redefined. The default 120° is a light from the upper
+    /// left, so the shadow falls down and to the right; mirrored horizontally it
+    /// must fall down and to the *left*, and vertically up and to the right.
+    #[test]
+    fn flipping_a_canvas_mirrors_the_light_an_effect_falls_from() {
+        use crate::geom::FlipAxis;
+
+        let shadow = Effect {
+            distance: 10.0,
+            ..Effect::drop_shadow()
+        };
+        let (dx, dy) = shadow.offset();
+        assert!(dx > 0.0 && dy > 0.0, "the default falls down and right");
+
+        let (mx, my) = shadow.flipped(FlipAxis::Horizontal).offset();
+        assert!((mx + dx).abs() < 1e-4, "{mx} against {dx}");
+        assert!((my - dy).abs() < 1e-4, "{my} against {dy}");
+
+        let (mx, my) = shadow.flipped(FlipAxis::Vertical).offset();
+        assert!((mx - dx).abs() < 1e-4, "{mx} against {dx}");
+        assert!((my + dy).abs() < 1e-4, "{my} against {dy}");
+
+        // Every other field is a length or a colour, and a mirror preserves
+        // those. Asserted so that a field added later is noticed here rather than
+        // silently carried or silently mirrored.
+        for axis in [FlipAxis::Horizontal, FlipAxis::Vertical] {
+            let there = shadow.flipped(axis);
+            assert_eq!(
+                Effect {
+                    angle: shadow.angle,
+                    ..there
+                },
+                shadow,
+                "a flip changed something other than the angle"
+            );
+        }
+    }
+
+    /// Flipping twice restores the angle — **bit for bit on one axis and within
+    /// half an ulp of 180 on the other**, and the difference was measured rather
+    /// than reasoned about.
+    ///
+    /// Undoing a flip *is* another flip — the reason `flip.wgsl` is an exact texel
+    /// permutation — so anything lost here compounds every time somebody flips and
+    /// undoes, and there is no other route back. So the requirement is exactness,
+    /// and this test is where the honest answer had to replace the expected one.
+    ///
+    /// **The vertical axis is `-a`, a negation, and is exact for every `f32` there
+    /// is.** The horizontal axis is `180 - a` and is *not*: by Sterbenz the
+    /// subtraction is exact for `a` in `[90, 360]`, and outside that it rounds —
+    /// `180.0 - (180.0 - 0.1)` is `0.100006`. Naming this test "exactly" and
+    /// asserting a tolerance would be `CLAUDE.md`'s "a guard's comment must not
+    /// claim more reach than the mutation demonstrates", so the name says what is
+    /// true and the bound is **derived** rather than picked: the error is at most
+    /// half an ulp of 180, which is `180 · f32::EPSILON / 2`, and the assertion
+    /// uses the whole ulp for slack.
+    ///
+    /// **It does not compound.** `f(a) = 180 - a` is its own near-inverse, so a
+    /// pair of flips adds at most one ulp and a thousand of them add at most five
+    /// hundred — 0.008 of a degree, which over the longest displacement a canvas
+    /// can hold is a hundredth of a pixel. That is the reason a bounded error is
+    /// acceptable here where a bounded error in `flip.wgsl` would not be: the
+    /// shader's would be re-quantised into eight bits every time.
+    ///
+    /// An exact horizontal mirror **is** available and was rejected: negate the
+    /// angle *and* the distance, both of which are exact, and the displacement
+    /// comes out identical. It makes `distance` negative, which
+    /// [`effect_marks_nothing`](crate::effect) reads as no reach — so a hard offset
+    /// shadow would stop drawing the moment somebody flipped the canvas — and it
+    /// puts a sign convention nobody asked for into the file and onto the panel's
+    /// own readout. A hundredth of a pixel is the better trade.
+    ///
+    /// The sweep carries angles the interface can produce and a file can hold:
+    /// tenths, values either side of Sterbenz's boundary, a value near zero, and
+    /// values past a full turn in both directions.
+    #[test]
+    fn flipping_a_canvas_twice_restores_an_effects_angle() {
+        use crate::geom::FlipAxis;
+
+        // One ulp of 180 in `f32`: 1.526e-5 of a degree.
+        let slack = 180.0 * f32::EPSILON;
+
+        for angle in [
+            0.0, 0.1, -0.1, 1.0, 37.5, 45.0, 89.9, 90.0, 120.0, 179.9, 180.0, 270.0, 359.9, 360.0,
+            720.0, -400.0, 1e-6,
+        ] {
+            let effect = Effect {
+                angle,
+                distance: 1000.0,
+                ..Effect::drop_shadow()
+            };
+
+            let back = effect
+                .flipped(FlipAxis::Vertical)
+                .flipped(FlipAxis::Vertical);
+            assert_eq!(back.angle, angle, "vertical is a negation, so at {angle}");
+
+            let back = effect
+                .flipped(FlipAxis::Horizontal)
+                .flipped(FlipAxis::Horizontal);
+            assert!(
+                (back.angle - angle).abs() <= slack,
+                "horizontal, at {angle}: came back {} , which is over one ulp of \
+                 180 out",
+                back.angle
+            );
+            // And the displacement it produces with it, because the angle is a
+            // spelling of that and a bound on one is not a bound on the other.
+            // A thousand pixels of displacement, so this is in the same units a
+            // canvas is.
+            let ((ax, ay), (bx, by)) = (effect.offset(), back.offset());
+            assert!(
+                (ax - bx).abs() < 1e-3 && (ay - by).abs() < 1e-3,
+                "horizontal, at {angle}: ({ax}, {ay}) became ({bx}, {by})"
+            );
+        }
     }
 
     /// The budget's boundary as arithmetic. `layer.rs`'s tests are what meet it
