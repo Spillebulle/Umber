@@ -4500,6 +4500,33 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 mod tests {
     use super::*;
 
+    /// The behavioural half of the guard below, and the half that was missing.
+    ///
+    /// That one is textual and catches the `effects:` line being deleted. It is
+    /// defeated by `effects: &[]`, which still names the field — and which is
+    /// both what this path held before it was wired and what
+    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
+    /// directions: neutering the value fails *this* test and passes that one;
+    /// deleting the line fails that one and passes this.
+    #[test]
+    fn a_save_carries_the_effects_the_layer_holds() {
+        let mut stack = umber_core::LayerStack::new();
+        assert!(
+            stack.set_effect(0, umber_core::Effect::drop_shadow()),
+            "the model should accept one effect on a fresh layer"
+        );
+
+        let layer = &stack.layers()[0];
+        assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
+
+        let written = save_layer(layer, &[], None);
+        assert_eq!(
+            written.effects,
+            layer.effects(),
+            "a Save must write the effects the layer is holding, not an empty slice",
+        );
+    }
+
     /// **Every writer of a `SaveLayer` states its effects, and this is a text
     /// guard on purpose.**
     ///
@@ -4550,33 +4577,6 @@ mod tests {
     ///   on it), which is the stronger guard and the reason the weaker one is
     ///   only asked to carry the writer that cannot have one.
     #[test]
-    /// The behavioural half of the guard below, and the half that was missing.
-    ///
-    /// That one is textual and catches the `effects:` line being deleted. It is
-    /// defeated by `effects: &[]`, which still names the field — and which is
-    /// both what this path held before it was wired and what
-    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
-    /// directions: neutering the value fails *this* test and passes that one;
-    /// deleting the line fails that one and passes this.
-    #[test]
-    fn a_save_carries_the_effects_the_layer_holds() {
-        let mut stack = umber_core::LayerStack::new();
-        assert!(
-            stack.set_effect(0, umber_core::Effect::drop_shadow()),
-            "the model should accept one effect on a fresh layer"
-        );
-
-        let layer = &stack.layers()[0];
-        assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
-
-        let written = save_layer(layer, &[], None);
-        assert_eq!(
-            written.effects,
-            layer.effects(),
-            "a Save must write the effects the layer is holding, not an empty slice",
-        );
-    }
-
     fn every_writer_of_a_save_layer_states_its_effects() {
         // **Everything from `#[cfg(test)]` on is cut off first, and that is
         // not tidiness.** This test's own body names both strings it counts,
