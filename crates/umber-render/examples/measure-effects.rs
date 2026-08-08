@@ -377,8 +377,8 @@ struct Cfg {
     reach: f32,
 }
 
-// SAFETY: `#[repr(C)]`, no padding beyond the explicit `_pad`, all members are
-// plain old data.
+// SAFETY: `#[repr(C)]`, the trailing `reach` keeps the size a multiple of 16
+// with no implicit padding anywhere, and all members are plain old data.
 unsafe impl bytemuck::Zeroable for Cfg {}
 unsafe impl bytemuck::Pod for Cfg {}
 
@@ -1200,7 +1200,12 @@ impl<'a> Shadow<'a> {
         let cfg = |radius: i32, axis: u32| cfg_blur(self.size, radius, axis);
         let mut resolve = cfg(0, 0);
         resolve.width = width as f32;
-        resolve.reach = 2.0 * r as f32;
+        // `2r + 1` rather than `2r`, matching the picture path: the tent is two
+        // *discrete* boxes of `2r + 1` taps, so its continuous half support is
+        // a texel wider than twice the box radius. It moves no timing, and the
+        // point of matching exactly is that "the stroke that was timed is the
+        // stroke that was drawn" should not be something anybody has to check.
+        resolve.reach = 2.0 * r as f32 + 1.0;
         time(gpu, |enc| {
             let steps: [(&wgpu::TextureView, &wgpu::TextureView, u32); 4] = [
                 (&self.cov, &self.wide_a, 0),
@@ -1252,7 +1257,7 @@ impl<'a> Shadow<'a> {
         resolve.width = width as f32;
         // Four times the small-texel reach, because the distance recovered from
         // it is read in full-resolution texels.
-        resolve.reach = 8.0 * r as f32;
+        resolve.reach = 4.0 * (2.0 * r as f32 + 1.0);
         time(gpu, |enc| {
             let steps: [(&wgpu::TextureView, &wgpu::TextureView, u32); 4] = [
                 (&self.small_wide_a, &self.small_wide_b, 0),
@@ -1456,19 +1461,21 @@ fn blur_radius_for(width: u32, factor: f32) -> i32 {
     ((width as f32 * factor).round() as i32).max(floor).max(1)
 }
 
-/// The factor the timed columns and the headline pictures use.
+/// The factor the timed columns use.
 ///
-/// **Chosen off the sweep, and it is a minimum rather than an end of the
-/// range** — which matters, because "the tightest setting" would be a
-/// suspicious answer and this is not it. Below about `h = 1.1w` the corner
-/// stops being cut and starts *bulging*: at `h = 1.02w` a 64 px stroke puts a
-/// right angle 78.7 px out where a disc puts it at 64. 0.55 lands on `h/w` of
-/// 1.11 to 1.15 across 8, 20 and 64 px, and at every one of those it is the
-/// smallest mean difference from the flood the sweep finds.
+/// **A minimum rather than an end of the range**, which matters because "the
+/// tightest setting" would be a suspicious answer and this is not it. Below
+/// about `h = 1.1w` the corner stops being cut and starts *bulging*: at
+/// `h = 1.02w` a 64 px stroke puts a right angle 82.5 px out where a disc puts
+/// it at 64.
 ///
-/// It is also the cheapest useful setting, since a box pass is `2r + 1` taps —
-/// so the method is timed at its best rather than at its worst, which is the
-/// only way the cost column means anything.
+/// It is what `pictures::radius_sweep` independently picks at all four widths
+/// measured — `r` of 1, 4, 11 and 35 at widths 2, 8, 20 and 64 — judged on the
+/// worst any one feature is out by rather than on a mean over the picture. So
+/// the stroke that is timed here is the same stroke the pictures draw, and it
+/// is the method at its best rather than at a setting chosen to flatter the
+/// conclusion. Being also the cheapest of the useful settings, since a box pass
+/// is `2r + 1` taps, the cost column is generous to it too.
 const BLUR_FACTOR: f32 = 0.55;
 
 fn cfg_blur(size: u32, radius: i32, axis: u32) -> Cfg {
@@ -1748,7 +1755,7 @@ mod pictures {
             bench: &Bench,
             build: impl FnOnce(&mut wgpu::CommandEncoder),
         ) -> (Field, Field) {
-            // 512 x 4 is 2048, a multiple of the 256-byte row alignment, so
+            // 768 x 4 is 3072, a multiple of the 256-byte row alignment, so
             // there is no padding to unpick. Asserted rather than assumed: a
             // later size that is not would read back as diagonal stripes and
             // look like a shader bug.
@@ -1959,25 +1966,70 @@ mod pictures {
 
     const STEP: f32 = 0.02;
 
+    /// How far a stroke reaches along a ray — or why that cannot be said.
+    ///
+    /// **The two failures are opposites and reporting both as "none" is how a
+    /// false headline gets written.** Under a loose kernel the thin limb's
+    /// reading was "none" and the sentence attached to it was "no stroke around
+    /// the limb"; the picture showed the limb *engulfed* in the body's own
+    /// stroke, which is the other end of the same scale. They also point
+    /// opposite ways for the calibration below, which is what sent it to a
+    /// clamp and printed the rail as an answer.
+    #[derive(Clone, Copy)]
+    enum Reach {
+        At(f32),
+        /// Nothing on this ray is more than half covered.
+        None_,
+        /// The ray never leaves the stroke, so its far edge is past the window.
+        Engulfed,
+    }
+
+    impl Reach {
+        /// As a width the calibration can order. Zero and infinity, because
+        /// that is what the two failures *mean* — a stroke narrower than
+        /// anything and one wider than the window.
+        fn width(self) -> f32 {
+            match self {
+                Self::At(t) => t,
+                Self::None_ => 0.0,
+                Self::Engulfed => f32::INFINITY,
+            }
+        }
+
+        fn found(self) -> Option<f32> {
+            match self {
+                Self::At(t) => Some(t),
+                _ => None,
+            }
+        }
+    }
+
     /// Where the stroke's outer contour crosses a half, along a ray.
     ///
     /// The *outermost* crossing, not the first. An outer stroke is knocked out
     /// under the layer, so a ray starting at the shape's own edge begins in a
     /// texel that is half inside and reads below a half; taking the first
     /// crossing would measure the knockout instead of the stroke.
-    fn contour(f: &Field, origin: (f32, f32), dir: (f32, f32), max_t: f32) -> Option<f32> {
+    fn contour(f: &Field, origin: (f32, f32), dir: (f32, f32), max_t: f32) -> Reach {
+        let at = |t: f32| f.at(origin.0 - 0.5 + dir.0 * t, origin.1 - 0.5 + dir.1 * t);
         let mut answer = None;
-        let mut prev = (0.0f32, f.at(origin.0 - 0.5, origin.1 - 0.5));
+        let mut peak: f32 = at(0.0);
+        let mut prev = (0.0f32, peak);
         let mut t = STEP;
         while t <= max_t {
-            let v = f.at(origin.0 - 0.5 + dir.0 * t, origin.1 - 0.5 + dir.1 * t);
+            let v = at(t);
+            peak = peak.max(v);
             if prev.1 >= 0.5 && v < 0.5 {
                 answer = Some(prev.0 + STEP * cross(prev.1, v));
             }
             prev = (t, v);
             t += STEP;
         }
-        answer
+        match answer {
+            Some(t) => Reach::At(t),
+            None if peak >= 0.5 => Reach::Engulfed,
+            None => Reach::None_,
+        }
     }
 
     /// Where between two samples the half lies, as a fraction of the step.
@@ -1992,15 +2044,44 @@ mod pictures {
 
     /// Everything one bake is judged on, in pixels.
     struct Probe {
-        axis: Option<f32>,
-        corner: Option<f32>,
-        apex: Option<f32>,
-        diagonal: Option<f32>,
-        limb_span: Option<f32>,
+        axis: Reach,
+        corner: Reach,
+        apex: Reach,
+        diagonal: Reach,
+        limb_span: Reach,
         hole_fill: f32,
     }
 
     const ROOT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    impl Probe {
+        /// The worst any one feature is out by, in pixels, against what a true
+        /// disc would draw.
+        ///
+        /// **The selector is stated because it decides the answer.** The
+        /// obvious one — mean absolute alpha against the flood — is dominated
+        /// by the area where both methods agree by construction, so it rewards
+        /// a setting that is nearly right over most of the picture and badly
+        /// wrong at four corners. This is the pessimistic reading instead, and
+        /// the two do not always pick the same row.
+        ///
+        /// The apex is **excluded**, and not because it is inconvenient: the
+        /// spike rasterises short of its own point, so there is no ideal to
+        /// measure against. Including it would drive the choice to the floor of
+        /// the kernel range, where the apex is best and the corner bulges by a
+        /// quarter of the stroke's width. The axis is excluded because it is
+        /// what was tuned.
+        fn worst_error(&self, width: u32) -> f32 {
+            let w = width as f32;
+            let off = |r: Reach, ideal: f32| match r {
+                Reach::At(t) => (t - ideal).abs(),
+                _ => f32::INFINITY,
+            };
+            off(self.corner, w)
+                .max(off(self.diagonal, w))
+                .max(off(self.limb_span, 5.0 + 2.0 * w))
+        }
+    }
 
     /// How far out to march. Two widths plus a margin: the contour sits at
     /// about one width and nothing here is interested in a stroke that
@@ -2012,20 +2093,19 @@ mod pictures {
     /// The half-plane's edge, on the calibration picture. This is what a reach
     /// is tuned against, and both methods have to answer the width they were
     /// asked for here or nothing else in the table is a comparison.
-    fn flat_contour(f: &Field, width: u32) -> Option<f32> {
+    fn flat_contour(f: &Field) -> Reach {
         // The covered half is the *left* one, so the outward ray runs right.
-        contour(
-            f,
-            (FLAT_EDGE, FLAT_EDGE + 0.5),
-            (1.0, 0.0),
-            ray_reach(width),
-        )
+        //
+        // A wider window than the probes use, because the search below tries
+        // reaches that put the contour a long way out and has to be able to
+        // see how far rather than only that it missed.
+        contour(f, (FLAT_EDGE, FLAT_EDGE + 0.5), (1.0, 0.0), FLAT_EDGE - 8.0)
     }
 
     /// The same reading on the shape's own left edge. Not the calibration —
     /// what it shows is how far a finite body moves an answer the half-plane
     /// gets exactly right, which at 64 px is most of a pixel.
-    fn axis_contour(f: &Field, width: u32) -> Option<f32> {
+    fn axis_contour(f: &Field, width: u32) -> Reach {
         contour(f, (OFF + 40.0, OFF + 160.5), (-1.0, 0.0), ray_reach(width))
     }
 
@@ -2041,8 +2121,15 @@ mod pictures {
             // own answer is the reference. What the column is for is the
             // categorical reading: whether a stroke appears there at all.
             apex: contour(f, (OFF + 480.0, OFF + 88.0), (1.0, 0.0), reach),
-            // On the capsule's upper-left flank, at its midpoint, along the
-            // normal.
+            // On the capsule's lower-left flank, at its midpoint, along the
+            // normal — y runs down, so the offset that looks like "up" is not.
+            //
+            // Like the corner's ray, this one carries about a fifth of a pixel
+            // of the probe's own residual: the flood's nearest seed on a
+            // diagonal is `t + 0.707` away rather than `t + 0.5`, so the half
+            // texel `fs_stroke_probe` takes off leaves 0.21 short. It is why
+            // the flood reads 19.78 and 63.79 against an ideal of 20 and 64,
+            // and it is the probe rather than the flood.
             diagonal: contour(
                 f,
                 (
@@ -2059,15 +2146,19 @@ mod pictures {
 
     /// How wide the stroke around the five-texel limb comes out, outer edge to
     /// outer edge. A true disc answers `5 + 2w`.
-    fn limb_span(f: &Field, width: u32) -> Option<f32> {
+    fn limb_span(f: &Field, width: u32) -> Reach {
         let y = OFF + 350.0 - 0.5;
         let (mut left, mut right) = (None, None);
         let start = OFF + 58.0 - width as f32 - 10.0;
         let end = OFF + 63.0 + width as f32 + 10.0;
         let mut x = start;
         let mut prev = f.at(x - 0.5, y);
+        let mut peak: f32 = prev;
+        let mut floor: f32 = prev;
         while x <= end {
             let v = f.at(x - 0.5, y);
+            peak = peak.max(v);
+            floor = floor.min(v);
             if prev < 0.5 && v >= 0.5 && left.is_none() {
                 left = Some(x - STEP * cross(v, prev));
             }
@@ -2078,8 +2169,15 @@ mod pictures {
             x += STEP;
         }
         match (left, right) {
-            (Some(l), Some(r)) if r > l => Some(r - l),
-            _ => None,
+            (Some(l), Some(r)) if r > l => Reach::At(r - l),
+            // The window is entirely inside the stroke: the limb is swallowed
+            // by something larger, not bare. Under a loose kernel this was the
+            // *usual* answer at 64 px and it read as the opposite.
+            _ if floor >= 0.5 => Reach::Engulfed,
+            _ if peak < 0.5 => Reach::None_,
+            // One edge only, which is the engulfed case seen from a window
+            // that happens to clear the stroke on one side.
+            _ => Reach::Engulfed,
         }
     }
 
@@ -2208,8 +2306,13 @@ mod pictures {
         (out, side)
     }
 
-    fn px(v: Option<f32>) -> String {
-        v.map_or_else(|| "none".into(), |v| format!("{v:.2}"))
+    /// "none" and "engulfed" are opposite answers and must not print alike.
+    fn px(v: Reach) -> String {
+        match v {
+            Reach::At(t) => format!("{t:.2}"),
+            Reach::None_ => "none".into(),
+            Reach::Engulfed => "engulf".into(),
+        }
     }
 
     /// Tune a blur path's reach until a straight axis-aligned edge comes out at
@@ -2230,24 +2333,89 @@ mod pictures {
     /// Nothing tunes the jump flood. Its distance is exact by construction and
     /// the calibration column proves it: it reads the width asked for without
     /// any parameter having been moved.
-    fn calibrate(target: u32, guess: f32, mut axis: impl FnMut(f32) -> Option<f32>) -> f32 {
-        let want = target as f32;
-        let (mut x0, mut x1) = (guess, guess * 1.15);
-        let mut y0 = axis(x0).unwrap_or(0.0);
-        for _ in 0..10 {
-            let y1 = axis(x1).unwrap_or(0.0);
-            if (y1 - want).abs() < 0.005 {
-                return x1;
-            }
-            let next = if (y1 - y0).abs() > 1e-4 {
-                x1 + (want - y1) * (x1 - x0) / (y1 - y0)
-            } else {
-                x1 * 1.1
-            };
-            (x0, y0) = (x1, y1);
-            x1 = next.clamp(guess * 0.2, guess * 5.0);
+    /// A tuned reach and the width it actually produced.
+    ///
+    /// The second half is not diagnostics for its own sake. A path whose
+    /// calibration does not converge is one that cannot draw the width it was
+    /// asked for *at all*, and every figure measured off it afterwards is
+    /// meaningless — so the caller has to be able to say so rather than print
+    /// numbers. The quarter-resolution path fails here at ordinary widths, and
+    /// finding that out took an hour of reading a table that looked merely
+    /// poor.
+    struct Tuned {
+        reach: f32,
+        got: Reach,
+    }
+
+    impl Tuned {
+        fn converged(&self, target: u32) -> bool {
+            self.got
+                .found()
+                .is_some_and(|g| (g - target as f32).abs() < 0.05)
         }
-        x1
+    }
+
+    /// Bracket, then bisect, on the width the picture actually shows.
+    ///
+    /// It was a secant on `axis(x).unwrap_or(0.0)`, and that was wrong in a way
+    /// that produced plausible numbers rather than an error. A reach too small
+    /// makes the recovered distance never reach the stroke's own width, so the
+    /// whole of the kernel's support comes out solid and the ray finds no
+    /// crossing — a `None` meaning *infinitely wide*, scored there as **zero**,
+    /// which is the exact opposite. The search then ran away, was clamped to
+    /// `guess * 5`, and printed the rail as a result: the quarter-resolution
+    /// path's "reach 120.0" was that, and the table under it was a measurement
+    /// of nothing.
+    ///
+    /// The width is monotone decreasing in the reach — a longer reach maps the
+    /// same blurred value to a larger distance, so the contour comes in — so a
+    /// bracket and a bisection need no derivative and cannot run away. `Reach`
+    /// is what orders the two failures for it: nothing is zero, engulfed is
+    /// infinity.
+    fn calibrate(target: u32, guess: f32, mut axis: impl FnMut(f32) -> Reach) -> Tuned {
+        let want = target as f32;
+
+        // Widen until the answer is bracketed: too wide at `lo`, too narrow at
+        // `hi`. Sixteen steps at these ratios covers a factor of several
+        // hundred either way, which is far more than any kernel here is out by.
+        let mut lo = guess;
+        let mut lo_w = axis(lo).width();
+        for _ in 0..16 {
+            if lo_w >= want {
+                break;
+            }
+            lo *= 0.75;
+            lo_w = axis(lo).width();
+        }
+        let mut hi = lo.max(guess);
+        let mut hi_w = axis(hi).width();
+        for _ in 0..16 {
+            if hi_w <= want {
+                break;
+            }
+            hi *= 1.35;
+            hi_w = axis(hi).width();
+        }
+        if lo_w < want || hi_w > want {
+            return Tuned {
+                reach: guess,
+                got: axis(guess),
+            };
+        }
+
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if axis(mid).width() > want {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let reach = 0.5 * (lo + hi);
+        Tuned {
+            reach,
+            got: axis(reach),
+        }
     }
 
     fn row(w: &str, m: &str, p: &Probe, worst: Option<f32>, mean: Option<f32>) {
@@ -2282,23 +2450,54 @@ mod pictures {
     /// blurred value and an edge's have not yet diverged. It is also cheaper
     /// there. What bounds it is the floor at `w/2`, below which the recovered
     /// distance cannot reach the contour at all.
-    fn radius_sweep(gpu: &Gpu, bench: &Bench, t: &Targets, flat: &Targets, w: u32) {
+    fn radius_sweep(gpu: &Gpu, bench: &Bench, t: &Targets, flat: &Targets, w: u32) -> Option<i32> {
         println!("  {w} px, blur 16-bit at full resolution, across kernel widths:");
         println!(
-            "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7}",
-            "h/w", "box r", "axis", "corner", "apex", "diagonal", "limb span", "hole", "mean d",
+            "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7} {:>7}",
+            "h/w",
+            "box r",
+            "axis",
+            "corner",
+            "apex",
+            "diagonal",
+            "limb span",
+            "hole",
+            "worst",
+            "mean d",
         );
+        let mut best: Option<(f32, i32)> = None;
         let (jfa, _) = t.jfa(gpu, bench, w);
+        // A radius is a whole number of texels, so at a small width several
+        // factors land on the same kernel. Printing the row four times would
+        // read as four measurements agreeing.
+        let mut seen = None;
         for factor in FACTORS {
             let r = blur_radius_for(w, factor);
+            if seen == Some(r) {
+                continue;
+            }
+            seen = Some(r);
             let reach = calibrate(w, 2.0 * r as f32 + 1.0, |k| {
-                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0, w)
+                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0)
             });
-            let (f, _) = t.blur(gpu, bench, w, true, reach, r);
+            let (f, _) = t.blur(gpu, bench, w, true, reach.reach, r);
             let p = probe(&f, w);
             let (_, _, mean) = difference(&jfa, &f);
+            if !reach.converged(w) {
+                println!(
+                    "    {:>6} {:>7}   no reach draws {w} px on a half-plane; nearest {}",
+                    format!("{:.2}", (2 * r + 1) as f32 / w as f32),
+                    r,
+                    px(reach.got),
+                );
+                continue;
+            }
+            let worst = p.worst_error(w);
+            if best.is_none_or(|(b, _)| worst < b) {
+                best = Some((worst, r));
+            }
             println!(
-                "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7}",
+                "    {:>6} {:>7} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6} {:>7} {:>7}",
                 format!("{:.2}", (2 * r + 1) as f32 / w as f32),
                 r,
                 px(p.axis),
@@ -2307,9 +2506,15 @@ mod pictures {
                 px(p.diagonal),
                 px(p.limb_span),
                 format!("{:.2}", p.hole_fill),
+                if worst.is_finite() {
+                    format!("{worst:.2}")
+                } else {
+                    "-".into()
+                },
                 format!("{mean:.4}"),
             );
         }
+        best.map(|(_, r)| r)
     }
 
     pub(super) fn draw(gpu: &Gpu, bench: &Bench, dir: &std::path::Path, ok: bool) {
@@ -2352,26 +2557,33 @@ mod pictures {
         );
 
         for w in WIDTHS {
-            radius_sweep(gpu, bench, &t, &flat, w);
-
-            let r = blur_radius_for(w, BLUR_FACTOR);
+            // The headline row is the sweep's own best, not `BLUR_FACTOR`.
+            // There is no single factor that is best at every width — the
+            // optimum drifts from about 1.0 at 2 px to 0.55 at 64 — so pinning
+            // one and calling the result "the blur" would be reporting the
+            // method at a setting nobody would choose for that stroke. The
+            // *timed* columns still use `BLUR_FACTOR`, which is the cheapest of
+            // the useful settings and therefore generous to the method on the
+            // one axis a recommendation against it would be accused of rigging.
+            let r = radius_sweep(gpu, bench, &t, &flat, w)
+                .unwrap_or_else(|| blur_radius_for(w, BLUR_FACTOR));
             let full_guess = 2.0 * r as f32 + 1.0;
             let small_guess = 8.0 * r.div_euclid(4).max(1) as f32 + 8.0;
             let wide_reach = calibrate(w, full_guess, |k| {
-                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0, w)
+                flat_contour(&flat.blur(gpu, bench, w, true, k, r).0)
             });
             let byte_reach = calibrate(w, full_guess, |k| {
-                flat_contour(&flat.blur(gpu, bench, w, false, k, r).0, w)
+                flat_contour(&flat.blur(gpu, bench, w, false, k, r).0)
             });
             let quarter_reach = calibrate(w, small_guess, |k| {
-                flat_contour(&flat.blur_quarter(gpu, bench, w, k, r).0, w)
+                flat_contour(&flat.blur_quarter(gpu, bench, w, k, r).0)
             });
-            let flood_flat = flat_contour(&flat.jfa(gpu, bench, w).0, w);
+            let flood_flat = flat_contour(&flat.jfa(gpu, bench, w).0);
 
             let (jfa, cov) = t.jfa(gpu, bench, w);
-            let (blur, _) = t.blur(gpu, bench, w, true, wide_reach, r);
-            let (blur8, _) = t.blur(gpu, bench, w, false, byte_reach, r);
-            let (quarter, _) = t.blur_quarter(gpu, bench, w, quarter_reach, r);
+            let (blur, _) = t.blur(gpu, bench, w, true, wide_reach.reach, r);
+            let (blur8, _) = t.blur(gpu, bench, w, false, byte_reach.reach, r);
+            let (quarter, _) = t.blur_quarter(gpu, bench, w, quarter_reach.reach, r);
 
             let jfa_rgb = compose(&jfa, &cov);
             let blur_rgb = compose(&blur, &cov);
@@ -2381,7 +2593,14 @@ mod pictures {
             let (diffq_rgb, q_max, q_mean) = difference(&jfa, &quarter);
             let (_, e_max, e_mean) = difference(&blur, &blur8);
 
-            let named = |what: &str| format!("w{w:02}-{what}.png");
+            // **The kernel goes in the filename.** `dist/` is ignored, so
+            // nothing in git ties a picture to the run that made it, and a
+            // reviewer comparing a stale `w20-blur.png` against a fresh table
+            // reads the mismatch as a bug in the probes rather than as a stale
+            // file — which happened, twice, and cost an hour. With `r` in the
+            // name a stale picture sits visibly beside the current one instead
+            // of quietly replacing it.
+            let named = |what: &str| format!("w{w:02}r{r:02}-{what}.png");
             write_png(dir, &named("jfa"), SIZE, SIZE, &jfa_rgb);
             write_png(dir, &named("blur"), SIZE, SIZE, &blur_rgb);
             write_png(dir, &named("blur-8bit"), SIZE, SIZE, &blur8_rgb);
@@ -2412,13 +2631,26 @@ mod pictures {
                 Some(e_max),
                 Some(e_mean),
             );
-            row(
-                "",
-                "blur quarter",
-                &probe(&quarter, w),
-                Some(q_max),
-                Some(q_mean),
-            );
+            if quarter_reach.converged(w) {
+                row(
+                    "",
+                    "blur quarter",
+                    &probe(&quarter, w),
+                    Some(q_max),
+                    Some(q_mean),
+                );
+            } else {
+                // Not "poor" — *unusable*. No reach makes this path draw the
+                // width it was asked for on a straight edge, so every figure
+                // taken off it would be a measurement of a stroke that is not
+                // the one being compared. It is the path §13 proposes, on the
+                // grounds that the shadow's blur is being built anyway.
+                println!(
+                    "          blur quarter: no reach draws {w} px on a half-plane; \
+                     nearest {}",
+                    px(quarter_reach.got),
+                );
+            }
             println!(
                 "  {:<7} {:<13} {:>6} {:>7} {:>6} {:>9} {:>10} {:>6}",
                 "",
@@ -2431,10 +2663,13 @@ mod pictures {
                 format!("{:.2}", ideal_hole_fill(w)),
             );
             println!(
-                "          box r {r} (factor {BLUR_FACTOR}); half-plane: flood {}, reach tuned to \
-                 full {wide_reach:.1} (analytic {full_guess:.1}), 8-bit {byte_reach:.1}, \
-                 quarter {quarter_reach:.1}",
+                "          box r {r} (the sweep's best; timed at {BLUR_FACTOR} x width); \
+                 half-plane: flood {}, reach tuned to full {:.1} \
+                 (analytic {full_guess:.1}), 8-bit {:.1}, quarter {:.1}",
                 px(flood_flat),
+                wide_reach.reach,
+                byte_reach.reach,
+                quarter_reach.reach,
             );
             println!();
         }
@@ -2443,7 +2678,11 @@ mod pictures {
         println!("  'max d' and 'mean d' are against the jump flood, except the 8-bit row,");
         println!("  which is against the 16-bit blur so the quantisation stands on its own.");
         println!("  the apex column has no ideal: the spike rasterises short of its own point,");
-        println!("  so the jump flood's answer is the reference and 'none' means no stroke.");
+        println!("  so the jump flood's answer is the reference for that column.");
+        println!("  'none' is no stroke on that ray; 'engulf' is the opposite, a ray that");
+        println!("  never leaves one -- swallowed by a neighbouring feature's stroke.");
+        println!("  the corner and diagonal rays carry about 0.21 px of the probe's own");
+        println!("  residual, which is why the flood reads 19.78 and 20.41 against 20.");
         println!();
     }
 }
