@@ -17,11 +17,12 @@
 //! # Umber's own documents come through here
 //!
 //! [`crate::docformat`] writes ORA, so this is also the reader for Umber's own
-//! saved files. Five extra attributes carry what baseline ORA has nowhere to
-//! put — `umber-version`, `umber-selected`, `umber-blend`, `umber-background`
-//! and `umber-history`, all documented there — and they are read here rather
-//! than in a second reader, because two readers for one format is two things to
-//! keep in step. A file written by anything else simply has none of them.
+//! saved files. Its extra attributes carry what baseline ORA has nowhere to
+//! put — `umber-version`, `umber-selected`, `umber-blend`, `umber-background`,
+//! `umber-history`, `umber-mask` and `umber-effects`, all documented there —
+//! and they are read here rather than in a second reader, because two readers
+//! for one format is two things to keep in step. A file written by anything
+//! else simply has none of them.
 //!
 //! `umber-background` is the one that changes what this reader *does* rather
 //! than what it concludes: the layer carrying it is the document background,
