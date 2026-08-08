@@ -449,15 +449,34 @@ impl Brush {
     /// `dynamics` modulation both move a single dab's angle, and letting either
     /// decide the *step* would make the spacing of a stroke wander with the RNG.
     pub fn step_at(&self, pressure: f32, off_heading: f32) -> f32 {
+        // Floored in **document pixels**, so on a dab a pixel or two across the
+        // floor rather than the spacing decides the step. Anything reasoning
+        // about how deep the dabs pile up has to know that: at a radius of 1 a
+        // spacing of 2% asks for a step of 0.04 px and gets 0.25, which is six
+        // times fewer dabs over a point than the spacing suggests.
+        // `tip::stack_depth` takes the step and the reach for exactly this
+        // reason rather than recomputing either.
+        (self.reach_at(pressure, off_heading) * 2.0 * self.spacing).max(0.25)
+    }
+
+    /// How far the dab reaches from its own centre in the direction of travel,
+    /// in document pixels.
+    ///
+    /// The ellipse's **radius** in that direction, `1 / sqrt((cos Δ / a)² +
+    /// (sin Δ / b)²)`, which is what [`Brush::step_at`] measures the spacing
+    /// against and what the fragment shader's `length(local) <= 1` is a test on.
+    /// Factored out so nothing else has to restate it: it is also the length one
+    /// unit of the dab's own frame comes to, which is what turns a step in pixels
+    /// into a step in the units a falloff is written in.
+    pub fn reach_at(&self, pressure: f32, off_heading: f32) -> f32 {
         let long = self.radius_at(pressure).max(1e-4);
         let short = (long / self.dab_ratio.max(1.0)).max(1e-4);
         let (sin, cos) = off_heading.sin_cos();
         // `a == b` reduces this to `a` exactly, which is what keeps every round
         // brush byte for byte what it was.
-        let reach = ((cos / long).powi(2) + (sin / short).powi(2))
+        ((cos / long).powi(2) + (sin / short).powi(2))
             .sqrt()
-            .recip();
-        (reach * 2.0 * self.spacing).max(0.25)
+            .recip()
     }
 
     /// How far the dab's long axis sits from the direction of travel, in

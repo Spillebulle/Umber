@@ -21,8 +21,12 @@
 
 use std::path::PathBuf;
 
+use glam::Vec2;
+use umber_core::brush::Brush;
 use umber_core::brushimport::clipstudio;
 use umber_core::curve::ResponseCurve;
+use umber_core::input::InputPoint;
+use umber_core::stroke::StrokeBuilder;
 
 fn main() {
     let Some(arg) = std::env::args().nth(1) else {
@@ -82,31 +86,17 @@ fn main() {
                 .map(ResponseCurve::x_of)
                 .collect::<Vec<_>>()
         );
-        let depth = if b.build_up {
-            umber_core::tip::stack_depth(b.spacing, b.hardness)
-        } else {
-            1.0
-        };
-        println!("  stack depth   {depth:.3}");
-        print!("  stroke, uncompensated (0.0.9)");
+        print!("  mark, this build              ");
         for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            print!(
-                " p={p:.2}:{:.4}",
-                umber_core::tip::dab_stack_alpha(b.coverage_at(p), b.spacing, b.hardness)
-                    * b.opacity
-            );
+            print!(" p={p:.2}:{:.4}", mark_of(b, p, false) * b.opacity);
         }
         println!();
-        print!("  stroke, compensated (now)    ");
+        print!("  mark, before the conversion   ");
         for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let dab = umber_core::tip::per_dab_for_stroke(b.coverage_at(p), depth);
-            print!(
-                " p={p:.2}:{:.4}",
-                umber_core::tip::dab_stack_alpha(dab, b.spacing, b.hardness) * b.opacity
-            );
+            print!(" p={p:.2}:{:.4}", mark_of(b, p, true) * b.opacity);
         }
         println!();
-        print!("  stroke, max (0.0.7/0.0.8)    ");
+        print!("  mark, under `max` (0.0.7/8)   ");
         for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
             print!(" p={p:.2}:{:.4}", b.coverage_at(p) * b.opacity);
         }
@@ -140,63 +130,161 @@ fn main() {
     println!("\ndropped: {:?}", clipstudio::dropped_features(&bytes));
 }
 
-/// The round-trip error surface of `per_dab_for_stroke`, so the bound its guard
-/// asserts is a measurement rather than a guess.
-fn sweep_conversion() {
-    println!("spacing  worst error over hardness 0..1 and target 0..1");
-    for s in [0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0] {
-        let mut worst = 0.0f32;
-        let mut at = (0.0f32, 0.0f32);
-        for h in 0..=20 {
-            let hardness = h as f32 / 20.0;
-            let depth = umber_core::tip::stack_depth(s, hardness);
-            for step in 0..=100 {
-                let want = step as f32 / 100.0;
-                let got = umber_core::tip::dab_stack_alpha(
-                    umber_core::tip::per_dab_for_stroke(want, depth),
-                    s,
-                    hardness,
-                );
-                if (got - want).abs() > worst {
-                    worst = (got - want).abs();
-                    at = (hardness, want);
-                }
-            }
+/// What a straight stroke of this brush at this pressure actually leaves on a
+/// point of its own centre line, excluding the stroke's opacity.
+///
+/// Driven through the **real** `StrokeBuilder`, so it reads the dabs the canvas
+/// would get rather than a model of them, and accumulated with `dab.wgsl`'s own
+/// arithmetic — the antialiasing margin included, because a pixel of falloff is a
+/// third of a 3 px dab and leaving it out is how the first draft of this
+/// measurement agreed with a conversion that was wrong.
+///
+/// `raw` asks for the mark the brush made *before* the conversion existed: the
+/// dab carries `coverage_at` itself and build-up compounds it.
+///
+/// `store` rounds the accumulator to the `R8Unorm` scratch after every dab, which
+/// is what the GPU does and what exact arithmetic hides: a per-dab figure below
+/// half a level moves the accumulator by nothing at all, so a conversion that
+/// asks for one paints an invisible stroke. Pass `false` for the exact reading
+/// and `true` for the one the artist sees.
+fn mark_of(brush: &Brush, pressure: f32, raw: bool) -> f32 {
+    mark_stored(brush, pressure, raw, false)
+}
+
+fn mark_stored(brush: &Brush, pressure: f32, raw: bool, store: bool) -> f32 {
+    let mut builder = StrokeBuilder::new();
+    let flat = Brush {
+        stabilization: 0.0,
+        ..*brush
+    };
+    builder.begin(
+        flat,
+        [1.0; 3],
+        InputPoint::new(Vec2::new(0.0, 0.0), pressure, 0.0),
+    );
+    // Long enough that the midpoint is covered from both sides by every dab that
+    // could reach it. A stroke shorter than the dab is wide reads as fainter than
+    // its own curve under build-up, and that is true of the head of every
+    // building stroke rather than anything the conversion decides.
+    let length = (brush.size * 8.0).max(400.0);
+    builder.extend(InputPoint::new(Vec2::new(length, 0.0), pressure, 0.2));
+    let dabs: Vec<_> = builder.drain_pending().collect();
+
+    // A dab's own centre half way along, and not an arbitrary point: a soft
+    // dab's falloff has begun a quarter of a radius out, so a `max` stroke read
+    // between two centres is legitimately below its own coverage.
+    let mid = dabs[dabs.len() / 2];
+    let at = Vec2::new(mid.pos[0], mid.pos[1]);
+    let mut alpha = 0.0f32;
+    for dab in &dabs {
+        let d = (at - Vec2::new(dab.pos[0], dab.pos[1])).length() / dab.radius;
+        if d >= 1.0 {
+            continue;
         }
-        println!(
-            "{s:>7.2}  {worst:.5} ({:.1} levels of 255)  hardness {:.2} target {:.2}",
-            worst * 255.0,
-            at.0,
-            at.1
-        );
+        let aa = (1.0 / dab.radius.max(1.0)).clamp(0.001, 0.5);
+        let inner = dab.hardness.clamp(0.0, 1.0 - aa);
+        let t = if inner >= 1.0 {
+            0.0
+        } else {
+            ((d - inner) / (1.0 - inner)).clamp(0.0, 1.0)
+        };
+        let carried = if raw {
+            brush.coverage_at(pressure)
+        } else {
+            dab.coverage
+        };
+        let cov = carried * (1.0 - t * t * (3.0 - 2.0 * t));
+        if brush.build_up {
+            alpha += cov * (1.0 - alpha);
+        } else {
+            alpha = alpha.max(cov);
+        }
+        if store {
+            alpha = (alpha * 255.0).round() / 255.0;
+        }
     }
-    println!("hardness  worst error (over spacing 0.02..1.0, target 0..1)  at");
-    for hardness in [0.0, 0.25, 0.5, 0.55, 0.81, 0.9, 1.0] {
-        let mut worst = 0.0f32;
-        let mut at = (0.0f32, 0.0f32);
-        for s in 1..=100 {
-            let spacing = s as f32 / 100.0;
-            let depth = umber_core::tip::stack_depth(spacing, hardness);
-            for step in 0..=100 {
-                let want = step as f32 / 100.0;
-                let got = umber_core::tip::dab_stack_alpha(
-                    umber_core::tip::per_dab_for_stroke(want, depth),
+    alpha
+}
+
+/// How far a building stroke's mark lands from the curve that asked for it, over
+/// the brushes a painter could actually build.
+///
+/// Through the real dab generator, at each of a row of pressures, so the reading
+/// includes the antialiasing margin and every clamp on the way. The figures
+/// `tip::per_dab_for_stroke` quotes come from here.
+fn sweep_conversion() {
+    println!("size  spacing  hardness  worst error over pressure 0..1");
+    let mut overall = 0.0f32;
+    let mut overall_at = (0.0, 0.0, 0.0);
+    let mut blanks = 0usize;
+    let mut floors = 0usize;
+    for size in [2.0, 6.0, 20.0, 200.0, 1000.0] {
+        for spacing in [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5] {
+            for hardness in [0.0, 0.5, 0.81, 1.0] {
+                let brush = Brush {
+                    size,
                     spacing,
                     hardness,
-                );
-                if (got - want).abs() > worst {
-                    worst = (got - want).abs();
-                    at = (spacing, want);
+                    stabilization: 0.0,
+                    pressure_size: false,
+                    pressure_opacity: true,
+                    opacity_curve: ResponseCurve::LINEAR,
+                    build_up: true,
+                    ..Brush::default()
+                };
+                let mut worst = 0.0f32;
+                let mut at = 0.0f32;
+                let mut blank = 0usize;
+                let mut floored = 0usize;
+                for step in 0..=20 {
+                    let p = step as f32 / 20.0;
+                    let want = brush.coverage_at(p);
+                    // Whether the scratch's own floor is what decides this mark,
+                    // rather than the conversion: a stack this deep cannot make a
+                    // mark fainter than one level built up through it, and the
+                    // error there is the target's, not the arithmetic's.
+                    let off = brush.off_heading(Vec2::X);
+                    let depth = umber_core::tip::stack_depth(
+                        brush.step_at(p, off),
+                        brush.reach_at(p, off),
+                        brush.hardness_at(p),
+                        brush.radius_at(p),
+                    );
+                    let floor = 1.0 - (1.0 - umber_core::tip::SCRATCH_LEVEL).powf(depth);
+                    if want > floor {
+                        let error = (mark_of(&brush, p, false) - want).abs();
+                        if error > worst {
+                            worst = error;
+                            at = p;
+                        }
+                    } else if want > 0.0 {
+                        floored += 1;
+                    }
+                    // A mark the curve asked for and the scratch could not hold
+                    // is a stroke that paints nothing at all.
+                    if want > 0.002 && mark_stored(&brush, p, false, true) <= 0.0 {
+                        blank += 1;
+                    }
                 }
+                blanks += blank;
+                floors += floored;
+                if worst > overall {
+                    overall = worst;
+                    overall_at = (size, spacing, hardness);
+                }
+                println!(
+                    "{size:>5.0} {spacing:>7.2} {hardness:>9.2}  {worst:.5} ({:.1} levels of 255) at pressure {at:.2}",
+                    worst * 255.0
+                );
             }
         }
-        println!(
-            "{hardness:>8.2}  {worst:.5} ({:.1} levels of 255)   spacing {:.2} target {:.2}",
-            worst * 255.0,
-            at.0,
-            at.1
-        );
     }
+    println!(
+        "\nworst overall {overall:.5} ({:.1} levels of 255) at size/spacing/hardness {overall_at:?}",
+        overall * 255.0
+    );
+    println!("marks the curve asked for and the 8-bit scratch could not hold: {blanks}");
+    println!("marks below the faintest a stack that deep can make, so pinned at it: {floors}");
 }
 
 /// Which shipped presets build up, and which of those have anything below full
@@ -229,17 +317,14 @@ fn survey_builtin() {
         if !takes_it {
             continue;
         }
-        let depth = umber_core::tip::stack_depth(b.spacing, b.hardness);
-        print!("    depth {depth:5.2}  mark before ->  after ");
-        for p in [0.1, 0.25, 0.5, 0.75, 1.0] {
-            let want = b.coverage_at(p);
-            let before = umber_core::tip::dab_stack_alpha(want, b.spacing, b.hardness);
-            let after = umber_core::tip::dab_stack_alpha(
-                umber_core::tip::per_dab_for_stroke(want, depth),
-                b.spacing,
-                b.hardness,
+        print!("    asked / before / now, on an 8-bit scratch ");
+        for p in [0.05, 0.1, 0.25, 0.5, 1.0] {
+            print!(
+                " p={p:.2}:{:.3}/{:.3}/{:.3}",
+                b.coverage_at(p),
+                mark_stored(b, p, true, true),
+                mark_stored(b, p, false, true),
             );
-            print!(" p={p:.2}:{before:.3}->{after:.3}");
         }
         println!();
     }
