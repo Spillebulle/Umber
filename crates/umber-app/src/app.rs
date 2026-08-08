@@ -1325,19 +1325,49 @@ impl UmberApp {
     /// from the same rule a stroke across such a canvas follows and is said here
     /// rather than left to look like a fault.
     fn cut_selection(&mut self) {
-        // **The one gate a lock has on cutting.** An explicit command with one
-        // obvious outcome, so it says so, exactly as a paste onto a locked
-        // layer does.
-        if self.editor.layers.active_is_locked() {
-            self.editor.notice = Some(Notice {
-                title: "The layer is locked".to_string(),
-                lines: vec![
-                    "Nothing was cut. Unlock the layer in the Layers panel, or select \
-                     another one, and cut again."
-                        .to_string(),
-                ],
-            });
-            return;
+        // **The one gate cutting has.** An explicit command with one obvious
+        // outcome, so a lock says so, exactly as a paste onto a locked layer
+        // does — and text says so too, because a cut takes coverage off the
+        // layer's own pixels and would leave the record describing letters
+        // that are no longer there. The fingerprint does not cover it: a save
+        // fingerprints the pixels it is writing, so the file would agree with
+        // itself and the next open would re-render the whole caption back.
+        //
+        // Exhaustive with no catch-all, so a fifth refusal cannot arrive
+        // without somebody deciding whether a cut is allowed through it.
+        match self
+            .editor
+            .layers
+            .active_refusal(umber_core::EditTarget::Layer)
+        {
+            Some(EditRefusal::Locked) => {
+                self.editor.notice = Some(Notice {
+                    title: "The layer is locked".to_string(),
+                    lines: vec![
+                        "Nothing was cut. Unlock the layer in the Layers panel, or select \
+                         another one, and cut again."
+                            .to_string(),
+                    ],
+                });
+                return;
+            }
+            Some(EditRefusal::Text) => {
+                self.editor.notice = Some(Notice {
+                    title: "This layer holds text".to_string(),
+                    lines: vec![
+                        "Nothing was cut. The text on this layer can still be set again, \
+                         so nothing may be taken out of it. Convert it to paint in the \
+                         Text panel, or select another layer."
+                            .to_string(),
+                    ],
+                });
+                return;
+            }
+            // Silent, for the reason the copy above is silent about a folder: a
+            // folder is a perfectly ordinary thing to have selected, and the
+            // `active_slot` read below already returns for both of these.
+            Some(EditRefusal::Folder | EditRefusal::Missing) => return,
+            None => {}
         }
         let (rect, mask) = self.take_region();
         // Nothing to cut out of a folder: it holds no pixels of its own, so
