@@ -389,29 +389,37 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             // would say "the letter B" and nothing more. Its pair, `Italic`,
             // keeps the common weight, which is what makes the two a contrast
             // rather than two heavy marks.
-            let heavy = Stroke::new((3.4 * scale).max(1.5), colour);
+            let heavy = Stroke::new((2.9 * scale).max(1.5), colour);
             let run = |pts: Vec<Pos2>| {
                 painter.add(Shape::line(pts, heavy));
             };
             // The stem, then two bowls hung off it. Three segments a bowl rather
             // than an arc: at 16 px a chamfer and a curve are the same picture,
             // and the polyline is what every other mark here is made of.
-            run(vec![at(8.5, 4.8), at(8.5, 19.2)]);
+            //
+            // The bowls are drawn **wide of what the letter wants**, and that is
+            // measured rather than eyeballed: an `icon_toggle` shrinks its 20 pt
+            // box by two, so this is a 16 px mark, and a heavy stroke that
+            // reaches from a bowl's top edge halfway to its bottom one closes
+            // the counter up and leaves a blob. Each counter is about six units
+            // of the 24 here, which is four pixels of hole at the size it is
+            // actually drawn at.
+            run(vec![at(7.6, 4.0), at(7.6, 20.0)]);
             run(vec![
-                at(8.5, 4.8),
-                at(13.6, 4.8),
-                at(16.2, 6.6),
-                at(16.2, 9.6),
-                at(13.6, 11.4),
-                at(8.5, 11.4),
+                at(7.6, 4.0),
+                at(13.6, 4.0),
+                at(16.6, 6.2),
+                at(16.6, 9.6),
+                at(13.6, 11.8),
+                at(7.6, 11.8),
             ]);
             run(vec![
-                at(8.5, 11.4),
-                at(14.6, 11.4),
-                at(17.6, 13.4),
-                at(17.6, 17.2),
-                at(14.6, 19.2),
-                at(8.5, 19.2),
+                at(7.6, 11.8),
+                at(14.4, 11.8),
+                at(17.8, 14.0),
+                at(17.8, 17.8),
+                at(14.4, 20.0),
+                at(7.6, 20.0),
             ]);
         }
 

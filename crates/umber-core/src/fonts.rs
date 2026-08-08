@@ -352,6 +352,25 @@ impl Face {
 /// Near-equality rather than exact: both sides came out of the same table, but
 /// a user coordinate is an `f32` read off disk and a control is not a thing to
 /// bet on the last bit of one.
+/// The most ordinary face of a set: upright, and nearest [`REGULAR_WEIGHT`].
+///
+/// One statement of it, because [`FontLibrary::resolve`] falls back **twice** —
+/// to the family without the style asked for, and then to the library without
+/// either — and the second used to be `faces.first()`. That is the *lightest*
+/// face of the alphabetically first family, because [`FontLibrary::insert`]
+/// sorts on the weight: a family that had moved off the disk was therefore
+/// substituted with Archivo **Thin**, so every caption in a document opened on
+/// another machine came back as a hairline. It was found by looking at a picture
+/// of the panel, which named the substitute out loud; nothing asserted it either
+/// way.
+///
+/// The weight is in the key after the distance so a tie is decided rather than
+/// left to iteration order, and it decides for the lighter face, which is what
+/// the sort order already produced.
+fn most_ordinary<'a>(faces: impl Iterator<Item = &'a Face>) -> Option<&'a Face> {
+    faces.min_by_key(|f| (f.italic, f.weight.abs_diff(REGULAR_WEIGHT), f.weight))
+}
+
 fn same_other_axes(a: &Face, b: &Face) -> bool {
     a.variations.len() == b.variations.len()
         && a.variations
@@ -576,19 +595,19 @@ impl FontLibrary {
     /// preference records a family and a style by *name*, and the machine it is
     /// read back on may not have either. So an exact match first, then anything
     /// in that family — nearest weight to regular, upright before italic —
-    /// then the first face in the library, which is the built-in one. The
-    /// caller is what says a substitution happened; this only refuses when the
-    /// library is empty.
+    /// then the most ordinary face in the whole library. The caller is what
+    /// says a substitution happened; this only refuses when the library is
+    /// empty.
     pub fn resolve(&self, family: &str, style: &str) -> Option<&Face> {
         if let Some(exact) = self.exact(family, style) {
             return Some(exact);
         }
-        let nearest = self
-            .faces
-            .iter()
-            .filter(|f| f.family.eq_ignore_ascii_case(family))
-            .min_by_key(|f| (f.italic, f.weight.abs_diff(REGULAR_WEIGHT)));
-        nearest.or_else(|| self.faces.first())
+        most_ordinary(
+            self.faces
+                .iter()
+                .filter(|f| f.family.eq_ignore_ascii_case(family)),
+        )
+        .or_else(|| most_ordinary(self.faces.iter()))
     }
 
     /// The face this exact `(family, style)` pair names, and nothing else.
@@ -1155,6 +1174,38 @@ mod tests {
             },
             variations: Vec::new(),
         }
+    }
+
+    /// A family that is not here is substituted with something **ordinary**, not
+    /// with whatever sorted first.
+    ///
+    /// The last fallback used to be `faces.first()`, and `insert` sorts on the
+    /// weight, so the answer was the lightest face of the alphabetically first
+    /// family: a document whose fonts had moved came back set in Archivo Thin,
+    /// as a hairline. Noticed by looking at a picture of the panel, which names
+    /// the substitute in a sentence.
+    #[test]
+    fn a_substitute_for_a_missing_family_is_an_ordinary_weight() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let face = lib
+            .resolve("A Foundry Face Nobody Has", "Regular")
+            .expect("a substitute");
+        assert!(!face.italic, "{face:?}");
+        assert!(
+            (350..=550).contains(&face.weight),
+            "substituted a weight nobody would set a caption in: {face:?}"
+        );
+
+        // The same rule where the *style* is what is missing, which is the
+        // fallback one step earlier and always behaved this way.
+        let face = lib
+            .resolve("Archivo", "Ultra Condensed Black Italic")
+            .expect("a substitute");
+        assert!(
+            !face.italic && (350..=550).contains(&face.weight),
+            "{face:?}"
+        );
     }
 
     /// `exact` refuses where `resolve` substitutes, which is the whole reason it
