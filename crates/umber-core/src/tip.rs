@@ -1167,6 +1167,19 @@ pub fn stack_depth(step: f32, reach: f32, hardness: f32, radius: f32) -> f32 {
 /// is a property of the target it commits into and not of this function. Above
 /// that the conversion is what the paragraphs above describe.
 ///
+/// **The floor bounds the dab's own coverage and not what reaches the scratch**,
+/// and that limit is real: `dab.wgsl` multiplies by the tip, the paper and the
+/// selection *after* `in.coverage`, so a uniformly faint stamp can take a floored
+/// dab back under half a level and the very bottom of such a brush's ramp comes
+/// out blank where the unconverted version was merely too dark. Nothing here can
+/// see the tip — the renderer binds it, and `StrokeBuilder` never holds one — so
+/// this is stated rather than compensated, and it is the same eight-bit limit the
+/// masks themselves live under: `TipMask` is `R8Unorm` too and has no stored value
+/// below one level either. It needs the ramp to be within a level or two of the
+/// floor already; a peaky tip or grain, which is every real one, keeps its peaks
+/// above it, which is why `Sketch.sut`'s own mark survives at 0.040 through a tile
+/// of mean 0.272.
+///
 /// `canvas.rs`'s note on the scratch says the pathological case "needs a constant
 /// faint coverage on one pixel for a hundred dabs, which a bitmap tip cannot
 /// produce". A converted opacity ramp produces exactly that, without a tip, which
