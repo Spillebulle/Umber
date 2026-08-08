@@ -34,6 +34,7 @@ mod sqlite;
 pub mod stroke;
 pub mod style;
 pub mod text;
+pub mod textobj;
 pub mod thumbnail;
 pub mod time;
 pub mod tip;
@@ -59,7 +60,7 @@ pub use geom::{FlipAxis, PixelRect, Rect};
 pub use harmony::Harmony;
 pub use history::{Edit, EditBody, EditKind, History, Jump, PixelPatch};
 pub use input::InputPoint;
-pub use layer::{BlendMode, EditTarget, Layer, LayerStack, SlotRoom, StackShape};
+pub use layer::{BlendMode, EditRefusal, EditTarget, Layer, LayerStack, SlotRoom, StackShape};
 pub use overlay::{Side, Strip};
 // `palette::Palette` is deliberately **not** re-exported at the root. The app
 // crate's own `theme::Palette` is the interface's colour tokens and is in scope
@@ -71,6 +72,7 @@ pub use preset::{BrushPreset, Credit, PresetError, UserLibrary};
 pub use selection::{Selection, SelectionDraft, SelectionMode, SelectionOp};
 pub use stroke::{Dab, StrokeBuilder};
 pub use text::{Align, Setting, TextBlock, TextError};
+pub use textobj::{Placement, TextFace, TextObject};
 pub use time::Timestamp;
 pub use tip::{StrokeCoverage, TipMask, TipReading, TipTarget, stroke_coverage};
 pub use transform::{Affine, Handle, Transform};

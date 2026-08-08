@@ -922,10 +922,19 @@ are the contiguous run immediately below it whose `depth` is greater.
   dab reads as a single dab.
 - **The invalidation rule is `CanvasRenderer::slot_revision`, bumped inside
   every method that writes a slice** — commit, float commit, `write_layer_rect`,
-  clear, mask fill, flip, resize. That is exhaustive by construction, because a
-  layer's pixels cannot change without going through one of them; a `touch` call
+  clear, mask fill, flip, resize. Putting it inside the method rather than
   beside each of the eight call sites in `app.rs` is the "forgotten at the
-  sixth" failure written out in advance. `Thumbs::wanted` is the whole policy —
+  sixth" failure written out in advance.
+  **This file called that "exhaustive by construction" and it was false for
+  exactly one method.** `render_float` writes the float's *preview* slice every
+  frame of a drag and bumped nothing, and nothing noticed because a thumbnail is
+  never taken of the float's spare — so the one consumer that existed could not
+  see the gap. Layer effects found it, because their cache is keyed on the slot
+  the *draw* carries and a float swaps that slot. "By construction" is a claim
+  about a set of methods somebody has to have enumerated; it is true now,
+  `a_dragged_float_carries_the_effect_derived_from_it` is what holds it, and the
+  lesson is that a rule enforced inside N methods still needs somebody to check
+  that N is all of them. `Thumbs::wanted` is the whole policy —
   the active layer first, then stack order — and it is a model with no drawing
   in it.
 - **"Nothing on this layer" is a cached answer, not a missing one**, or a blank
@@ -3502,6 +3511,22 @@ standing instruction and it overrides the usual reluctance to delegate.
   (`fmt --check`, `clippy`, `test`) run in the worktree *and* after the merge —
   a clean branch and a clean merge of several clean branches are different
   claims.
+- **Check every worktree's base before briefing it, because it is not
+  necessarily current `HEAD`.** Three agents spawned in one message came out
+  with two different bases: one from `main` as it then stood and two from
+  where the *session* had started, 55 commits earlier. `git worktree list`
+  and `git merge-base main <branch>` is the check, and it takes ten seconds
+  against a merge that took five conflicted files in the document format.
+  **The tell is the agent contradicting the brief about a constant.** "The
+  brief said `umber-version` is 3; it is 2 in my base" reads like an agent
+  that has got confused, and it is the most useful sentence such a report can
+  contain — the agent is right about its own tree and the brief is describing
+  a different one. Believe it and check.
+  Two consequences worth pre-empting in the brief: the agent's copy of *this
+  file* is stale too, so any rule added mid-session is invisible to it; and
+  whether staleness costs anything is a `git diff --name-only <base>..main --
+  <its files>` away. Zero overlap means carry on — a rebase for tidiness is
+  pure risk.
 
 ### The shape that worked, for twelve agents at once
 
@@ -3623,6 +3648,14 @@ parts that mattered are not the obvious ones.
   the shared checkout and switched the working tree onto it. Tie the cleanup to
   the agent being finished with, not to its branch being merged, and do the
   whole sweep once at the end.
+- **A doc comment that names a call site is a claim, and a wave-one change is
+  exactly where it is false.** Three methods in one branch said "called from
+  `mirror_document`", "what a resize does" and "the question `begin_stroke`
+  asks", and none of the three was reached from outside its own crate, because
+  the wiring was another agent's file. The commit message repeated all three.
+  Write `Transform::reseat`'s form instead: **nothing calls this yet**, and what
+  goes wrong until it does. A split remit is what makes this the *normal* case
+  rather than a slip, so it belongs in the brief.
 - **Commit before mutating.** An agent undoing a mutation test with
   `git checkout -- <path>` destroyed its own uncommitted work in the same
   stroke, because the file held both. It redid it from context and nothing was
