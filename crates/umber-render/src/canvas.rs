@@ -234,11 +234,37 @@ const EFFECT_FULL_RES_SOFTNESS: f32 = 32.0;
 /// the right picture; a notice about it would be a notice on every frame of
 /// every stroke on a large canvas.
 ///
-/// 4096² rather than something derived, and it is a judgement: §3.4 measures
-/// 2048² and 10000² and nothing between, and the flood scales with the area, so
-/// 16.8 Mpx puts the worst bake at roughly 3 ms on the card that was measured.
-/// `examples/measure-effects.rs` is the instrument for moving it, and stage 3's
-/// region-bounded rebake is what removes the need for it.
+/// **Measured on the shipped bake and not on the design's prototypes** —
+/// `examples/measure-effects.rs`'s second table, which exists because those are
+/// two different measurements and quoting one for the other is the mistake §3.1a
+/// records. On an RTX 3080:
+///
+/// | | 2048² | 10000² |
+/// |---|---|---|
+/// | shadow at its default 5 px | 0.59 | 7.94 |
+/// | shadow at 64 px | 0.41 | 4.54 |
+/// | outline 16 px wide | 1.03 | **20.36** |
+///
+/// So 2048² is free and 10000² is not, which is the split §3.4 predicted. 4096²
+/// is where the line is drawn and it is a judgement rather than a reading:
+/// nothing has been measured between those two sizes and the flood scales with
+/// the area, which puts a 4096² outline at roughly 3 ms.
+///
+/// **One gate on the canvas rather than a gate per effect, and §5.1 would allow
+/// the second.** Its corrected claim is that what cannot hold at canvas scale is
+/// "memory at canvas scale and the stroke's distance field, not the shadow and
+/// not the frame budget" — and the table above bears that out: at 10000² the
+/// outline is over a 60 Hz frame and neither shadow is. A per-effect gate would
+/// therefore keep the live shadow on the largest canvas Umber supports. It is
+/// **not** what this does, on the grounds that 7.94 ms every frame is half of a
+/// 60 Hz frame before the composite, the dab pass and the interface have had any
+/// of it, and a stroke drawn at thirty frames a second is a worse thing to hand
+/// an artist than a shadow that arrives when they lift the pen. It is a judgement
+/// against the design's lean and it is recorded as one; a full-resolution blur at
+/// 31 px is 22.45 ms at that size, which is the case a per-effect gate would also
+/// have to cover.
+///
+/// Stage 3's region-bounded rebake is what removes the need for any of it.
 const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
 
 /// Slices left for effects once a stack of `layers`, all masked, and the
@@ -8067,7 +8093,10 @@ mod tests {
             };
             assert!(effect_marks_nothing(&bare), "{position:?}");
             assert!(
-                !effect_marks_nothing(&Effect { spread: 2.0, ..bare }),
+                !effect_marks_nothing(&Effect {
+                    spread: 2.0,
+                    ..bare
+                }),
                 "{position:?}"
             );
         }
@@ -8111,12 +8140,18 @@ mod tests {
         let h = effect_params_hash(&base);
 
         let moved: [Effect; 6] = [
-            Effect { spread: 3.5, ..base },
+            Effect {
+                spread: 3.5,
+                ..base
+            },
             Effect {
                 softness: 4.5,
                 ..base
             },
-            Effect { angle: 31.0, ..base },
+            Effect {
+                angle: 31.0,
+                ..base
+            },
             Effect {
                 distance: 5.5,
                 ..base

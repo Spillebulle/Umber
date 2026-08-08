@@ -271,10 +271,123 @@ fn main() {
         }
         drop(sh);
         println!();
+        // After the prototypes and on the same canvas, so the two tables can be
+        // read against each other. Dropped `sh` first: the shipped bake allocates
+        // a working set of its own and holding both at 10000² is over two
+        // gigabytes for no reason.
+        bake_sweep(&gpu, size);
     }
 
     println!("verdict is per row: a bake fits a 60 Hz frame under {FRAME_60HZ_MS:.1} ms,");
     println!("and has to share that frame with the composite, the dab pass and the interface.");
+}
+
+/// What the **shipped** bake costs, as against the prototypes above.
+///
+/// The sweep above prices *methods* and is what settled which method to write;
+/// this prices `CanvasRenderer::bake_effects`, which is the thing a frame
+/// actually waits for. They are not the same measurement and quoting one for the
+/// other is the mistake §3.1a records — the rows here are labelled with the
+/// column of the table above they correspond to, so the two can be compared
+/// rather than confused.
+///
+/// Three shapes, because they are the three pass structures the bake has:
+///
+/// - **a shadow at its default settings** — no spread, so no jump flood at all,
+///   which is the case every application opens a drop shadow at and is the one
+///   the design did not price separately;
+/// - **a wide shadow** — the downsampled tent, `EFFECT_FULL_RES_SOFTNESS` and
+///   above;
+/// - **an outline** — the flood, which is the expensive half of the feature.
+///
+/// The colour is nudged between runs. That is not decoration: the cache is keyed
+/// on a hash of the parameters, so a second bake of the same effect is a
+/// comparison and nothing else, and the sweep would otherwise report the cost of
+/// deciding there was nothing to do. Colour is the one parameter that changes the
+/// hash and changes no pass.
+fn bake_sweep(gpu: &Gpu, size: u32) {
+    use umber_core::{Effect, OutlinePosition, PixelRect};
+    use umber_render::{CanvasRenderer, EffectFrame, LayerDraw, LayerEffects, StrokeStyle};
+
+    let mut canvas = CanvasRenderer::new(
+        &gpu.device,
+        glam::UVec2::splat(size),
+        wgpu::TextureFormat::Rgba8Unorm,
+    );
+    // Something for the flood to find. A band rather than the whole canvas, so
+    // the flood's inner branch is taken — §3.4's own caveat is that a
+    // zero-initialised layer prices the cheapest content there is.
+    let band = PixelRect {
+        x: size / 4,
+        y: size / 4,
+        width: size / 2,
+        height: size / 2,
+    };
+    let rgba: Vec<u8> = std::iter::repeat_n([255u8, 255, 255, 255], (band.area()) as usize)
+        .flatten()
+        .collect();
+    canvas.write_layer_rect(&gpu.queue, 0, band, &rgba);
+
+    let draw = LayerDraw {
+        slot: 0,
+        opacity: 1.0,
+        blend: 0,
+        visible: true,
+        mask: None,
+        clipped: false,
+    };
+    let frame = EffectFrame {
+        active_index: u32::MAX,
+        stroke: StrokeStyle {
+            opacity: 0.0,
+            ..Default::default()
+        },
+        stroke_live: false,
+    };
+
+    let cases: [(&str, &str, Effect); 3] = [
+        (
+            "shadow, default (softness 5)",
+            "shadow/full @ 4",
+            Effect::drop_shadow(),
+        ),
+        (
+            "shadow, softness 64",
+            "shadow/quarter @ 64",
+            Effect {
+                softness: 64.0,
+                ..Effect::drop_shadow()
+            },
+        ),
+        (
+            "outline, width 16",
+            "stroke/jfa @ 16",
+            Effect {
+                spread: 16.0,
+                position: OutlinePosition::Outside,
+                ..Effect::outline()
+            },
+        ),
+    ];
+
+    println!("  {:<30} {:>10}   prototype column", "shipped bake", "ms");
+    for (what, like, effect) in cases {
+        let mut nudge = 0.0f32;
+        let t = time(gpu, |enc| {
+            nudge += 1.0 / 4096.0;
+            let effects = [Effect {
+                color: umber_core::Color::new(0.0, nudge, 0.0, 1.0),
+                ..effect
+            }];
+            let stack = [LayerEffects {
+                draw,
+                effects: &effects,
+            }];
+            canvas.bake_effects(&gpu.device, &gpu.queue, enc, 2, &stack, frame);
+        });
+        println!("  {what:<30} {:>10}   {like}", ms(t));
+    }
+    println!();
 }
 
 /// Where the pictures go. `dist/` is in `.gitignore`, so a run leaves the tree
