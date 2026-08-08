@@ -3782,6 +3782,17 @@ parts that mattered are not the obvious ones.
   `the_release_workflow_stages_every_asset_the_installer_names` — a test failure
   that looks like a real regression and is a missing file. `git cat-file -p
   HEAD:<path> > <path>` is the way back.
+- **An orphaned worktree directory is detectable in one command, and there were
+  ten of them.** A live worktree holds a `.git` **pointer file**; an orphan has
+  none, so git walks up and resolves to the shared checkout — which is why
+  `git rev-parse --show-toplevel` answering the repository root *from inside the
+  worktree* is the tell, and why `git merge --ff-only main` there reports
+  "Already up to date" while meaning something else entirely. `ls .claude/
+  worktrees | wc -l` against `git worktree list | tail -n +2 | wc -l` is the
+  audit: seventeen against seven, in this session. **Any agent still live in one
+  of those commits to `main` without knowing**, so that count is the first thing
+  to check when a worktree behaves oddly, and a dead agent in one must not be
+  resumed.
 - **The sync client can delete a *live* agent's whole worktree, and it has.**
   Two worktrees created in one round vanished mid-session — directory, branch,
   ref, reflog and `.git/worktrees/` metadata, with no remnant — while the seven
