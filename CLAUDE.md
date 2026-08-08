@@ -1116,10 +1116,16 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   approximate — without it, reopening Umber's own file reports a loss that did
   not happen. `umber-version` is bumped only when a revision stores something an
   older build would drop silently, and an older build then **refuses** the file
-  rather than opening it with pieces missing. It is at **2**, for masks and
-  clipping: a build ignoring either shows a picture that is *wrong* — what the
-  mask hid comes back, and the clipped layer paints everywhere. Locks and links
-  ride along, because ignoring them changes no pixel.
+  rather than opening it with pieces missing. It is at **3**. Revision 2 was
+  masks and clipping, because a build ignoring either shows a picture that is
+  *wrong* — what the mask hid comes back, and the clipped layer paints
+  everywhere. Revision 3 is **layer effects**, and that one is not about what an
+  older build shows but about what it *writes*: the parameters are the whole
+  feature, so opening and saving drops them for ever. Locks, links and a **text
+  record** all ride along, because ignoring them changes no pixel — and the text
+  record only rides along because of its fingerprint, without which an older
+  build could paint over the layer and this one would re-render over the
+  brushwork. See "Text".
 - **A derived `Debug` or serde spelling that reaches a file is a format, not a
   name.** `docformat::history::kind_id` and `blend_id` are both
   `format!("{:?}")`, and `BlendMode` additionally derives `Serialize` because a

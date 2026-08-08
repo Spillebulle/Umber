@@ -1239,10 +1239,26 @@ impl Editor {
     /// [`Editor::begin_stroke`], which refuses on it at the same gate a lock is
     /// refused at, so this is the shape rather than a case anything downstream
     /// has to invent an answer for.
+    /// **Exhaustive over [`EditTarget`] on purpose, and it was not.** It read
+    /// `match (self.edit_target, self.layers.active_mask())` with a single
+    /// `_ =>` falling through to the layer's slot, which is `matches!` wearing
+    /// a tuple: a third variant added to `EditTarget` would be a stroke landing
+    /// silently on the layer's *pixels*, which is the one outcome that damages
+    /// a document rather than refusing to touch it. Found by an agent whose own
+    /// gate had cited this function as a precedent for exhaustive matching.
+    /// See CLAUDE.md's "Partial exhaustiveness is worse than none" — the
+    /// catch-all is what makes the compiler look as though it has your back.
+    ///
+    /// The fall-through for `Mask` **with no mask** is deliberate and stays,
+    /// which is why the arms are written out rather than collapsed: it is a
+    /// stated answer to a real state, not a default for one nobody considered.
     pub fn stroke_target(&self) -> Option<(u32, bool)> {
-        match (self.edit_target, self.layers.active_mask()) {
-            (EditTarget::Mask, Some(slot)) => Some((slot, true)),
-            _ => Some((self.layers.active_slot()?, false)),
+        match self.edit_target {
+            EditTarget::Mask => match self.layers.active_mask() {
+                Some(slot) => Some((slot, true)),
+                None => Some((self.layers.active_slot()?, false)),
+            },
+            EditTarget::Layer => Some((self.layers.active_slot()?, false)),
         }
     }
 
