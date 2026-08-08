@@ -362,10 +362,18 @@ impl Brush {
         (self.size * scale * 0.5).max(0.5)
     }
 
-    /// Per-dab coverage for a given pressure.
+    /// Coverage the **mark** reaches at a given pressure.
     ///
     /// Note this deliberately excludes [`Brush::opacity`]: dabs accumulate with
     /// a `max` blend, so stroke opacity has to be applied once afterwards.
+    ///
+    /// The mark rather than one dab, and under the `max` those are the same
+    /// number — which is why this reads as "per-dab coverage" everywhere the
+    /// dab pass is being described. Under [`Brush::build_up`] they part company,
+    /// and it is [`crate::stroke::StrokeBuilder`] that converts: this stays the
+    /// figure the brush editor's curve draws and the figure the stroke arrives
+    /// at. See [`crate::tip::per_dab_for_stroke`] for what happens to a
+    /// pressure-opacity ramp when the two are confused.
     pub fn coverage_at(&self, pressure: f32) -> f32 {
         if self.pressure_opacity {
             self.opacity_curve.sample(pressure.clamp(0.0, 1.0))
