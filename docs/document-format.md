@@ -170,16 +170,17 @@ plain everywhere else. Umber's own reader loses nothing: a record comes back as
 the effects it was written from, parameter for parameter, with a colour that
 does not move.
 
-**The writer is not yet connected, and this section describes the format rather
-than the running application.** `docformat` writes the record and `docimport`
-reads it, and both are under test — but the two places that build a `SaveLayer`,
-in `app.rs` and in `autosave.rs`, do not yet pass a layer's effects, so no save
-this build makes writes `umber/effects/` and no save raises the warning. Reading
-is wired, which means a document carrying effects opens with them and is saved
-without them. Nothing in the interface can create an effect yet, so no painting
-is at risk today; the two writers have to be connected together, because
-connecting Save alone would leave the autosave stripping effects off a modified
-document every five minutes.
+Both writers are connected: Save reads the stack it is looking at, and the
+autosave takes a layer's effects with its name when the capture begins, so a
+file's parameters and its pixels always come from the same instant. They had to
+be wired together. Wiring Save alone would have made an effect's survival depend
+on which path last touched the file, with the five-minute timer stripping what
+Save had kept.
+
+Nothing in the interface can make an effect yet, so today this is a format with
+no author. That is deliberate: the parameters are settled and round-trip before
+anything can create one, so the first control cannot ship a document Umber
+cannot reopen.
 
 `docs/layer-effects.md` is the whole design.
 
