@@ -2704,6 +2704,21 @@ seventeen concurrent Vulkan devices each blocking on `poll` for its own
 submission, which starved them into a hang — the run never finished rather than
 failing. Sharing one device is also ~10× faster.
 
+**A test that writes a process-global must take a lock, and the harness will
+not tell you it does not.** `prefs::apply` publishes the undo budget through
+`history::set_default_budget`, deliberately — a `History` is built by three
+things that cannot see a `Prefs`, the shape `shortcuts::publish` also has. The
+cost is that every test calling `apply` writes one variable while the harness
+runs them on parallel threads. Measured before it was fixed:
+`the_undo_budget_reaches_the_history_and_back` failed **10 runs in 40** at
+sixteen threads — it publishes 1024 MB and asserts it, and three other tests
+publish the default in between. **It passed every whole-workspace run**, because
+six hundred other tests change the interleaving, which is the worst shape this
+can take: green on the gate, red on whoever next runs `cargo test prefs`. The
+fix is `prefs_lock()`, `gputest::lock`'s idiom for a global that is not a
+device. When adding a test that touches one, filter the binary down to its own
+module and run it twenty times before believing the suite.
+
 **That rule is per test *binary*, and `umber-app` is a second one.**
 `umber_app::gputest` is its copy, and it exists because the rule was not applied
 there: `autosave`'s frame-loop test was the only thing in the crate that wanted
