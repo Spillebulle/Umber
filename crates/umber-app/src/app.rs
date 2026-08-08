@@ -4502,20 +4502,39 @@ mod tests {
     /// effect surviving or not depending on whether Save or the five-minute
     /// timer last touched the file is not a rule anybody can learn, where
     /// losing them consistently is at least a bug somebody reports.
+    ///
+    /// **Its reach is uneven and that is measured, not assumed.** Deleting
+    /// Save's line fails this; deleting the autosave's does not, because
+    /// `autosave.rs` names the field three times outside its tests — on
+    /// `LayerMeta`, in `snapshot` and in `run_task` — so a lower bound of one
+    /// literal is still met. That writer is covered by *behaviour* instead
+    /// (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails on
+    /// the same mutation), which is the stronger guard and the reason the
+    /// weaker one is only asked to cover the writer that cannot have it.
     #[test]
     fn every_writer_of_a_save_layer_states_its_effects() {
-        for (file, source) in [
+        // **Everything from `#[cfg(test)]` on is cut off first, and that is
+        // not tidiness.** This test's own body names both strings it counts,
+        // and its failure message named one of them — so the first draft read
+        // two `SaveLayer {` in this file where there is one, and two
+        // `effects:` where there is one, and passed on a coincidence. It did
+        // still fail under the mutation, by 1 against 2, which is exactly how
+        // a guard that passes for the wrong reason survives review. A text
+        // guard has to be told not to read itself.
+        for (file, whole) in [
             ("app.rs", include_str!("app.rs")),
             ("autosave.rs", include_str!("autosave.rs")),
         ] {
+            let source = whole.split("#[cfg(test)]").next().unwrap_or(whole);
             let literals = source.match_indices("SaveLayer {").count();
             assert!(literals > 0, "{file} builds no SaveLayer any more");
-            let stated = source.matches("effects: ").count();
+            let stated = source.match_indices("effects:").count();
             assert!(
                 stated >= literals,
-                "{file} builds {literals} SaveLayer(s) and states `effects:` \
-                 {stated} time(s); `..SaveLayer::new` defaults it to empty, so \
-                 the one that does not state it drops them in silence"
+                "{file} builds {literals} SaveLayer(s) outside its tests and \
+                 names the field {stated} time(s); `..SaveLayer::new` defaults \
+                 it to empty, so the one that does not name it drops a layer's \
+                 effects in silence"
             );
         }
     }
