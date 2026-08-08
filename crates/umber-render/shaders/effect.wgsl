@@ -18,15 +18,46 @@
 //   grow     `fs_grow`     signed distance, thresholded at the spread
 //   soften   `fs_down` + `fs_box` x4    a tent, on a downsample
 //   offset   `fs_resolve`  read the field where the shadow came from
-//   confine  `fs_resolve`  multiply by `1 - coverage`, for an *outer* effect
+//   confine  both          see below — it is per *kind*, not per side
 //
-// The confinement is the one asymmetry and it is deliberate: an **outer**
-// effect bakes its knockout here, because doing it at composite time would need
-// an *inverse* clip that `composite.wgsl` has no notion of; an **inner** effect
-// does nothing here at all and is confined by `LayerDraw::clipped`, which
-// already means "bounded by the alpha of the nearest unclipped layer below".
-// That asymmetry is the kind of thing that gets forgotten and reintroduced as a
-// uniform, so it is written here as well as in the design.
+// # The knockout belongs to the drop shadow, not to a side of the stack
+//
+// **`docs/layer-effects.md` §3.3 got this wrong and the correction is worth
+// stating where the code is.** It says an *outer* effect must not paint under
+// the layer's own opaque pixels, and cites Photoshop — but look at what that
+// control is called there: "Layer knocks out **drop shadow**". It is named for
+// the drop shadow because it is the drop shadow's. Generalising it to a whole
+// side of the stack is what made a centred outline undrawable: a stroke is meant
+// to sit *on* the edge, so removing it wherever the layer covers deletes the
+// half the artist asked for.
+//
+// So the confinement is chosen by kind and position, in `fs_grow`'s
+// `SHAPE_*` modes, and only a drop shadow sets `knockout` in `fs_resolve`:
+//
+//   drop shadow       `SHAPE_DILATE`  the coverage grown; knocked out at resolve,
+//                                     *after* the blur and the displacement,
+//                                     because the shadow's body has moved and
+//                                     what it must not cover is where the layer
+//                                     is *now*
+//   outline, outside  `SHAPE_OUTER`   the band times `1 - coverage`, which is
+//                                     what "outside the edge" *means* rather
+//                                     than a knockout — and applied before the
+//                                     blur, so a soft stroke is soft on both
+//                                     sides
+//   outline, centre   `SHAPE_CENTRE`  the full width straddling the edge, hidden
+//                                     by an opaque layer because the layer is
+//                                     drawn over it and visible through a
+//                                     translucent one, which is what Photoshop
+//                                     does and falls out of ordinary
+//                                     compositing
+//   outline, inside   `SHAPE_INNER`   the inward band alone, confined by
+//                                     `LayerDraw::clipped` — no new mechanism
+//
+// `LayerDraw::clipped` already means "bounded by the alpha of the nearest
+// unclipped layer below", so an inner effect drawn immediately above its own
+// layer reads exactly that. **When outer glow is built, ask the knockout
+// question again for it rather than inheriting either answer** — nobody has
+// decided whether a glow should be removed from under its own shape.
 //
 // # The distance field is a jump flood, and only a jump flood
 //
@@ -79,9 +110,8 @@ struct Cfg {
     down: i32,
     // How far the shape is grown before it is softened, in texels.
     spread: f32,
-    // Non-zero for an **inner** effect: no knockout, and `fs_grow` returns the
-    // band alone rather than the union of the band and the coverage.
-    inner: u32,
+    // Which shape `fs_grow` builds: one of the `SHAPE_*` constants below.
+    shape: u32,
     // Which slice of the layer array holds the pixels, and which holds the mask.
     slot: i32,
     mask_slot: i32,
@@ -102,10 +132,28 @@ struct Cfg {
     // Jump-flood step, in texels.
     k: i32,
     // Non-zero to seed the flood on the **complement** of the coverage, which
-    // turns the field into an *inward* distance. That is the whole of how an
-    // inside outline is drawn without a second field or a signed one.
+    // turns the field into an *inward* distance.
     invert: u32,
+    // Non-zero to remove the layer's own shape from the effect at resolve time.
+    // **A drop shadow and nothing else** — see the file header.
+    knockout: u32,
 };
+
+// What `fs_grow` builds. Mirrored by `EffectShape` in `canvas.rs`.
+//
+// The coverage grown by `spread`, for a drop shadow.
+const SHAPE_DILATE: u32 = 0u;
+// The outward band alone, outside the edge: an outline sitting outside.
+const SHAPE_OUTER: u32 = 1u;
+// The inward band alone, unconfined: an outline sitting inside, which
+// `LayerDraw::clipped` bounds.
+const SHAPE_INNER: u32 = 2u;
+// The two bands mixed by the coverage, for a centred outline. Reads `src`, which
+// holds the outward band a `SHAPE_RAW` pass put there.
+const SHAPE_CENTRE: u32 = 3u;
+// A band with no confinement at all, which is the first half of a centred
+// outline and is never an effect on its own.
+const SHAPE_RAW: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> c: Cfg;
 // The layer array, read by `fs_extract` alone.
@@ -248,19 +296,59 @@ fn fs_step(@builtin(position) f: vec4<f32>) -> @location(0) vec2<u32> {
 fn fs_grow(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
     let p = vec2<i32>(f.xy);
     let inside = coverage_at(p);
+    // **Unreachable, and kept as a guard rather than as a path.** Nothing plans a
+    // grow pass at all where the reach is zero — `plan_effect` skips it and points
+    // the blur and the resolve straight at the coverage, which is the same answer
+    // without a full-screen copy. What this catches is a *later* change planning
+    // one anyway: with `spread` at zero the band below is
+    // `1 - smoothstep(-0.5, 0.5, d)`, which is the coverage hard-thresholded, so
+    // an unguarded fall-through would silently lose the layer's antialiasing.
     if (c.grow == 0u) {
         return inside;
     }
+    var band = 0.0;
     let s = textureLoad(seeds, clamp(p, vec2<i32>(0), vec2<i32>(c.size) - vec2<i32>(1)), 0).xy;
-    if (s.x == NONE) {
-        return 0.0;
+    if (s.x != NONE) {
+        let d = distance(vec2<f32>(p), vec2<f32>(vec2<i32>(s))) - 0.5;
+        band = 1.0 - smoothstep(c.spread - 0.5, c.spread + 0.5, d);
     }
-    let d = distance(vec2<f32>(p), vec2<f32>(vec2<i32>(s))) - 0.5;
-    let band = 1.0 - smoothstep(c.spread - 0.5, c.spread + 0.5, d);
-    // An inner effect is a band and nothing else: the coverage it sits inside is
-    // what `LayerDraw::clipped` bounds it by, and unioning it in here would fill
-    // the whole shape.
-    return select(max(inside, band), band, c.inner != 0u);
+    switch c.shape {
+        // "Outside the edge" *is* `band * (1 - coverage)`: the outward distance
+        // is zero inside the shape, so the band alone fills it. Not a knockout
+        // — the drop shadow's is at resolve time, after its body has moved.
+        case SHAPE_OUTER: {
+            return band * (1.0 - inside);
+        }
+        // The inward band, whole. `LayerDraw::clipped` is what bounds it, and
+        // multiplying by the coverage here as well would apply the layer's alpha
+        // twice.
+        case SHAPE_INNER, SHAPE_RAW: {
+            return band;
+        }
+        // The outward band outside and the inward band inside, blended by the
+        // coverage rather than chosen by a threshold — so an antialiased edge
+        // hands over smoothly and the two halves meet at 1.0 where the coverage
+        // is a half and both bands are full. `src` holds the outward band.
+        case SHAPE_CENTRE: {
+            return mix(at(src, p, vec2<i32>(c.size)), band, inside);
+        }
+        // A drop shadow's dilate: the union, because the shadow is the whole
+        // shape grown rather than a band of it.
+        case SHAPE_DILATE: {
+            return max(inside, band);
+        }
+        // **Nothing, and that is the point.** WGSL demands a `default` and this
+        // one used to be `SHAPE_DILATE`, which meant a mode the shader had never
+        // heard of drew the union of the shape and the band — a filled silhouette
+        // in the effect's colour rather than a ring, which is the loudest possible
+        // wrong picture arriving as the quietest possible failure. Drawing nothing
+        // is a bug somebody reports. `the_shader_knows_every_shape_the_planner_
+        // can_ask_for` is what makes a shape added on the Rust side and not here a
+        // red test rather than a silhouette.
+        default: {
+            return 0.0;
+        }
+    }
 }
 
 // 4x box downsample, so the tent that follows runs on a sixteenth of the texels
@@ -320,17 +408,24 @@ fn bilinear(p: vec2<f32>) -> f32 {
     return mix(mix(a00, a10, fr.x), mix(a01, a11, fr.x), fr.y);
 }
 
-// The last pass: displace, tint, and knock the layer's own coverage out.
+// The last pass: displace, tint, and — for a drop shadow alone — knock the
+// layer's own shape out.
 //
-// The knockout is the outer effect's whole confinement and it is baked, not
-// composited — see the file header. `1 - coverage` rather than anything cleverer
-// because that is what the design says in as many words, and because at a
-// coverage of 1 it is exactly zero, which is what "a layer at 50% opacity shows
-// no shadow inside its own shape" needs.
+// **Here rather than in `fs_grow`, and only for the shadow.** The shadow's body
+// has been blurred and displaced by the time it reaches this pass, so what it
+// must not cover is where the layer is *now* — knocking it out before the
+// displacement would cut a hole where the shape used to be. An outline's
+// confinement is the opposite case and belongs in the grow: it is what "outside
+// the edge" means, and applying it before the blur is what makes a soft stroke
+// soft on both sides rather than sheared flat against the layer.
+//
+// `1 - coverage` rather than anything cleverer, because at a coverage of 1 it is
+// exactly zero — which is what "a layer at 50% opacity shows no shadow inside
+// its own shape" needs.
 @fragment
 fn fs_resolve(@builtin(position) f: vec4<f32>) -> @location(0) vec4<f32> {
     var a = bilinear(f.xy - c.offset);
-    if (c.inner == 0u) {
+    if (c.knockout != 0u) {
         a = a * (1.0 - coverage_at(vec2<i32>(f.xy)));
     }
     return c.tint * a;

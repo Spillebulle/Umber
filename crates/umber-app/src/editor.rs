@@ -1101,8 +1101,10 @@ impl Editor {
     ///
     /// The pixels are the renderer's — see `CanvasRenderer::flip_layers` — and
     /// the history entry is `app.rs`'s, because it has to be recorded only if
-    /// the GPU work actually happened. What is here is the selection, which is
-    /// geometry and belongs to the document.
+    /// the GPU work actually happened. What is here is everything on the document
+    /// that carries a **direction or a position**: the selection, which is
+    /// geometry, and every layer effect's lighting. `LayerStack::flip_text`
+    /// belongs here too and nothing calls it yet.
     ///
     /// **Called for the flip and again for its undo**, and it is its own
     /// inverse on both halves, which is the whole reason the history can record
@@ -1129,6 +1131,12 @@ impl Editor {
             .as_deref()
             .and_then(|sel| sel.flipped(axis, doc))
             .map(Arc::new);
+        // Every layer effect carries a *direction* — where the light is — and a
+        // flip that mirrored the pixels and left that alone is a whole document's
+        // shadows disagreeing with its forms. `LayerStack::flip_text` belongs on
+        // the next line when somebody wires it: this is the one place a flip
+        // reaches the model, and both are the same job.
+        self.layers.flip_effects(axis);
         // The gesture belongs to the pointer and was drawn on the picture as it
         // was. Abandoned rather than mirrored, exactly as a tab switch does —
         // and through `cancel_selection_draft` rather than by clearing the
@@ -2267,6 +2275,43 @@ mod tests {
             ed.brush.blend,
             BlendMode::Multiply,
             "the brush itself is untouched — the coercion is the stroke's"
+        );
+    }
+
+    /// **The flip is wired, and this is what says so.**
+    ///
+    /// `LayerStack::flip_effects` being correct is `umber-core`'s business and is
+    /// tested there; what cannot be tested there is that anything calls it. That
+    /// is the gap `LayerStack::flip_text`'s own docs name in as many words —
+    /// "nothing calls it yet" — and the one an effect's flip had no note about at
+    /// all, which is why a second agent had to find it. A test at the call site is
+    /// worth more than a note, so here is one.
+    ///
+    /// `Editor::flip_canvas` rather than `App::mirror_document` because that is
+    /// where a flip reaches the *model*: the selection's mirror is already there,
+    /// and `mirror_document` is the one route to it.
+    #[test]
+    fn flipping_the_canvas_mirrors_an_effects_lighting() {
+        let mut ed = Editor::default();
+        let shadow = umber_core::Effect {
+            angle: 120.0,
+            distance: 10.0,
+            ..umber_core::Effect::drop_shadow()
+        };
+        assert!(ed.layers.set_effect(0, shadow));
+        let (was_x, _) = shadow.offset();
+
+        ed.flip_canvas(umber_core::FlipAxis::Horizontal);
+        let there = ed
+            .layers
+            .get(0)
+            .and_then(|l| l.effect(umber_core::EffectKind::DropShadow))
+            .copied()
+            .expect("the effect survived");
+        let (dx, _) = there.offset();
+        assert!(
+            (dx + was_x).abs() < 1e-3,
+            "a flip left the shadow cast the way it was: {dx} against {was_x}"
         );
     }
 

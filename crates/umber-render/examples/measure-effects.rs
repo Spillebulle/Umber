@@ -345,7 +345,7 @@ fn bake_sweep(gpu: &Gpu, size: u32) {
         stroke_live: false,
     };
 
-    let cases: [(&str, &str, Effect); 3] = [
+    let cases: [(&str, &str, Effect); 4] = [
         (
             "shadow, default (softness 5)",
             "shadow/full @ 4",
@@ -360,11 +360,25 @@ fn bake_sweep(gpu: &Gpu, size: u32) {
             },
         ),
         (
-            "outline, width 16",
+            "outline 16, outside",
             "stroke/jfa @ 16",
             Effect {
                 spread: 16.0,
                 position: OutlinePosition::Outside,
+                ..Effect::outline()
+            },
+        ),
+        // **The expensive one, and the reason it is here.** A centred outline
+        // straddles the edge, so it needs the outward distance *and* the inward
+        // one and floods twice — which makes it the worst bake there is and the
+        // figure `EFFECT_MAX_PASSES_PER_EFFECT` is sized against. Nothing priced
+        // it until the knockout became per-kind and made the position real.
+        (
+            "outline 16, centre",
+            "stroke/jfa @ 16, twice",
+            Effect {
+                spread: 16.0,
+                position: OutlinePosition::Centre,
                 ..Effect::outline()
             },
         ),
