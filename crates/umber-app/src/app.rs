@@ -622,6 +622,11 @@ impl UmberApp {
     ///   the history's whole flip design rests on: no coordinate mapping, no
     ///   mirrored bytes, and every older patch reached with the canvas already
     ///   back in the orientation it was recorded in.
+    /// * A text entry is a patch **and** the record the layer held, swapped
+    ///   together. Restoring the pixels alone would leave the panel showing a
+    ///   caption the picture does not have and, worse, the next save writing
+    ///   that record beside those pixels with a fingerprint that agrees — see
+    ///   [`EditBody::Text`].
     fn reverse(&mut self, kind: EditKind, body: EditBody) -> EditBody {
         match body {
             EditBody::Pixels(patch) => {
@@ -653,6 +658,43 @@ impl UmberApp {
                     self.mirror_document(axis);
                 }
                 EditBody::Flip
+            }
+            EditBody::Text { patch, was } => {
+                // The record is found by the patch's **slot**, never by a
+                // position recorded beside it: stack order is a `Vec` order and
+                // a reorder between the edit and its undo would otherwise put
+                // the caption on whichever layer had moved into that row. A
+                // slot never changes hands while a patch naming it is held —
+                // that is what parking a deleted slice buys.
+                let at = self
+                    .editor
+                    .layers
+                    .layers()
+                    .iter()
+                    .position(|l| l.slot() == Some(patch.slot));
+                // `None` is a layer that has left the stack, which is a patch
+                // that no longer names anything either; the record goes with
+                // it rather than being put somewhere it does not belong.
+                let mut held = None;
+                if let Some(at) = at {
+                    held = self.editor.layers.take_text(at);
+                    if let Some(text) = was {
+                        // `set_text` refuses a folder, and a folder holds no
+                        // slot, so this cannot be one.
+                        self.editor.layers.set_text(at, *text);
+                    }
+                }
+                let id = self.editor.session.active_id();
+                let Some(gfx) = self.gfx.as_mut() else {
+                    return EditBody::Text { patch, was: held };
+                };
+                let Some(canvas) = gfx.canvases.get_mut(&id) else {
+                    return EditBody::Text { patch, was: held };
+                };
+                EditBody::Text {
+                    patch: swap_patch(canvas, &gfx.gpu, &patch),
+                    was: held,
+                }
             }
         }
     }

@@ -308,14 +308,17 @@ impl EditKind {
 ///   move and nothing is copied. See [`StackShape`].
 /// * [`EditBody::Flip`] is an edit that is **its own inverse**, so there is
 ///   nothing to keep. Undoing it is doing it again.
+/// * [`EditBody::Text`] is pixels **and** the [`crate::textobj::TextObject`]
+///   that made them. See its own docs for why that is not the mixing the
+///   paragraph below refuses.
 ///
-/// **No entry mixes them.** A structural entry never carries a patch, for the
-/// reason the timeline is stepped rather than seeked: a delete and the paint
-/// before it are reached in order, so the paint never has to be carried inside
-/// the delete. A body that meant two different things depending on the kind is
-/// exactly what that buys freedom from.
+/// **No entry mixes pixels and *structure*.** A structural entry never carries
+/// a patch, for the reason the timeline is stepped rather than seeked: a delete
+/// and the paint before it are reached in order, so the paint never has to be
+/// carried inside the delete. A body that meant two different things depending
+/// on the kind is exactly what that buys freedom from.
 ///
-/// Deliberately not a fourth arm for "some other self-inverse thing later": the
+/// Deliberately not an arm for "some other self-inverse thing later": the
 /// axis is in the [`EditKind`], and a body that carried its own copy of it
 /// would be a second place for the row's icon and the pixels to disagree.
 #[derive(Clone, Debug)]
@@ -327,6 +330,48 @@ pub enum EditBody {
     Structure(Box<StackShape>),
     /// Nothing. See [`EditKind::flip_axis`] for which way.
     Flip,
+    /// The pixels the edit replaced **and** the text record the layer held
+    /// before it.
+    ///
+    /// # Why this is not a `Pixels` with a note taped to it
+    ///
+    /// Setting a text layer again changes two things at once, and undoing one
+    /// without the other is worse than undoing neither. Restore the pixels
+    /// alone and the layer draws the old caption while [`crate::Layer::text`]
+    /// names the new one — the panel then shows a string the picture does not
+    /// have, and, far worse, the next save writes that record beside those
+    /// pixels with a fingerprint taken from *the pixels it is writing*. The
+    /// file agrees with itself, the reader's guard against a record that has
+    /// come adrift does not fire, and reopening re-renders the newer text over
+    /// the older picture. A document quietly damaged, which is the one outcome
+    /// this history loses itself over.
+    ///
+    /// So the two travel together, in one entry, for exactly the reason a
+    /// multi-layer transform will have to carry several patches in one: an
+    /// undo may not leave the document in a state it was never in.
+    ///
+    /// # It is in memory only, and `docformat::history::VERSION` did not move
+    ///
+    /// [`crate::docformat::SaveHistory`] writes this as an ordinary `Pixels`
+    /// body and the reader gives back a `Pixels`. A reopened undo therefore
+    /// restores the pixels alone — which is safe, and safe for a reason rather
+    /// than by luck: the record in the file was written with a fingerprint of
+    /// the pixels *that save* wrote, so after such an undo the record and the
+    /// pixels disagree and the **next** save either re-fingerprints them
+    /// together or, if the document is reopened first, the reader drops the
+    /// record and keeps the picture. The failure above needs the record to be
+    /// carried forward silently, and across a file it is not carried at all.
+    ///
+    /// Writing it down would be a `history::VERSION` bump for an entry an older
+    /// build would read as a flip — see the writer's `SaveBody::Flip` fallback
+    /// — and buys back only the caption in an undo step somebody has reopened
+    /// the document to reach.
+    Text {
+        patch: PixelPatch,
+        /// What the layer held before, or `None` where it held no record —
+        /// which is what placing text on an ordinary layer undoes to.
+        was: Option<Box<crate::textobj::TextObject>>,
+    },
 }
 
 impl From<PixelPatch> for EditBody {
@@ -358,6 +403,15 @@ impl EditBody {
             Self::Pixels(patch) => patch.byte_len(),
             Self::Structure(shape) => shape.byte_len(),
             Self::Flip => 0,
+            // The record is counted beside the patch for the reason a parked
+            // slice is counted beside a shape: it is kilobytes against a
+            // rectangle of pixels and will change no eviction anybody sees, and
+            // a budget blind to part of what it holds is one that will be wrong
+            // later. `TextObject::byte_len` is the same figure `StackShape`
+            // uses for one.
+            Self::Text { patch, was } => {
+                patch.byte_len() + was.as_ref().map_or(0, |t| t.byte_len())
+            }
         }
     }
 }
@@ -418,6 +472,12 @@ impl Edit {
     pub fn patches(&self) -> &[PixelPatch] {
         match &self.body {
             EditBody::Pixels(patch) => std::slice::from_ref(patch),
+            // A text entry *is* a painting entry that also carries the record,
+            // so its patch is read here exactly as any other is — which is what
+            // makes `SaveHistory` write it as an ordinary `Pixels` body with no
+            // arm of its own, and what makes the budget, the eviction and the
+            // saved-history resolution all treat it as the paint it is.
+            EditBody::Text { patch, .. } => std::slice::from_ref(patch),
             EditBody::Structure(_) | EditBody::Flip => &[],
         }
     }
@@ -1432,6 +1492,20 @@ mod tests {
                 model.flip(edit.kind.flip_axis().expect("a flip entry names an axis"));
                 EditBody::Flip
             }
+            // The pixels exactly as above, and the record swapped with them —
+            // one entry, so an undo cannot leave the two disagreeing.
+            EditBody::Text { patch, was } => {
+                let now = model.read(patch.rect);
+                model.write(patch.rect, &patch.pieces()[0].bytes());
+                let held = stack.take_text(0);
+                if let Some(text) = was {
+                    stack.set_text(0, *text);
+                }
+                EditBody::Text {
+                    patch: PixelPatch::new(patch.rect, patch.slot, now),
+                    was: held,
+                }
+            }
         };
         Edit::made_at(edit.kind, edit.at, body)
     }
@@ -1661,6 +1735,19 @@ mod tests {
                     EditBody::Structure(Box::new(self.stack.restore_shape(*shape)))
                 }
                 EditBody::Flip => EditBody::Flip,
+                EditBody::Text { patch, was } => {
+                    let now = self.read(patch.slot, patch.rect);
+                    let bytes = patch.pieces()[0].bytes().to_vec();
+                    self.write(patch.slot, patch.rect, &bytes);
+                    let held = self.stack.take_text(0);
+                    if let Some(text) = was {
+                        self.stack.set_text(0, *text);
+                    }
+                    EditBody::Text {
+                        patch: PixelPatch::new(patch.rect, patch.slot, now),
+                        was: held,
+                    }
+                }
             };
             Edit::made_at(edit.kind, edit.at, body)
         }
@@ -1673,6 +1760,115 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    /// **An undo of a text edit restores the pixels and the record together**,
+    /// and a redo puts both back.
+    ///
+    /// Either one alone is worse than neither. Pixels alone leaves the layer
+    /// drawing the old caption while [`crate::Layer::text`] names the new one:
+    /// the panel shows a string the picture does not have, and the next save
+    /// writes that record beside those pixels with a fingerprint taken from the
+    /// pixels *it* is writing — so the file agrees with itself, the reader's
+    /// guard against a record that has come adrift does not fire, and reopening
+    /// re-renders the newer text over the older picture.
+    ///
+    /// **Both directions and twice round**, because a body that swaps has to be
+    /// its own inverse to be steppable at all, which is what
+    /// `stepping_back_over_a_flip_...` pins one arm along.
+    #[test]
+    fn undoing_a_text_edit_puts_the_record_back_with_the_pixels() {
+        use crate::text::{Align, TextBlock};
+        use crate::textobj::{Placement, TextFace, TextObject};
+
+        let record = |caption: &str| {
+            TextObject::new(
+                TextBlock {
+                    text: caption.to_string(),
+                    size: 48.0,
+                    line_spacing: 1.2,
+                    tracking: 0.0,
+                    align: Align::Left,
+                },
+                TextFace {
+                    family: "Archivo".into(),
+                    style: "Regular".into(),
+                    postscript: String::new(),
+                },
+                crate::Color::new(0.1, 0.1, 0.1, 1.0),
+                Placement::identity(rect(0, 0, 4, 3)),
+            )
+        };
+
+        let mut doc = Doc::new(8, 6);
+        let slot = doc.stack.active_slot().expect("a fresh stack has a layer");
+        let mark = rect(0, 0, 4, 3);
+
+        // As it was: the old caption's pixels and the old record.
+        doc.paint(slot, mark, 60);
+        doc.stack.set_text(0, record("As it was"));
+        let before_pixels = doc.read(slot, mark);
+
+        // Setting it again: new pixels, new record, one entry holding both.
+        let patch = doc.paint(slot, mark, 200);
+        let was = doc.stack.take_text(0);
+        doc.stack.set_text(0, record("Set again"));
+        let entry = Edit::new(EditKind::Transform, EditBody::Text { patch, was });
+
+        // The patch is read exactly as any painting entry's is, which is what
+        // lets `SaveHistory` write this as an ordinary `Pixels` body with no arm
+        // of its own — and what makes the budget count it.
+        assert_eq!(entry.patches().len(), 1);
+        assert!(
+            entry.byte_len() > mark.area() as usize * 4,
+            "the record is not counted"
+        );
+
+        let redo = doc.reverse(entry);
+        assert_eq!(doc.read(slot, mark), before_pixels, "the pixels came back");
+        assert_eq!(
+            doc.stack.text_at(0).map(|t| t.block.text.clone()),
+            Some("As it was".to_string()),
+            "the record did not come back with the pixels"
+        );
+
+        let undo = doc.reverse(redo);
+        assert_eq!(
+            doc.stack.text_at(0).map(|t| t.block.text.clone()),
+            Some("Set again".to_string()),
+            "a redo did not put the newer record back"
+        );
+
+        // And once more, so the swap is shown to be its own inverse rather than
+        // right once.
+        doc.reverse(undo);
+        assert_eq!(
+            doc.stack.text_at(0).map(|t| t.block.text.clone()),
+            Some("As it was".to_string())
+        );
+
+        // Placing text on an ordinary layer undoes to *no* record, which is the
+        // `None` arm and the case that would otherwise leave a layer claiming
+        // text it does not have after Ctrl+Z.
+        let patch = doc.paint(slot, mark, 30);
+        let was = doc.stack.take_text(0);
+        assert!(was.is_some());
+        let placed = Edit::new(
+            EditKind::Transform,
+            EditBody::Text {
+                patch,
+                was: Some(Box::new(record("As it was"))),
+            },
+        );
+        doc.reverse(placed);
+        assert!(doc.stack.text_at(0).is_some());
+        let patch = doc.paint(slot, mark, 31);
+        let placed = Edit::new(EditKind::Transform, EditBody::Text { patch, was: None });
+        doc.reverse(placed);
+        assert!(
+            doc.stack.text_at(0).is_none(),
+            "undoing a placement left the layer claiming text it no longer draws"
+        );
     }
 
     /// The claim the whole design rests on, end to end.
