@@ -985,28 +985,154 @@ pub fn dab_stack_alpha(per_dab: f32, spacing: f32, hardness: f32) -> f32 {
     if per_dab <= 0.0 {
         return 0.0;
     }
+    let mut alpha = 0.0f32;
+    for coverage in centre_line_falloffs(spacing, hardness) {
+        alpha += per_dab * coverage * (1.0 - alpha);
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
+/// The dab pass's own falloff at the stroke's centre line: one weight per dab
+/// whose footprint reaches the point being measured.
+///
+/// One statement of it, because [`dab_stack_alpha`] and [`stack_depth`] are the
+/// forward and the reverse of the same simulation and a second copy of the walk
+/// is exactly how the two would come to disagree about how deep a stroke is.
+fn centre_line_falloffs(spacing: f32, hardness: f32) -> impl Iterator<Item = f32> {
     // In radii: a dab lands every `2 × spacing` of them, and one reaches 1.0.
     let step = (spacing.clamp(0.001, 4.0) * 2.0).max(1e-3);
     let reach = (1.0 / step).ceil() as i32;
-
-    let mut alpha = 0.0f32;
-    for i in -reach..=reach {
+    let inner = hardness.clamp(0.0, 1.0);
+    (-reach..=reach).filter_map(move |i| {
         let d = (i as f32 * step).abs();
         if d >= 1.0 {
-            continue;
+            return None;
         }
         // The fragment shader's falloff, with the antialiasing margin left out:
         // that is a per-pixel softening at the rim and this is the centre line.
-        let inner = hardness.clamp(0.0, 1.0);
         let t = if inner >= 1.0 {
             0.0
         } else {
             ((d - inner) / (1.0 - inner)).clamp(0.0, 1.0)
         };
-        let coverage = 1.0 - t * t * (3.0 - 2.0 * t);
-        alpha += per_dab * coverage * (1.0 - alpha);
+        Some(1.0 - t * t * (3.0 - 2.0 * t))
+    })
+}
+
+/// Where [`stack_depth`]'s fit is pinned, and it is a measured figure rather
+/// than a round one.
+///
+/// The unfitted model — a flat stack as deep as the falloffs sum to — is exact
+/// as the coverage approaches zero, because every term is then near its own
+/// linearisation, and worst high up: 10.7 levels of 255 at a target of 0.88.
+/// Pinning the fit spreads what is left either side of the pin, so the choice is
+/// only which end to be exact at, and this is the one that measured smallest over
+/// the whole surface. 0.85 leaves 9.0 levels and 0.45 leaves 7.7; this leaves
+/// 6.4, and 2.4 at the 10% spacing a brush is actually likely to carry.
+/// `examples/measure-buildup.rs` prints the sweep those come from.
+const CALIBRATION: f32 = 0.6;
+
+/// The depth of a flat stack of dabs that accumulates the way this brush's
+/// overlapping dabs actually do, for [`per_dab_for_stroke`] to invert.
+///
+/// **Not simply how many dabs reach a point.** That count — the falloffs summed
+/// — is what the accumulation behaves like for a faint dab, where every term is
+/// small and the product is near its linearisation, and it overstates the depth
+/// for a strong one, because a dab out at the rim of the overlap contributes a
+/// fraction of a dab and the near ones have already saturated. So the depth is
+/// *fitted*: the weighted product is solved once for the coverage that reaches
+/// [`CALIBRATION`], and the flat depth that reaches the same place is returned.
+///
+/// The bisection is affordable because this is a **per-stroke** figure, not a
+/// per-dab one — it depends on nothing but the spacing and the hardness. Forty
+/// halvings of a monotone function is exact to a float, and the alternative
+/// (solving the weighted product per dab) is a bisection on the drawing path.
+///
+/// At least one, because a dab always covers its own centre; and exactly one for
+/// a brush whose dabs do not overlap at all, which makes the conversion the
+/// identity.
+pub fn stack_depth(spacing: f32, hardness: f32) -> f32 {
+    let falloffs: Vec<f32> = centre_line_falloffs(spacing, hardness).collect();
+    let stacked = |per_dab: f32| {
+        let mut alpha = 0.0f32;
+        for w in &falloffs {
+            alpha += per_dab * w * (1.0 - alpha);
+        }
+        alpha
+    };
+    // A single dab already reaching the calibration point is a stack with
+    // nothing to unpick, and the answer is exactly one.
+    if stacked(1.0) <= CALIBRATION {
+        return 1.0;
     }
-    alpha.clamp(0.0, 1.0)
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if stacked(mid) < CALIBRATION {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let per_dab = (0.5 * (lo + hi)).clamp(1e-6, 1.0 - 1e-6);
+    // `n` from `1 - (1 - c)^n = CALIBRATION`.
+    ((1.0 - CALIBRATION).ln() / (1.0 - per_dab).ln()).max(1.0)
+}
+
+/// [`dab_stack_alpha`] read backwards: the per-dab coverage whose accumulation
+/// reaches `stroke_alpha`.
+///
+/// **This is what keeps [`crate::Brush::build_up`] from redefining what a
+/// pressure-opacity curve means.** Under the wet-layer `max` the per-dab figure
+/// *is* the stroke's, so `coverage_at` describes the mark and the brush editor's
+/// graph of it is a picture of the mark. Build-up swaps that blend for
+/// `a = cov + a(1 − cov)`, and then the same curve arrives at the canvas
+/// compounded [`stack_depth`] times over: an author's 4% at a feather touch became
+/// 31% of the layer, and everything above about a third of the pressure range
+/// saturated flat at full. Both ends capped, the curve still drawing 0.04…1.0,
+/// and — worse — by an amount decided by the **spacing**, which for an imported
+/// brush whose file says "automatic" is a default constant nobody chose. Two
+/// reports of the same brush a version apart, in opposite directions, are this.
+///
+/// So a building stroke converts on the way *out*: the dab gets the smaller
+/// figure, the accumulation puts it back, and a tip's or a paper's own faintness
+/// still builds because those are multiplied in by the shader afterwards. That
+/// is the whole point of the split — build-up is for a mark made of many faint
+/// *stamps*, never for undoing the artist's own opacity.
+///
+/// **Zero and one are exact fixed points, and a depth of one is the exact
+/// identity**, so a brush that already paints solid — which is nearly every one
+/// that sets `build_up` — is untouched, and every brush that does not set it
+/// still carries its curve to the dab byte for byte.
+///
+/// `depth` comes from [`stack_depth`], which fits it to the way this brush's
+/// dabs actually accumulate rather than counting them; the inverse here is then
+/// the flat `1 − (1 − c)^depth`. Exact for a hard dab, where the falloff across
+/// the overlap is flat, and out by at most **6.4 levels of 255** over every
+/// spacing and hardness a brush can carry — 2.4 at a 10% spacing, and exactly
+/// nothing above 50%, where dabs stop overlapping and the depth is one —
+/// `a_converted_dab_builds_back_to_what_the_curve_asked_for` measures that
+/// rather than assuming it, and `examples/measure-buildup.rs` prints the surface. The
+/// remaining error is the same order as `dab_stack_alpha`'s own against the
+/// `R8Unorm` scratch, and the alternative — solving the weighted product per
+/// dab — is a bisection on the drawing path.
+pub fn per_dab_for_stroke(stroke_alpha: f32, depth: f32) -> f32 {
+    let target = stroke_alpha.clamp(0.0, 1.0);
+    // A single dab deep is every brush that does not build up, and it has to
+    // come back **byte for byte** rather than merely close: the `max` path is
+    // what every pixel test in the suite is written against. `1 - (1 - x)` is
+    // not the identity in floating point — at 0.03 it returns 0.029999971 — so
+    // the early answer is the guarantee and not an optimisation, though it is
+    // also what keeps `powf` off the ordinary drawing path.
+    if depth <= 1.0 || target <= 0.0 {
+        return target;
+    }
+    // `powf` on a zero base would otherwise decide whether a brush that already
+    // paints solid stays solid, which is nearly every brush that sets build-up.
+    if target >= 1.0 {
+        return 1.0;
+    }
+    1.0 - (1.0 - target).powf(1.0 / depth)
 }
 
 /// What a stroke through `tile` reaches under each rule, at `strength`.
@@ -1747,6 +1873,63 @@ mod tests {
         let full = grain_coverage(&blank, 1.0, 0.1);
         assert_eq!(full.under_max, 1.0);
         assert!(!full.needs_build_up());
+    }
+
+    /// [`per_dab_for_stroke`] against [`dab_stack_alpha`], which is the forward
+    /// simulation it inverts, over every spacing and hardness a brush can carry.
+    ///
+    /// **It measures the worst case rather than asserting a bound out of
+    /// nowhere.** [`stack_depth`] fits a flat depth to the way a brush's dabs
+    /// actually accumulate, pinned at [`CALIBRATION`]; what is left over is the
+    /// difference in *shape* between a flat stack and a stack of falloffs, and
+    /// it is largest for a soft dab at a spacing wide enough that only two or
+    /// three dabs overlap. A hard dab is exact, because its falloff across the
+    /// overlap is flat and the flat model is then the real one.
+    ///
+    /// The bound is a whole level of 255 clear of what this measures, which
+    /// leaves room for the figure to move without leaving room for the defect it
+    /// exists to catch: the failure that made this necessary was 68 levels at
+    /// the light end and 105 in the middle.
+    #[test]
+    fn a_converted_dab_builds_back_to_what_the_curve_asked_for() {
+        let mut worst = 0.0f32;
+        let mut worst_at = (0.0, 0.0, 0.0);
+        for step in 1..=100 {
+            let spacing = step as f32 / 100.0;
+            for hardness in [0.0, 0.25, 0.5, 0.55, 0.81, 0.9, 1.0] {
+                let depth = stack_depth(spacing, hardness);
+                for step in 0..=100 {
+                    let want = step as f32 / 100.0;
+                    let got = dab_stack_alpha(per_dab_for_stroke(want, depth), spacing, hardness);
+                    let error = (got - want).abs();
+                    if error > worst {
+                        worst = error;
+                        worst_at = (spacing, hardness, want);
+                    }
+                }
+            }
+        }
+        // Measured: 0.0250, which is 6.4 levels of 255, at spacing 0.30 and
+        // hardness 0.10 — three dabs of very unequal weight. At the 10% spacing
+        // a brush is actually likely to carry it is 2.4 levels, and every
+        // hardness of 1.0 is exact to a float.
+        assert!(
+            worst < 0.03,
+            "worst round trip {worst} at spacing/hardness/target {worst_at:?}"
+        );
+
+        // The two fixed points, exactly, at a depth that is genuinely stacking.
+        let depth = stack_depth(0.1, 1.0);
+        assert!(depth > 8.0, "a 10% spacing is nine dabs deep, not {depth}");
+        assert_eq!(per_dab_for_stroke(0.0, depth), 0.0);
+        assert_eq!(per_dab_for_stroke(1.0, depth), 1.0);
+
+        // And a depth of one is the identity byte for byte, which is what keeps
+        // every brush that does not build up on the path it was tested on.
+        for step in 0..=255 {
+            let v = step as f32 / 255.0;
+            assert_eq!(per_dab_for_stroke(v, 1.0), v);
+        }
     }
 
     /// The whole of what a tip drawn in Umber is: the alpha, and nothing else.

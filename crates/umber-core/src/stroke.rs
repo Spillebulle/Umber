@@ -23,6 +23,7 @@ use crate::dynamics::{
 };
 use crate::geom::Rect;
 use crate::input::InputPoint;
+use crate::tip;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
@@ -206,6 +207,13 @@ pub struct StrokeBuilder {
     /// How far into the stroke we are, in the `0..1` the `Stroke` input reports
     /// — advanced by travel measured in dab radii, and wrapped.
     stroke_pos: f32,
+    /// How many dabs deep a point on this stroke's centre line sits, for
+    /// [`tip::per_dab_for_stroke`]. `1.0` — the exact identity — for every brush
+    /// that does not build up, which is nearly all of them.
+    ///
+    /// Snapshotted with the brush rather than read per dab: it depends only on
+    /// the spacing and the hardness, and `powf` is enough to pay for once.
+    stack_depth: f32,
 }
 
 // Written out rather than derived: a derived `Default` would zero `bounds`,
@@ -238,6 +246,7 @@ impl StrokeBuilder {
             slow_speed: 0.0,
             velocity: Vec2::ZERO,
             stroke_pos: 0.0,
+            stack_depth: 1.0,
         }
     }
 
@@ -348,6 +357,16 @@ impl StrokeBuilder {
     /// alter the half already painted.
     pub fn begin(&mut self, brush: Brush, paint: [f32; 3], point: InputPoint) {
         self.brush = brush;
+        // Exactly 1.0 unless this brush builds up, which makes
+        // `per_dab_for_stroke` the identity and keeps the `max` path byte for
+        // byte what it was. Read from the snapshotted brush for the reason the
+        // colour is snapshotted: the depth has to be the same for every dab of
+        // one stroke, or its strength would change mid-mark.
+        self.stack_depth = if brush.build_up {
+            tip::stack_depth(brush.spacing, brush.hardness)
+        } else {
+            1.0
+        };
         self.paint = paint;
         self.smudge = None;
         self.active = true;
@@ -576,7 +595,16 @@ impl StrokeBuilder {
         if m.size_log != 0.0 {
             radius = (radius * m.size_log.exp()).clamp(0.05, Brush::MAX_SIZE);
         }
-        let coverage = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
+        // What the *mark* is to reach at this pressure — which is what
+        // `coverage_at` means, what the brush editor's curve draws, and under
+        // the `max` blend exactly what one dab carries.
+        let mark = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
+        // Under build-up the scratch accumulates instead, so the dab has to
+        // carry less for the stroke to arrive at the same place. `stack_depth`
+        // is 1.0 for every other brush and this is then the exact identity —
+        // see `tip::per_dab_for_stroke` for why the alternative was two bug
+        // reports of the same brush pointing in opposite directions.
+        let coverage = tip::per_dab_for_stroke(mark, self.stack_depth);
 
         // Jitter in log space, so the variation is symmetric about the nominal
         // radius and cannot produce a negative one however large the setting.
@@ -1461,6 +1489,103 @@ mod tests {
             "hardness did not follow pressure: {first} to {last}"
         );
         assert!(dabs.iter().all(|d| (0.0..=1.0).contains(&d.hardness)));
+    }
+
+    /// Accumulate the mark a row of dabs makes at one point on the stroke's
+    /// centre line, under whichever coverage rule the brush asks for.
+    ///
+    /// The dab pass's own arithmetic: `local` is the fragment's position in the
+    /// dab's own frame, the falloff is the same `smoothstep`, and the two blends
+    /// are the two the pipeline offers. Antialiasing is left out for the reason
+    /// `tip::dab_stack_alpha` leaves it out — it is a softening at the rim and
+    /// this is the middle.
+    fn mark_at(dabs: &[Dab], at: Vec2, build_up: bool) -> f32 {
+        let mut alpha = 0.0f32;
+        for dab in dabs {
+            let d = (at - vec2(dab.pos[0], dab.pos[1])).length() / dab.radius;
+            if d >= 1.0 {
+                continue;
+            }
+            let inner = dab.hardness.clamp(0.0, 1.0);
+            let t = if inner >= 1.0 {
+                0.0
+            } else {
+                ((d - inner) / (1.0 - inner)).clamp(0.0, 1.0)
+            };
+            let cov = dab.coverage * (1.0 - t * t * (3.0 - 2.0 * t));
+            if build_up {
+                alpha += cov * (1.0 - alpha);
+            } else {
+                alpha = alpha.max(cov);
+            }
+        }
+        alpha
+    }
+
+    /// **The mark a stroke makes is what `coverage_at` says, under either
+    /// coverage rule** — which is the promise the brush editor's
+    /// "Pressure → opacity" curve makes by drawing that function.
+    ///
+    /// It held for the `max` blend by construction: coverage saturates, so one
+    /// dab's figure is the whole mark's. Build-up composites instead, and the
+    /// same curve then reached the canvas compounded once per overlapping dab: a
+    /// Clip Studio pencil whose author set 4% at a feather touch painted 31% of
+    /// the layer, and everything above about a third of its pressure range
+    /// saturated flat at full. Capped at both ends, with the curve beside it
+    /// still drawing 0.04 to 1.0 — reported twice, a version apart, in opposite
+    /// directions. `tip::per_dab_for_stroke` is the conversion and this is what
+    /// says the two rules now agree about the mark.
+    ///
+    /// Hardness 1.0 so the falloff is flat across the overlap and the figure is
+    /// the conversion's own accuracy rather than the model's.
+    #[test]
+    fn a_building_stroke_reaches_the_coverage_its_curve_asks_for() {
+        for build_up in [false, true] {
+            let brush = Brush {
+                hardness: 1.0,
+                pressure_opacity: true,
+                opacity_curve: ResponseCurve::LINEAR,
+                build_up,
+                ..unsmoothed(20.0, 0.1)
+            };
+            for step in 0..=8 {
+                let pressure = step as f32 / 8.0;
+                let mut s = StrokeBuilder::new();
+                s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                s.extend(InputPoint::new(vec2(100.0, 0.0), pressure, 0.1));
+                let dabs: Vec<Dab> = s.drain_pending().collect();
+                // Half way along, so the point is covered from both sides.
+                let got = mark_at(&dabs, vec2(50.0, 0.0), build_up);
+                let want = brush.coverage_at(pressure);
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "build_up {build_up} at pressure {pressure}: mark {got} for a curve asking {want}"
+                );
+            }
+        }
+    }
+
+    /// The other half of the pair: the conversion must not touch a brush that
+    /// does not build up, and `max` must still receive the curve verbatim.
+    ///
+    /// Byte for byte, not nearly — `per_dab_for_stroke` is the exact identity at
+    /// a depth of one, and every brush in the shipped library but eight takes
+    /// that path.
+    #[test]
+    fn a_stroke_that_does_not_build_up_carries_the_curve_verbatim() {
+        let brush = Brush {
+            pressure_opacity: true,
+            opacity_curve: ResponseCurve::EASE_IN,
+            build_up: false,
+            ..unsmoothed(20.0, 0.1)
+        };
+        for step in 0..=8 {
+            let pressure = step as f32 / 8.0;
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+            let dab = s.drain_pending().next().expect("a dab");
+            assert_eq!(dab.coverage, brush.coverage_at(pressure));
+        }
     }
 
     #[test]
