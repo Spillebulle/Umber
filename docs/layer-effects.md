@@ -628,6 +628,20 @@ doubles — so a document with no effects pays nothing, which is the argument th
 mask's own headroom already makes. **Except one thing, which is eager:**
 `slot_revisions` is `vec![0; MAX_SLOTS]` and is paid per open document.
 
+**And that sentence was wrong about the big one, which is why it is worth
+reading twice.** Raising the ceiling changed `ensure_slots` without a line of
+it being touched: growth doubles and the `.min(MAX_SLOTS)` had been acting as a
+*tight* bound, so a legal document — 64 masked layers and the float's spare,
+exactly 129 slices — went from allocating 129 to allocating **256**. At 2048²
+that is 4.29 GB against 2.16, with a 6.44 GB transient while the copy runs and
+no shrink afterwards. Growth is now stated in **bytes**: double while the array
+stays inside a budget, then round up to a whole quantum, which degenerates to
+exact growth at 10000² where waste is unaffordable. Landing on 129 was an
+accident of a ceiling sitting one above a power of two, not a property.
+
+The lesson generalises past this feature: **a constant that bounds a resource
+may also be silently bounding something else**, and moving it moves both.
+
 At `u64` each it goes from 1,032 bytes to 2,048. Its doc comment calls it "half a
 kilobyte", which is **already wrong by a factor of two** at 129 slots — correct
 it to be right rather than doubling a figure that was not right to begin with.
@@ -724,10 +738,10 @@ having been made rather than assumed — because the consequence, an older Umber
 *refusing* a document rather than opening it plainly, is a heavy hammer and the
 next person to read this will want to know somebody chose it on purpose.
 
-**Which number, and the collision with group compositing.**
-`docs/group-compositing.md` §4.3 also proposes 3. Only one of them can have it.
-Whichever lands first takes 3 and the other takes 4; this must be decided once,
-in whichever lands second, and not left for `required_version` to reconcile.
+**Which number — settled.** `docs/group-compositing.md` §4.3 also proposed 3.
+**Effects landed first and took 3, so group compositing takes 4**, and that is
+now written in §4.3 itself rather than only here, because the person who builds
+it reads that document and not this one.
 `required_version` emitting the lowest revision that describes the file does the
 rest: a document with effects and no isolated group declares only what effects
 need, and every document without either still declares 1 or 2 and still opens in

@@ -1163,6 +1163,55 @@ MyPaint's files. `docs/document-format.md` has the whole argument.
   `opacity` and no `composite-op`** — a group opacity is the one thing a
   flattening reader cannot reproduce, and writing one is what would earn the
   bump. `a_document_of_folders_still_declares_the_revision_it_needs` guards it.
+- **`umber-version` is at 3, and layer effects are what took it there.**
+  `docs/layer-effects.md` §8.2. The argument is not what an older build
+  *shows* — a layer without its shadow is merely plainer, which is the folder
+  case — it is what an older build *writes*: effects are non-destructive, the
+  parameters are the whole feature, so opening and saving drops
+  `umber/effects/` permanently. **`docs/group-compositing.md` §4.3 wanted 3
+  too; effects landed first, so group compositing takes 4**, and that is
+  recorded in §4.3 rather than only in a Rust comment, because the person who
+  implements it reads the document.
+- **An effects record goes outside the ORA stack, under `umber/effects/`, named
+  by an attribute on the element** — the mask's shape, for the mask's reason. A
+  document-wide table would need a key and every candidate is wrong: a stack
+  position shifts, a name is not unique, and `Layer::id` is never written down.
+- **Both writers were wired in one commit, deliberately.** A build that reads a
+  version-3 document and drops its effects at the next Save is the exact
+  failure the bump exists to prevent, arriving inside the build that raised it
+  — and the version gate cannot catch it, because the gate is
+  `version > VERSION` and this build *is* 3. Wiring Save alone looks like half
+  a fix and is **worse**: Save would preserve while the autosave stripped every
+  five minutes, so survival would depend on which path last touched the file.
+  Losing something every time is a bug somebody reports; losing it sometimes is
+  one they doubt themselves over.
+- **A parameter record needs a size bound of its own, and it is the first entry
+  that did.** Every other entry is a canvas and answers to `MAX_TOTAL_BYTES`'
+  2 GiB; a record's size follows a *count* the format does not bound. Measured:
+  569 KB expands to 300 MB and twenty million effects in eight seconds,
+  materialised before any budget check sees it, and sixty-four layers may name
+  the same entry. `MAX_EFFECTS_BYTES` is 64 KiB, derived from what
+  `MAX_ENABLED` permits.
+- **`PrettyConfig::new()` takes the *platform's* line ending.** Right for
+  `brushes.ron`, wrong for a document: the same `.ora` saved on Windows and on
+  Linux differed byte for byte. A document travels and a preference file does
+  not.
+- **A refusal that cannot be reported is not a refusal.** `set_effect` answers
+  `false` for the budget and `true` for a duplicate it silently replaced, so
+  the budget is settled by `disable_effects_over_budget` before anything is
+  installed — called from the reader *and* from `open`, idempotent by
+  construction, so the diagnostic and the guarantee are one function — and
+  "at most one per kind" is `LayerStack::duplicate_effect_kind`, which the
+  reader asks rather than keeping its own copy of.
+- **A warning must name a loss that happened.** `EffectsNotPortable` is once
+  per document and counts layers with an effect switched *on*: per layer it was
+  thirty lines of one sentence, and a layer whose effects are all off draws
+  plain in Umber too. `EffectsOverBudget` states what happened and does not
+  tell the artist to switch an effect off, because no such control exists.
+- **An unreadable effects record costs that layer its effects and nothing
+  else** — the mask's rule, not the saved history's. A history is a sequence in
+  which each entry restores what the next expects, so one missing from the
+  middle is a *wrong* history; effects are independent per layer.
 - **The writer emits the lowest revision the file actually needs**
   (`required_version`), so a document with no mask and no clipping still
   declares 1 and still opens in every older Umber. A version number is a

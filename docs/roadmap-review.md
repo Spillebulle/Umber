@@ -1,5 +1,19 @@
 # Reconciling the six designs
 
+> **The slot ceiling moved after this was written.** `LayerStack::MAX_SLOTS` is
+> **256**, not 129 — it is the device's `max_texture_array_layers` guarantee
+> rather than `MAX * 2 + 1`, and 127 of it is reserved as the layer-effect
+> budget. Growth is no longer plain doubling either: it doubles inside a byte
+> budget and rounds to a quantum past it. Every figure below that names 129, or
+> describes growth as doubling, needs re-deriving before it is acted on; the
+> arguments do not change, the arithmetic does. See `docs/layer-effects.md`
+> §6.3 and `grown_capacity` in `canvas.rs`.
+>
+> **This document's plan to raise `MAX_SLOTS` from 129 to 136 has to be
+> re-derived in particular**: there is no longer open room above the ceiling,
+> only the 127 slices layer effects have claimed, so eight more slots must now
+> be taken *from* that budget rather than added on top of it.
+
 `structural-undo.md`, `linked-transform.md`, `group-compositing.md`,
 `text-tool.md`, `mobile.md` and `pen-platforms.md` were written in parallel by
 six agents who could not read each other. Each is good on its own subject. This
