@@ -1958,7 +1958,7 @@ mod tests {
     /// This is the defect the design walked into: `docs/structural-undo.md` §7
     /// says a parked slot "costs no *new* allocation", and that is false.
     /// `LayerStack::slot_capacity_needed` never falls while a slice is parked,
-    /// and `CanvasRenderer::ensure_slots` doubles and never shrinks — so a
+    /// and `CanvasRenderer::ensure_slots` never shrinks — so a
     /// session of deleting and adding layers walks the layer array to its
     /// 256-slice ceiling, which is 4.29 GB at 2048² and 102.4 GB at 10000²,
     /// with a budget that reported a few kilobytes and evicted nothing. An
