@@ -12,6 +12,63 @@ version here must match `workspace.package.version` in `Cargo.toml`; the test
 `the_changelog_describes_this_version` fails the build if it does not, so a
 release cannot be cut without notes.
 
+## 0.1.0 — 2026-08-09
+
+Layers can carry effects, and text stays text.
+
+A drop shadow or a stroke now sits on a layer as a setting rather than as paint
+you cannot take back. Change the colour, the size or the angle whenever you
+like, and the shadow follows the brush while you draw.
+
+Text placed on the canvas can be set again. Reopen the document tomorrow and
+the caption is still a caption: fix the typo, change the font, pick bold or
+italic. Scaling it up is sharp now, because it is drawn again at the size you
+dragged it to rather than being stretched.
+
+### New
+
+- **Layer effects: a drop shadow and a stroke.** Both are settings on the
+  layer, not paint. A stroke can sit outside the edge, centred on it, or
+  inside. A shadow takes a colour, an angle, a distance, a spread and a
+  softness, and it multiplies against what is under the layer the way you would
+  expect.
+- **Effects follow the brush.** The shadow updates as you paint rather than
+  appearing when you lift the pen.
+- **Text stays text.** A caption is kept as text in the document, so it can be
+  set again after a save and a reopen. Umber writes it beside the picture, so
+  the file still opens anywhere that reads OpenRaster.
+- **Bold and italic**, from a family's own faces. Umber will not fake a bold by
+  thickening an outline or fake an italic by leaning one over, so where a
+  family has neither it says which one is missing rather than inventing it.
+- **A style picker** listing a family's real styles, including the named
+  instances inside a variable font.
+- **Text colour**, and a "Convert to paint" command for when you want the
+  caption to stop being editable.
+
+### Fixed
+
+- **Scaling placed text was pixelated.** It was being stretched like a
+  photograph. It is now drawn again through whatever scale and rotation you
+  have given it, so it is sharp at any size.
+- **Text blocks reserved far more room than they needed**, which is why a large
+  caption could be refused for being too big when it was not.
+- **A canvas flip left every drop shadow lit from the old direction.**
+- **Clip Studio brushes ignored their Density setting entirely**, and their
+  pressure-to-opacity curve arrived meaning the wrong thing, so brushes painted
+  darker at a light touch and reached solid before full pressure.
+
+### Known limits
+
+Named here rather than left to be discovered.
+
+- **Moving a placed caption with the transform tool turns it back into paint.**
+  You are told, and it can be undone.
+- **Text is only kept as text when it is placed on an empty layer**, and only
+  up to the size of the canvas. Umber says so at the time.
+- **Editing a caption is a button, not live typing.** The canvas updates when
+  you ask it to.
+- Effects other than the shadow and the stroke are not built yet.
+
 ## 0.0.9 — 2026-08-06
 
 The Windows installer works. `umber-setup.exe` opened Umber instead of
