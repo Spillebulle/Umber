@@ -194,15 +194,21 @@ impl Transform {
     /// float that was typed into but never dragged from recording an edit it
     /// did not make.
     ///
-    /// **Nothing calls this yet**, and that is said here rather than left to be
-    /// discovered. Text placed on the canvas today is a *paste* — pixels the
-    /// moment they land, with no caret and therefore no box that grows as it is
-    /// typed into. This is here because the exactness is the part that is worth
-    /// proving before anything depends on it, and it is provable without a
+    /// **`App::update_text_layer` is what calls it**, and not the caret this was
+    /// written for: setting a placed text layer again grows or shrinks the ink,
+    /// so the source rectangle has to move while every glyph already on the
+    /// canvas stays exactly where the artist dragged it to. The caret of
+    /// `docs/text-tool.md` §4(a) will want the same thing per keystroke.
+    ///
+    /// The exactness is the part worth proving, and it is provable without a
     /// device: the pair of tests beside
     /// `a_transform_and_its_inverse_are_exact_opposites` is the whole of the
-    /// argument, and it will not have to be reconstructed by whoever builds the
-    /// caret. See `docs/text-tool.md` §4(a).
+    /// argument. **Read it before taking the source rectangle from a reseated
+    /// transform**: `reseat` deliberately leaves `apply` identical and
+    /// deliberately changes `source`, so [`Self::dest_rect`] afterwards is the
+    /// new block's bounding box and not the old one's. That was a real bug in
+    /// this method's first caller, and a shortened caption left its old letters
+    /// standing.
     pub fn reseat(&mut self, source: PixelRect) {
         let was = self.pivot();
         let m = self.rotation() * Mat2::from_diagonal(self.scale);

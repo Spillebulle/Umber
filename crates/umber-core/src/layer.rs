@@ -383,9 +383,11 @@ impl EditRefusal {
     /// What to tell somebody who asked for an edit this refuses.
     ///
     /// A finished sentence written for the user, and deliberately not one that
-    /// names a control: there is no "convert to paint" command yet, and a notice
-    /// promising one would be the lying control this project refuses everywhere.
-    /// [`LayerStack::take_text`] is that command's model half when it arrives.
+    /// names a control: this module cannot know what the interface calls the
+    /// way out, and a sentence naming a button is one that goes stale silently
+    /// when the button is renamed. The Text panel's "Convert to paint" —
+    /// [`LayerStack::take_text`]'s caller — is named in `app.rs`'s own wording
+    /// for a refused paste and a refused cut, where the button is in view.
     ///
     /// Exhaustive with no catch-all, so a further variant fails the build here
     /// rather than going out as a blank line.
@@ -1391,11 +1393,10 @@ impl LayerStack {
     /// canvas that only *grew*, and two behaviours behind one command is how the
     /// cropping case comes to be the one nobody tested.
     ///
-    /// **Nothing calls it yet.** `Editor::apply_canvas` drops the selection and
-    /// clears the history and does not reach here, so a resize currently leaves a
-    /// record describing a canvas that has gone. Wave two wires it, beside the
-    /// history clear; see [`LayerStack::refusal_at`] for the same note about the
-    /// paint gate and why the record cannot yet be reached anyway.
+    /// **Called from `Editor::apply_canvas`**, beside the history clear and the
+    /// selection being dropped, and only where the size actually changed —
+    /// calling it unconditionally would make every caption in the document paint
+    /// the moment somebody pressed Apply on a dialog they had not touched.
     ///
     /// Returns how many were dropped, so the caller can say so rather than
     /// leaving somebody to find out that their text is paint now.
@@ -1411,11 +1412,11 @@ impl LayerStack {
     ///
     /// **It belongs beside wherever the layer pixels are flipped, and there is one
     /// such place**: `app.rs`'s `mirror_document` is the single route a flip
-    /// takes, shared by the command and by both undo directions. **Nothing calls
-    /// it yet** — `mirror_document` reaches `flip_layers` and `flip_canvas` and
-    /// neither of those reaches here — so a flip currently mirrors the pixels and
-    /// leaves the record un-mirrored. Wave two wires it, in that one place;
-    /// forgetting it means the next re-render un-mirrors the layer.
+    /// takes, shared by the command and by both undo directions. It reaches here
+    /// through `Editor::flip_canvas`, on the line after
+    /// [`LayerStack::flip_effects`] and for the same reason — both mirror
+    /// something that carries a direction or a position. Leaving the record
+    /// behind means the next re-render un-mirrors the layer.
     ///
     /// The mirror is exact rather than approximate — see
     /// [`crate::textobj::Placement::flipped`] — which is why a flip does not cost
@@ -1452,7 +1453,7 @@ impl LayerStack {
     ///
     /// It went unnoticed on this side and was written down on the other, which is
     /// why a second pair of eyes had to find it: [`LayerStack::flip_text`]'s docs
-    /// say in as many words that nothing calls it yet, and an effect's flip said
+    /// said in as many words that nothing called it, and an effect's flip said
     /// nothing at all. **If a third thing on a layer ever carries a direction,
     /// say so at its own method whether or not it is wired.**
     ///
@@ -1462,8 +1463,8 @@ impl LayerStack {
     ///
     /// **Called from `Editor::flip_canvas`**, which `app.rs`'s `mirror_document`
     /// is the single route to and which already holds the model's other half of a
-    /// flip, the selection's mirror. `flip_text` belongs in exactly that line when
-    /// somebody wires it.
+    /// flip, the selection's mirror. [`LayerStack::flip_text`] is on the next
+    /// line, where this doc said it belonged.
     pub fn flip_effects(&mut self, axis: FlipAxis) {
         for layer in &mut self.layers {
             for effect in &mut layer.effects {
@@ -1797,15 +1798,20 @@ impl LayerStack {
     /// reason to show. Three separate booleans is how the fourth gate comes to
     /// check only two of them.
     ///
-    /// **Nothing calls it yet, and that is said here rather than left to be
-    /// discovered.** `Editor::begin_stroke` still reads `active_is_locked` and
-    /// `stroke_target` separately, and nothing sets [`Layer::text`] outside a
-    /// document that carried a record, so there is at present no text layer for a
-    /// brush to reach. The paint gate is wave two's to wire, in
-    /// `Editor::begin_stroke` and `App::begin_float`, and until it is **a text
-    /// layer can be painted on** — which the fingerprint does *not* cover, since
-    /// a save takes its fingerprint from the pixels it is writing. See
+    /// **Four operations ask it**, and they are every route by which a layer's
+    /// own pixels are written outside an undo: `Editor::begin_stroke`,
+    /// `App::begin_float` for a lift and a paste both, and `App::cut_selection`.
+    /// Anything added beside them has to ask it too — the fingerprint does *not*
+    /// cover a record that has come adrift in the session, since a save takes
+    /// its fingerprint from the pixels it is writing, so the file agrees with
+    /// itself and the next open re-renders over whatever is there. See
     /// `docs/text-tool.md` §3 and this module's docs.
+    ///
+    /// **A lift is the one that is allowed through and it is not an exception
+    /// here**: `begin_float` filters this answer for a lift itself, because a
+    /// lift moves the caption's *own* pixels and takes the record off with them.
+    /// This method's answer is unchanged, which is what keeps the reading in one
+    /// place and the policy at the caller.
     ///
     /// `target` matters, and it is the half that is easy to get backwards. A
     /// stroke on a text layer's **mask** is allowed: a mask bounds the alpha the

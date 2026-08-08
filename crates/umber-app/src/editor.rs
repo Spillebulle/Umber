@@ -1190,8 +1190,8 @@ impl Editor {
     /// the history entry is `app.rs`'s, because it has to be recorded only if
     /// the GPU work actually happened. What is here is everything on the document
     /// that carries a **direction or a position**: the selection, which is
-    /// geometry, and every layer effect's lighting. `LayerStack::flip_text`
-    /// belongs here too and nothing calls it yet.
+    /// geometry, every layer effect's lighting, and every text record's
+    /// placement.
     ///
     /// **Called for the flip and again for its undo**, and it is its own
     /// inverse on both halves, which is the whole reason the history can record
@@ -2583,10 +2583,11 @@ mod tests {
     ///
     /// `LayerStack::flip_effects` being correct is `umber-core`'s business and is
     /// tested there; what cannot be tested there is that anything calls it. That
-    /// is the gap `LayerStack::flip_text`'s own docs name in as many words —
-    /// "nothing calls it yet" — and the one an effect's flip had no note about at
-    /// all, which is why a second agent had to find it. A test at the call site is
-    /// worth more than a note, so here is one.
+    /// is the gap `LayerStack::flip_text`'s own docs used to name in as many
+    /// words — "nothing calls it yet" — and the one an effect's flip had no note
+    /// about at all, which is why a second agent had to find it. A test at the
+    /// call site is worth more than a note, so here is one; the text record's
+    /// own is `a_canvas_flip_mirrors_a_text_layers_placement`.
     ///
     /// `Editor::flip_canvas` rather than `App::mirror_document` because that is
     /// where a flip reaches the *model*: the selection's mirror is already there,

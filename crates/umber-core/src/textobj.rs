@@ -224,11 +224,15 @@ impl TextFace {
     /// It names the font, says the picture is untouched, and says what would fix
     /// it — which is the whole of what an artist can act on.
     ///
-    /// **Nothing draws it yet**, because nothing in this build can ask to edit a
-    /// text layer. It says "install the font to edit it again", which is a promise
-    /// about a control wave two adds; drawing it before then would be the lying
-    /// notice this project refuses, so the panel that shows it is the panel that
-    /// makes it true.
+    /// **The Text panel draws it** above the Update row, whenever the selected
+    /// layer's recorded face is not here, and `App::update_text_layer` raises it
+    /// as a notice for the route that goes round the panel. It says "install the
+    /// font to edit it again", which is now a promise the panel keeps: Update is
+    /// refused while the boxes name a font this machine has not got, and it comes
+    /// back the moment one is installed. Choosing a *different* font off the list
+    /// also sets the layer again, and that is not what this sentence is about —
+    /// it is a face somebody picked, where the refusal is about a substitution
+    /// nobody asked for.
     pub fn missing_notice(&self) -> String {
         let mut out = format!("This text was set in {}", self.label());
         if !self.postscript.is_empty() {

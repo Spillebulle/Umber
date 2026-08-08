@@ -297,17 +297,16 @@ impl Placed {
     ///
     /// `None` where none of it lands on the canvas at all.
     ///
-    /// **Nothing calls this yet**, and the paragraph below is written in the
-    /// future tense it deserves rather than the present tense it had. The caller
-    /// is `app.rs`'s transform region once a text float carries the block it was
-    /// set from; until then a placement goes through [`Setting::clip`] and
-    /// `Clip::place` like a paste, and this saves nobody anything.
-    /// `the_layer_rect_of_a_block_off_the_top_left_reads_its_own_coverage` is what
-    /// stops it rotting in the meantime — the arithmetic here is the part with a
-    /// signed origin in it, which is the thing that has already been wrong once
-    /// in this module.
+    /// **`App::update_text_layer` is the caller**, which sets a placed text
+    /// layer again through its own placement and writes the result straight into
+    /// the layer. A first *placement* still goes through [`Setting::clip`] and
+    /// `Clip::place` like a paste, because that one has a box to be dragged
+    /// before it lands and this one does not.
+    /// `the_layer_rect_of_a_block_off_the_top_left_reads_its_own_coverage` is
+    /// what guards it — the arithmetic here is the part with a signed origin in
+    /// it, which is the thing that has already been wrong once in this module.
     ///
-    /// **One pass, and that will not be tidiness.** The three steps it replaces —
+    /// **One pass, and that is not tidiness.** The three steps it replaces —
     /// paint the coverage, premultiply it, crop it — are each a full copy of a
     /// rectangle that on a large drag is tens of megabytes, and they would run
     /// every frame. The colour is constant over the block, so what varies per pixel is
