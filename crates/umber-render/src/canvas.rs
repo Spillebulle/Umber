@@ -5806,6 +5806,19 @@ mod tests {
         assert_eq!(MAX_EFFECT_SLICES, 127);
         assert_eq!(MAX_DRAWS, 191);
 
+        // The model's budget and this array's capacity are the same quantity
+        // spelled in two crates, and **this is the only place both can be
+        // seen**: `umber-core` may not depend on wgpu, so it cannot derive its
+        // figure from the device's ceiling and carries a literal instead. An
+        // effect draw reads an effect slice, one for one, so a model that let
+        // more effects be added than there are slices would be promising a
+        // draw with nothing to read.
+        assert_eq!(
+            umber_core::effect::MAX_ENABLED,
+            MAX_EFFECT_SLICES,
+            "the model's effect budget and the renderer's slice budget are one number",
+        );
+
         // The ceiling is fixed by the device, so it is the one input that does
         // not vary. `MAX_LAYERS` is ours and may move, which is the whole
         // reason these are functions.
