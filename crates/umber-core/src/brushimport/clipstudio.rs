@@ -1356,6 +1356,44 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
         brush.spacing = (interval as f32 / INTERVAL_PER_CENT).clamp(0.01, 4.0);
     }
 
+    // ---- per-dab density, as a stroke opacity --------------------------
+    // `BrushFlow` is Clip Studio's Density: the alpha **one dab** deposits,
+    // where `Opacity` is the whole stroke's. Two comments in this file already
+    // said the two multiply — `SPEED_TARGETS`' and the pressure block's below —
+    // and the code multiplied only their *pressure curves*, discarding the
+    // constant entirely. `BrushFlow` was read nowhere at all, and
+    // `VARIANT_COLUMNS` could not even hold it, so no fixture could ask.
+    //
+    // It is live on every brush: Clip Studio has no "use density" switch to
+    // leave a stale value behind, which is why this is read unconditionally
+    // where the taper and the texture are gated. In `Used.sutg` three of
+    // thirteen sub-tools set it below full — 20, 44 and 80 — so "Soft 2"
+    // arrived painting at five times the density its author chose. That is the
+    // paper bug's mirror image: a brush too *strong* rather than too weak, and
+    // a brush already at full density is the one shape that hides it, which is
+    // exactly the shape of the reported file's only sub-tool.
+    //
+    // **A per-dab alpha is not a stroke opacity and must not be assigned as
+    // one.** Clip Studio composites every dab; `Brush::opacity` is applied once
+    // at commit over coverage the dab pass has already saturated. So it goes
+    // through `tip::dab_stack_alpha`, the third of `stroke_coverage`'s family,
+    // which asks what stroke opacity reproduces the mark a compositing engine
+    // makes at this spacing and hardness — the conversion `mypaint.rs` already
+    // does and that `CLAUDE.md` names as this reader's outstanding half.
+    // Reading 0.2 as an opacity of 0.2 would be the `4H_pencil` mistake with
+    // the sign flipped, and it is why this sits *after* the spacing block: the
+    // conversion is a function of the step, so a fixed interval has to have
+    // been read first.
+    //
+    // Full density is the exact identity — `dab_stack_alpha` returns 1.0 at or
+    // above 1.0 — so an absent column and the ten of thirteen sub-tools set to
+    // 100 all arrive byte for byte as they did before.
+    if let Some(flow) = settings.percent("BrushFlow") {
+        brush.opacity = (brush.opacity
+            * tip::dab_stack_alpha(flow, brush.spacing, brush.hardness))
+        .clamp(0.0, 1.0);
+    }
+
     // ---- pressure ------------------------------------------------------
     let size_effector = settings.effector("BrushSizeEffector");
     brush.pressure_size = size_effector.as_ref().is_some_and(|e| e.drives(PRESSURE));
@@ -1829,9 +1867,14 @@ mod tests {
     /// it deliberately does not, in an order that
     /// is deliberately *not* the order the code reads them in — the point of
     /// the schema being name-addressed is that neither one matters.
-    const VARIANT_COLUMNS: [&str; 46] = [
+    const VARIANT_COLUMNS: [&str; 47] = [
         "TextureDensityEffector",
         "VariantID",
+        // The per-dab density. Its absence here is why nothing caught it being
+        // unread: a fixture that cannot hold a value cannot ask what happens to
+        // it, and `BrushFlowEffector` sitting below reads as coverage of the
+        // same setting while covering only its pressure mapping.
+        "BrushFlow",
         // Five columns this importer never reads, and that is why they are
         // here: the row has to be able to carry the dual brush's leftovers so
         // that `a_dual_brush_that_is_switched_off_is_not_reported_from_the_
@@ -2663,6 +2706,66 @@ mod tests {
         let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
         assert!(brush.pressure_opacity);
         assert_eq!(brush.coverage_at(0.0), 0.0);
+    }
+
+    /// **A constant per-dab density is read, and it is converted rather than
+    /// assigned.**
+    ///
+    /// `BrushFlow` is Clip Studio's Density and it was read nowhere at all,
+    /// while two comments in this file said it multiplies with `Opacity` to
+    /// reach per-dab coverage — the code multiplied only their *pressure
+    /// curves*. Three of `Used.sutg`'s thirteen sub-tools set it below full, so
+    /// "Soft 2" at 20 imported painting at five times its author's density: a
+    /// mark that saturates in one pass and therefore cannot be built up by
+    /// going over it again, which is the paper bug's mirror image.
+    ///
+    /// The conversion is the point. Clip Studio composites every dab where
+    /// `Brush::opacity` is applied once over saturated coverage, so a per-dab
+    /// alpha assigned straight across is the `4H_pencil` mistake with its sign
+    /// flipped — a fifth of the mark rather than five times it.
+    /// [`tip::dab_stack_alpha`] is what a compositing engine actually reaches,
+    /// and this pins that the imported figure sits between the two readings
+    /// rather than being either of them.
+    #[test]
+    fn a_constant_per_dab_density_becomes_the_stroke_opacity_it_builds_to() {
+        let bytes = sut(&[("Soft", Variant::plain(1).int("BrushFlow", 20))], &[]);
+        let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+
+        // The engine's own answer for "what does a fifth per dab build to", at
+        // the spacing and hardness this brush actually carries. Recomputed
+        // rather than written as a literal because the figure is a function of
+        // both, and a literal would pin the fixture instead of the rule.
+        let wanted = tip::dab_stack_alpha(0.2, brush.spacing, brush.hardness);
+        assert!(
+            (brush.opacity - wanted).abs() < 1e-6,
+            "opacity {} is not the built-up reading {wanted}",
+            brush.opacity
+        );
+        // Both wrong readings are refused: neither the raw per-dab figure nor
+        // the full density it used to arrive at.
+        assert!(brush.opacity > 0.2, "a per-dab alpha read as a stroke one");
+        assert!(brush.opacity < 1.0, "the density was discarded again");
+
+        // `Opacity` is the stroke's and multiplies in, unconverted: half the
+        // stroke of the same density is half the mark.
+        let bytes = sut(
+            &[(
+                "Half",
+                Variant::plain(2).int("BrushFlow", 20).int("Opacity", 50),
+            )],
+            &[],
+        );
+        let halved = from_sut(&bytes).expect("read").tools.remove(0).brush;
+        assert!((halved.opacity - brush.opacity * 0.5).abs() < 1e-6);
+
+        // And full density is the exact identity, which is what keeps the ten
+        // of thirteen sub-tools set to 100 — and every fixture without the
+        // column — arriving exactly as they did before.
+        for full in [Variant::plain(3).int("BrushFlow", 100), Variant::plain(4)] {
+            let bytes = sut(&[("Full", full)], &[]);
+            let brush = from_sut(&bytes).expect("read").tools.remove(0).brush;
+            assert_eq!(brush.opacity, 1.0);
+        }
     }
 
     /// Hardness follows pressure in Clip Studio exactly as size does, and Umber
