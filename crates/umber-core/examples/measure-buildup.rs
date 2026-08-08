@@ -212,16 +212,35 @@ fn survey_builtin() {
             .as_slice()
             .iter()
             .any(|m| matches!(m.target, umber_core::dynamics::DabTarget::Opacity));
+        // Only a brush whose per-dab coverage drops below 1.0 for a reason the
+        // artist set takes the conversion at all; the rest are untouched, which
+        // is what the `1.0` fixed point is for.
+        let takes_it = b.pressure_opacity || modulated;
         println!(
-            "{:<28} build_up  pressure_opacity {:<5} opacity-modulation {:<5} coverage_at(0) {:.4} coverage_at(1) {:.4} spacing {:.3} hardness {:.3} grain {:.2}",
+            "{:<48} pressure_opacity {:<5} opacity-modulation {:<5} spacing {:.3} hardness {:.3} grain {:.2}  {}",
             preset.id,
             b.pressure_opacity,
             modulated,
-            b.coverage_at(0.0),
-            b.coverage_at(1.0),
             b.spacing,
             b.hardness,
             b.grain,
+            if takes_it { "CONVERTED" } else { "unchanged" },
         );
+        if !takes_it {
+            continue;
+        }
+        let depth = umber_core::tip::stack_depth(b.spacing, b.hardness);
+        print!("    depth {depth:5.2}  mark before ->  after ");
+        for p in [0.1, 0.25, 0.5, 0.75, 1.0] {
+            let want = b.coverage_at(p);
+            let before = umber_core::tip::dab_stack_alpha(want, b.spacing, b.hardness);
+            let after = umber_core::tip::dab_stack_alpha(
+                umber_core::tip::per_dab_for_stroke(want, depth),
+                b.spacing,
+                b.hardness,
+            );
+            print!(" p={p:.2}:{before:.3}->{after:.3}");
+        }
+        println!();
     }
 }
