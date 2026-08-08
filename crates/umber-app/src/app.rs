@@ -1109,9 +1109,9 @@ impl UmberApp {
         // Update could only keep by destroying paint. Placed on nothing it is
         // exact, and `LayerStack::refusal_at` keeps it exact from then on.
         //
-        // Everything is straight-alpha in the layer's own form here, and alpha
-        // is the fourth byte; a fully transparent pixel is the one thing that
-        // cannot be hiding a colour.
+        // The layer's own form — sRGB with alpha premultiplied in linear space —
+        // and alpha is the fourth byte. A zero there is the one value that
+        // cannot be hiding a colour, whichever way the alpha is carried.
         let landed_on_nothing = before.chunks_exact(4).all(|px| px[3] == 0);
         // **Taken before the filter, because `record.is_none()` is two different
         // things.** It is true when a *placement* was refused the record, and
@@ -1121,7 +1121,18 @@ impl UmberApp {
         // application — a lift's `before` spans the pixels it took, so
         // `landed_on_nothing` is false for essentially all of them.
         let was_text = set_from.is_some();
-        let record = set_from.filter(|_| landed_on_nothing).map(|set| {
+        // **A cropped placement records nothing either.** A block larger than
+        // the canvas is centred and cropped by `Clip::place`, so the source
+        // rectangle would record the cropped size while the next Update measures
+        // the whole block again at identity — and the caption would jump the
+        // first time somebody fixed a typo in it. `float_a_clip` has already put
+        // the crop notice on screen, so this is silent.
+        let source = float.xf.source();
+        let whole = set_from.as_ref().is_some_and(|set| {
+            (source.max.x - source.min.x) as u32 >= set.size.x
+                && (source.max.y - source.min.y) as u32 >= set.size.y
+        });
+        let record = set_from.filter(|_| landed_on_nothing && whole).map(|set| {
             Box::new(umber_core::textobj::TextObject::new(
                 set.block.clone(),
                 set.face.clone(),
@@ -1129,7 +1140,9 @@ impl UmberApp {
                 umber_core::textobj::Placement::of(&float.xf),
             ))
         });
-        let placed_over_paint = was_text && record.is_none();
+        // Only the paint case, because the crop already has a notice of its own
+        // and two dialogs for one click is worse than either.
+        let placed_over_paint = was_text && record.is_none() && whole;
         // A lift off a text layer moves the pixels and leaves the record naming
         // where they used to be, so the record goes with them. It is dropped
         // rather than composed: a placement is a rotation and a scale about one
@@ -1657,6 +1670,7 @@ impl UmberApp {
                 block,
                 face,
                 colour,
+                size: clip.size(),
             }));
         }
     }
@@ -1687,6 +1701,16 @@ impl UmberApp {
         let Some(editing) = self.editor.text.editing.as_ref() else {
             return;
         };
+        // **The document, not only the slot.** A slot is a slice of one
+        // document's texture array, so slot 3 is a different layer in every tab
+        // — the reason `Editing` and `Thumbs`' cache are both keyed by document.
+        // `sync_editing` ran earlier in this frame and would have dropped a
+        // stale target, so this cannot fire; a write into another document's
+        // canvas is not a thing to leave resting on the order two functions
+        // happen to be called in.
+        if editing.doc != self.editor.session.active_id() {
+            return;
+        }
         // **The one gate this operation has, and it is a sixth operation that
         // writes pixels.** `refusal_at` cannot supply it on its own: it answers
         // `Locked` before `Text`, and this whole path exists for a layer that

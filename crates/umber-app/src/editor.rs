@@ -121,6 +121,17 @@ pub struct PlacedText {
     /// palette can move while the box is being dragged, and the record has to
     /// describe the pixels that actually land.
     pub colour: Color,
+    /// How large the setting was, in pixels, before `Clip::place` saw it.
+    ///
+    /// **Carried so the commit can tell a placement that was cropped.** A block
+    /// larger than the canvas is centred and cropped — `float_a_clip` says so in
+    /// a notice — and the source rectangle then records the *cropped* size while
+    /// the next Update measures the whole block again at identity. The caption
+    /// would jump the first time somebody fixed a typo in it. A cropped
+    /// placement therefore records nothing at all, which is the same answer one
+    /// landing on paint gets and for the same reason: a record that does not
+    /// describe the pixels is worse than no record.
+    pub size: glam::UVec2,
 }
 
 /// How near a handle a press has to land, in *screen* pixels. Divided by the
@@ -457,12 +468,18 @@ pub struct Editor {
     /// `String`, so folding it in would take the `Copy` away from all of them
     /// for a field only the commit reads.
     ///
-    /// **One writer clears it and one reads it, which is what keeps the two in
-    /// step without a rule anybody has to remember.** `App::begin_float` clears
-    /// it as it installs a float, so nothing a cancelled placement left behind
-    /// can attach itself to the next paste; `App::place_text` sets it
-    /// immediately afterwards; `App::finish_transform` takes it. There is no
-    /// third site to forget.
+    /// **`App::begin_float` clears it unconditionally as it installs a float,
+    /// and that one line is the whole guarantee.** `App::place_text` sets it
+    /// immediately afterwards and `App::finish_transform` takes it, so a
+    /// placement the artist abandoned cannot attach itself to the next paste's
+    /// commit.
+    ///
+    /// The three places that clear [`Editor::float`] and leave this alone —
+    /// `App::cancel_transform`, `Editor::install_document` and `App::suspended`
+    /// — are therefore safe rather than forgotten, and they are named here
+    /// because "there is no third site" was written first and was not true.
+    /// Nothing reads this without a float, and no float exists that
+    /// `begin_float` did not install.
     ///
     /// Above the `--- documents ---` line with the float itself, and for the
     /// same reason: every path that leaves the document commits first.
@@ -1230,11 +1247,15 @@ impl Editor {
         // flip is another flip.
         let dropped = self.layers.flip_text(axis, doc);
         if dropped > 0 {
-            // `Clip::place` crops to the document, so a placement outside the
-            // canvas is one nothing here writes and this cannot be reached. It
-            // is said out loud anyway rather than logged, because a record that
-            // lies about where its pixels are is worse than none, and somebody
-            // whose caption stopped being editable is owed the reason.
+            // Rare rather than unreachable, and the difference is worth stating.
+            // `Clip::place` crops to the document, so a *placement* never
+            // produces one; what can is `App::update_text_layer`, which grows
+            // the source rectangle with the ink, so a caption set much longer
+            // near the right edge can end up with a source that runs off the
+            // canvas even though what was drawn was clamped to it. Said out loud
+            // rather than logged, because a record that lies about where its
+            // pixels are is worse than none and somebody whose caption stopped
+            // being editable is owed the reason.
             self.notice = Some(Notice {
                 title: "Some text is paint now".to_string(),
                 lines: vec![format!(
