@@ -85,6 +85,35 @@ const MAX_DEPTH: usize = 4;
 /// by the caller and leaves a usable library rather than a hung application.
 const MAX_FILES: usize = 20_000;
 
+/// Where [`FontLibrary::restyle`] cuts a family into its bold half and its
+/// regular half.
+///
+/// 600 rather than the 700 CSS calls bold, and that is a reading of real font
+/// libraries rather than of the specification. A family whose heaviest upright
+/// is SemiBold at 600, or Black at 900 with no 700 anywhere at all, is entirely
+/// ordinary. A threshold of exactly 700 would answer "this family has no bold"
+/// for a family that plainly has one, and the only alternative to offering its
+/// heavier face is **synthesising** a bold, which `restyle` refuses to do.
+///
+/// **It is a partition and not a reading of "is this text bold".** A nine-weight
+/// family has four faces at or above it, and lighting a Bold control from
+/// [`Face::is_bold`] would say the text was bold while it was SemiBold, with the
+/// family's actual Bold two rows further down the same list — and would then take
+/// a press as "make it regular", so no press would ever *reach* Bold from
+/// SemiBold. [`FontLibrary::is_bold_anchor`] is the reading a control lights
+/// from; this is only which side of the family a face is on.
+pub const BOLD_THRESHOLD: u16 = 600;
+
+/// The weight [`FontLibrary::restyle`] aims at when it is asked for bold.
+///
+/// `usWeightClass`'s own bold, and the target rather than the test: a family
+/// carrying SemiBold, Bold, ExtraBold and Black hands back Bold, and one
+/// carrying only SemiBold hands back that.
+const BOLD_WEIGHT: u16 = 700;
+
+/// The weight [`FontLibrary::restyle`] aims at when the bold comes off.
+const REGULAR_WEIGHT: u16 = 400;
+
 /// Which platform's font directories to name.
 ///
 /// Injected rather than read from `cfg!`, so all three answers are testable
@@ -267,10 +296,20 @@ pub struct Face {
     /// This is why a *style* is not just a name. A variable font is one file
     /// carrying a continuum, and the styles somebody expects to pick from are
     /// its **named instances**; without them Archivo offers "Regular" alone
-    /// while the file it comes out of holds nine weights and every width. It is
-    /// also the reason `cputext.rs` exists at all — `ab_glyph` ignores
-    /// variation axes and renders the default master whatever weight is asked
-    /// for, which is why the interface has no bold.
+    /// while the file it comes out of holds nine weights and every width.
+    ///
+    /// **Two rasterisers are in this binary and only one of them applies
+    /// these**, which is worth being exact about because the sentence that used
+    /// to sit here was not. `crate::text::set` hands the location to `skrifa`
+    /// and `harfrust` and therefore genuinely draws the weight asked for —
+    /// `a_named_instance_is_actually_drawn_at_its_own_weight` and
+    /// `pressing_bold_actually_puts_a_heavier_mark_on_the_canvas` are what say
+    /// so, both by rasterising and comparing rather than by reading a field.
+    /// egui's own text goes through `ab_glyph`, which ignores variation axes and
+    /// renders the default master whatever weight is asked for — **which is why
+    /// the *interface* has no bold**, and it is the reason `cputext.rs` exists
+    /// for the splash. That limit belongs to the panels, not to what the text
+    /// tool puts on the canvas.
     pub variations: Vec<(String, f32)>,
 }
 
@@ -298,6 +337,105 @@ impl Face {
     pub fn label(&self) -> &str {
         &self.style
     }
+
+    /// Which half of its family this face is in, [`BOLD_THRESHOLD`]'s partition.
+    ///
+    /// Read off the weight and never off the style *name*. "Bold", "Gras",
+    /// "Negrita", "Demi", "Heavy" and "Black" are all one answer here, and a
+    /// name comparison would get every family not named in English wrong — the
+    /// `name` table is localised and [`string`] takes the first record it finds.
+    ///
+    /// **This is not "the Bold control is on".** Four of Archivo's nine upright
+    /// weights answer `true`, and only one of them is the family's bold; see
+    /// [`BOLD_THRESHOLD`] and [`FontLibrary::is_bold_anchor`].
+    pub fn is_bold(&self) -> bool {
+        self.weight >= BOLD_THRESHOLD
+    }
+}
+
+/// The most ordinary face of a set: upright, and nearest `REGULAR_WEIGHT`.
+///
+/// One statement of it, because [`FontLibrary::resolve`] falls back **twice** —
+/// to the family without the style asked for, and then to the library without
+/// either — and the second used to be `faces.first()`. That is the *lightest*
+/// face of the alphabetically first family, because `FontLibrary::insert` sorts
+/// on the weight: a family that had moved off the disk was therefore substituted
+/// with Archivo **Thin**, so every caption in a document opened on another
+/// machine came back as a hairline. It was found by looking at a picture of the
+/// panel, which named the substitute out loud; nothing asserted it either way.
+///
+/// The weight is in the key after the distance so a tie is decided rather than
+/// left to iteration order, and it decides for the lighter face, which is what
+/// the sort order already produced.
+fn most_ordinary<'a>(faces: impl Iterator<Item = &'a Face>) -> Option<&'a Face> {
+    faces.min_by_key(|f| (f.italic, f.weight.abs_diff(REGULAR_WEIGHT), f.weight))
+}
+
+/// [`axis_agreement`]'s best answer: the two sit at the same place on every axis
+/// an emphasis may not move.
+const AXES_AGREE: u8 = 0;
+
+/// One of the two faces does not state where it is, so there is nothing to
+/// compare. Ranked between the other two so it can neither beat an agreement nor
+/// lose to a disagreement — see [`axis_agreement`].
+const AXES_UNKNOWN: u8 = 1;
+
+/// They are at different places on an axis that was not asked to move.
+const AXES_DISAGREE: u8 = 2;
+
+/// How well `candidate` matches where `from` sits on every variable axis an
+/// emphasis is **not** allowed to move. Lower is better; it is the first term of
+/// [`FontLibrary::restyle`]'s sort key.
+///
+/// A modern family in one file is a **grid rather than a row**: a two-axis face
+/// carries every weight at every width, so "the bold of Condensed Light" and
+/// "the bold of Expanded Light" are both weight 700 and only one of them is the
+/// answer. Without this, asking a condensed face for its bold hands back plain
+/// Bold and loses the width somebody chose, silently and with nothing on screen
+/// to say it happened.
+///
+/// `wght`, `ital` and `slnt` are skipped because those are exactly what is being
+/// changed. Every other axis of `candidate` is looked up **by tag** in `from`
+/// rather than walked in step: both faces usually come out of one `fvar` table
+/// and [`read_faces`] records them in its order, so walking would agree, but two
+/// files of one family (a roman and an italic) need not order their axes alike.
+///
+/// **Three answers rather than two, and the middle one is the whole of why.** A
+/// variable font's own default instance carries **no variations at all** —
+/// [`read_faces`] records it that way deliberately, because an empty list is
+/// what tells `crate::text::set` there is nothing to instance — so a face with an
+/// empty list has not said where it is on any axis. Read as agreement that cuts
+/// both ways and one way is a *wrong face*: with the default master as a
+/// candidate, "agrees with everything" made it tie with the correctly-widthed
+/// face on every term and let the library's own order decide, so a condensed face
+/// asked for its bold could be handed the wide default. `AXES_UNKNOWN` keeps it
+/// behind a real agreement and ahead of a real disagreement, which is the only
+/// ranking that is honest about not knowing. Where **`from`** is the default the
+/// term goes uniform and the choice falls through to the weight rule, which is
+/// what it was before this function existed: a gap, not a wrong answer, and the
+/// honest cost of the empty-is-the-identity fast path. Closing that half means
+/// recording the default's own axis values and giving `set` another way to spot
+/// the identity.
+///
+/// Near-equality, and the tolerance is deliberately tiny: both sides are `f32`s
+/// read off disk unmodified, so they agree bit for bit or they are at different
+/// axis positions. A tolerance wide enough to be "forgiving" would merge the two
+/// ends of a custom 0..1 axis such as Recursive's `CASL`.
+fn axis_agreement(candidate: &Face, from: &Face) -> u8 {
+    if candidate.variations.is_empty() || from.variations.is_empty() {
+        return AXES_UNKNOWN;
+    }
+    for (tag, want) in &candidate.variations {
+        if matches!(tag.as_str(), "wght" | "ital" | "slnt") {
+            continue;
+        }
+        match from.variations.iter().find(|(t, _)| t == tag) {
+            Some((_, have)) if (want - have).abs() < 1e-6 => {}
+            Some(_) => return AXES_DISAGREE,
+            None => return AXES_UNKNOWN,
+        }
+    }
+    AXES_AGREE
 }
 
 /// The bytes of one face, held long enough to draw with.
@@ -400,6 +538,24 @@ impl FontLibrary {
         }
     }
 
+    /// Put one face in the library, on [`Self::insert`]'s terms.
+    ///
+    /// The general form of [`Self::add_builtin`] and [`Self::add_file`], and it
+    /// is `pub` for one reason: the states a style control can be refused in need
+    /// families the shipped typeface cannot produce — one carrying a bold and no
+    /// bold italic, one of a single heavy weight, an italic-only script face —
+    /// and `textpanel`'s guard for those sentences lives in another crate.
+    ///
+    /// A [`Face`] is a name and a [`Source`], and `Source` is `pub`, so a caller
+    /// **can** hand over one that names real bytes; the tests here do not, and
+    /// this comment used to claim the function could not. What it does guarantee
+    /// is [`Self::insert`]'s: the `(family, style)` name is unique and the family
+    /// is not empty, so nothing added this way can break what
+    /// [`Self::is_bold_anchor`] relies on.
+    pub fn add_face(&mut self, face: Face) {
+        self.insert(face);
+    }
+
     /// Add every face in one file. False when nothing could be read out of it.
     pub fn add_file(&mut self, path: &Path) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
@@ -430,7 +586,46 @@ impl FontLibrary {
     /// directory, and a list that offered "DejaVu Sans — Book" twice would be a
     /// list nobody trusts. The **first** wins, which with [`search_roots`]'s
     /// order means the system copy rather than a stray one.
+    ///
+    /// **What counts as a duplicate is the `(family, style)` name and nothing
+    /// else**, which is stricter than the order key below and is what makes
+    /// [`Self::exact`] a bijection. Two faces of one family sharing a style name
+    /// at different weights is a malformed library rather than a hypothetical,
+    /// and keeping both is worse than dropping one in three ways at once: the
+    /// picker draws two rows with identical labels and highlights both, `exact`
+    /// answers with whichever sorts first, and [`Self::restyle`] can therefore
+    /// choose the heavier and hand back a *name* that resolves to the lighter —
+    /// so the style mark lands on a face the model did not pick and reads its
+    /// own state off a third one. A name is how a style is recorded, in a
+    /// preferences file and in this panel, so a name that does not identify a
+    /// face is the thing to refuse.
+    ///
+    /// **A face with no family name is refused too.** [`read_face`] cannot
+    /// produce one — it returns `None` where the `name` table has no usable
+    /// family — but [`Self::add_face`] is a public door, and one empty name
+    /// becomes an empty row in the family picker *and* [`Self::resolve`]'s
+    /// whole-library fallback for every family that is missing, which is the
+    /// substitute every caption in a moved document would come back in.
+    ///
+    /// The cost is that the duplicate check is a linear scan per insert where the
+    /// order key was a binary search, so a scan is quadratic in the faces it
+    /// finds. Measured on a real Windows installation, 452 faces is about a
+    /// hundred thousand comparisons and 0.65 ms, against 149 ms for the warm
+    /// scan and 1.58 s cold in the same loop; a designer's collection is a few
+    /// million comparisons. It is on a worker thread either way — see the module
+    /// docs — and the figure to re-measure before changing this is that ratio,
+    /// not the count.
     fn insert(&mut self, face: Face) {
+        if face.family.trim().is_empty() {
+            return;
+        }
+        if self.exact(&face.family, &face.style).is_some() {
+            return;
+        }
+        // Sorted by family, then **weight**, then upright before italic — the
+        // order the style list reads in, which is not the order the check above
+        // dedupes by. A key that sorted on the name would list a family's
+        // weights alphabetically.
         let key = |f: &Face| {
             (
                 f.family.to_lowercase(),
@@ -440,10 +635,8 @@ impl FontLibrary {
             )
         };
         let k = key(&face);
-        match self.faces.binary_search_by(|f| key(f).cmp(&k)) {
-            Ok(_) => {}
-            Err(at) => self.faces.insert(at, face),
-        }
+        let at = self.faces.partition_point(|f| key(f) < k);
+        self.faces.insert(at, face);
     }
 
     pub fn faces(&self) -> &[Face] {
@@ -513,26 +706,174 @@ impl FontLibrary {
     /// preference records a family and a style by *name*, and the machine it is
     /// read back on may not have either. So an exact match first, then anything
     /// in that family — nearest weight to regular, upright before italic —
-    /// then the first face in the library, which is the built-in one. The
-    /// caller is what says a substitution happened; this only refuses when the
-    /// library is empty.
+    /// then the most ordinary face in the whole library. The caller is what
+    /// says a substitution happened; this only refuses when the library is
+    /// empty.
     pub fn resolve(&self, family: &str, style: &str) -> Option<&Face> {
-        // Case-insensitively on both halves, for the reason [`Self::families`]
-        // gives about the family and one more about the style: the style is
-        // stored in a preferences file and typed back by whoever edits it.
-        if let Some(exact) = self
-            .faces
-            .iter()
-            .find(|f| f.family.eq_ignore_ascii_case(family) && f.style.eq_ignore_ascii_case(style))
-        {
+        if let Some(exact) = self.exact(family, style) {
             return Some(exact);
         }
-        let nearest = self
-            .faces
+        most_ordinary(
+            self.faces
+                .iter()
+                .filter(|f| f.family.eq_ignore_ascii_case(family)),
+        )
+        .or_else(|| most_ordinary(self.faces.iter()))
+    }
+
+    /// The face this exact `(family, style)` pair names, and nothing else.
+    ///
+    /// [`Self::resolve`] is total on purpose and therefore cannot say "no";
+    /// this is the half that can, and it is what anything reasoning about
+    /// *this* face has to ask. `resolve` is written in terms of it, so the two
+    /// cannot come to disagree about what an exact match is.
+    ///
+    /// Case-insensitively on both halves, for the reasons `resolve` gives: the
+    /// family may be spelled several ways across one typeface's files, and the
+    /// style comes back out of a preferences file somebody may have edited.
+    pub fn exact(&self, family: &str, style: &str) -> Option<&Face> {
+        self.faces
             .iter()
-            .filter(|f| f.family.eq_ignore_ascii_case(family))
-            .min_by_key(|f| (f.italic, f.weight.abs_diff(400)));
-        nearest.or_else(|| self.faces.first())
+            .find(|f| f.family.eq_ignore_ascii_case(family) && f.style.eq_ignore_ascii_case(style))
+    }
+
+    /// The face of `family` that is this one with bold and italic as asked for.
+    ///
+    /// **`None` is an answer the interface draws**, and that is the whole point
+    /// of the `Option`. A family with no italic on this machine has no italic,
+    /// and the two ways of pretending otherwise are both refused here: **Umber
+    /// never smears an outline sideways to make a bold and never shears one to
+    /// make an oblique.** A fake bold is a blur at every size, a fake oblique
+    /// bends letters a designer drew straight, and both are what a text engine
+    /// does when it has given up — a family that carries a *real* bold puts the
+    /// difference side by side on the same line. So the controls that ask for
+    /// these are **disabled with a sentence** wherever this answers `None`; see
+    /// `textpanel::emphasis`.
+    ///
+    /// Which face, when there is one: among the family's faces of the slant
+    /// asked for and on the side of [`BOLD_THRESHOLD`] asked for, the one
+    /// nearest a target weight. `axis_agreement` is ahead of the weight in the
+    /// sort key, so the width and every other axis somebody chose survives; ties
+    /// on both break to the lighter face, and a tie on *that* falls to the
+    /// library's own order, which is `style` alphabetically within a weight.
+    ///
+    /// **What decides the target weight is which half of the pair moved.**
+    /// Where the *slant* changed this is the italic control, so the weight is
+    /// kept and Light asked for its italic gets Light Italic. Otherwise the
+    /// weight is what moved, so the target is `BOLD_WEIGHT` or
+    /// `REGULAR_WEIGHT` — and it has to be read that way round rather than off
+    /// the face's own half: SemiBold is already in the bold half, so a rule that
+    /// kept the weight whenever the half agreed would hand SemiBold straight
+    /// back and the Bold control would do nothing. See
+    /// [`Self::is_bold_anchor`] for the other half of that fix.
+    ///
+    /// **It is not an exact inverse, and that is deliberate.** Bold on and off
+    /// again from Light lands on Regular rather than back on Light, because the
+    /// alternative is a second piece of state — "the style this was before" —
+    /// beside the style *name* that is the panel's one source of truth, and a
+    /// second record of the same thing is what drifts. Every application with a
+    /// Bold button behaves this way.
+    pub fn restyle(&self, family: &str, style: &str, bold: bool, italic: bool) -> Option<&Face> {
+        let from = self.exact(family, style);
+        let want = match from {
+            Some(f) if f.italic != italic => f.weight,
+            _ if bold => BOLD_WEIGHT,
+            _ => REGULAR_WEIGHT,
+        };
+        self.faces
+            .iter()
+            .filter(|f| {
+                f.family.eq_ignore_ascii_case(family) && f.italic == italic && f.is_bold() == bold
+            })
+            .min_by_key(|f| {
+                (
+                    // Ahead of the weight, so a face agreeing with the one in
+                    // hand about the width wins whatever the weights say. With
+                    // no face in hand the term is uniform and decides nothing.
+                    from.map_or(AXES_UNKNOWN, |c| axis_agreement(f, c)),
+                    f.weight.abs_diff(want),
+                    f.weight,
+                )
+            })
+    }
+
+    /// Whether any face of this family is here at all.
+    ///
+    /// What tells "that font is not on this machine" from "that font is here and
+    /// the style recorded beside it is not". [`Self::exact`] answers about the
+    /// **pair**, so reading its `None` as a missing family is how a mark came to
+    /// tell somebody to install a font they already had — and `Substitution` has
+    /// carried the distinction all along, because the panel draws a different
+    /// sentence for each.
+    pub fn has_family(&self, name: &str) -> bool {
+        self.faces
+            .iter()
+            .any(|f| f.family.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether [`Self::restyle`] would answer.
+    ///
+    /// What a control draws itself from, delegating to the plan it stands for —
+    /// the arrangement `plan_reorder`/`can_reorder` already keeps, so a control
+    /// cannot light up promising something the model will then decline.
+    ///
+    /// It answers `true` for a pair a face already satisfies, because `restyle`
+    /// would hand that face back. No caller asks that: the panel's marks always
+    /// flip one half. A keystroke route that passed the *current* pair would get
+    /// a lit control that does nothing, and would want its own guard.
+    pub fn can_restyle(&self, family: &str, style: &str, bold: bool, italic: bool) -> bool {
+        self.restyle(family, style, bold, italic).is_some()
+    }
+
+    /// Whether the family's own bold, at this face's slant, **is** this face.
+    ///
+    /// **This is what a Bold control lights from, and [`Face::is_bold`] is
+    /// not.** `is_bold` is [`BOLD_THRESHOLD`]'s partition, and Archivo has four
+    /// upright faces on the bold side of it; lighting from that said the text was
+    /// bold while it was SemiBold, and — because a lit control asks for the
+    /// regular weight — meant no press ever reached Bold from SemiBold,
+    /// ExtraBold or Black. Those three lost two or three weights on one click,
+    /// silently.
+    ///
+    /// Asking the *anchor* instead — is the bold you would be given the one you
+    /// already have — is lit for exactly one face of each slant and reachable in
+    /// one press from every other. So SemiBold reads as not bold, which is a
+    /// small thing to say about a heavy face and is what every application with
+    /// a style menu beside a `B` says about it.
+    ///
+    /// Written in terms of [`Self::restyle`] rather than beside it, so the mark
+    /// and the press cannot disagree about which face is the bold: identity, not
+    /// equality, because two faces of one family can only be told apart reliably
+    /// by *being* the same entry.
+    pub fn is_bold_anchor(&self, family: &str, style: &str) -> bool {
+        let Some(face) = self.exact(family, style) else {
+            return false;
+        };
+        self.restyle(family, style, true, face.italic)
+            .is_some_and(|bold| std::ptr::eq(bold, face))
+    }
+
+    /// Whether the family carries any face on the bold side of
+    /// [`BOLD_THRESHOLD`], at either slant.
+    ///
+    /// Not what decides whether a control may be pressed — `can_restyle` is —
+    /// but what tells the two refusals apart: a family with no bold anywhere is
+    /// a font to go and install, where one with a bold and no *bold italic* is a
+    /// combination it never had. Naming the wrong one sends somebody looking for
+    /// a file they already have.
+    pub fn offers_bold(&self, family: &str) -> bool {
+        self.faces
+            .iter()
+            .any(|f| f.family.eq_ignore_ascii_case(family) && f.is_bold())
+    }
+
+    /// Whether the family carries any italic, at any weight. See
+    /// [`Self::offers_bold`] for why this is asked separately from
+    /// [`Self::can_restyle`].
+    pub fn offers_italic(&self, family: &str) -> bool {
+        self.faces
+            .iter()
+            .any(|f| f.family.eq_ignore_ascii_case(family) && f.italic)
     }
 
     /// Whether [`Self::resolve`] answered with something other than what was
@@ -1006,6 +1347,434 @@ mod tests {
         assert_eq!(walked.len(), 3, "{walked:?}");
         // Empty is the answer for an empty library rather than one blank row.
         assert_eq!(FontLibrary::default().families_iter().count(), 0);
+    }
+
+    /// A face built by hand, for the cases a real font file cannot produce.
+    fn made(family: &str, style: &str, weight: u16, italic: bool) -> Face {
+        Face {
+            family: family.to_string(),
+            style: style.to_string(),
+            weight,
+            italic,
+            source: Source::File {
+                path: PathBuf::from(format!("{family}-{style}.ttf")),
+                index: 0,
+            },
+            variations: Vec::new(),
+        }
+    }
+
+    /// A family that is not here is substituted with something **ordinary**, not
+    /// with whatever sorted first.
+    ///
+    /// The last fallback used to be `faces.first()`, and `insert` sorts on the
+    /// weight, so the answer was the lightest face of the alphabetically first
+    /// family: a document whose fonts had moved came back set in Archivo Thin,
+    /// as a hairline. Noticed by looking at a picture of the panel, which names
+    /// the substitute in a sentence.
+    #[test]
+    fn a_substitute_for_a_missing_family_is_an_ordinary_weight() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let face = lib
+            .resolve("A Foundry Face Nobody Has", "Regular")
+            .expect("a substitute");
+        assert!(!face.italic, "{face:?}");
+        assert!(
+            (350..=550).contains(&face.weight),
+            "substituted a weight nobody would set a caption in: {face:?}"
+        );
+
+        // The same rule where the *style* is what is missing, which is the
+        // fallback one step earlier and always behaved this way.
+        let face = lib
+            .resolve("Archivo", "Ultra Condensed Black Italic")
+            .expect("a substitute");
+        assert!(
+            !face.italic && (350..=550).contains(&face.weight),
+            "{face:?}"
+        );
+    }
+
+    /// `exact` refuses where `resolve` substitutes, which is the whole reason it
+    /// exists: everything reasoning about *this* face needs the half that can
+    /// say no.
+    #[test]
+    fn the_exact_lookup_refuses_what_resolve_substitutes_for() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        assert!(lib.exact("Archivo", "Regular").is_some());
+        // Both spellings, because a preferences file records whatever the
+        // person who edited it typed.
+        assert!(lib.exact("ARCHIVO", "regular").is_some());
+        assert!(
+            lib.exact("Archivo", "Ultra Condensed Black Italic")
+                .is_none()
+        );
+        assert!(lib.exact("Helvetica Neue", "Regular").is_none());
+        // And `resolve` still answers for both of those, which is what makes
+        // the pair necessary rather than redundant.
+        assert!(lib.resolve("Helvetica Neue", "Regular").is_some());
+    }
+
+    /// **Every weight of the family reaches its bold in one press, and exactly
+    /// one weight per slant reads as bold.**
+    ///
+    /// This is the case a threshold read as "is this text bold" gets wrong, and
+    /// the shipped font is that case: four of Archivo's nine upright faces are on
+    /// the bold side of [`BOLD_THRESHOLD`]. Lighting the control from
+    /// [`Face::is_bold`] said SemiBold was bold, and a lit control asks for the
+    /// *regular* weight — so pressing Bold on SemiBold, ExtraBold or Black went
+    /// down two or three weights and the family's own Bold could not be reached
+    /// by any sequence of presses at all.
+    #[test]
+    fn every_weight_of_a_family_reaches_its_bold_in_one_press() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+
+        let styles: Vec<String> = lib
+            .family("Archivo")
+            .iter()
+            .map(|f| f.style.clone())
+            .collect();
+        // The premise. With one face on the bold side this test guards nothing,
+        // and the defect it exists for could not happen.
+        let heavy = lib
+            .family("Archivo")
+            .iter()
+            .filter(|f| f.is_bold() && !f.italic)
+            .count();
+        assert!(heavy > 1, "only {heavy} upright faces are on the bold side");
+
+        // Exactly one upright face is the anchor, so exactly one row of the
+        // style list draws the mark lit.
+        let anchors: Vec<&String> = styles
+            .iter()
+            .filter(|s| lib.is_bold_anchor("Archivo", s))
+            .collect();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        let anchor = anchors[0].clone();
+
+        // And every other weight reaches it in a single press, including the
+        // ones heavier than it.
+        for style in &styles {
+            if *style == anchor {
+                continue;
+            }
+            let face = lib.exact("Archivo", style).expect("a face");
+            let landed = lib
+                .restyle("Archivo", style, true, face.italic)
+                .expect("a bold");
+            assert_eq!(
+                landed.style, anchor,
+                "{style} was not offered the family's own bold"
+            );
+        }
+
+        // Pressing it while it is lit goes to something lighter, never back to
+        // itself: a mark that is on and does nothing is the worst of the three.
+        let anchor_weight = lib.exact("Archivo", &anchor).expect("a face").weight;
+        let back = lib
+            .restyle("Archivo", &anchor, false, false)
+            .expect("something lighter");
+        assert!(back.weight < anchor_weight, "{back:?}");
+        assert!(!back.is_bold());
+    }
+
+    /// Bold is a **real face of the family** or it is nothing.
+    ///
+    /// Archivo carries nine weights in one file, so its bold is reachable and
+    /// heavier; it carries no italic at all, so the italic is `None` — and
+    /// `None` is the answer the panel draws as a disabled control rather than
+    /// shearing the upright outlines into a fake oblique.
+    #[test]
+    fn bold_is_a_real_face_of_the_family_and_a_missing_italic_is_refused() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+
+        let bold = lib
+            .restyle("Archivo", "Regular", true, false)
+            .expect("a bold");
+        assert!(bold.is_bold(), "{bold:?}");
+        assert!(bold.weight >= BOLD_THRESHOLD);
+        assert_eq!(bold.family, "Archivo");
+        // It is one of the styles the picker lists, never a name invented here.
+        assert!(
+            lib.family("Archivo")
+                .iter()
+                .any(|f| f.style == bold.style && f.weight == bold.weight),
+            "{} is not a style of the family",
+            bold.style
+        );
+
+        // The shipped file is upright only. Nothing here fabricates a slant.
+        assert!(
+            lib.restyle("Archivo", "Regular", false, true).is_none(),
+            "an italic was invented for a family that has none"
+        );
+        assert!(!lib.can_restyle("Archivo", "Regular", false, true));
+
+        // And a family that is not here at all offers neither, rather than
+        // reaching into whatever `resolve` would have substituted.
+        assert!(!lib.can_restyle("A Foundry Face Nobody Has", "Regular", true, false));
+        assert!(!lib.can_restyle("A Foundry Face Nobody Has", "Regular", false, true));
+    }
+
+    /// The bold coming off lands on the family's regular weight, and the italic
+    /// going on keeps the weight it was asked from. One rule, two controls.
+    #[test]
+    fn taking_the_bold_off_finds_regular_and_the_italic_keeps_its_weight() {
+        let mut lib = FontLibrary::default();
+        for (style, weight, italic) in [
+            ("Light", 300, false),
+            ("Regular", 400, false),
+            ("Bold", 700, false),
+            ("Light Italic", 300, true),
+            ("Italic", 400, true),
+            ("Bold Italic", 700, true),
+        ] {
+            lib.insert(made("Foo", style, weight, italic));
+        }
+
+        // Bold on and off moves the weight to the family's own two anchors.
+        assert_eq!(
+            lib.restyle("Foo", "Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Bold")
+        );
+        assert_eq!(
+            lib.restyle("Foo", "Bold", false, false).map(|f| &*f.style),
+            Some("Regular")
+        );
+        // Italic keeps it. This is the case that would be wrong under a single
+        // "always aim at 400" rule: Light Italic, not Italic.
+        assert_eq!(
+            lib.restyle("Foo", "Light", false, true).map(|f| &*f.style),
+            Some("Light Italic")
+        );
+        assert_eq!(
+            lib.restyle("Foo", "Bold", true, true).map(|f| &*f.style),
+            Some("Bold Italic")
+        );
+        assert_eq!(
+            lib.restyle("Foo", "Bold Italic", true, false)
+                .map(|f| &*f.style),
+            Some("Bold")
+        );
+
+        // Not an exact inverse, and said out loud rather than left to be found:
+        // Light bolded and un-bolded is Regular. See `restyle`.
+        let there = lib.restyle("Foo", "Light", true, false).expect("a bold");
+        assert_eq!(
+            lib.restyle("Foo", &there.style, false, false)
+                .map(|f| &*f.style),
+            Some("Regular")
+        );
+    }
+
+    /// A family whose heaviest face is SemiBold has a bold, and it is the
+    /// SemiBold. [`BOLD_THRESHOLD`] is 600 for exactly this: at 700 the answer
+    /// would be "no bold" for a family that plainly has one, and the only other
+    /// way to produce one is to fake it.
+    #[test]
+    fn a_family_whose_heaviest_is_semibold_still_has_a_bold() {
+        let mut lib = FontLibrary::default();
+        lib.insert(made("Thin Air", "Regular", 400, false));
+        lib.insert(made("Thin Air", "SemiBold", 600, false));
+        assert_eq!(
+            lib.restyle("Thin Air", "Regular", true, false)
+                .map(|f| &*f.style),
+            Some("SemiBold")
+        );
+
+        // Bold at 700 beats SemiBold at 600 where both are there, because the
+        // threshold is the test and 700 is the target.
+        lib.insert(made("Thin Air", "Bold", 700, false));
+        assert_eq!(
+            lib.restyle("Thin Air", "Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Bold")
+        );
+
+        // A family of one weight offers nothing at all, in either direction.
+        let mut alone = FontLibrary::default();
+        alone.insert(made("Zapfino", "Regular", 400, false));
+        assert!(!alone.can_restyle("Zapfino", "Regular", true, false));
+        assert!(!alone.can_restyle("Zapfino", "Regular", false, true));
+        // And a family of nothing *but* bold has no way back, which is a
+        // disabled control rather than a lighter face fabricated for it.
+        let mut heavy = FontLibrary::default();
+        heavy.insert(made("Slab Only", "Black", 900, false));
+        assert!(!heavy.can_restyle("Slab Only", "Black", false, false));
+    }
+
+    /// Bolding a condensed face keeps it condensed.
+    ///
+    /// A variable family is a grid: every width carries every weight, so several
+    /// faces are weight 700 and only one of them is the bold *of this one*.
+    /// Without [`same_other_axes`] the answer was whichever sorted first, which
+    /// silently threw away the width somebody had chosen.
+    #[test]
+    fn bolding_a_condensed_face_keeps_the_width_it_was_asked_from() {
+        let mut lib = FontLibrary::default();
+        let grid = |style: &str, weight: u16, wdth: f32| Face {
+            family: "Grid".to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from("Grid[wdth,wght].ttf"),
+                index: 0,
+            },
+            variations: vec![
+                ("wdth".to_string(), wdth),
+                ("wght".to_string(), weight as f32),
+            ],
+        };
+        for (style, weight, wdth) in [
+            ("Light", 300, 100.0),
+            ("Regular", 400, 100.0),
+            ("Bold", 700, 100.0),
+            ("Condensed Light", 300, 75.0),
+            ("Condensed Regular", 400, 75.0),
+            ("Condensed Bold", 700, 75.0),
+        ] {
+            lib.insert(grid(style, weight, wdth));
+        }
+        assert_eq!(
+            lib.restyle("Grid", "Condensed Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Condensed Bold")
+        );
+        assert_eq!(
+            lib.restyle("Grid", "Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Bold")
+        );
+        assert_eq!(
+            lib.restyle("Grid", "Condensed Bold", false, false)
+                .map(|f| &*f.style),
+            Some("Condensed Regular")
+        );
+    }
+
+    /// **A face that states no axis position must not be read as agreeing with
+    /// every width**, and this is the case that guards the rule rather than the
+    /// case that happens to pass under it.
+    ///
+    /// `read_faces` records a variable font's own default instance with an empty
+    /// `variations` list, deliberately, because that is what tells `text::set`
+    /// there is nothing to instance. Exactly one face per file is like that, and
+    /// it is a *candidate* like any other. Under a two-way comparison it agreed
+    /// with everything, tied the correctly-widthed face on every term of the sort
+    /// key, and let the library's own alphabetical order decide — so a condensed
+    /// face asked for its bold could be handed the wide default master. The
+    /// sibling case, where the *face in hand* is the default, is the documented
+    /// gap and is checked here too: the preference goes uniform and the weight
+    /// rule decides, which is a plainer answer rather than a wrong one.
+    #[test]
+    fn a_face_that_states_no_axis_position_does_not_claim_every_width() {
+        let mut lib = FontLibrary::default();
+        let one = |style: &str, weight: u16, wdth: Option<f32>| Face {
+            family: "Grid".to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from("Grid[wdth,wght].ttf"),
+                index: 0,
+            },
+            variations: match wdth {
+                Some(wdth) => vec![
+                    ("wdth".to_string(), wdth),
+                    ("wght".to_string(), weight as f32),
+                ],
+                // The file's default master, as `read_faces` records it.
+                None => Vec::new(),
+            },
+        };
+        lib.insert(one("Condensed Regular", 400, Some(75.0)));
+        lib.insert(one("Condensed Bold", 700, Some(75.0)));
+        // The default master is a bold, and sorts *before* "Condensed Bold"
+        // alphabetically at the same weight — which is what made the old
+        // comparison hand it back.
+        lib.insert(one("Bold", 700, None));
+
+        assert_eq!(
+            lib.restyle("Grid", "Condensed Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Condensed Bold"),
+            "a face stating no width was taken to agree with this one"
+        );
+
+        // And the other half, which is the documented gap: with the default
+        // master *in hand* nothing is known about its width, so the weight rule
+        // decides and either bold is an honest answer.
+        lib.insert(one("Condensed Light", 300, Some(75.0)));
+        assert!(
+            lib.restyle("Grid", "Bold", false, false).is_some(),
+            "a default master in hand should still reach a lighter face"
+        );
+    }
+
+    /// A face with no family name never enters the library.
+    ///
+    /// `read_face` cannot make one, but `add_face` is a public door, and one
+    /// empty name is an empty row in the family picker *and* `resolve`'s
+    /// whole-library fallback for every family that is missing — so every caption
+    /// in a moved document would come back set in nothing.
+    #[test]
+    fn a_face_with_no_family_name_is_refused() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let before = lib.faces().len();
+        for family in ["", "   "] {
+            lib.add_face(made(family, "Regular", 400, false));
+        }
+        assert_eq!(lib.faces().len(), before, "{:?}", lib.families());
+        assert_eq!(lib.families(), vec!["Archivo"]);
+    }
+
+    /// **A style name identifies a face**, so two faces of one family that share
+    /// one cannot both be in the library.
+    ///
+    /// The order key tells them apart by weight, so keeping both compiles and
+    /// sorts fine, and then costs three things at once: the picker draws two rows
+    /// with identical labels and highlights both, `exact` answers with whichever
+    /// sorts first, and `restyle` can pick the heavier and hand back a *name*
+    /// that resolves to the lighter — so the style mark lands on a face the model
+    /// did not choose and reads its own state off a third. A name is what a
+    /// preference records and what the panel holds, so a name that does not
+    /// identify a face is the thing to refuse.
+    #[test]
+    fn a_style_name_identifies_one_face_of_its_family() {
+        let mut lib = FontLibrary::default();
+        lib.insert(made("Foo", "Regular", 400, false));
+        // Same family, same style name, a different weight: refused, first wins.
+        lib.insert(made("Foo", "Regular", 500, false));
+        // And a different spelling of both is still the same name.
+        lib.insert(made("FOO", "REGULAR", 900, false));
+        assert_eq!(lib.family("Foo").len(), 1, "{:?}", lib.faces());
+        assert_eq!(lib.exact("Foo", "Regular").map(|f| f.weight), Some(400));
+
+        // A different name at the same weight is a different face and is kept,
+        // and a different family sharing a style name is untouched.
+        lib.insert(made("Foo", "Book", 400, false));
+        lib.insert(made("Bar", "Regular", 400, false));
+        assert_eq!(lib.family("Foo").len(), 2, "{:?}", lib.faces());
+        assert_eq!(lib.family("Bar").len(), 1);
+
+        // Whatever the library holds, every style name it lists resolves back to
+        // the face it came off. That is the property the whole rule exists for,
+        // and `restyle` relies on it to be able to answer with a name.
+        for face in lib.faces() {
+            let back = lib.exact(&face.family, &face.style).expect("a face");
+            assert!(
+                std::ptr::eq(back, face),
+                "{:?} does not resolve to itself",
+                face
+            );
+        }
     }
 
     /// The same family in two directories is one row in the list, not two — the
