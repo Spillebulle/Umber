@@ -66,8 +66,8 @@ use super::{
 };
 use crate::color::Color;
 use crate::docformat;
-use crate::effect::Effect;
 use crate::document::Background;
+use crate::effect::Effect;
 use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
@@ -884,6 +884,134 @@ mod tests {
                 source: "dst-in".into()
             }]
         );
+    }
+
+    // --- layer effects --------------------------------------------------
+
+    /// A record written by hand, read as the effects it names, and reaching
+    /// the layer it was written for rather than the one beside it.
+    ///
+    /// The fixture lists the effected layer *first*, which is uppermost in an
+    /// ORA and last in a `LayerStack` — so a reader that read the record
+    /// against the file's order rather than the stack's would put a shadow on
+    /// the wrong layer, and this is the ordering that catches it.
+    #[test]
+    fn a_layers_effects_are_read_onto_that_layer() {
+        let ora = fixtures::ora(
+            2,
+            2,
+            &[
+                OraLayer::new("Top", 2, 2, &[0, 0, 255, 255])
+                    .effects("[(kind: DropShadow, angle: 90.0, distance: 4.0)]"),
+                OraLayer::new("Bottom", 2, 2, &[255, 0, 0, 255]),
+            ],
+        );
+        let doc = read(&ora).unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        assert_eq!(doc.layers[0].name, "Bottom");
+        assert!(doc.layers[0].effects.is_empty());
+        assert_eq!(doc.layers[1].name, "Top");
+        assert_eq!(doc.layers[1].effects.len(), 1);
+        let effect = doc.layers[1].effects[0];
+        assert_eq!(effect.kind, crate::effect::EffectKind::DropShadow);
+        assert_eq!(effect.angle, 90.0);
+        assert_eq!(effect.distance, 4.0);
+        // Every field the record left out reads at its own **neutral**, not at
+        // the kind's own starting point — `Effect::drop_shadow` opens at 5.0
+        // softness and 0.75 opacity, and neither may leak in here. This is the
+        // per-field `#[serde(default)]` rule seen from the file rather than
+        // from the struct.
+        assert_eq!(effect.softness, 0.0);
+        assert_eq!(effect.opacity, 1.0);
+        assert!(effect.enabled, "an effect in a file is one somebody made");
+
+        // And it survives being installed in a stack.
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().effects().is_empty());
+        assert_eq!(opened.stack.get(1).unwrap().effects(), &[effect]);
+    }
+
+    /// **A record with no `kind` is refused, and the layer still arrives.**
+    ///
+    /// Two rules meeting. `Effect` deliberately gives `kind` no serde default,
+    /// so a record that omits it — or names a kind this build has never heard
+    /// of — cannot be read as an arbitrary effect; that refusal has to survive
+    /// the trip through the file, which is what the first half checks. And the
+    /// refusal costs the *layer* nothing: the picture is all there, and losing
+    /// it over a decoration would be far worse than losing the decoration.
+    ///
+    /// The named loss is the whole point. An effect is the only record of
+    /// itself, so a document reopened without one and saved again has lost it
+    /// for good — which is exactly the silent loss this module refuses.
+    #[test]
+    fn an_effects_record_with_no_kind_is_refused_and_the_layer_still_arrives() {
+        for record in [
+            // No kind at all.
+            "[(spread: 8.0)]",
+            // A kind from a build this one does not know.
+            "[(kind: InnerGlow, spread: 8.0)]",
+            // One good effect and one bad: the sequence is one record, so the
+            // good one goes with it rather than being read past.
+            "[(kind: Outline),(spread: 8.0)]",
+            // Not RON at all.
+            "not a record",
+            // Empty, which is a truncated write rather than "no effects".
+            "",
+        ] {
+            let ora = fixtures::ora(
+                2,
+                2,
+                &[OraLayer::new("Ink", 2, 2, &[1, 2, 3, 255]).effects(record)],
+            );
+            let doc = read(&ora).unwrap();
+            assert_eq!(doc.layers.len(), 1, "{record}");
+            assert!(doc.layers[0].effects.is_empty(), "{record}");
+            assert!(
+                doc.warnings.iter().any(
+                    |w| matches!(w, ImportWarning::EffectsIgnored { layer, .. } if layer == "Ink")
+                ),
+                "{record} was dropped in silence: {:?}",
+                doc.warnings
+            );
+            // The pixels are untouched, which is the half that matters. The
+            // fixture places every layer at (1,1), so that is where to look.
+            assert_eq!(&doc.layers[0].pixels[12..16], [1, 2, 3, 255], "{record}");
+        }
+    }
+
+    /// A record the file names and does not contain. Same answer, and it has
+    /// to be reached without the `?` in `read` turning it into a refusal of
+    /// the whole document.
+    #[test]
+    fn an_effects_record_that_is_not_in_the_file_is_named() {
+        let ora = fixtures::ora(
+            2,
+            2,
+            &[OraLayer::new("Ink", 2, 2, &[1, 2, 3, 255]).effects_named_but_absent()],
+        );
+        let doc = read(&ora).unwrap();
+        assert_eq!(doc.layers.len(), 1);
+        assert!(doc.layers[0].effects.is_empty());
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::EffectsIgnored { .. })),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    /// A layer that names no record says nothing at all.
+    ///
+    /// The other half of every warning rule here: a list that speaks about
+    /// every document is a list nobody reads, and every ORA from every other
+    /// application is in this case.
+    #[test]
+    fn a_layer_with_no_effects_raises_nothing() {
+        let doc = read(&two_layer_ora()).unwrap();
+        assert!(doc.layers.iter().all(|l| l.effects.is_empty()));
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
     #[test]

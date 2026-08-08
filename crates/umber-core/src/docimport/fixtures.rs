@@ -107,6 +107,14 @@ pub struct OraLayer {
     opacity: f32,
     visible: bool,
     op: String,
+    /// The body of the `umber/effects/<i>.ron` entry, when there is to be one.
+    effects_record: Option<String>,
+    /// Write `umber-effects` on the `<layer>`.
+    ///
+    /// Separate from the record so a fixture can name one that is not in the
+    /// archive — the case a reader has to survive and cannot produce for
+    /// itself.
+    effects_named: bool,
 }
 
 impl OraLayer {
@@ -123,11 +131,30 @@ impl OraLayer {
             opacity: 1.0,
             visible: true,
             op: "svg:src-over".to_string(),
+            effects_record: None,
+            effects_named: false,
         }
     }
 
     pub fn op(mut self, op: &str) -> Self {
         self.op = op.to_string();
+        self
+    }
+
+    /// Carry `umber-effects`, pointing at a record holding this exact text.
+    ///
+    /// The text rather than a `Vec<Effect>`, because the cases worth testing
+    /// are the ones a serialiser cannot produce: a record with no `kind`, a
+    /// kind this build has never heard of, bytes that are not RON at all.
+    pub fn effects(mut self, record: &str) -> Self {
+        self.effects_record = Some(record.to_string());
+        self.effects_named = true;
+        self
+    }
+
+    /// Carry `umber-effects` naming a record that is not in the archive.
+    pub fn effects_named_but_absent(mut self) -> Self {
+        self.effects_named = true;
         self
     }
 
@@ -141,9 +168,13 @@ impl OraLayer {
         self
     }
 
-    fn xml(&self, src: &str) -> String {
+    fn xml(&self, src: &str, effects_src: Option<&str>) -> String {
+        let effects = match effects_src {
+            Some(path) => format!(" umber-effects=\"{path}\""),
+            None => String::new(),
+        };
         format!(
-            "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{}\" visibility=\"{}\" composite-op=\"{}\"/>",
+            "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{}\" visibility=\"{}\" composite-op=\"{}\"{effects}/>",
             self.name,
             self.x,
             self.y,
@@ -159,7 +190,13 @@ pub fn ora(width: u32, height: u32, layers: &[OraLayer]) -> Vec<u8> {
     let mut body = String::new();
     for (i, layer) in layers.iter().enumerate() {
         let src = format!("data/layer{i}.png");
-        body += &layer.xml(&src);
+        // The writer's own numbering, so a fixture and a saved document name
+        // the record the same way.
+        let effects_src = format!("umber/effects/{i:03}.ron");
+        if let Some(record) = &layer.effects_record {
+            archive.add(&effects_src, record.as_bytes());
+        }
+        body += &layer.xml(&src, layer.effects_named.then_some(effects_src.as_str()));
         let png = png_rgba(
             layer.width,
             layer.height,

@@ -1060,6 +1060,133 @@ mod tests {
         ));
     }
 
+    /// **A document over the effect budget opens, and says what it switched
+    /// off.**
+    ///
+    /// It is one document over, not a theoretical bound:
+    /// `effect::MAX_ENABLED` is 127 and 64 layers carrying both kinds ask for
+    /// 128. Built at exactly that shape rather than at some round number, so
+    /// the test would notice if either figure moved without the other.
+    ///
+    /// Two things are checked and the second is the one worth having. The
+    /// excess is **disabled rather than removed**, so every parameter is still
+    /// on the layer, still written at the next save, and can be switched back
+    /// on the moment something else is switched off. Deleting them would be
+    /// the silent loss — the document would open, look nearly right, and be
+    /// saved back a shadow short.
+    #[test]
+    fn a_document_over_the_effect_budget_opens_with_the_excess_switched_off() {
+        use crate::effect::{Effect, EffectKind};
+
+        let size = UVec2::new(1, 1);
+        let mut layers: Vec<ImportedLayer> = (0..LayerStack::MAX)
+            .map(|i| {
+                let mut l = layer(&format!("L{i}"), size);
+                l.effects = vec![Effect::drop_shadow(), Effect::outline()];
+                l
+            })
+            .collect();
+        let asked: usize = layers.iter().map(|l| l.effects.len()).sum();
+        assert_eq!(asked, effect::MAX_ENABLED + 1, "the fixture is one over");
+
+        let mut warnings = Vec::new();
+        disable_effects_over_budget(&mut layers, &mut warnings);
+        assert_eq!(
+            warnings,
+            vec![ImportWarning::EffectsOverBudget {
+                disabled: 1,
+                max: effect::MAX_ENABLED
+            }]
+        );
+
+        // Nothing was thrown away: every layer still holds both, and exactly
+        // one of them is off.
+        assert!(layers.iter().all(|l| l.effects.len() == 2));
+        let enabled: usize = layers
+            .iter()
+            .map(|l| l.effects.iter().filter(|e| e.enabled).count())
+            .sum();
+        assert_eq!(enabled, effect::MAX_ENABLED);
+
+        // Bottom to top and in composite order, so it is the *last* effect of
+        // the *top* layer that gives way — the same answer on every reopen
+        // rather than one that depends on which layer was read first.
+        let top = layers.last().expect("a layer");
+        assert_eq!(top.effects[0].kind, EffectKind::DropShadow);
+        assert!(top.effects[0].enabled);
+        assert_eq!(top.effects[1].kind, EffectKind::Outline);
+        assert!(!top.effects[1].enabled, "the last one is what gave way");
+
+        // And the whole set installs into a stack without `set_effect`
+        // refusing any of it, which is what `open`'s `debug_assert` claims.
+        let doc = ImportedDocument {
+            format: SourceFormat::OpenRaster,
+            size,
+            layers,
+            active: None,
+            background: Background::Transparent,
+            dpi: None,
+            history: None,
+            warnings,
+        };
+        let opened = doc.open();
+        assert_eq!(
+            opened.stack.enabled_effect_count(),
+            effect::MAX_ENABLED,
+            "the trimmed set must be exactly what the stack accepts"
+        );
+        assert!(
+            opened.stack.layers().iter().all(|l| l.effects().len() == 2),
+            "a disabled effect still lives on its layer"
+        );
+    }
+
+    /// A document inside the budget has nothing switched off and says nothing.
+    #[test]
+    fn a_document_within_the_effect_budget_is_left_alone() {
+        let size = UVec2::new(1, 1);
+        let mut only = layer("Ink", size);
+        only.effects = vec![crate::effect::Effect::outline()];
+        let mut layers = vec![only];
+
+        let mut warnings = Vec::new();
+        disable_effects_over_budget(&mut layers, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(layers[0].effects[0].enabled);
+    }
+
+    /// A **disabled** effect is not charged against the budget, so a document
+    /// full of them is not over it.
+    ///
+    /// That is `Effect::enabled`'s stated meaning — no draw, no bake, nothing
+    /// charged — and counting the effects rather than the enabled ones would
+    /// switch off effects that were already off and report a loss that did not
+    /// happen.
+    #[test]
+    fn a_disabled_effect_costs_the_budget_nothing_on_the_way_in() {
+        use crate::effect::Effect;
+
+        let size = UVec2::new(1, 1);
+        let mut layers: Vec<ImportedLayer> = (0..LayerStack::MAX)
+            .map(|i| {
+                let mut l = layer(&format!("L{i}"), size);
+                l.effects = vec![
+                    Effect::drop_shadow(),
+                    Effect {
+                        enabled: false,
+                        ..Effect::outline()
+                    },
+                ];
+                l
+            })
+            .collect();
+
+        let mut warnings = Vec::new();
+        disable_effects_over_budget(&mut layers, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(layers.iter().all(|l| l.effects[0].enabled));
+    }
+
     #[test]
     fn every_supported_extension_dispatches() {
         // A format added to the list but not to `import` would fail here
