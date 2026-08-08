@@ -1052,6 +1052,10 @@ pub struct Candidate {
     pub background: Background,
     pub dpi: f32,
     pub active_layer: usize,
+    /// The lowest texture-array slice a baked effect may take —
+    /// `Editor::effect_slot_base`'s number, taken here for the reason
+    /// [`LayerMeta::effects`] is taken here.
+    pub effect_base: u32,
     /// Bottom to top, matching `LayerStack`'s own order.
     pub layers: Vec<LayerMeta>,
 }
@@ -1059,22 +1063,39 @@ pub struct Candidate {
 impl Candidate {
     /// The stack as the composite pass takes it, for the flattened preview.
     pub fn draws(&self) -> Vec<umber_render::LayerDraw> {
+        self.effected_draws().into_iter().map(|e| e.draw).collect()
+    }
+
+    /// The same flattening with each layer's effects beside its draw.
+    ///
+    /// [`Candidate::draws`] is this with the effects thrown away, so the two
+    /// cannot disagree — the arrangement `Editor::effected_draws` keeps for
+    /// exactly the same reason, on the live stack rather than on the snapshot.
+    ///
+    /// **The effects come out of the snapshot and are never read off the stack**,
+    /// which is the rule this whole struct exists for: a shadow dialled or
+    /// switched off while the readback was crossing frames would produce a file
+    /// whose parameters and whose pixels came from different moments.
+    pub fn effected_draws(&self) -> Vec<umber_render::LayerEffects<'_>> {
         self.layers
             .iter()
             .enumerate()
-            // Exactly what `Editor::layer_draws` does, and for the same reason:
-            // a pass-through folder is its contents composited in place, so it
-            // contributes nothing but its eye. The flattened preview this
+            // Exactly what `Editor::effected_draws` does, and for the same
+            // reason: a pass-through folder is its contents composited in place,
+            // so it contributes nothing but its eye. The flattened preview this
             // builds has to match the screen, so the two rules have to be the
             // same rule.
             .filter_map(|(i, l)| {
-                Some(umber_render::LayerDraw {
-                    slot: l.slot?,
-                    opacity: l.opacity,
-                    blend: l.blend.index(),
-                    visible: self.effective_visible(i),
-                    mask: l.mask,
-                    clipped: l.clipped,
+                Some(umber_render::LayerEffects {
+                    draw: umber_render::LayerDraw {
+                        slot: l.slot?,
+                        opacity: l.opacity,
+                        blend: l.blend.index(),
+                        visible: self.effective_visible(i),
+                        mask: l.mask,
+                        clipped: l.clipped,
+                    },
+                    effects: &l.effects,
                 })
             })
             .collect()
@@ -1702,13 +1723,36 @@ pub fn drive(
         .next_due(Instant::now(), quiet, &editor.session)
         && let Some(doc) = snapshot(editor, id)
     {
-        let (slots, draws) = (doc.slots(), doc.draws());
+        let slots = doc.slots();
         // A document with no renderer has no pixels to read — the resume path
         // rebuilds them, and until then there is nothing worth writing.
-        if canvases
-            .get_mut(&id)
-            .is_some_and(|canvas| canvas.begin_capture(&slots, &draws))
-        {
+        //
+        // The draw list is the *baked* one, so `mergedimage.png` shows the
+        // effects the screen shows. Nothing is normally rebaked here: the frame
+        // this rides in has already baked the same slices from the same
+        // parameters, and an autosave only starts with the pointer up and no
+        // stroke in flight, so every stamp matches. What the call is for is the
+        // slot assignment, which is the renderer's and not the snapshot's.
+        if canvases.get_mut(&id).is_some_and(|canvas| {
+            let stack = doc.effected_draws();
+            let baked = canvas.bake_effects(
+                &gpu.device,
+                &gpu.queue,
+                encoder,
+                doc.effect_base,
+                &stack,
+                umber_render::EffectFrame {
+                    // No stroke can be in flight — `next_due` refuses one — so
+                    // there is no active draw for the bake to fold a scratch in
+                    // for, and `u32::MAX` is what the composite already reads as
+                    // "no layer".
+                    active_index: u32::MAX,
+                    stroke: umber_render::StrokeStyle::default(),
+                    stroke_live: false,
+                },
+            );
+            canvas.begin_capture(&slots, &baked.draws)
+        }) {
             log::debug!("autosaving “{}”", doc.title);
             editor.autosave.begin(doc);
         }
@@ -1843,6 +1887,11 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
         background: doc.background,
         dpi: doc.dpi,
         active_layer: layers.active_index(),
+        // Snapshotted with everything else, and for the reason everything else
+        // here is: the capture spans frames, so a layer added in between would
+        // move it and the flattened preview would name effect slices that had
+        // been reassigned.
+        effect_base: layers.slot_capacity_needed() + 1,
         layers: layers
             .layers()
             .iter()
@@ -2260,6 +2309,7 @@ mod tests {
             background: Background::Transparent,
             dpi: 72.0,
             active_layer: 0,
+            effect_base: 2,
             layers: vec![LayerMeta {
                 name: "Layer 1".to_string(),
                 visible: true,

@@ -31,7 +31,8 @@ use umber_core::{
     PixelRect, SelectionOp, Transform,
 };
 use umber_render::{
-    CanvasRenderer, CompositeParams, DabStyle, FloatParams, FloatSource, Gpu, ProbeParams,
+    CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
+    LayerDraw, ProbeParams,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -743,6 +744,64 @@ impl UmberApp {
     fn float_preview(&self) -> Option<(u32, u32)> {
         let id = self.editor.session.active_id();
         self.gfx.as_ref()?.canvases.get(&id)?.float_preview()
+    }
+
+    /// The draw list, with this document's layer effects baked and spliced in.
+    ///
+    /// **Every path that composites has to use this and not
+    /// `Editor::layer_draws`**, and that is the rule the composite pass's own
+    /// reuse already lives by: `export_rgba`, `pick_colour`, `probe_canvas` and
+    /// the autosave's capture share one shader precisely so that none of them can
+    /// differ from the screen, and handing three of them a draw list the fourth
+    /// does not use gives that away without touching a line of WGSL. It shipped
+    /// that way for one commit — the screen and the autosave preview carried the
+    /// effects and every exported PNG, the ORA's `mergedimage.png` and the
+    /// eyedropper did not, which is the asymmetry `docformat`'s own notes call
+    /// worse than losing them everywhere: "losing something every time is a bug
+    /// somebody reports; losing it sometimes is one they doubt themselves over".
+    ///
+    /// Its own encoder, submitted here, because the paths that want it do not all
+    /// have one — `export_rgba` and `pick_colour` build theirs inside. A bake is a
+    /// comparison and a `Vec` where nothing is stale, which for a document with no
+    /// effects is always.
+    ///
+    /// **`render` deliberately does not use this**, and calls `bake_effects`
+    /// directly instead. It has an encoder already, and the bake has to go into
+    /// *that* one so that the ordering against the composite is the encoder's
+    /// rather than two submissions' — the same reason `draw_float` writes the
+    /// preview slice into the frame's encoder. It also needs the mapped active
+    /// draw index back, which this throws away because no other caller has a
+    /// stroke in flight to preview.
+    ///
+    /// `None` where there is no renderer, which is the resume path: there are no
+    /// pixels to composite either.
+    fn baked_draws(&mut self, float: Option<(u32, u32)>) -> Option<Vec<LayerDraw>> {
+        let id = self.editor.session.active_id();
+        let base = self.editor.effect_slot_base();
+        let stack = self.editor.effected_draws(float);
+        let frame = EffectFrame {
+            active_index: self.editor.active_draw_index(),
+            stroke: self.editor.stroke_style,
+            stroke_live: self.editor.stroke.is_active(),
+        };
+        let gfx = self.gfx.as_mut()?;
+        let canvas = gfx.canvases.get_mut(&id)?;
+        let mut encoder = gfx
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bake-effects"),
+            });
+        let baked = canvas.bake_effects(
+            &gfx.gpu.device,
+            &gfx.gpu.queue,
+            &mut encoder,
+            base,
+            &stack,
+            frame,
+        );
+        gfx.gpu.queue.submit(Some(encoder.finish()));
+        Some(baked.draws)
     }
 
     /// Everything a float needs from the GPU, in one place.
@@ -1998,7 +2057,10 @@ impl UmberApp {
             return;
         }
 
-        let layers = self.editor.layer_draws(self.float_preview());
+        let float = self.float_preview();
+        let Some(layers) = self.baked_draws(float) else {
+            return;
+        };
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(canvas) = gfx.canvases.get(&id) else {
@@ -2093,6 +2155,13 @@ impl UmberApp {
             height: size.y,
         };
 
+        // Before the scope below, because it wants `&mut self` and everything in
+        // there is a borrow. A float has already been put down by the caller, so
+        // there is no preview slice to substitute.
+        let Some(merged_draws) = self.baked_draws(None) else {
+            return false;
+        };
+
         // Scoped so every borrow of the editor and the GPU is released before
         // the outcome is acted on, which needs `&mut self`.
         let outcome = {
@@ -2135,12 +2204,10 @@ impl UmberApp {
                 })
                 .collect();
             // The flattened preview the format requires comes from the same
-            // composite pass the screen uses, so it cannot disagree with it.
-            let merged = canvas.export_rgba(
-                &gfx.gpu.device,
-                &gfx.gpu.queue,
-                &self.editor.layer_draws(None),
-            );
+            // composite pass the screen uses, so it cannot disagree with it — and
+            // from the same *draw list*, effects included, which is the other half
+            // of that and is not free: see `App::baked_draws`.
+            let merged = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &merged_draws);
 
             let layers: Vec<SaveLayer<'_>> = stack
                 .iter()
@@ -2257,10 +2324,16 @@ impl UmberApp {
         let id = self.editor.session.active_id();
         let suggested =
             export::default_file_name(self.editor.session.active_title(), options.format);
-        let Some(gfx) = self.gfx.as_ref() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
+        // Asked before the dialog, so a document with no renderer does not open a
+        // file picker only to find there is nothing to write. The renderer and the
+        // draw list are both taken *after* it — see below.
+        if self
+            .gfx
+            .as_ref()
+            .is_none_or(|g| !g.canvases.contains_key(&id))
+        {
             return;
-        };
+        }
 
         let Some(picked) = rfd::FileDialog::new()
             .set_title(format!("Export {}", options.format.label()))
@@ -2276,7 +2349,17 @@ impl UmberApp {
         let target = export::target(&picked, options.format);
         let name = file_name_of(&target.path);
 
-        let layers = self.editor.layer_draws(None);
+        // Effects included, or the exported file is not the picture on the screen
+        // — see `App::baked_draws`. Between the dialog and here nothing has
+        // touched a pixel, so a bake is a comparison unless a shadow was still
+        // stale when the dialog opened.
+        let Some(layers) = self.baked_draws(None) else {
+            return;
+        };
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(canvas) = gfx.canvases.get(&id) else {
+            return;
+        };
         let pixels = canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers);
         let size = self.editor.doc.size;
 
@@ -2660,7 +2743,34 @@ impl UmberApp {
             );
         }
 
-        let layer_draws = self.editor.layer_draws(canvas.float_preview());
+        // Before the composite and into the same encoder, for the reason the
+        // float's preview is: an effect is an ordinary draw pointing at an
+        // ordinary slice, so those slices have to hold this frame's picture by
+        // the time the stack is drawn. Every stale effect is rebaked from the
+        // layer **plus the scratch**, which is what makes a shadow follow the
+        // brush; a document with no effects is a comparison and a `Vec` and
+        // touches no GPU at all.
+        //
+        // The active *draw* index has to come back out of this, because effect
+        // draws sit between the layers and shift it — hand the composite the
+        // plain one and the stroke previews on the wrong layer.
+        let baked = {
+            let stack = self.editor.effected_draws(canvas.float_preview());
+            canvas.bake_effects(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                &mut encoder,
+                self.editor.effect_slot_base(),
+                &stack,
+                EffectFrame {
+                    active_index: self.editor.active_draw_index(),
+                    stroke: self.editor.stroke_style,
+                    stroke_live: self.editor.stroke.is_active(),
+                },
+            )
+        };
+        let layer_draws = baked.draws;
+        let active_draw = baked.active_index;
 
         // A smudging brush needs to know what it is passing over. The read is
         // asynchronous: this records a sample and collects whichever earlier one
@@ -2675,7 +2785,7 @@ impl UmberApp {
                 &mut encoder,
                 &ProbeParams {
                     layers: &layer_draws,
-                    active_index: self.editor.active_draw_index(),
+                    active_index: active_draw,
                     stroke: self.editor.stroke_style,
                     doc_point: point,
                     radius,
@@ -2701,7 +2811,7 @@ impl UmberApp {
                 camera: &self.editor.camera,
                 pivot: self.editor.canvas_pivot,
                 layers: &layer_draws,
-                active_index: self.editor.active_draw_index(),
+                active_index: active_draw,
                 stroke: self.editor.stroke_style,
                 backdrop: self.editor.palette().backdrop_display(),
                 export: false,
@@ -3099,6 +3209,12 @@ impl UmberApp {
             return false;
         };
         let id = self.editor.session.active_id();
+        // Effects included: a tip is what the artist painted, and a shadow they
+        // dialled is part of that. `App::baked_draws` before the scope, because it
+        // wants `&mut self`.
+        let Some(layers) = self.baked_draws(None) else {
+            return false;
+        };
         // Scoped so the borrow of `self.gfx` ends before the editor is taken
         // mutably below. The context is an `Arc` inside, so cloning it is a
         // refcount rather than a copy of egui's state.
@@ -3106,7 +3222,6 @@ impl UmberApp {
             let gfx = self.gfx.as_ref();
             gfx.and_then(|gfx| gfx.canvases.get(&id).map(|canvas| (gfx, canvas)))
                 .map(|(gfx, canvas)| {
-                    let layers = self.editor.layer_draws(None);
                     (
                         gfx.egui_ctx.clone(),
                         canvas.export_rgba(&gfx.gpu.device, &gfx.gpu.queue, &layers),

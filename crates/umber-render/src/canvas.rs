@@ -6,8 +6,8 @@ use glam::{UVec2, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use umber_core::{
-    Affine, Anchor, Background, BlendMode, BrushMode, Camera, CanvasCopy, Color, Dab, FlipAxis,
-    PixelRect, Selection, TipMask, transform,
+    Affine, Anchor, Background, BlendMode, BrushMode, Camera, CanvasCopy, Color, Dab, Effect,
+    EffectKind, FlipAxis, OutlinePosition, PixelRect, Selection, TipMask, transform,
 };
 use wgpu::util::DeviceExt;
 
@@ -179,6 +179,105 @@ const MAX_EFFECT_SLICES: usize = effect_slices(MAX_LAYERS, MAX_SLOTS);
 /// fragment: the loop in `composite.wgsl` is bounded by `layer_count`. The
 /// bytes are counted in [`ViewUniforms`].
 const MAX_DRAWS: usize = MAX_LAYERS + MAX_EFFECT_SLICES;
+
+/// The jump flood's seed coordinate.
+///
+/// A *coordinate*, so it has to be exact: an `f16`'s mantissa runs out of whole
+/// integers at 2048, which is a canvas size Umber ships with, and a 2049th
+/// column would flood towards the wrong texel. Sixteen bits of unsigned integer
+/// covers every canvas `max_texture_dimension_2d` permits four times over, which
+/// is also what lets 65535 stand for "no seed" without ever colliding with one.
+///
+/// **A render target on every device, and that was checked rather than
+/// assumed.** `TextureFormat::guaranteed_format_features` gives `Rg16Uint`
+/// `attachment` on `Features::empty()`, so it is part of what the WebGPU
+/// specification requires rather than something an adapter may refuse — which is
+/// the question that had to be asked, because the whole point of requesting
+/// `downlevel_defaults` is that a desktop build must not depend on what a mobile
+/// GPU will not do. `the_seed_format_is_a_render_target_on_every_device` is the
+/// pin; a wgpu bump that moved it would otherwise be a fatal `create_texture`
+/// validation error on somebody else's machine and on nobody's here.
+///
+/// The first draft carried an `effects_available(&Adapter)` beside this instead,
+/// and it was never called — a control that would have greyed itself out if
+/// anything had asked it. An uncalled guard is a promise nothing keeps;
+/// `examples/measure-effects.rs` still asks the adapter, which is the right place
+/// for the caution, because a measuring tool must not die on the first
+/// allocation a device refuses.
+const SEED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Uint;
+
+/// How much smaller than the canvas a wide blur runs.
+///
+/// Sixteen times fewer texels at a quarter of the radius is ~64x less work, and
+/// `docs/layer-effects.md` §3.2 is emphatic that this is not an optimisation to
+/// add later: at 10000² a full-resolution tent goes from 8.5 ms at radius 4 to
+/// 83 ms at radius 64, where the downsampled one is 2.0 to 3.2 ms across the
+/// same sweep.
+const EFFECT_DOWN: u32 = 4;
+
+/// Below this softness the blur runs at full resolution instead.
+///
+/// **A departure from §3.2, which says the blur is always downsampled, and the
+/// reason is that a quarter-resolution tent cannot represent a narrow soft edge
+/// at all.** Two box passes of `2r + 1` taps at a reduction of `d` have a half
+/// support of `d(2r + 1)`, so the smallest edge [`EFFECT_DOWN`] can draw is
+/// twelve document pixels and the quantisation step is eight — a shadow asked
+/// for four would arrive at twelve, and one asked for sixteen could only be
+/// twelve or twenty. §13 left "whether the quarter-resolution blur can be
+/// calibrated at 20 px" open; this is that question answered in the honest
+/// direction rather than left to the artist to discover.
+///
+/// It is a *parameter* and not a second implementation — the same four passes
+/// run either way, and `fs_down` is simply not recorded — which is why it is not
+/// the second path §3.1a refuses for the distance field. At and above this
+/// figure the quantisation is under 13% of the radius, which is invisible on a
+/// falloff; below it the full-resolution tent is exact to a pixel and costs
+/// 1.3 ms at 2048² by §3.4's own table.
+const EFFECT_FULL_RES_SOFTNESS: f32 = 32.0;
+
+/// The largest canvas a bake may be re-run on **every frame**, in pixels.
+///
+/// `docs/layer-effects.md` §5.1 and §12: at 2048² a bake is 0.4 ms to 1.2 ms, so
+/// rebaking from layer plus scratch every frame is affordable and the shadow
+/// follows the brush. At 10000² the jump flood alone is 19 ms and holds about a
+/// gigabyte, so above this the bake waits for the layer's pixels to change —
+/// which at the end of a stroke is the commit. The shadow then lags a stroke,
+/// and **nothing on screen says so**, because a shadow one stroke late is still
+/// the right picture; a notice about it would be a notice on every frame of
+/// every stroke on a large canvas.
+///
+/// **Measured on the shipped bake and not on the design's prototypes** —
+/// `examples/measure-effects.rs`'s second table, which exists because those are
+/// two different measurements and quoting one for the other is the mistake §3.1a
+/// records. On an RTX 3080:
+///
+/// | | 2048² | 10000² |
+/// |---|---|---|
+/// | shadow at its default 5 px | 0.54 | 7.82 |
+/// | shadow at 64 px | 0.38 | 4.05 |
+/// | outline 16 px wide | 1.04 | **20.39** |
+///
+/// So 2048² is free and 10000² is not, which is the split §3.4 predicted. 4096²
+/// is where the line is drawn and it is a judgement rather than a reading:
+/// nothing has been measured between those two sizes and the flood scales with
+/// the area, which puts a 4096² outline at roughly 3 ms.
+///
+/// **One gate on the canvas rather than a gate per effect, and §5.1 would allow
+/// the second.** Its corrected claim is that what cannot hold at canvas scale is
+/// "memory at canvas scale and the stroke's distance field, not the shadow and
+/// not the frame budget" — and the table above bears that out: at 10000² the
+/// outline is over a 60 Hz frame and neither shadow is. A per-effect gate would
+/// therefore keep the live shadow on the largest canvas Umber supports. It is
+/// **not** what this does, on the grounds that 7.94 ms every frame is half of a
+/// 60 Hz frame before the composite, the dab pass and the interface have had any
+/// of it, and a stroke drawn at thirty frames a second is a worse thing to hand
+/// an artist than a shadow that arrives when they lift the pen. It is a judgement
+/// against the design's lean and it is recorded as one; a full-resolution blur at
+/// 31 px is 22.45 ms at that size, which is the case a per-effect gate would also
+/// have to cover.
+///
+/// Stage 3's region-bounded rebake is what removes the need for any of it.
+const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
 
 /// Slices left for effects once a stack of `layers`, all masked, and the
 /// float's spare have theirs, under a ceiling of `ceiling`.
@@ -980,6 +1079,92 @@ pub struct LayerDraw {
     pub clipped: bool,
 }
 
+/// One layer's draw and the effects derived from it.
+///
+/// What [`CanvasRenderer::bake_effects`] takes, and it is deliberately a
+/// *description* rather than a draw list with the effects already in it: which
+/// slice each effect gets, which are refused for want of one, and where the
+/// active layer ends up once they are spliced in are all this crate's to decide,
+/// because [`MAX_EFFECT_SLICES`] is this crate's number. The caller supplies
+/// what the document says; the renderer answers with what can be drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerEffects<'a> {
+    pub draw: LayerDraw,
+    /// Already in composite order, bottom to top — `Layer::effects` maintains
+    /// that. Disabled ones and ones that would mark nothing are filtered here
+    /// rather than by the caller, so one rule decides it: see
+    /// [`effect_marks_nothing`].
+    pub effects: &'a [Effect],
+}
+
+/// What the frame the bake is part of is doing.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectFrame {
+    /// Position in the caller's **plain** draw list of the layer receiving the
+    /// stroke in flight, or `u32::MAX` for none. [`BakedStack::active_index`] is
+    /// the same layer's position once effect draws are spliced in, and the
+    /// composite has to be given *that* one.
+    pub active_index: u32,
+    /// The stroke in flight, needed because an effect on the layer being painted
+    /// is baked from the layer **plus the scratch**.
+    pub stroke: StrokeStyle,
+    /// A stroke really is in flight. Distinct from `active_index` being valid,
+    /// which is true whenever a layer is selected — and it is what makes the
+    /// *end* of a stroke invalidate the bake even when the stroke was cancelled
+    /// rather than committed, since a cancel writes no pixels and moves no slice
+    /// revision.
+    pub stroke_live: bool,
+}
+
+/// What [`CanvasRenderer::bake_effects`] produced.
+pub struct BakedStack {
+    /// Bottom to top, effect draws spliced in around the layers they belong to,
+    /// in `docs/layer-effects.md` §4's order. This is what the composite takes.
+    pub draws: Vec<LayerDraw>,
+    /// Effects the document holds and this bake could not draw, because there was
+    /// no slice or no room in the pass budget for them. Non-zero says the document
+    /// is over budget, which is a thing to say out loud rather than a thing to be
+    /// quiet about — see [`CanvasRenderer::effects_dropped`].
+    pub dropped: usize,
+    /// Where [`EffectFrame::active_index`]'s layer ended up, once effect draws are
+    /// spliced in around it. `u32::MAX` stays `u32::MAX`, which the shader's
+    /// `i == active_index` never matches.
+    ///
+    /// The composite has to be given **this** and not the plain index, or the
+    /// stroke in flight previews on whichever draw happens to sit at the old
+    /// number — an effect, or the wrong layer — and jumps into place at
+    /// pointer-up.
+    pub active_index: u32,
+}
+
+/// Would this effect put nothing on the canvas at all?
+///
+/// **The one rule for it, in this crate rather than in the caller**, so the draw
+/// list and the bake cannot disagree about whether an effect exists. Two of the
+/// three clauses are ordinary; the third is a decision.
+///
+/// * A disabled effect, or one at zero opacity, draws nothing. Obvious.
+/// * An outline with no width has no band to trace. Obvious.
+/// * **A drop shadow with no softness, no spread and no displacement draws
+///   nothing**, and that is a choice rather than arithmetic. Such a shadow is
+///   its own layer's shape sitting exactly underneath its own layer, and
+///   §3.3's knockout multiplies it by `1 - coverage` — so all that could survive
+///   is a rim at the layer's antialiased edge, at `c(1 - c)`, which is a mark
+///   nobody asked for and is at most a quarter of the effect's colour. Declining
+///   to draw it is what makes "a shadow of radius 0 is the exact identity" true
+///   as *identity* rather than as "nearly". Photoshop draws the rim.
+pub fn effect_marks_nothing(effect: &Effect) -> bool {
+    if !effect.enabled || effect.opacity <= 0.0 {
+        return true;
+    }
+    match effect.kind {
+        EffectKind::Outline => effect.spread <= 0.0,
+        EffectKind::DropShadow => {
+            effect.softness <= 0.0 && effect.spread <= 0.0 && effect.distance <= 0.0
+        }
+    }
+}
+
 /// How the stroke in the scratch surface should look.
 ///
 /// Preview and commit must be handed the *same* style — they implement the same
@@ -1355,6 +1540,281 @@ struct ThumbUniforms {
     _pad1: u32,
 }
 
+/// Mirrors `Cfg` in `effect.wgsl`, byte for byte.
+///
+/// The arithmetic, because there is no `vec3` here to make it interesting and
+/// that is exactly why: one `vec4<f32>` (16) + four `vec2<f32>` (32) + fifteen
+/// scalars (60) = 108, rounded up to the struct's 16-byte alignment = **112**.
+/// Every `vec2` sits on an 8-byte boundary and the scalars are 4-aligned, so
+/// both sides pack the obvious way. Padding is a scalar, not a vector — see the
+/// uniform-layout note in CLAUDE.md.
+///
+/// One block per **pass**, reached with a dynamic offset, for the reason
+/// [`CommitUniforms`] is: a bake records a dozen or more passes into one encoder
+/// and `Queue::write_buffer` is flushed before the command buffer, so writing
+/// one block repeatedly would leave every pass reading the last one's numbers.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct EffectUniforms {
+    tint: [f32; 4],
+    size: [f32; 2],
+    src_size: [f32; 2],
+    offset: [f32; 2],
+    step: [f32; 2],
+    radius: i32,
+    down: i32,
+    spread: f32,
+    inner: u32,
+    slot: i32,
+    mask_slot: i32,
+    has_mask: u32,
+    stroke_here: u32,
+    stroke_mode: u32,
+    stroke_opacity: f32,
+    stroke_on_mask: u32,
+    stroke_gray: f32,
+    grow: u32,
+    k: i32,
+    invert: u32,
+    _pad: u32,
+}
+
+/// How many pass blocks the bake's uniform buffer holds.
+///
+/// One effect is extract + seed + `ceil(log2(reach)) + 1` flood steps + grow +
+/// downsample + four box passes + resolve. The flood is what makes that
+/// unbounded-looking, and it is bounded by the canvas rather than by the spread —
+/// see [`CanvasRenderer::plan_effect`] — so at 10000² the worst effect is
+/// **twenty-four** passes and [`EFFECT_MAX_PASSES_PER_EFFECT`] is that figure with
+/// room over it.
+///
+/// **The buffer is sized for `effect::MAX_ENABLED` of them, which the model will
+/// really install**: 64 layers times two kinds is 128, and the cap is 127. At 512
+/// blocks — five times too few — the whole bake was refused, `plain()` came back,
+/// and `effects_dropped` reported **zero** while nothing drew, every frame, for
+/// as long as the document was open. A panel reading that figure would have said
+/// the document was within its budget while showing none of it, which is the
+/// silent version of the failure §6.1a exists to prevent. The plan is now bounded
+/// as well, so an overrun is *impossible* rather than merely unlikely, and an
+/// effect that will not fit is dropped through the same visible path as one that
+/// has no slice.
+///
+/// At the 256-byte alignment `downlevel_defaults` guarantees this is 780 KiB, and
+/// it is noise against the 16 KiB *binding* limit because exactly one block is
+/// bound at a time — the buffer's own size is not a bound anything checks. It is
+/// allocated once per document that has an effect, and never on the drawing path.
+const EFFECT_PASS_BLOCKS: u64 =
+    EFFECT_MAX_PASSES_PER_EFFECT as u64 * umber_core::effect::MAX_ENABLED as u64;
+
+/// The most passes one effect can ask for, which is what bounds the plan.
+///
+/// Twenty-four is the measured worst — a 10000² canvas, where the flood's step
+/// count is `ceil(log2(10000)) + 1` = 15, plus extract, seed, grow, downsample,
+/// four box passes and the resolve. Thirty-two rather than twenty-four so that
+/// adding a pass to the pipeline does not silently start dropping effects; the
+/// cost of the slack is uniform bytes and nothing else.
+///
+/// `the_pass_budget_covers_the_effects_the_model_permits` is what says the two
+/// figures still agree with what `plan_effect` actually emits.
+const EFFECT_MAX_PASSES_PER_EFFECT: usize = 32;
+
+/// Stride of one [`EffectUniforms`] block.
+///
+/// `min_uniform_buffer_offset_alignment` is 256 on every device
+/// `downlevel_defaults` describes, and a dynamic offset must be a multiple of
+/// it. Stated as a constant rather than read from the device because the buffer
+/// is sized from it as well as indexed by it, and two spellings would be two
+/// chances to disagree.
+const EFFECT_BLOCK_STRIDE: u64 = 256;
+
+const _: () = assert!(
+    EFFECT_BLOCK_STRIDE >= std::mem::size_of::<EffectUniforms>() as u64,
+    "an effect pass's uniform block does not fit its own stride"
+);
+
+/// Which pass of the bake a recorded step is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectPass {
+    Extract,
+    Seed,
+    Flood,
+    Grow,
+    Down,
+    Box,
+    Resolve,
+}
+
+/// Where one recorded step writes.
+#[derive(Clone, Copy, Debug)]
+enum EffectTarget {
+    Coverage,
+    Grown,
+    Blur(usize),
+    Seed(usize),
+    /// A slice of the layer array: the effect's own, and the only target of the
+    /// whole bake that outlives it.
+    Slice(u32),
+}
+
+/// One recorded pass, before anything is written or encoded.
+///
+/// The bake is planned whole and then run, rather than recorded as it is worked
+/// out, because every pass reads its numbers out of one uniform buffer at
+/// *submit* time — see [`EffectUniforms`]. Planning first is what lets all the
+/// blocks be written in one `write_buffer` before the first pass is recorded.
+struct EffectStep {
+    pass: EffectPass,
+    target: EffectTarget,
+    /// Which of the scratch's bind groups this pass reads through.
+    bind: usize,
+    /// The region of the target the pass covers, in texels. Smaller than the
+    /// attachment whenever the blur is running downsampled, which is what
+    /// `set_viewport` is for.
+    viewport: UVec2,
+    cfg: EffectUniforms,
+}
+
+/// The canvas-sized working set every effect on this document shares.
+///
+/// **Shared rather than per effect**, which is what keeps the memory bounded by
+/// the document rather than by how many shadows are switched on: one effect is
+/// baked at a time, so the coverage, the grown shape, the tent's ping-pong pair
+/// and the flood's seed pair are reused by all of them. At 2048² that is 20 MB
+/// with no flood and 52 MB with one; at 10000² it is 400 MB and 1,200 MB, which
+/// is the figure `docs/layer-effects.md` §3.4 records and the reason stage 3
+/// bounds the bake by region.
+///
+/// The seed pair is [`Option`] because most effects never need it: a drop shadow
+/// with no spread is a blur of the coverage and nothing else, and that is the
+/// setting every application opens one at.
+struct EffectScratch {
+    size: UVec2,
+    /// The layer's coverage after its mask and its wet stroke.
+    coverage: wgpu::TextureView,
+    /// That coverage grown by the effect's spread.
+    grown: wgpu::TextureView,
+    /// The tent's ping-pong pair, at full resolution so that the same pair
+    /// serves a downsampled blur in its top-left corner and a full-resolution
+    /// one whole. A pair sized to the downsample would have to be reallocated
+    /// whenever a radius crossed [`EFFECT_FULL_RES_SOFTNESS`].
+    blur: [wgpu::TextureView; 2],
+    seeds: Option<[wgpu::TextureView; 2]>,
+    /// Held so the views above outlive the bind groups that reference them.
+    #[allow(dead_code)]
+    textures: Vec<wgpu::Texture>,
+    uniforms: wgpu::Buffer,
+    /// The bind groups, in [`EffectBind`]'s order.
+    binds: Vec<wgpu::BindGroup>,
+    /// The layer array's capacity when [`EffectScratch::binds`] were built. The
+    /// extract reads the array, so a growth that reallocated it leaves those
+    /// bind groups naming a texture nothing draws into any more.
+    bound_capacity: u32,
+}
+
+/// Which bind group a pass reads through. Indices into
+/// [`EffectScratch::binds`].
+///
+/// Built once per scratch and reused by every effect, because the views they
+/// name are fixed for the document's life. Only the uniform block changes per
+/// pass, and that is a dynamic offset.
+///
+/// **There are twelve rather than four because a colour attachment may not also
+/// be bound**, and every one of these passes writes into the same small set of
+/// textures the others read. That is the constraint `flip.wgsl` works around with
+/// a scratch and `commit_blended` works around with a copy; here it is worked
+/// around by binding a 1x1 stand-in wherever an entry point does not read a slot.
+/// Two of them are not obvious and both were validation errors before they were
+/// bind groups: the extract writes the coverage, so it must not bind it, and the
+/// **resolve writes a slice of the layer array**, so it must not bind the array —
+/// even though `fs_resolve` never reads it.
+#[allow(clippy::enum_variant_names)]
+enum EffectBind {
+    /// The real layer array and the stroke scratch. The only pass that reads
+    /// either, and the only one whose target is not in this list.
+    Extract = 0,
+    /// The coverage, and nothing else: the seed pass, and a grow with no spread.
+    Coverage = 1,
+    /// The coverage and one of the flood pair.
+    Grow0 = 2,
+    Grow1 = 3,
+    /// One of the flood pair alone.
+    Flood0 = 4,
+    Flood1 = 5,
+    /// One coverage field as `src`, for a blur pass.
+    SrcGrown = 6,
+    SrcBlur0 = 7,
+    SrcBlur1 = 8,
+    /// The same, plus the coverage the knockout needs.
+    ResolveGrown = 9,
+    ResolveBlur0 = 10,
+    ResolveBlur1 = 11,
+    /// The coverage itself as `src`, for an effect with no spread: there is
+    /// nothing to grow, so the shape *is* the coverage and the grow pass is not
+    /// recorded at all. Two bind groups rather than one because the blur reads the
+    /// shape without the coverage beside it and the resolve reads both.
+    SrcCoverage = 12,
+    ResolveCoverage = 13,
+}
+
+const EFFECT_BIND_COUNT: usize = 14;
+
+/// One effect's slice, and what it was baked from.
+///
+/// **Keyed on the slot the *draw* carries, not on the layer**, which is
+/// `docs/layer-effects.md` §5.2's rule and is what makes a floating transform
+/// fall out rather than needing one: during a drag the draw carries the preview
+/// slice, so the effect baked from it is a different cache entry from the one
+/// baked from the layer's own slice, and the commit swaps back to an entry that
+/// is stale for the ordinary reason.
+struct CachedEffect {
+    source: u32,
+    mask: Option<u32>,
+    kind: EffectKind,
+    /// The effect slice this entry owns.
+    slot: u32,
+    /// The layer slice's revision when it was last baked.
+    source_revision: u64,
+    /// The mask slice's, or 0 where there is none.
+    mask_revision: u64,
+    /// A hash of every parameter the *pixels* depend on. Opacity and blend mode
+    /// are deliberately absent: those are the draw's, applied by the composite,
+    /// so dragging either slider costs no rebake.
+    params: u64,
+    /// Whether the last bake folded a live stroke in. A change either way is
+    /// staleness, which is how a *cancelled* stroke invalidates the bake — a
+    /// cancel writes no pixels, so no slice revision moves.
+    live: bool,
+}
+
+/// Every effect's slice, and the scratch they are baked through.
+///
+/// Effect slices are handed out from `[base, base + capacity)` where `base` is
+/// one past everything `LayerStack` has claimed — the `+ 1` being the slice a
+/// floating transform previews into, which is taken at exactly
+/// `slot_capacity_needed()`. That is above every *parked* slice as well as every
+/// live one, because `SlotPool` compacts only its tail, and it is what makes
+/// §4.2 safe: **an effect slice may be freed rather than parked**, because the
+/// model can never hand it to a layer and so no `PixelPatch` can ever name it.
+#[derive(Default)]
+struct EffectCache {
+    /// The lowest slice effects may use. A change means the stack claimed or
+    /// released slices, so every entry is dropped and rebaked at its new number.
+    base: u32,
+    entries: Vec<CachedEffect>,
+    /// Offsets from `base` nobody holds, ascending.
+    free: Vec<u32>,
+    /// One past the highest offset ever handed out.
+    next: u32,
+    scratch: Option<EffectScratch>,
+    /// Effects the last bake could not give a slice to. Non-zero says the
+    /// document is over its effect budget, which the panel is meant to say out
+    /// loud — see [`CanvasRenderer::effects_dropped`].
+    dropped: usize,
+    /// How many bakes have run. Observation only, and the only way a test can
+    /// say "this frame rebaked nothing".
+    bakes: u64,
+}
+
 /// The layer texture array and the views onto it.
 struct LayerStore {
     texture: wgpu::Texture,
@@ -1490,6 +1950,30 @@ struct Shared {
     thumb_layout: wgpu::BindGroupLayout,
     thumb_pipeline: wgpu::RenderPipeline,
 
+    /// Bakes a layer effect. See `effect.wgsl`.
+    ///
+    /// **One layout for all seven passes**, holding every binding any of them
+    /// reads, so a pass is chosen by a pipeline and a uniform block and never by
+    /// a second bind-group shape. That is what lets the bind groups be built once
+    /// per document and reused by every effect — the alternative was a layout per
+    /// pass and a bind group per pass per frame, which is allocation churn on the
+    /// drawing path for nothing. Extra entries a given entry point does not read
+    /// are legal; missing ones are not, which is the direction that matters.
+    effect_layout: wgpu::BindGroupLayout,
+    /// The layer's alpha, after its mask and after the wet stroke, into
+    /// [`STROKE_FORMAT`].
+    effect_extract: wgpu::RenderPipeline,
+    effect_seed: wgpu::RenderPipeline,
+    effect_step: wgpu::RenderPipeline,
+    effect_grow: wgpu::RenderPipeline,
+    effect_down: wgpu::RenderPipeline,
+    effect_box: wgpu::RenderPipeline,
+    /// The only one of the seven that writes a layer slice, and therefore the
+    /// only one whose target is [`LAYER_FORMAT`] — an **sRGB** view, like a
+    /// layer, so the composite decodes what it wrote. Every intermediate above
+    /// it is `R8Unorm` and carries no transfer function at all.
+    effect_resolve: wgpu::RenderPipeline,
+
     transform_layout: wgpu::BindGroupLayout,
     /// `dst * cov` — takes the selected pixels into the floating copy.
     transform_keep_pipeline: wgpu::RenderPipeline,
@@ -1613,6 +2097,10 @@ pub struct CanvasRenderer {
     /// holding them is cheaper than the allocation churn of a per-job pair.
     thumb_target: Option<wgpu::Texture>,
     thumb_buffer: Option<wgpu::Buffer>,
+    /// Which slice each of this document's effects is baked into, and the
+    /// canvas-sized working set they are baked through. Empty and allocating
+    /// nothing until a document has an effect.
+    effects: EffectCache,
 }
 
 impl Shared {
@@ -2014,6 +2502,93 @@ impl Shared {
             cache: None,
         });
 
+        // ---- effect bake ----------------------------------------------------
+        //
+        // No sampler, for the reason the flip and thumbnail passes have none:
+        // `effect.wgsl` reads with `textureLoad` throughout and does the one
+        // bilinear it needs by hand. That also keeps the uint seed texture beside
+        // the float ones out of any argument about filtering support, since a
+        // `Uint` sample type is never filterable.
+        let effect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("effect"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/effect.wgsl").into()),
+        });
+        let effect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("effect-bgl"),
+            entries: &[
+                // Dynamic, one block per pass: see `EffectUniforms`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture_array_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let effect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("effect-pl"),
+            bind_group_layouts: &[Some(&effect_layout)],
+            immediate_size: 0,
+        });
+        // Seven pipelines from one loop over one descriptor, for the reason the
+        // four dab pipelines are: they differ in an entry point and a target
+        // format, and seven copies of a descriptor is seven places for the rest
+        // of it to drift.
+        let effect_pipeline = |label: &str, entry: &str, format: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&effect_pl),
+                vertex: wgpu::VertexState {
+                    module: &effect_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &effect_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        // Every pass writes every texel of its own viewport, so
+                        // there is nothing to blend with and a blend state would
+                        // only be a dependency the driver has to honour.
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let effect_extract = effect_pipeline("effect-extract", "fs_extract", STROKE_FORMAT);
+        let effect_seed = effect_pipeline("effect-seed", "fs_seed", SEED_FORMAT);
+        let effect_step = effect_pipeline("effect-step", "fs_step", SEED_FORMAT);
+        let effect_grow = effect_pipeline("effect-grow", "fs_grow", STROKE_FORMAT);
+        let effect_down = effect_pipeline("effect-down", "fs_down", STROKE_FORMAT);
+        let effect_box = effect_pipeline("effect-box", "fs_box", STROKE_FORMAT);
+        let effect_resolve = effect_pipeline("effect-resolve", "fs_resolve", LAYER_FORMAT);
+
         // ---- transform pass -------------------------------------------------
         let transform_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("transform"),
@@ -2112,6 +2687,14 @@ impl Shared {
             transform_layout,
             thumb_layout,
             thumb_pipeline,
+            effect_layout,
+            effect_extract,
+            effect_seed,
+            effect_step,
+            effect_grow,
+            effect_down,
+            effect_box,
+            effect_resolve,
             transform_keep_pipeline,
             transform_take_pipeline,
             transform_draw_pipeline,
@@ -2287,6 +2870,10 @@ impl CanvasRenderer {
             thumb: None,
             thumb_target: None,
             thumb_buffer: None,
+            // Nothing is allocated until a document actually has an effect: a
+            // canvas-sized working set is 400 MB at 10000², and the great
+            // majority of documents never ask for one.
+            effects: EffectCache::default(),
         }
     }
 
@@ -2464,6 +3051,14 @@ impl CanvasRenderer {
         // existing, and the one in flight would come home describing the old
         // geometry through the new document's arithmetic.
         self.touch_all_slots();
+        // And every effect slice holds a picture of that canvas. Dropped rather
+        // than resampled, for the reason `docs/layer-effects.md` §9.4 gives: the
+        // pixels are derived, so rebuilding them is exact by definition where a
+        // resample would be a promise about filtering. `touch_all_slots` above
+        // has already made every entry stale; this also gives back the working
+        // set, whose textures are the old canvas's size — and the bind groups
+        // with it, which name a layer array this method is about to replace.
+        self.effects.forget_all();
         let plan = CanvasCopy::plan(self.doc_size, new_size, anchor);
         log::info!(
             "resizing canvas {} x {} -> {} x {}, {anchor:?}",
@@ -3941,6 +4536,7 @@ impl CanvasRenderer {
         let (preview_slot, last) = (float.preview_slot, float.last_dest);
         if let Some(restore) = span(last, params.dest) {
             self.render_float(queue, encoder, preview_slot, restore, params);
+            self.touch_slot(preview_slot);
         }
         if let Some(float) = self.float.as_mut() {
             float.last_dest = params.dest;
@@ -4906,6 +5502,671 @@ impl CanvasRenderer {
         if let Some(job) = self.thumb.as_mut() {
             job.abandoned = true;
         }
+    }
+
+    // --- layer effects ------------------------------------------------------
+
+    /// How many effects the last [`Self::bake_effects`] could not draw.
+    ///
+    /// Non-zero means the document holds more enabled effects than there are
+    /// slices to read them out of, and **the panel is meant to say so.** A
+    /// control that lights up and does nothing is what this project refuses
+    /// everywhere; the honest shape is that the effect stays enabled and the
+    /// document is said to be over its budget. See `docs/layer-effects.md` §6.1a
+    /// for why this cannot be a refusal instead: `restore_shape` puts a deleted
+    /// layer back with the effects it had, and an undo that declines to undo is
+    /// worse than a picture missing a shadow.
+    pub fn effects_dropped(&self) -> usize {
+        self.effects.dropped
+    }
+
+    /// How many effect bakes this renderer has run. Observation only.
+    ///
+    /// The only way a test can say "that frame rebaked nothing", which is the
+    /// whole of the cache's contract and is otherwise invisible: a stale bake and
+    /// a fresh one of the same parameters produce the same pixels.
+    pub fn effect_bakes(&self) -> u64 {
+        self.effects.bakes
+    }
+
+    /// Whether a bake may run every frame on a canvas this size.
+    ///
+    /// See [`EFFECT_LIVE_PIXELS`]. Public because the *caller* is what knows a
+    /// stroke is in flight, and because a panel that wanted to explain the lag
+    /// would need to be able to ask.
+    pub fn effects_bake_live(&self) -> bool {
+        u64::from(self.doc_size.x) * u64::from(self.doc_size.y) <= EFFECT_LIVE_PIXELS
+    }
+
+    /// Bake every stale effect and return the draw list the composite takes.
+    ///
+    /// `base` is the lowest slice number effects may use, and the caller owes it
+    /// `LayerStack::slot_capacity_needed() + 1`. Both halves matter. It is one
+    /// past everything the model has *claimed*, which includes a slice parked in
+    /// an undo entry — `SlotPool` compacts only its tail, so `next` is above
+    /// every parked slice as well as every live one, and an effect written below
+    /// it would be an effect written over a deleted layer's pixels, found months
+    /// later by an undo. The `+ 1` is the slice a floating transform previews
+    /// into, taken at exactly `slot_capacity_needed()`.
+    ///
+    /// A `base` that would collide with something in `stack` is refused whole and
+    /// logged: no effect is drawn and the plain draw list comes back. That is a
+    /// caller error rather than a state, and drawing an effect over a layer is
+    /// the one outcome nothing here may risk.
+    ///
+    /// # What it does not do
+    ///
+    /// It does not touch [`Self::slot_revision`]. An effect slice's pixels are
+    /// derived, are never read back and are never captured into the undo history,
+    /// so nothing invalidates against them — which is the same fact that lets an
+    /// effect slice be freed rather than parked (§4.2).
+    pub fn bake_effects(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        base: u32,
+        stack: &[LayerEffects<'_>],
+        frame: EffectFrame,
+    ) -> BakedStack {
+        // The draw list with no effects in it, and **the count of what that
+        // cost**. The count is a parameter rather than zero: every route to this
+        // list except the first is a refusal, and a refusal that reported nothing
+        // dropped would be the silent degradation §6.1a forbids — a panel reading
+        // the figure would say the document was within its budget while showing
+        // none of it.
+        let plain = |dropped: usize| BakedStack {
+            draws: stack.iter().map(|e| e.draw).collect(),
+            dropped,
+            active_index: frame.active_index,
+        };
+
+        // Every effect the document would draw, bottom to top, as
+        // (stack position, effect).
+        //
+        // **At most one per kind per layer, enforced here as well as upstream.**
+        // `LayerStack::set_effect` guarantees it and `duplicate_effect_kind` is
+        // what the reader asks, but this is a public function taking a bare
+        // `&[Effect]`, and the failure a second one produces is not obvious: the
+        // cache is keyed on `(slot, mask, kind)`, so both draws would read the
+        // *second* effect's pixels while `record` kept one stamp — two entries in
+        // the draw list showing one effect, rebaking every frame for ever. Cheaper
+        // to drop the later one and say so than to make a caller's slip into that.
+        let mut wanted: Vec<(usize, Effect)> = Vec::new();
+        for (i, entry) in stack.iter().enumerate() {
+            for effect in entry.effects.iter().filter(|e| !effect_marks_nothing(e)) {
+                if wanted
+                    .iter()
+                    .any(|(at, e)| *at == i && e.kind == effect.kind)
+                {
+                    log::warn!("layer {i} carries two {:?} effects", effect.kind);
+                    continue;
+                }
+                wanted.push((i, *effect));
+            }
+        }
+        if wanted.is_empty() {
+            // A document with no effects produces exactly the draw list it
+            // produced before this feature existed, entry for entry — the
+            // regression that matters most. Nothing is allocated and the scratch
+            // is given back.
+            self.effects.forget_all();
+            return plain(0);
+        }
+
+        // A `base` below anything the stack itself uses is a caller that has read
+        // the wrong number off the model. Refuse rather than overwrite: this is
+        // the only failure here that damages a picture.
+        let highest = stack
+            .iter()
+            .flat_map(|e| [Some(e.draw.slot), e.draw.mask].into_iter().flatten())
+            .max()
+            .unwrap_or(0);
+        if base <= highest {
+            log::error!("effect slices would start at {base}, over slot {highest} in use");
+            self.effects.forget_all();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
+        }
+
+        // A slice count, and it is not the same bound as the byte budget: `127`
+        // effect slices at 10000² would be 50 GB, which is stage 3's problem.
+        // What this stops is the one that is fatal — a slice past the depth the
+        // device guarantees. `MAX_SLOTS - base` can be **zero**: `SlotPool` hands
+        // out up to slot 255, so `slot_capacity_needed` can reach 256 and `base`
+        // 257, which enough delete-then-add cycles reach through parked slices.
+        let capacity = MAX_EFFECT_SLICES.min(MAX_SLOTS.saturating_sub(base as usize));
+        if capacity == 0 {
+            // Nothing can be drawn, and it has to be said rather than fallen
+            // through: below, `slots` would be empty and `top` would fall back to
+            // `base` — 257, which is over the ceiling `ensure_slots` debug-asserts
+            // and, in a release build, a fresh 256-slice array allocated and
+            // copied every frame.
+            log::warn!("no slices left for effects: they start at {base} of {MAX_SLOTS}");
+            self.effects.forget_all();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
+        }
+
+        // Over budget: keep the effects **highest** in the stack, so the layer
+        // somebody is working on keeps its own. Stated rather than truncated —
+        // `dropped` is what the panel reports.
+        //
+        // **Two budgets, and the tighter of the two decides.** Slices are the one
+        // §6.3 derives from the device; passes are this crate's own uniform
+        // buffer, and at `MAX_ENABLED` effects the second bites first on a large
+        // canvas. Routing both through one figure is what stops the pass budget
+        // being a *silent* refusal — which it was, when overrunning it abandoned
+        // the whole bake and left `dropped` reporting zero.
+        let affordable = capacity.min(EFFECT_PASS_BLOCKS as usize / EFFECT_MAX_PASSES_PER_EFFECT);
+        let dropped = wanted.len().saturating_sub(affordable);
+        let kept = &wanted[dropped..];
+        self.effects.dropped = dropped;
+        if dropped > 0 {
+            log::warn!(
+                "document is over its effect budget: {dropped} of {} effects are not drawn",
+                wanted.len()
+            );
+        }
+
+        if self.effects.base != base {
+            self.effects.forget_entries();
+            self.effects.base = base;
+        }
+
+        // Which cache entry each kept effect is, allocating for the ones that are
+        // new and releasing the ones nothing wants any more. A key is the *slot
+        // the draw carries* and not the layer — §5.2 — so a float's preview slice
+        // falls out of the cache rather than needing a rule.
+        let keys: Vec<(u32, Option<u32>, EffectKind)> = kept
+            .iter()
+            .map(|(i, e)| (stack[*i].draw.slot, stack[*i].draw.mask, e.kind))
+            .collect();
+        self.effects.retain_only(&keys);
+        let mut slots = Vec::with_capacity(kept.len());
+        for key in &keys {
+            match self.effects.slot_for(*key, capacity) {
+                Some(slot) => slots.push(slot),
+                None => {
+                    // Unreachable: `capacity` bounds `kept` above. Named rather
+                    // than unwrapped because the failure is a draw pointing at a
+                    // slice nobody wrote.
+                    log::error!("no effect slice for {key:?}");
+                    self.effects.forget_all();
+                    self.effects.dropped = wanted.len();
+                    return plain(wanted.len());
+                }
+            }
+        }
+
+        // The array has to be deep enough for the highest slice a draw names
+        // before any of them is written or read — **and no deeper**. Falling back
+        // to `base` where nothing was assigned would pre-allocate the float's
+        // spare slice for a document that has no float, and at `base == 257` it
+        // asks for a slice past the ceiling: a `debug_assert` on the drawing path,
+        // or in a release build a 256-slice array allocated and copied every
+        // frame. `capacity == 0` is refused above, so this is belt and braces
+        // rather than the only guard.
+        if let Some(highest) = slots.iter().copied().max() {
+            self.ensure_slots(device, queue, highest + 1);
+        }
+
+        // Plan the whole bake before recording any of it: every pass reads its
+        // numbers out of one uniform buffer at submit time, so the blocks have to
+        // be written before the first pass rather than as each is worked out.
+        let live = frame.stroke_live && self.effects_bake_live();
+        let mut steps: Vec<EffectStep> = Vec::new();
+        let mut previous_source: Option<u32> = None;
+        for ((position, effect), slot) in kept.iter().zip(&slots) {
+            let entry = &stack[*position];
+            let stroke_here = frame.stroke_live && frame.active_index as usize == *position;
+            let stamp = CachedEffect {
+                source: entry.draw.slot,
+                mask: entry.draw.mask,
+                kind: effect.kind,
+                slot: *slot,
+                source_revision: self.slot_revision(entry.draw.slot),
+                mask_revision: entry.draw.mask.map_or(0, |m| self.slot_revision(m)),
+                params: effect_params_hash(effect),
+                live: stroke_here && live,
+            };
+            if self.effects.is_fresh(&stamp) {
+                continue;
+            }
+            // The coverage is per *layer*, so it is extracted once for a layer
+            // carrying several effects — which is also why `kept` is walked in
+            // stack order rather than grouped.
+            if previous_source != Some(entry.draw.slot) {
+                steps.push(self.extract_step(entry, &frame, stroke_here && live));
+                previous_source = Some(entry.draw.slot);
+            }
+            self.plan_effect(&mut steps, effect, *slot);
+            self.effects.record(stamp);
+        }
+        if steps.is_empty() {
+            return self.baked(stack, kept, &slots, frame);
+        }
+
+        if let Err(what) = self.run_effect_steps(device, queue, encoder, &steps) {
+            // **The plain list, not the spliced one.** A bake that stopped part
+            // way has left some of its slices unwritten, and a draw pointing at
+            // one of those is whatever the driver left there — which is worse
+            // than a picture with no shadow in it, and is exactly the failure
+            // the over-budget rule refuses to produce silently. Every entry goes
+            // with it, so the next frame rebakes from nothing rather than
+            // trusting a stamp recorded for a pass that did not run.
+            log::error!("effect bake abandoned: {what}");
+            self.effects.forget_all();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
+        }
+        self.baked(stack, kept, &slots, frame)
+    }
+
+    /// The draw list, with each kept effect spliced in beside its layer.
+    ///
+    /// `docs/layer-effects.md` §4's order, and it falls out of two facts rather
+    /// than being restated here: `Layer::effects` is held in composite order, and
+    /// `Effect::is_outer` says which side of the layer each falls on.
+    fn baked(
+        &self,
+        stack: &[LayerEffects<'_>],
+        kept: &[(usize, Effect)],
+        slots: &[u32],
+        frame: EffectFrame,
+    ) -> BakedStack {
+        let mut draws = Vec::with_capacity(stack.len() + kept.len());
+        let mut active_index = frame.active_index;
+        let mut cursor = 0;
+        for (position, entry) in stack.iter().enumerate() {
+            let mine = |outer: bool| {
+                kept.iter()
+                    .zip(slots)
+                    .filter(move |((p, e), _)| *p == position && e.is_outer() == outer)
+            };
+            for ((_, effect), slot) in mine(true) {
+                draws.push(effect_draw(effect, *slot, entry));
+                cursor += 1;
+            }
+            if frame.active_index as usize == position {
+                active_index = cursor;
+            }
+            draws.push(entry.draw);
+            cursor += 1;
+            for ((_, effect), slot) in mine(false) {
+                draws.push(effect_draw(effect, *slot, entry));
+                cursor += 1;
+            }
+        }
+        BakedStack {
+            draws,
+            dropped: self.effects.dropped,
+            active_index,
+        }
+    }
+
+    /// The pass that turns a layer slice into the coverage every effect on it
+    /// derives from.
+    fn extract_step(
+        &self,
+        entry: &LayerEffects<'_>,
+        frame: &EffectFrame,
+        stroke_here: bool,
+    ) -> EffectStep {
+        let size = self.doc_size;
+        EffectStep {
+            pass: EffectPass::Extract,
+            target: EffectTarget::Coverage,
+            bind: EffectBind::Extract as usize,
+            viewport: size,
+            cfg: EffectUniforms {
+                size: [size.x as f32, size.y as f32],
+                src_size: [size.x as f32, size.y as f32],
+                slot: entry.draw.slot as i32,
+                mask_slot: entry.draw.mask.unwrap_or(entry.draw.slot) as i32,
+                has_mask: u32::from(entry.draw.mask.is_some()),
+                stroke_here: u32::from(stroke_here),
+                stroke_mode: match frame.stroke.mode {
+                    BrushMode::Paint => 0,
+                    BrushMode::Erase => 1,
+                },
+                stroke_opacity: frame.stroke.opacity.clamp(0.0, 1.0),
+                stroke_on_mask: u32::from(frame.stroke.on_mask),
+                stroke_gray: frame.stroke.color.r,
+                ..EffectUniforms::default()
+            },
+        }
+    }
+
+    /// The grow, the soften, the displacement and the confinement, for one
+    /// effect whose coverage is already in the scratch.
+    fn plan_effect(&self, steps: &mut Vec<EffectStep>, effect: &Effect, slot: u32) {
+        let size = self.doc_size;
+        let full = [size.x as f32, size.y as f32];
+        let inner = u32::from(effect.is_inner());
+        // An inside outline is a band of the **inward** distance, which is the
+        // outward distance of the complement — so the same flood with its seed
+        // test inverted, and no second field and no signed one. A centred outline
+        // is deliberately the *outer* half of its width: the inner half sits
+        // under the layer and §3.3's knockout removes it whatever the layer's
+        // opacity, so drawing it would be a pass that produces nothing.
+        let (reach, invert) = match (effect.kind, effect.position) {
+            (EffectKind::Outline, OutlinePosition::Inside) => (effect.spread, 1),
+            (EffectKind::Outline, OutlinePosition::Centre) => (effect.spread * 0.5, 0),
+            _ => (effect.spread, 0),
+        };
+        let base = EffectUniforms {
+            size: full,
+            src_size: full,
+            spread: reach,
+            inner,
+            invert,
+            ..EffectUniforms::default()
+        };
+
+        // The distance field, and only where something needs one. A drop shadow
+        // with no spread is a blur of the coverage and nothing else, which is the
+        // setting every application opens one at — so the flood, which is the
+        // expensive half of this whole feature, is skipped for the common case.
+        let grow = reach > 0.0;
+        if grow {
+            steps.push(EffectStep {
+                pass: EffectPass::Seed,
+                target: EffectTarget::Seed(0),
+                bind: EffectBind::Coverage as usize,
+                viewport: size,
+                cfg: base,
+            });
+            // `ceil(log2(reach)) + 1` halving steps, largest first. One more than
+            // the log because the last step at k = 1 is what settles a
+            // neighbouring texel, and the flood is only exact once it has run.
+            //
+            // **Bounded by the canvas, and that is not tidiness.** A spread wider
+            // than the longest side reaches every texel already, so more steps
+            // buy nothing — and unbounded this is a shift by `32 - leading_zeros`
+            // of a saturating `as u32`, which at a spread near four billion is a
+            // shift of 32 and therefore a panic on the drawing path. `spread` is
+            // an `f32` a file carries, so "nobody would type that" is not a
+            // bound. `max(1.0)` before the `min` also disposes of a NaN, since
+            // `f32::max` answers the operand that is not one.
+            let longest = size.x.max(size.y) as f32;
+            let span = reach.ceil().max(1.0).min(longest) as u32;
+            let mut from = 0usize;
+            let mut k = 1i32 << (32 - span.leading_zeros());
+            while k >= 1 {
+                steps.push(EffectStep {
+                    pass: EffectPass::Flood,
+                    target: EffectTarget::Seed(1 - from),
+                    bind: if from == 0 {
+                        EffectBind::Flood0 as usize
+                    } else {
+                        EffectBind::Flood1 as usize
+                    },
+                    viewport: size,
+                    cfg: EffectUniforms { k, ..base },
+                });
+                from = 1 - from;
+                k /= 2;
+            }
+            steps.push(EffectStep {
+                pass: EffectPass::Grow,
+                target: EffectTarget::Grown,
+                bind: if from == 0 {
+                    EffectBind::Grow0 as usize
+                } else {
+                    EffectBind::Grow1 as usize
+                },
+                viewport: size,
+                cfg: EffectUniforms { grow: 1, ..base },
+            });
+        }
+        // With nothing to grow, the shape **is** the coverage and no grow pass is
+        // recorded: `fs_grow` with `grow == 0` hands the coverage straight back, so
+        // the pass was a full-screen copy of a texture already in hand. That is the
+        // common case — a drop shadow's default spread is zero, and its
+        // displacement is what makes it a shadow. The bind groups below are what
+        // pay for it, and they are what a placeholder cannot be: the shape's source
+        // is a *binding*, so choosing it is choosing a bind group.
+        let shape = if grow {
+            (
+                EffectBind::SrcGrown as usize,
+                EffectBind::ResolveGrown as usize,
+            )
+        } else {
+            (
+                EffectBind::SrcCoverage as usize,
+                EffectBind::ResolveCoverage as usize,
+            )
+        };
+
+        // The tent: two box passes per axis, on a downsample where the radius is
+        // wide enough for one to represent it. A radius of zero records no pass
+        // at all, which is the exact identity the feather and the grain both
+        // keep — the shape itself is what the resolve then reads.
+        let (down, radius) = tent_for(effect.softness);
+        let mut blurred = None;
+        if radius > 0 {
+            let small = UVec2::new(size.x.div_ceil(down), size.y.div_ceil(down));
+            let small_f = [small.x as f32, small.y as f32];
+            let mut from = 0usize;
+            if down > 1 {
+                steps.push(EffectStep {
+                    pass: EffectPass::Down,
+                    target: EffectTarget::Blur(0),
+                    bind: shape.0,
+                    viewport: small,
+                    cfg: EffectUniforms {
+                        size: small_f,
+                        src_size: full,
+                        down: down as i32,
+                        ..base
+                    },
+                });
+                from = 0;
+            }
+            // Four box passes, two per axis: a tent is the box convolved with
+            // itself and convolution is per axis. The first reads the shape when
+            // there was no downsample, which is what makes the two resolutions one
+            // code path rather than two.
+            for (i, axis) in [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+                .into_iter()
+                .enumerate()
+            {
+                let first = i == 0 && down == 1;
+                let bind = if first {
+                    shape.0
+                } else if from == 0 {
+                    EffectBind::SrcBlur0 as usize
+                } else {
+                    EffectBind::SrcBlur1 as usize
+                };
+                let to = if first { 0 } else { 1 - from };
+                steps.push(EffectStep {
+                    pass: EffectPass::Box,
+                    target: EffectTarget::Blur(to),
+                    bind,
+                    viewport: small,
+                    cfg: EffectUniforms {
+                        size: small_f,
+                        src_size: small_f,
+                        radius,
+                        step: axis,
+                        ..base
+                    },
+                });
+                from = to;
+            }
+            blurred = Some((from, small_f));
+        }
+
+        let (bind, src_size, read_down) = match blurred {
+            Some((i, small)) => (
+                if i == 0 {
+                    EffectBind::ResolveBlur0 as usize
+                } else {
+                    EffectBind::ResolveBlur1 as usize
+                },
+                small,
+                down as i32,
+            ),
+            None => (shape.1, full, 1),
+        };
+        let (dx, dy) = effect.offset();
+        let c = effect.color;
+        steps.push(EffectStep {
+            pass: EffectPass::Resolve,
+            target: EffectTarget::Slice(slot),
+            bind,
+            viewport: size,
+            cfg: EffectUniforms {
+                // Premultiplied, with alpha 1: the coverage the shader works out
+                // scales all four channels together. The colour is **linear**,
+                // and the target is an sRGB view, so the hardware encodes it
+                // exactly as it encodes a layer's own pixels.
+                tint: [c.r, c.g, c.b, 1.0],
+                size: full,
+                src_size,
+                offset: [dx, dy],
+                down: read_down,
+                inner,
+                ..EffectUniforms::default()
+            },
+        });
+    }
+
+    /// Write every planned pass's uniform block, then record every pass.
+    fn run_effect_steps(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        steps: &[EffectStep],
+    ) -> Result<(), String> {
+        // Unreachable: `bake_effects` bounds the number of effects it plans by
+        // this buffer's capacity, and drops the rest through the *visible* path.
+        // Kept because what it prevents is a dynamic offset past the end of a
+        // buffer, which is a validation error and therefore fatal — and because
+        // this used to be the only bound, which made an overrun a silent refusal
+        // of the whole bake with `dropped` reporting zero.
+        if steps.len() as u64 > EFFECT_PASS_BLOCKS {
+            return Err(format!(
+                "{} passes against {EFFECT_PASS_BLOCKS} uniform blocks",
+                steps.len()
+            ));
+        }
+        let needs_seeds = steps
+            .iter()
+            .any(|s| matches!(s.pass, EffectPass::Seed | EffectPass::Flood));
+        self.ensure_effect_scratch(device, needs_seeds);
+        let Some(scratch) = self.effects.scratch.as_ref() else {
+            return Err("no working set".into());
+        };
+        if needs_seeds && scratch.seeds.is_none() {
+            return Err("no seed pair".into());
+        }
+
+        for (i, step) in steps.iter().enumerate() {
+            queue.write_buffer(
+                &scratch.uniforms,
+                i as u64 * EFFECT_BLOCK_STRIDE,
+                bytemuck::bytes_of(&step.cfg),
+            );
+        }
+
+        for (i, step) in steps.iter().enumerate() {
+            let target = match step.target {
+                EffectTarget::Coverage => &scratch.coverage,
+                EffectTarget::Grown => &scratch.grown,
+                EffectTarget::Blur(n) => &scratch.blur[n],
+                EffectTarget::Seed(n) => match scratch.seeds.as_ref() {
+                    Some(pair) => &pair[n],
+                    None => return Err("a flood with no seed pair".into()),
+                },
+                EffectTarget::Slice(slot) => match self.layers.slot_views.get(slot as usize) {
+                    Some(view) => view,
+                    None => return Err(format!("effect slice {slot} beyond capacity")),
+                },
+            };
+            let pipeline = match step.pass {
+                EffectPass::Extract => &self.shared.effect_extract,
+                EffectPass::Seed => &self.shared.effect_seed,
+                EffectPass::Flood => &self.shared.effect_step,
+                EffectPass::Grow => &self.shared.effect_grow,
+                EffectPass::Down => &self.shared.effect_down,
+                EffectPass::Box => &self.shared.effect_box,
+                EffectPass::Resolve => &self.shared.effect_resolve,
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effect-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    // Every texel of the viewport is written, so loading whatever
+                    // was there would only be a dependency the driver has to
+                    // honour. On the blur pair the viewport is smaller than the
+                    // attachment and the rest is cleared, which costs nothing and
+                    // keeps a stale radius from being read back through a clamp.
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(
+                0.0,
+                0.0,
+                step.viewport.x as f32,
+                step.viewport.y as f32,
+                0.0,
+                1.0,
+            );
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(
+                0,
+                &scratch.binds[step.bind],
+                &[(i as u64 * EFFECT_BLOCK_STRIDE) as u32],
+            );
+            pass.draw(0..3, 0..1);
+        }
+        self.effects.bakes += 1;
+        Ok(())
+    }
+
+    /// Build the canvas-sized working set if it is missing or the wrong shape.
+    fn ensure_effect_scratch(&mut self, device: &wgpu::Device, seeds: bool) {
+        let stale = match self.effects.scratch.as_ref() {
+            None => true,
+            Some(s) => {
+                s.size != self.doc_size
+                    || s.bound_capacity != self.layers.capacity
+                    || (seeds && s.seeds.is_none())
+            }
+        };
+        if !stale {
+            return;
+        }
+        // Keeping the seed pair once it has been allocated: an effect whose
+        // spread is being dragged crosses zero repeatedly, and reallocating
+        // 800 MB at 10000² on the way past would be worse than holding it.
+        let keep_seeds = seeds
+            || self
+                .effects
+                .scratch
+                .as_ref()
+                .is_some_and(|s| s.seeds.is_some());
+        self.effects.scratch = Some(EffectScratch::new(
+            device,
+            &self.shared,
+            self.doc_size,
+            &self.layers,
+            &self.stroke_view,
+            keep_seeds,
+        ));
     }
 
     // --- the whole-document capture ----------------------------------------
@@ -5887,6 +7148,416 @@ fn make_commit_bind_group(
     })
 }
 
+impl EffectCache {
+    /// Give up every slice and the working set with them.
+    ///
+    /// What a document with no effects does, and it is the whole of §4.2 in one
+    /// method: an effect slice goes straight back on the free list, with no
+    /// parking and no undo-budget arithmetic, because no `PixelPatch` can ever
+    /// name one. The working set goes too — 400 MB at 10000² is not something to
+    /// hold in case somebody switches a shadow back on.
+    fn forget_all(&mut self) {
+        self.forget_entries();
+        self.scratch = None;
+        self.dropped = 0;
+    }
+
+    /// Give up every slice but keep the working set, for a bake that is about to
+    /// re-run from a different `base`.
+    fn forget_entries(&mut self) {
+        self.entries.clear();
+        self.free.clear();
+        self.next = 0;
+    }
+
+    /// Release every entry whose key nothing wants any more.
+    fn retain_only(&mut self, keys: &[(u32, Option<u32>, EffectKind)]) {
+        let base = self.base;
+        let free = &mut self.free;
+        self.entries.retain(|e| {
+            if keys.contains(&(e.source, e.mask, e.kind)) {
+                return true;
+            }
+            free.push(e.slot - base);
+            false
+        });
+        self.free.sort_unstable();
+    }
+
+    /// The slice this key holds, allocating one if it does not hold any.
+    fn slot_for(&mut self, key: (u32, Option<u32>, EffectKind), capacity: usize) -> Option<u32> {
+        if let Some(e) = self
+            .entries
+            .iter()
+            .find(|e| (e.source, e.mask, e.kind) == key)
+        {
+            return Some(e.slot);
+        }
+        let offset = match self.free.pop() {
+            Some(o) => o,
+            None if (self.next as usize) < capacity => {
+                self.next += 1;
+                self.next - 1
+            }
+            None => return None,
+        };
+        let slot = self.base + offset;
+        self.entries.push(CachedEffect {
+            source: key.0,
+            mask: key.1,
+            kind: key.2,
+            slot,
+            // Never baked. `slot_revision` counts from zero and only rises, so
+            // this can never be mistaken for a real reading.
+            source_revision: u64::MAX,
+            mask_revision: u64::MAX,
+            params: u64::MAX,
+            live: false,
+        });
+        Some(slot)
+    }
+
+    /// Is the slice this stamp names already the picture the stamp describes?
+    ///
+    /// Everything the *pixels* depend on and nothing else: the two slice
+    /// revisions, the parameter hash, and whether a live stroke was folded in.
+    /// A stroke in flight makes the stamp differ every frame through the
+    /// revisions only after it commits, so the `live` flag is what carries the
+    /// frames in between — and, more importantly, what makes the *end* of a
+    /// cancelled stroke stale, since a cancel writes no pixels at all.
+    fn is_fresh(&self, stamp: &CachedEffect) -> bool {
+        self.entries.iter().any(|e| {
+            (e.source, e.mask, e.kind) == (stamp.source, stamp.mask, stamp.kind)
+                && e.slot == stamp.slot
+                && e.source_revision == stamp.source_revision
+                && e.mask_revision == stamp.mask_revision
+                && e.params == stamp.params
+                && e.live == stamp.live
+                // A live stroke is never fresh: the scratch has moved under it
+                // and nothing counts how far. That is what makes the shadow
+                // follow the brush.
+                && !e.live
+        })
+    }
+
+    fn record(&mut self, stamp: CachedEffect) {
+        let key = (stamp.source, stamp.mask, stamp.kind);
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| (e.source, e.mask, e.kind) == key)
+        {
+            *e = stamp;
+        }
+    }
+}
+
+impl EffectScratch {
+    fn new(
+        device: &wgpu::Device,
+        shared: &Shared,
+        size: UVec2,
+        layers: &LayerStore,
+        stroke_view: &wgpu::TextureView,
+        seeds: bool,
+    ) -> Self {
+        let mut textures = Vec::new();
+        let mut plane = |label: &str| {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.x,
+                    height: size.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                // `R8Unorm`: one channel, because coverage is all any of these
+                // hold, and **no transfer function**, which is what §3.2 requires
+                // of a separable blur's intermediate. It is also exactly as wide
+                // as the alpha channel the effect ends up in, so it adds no loss
+                // of its own — the same argument the stroke scratch makes.
+                format: STROKE_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.push(t);
+            view
+        };
+        let coverage = plane("umber-effect-coverage");
+        let grown = plane("umber-effect-grown");
+        let blur = [plane("umber-effect-blur-0"), plane("umber-effect-blur-1")];
+        // Bound wherever a pass does not read a coverage field, so that a
+        // texture this pass is *writing* is never also named by its bind group.
+        // A texture rather than nothing, because the layout is one layout for all
+        // seven passes and every binding in it has to be filled.
+        let blank = {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("umber-effect-blank"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: STROKE_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.push(t);
+            view
+        };
+        // And the same for the layer array, which the *resolve* writes a slice
+        // of — so every pass but the extract binds this instead.
+        let blank_array = {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("umber-effect-blank-array"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: LAYER_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("umber-effect-blank-array"),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            textures.push(t);
+            view
+        };
+
+        let mut seed_plane = |label: &str, w: u32, h: u32| {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: SEED_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.push(t);
+            view
+        };
+        // A 1x1 stand-in bound wherever a pass does not read the seeds. Needed
+        // rather than tidy: `fs_grow` names that binding even on the path that
+        // returns before reading it, so the layout demands one — the same reason
+        // the tip and the paper have placeholders.
+        let seed_placeholder = seed_plane("umber-effect-seed-none", 1, 1);
+        let seeds = seeds.then(|| {
+            [
+                seed_plane("umber-effect-seed-0", size.x, size.y),
+                seed_plane("umber-effect-seed-1", size.x, size.y),
+            ]
+        });
+
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effect-uniforms"),
+            size: EFFECT_PASS_BLOCKS * EFFECT_BLOCK_STRIDE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // One bind group per (src, seeds) pairing a pass can want, built here and
+        // reused by every effect for the document's life. The views they name are
+        // fixed; only the uniform block varies per pass, and that is a dynamic
+        // offset.
+        let bind = |label: &str,
+                    array: &wgpu::TextureView,
+                    src: &wgpu::TextureView,
+                    cov: &wgpu::TextureView,
+                    seed: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &shared.effect_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &uniforms,
+                            offset: 0,
+                            size: Some(
+                                std::num::NonZeroU64::new(
+                                    std::mem::size_of::<EffectUniforms>() as u64
+                                )
+                                .expect("the uniform block is not empty"),
+                            ),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(array),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(cov),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(seed),
+                    },
+                ],
+            })
+        };
+        let none = &seed_placeholder;
+        let seed0 = seeds.as_ref().map_or(none, |s| &s[0]);
+        let seed1 = seeds.as_ref().map_or(none, |s| &s[1]);
+        let a = &blank_array;
+        let b = &blank;
+        // In [`EffectBind`]'s order, and the order is the enum's discriminants —
+        // `debug_assert` below is the only thing holding the two together, which
+        // is why they are written adjacently.
+        let mut binds = Vec::with_capacity(EFFECT_BIND_COUNT);
+        binds.push(bind(
+            "effect-extract",
+            &layers.array_view,
+            stroke_view,
+            b,
+            none,
+        ));
+        binds.push(bind("effect-coverage", a, b, &coverage, none));
+        binds.push(bind("effect-grow-0", a, b, &coverage, seed0));
+        binds.push(bind("effect-grow-1", a, b, &coverage, seed1));
+        binds.push(bind("effect-flood-0", a, b, b, seed0));
+        binds.push(bind("effect-flood-1", a, b, b, seed1));
+        binds.push(bind("effect-src-grown", a, &grown, b, none));
+        binds.push(bind("effect-src-blur-0", a, &blur[0], b, none));
+        binds.push(bind("effect-src-blur-1", a, &blur[1], b, none));
+        binds.push(bind("effect-resolve-grown", a, &grown, &coverage, none));
+        binds.push(bind("effect-resolve-blur-0", a, &blur[0], &coverage, none));
+        binds.push(bind("effect-resolve-blur-1", a, &blur[1], &coverage, none));
+        binds.push(bind("effect-src-coverage", a, &coverage, b, none));
+        binds.push(bind(
+            "effect-resolve-coverage",
+            a,
+            &coverage,
+            &coverage,
+            none,
+        ));
+        debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
+
+        Self {
+            size,
+            coverage,
+            grown,
+            blur,
+            seeds,
+            textures,
+            uniforms,
+            binds,
+            bound_capacity: layers.capacity,
+        }
+    }
+}
+
+/// One effect's draw entry.
+///
+/// Every field is a decision and three of them are worth naming:
+///
+/// * **The opacity is the effect's times the layer's.** §4 says an effect carries
+///   "its own opacity", and it does; multiplying the layer's in is the answer
+///   every application gives and the only one that is not absurd — a layer faded
+///   to nothing whose drop shadow stayed at full strength would be a shadow of a
+///   picture that is not there.
+/// * **No mask.** The coverage the effect was baked from was already multiplied
+///   by it, so applying it again at composite time would apply it twice — the
+///   same double application the lift's `min` and the clipboard's exist to
+///   refuse.
+/// * **`clipped` is the inner effect's whole confinement**, and for an outer one
+///   it is the layer's own flag so that a clipped layer's effects are clipped
+///   with it (§9.3). Note what that costs: an *inner* effect on a *clipped* layer
+///   is bounded by the clip group's base rather than by its own layer, because
+///   one flag cannot say both. §9.3 accepts it; it is the one place the
+///   asymmetry is not free.
+fn effect_draw(effect: &Effect, slot: u32, entry: &LayerEffects<'_>) -> LayerDraw {
+    LayerDraw {
+        slot,
+        opacity: (effect.opacity * entry.draw.opacity).clamp(0.0, 1.0),
+        blend: effect.blend.index(),
+        visible: entry.draw.visible,
+        mask: None,
+        clipped: effect.is_inner() || entry.draw.clipped,
+    }
+}
+
+/// The tent the blur will actually run, as `(downsample, box radius)`.
+///
+/// A radius of zero means **no blur pass at all**, which is the exact identity
+/// the selection's feather and the brush's grain both keep.
+///
+/// Two discrete box passes of `2r + 1` taps at a reduction of `d` have a
+/// continuous half support of `d(2r + 1)`, so the radius that draws a soft edge
+/// of `softness` document pixels is `(softness/d - 1)/2`. The reduction is
+/// [`EFFECT_DOWN`] once the radius is wide enough for that to round to something
+/// useful and 1 below it — see [`EFFECT_FULL_RES_SOFTNESS`], which is where the
+/// argument for having two lives.
+fn tent_for(softness: f32) -> (u32, i32) {
+    if softness <= 0.0 {
+        return (1, 0);
+    }
+    let down = if softness >= EFFECT_FULL_RES_SOFTNESS {
+        EFFECT_DOWN
+    } else {
+        1
+    };
+    let radius = ((softness / down as f32 - 1.0) / 2.0).round().max(1.0) as i32;
+    (down, radius)
+}
+
+/// Everything about an effect that the **pixels** depend on, as one number.
+///
+/// Deliberately not the whole struct: `opacity` and `blend` belong to the draw
+/// and are applied by `composite.wgsl`, so dragging either slider must cost no
+/// rebake. `enabled` is absent because a disabled effect has no entry at all.
+///
+/// `to_bits` rather than a comparison, because this is a cache key and two
+/// values that differ in the last bit really do produce different pixels — and
+/// because `f32` is not `Hash`. NaN hashes to itself, which is right: a
+/// parameter that has gone NaN should not read as unchanged.
+fn effect_params_hash(effect: &Effect) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    effect.kind.hash(&mut h);
+    effect.position.hash(&mut h);
+    for v in [
+        effect.spread,
+        effect.softness,
+        effect.angle,
+        effect.distance,
+        effect.color.r,
+        effect.color.g,
+        effect.color.b,
+        effect.color.a,
+    ] {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -6445,5 +8116,297 @@ mod tests {
         // would name rows past the bottom of the texture, which is a validation
         // error and therefore an abort.
         assert_eq!(band_rows(u64::MAX, 256, 7), 7);
+    }
+
+    /// **The jump flood's seed target is a render attachment on every device the
+    /// specification describes**, which is not something to take on trust.
+    ///
+    /// `guaranteed_format_features` is what the WebGPU spec requires of *any*
+    /// adapter, as against `Adapter::get_texture_format_features`, which is what
+    /// the one in front of you happens to offer. Asking the second would pass on
+    /// this machine and say nothing about anybody else's, and the failure it hides
+    /// is a `create_texture` validation error — fatal, because
+    /// `crash::device_error` makes every uncaptured error fatal. Same shape as
+    /// `the_slice_ceiling_agrees_with_umber_core`, and for the same reason.
+    ///
+    /// A test rather than a `const` assertion only because that method is not a
+    /// `const fn`.
+    #[test]
+    fn the_seed_format_is_a_render_target_on_every_device() {
+        let features = SEED_FORMAT.guaranteed_format_features(wgpu::Features::empty());
+        assert!(
+            features
+                .allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            "{SEED_FORMAT:?} is no longer a guaranteed render target: {:?}",
+            features.allowed_usages
+        );
+        // And the coverage fields, which are the other half of the bake's own
+        // allocations. `R8Unorm` is the stroke scratch's format too, so this is
+        // already relied on elsewhere — stated here because the bake is what would
+        // break next.
+        assert!(
+            STROKE_FORMAT
+                .guaranteed_format_features(wgpu::Features::empty())
+                .allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    /// **The pass budget covers every effect the model will let somebody
+    /// install**, and the figure it is measured against is the worst one
+    /// `plan_effect` can emit.
+    ///
+    /// Not a restatement of the constants: the count is derived here from the same
+    /// arithmetic the planner uses — the flood's step count is
+    /// `ceil(log2(span)) + 1` for a `span` the canvas bounds, plus the extract, the
+    /// seed, the grow, the downsample, four box passes and the resolve — over the
+    /// largest canvas `max_texture_dimension_2d` permits, which is the case the
+    /// buffer has to be sized for and is not the case anybody measures.
+    ///
+    /// It is worth having because the first draft of this budget was **five times
+    /// too small** and failed in the worst possible direction: overrunning it
+    /// abandoned the whole bake, so no effect drew at all, every frame, while
+    /// `effects_dropped` reported zero. A panel built on that figure would have
+    /// said the document was within its budget while showing none of it.
+    #[test]
+    fn the_pass_budget_covers_the_effects_the_model_permits() {
+        // The flood, at the widest span a canvas can force.
+        let longest = wgpu::Limits::downlevel_defaults().max_texture_dimension_2d;
+        let span = longest;
+        let mut floods = 0;
+        let mut k = 1i64 << (32 - span.leading_zeros());
+        while k >= 1 {
+            floods += 1;
+            k /= 2;
+        }
+        // extract + seed + floods + grow + down + four box + resolve.
+        let worst = 1 + 1 + floods + 1 + 1 + 4 + 1;
+        assert!(
+            worst <= EFFECT_MAX_PASSES_PER_EFFECT,
+            "one effect can ask for {worst} passes against a budget of \
+             {EFFECT_MAX_PASSES_PER_EFFECT}"
+        );
+        assert!(
+            EFFECT_PASS_BLOCKS >= (worst * umber_core::effect::MAX_ENABLED) as u64,
+            "{} blocks will not hold {} effects at {worst} passes each",
+            EFFECT_PASS_BLOCKS,
+            umber_core::effect::MAX_ENABLED
+        );
+        // And the buffer's own size, because a dynamic offset past the end of it is
+        // a validation error and therefore fatal.
+        let last = (EFFECT_PASS_BLOCKS - 1) * EFFECT_BLOCK_STRIDE;
+        assert!(
+            last + std::mem::size_of::<EffectUniforms>() as u64
+                <= EFFECT_PASS_BLOCKS * EFFECT_BLOCK_STRIDE
+        );
+    }
+
+    /// A softness of zero records **no blur pass**, which is the exact identity
+    /// the selection's feather and the brush's grain both keep — and the half of
+    /// "an effect with no reach is the identity" that is arithmetic rather than a
+    /// decision.
+    #[test]
+    fn no_softness_is_no_blur_pass_at_all() {
+        assert_eq!(tent_for(0.0), (1, 0));
+        assert_eq!(tent_for(-3.0), (1, 0));
+        assert!(tent_for(1.0).1 > 0, "a real softness must blur something");
+    }
+
+    /// The tent the blur runs is the tent that was asked for, to within the step
+    /// its own kernel can express.
+    ///
+    /// Two discrete box passes of `2r + 1` taps at a reduction of `d` have a half
+    /// support of `d(2r + 1)`, so the error is bounded by `d` — which is the whole
+    /// argument for [`EFFECT_FULL_RES_SOFTNESS`] and the reason that constant is a
+    /// parameter rather than a second implementation. **A pixel below the
+    /// threshold and thirteen per cent above it**; the assertion is written that
+    /// way round because lowering the threshold is the tempting change and it
+    /// makes the *narrow* end wrong, which is the end a painter dials.
+    #[test]
+    fn the_tent_is_the_width_it_was_asked_for() {
+        for asked in 1..=200 {
+            let softness = asked as f32;
+            let (down, radius) = tent_for(softness);
+            let support = down as f32 * (2 * radius + 1) as f32;
+            let slack = if softness < EFFECT_FULL_RES_SOFTNESS {
+                // A full-resolution tent's step is two texels, and the smallest
+                // it can express at all is three — so a softness of one and of
+                // two both come out at three.
+                3.0
+            } else {
+                0.13 * softness
+            };
+            assert!(
+                (support - softness).abs() <= slack,
+                "asked {softness}, got {support} from down {down} radius {radius}"
+            );
+        }
+    }
+
+    /// A softness the quarter-resolution kernel could not represent runs at full
+    /// resolution instead.
+    ///
+    /// The departure from §3.2 stated as a test rather than as a sentence: below
+    /// the threshold the reduction is 1, above it 4, and the point of the second
+    /// assertion is that the *cheap* path really is taken where it can be. A
+    /// change that took the reduction to 4 everywhere would fail the width test
+    /// above at the narrow end; a change that took it to 1 everywhere would pass
+    /// every assertion here except this one, and cost 83 ms a frame at 10000².
+    #[test]
+    fn a_narrow_soft_edge_is_blurred_at_full_resolution() {
+        assert_eq!(tent_for(EFFECT_FULL_RES_SOFTNESS - 1.0).0, 1);
+        assert_eq!(tent_for(EFFECT_FULL_RES_SOFTNESS).0, EFFECT_DOWN);
+        assert_eq!(tent_for(64.0).0, EFFECT_DOWN);
+    }
+
+    /// Which effects mark nothing, in the two forms the rule takes.
+    ///
+    /// The outline half is arithmetic — a band of no width is no band. The shadow
+    /// half is a decision and it is argued at [`effect_marks_nothing`]; what is
+    /// pinned here is that it is narrow, because widening it by one clause would
+    /// silently stop drawing a shadow somebody had dialled. A displacement alone
+    /// is enough, a spread alone is enough, and a softness alone is enough.
+    #[test]
+    fn only_an_effect_with_no_reach_marks_nothing() {
+        let shadow = Effect {
+            spread: 0.0,
+            softness: 0.0,
+            distance: 0.0,
+            ..Effect::drop_shadow()
+        };
+        assert!(effect_marks_nothing(&shadow));
+        assert!(!effect_marks_nothing(&Effect {
+            distance: 4.0,
+            ..shadow
+        }));
+        assert!(!effect_marks_nothing(&Effect {
+            spread: 1.0,
+            ..shadow
+        }));
+        assert!(!effect_marks_nothing(&Effect {
+            softness: 1.0,
+            ..shadow
+        }));
+
+        // An outline is its width and nothing else, at every position.
+        for position in OutlinePosition::ALL {
+            let bare = Effect {
+                spread: 0.0,
+                position,
+                ..Effect::outline()
+            };
+            assert!(effect_marks_nothing(&bare), "{position:?}");
+            assert!(
+                !effect_marks_nothing(&Effect {
+                    spread: 2.0,
+                    ..bare
+                }),
+                "{position:?}"
+            );
+        }
+
+        // And the two that hold whatever the kind: off, and transparent.
+        for kind in EffectKind::ALL {
+            let live = Effect {
+                spread: 5.0,
+                softness: 5.0,
+                distance: 5.0,
+                ..Effect::of(kind)
+            };
+            assert!(!effect_marks_nothing(&live), "{kind:?}");
+            assert!(effect_marks_nothing(&Effect {
+                enabled: false,
+                ..live
+            }));
+            assert!(effect_marks_nothing(&Effect {
+                opacity: 0.0,
+                ..live
+            }));
+        }
+    }
+
+    /// The parameter hash covers what the **pixels** depend on and nothing else.
+    ///
+    /// The direction that matters is the second half: `opacity` and `blend` are
+    /// the draw's, applied by `composite.wgsl`, so dragging either must not
+    /// rebake — a canvas-sized bake per frame of a slider drag is exactly the cost
+    /// the cache exists to avoid. Property-driven over every field, because a
+    /// field missed is silent and looks like a driver bug.
+    #[test]
+    fn the_parameter_hash_reads_every_field_the_pixels_depend_on() {
+        let base = Effect {
+            spread: 3.0,
+            softness: 4.0,
+            angle: 30.0,
+            distance: 5.0,
+            ..Effect::drop_shadow()
+        };
+        let h = effect_params_hash(&base);
+
+        let moved: [Effect; 6] = [
+            Effect {
+                spread: 3.5,
+                ..base
+            },
+            Effect {
+                softness: 4.5,
+                ..base
+            },
+            Effect {
+                angle: 31.0,
+                ..base
+            },
+            Effect {
+                distance: 5.5,
+                ..base
+            },
+            Effect {
+                color: Color::new(0.1, 0.2, 0.3, 0.4),
+                ..base
+            },
+            Effect {
+                kind: EffectKind::Outline,
+                ..base
+            },
+        ];
+        for other in moved {
+            assert_ne!(
+                effect_params_hash(&other),
+                h,
+                "a parameter the pixels depend on is not in the hash: {other:?}"
+            );
+        }
+        // An outline's position changes which side of the edge the band is on and
+        // therefore which flood is run, so it is in the hash too.
+        assert_ne!(
+            effect_params_hash(&Effect {
+                kind: EffectKind::Outline,
+                position: OutlinePosition::Inside,
+                ..base
+            }),
+            effect_params_hash(&Effect {
+                kind: EffectKind::Outline,
+                position: OutlinePosition::Outside,
+                ..base
+            })
+        );
+
+        for same in [
+            Effect {
+                opacity: 0.25,
+                ..base
+            },
+            Effect {
+                blend: BlendMode::Screen,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                effect_params_hash(&same),
+                h,
+                "the draw's own settings must not rebake: {same:?}"
+            );
+        }
     }
 }

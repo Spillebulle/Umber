@@ -10,12 +10,12 @@ use glam::{UVec2, Vec2};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use umber_core::{
     Anchor, Background, BlendMode, Brush, BrushMode, Camera, Color, Dab, DabInput, DabTarget,
-    FlipAxis, InputPoint, Modulation, PixelRect, Rect, ResponseCurve, Selection, StrokeBuilder,
-    TileMask, TipMask, Transform,
+    Effect, FlipAxis, InputPoint, Modulation, OutlinePosition, PixelRect, Rect, ResponseCurve,
+    Selection, StrokeBuilder, TileMask, TipMask, Transform,
 };
 use umber_render::{
-    CanvasRenderer, Choice, CompositeParams, DabStyle, DocumentCapture, FloatParams, FloatSource,
-    Gpu, LayerDraw, ProbeParams, StrokeStyle, Thumbnail,
+    BakedStack, CanvasRenderer, Choice, CompositeParams, DabStyle, DocumentCapture, EffectFrame,
+    FloatParams, FloatSource, Gpu, LayerDraw, LayerEffects, ProbeParams, StrokeStyle, Thumbnail,
 };
 
 const DOC: u32 = 64;
@@ -5329,4 +5329,928 @@ fn mirrored(px: &[u8], side: u32, axis: FlipAxis) -> Vec<u8> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Layer effects
+// ---------------------------------------------------------------------------
+//
+// `docs/layer-effects.md` §11's GPU list. Three of these are the gates the
+// design names, and each is invisible to a test built out of the other two: the
+// identity says the fast path is really a fast path, the Multiply says an
+// effect composites against the *backdrop* rather than against its own layer,
+// and the knockout says an outer effect does not paint under the shape it came
+// from.
+//
+// Every assertion about a soft edge is on **alpha**, read out of the effect
+// slice, with a level of slack — CLAUDE.md's rule for a value that has been
+// through a shader. Where the arithmetic has nothing to round, an exact
+// comparison is used and said to be exact.
+
+/// The square every effect below is derived from: 24..40 on both axes, so it is
+/// centred on the canvas and its corner is 24 texels in from each edge.
+const SHAPE: PixelRect = PixelRect {
+    x: 24,
+    y: 24,
+    width: 16,
+    height: 16,
+};
+
+/// The whole canvas, for a floor to composite an effect against.
+const WHOLE: PixelRect = PixelRect {
+    x: 0,
+    y: 0,
+    width: DOC,
+    height: DOC,
+};
+
+impl Harness {
+    /// Bake, with nothing in flight.
+    fn bake(&mut self, stack: &[LayerEffects<'_>], base: u32) -> BakedStack {
+        self.bake_frame(
+            stack,
+            base,
+            EffectFrame {
+                active_index: u32::MAX,
+                stroke: StrokeStyle {
+                    opacity: 0.0,
+                    ..Default::default()
+                },
+                stroke_live: false,
+            },
+        )
+    }
+
+    fn bake_frame(
+        &mut self,
+        stack: &[LayerEffects<'_>],
+        base: u32,
+        frame: EffectFrame,
+    ) -> BakedStack {
+        let mut enc = self.encoder();
+        let baked = self.canvas.bake_effects(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut enc,
+            base,
+            stack,
+            frame,
+        );
+        self.gpu.queue.submit(Some(enc.finish()));
+        baked
+    }
+}
+
+/// One layer's worth of the bake's input.
+fn effected<'a>(draw: LayerDraw, effects: &'a [Effect]) -> LayerEffects<'a> {
+    LayerEffects { draw, effects }
+}
+
+/// The alpha of one texel of a slice.
+fn slice_alpha(h: &Harness, slot: u32, x: u32, y: u32) -> u8 {
+    h.canvas.read_layer_rect(
+        &h.gpu.device,
+        &h.gpu.queue,
+        slot,
+        PixelRect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        },
+    )[3]
+}
+
+/// A drop shadow at `angle`/`distance`, otherwise inert: no spread, no
+/// softness, opaque, Normal.
+fn shadow(color: Color, angle: f32, distance: f32) -> Effect {
+    Effect {
+        color,
+        opacity: 1.0,
+        blend: BlendMode::Normal,
+        spread: 0.0,
+        softness: 0.0,
+        angle,
+        distance,
+        ..Effect::drop_shadow()
+    }
+}
+
+/// An outline of `spread`, hard-edged, at `position`.
+fn outline(color: Color, spread: f32, position: OutlinePosition) -> Effect {
+    Effect {
+        color,
+        opacity: 1.0,
+        spread,
+        softness: 0.0,
+        position,
+        ..Effect::outline()
+    }
+}
+
+/// **The first gate.** An outline of no width and a shadow of no size are the
+/// exact identity: not "nearly the same picture", but no draw at all and
+/// therefore the same bytes.
+///
+/// It is what says the fast path is really a fast path — the rule the selection's
+/// feather, the brush's grain and the selection clip all keep. The shadow half is
+/// a *decision* rather than arithmetic, and `effect_marks_nothing` is where it is
+/// argued: such a shadow is its own shape directly under its own shape, so the
+/// knockout leaves only a rim at the antialiased edge, at `c(1 - c)`. Photoshop
+/// draws that rim; Umber declines to, because declining is what makes this test
+/// an identity.
+#[test]
+fn an_effect_with_no_reach_produces_no_draw_at_all() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let plain = [layer(0, 1.0, BlendMode::Normal)];
+    let bare = h.composite_pixel(&plain, 32, 32);
+    let edge = h.composite_pixel(&plain, 24, 24);
+
+    let inert = [
+        outline(Color::BLACK, 0.0, OutlinePosition::Outside),
+        shadow(Color::BLACK, 120.0, 0.0),
+    ];
+    let stack = [effected(plain[0], &inert)];
+    let baked = h.bake(&stack, 1);
+
+    assert_eq!(
+        baked.draws.len(),
+        1,
+        "an effect with no reach still produced a draw"
+    );
+    assert_eq!(baked.dropped, 0);
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        0,
+        "nothing to draw and a pass was still recorded"
+    );
+    assert_eq!(h.composite_pixel(&baked.draws, 32, 32), bare);
+    assert_eq!(
+        h.composite_pixel(&baked.draws, 24, 24),
+        edge,
+        "the antialiased edge moved, which is the rim this rule refuses"
+    );
+}
+
+/// **The second gate.** A drop shadow at Multiply multiplies against *the
+/// backdrop* — what is under the layer — and not against its own layer.
+///
+/// This is the whole point of an effect being its own draw entry rather than
+/// pixels baked into the layer's slice, and it is invisible in any test built
+/// only out of Normal. Stated as a blend identity: Multiply by white is exactly
+/// the identity, so the pixel under the shadow must come back as the grey layer's
+/// own colour, byte for byte. The Normal reading is asserted beside it to show
+/// the test can tell the two apart at all.
+#[test]
+fn a_drop_shadow_at_multiply_multiplies_against_the_backdrop() {
+    let mut h = harness_or_skip!();
+    // A mid-grey floor over the whole canvas, and an opaque square above it.
+    h.write_block(1, WHOLE, [128, 128, 128, 255]);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let floor = layer(1, 1.0, BlendMode::Normal);
+    let top = layer(0, 1.0, BlendMode::Normal);
+    // Angle 180 puts the offset squarely at +x: the shadow's shape is 36..52,
+    // so (45, 32) is inside the shadow and clear of the square.
+    let (x, y) = (45, 32);
+    let floor_only = h.composite_pixel(&[floor], x, y);
+
+    let white = [Effect {
+        blend: BlendMode::Multiply,
+        ..shadow(Color::WHITE, 180.0, 12.0)
+    }];
+    let stack = [effected(floor, &[]), effected(top, &white)];
+    let baked = h.bake(&stack, 2);
+    assert_eq!(baked.draws.len(), 3, "{:?}", baked.draws);
+    assert_eq!(
+        h.composite_pixel(&baked.draws, x, y),
+        floor_only,
+        "Multiply by white is the identity, so the backdrop must come back \
+         unchanged — it did not, so the shadow is not multiplying against it"
+    );
+
+    let normal = [shadow(Color::WHITE, 180.0, 12.0)];
+    let stack = [effected(floor, &[]), effected(top, &normal)];
+    let baked = h.bake(&stack, 2);
+    let over = h.composite_pixel(&baked.draws, x, y);
+    assert_ne!(
+        over, floor_only,
+        "the same shadow at Normal must replace the backdrop, or this test \
+         cannot tell the two modes apart"
+    );
+    assert_near(over, [255, 255, 255], 2, "a white shadow at Normal");
+}
+
+/// **The third gate.** A layer at 50% opacity over a shadow shows no shadow
+/// inside its own shape.
+///
+/// The knockout is §3.3's, baked rather than composited: the bake has the
+/// coverage in hand already, so multiplying by `1 - coverage` costs nothing
+/// there, where doing it at composite time would need an *inverse* clip the
+/// shader has no notion of. Fifty per cent is what makes the test bite — at full
+/// opacity the layer hides its own shadow whether or not anything knocked it out.
+#[test]
+fn a_layer_knocks_its_own_drop_shadow_out() {
+    let mut h = harness_or_skip!();
+    h.write_block(1, WHOLE, [0, 0, 0, 255]);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let floor = layer(1, 1.0, BlendMode::Normal);
+    let half = layer(0, 0.5, BlendMode::Normal);
+    let without = h.composite_pixel(&[floor, half], 32, 32);
+
+    // A spread rather than a displacement, so the shadow's shape covers the
+    // square rather than sitting beside it — which is the only arrangement in
+    // which the knockout is what decides the answer.
+    let red = [Effect {
+        spread: 8.0,
+        ..shadow(Color::new(1.0, 0.0, 0.0, 1.0), 120.0, 0.0)
+    }];
+    let stack = [effected(floor, &[]), effected(half, &red)];
+    let baked = h.bake(&stack, 2);
+    assert_eq!(baked.draws.len(), 3);
+
+    assert_eq!(
+        h.composite_pixel(&baked.draws, 32, 32),
+        without,
+        "a shadow showed through the middle of its own shape"
+    );
+    // And it is still there where the shape is not, or the knockout has taken
+    // the whole effect rather than the part under the layer.
+    let outside = h.composite_pixel(&baked.draws, 32, 18);
+    assert!(
+        outside[0] > outside[2] + 32,
+        "the shadow is missing outside the shape: {outside:?}"
+    );
+}
+
+/// The blur is mirrored about both axes.
+///
+/// The property two box passes per axis buy, and the one that catches an
+/// off-by-one in a separable pass — a kernel that reached one texel further one
+/// way than the other would leave the mark lopsided by a level, which is
+/// invisible in a picture and exact here. Read off the effect slice's alpha, so
+/// the reading is the bake's own output rather than something the composite has
+/// blended.
+///
+/// The shape is centred on a texel *boundary*, so texel `i` mirrors to `63 - i`
+/// with nothing to interpolate.
+///
+/// **Both resolutions**, and the second one is why this test is written as a
+/// sweep. The blur runs on a 4x downsample above `EFFECT_FULL_RES_SOFTNESS` and
+/// at full resolution below it, and nothing exercised the first — which is how a
+/// mis-centred upsample survived: it displaced the whole shadow a pixel and a
+/// half diagonally, on that path alone, whatever the effect's own angle. A
+/// diagonal shift is exactly what a mirror test sees.
+#[test]
+fn a_softened_shadow_is_mirrored_about_both_axes() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+
+    // 9 is under the threshold and 34 is over it, so one of these runs the tent
+    // whole and the other runs it on a quarter-resolution copy.
+    for softness in [9.0, 34.0] {
+        // No displacement, so the only thing that could break the symmetry is the
+        // kernel. A spread as well as a softness, so the effect draws at all.
+        let soft = [Effect {
+            spread: 2.0,
+            softness,
+            distance: 0.0,
+            ..Effect::drop_shadow()
+        }];
+        let stack = [effected(draw, &soft)];
+        let baked = h.bake(&stack, 1);
+        let slot = baked.draws[0].slot;
+        assert_ne!(slot, 0, "the effect draw is not the layer's own");
+
+        for (x, y) in [(20, 32), (14, 26), (30, 12), (8, 8), (24, 20)] {
+            let a = slice_alpha(&h, slot, x, y);
+            for (mx, my) in [
+                (DOC - 1 - x, y),
+                (x, DOC - 1 - y),
+                (DOC - 1 - x, DOC - 1 - y),
+            ] {
+                let b = slice_alpha(&h, slot, mx, my);
+                assert!(
+                    a.abs_diff(b) <= 1,
+                    "softness {softness}: ({x},{y})={a} against ({mx},{my})={b}: \
+                     the blur is lopsided"
+                );
+            }
+        }
+        // And it actually softened something, or the symmetry above is the
+        // symmetry of an empty texture.
+        let ramp: Vec<u8> = (8..24).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+        assert!(
+            ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] < ramp[15],
+            "softness {softness}: no falloff in the shadow: {ramp:?}"
+        );
+    }
+}
+
+/// A shadow of a layer that runs to the edge of the canvas fades **at** that
+/// edge.
+///
+/// The rule the selection's feather already keeps in as many words — "outside the
+/// canvas counts as unselected, so a selection against the document edge fades at
+/// it, as Photoshop's and GIMP's do" — and the one a `textureLoad` most naturally
+/// gets wrong, because clamp-to-edge makes a box pass sum the border row over and
+/// over. Matching the feather's kernel and then not matching its boundary is the
+/// worse half of both.
+///
+/// The shape is a band flush against the **left** edge and spanning the whole
+/// height, which is what makes the reading discriminating. Being uniform in `y`,
+/// its shadow is the same all the way down *if* the vertical box pass replicates
+/// the border row, and weaker at the top and bottom rows if it reads zero — so one
+/// comparison between the middle of an edge column and the middle of the canvas
+/// answers the question, with no value worked out by hand.
+///
+/// The first draft of this test put the band along the top and asserted that the
+/// knockout reached row zero. It passed under both rules: the knockout is
+/// `1 - coverage` and the band covers that row either way, so the assertion was
+/// about something else entirely.
+#[test]
+fn a_shadow_of_a_layer_against_the_canvas_edge_fades_at_it() {
+    let mut h = harness_or_skip!();
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: DOC,
+        },
+        [255, 255, 255, 255],
+    );
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let soft = [Effect {
+        spread: 3.0,
+        softness: 9.0,
+        distance: 0.0,
+        ..Effect::drop_shadow()
+    }];
+    let baked = h.bake(&[effected(draw, &soft)], 1);
+    let slot = baked.draws[0].slot;
+
+    // Right of the band, where the shadow reaches into open canvas: a real
+    // falloff, which is what says the shadow exists at all.
+    let across: Vec<u8> = (20..40).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+    assert!(
+        across[0] > across[19] && across[0] > 0,
+        "no shadow beside the band: {across:?}"
+    );
+
+    // The same column at the top and bottom rows. Half the tent's support is off
+    // the canvas there, so the shadow has to be plainly weaker than in the middle.
+    // `u32`, because three quarters of a `u8` over 85 is not a `u8`.
+    let middle = u32::from(slice_alpha(&h, slot, 24, DOC / 2));
+    for y in [0, DOC - 1] {
+        let edge = u32::from(slice_alpha(&h, slot, 24, y));
+        assert!(
+            edge < middle * 3 / 4,
+            "row {y} reads {edge} against {middle} in the middle: the kernel is \
+             replicating the border instead of fading at it"
+        );
+    }
+}
+
+/// The distance field is a **disc**, not a square.
+///
+/// §3.1's whole argument: a separated `max` — a horizontal dilate then a
+/// vertical one — grows to a square, and on a diagonal the corner is out by
+/// `r(sqrt 2 - 1)`, which is 41% of the radius. The corner of the shape is the
+/// place the two methods disagree most, so that is where this reads.
+///
+/// The second assertion is the discriminating one. A square dilate of radius 12
+/// from the corner texel at (24, 24) reaches (12, 12) on both axes at once, so it
+/// would put full coverage at (14, 14) — which is 14.1 texels from the shape and
+/// must be outside a disc of 12.
+#[test]
+fn the_distance_field_is_a_disc_and_not_a_square() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 12.0, OutlinePosition::Outside)];
+    let stack = [effected(draw, &ring)];
+    let baked = h.bake(&stack, 1);
+    let slot = baked.draws[0].slot;
+
+    // Straight out from an edge, well inside the width: solid.
+    assert_eq!(
+        slice_alpha(&h, slot, 16, 32),
+        255,
+        "the outline is missing where it is only 8 texels out"
+    );
+    // Diagonally out from the corner at 8.5 texels: inside a disc of 12.
+    assert!(
+        slice_alpha(&h, slot, 18, 18) > 250,
+        "the disc does not reach its own corner: {}",
+        slice_alpha(&h, slot, 18, 18)
+    );
+    // Diagonally out at 14.1 texels: outside a disc of 12, inside a square.
+    assert_eq!(
+        slice_alpha(&h, slot, 14, 14),
+        0,
+        "the field is a square: it painted 14.1 texels out from a corner at a \
+         width of 12"
+    );
+    // And plainly outside on the axis too, so the reading above is about the
+    // shape of the field rather than about a width that came out short.
+    assert_eq!(slice_alpha(&h, slot, 10, 32), 0);
+}
+
+/// An inner effect is confined to the layer's alpha, and it is
+/// `LayerDraw::clipped` that does it.
+///
+/// **No new mechanism at all** — §3.3's other half. `clipped` already means
+/// "bounded by the alpha of the nearest unclipped layer below", and an inner
+/// effect drawn immediately above its own layer reads exactly that. The
+/// asymmetry with the outer effect's baked knockout is the thing that gets
+/// forgotten and reintroduced as a uniform, so both directions are asserted:
+/// the band is inside the shape, and nothing of it is outside.
+#[test]
+fn an_inner_outline_is_confined_to_the_layers_own_alpha() {
+    let mut h = harness_or_skip!();
+    h.write_block(1, WHOLE, [0, 0, 0, 255]);
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let floor = layer(1, 1.0, BlendMode::Normal);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let inside = [outline(
+        Color::new(1.0, 0.0, 0.0, 1.0),
+        4.0,
+        OutlinePosition::Inside,
+    )];
+    let stack = [effected(floor, &[]), effected(draw, &inside)];
+    let baked = h.bake(&stack, 2);
+
+    // The layer, then its inner effect over it: an inside outline is the one
+    // effect that composites *above* the layer it came from.
+    assert_eq!(baked.draws.len(), 3);
+    assert_eq!(baked.draws[1].slot, 0, "{:?}", baked.draws);
+    assert!(
+        baked.draws[2].clipped,
+        "an inner effect must carry the clip"
+    );
+
+    // Two texels in from the edge: the band.
+    assert_near(
+        h.composite_pixel(&baked.draws, 26, 32),
+        [255, 0, 0],
+        2,
+        "the inside outline is missing at the edge it traces",
+    );
+    // Eight texels in: past the band, so the layer's own white.
+    assert_near(
+        h.composite_pixel(&baked.draws, 32, 32),
+        [255, 255, 255],
+        2,
+        "the inside outline filled the whole shape",
+    );
+    // Outside the shape: the black floor and nothing else. This is the half the
+    // clip flag is doing, and it is the half that fails if the flag is dropped —
+    // an unclipped band would paint the whole canvas red.
+    assert_near(
+        h.composite_pixel(&baked.draws, 12, 32),
+        [0, 0, 0],
+        2,
+        "the inside outline escaped its own layer",
+    );
+}
+
+/// The cache rebakes when the pixels or the parameters move, and not otherwise.
+///
+/// The whole of §5's contract, and it is invisible any other way: a stale bake
+/// and a fresh one of the same parameters produce the same pixels, so only a
+/// count can say which happened. The last two steps are the ones worth having —
+/// the opacity and the blend mode are the *draw's*, applied by the composite, so
+/// dragging either must cost nothing.
+#[test]
+fn an_effect_is_rebaked_when_its_pixels_move_and_not_otherwise() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let mut effects = vec![outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+
+    let baked = h.bake(&[effected(draw, &effects)], 1);
+    let slot = baked.draws[0].slot;
+    assert_eq!(h.canvas.effect_bakes(), 1);
+
+    h.bake(&[effected(draw, &effects)], 1);
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        1,
+        "an unchanged effect was rebaked"
+    );
+
+    // The layer's own pixels: `slot_revision` is bumped inside every method that
+    // writes a slice, which is what makes this exhaustive by construction.
+    h.write_block(
+        0,
+        PixelRect {
+            x: 8,
+            y: 8,
+            width: 4,
+            height: 4,
+        },
+        [255, 255, 255, 255],
+    );
+    h.bake(&[effected(draw, &effects)], 1);
+    assert_eq!(h.canvas.effect_bakes(), 2, "a layer edit did not rebake");
+
+    effects[0].spread = 6.0;
+    h.bake(&[effected(draw, &effects)], 1);
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        3,
+        "a parameter change did not rebake"
+    );
+    assert_eq!(
+        h.bake(&[effected(draw, &effects)], 1).draws[0].slot,
+        slot,
+        "the effect moved slice for nothing"
+    );
+
+    effects[0].opacity = 0.25;
+    effects[0].blend = BlendMode::Screen;
+    let baked = h.bake(&[effected(draw, &effects)], 1);
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        3,
+        "opacity and blend are the draw's, not the bake's"
+    );
+    assert_eq!(baked.draws[0].blend, BlendMode::Screen.index());
+    assert!((baked.draws[0].opacity - 0.25).abs() < 1e-6);
+}
+
+/// Over budget the draw path drops effects in a stated order and says how many.
+///
+/// §6.1a: adding an effect is gated by the model, but an undo, an import or a
+/// document opened from a file can all arrive over budget, and there is no answer
+/// to "your undo does not fit" better than doing it. So the draw path degrades
+/// **visibly** — the ones furthest down the stack go first, so the layer somebody
+/// is working on keeps its own, and `effects_dropped` is what the panel reports.
+/// Truncating the list at the cap instead would be the silent version.
+///
+/// Reached through `base` rather than through 128 effects on 64 layers: the
+/// budget is `MAX_EFFECT_SLICES` against what is left under the device's
+/// 256-slice ceiling, so a base near the top exercises the same arithmetic on a
+/// stack a test can build.
+#[test]
+fn an_effect_over_budget_is_dropped_from_the_bottom_and_counted() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    h.write_block(
+        1,
+        PixelRect {
+            x: 8,
+            y: 8,
+            width: 8,
+            height: 8,
+        },
+        [255, 255, 255, 255],
+    );
+
+    let bottom = layer(0, 1.0, BlendMode::Normal);
+    let top = layer(1, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 3.0, OutlinePosition::Outside)];
+    let stack = [effected(bottom, &ring), effected(top, &ring)];
+
+    // One slice left under the ceiling.
+    let baked = h.bake(&stack, 255);
+    assert_eq!(baked.dropped, 1, "{:?}", baked.draws);
+    assert_eq!(h.canvas.effects_dropped(), 1);
+    // Three draws, not four: the two layers and the surviving effect, which is
+    // the *upper* layer's.
+    assert_eq!(baked.draws.len(), 3, "{:?}", baked.draws);
+    assert_eq!(baked.draws[0].slot, 0, "the bottom layer lost its effect");
+    assert_eq!(baked.draws[1].slot, 255, "the top layer kept its own");
+    assert_eq!(baked.draws[2].slot, 1);
+
+    // **No slices left at all**, which is reachable: `SlotPool` hands out up to
+    // slot 255, so `slot_capacity_needed` can reach 256 and the base 257 — enough
+    // delete-then-add cycles get there through parked slices. Both figures are
+    // over the array's own ceiling, and falling through would ask `ensure_slots`
+    // for a 257th slice: a `debug_assert` on the drawing path, or in a release
+    // build a fresh 256-slice array allocated and copied every frame.
+    for base in [256, 257] {
+        let baked = h.bake(&stack, base);
+        assert_eq!(baked.draws.len(), 2, "base {base}: {:?}", baked.draws);
+        assert_eq!(baked.dropped, 2, "base {base} did not say what it dropped");
+        assert_eq!(h.canvas.effects_dropped(), 2);
+    }
+}
+
+/// A shadow baked mid-stroke is the shadow the commit produces.
+///
+/// The bake extracts the layer's coverage after its mask **and after the wet
+/// stroke**, which is the one place in it that has to agree with
+/// `composite.wgsl` — and it agrees about alpha only, because an effect is a
+/// shape wearing a colour of its own. Nothing but a test can hold those two
+/// together: the pixels are identical when they agree and there is no shared
+/// function to point at.
+///
+/// One level of slack, because the committed layer has been through an 8-bit
+/// store where the scratch had not.
+#[test]
+fn a_live_stroke_bakes_the_shadow_the_commit_would() {
+    let mut h = harness_or_skip!();
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 5.0, OutlinePosition::Outside)];
+    let style = StrokeStyle {
+        color: Color::WHITE,
+        opacity: 1.0,
+        ..Default::default()
+    };
+
+    h.stamp(&[dab(32.0, 32.0, 10.0, 1.0)]);
+    let live = h.bake_frame(
+        &[effected(draw, &ring)],
+        1,
+        EffectFrame {
+            active_index: 0,
+            stroke: style,
+            stroke_live: true,
+        },
+    );
+    let slot = live.draws[0].slot;
+    let wet: Vec<u8> = (10..54).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+    assert!(
+        wet.iter().any(|a| *a > 200),
+        "the wet stroke did not reach the bake at all: {wet:?}"
+    );
+
+    h.commit(Color::WHITE, 1.0, BrushMode::Paint);
+    let dry = h.bake_frame(
+        &[effected(draw, &ring)],
+        1,
+        EffectFrame {
+            active_index: 0,
+            stroke: StrokeStyle {
+                opacity: 0.0,
+                ..style
+            },
+            stroke_live: false,
+        },
+    );
+    assert_eq!(dry.draws[0].slot, slot);
+    let baked: Vec<u8> = (10..54).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+    for (i, (a, b)) in wet.iter().zip(&baked).enumerate() {
+        assert!(
+            a.abs_diff(*b) <= 1,
+            "x={}: mid-stroke {a} against committed {b}",
+            10 + i
+        );
+    }
+}
+
+/// A dragged float carries its own effects, and puts them down where the pixels
+/// landed.
+///
+/// §5.2's whole case, and the reason the cache is keyed on the slot the *draw*
+/// carries rather than on the layer: during a drag the draw carries the preview
+/// slice, so the effect baked from it is a different entry from the one baked
+/// from the layer's own — and the commit swaps back to an entry that is stale for
+/// the ordinary reason. No rule about floats anywhere in the cache.
+///
+/// It caught a real defect. `render_float` writes the preview slice and did not
+/// move its revision, so the outline baked at the moment the pixels were picked
+/// up stayed there for the whole drag — a shadow left behind by a dragged object,
+/// which is the exact failure §5.2 names.
+#[test]
+fn a_dragged_float_carries_the_effect_derived_from_it() {
+    let mut h = harness_or_skip!();
+    let block = PixelRect {
+        x: 8,
+        y: 8,
+        width: 10,
+        height: 10,
+    };
+    h.write_block(0, block, [255, 255, 255, 255]);
+
+    let mut xf = Transform::identity(block);
+    let preview = h
+        .canvas
+        .begin_float(
+            &h.gpu.device,
+            &h.gpu.queue,
+            1,
+            &FloatSource {
+                slot: 0,
+                rect: block,
+                pixels: None,
+                mask: None,
+            },
+        )
+        .expect("no room for a preview");
+    // `Editor::effected_draws` substitutes the preview slice for the layer's, so
+    // the bake is handed exactly what the composite is handed.
+    let dragged = LayerDraw {
+        slot: preview,
+        ..layer(0, 1.0, BlendMode::Normal)
+    };
+    let ring = [outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+
+    // A frame of the drag at identity first. A *lift* takes the pixels out of the
+    // preview, so until something has been drawn into it the preview holds only
+    // the hole — and an outline of nothing is nothing, which would make the
+    // assertions below pass for the wrong reason.
+    let at_rest = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &at_rest);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    let baked = h.bake(&[effected(dragged, &ring)], preview + 1);
+    let slot = baked.draws[0].slot;
+    assert_ne!(slot, preview, "the effect took the float's own slice");
+    assert!(
+        slice_alpha(&h, slot, 8, 5) > 0,
+        "the outline is missing where the picture is"
+    );
+
+    // Drag it clean across the canvas.
+    xf.offset = Vec2::splat(28.0);
+    let params = FloatParams {
+        inverse: xf.inverse(),
+        dest: xf.dest_rect(UVec2::splat(DOC)),
+    };
+    let mut enc = h.encoder();
+    h.canvas.draw_float(&h.gpu.queue, &mut enc, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+
+    h.bake(&[effected(dragged, &ring)], preview + 1);
+    assert!(
+        slice_alpha(&h, slot, 36, 33) > 0,
+        "the effect did not follow the float"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 8, 5),
+        0,
+        "the effect was left behind where the picture used to be"
+    );
+
+    // The commit puts the pixels in the layer and the draw goes back to the
+    // layer's own slice, which is a different cache key and stale for the
+    // ordinary reason — the commit moved that slice's revision.
+    let damage = xf.damage(UVec2::splat(DOC), true).expect("something to do");
+    let mut enc = h.encoder();
+    h.canvas
+        .commit_float(&h.gpu.queue, &mut enc, damage, &params);
+    h.gpu.queue.submit(Some(enc.finish()));
+    h.canvas.end_float();
+
+    let settled = layer(0, 1.0, BlendMode::Normal);
+    let after = h.bake(&[effected(settled, &ring)], preview + 1);
+    let slot = after.draws[0].slot;
+    assert!(
+        slice_alpha(&h, slot, 36, 33) > 0,
+        "the committed picture has no outline"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 8, 5),
+        0,
+        "the outline of where the picture came from survived the commit"
+    );
+}
+
+/// A spread wider than the canvas, and one that is not a number at all, are
+/// baked rather than crashed on.
+///
+/// `spread` is an `f32` a document carries, so "nobody would type that" is not a
+/// bound. Unbounded, the flood's step count is a shift by `32 - leading_zeros` of
+/// a saturating cast, which at a spread near four billion is a shift of 32 — a
+/// panic, on the drawing path, out of a file. The step count is bounded by the
+/// longest side of the canvas instead, which reaches every texel anyway.
+///
+/// The assertion is only that it produced a picture and did not die; what the
+/// picture *is* for a NaN spread is not a thing worth pinning.
+#[test]
+fn an_absurd_spread_is_baked_rather_than_crashed_on() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+
+    for spread in [1.0e9, f32::MAX, f32::INFINITY, f32::NAN] {
+        let ring = [outline(Color::WHITE, spread, OutlinePosition::Outside)];
+        let baked = h.bake(&[effected(draw, &ring)], 1);
+        assert_eq!(baked.draws.len(), 2, "spread {spread} produced no draw");
+        // A spread that covers the canvas leaves nothing for the outline to
+        // occupy once the knockout has taken the shape out of it, so this reads
+        // that the pass ran rather than what it wrote.
+        let _ = slice_alpha(&h, baked.draws[0].slot, 4, 4);
+    }
+}
+
+/// The shadow follows the brush: a live stroke rebakes on **every** frame.
+///
+/// §5.1's whole argument, and the thing the design says makes the difference
+/// between a feature and a limitation — "drawing an outlined shape and not
+/// seeing the outline until you lift is the kind of thing that makes a feature
+/// unusable rather than merely limited". Nothing else here catches it: the
+/// stamp's slice revisions do not move until the commit and its parameters never
+/// move at all, so an ordinary freshness check would find the entry fresh from
+/// the second frame on and freeze the shadow where the pen went down.
+#[test]
+fn a_live_stroke_rebakes_the_effect_on_every_frame() {
+    let mut h = harness_or_skip!();
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+    let style = StrokeStyle {
+        color: Color::WHITE,
+        opacity: 1.0,
+        ..Default::default()
+    };
+    let live = EffectFrame {
+        active_index: 0,
+        stroke: style,
+        stroke_live: true,
+    };
+
+    h.stamp(&[dab(16.0, 32.0, 8.0, 1.0)]);
+    let first = h.bake_frame(&[effected(draw, &ring)], 1, live);
+    let slot = first.draws[0].slot;
+    let bakes = h.canvas.effect_bakes();
+    assert!(
+        slice_alpha(&h, slot, 16, 21) > 0,
+        "the first frame of the stroke did not reach the bake"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 48, 32),
+        0,
+        "the far end of the stroke has not been painted yet"
+    );
+
+    // The next frame of the same stroke: more dabs in the scratch, nothing else
+    // changed anywhere.
+    h.stamp(&[dab(48.0, 32.0, 8.0, 1.0)]);
+    h.bake_frame(&[effected(draw, &ring)], 1, live);
+    assert!(
+        h.canvas.effect_bakes() > bakes,
+        "the second frame of a stroke did not rebake"
+    );
+    assert!(
+        slice_alpha(&h, slot, 48, 21) > 0,
+        "the shadow did not follow the brush: the outline is missing where the \
+         stroke has just been"
+    );
+}
+
+/// Ending a stroke without committing it still rebakes.
+///
+/// A cancel writes no pixels, so no slice revision moves and every other part of
+/// the stamp is unchanged — the bake would keep showing a stroke the artist threw
+/// away. `CachedEffect::live` is what catches it, and this is the only thing that
+/// says so.
+#[test]
+fn a_cancelled_stroke_rebakes_the_effect_it_was_showing() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+    let style = StrokeStyle {
+        color: Color::WHITE,
+        opacity: 1.0,
+        ..Default::default()
+    };
+
+    h.stamp(&[dab(8.0, 8.0, 6.0, 1.0)]);
+    let live = h.bake_frame(
+        &[effected(draw, &ring)],
+        1,
+        EffectFrame {
+            active_index: 0,
+            stroke: style,
+            stroke_live: true,
+        },
+    );
+    let slot = live.draws[0].slot;
+    assert!(
+        slice_alpha(&h, slot, 8, 16) > 0,
+        "the stroke's own outline never appeared"
+    );
+
+    // Cancelled, not committed: the scratch is thrown away and the layer is
+    // untouched.
+    let mut enc = h.encoder();
+    h.canvas.clear_stroke(&mut enc);
+    h.gpu.queue.submit(Some(enc.finish()));
+    let before = h.canvas.effect_bakes();
+    h.bake(&[effected(draw, &ring)], 1);
+    assert!(
+        h.canvas.effect_bakes() > before,
+        "a cancelled stroke left the effect showing it"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 8, 16),
+        0,
+        "the cancelled stroke is still in the effect slice"
+    );
 }
