@@ -533,6 +533,18 @@ fn load_layer(
 /// record whose kind is absent or is a name this build has never heard of is
 /// *refused* rather than read as an arbitrary effect. Every other field
 /// defaults to its own neutral, so a record written by an older build loads.
+///
+/// **Two effects of one kind are refused here, and it has to be here**, which
+/// is the one refusal in this function that serde cannot make. A layer holds at
+/// most one per kind — `LayerStack::plan_set_effect` maintains it — and
+/// [`ImportedDocument::open`](super::ImportedDocument::open) installs them one
+/// at a time, so a record naming two drop shadows would have the second
+/// *replace* the first and the document would silently hold one where the file
+/// said two. `set_effect` returning `true` both times is exactly the shrug
+/// CLAUDE.md's "Partial exhaustiveness" section warns about: the refusal is
+/// real at the site that makes it and invisible at the call site. Refused
+/// whole rather than deduplicated, because the record is one unit and nothing
+/// in it says which of the two the artist meant.
 fn load_effects(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
@@ -546,7 +558,13 @@ fn load_effects(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("`{src}` is not in the file"))?;
         let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-        ron::from_str(text).map_err(|e| e.to_string())
+        let effects: Vec<Effect> = ron::from_str(text).map_err(|e| e.to_string())?;
+        for (i, effect) in effects.iter().enumerate() {
+            if effects[..i].iter().any(|e| e.kind == effect.kind) {
+                return Err(format!("it names two {:?} effects", effect.kind));
+            }
+        }
+        Ok(effects)
     };
     match read() {
         Ok(effects) => effects,
@@ -958,6 +976,12 @@ mod tests {
             "not a record",
             // Empty, which is a truncated write rather than "no effects".
             "",
+            // **Two of one kind**, which serde cannot refuse and the install
+            // loop would not either: `set_effect` replaces whatever the layer
+            // held of that kind, so the second would quietly overwrite the
+            // first and the document would hold one where the file said two.
+            // The one refusal in `load_effects` that is not the deserialiser's.
+            "[(kind: Outline, spread: 1.0),(kind: Outline, spread: 9.0)]",
         ] {
             let ora = fixtures::ora(
                 2,
