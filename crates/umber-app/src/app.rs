@@ -27,8 +27,8 @@ use umber_core::docformat::{self, SaveDocument, SaveLayer};
 use umber_core::export;
 use umber_core::history::PatchPiece;
 use umber_core::{
-    Brush, Clip, Color, Dab, Document, Edit, EditBody, EditKind, InputPoint, Jump, PixelPatch,
-    PixelRect, SelectionOp, Transform,
+    Brush, Clip, Color, Dab, Document, Edit, EditBody, EditKind, EditRefusal, InputPoint, Jump,
+    PixelPatch, PixelRect, SelectionOp, Transform,
 };
 use umber_render::{
     CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
@@ -813,10 +813,15 @@ impl UmberApp {
     /// Returns false when there was no room, which is when the layer stack is
     /// already using every slice the composite shader's array has.
     fn begin_float(&mut self, rect: PixelRect, pixels: Option<&[u8]>) -> bool {
-        // **The one gate a lock has on the transform tool.** A lift and a paste
-        // both come through here, so neither needs a check of its own — and
-        // neither does the drag, the commit or the flip buttons, because
-        // without a float there is nothing for any of them to act on.
+        // **The one gate the transform tool has, and it asks one question.** A
+        // lift and a paste both come through here, so neither needs a check of
+        // its own — and neither does the drag, the commit or the flip buttons,
+        // because without a float there is nothing for any of them to act on.
+        //
+        // `LayerStack::refusal_at` is that question. The lock and the folder
+        // used to be two tests here and text would have been a third, which is
+        // the arrangement that gate exists to replace: one call, one answer, and
+        // the interface can say *which*.
         //
         // A *paste* says so and a lift does not, which is not an inconsistency:
         // a paste is an explicit command with one obvious outcome, where a
@@ -824,34 +829,23 @@ impl UmberApp {
         // time somebody puts the pen down. A notice raised by that would be a
         // dialog appearing over the canvas repeatedly, which is the failure the
         // autosave's "say it once" rule is about.
-        if self.editor.layers.active_is_locked() {
+        //
+        // `EditTarget::Layer` and never the strip's setting: a float is pixels
+        // in the layer's own slice whatever the Layers panel is pointed at.
+        if let Some(why) = self
+            .editor
+            .layers
+            .active_refusal(umber_core::EditTarget::Layer)
+        {
             if pixels.is_some() {
-                self.editor.notice = Some(Notice {
-                    title: "The layer is locked".to_string(),
-                    lines: vec![
-                        "Nothing was pasted. Unlock the layer in the Layers panel, or \
-                         select another one, and paste again."
-                            .to_string(),
-                    ],
-                });
+                self.editor.notice = Some(paste_refusal(why));
             }
             return false;
         }
-        // A folder holds no pixels, so there is nothing to lift out of it and
-        // nowhere to paste into it. Refused at the same one gate the lock is,
-        // and silently for the same reason a locked *canvas press* is: this is
-        // reached every time the pen goes down with the transform tool in hand.
+        // The gate above has already refused a folder and a missing entry, so
+        // this is `Some`. Read rather than unwrapped, because a gate and an
+        // assumption about a gate are different things.
         let Some(slot) = self.editor.layers.active_slot() else {
-            if pixels.is_some() {
-                self.editor.notice = Some(Notice {
-                    title: "A folder is selected".to_string(),
-                    lines: vec![
-                        "Nothing was pasted. A folder holds no pixels. Select a \
-                         layer in the Layers panel and paste again."
-                            .to_string(),
-                    ],
-                });
-            }
             return false;
         };
         // The preview takes the slice one past the highest one claimed, which
@@ -4601,6 +4595,50 @@ fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> Pix
     PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
 }
 
+/// What to tell somebody whose paste was refused.
+///
+/// A free function for the reason [`combined_selection_op`] is one: the sentences
+/// are the part that can be wrong, and a sentence read out of a running window is
+/// not a test anybody can run on CI — `UmberApp` needs an `EventLoopProxy` and
+/// therefore an event loop, so `begin_float` itself cannot be driven headlessly.
+///
+/// **Exhaustive with no catch-all**, so a fifth [`EditRefusal`] cannot arrive
+/// without somebody writing what it means for a paste. The wording is the
+/// paste's own rather than [`EditRefusal::reason`]'s: that one is written for a
+/// painting gesture, and this has to say what was *not pasted* and where to go.
+fn paste_refusal(why: EditRefusal) -> Notice {
+    let (title, line) = match why {
+        EditRefusal::Locked => (
+            "The layer is locked",
+            "Nothing was pasted. Unlock the layer in the Layers panel, or select \
+             another one, and paste again.",
+        ),
+        EditRefusal::Folder => (
+            "A folder is selected",
+            "Nothing was pasted. A folder holds no pixels. Select a layer in the \
+             Layers panel and paste again.",
+        ),
+        // The record describes the pixels under it, so pasting over them would
+        // leave it naming a picture it did not make — and a save fingerprints
+        // the pixels it is writing, so the reader's own guard against a record
+        // that has come adrift would agree with the paste and re-render over it.
+        EditRefusal::Text => (
+            "This layer holds text",
+            "Nothing was pasted. The text on this layer can still be set again, so \
+             nothing may be pasted over it. Convert it to paint in the Text panel, \
+             or select another layer.",
+        ),
+        EditRefusal::Missing => (
+            "No layer is selected",
+            "Nothing was pasted. Select a layer in the Layers panel and paste again.",
+        ),
+    };
+    Notice {
+        title: title.to_string(),
+        lines: vec![line.to_string()],
+    }
+}
+
 /// The rule [`App::selection_op`] applies, as a pure function of what was held
 /// and what the strip is set to.
 ///
@@ -4830,6 +4868,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Every reason a paste can be refused has a finished sentence**, and the
+    /// one that had none until now is the text layer's.
+    ///
+    /// `paste_refusal`'s wildcard-free match is what forces a sentence to exist;
+    /// this checks it is a sentence rather than a code, and that it does not
+    /// merely repeat the sentence beside it — four refusals sending somebody
+    /// four different places is the whole of what the enum bought over a
+    /// boolean.
+    ///
+    /// **What no test here can reach is `begin_float` calling it.** `UmberApp`
+    /// is built around an `EventLoopProxy`, so it cannot be constructed without
+    /// an event loop and the gate cannot be driven headlessly. The reading it
+    /// takes is `LayerStack::active_refusal`, which is checked below and in
+    /// `umber-core`; that the gate is *asked* is not covered.
+    #[test]
+    fn every_reason_a_paste_is_refused_has_a_finished_sentence() {
+        let mut said: Vec<String> = Vec::new();
+        for why in EditRefusal::ALL {
+            let notice = paste_refusal(why);
+            let at = format!("{why:?}");
+            assert!(!notice.title.is_empty(), "{at} has no title");
+            assert_eq!(notice.lines.len(), 1, "{at}");
+            let line = &notice.lines[0];
+            assert!(line.ends_with('.'), "{at} is not a sentence: {line:?}");
+            assert!(line.len() > 20, "{at} is a code, not a sentence: {line:?}");
+            // No em-dash in anything the interface draws.
+            assert!(!line.contains('—'), "{at} carries an em-dash: {line:?}");
+            // It says what did not happen, which is the thing an artist who
+            // pressed Ctrl+V and saw nothing needs first.
+            assert!(
+                line.contains("Nothing was pasted"),
+                "{at} does not say what did not happen: {line:?}"
+            );
+            said.push(line.clone());
+        }
+        said.sort();
+        said.dedup();
+        assert_eq!(
+            said.len(),
+            EditRefusal::ALL.len(),
+            "two refusals say the same thing: {said:?}"
+        );
+        // And the one this change is for names the way out, which is the
+        // control the Text panel draws rather than a remedy that does not exist.
+        assert!(paste_refusal(EditRefusal::Text).lines[0].contains("Convert it to paint"));
+    }
+
+    /// The reading `begin_float` takes, which is the half that can be checked:
+    /// a layer holding a record refuses a paste, and taking the record off lets
+    /// it through again.
+    #[test]
+    fn a_text_layer_is_what_the_float_gate_reads_as_a_refusal() {
+        use umber_core::EditTarget;
+        let mut stack = umber_core::LayerStack::new();
+        assert_eq!(stack.active_refusal(EditTarget::Layer), None);
+
+        assert!(stack.set_text(
+            0,
+            umber_core::textobj::TextObject::new(
+                umber_core::text::TextBlock {
+                    text: "A caption".into(),
+                    size: 48.0,
+                    line_spacing: 1.2,
+                    tracking: 0.0,
+                    align: umber_core::text::Align::Left,
+                },
+                umber_core::textobj::TextFace {
+                    family: "Archivo".into(),
+                    style: "Regular".into(),
+                    postscript: String::new(),
+                },
+                Color::new(0.1, 0.1, 0.1, 1.0),
+                umber_core::textobj::Placement::identity(PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 24,
+                }),
+            )
+        ));
+        assert_eq!(
+            stack.active_refusal(EditTarget::Layer),
+            Some(EditRefusal::Text)
+        );
+        assert!(stack.take_text(0).is_some());
+        assert_eq!(stack.active_refusal(EditTarget::Layer), None);
     }
 
     #[test]

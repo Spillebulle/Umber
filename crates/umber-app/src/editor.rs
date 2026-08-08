@@ -1090,6 +1090,26 @@ impl Editor {
             // mask on the GPU to match.
             self.selection = None;
             self.selection_draft = None;
+            // Every text record too, and for the reason the history goes: a
+            // placement is a rectangle of a canvas that no longer exists, and a
+            // canvas that shrank has cropped the pixels the record describes,
+            // so a re-render would put back part of the text the artist cut
+            // away. Translating by the anchor's offset would be exact for a
+            // canvas that only *grew*, and two behaviours behind one command is
+            // how the cropping case comes to be the one nobody tested.
+            let dropped = self.layers.drop_text_objects();
+            if dropped > 0 {
+                // Named rather than discovered. Unlike the flip's, this one is
+                // reachable by anybody who resizes a document holding text.
+                self.notice = Some(Notice {
+                    title: "Text on this document is paint now".to_string(),
+                    lines: vec![format!(
+                        "The canvas changed size, so Umber no longer knows where the text \
+                         on {dropped} layer(s) goes. Every pixel is still there. What is \
+                         lost is that those layers can be set again."
+                    )],
+                });
+            }
             // Keep the zoom, but not the ability to be looking at a part of the
             // canvas that no longer exists.
             self.camera.center = self.camera.center.clamp(Vec2::ZERO, doc.size_vec2());
@@ -1133,10 +1153,30 @@ impl Editor {
             .map(Arc::new);
         // Every layer effect carries a *direction* — where the light is — and a
         // flip that mirrored the pixels and left that alone is a whole document's
-        // shadows disagreeing with its forms. `LayerStack::flip_text` belongs on
-        // the next line when somebody wires it: this is the one place a flip
-        // reaches the model, and both are the same job.
+        // shadows disagreeing with its forms.
         self.layers.flip_effects(axis);
+        // And a text record carries a *position*, which is the same job: a
+        // placement left alone would put the next re-render where the text used
+        // to be, un-mirroring the layer. The mirror is exact — see
+        // `Placement::flipped` — which is why a flip does not cost a text layer
+        // its record the way a resize does, and it has to be, because undoing a
+        // flip is another flip.
+        let dropped = self.layers.flip_text(axis, doc);
+        if dropped > 0 {
+            // `Clip::place` crops to the document, so a placement outside the
+            // canvas is one nothing here writes and this cannot be reached. It
+            // is said out loud anyway rather than logged, because a record that
+            // lies about where its pixels are is worse than none, and somebody
+            // whose caption stopped being editable is owed the reason.
+            self.notice = Some(Notice {
+                title: "Some text is paint now".to_string(),
+                lines: vec![format!(
+                    "{dropped} text layer(s) sat outside the canvas, so Umber could not \
+                     mirror where the text goes. Every pixel is still there. What is lost \
+                     is that those layers can be set again."
+                )],
+            });
+        }
         // The gesture belongs to the pointer and was drawn on the picture as it
         // was. Abandoned rather than mirrored, exactly as a tab switch does —
         // and through `cancel_selection_draft` rather than by clearing the
@@ -1300,24 +1340,42 @@ impl Editor {
         )
     }
 
-    /// Begin a stroke, unless the layer it would land on is locked.
+    /// Begin a stroke, unless the layer it would land on refuses one.
     ///
-    /// **The lock is refused here and nowhere else on the painting path.** Every
-    /// route to a stroke — mouse, pen, touch, a shortcut that starts one —
+    /// **Every refusal is made here and nowhere else on the painting path.**
+    /// Every route to a stroke — mouse, pen, touch, a shortcut that starts one —
     /// arrives at this function, so a check spread over those call sites is one
     /// that a later route would miss. Returns whether the stroke started, which
     /// is what tells the caller not to put the interaction into `Drawing`.
+    ///
+    /// **The reading is `LayerStack::refusal_at`'s**, which is one call with one
+    /// answer for the lock, the folder and the text record together. The lock
+    /// and the folder used to be two separate tests here, which is exactly the
+    /// arrangement that gate exists to replace: text was the third and a third
+    /// test is the one somebody forgets.
+    ///
+    /// **The target has to be the one `stroke_target` actually resolved to, not
+    /// the one the strip says**, and that is the half that is easy to get
+    /// backwards. `EditTarget::Mask` on a layer with no mask falls back to the
+    /// *layer*, so asking about the mask there would let a brush onto a text
+    /// layer's own pixels and leave its record describing pixels it did not
+    /// make. Everything is silent, because this is reached every time the pen
+    /// goes down and a notice there would be a dialog over the canvas.
     pub fn begin_stroke(&mut self, point: InputPoint) -> bool {
-        if self.layers.active_is_locked() {
-            return false;
-        }
         // A folder holds no pixels and no mask, so there is nowhere for the
-        // stroke to go. Refused at this same one gate rather than at the four
-        // routes that reach it, exactly as the lock above is — and silently,
-        // because this is reached every time the pen goes down.
+        // stroke to go. `refusal_at` answers `Folder` for one too; this is what
+        // produces the slice, and it is what decides which target to ask about.
         let Some((slot, on_mask)) = self.stroke_target() else {
             return false;
         };
+        let target = if on_mask {
+            EditTarget::Mask
+        } else {
+            EditTarget::Layer
+        };
+        if self.layers.active_refusal(target).is_some() {
+            return false;
+        }
         let (color, mode) = if on_mask {
             self.mask_paint()
         } else {
@@ -2170,6 +2228,172 @@ mod tests {
             "a refused stroke must not leave the pointer drawing"
         );
         assert!(!ed.stroke.is_active());
+    }
+
+    /// A text record for a layer of a default-sized document.
+    fn a_record(caption: &str) -> umber_core::textobj::TextObject {
+        use umber_core::text::{Align, TextBlock};
+        use umber_core::textobj::{Placement, TextFace, TextObject};
+        TextObject::new(
+            TextBlock {
+                text: caption.to_string(),
+                size: 48.0,
+                line_spacing: 1.2,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: String::new(),
+            },
+            Color::new(0.1, 0.1, 0.1, 1.0),
+            Placement::identity(umber_core::PixelRect {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+        )
+    }
+
+    /// **A text layer refuses a brush, and its mask does not.**
+    ///
+    /// The gate is `LayerStack::refusal_at` and this is the *call site*, which
+    /// is the half a test of the model cannot see: the model answered `Text`
+    /// for months while `begin_stroke` read `active_is_locked` and never asked.
+    /// A stroke landing on a text layer leaves the record describing pixels it
+    /// did not make, and the fingerprint does not cover for that — a save
+    /// fingerprints the pixels it is writing, so the file agrees with itself
+    /// and the reader re-renders over somebody's brushwork.
+    ///
+    /// The mask half is not a nicety. A mask bounds the alpha the composite
+    /// reads and changes none of the layer's own pixels, so it cannot put the
+    /// record out of step with them — and refusing it would take a working
+    /// control away for no reason.
+    #[test]
+    fn a_text_layer_refuses_a_stroke_and_its_mask_still_takes_one() {
+        let mut ed = Editor::default();
+        assert!(ed.begin_stroke(point()), "an ordinary layer paints");
+        ed.stroke.end();
+        ed.interaction = Interaction::Idle;
+
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+        assert!(
+            !ed.begin_stroke(point()),
+            "a brush reached a text layer's own pixels"
+        );
+        assert_eq!(
+            ed.interaction,
+            Interaction::Idle,
+            "a refused stroke must not leave the pointer drawing"
+        );
+        assert!(!ed.stroke.is_active());
+
+        // The mask is a different slice and cannot disagree with the record.
+        let mask = ed.layers.add_mask(0).expect("a mask");
+        ed.edit_target = EditTarget::Mask;
+        assert!(ed.begin_stroke(point()), "a text layer's mask must paint");
+        assert_eq!(ed.stroke_slot, mask);
+
+        // **And the fallback is the case that would have been silent.** With
+        // the strip on Mask and the mask taken off, `stroke_target` falls back
+        // to the *layer* — so asking about the target the strip names rather
+        // than the one it resolved to would let a brush straight through.
+        ed.stroke.end();
+        ed.interaction = Interaction::Idle;
+        assert!(ed.layers.remove_mask(0).is_some());
+        assert_eq!(
+            ed.stroke_target(),
+            ed.layers.active_slot().map(|s| (s, false))
+        );
+        assert!(
+            !ed.begin_stroke(point()),
+            "the mask fell back to the layer and the layer took the stroke"
+        );
+
+        // Taking the record off is what lets paint back on, which is the whole
+        // of what "Convert to paint" does.
+        assert!(ed.layers.take_text(0).is_some());
+        ed.edit_target = EditTarget::Layer;
+        assert!(ed.begin_stroke(point()));
+    }
+
+    /// **A canvas flip mirrors the record with the pixels**, at the one place a
+    /// flip reaches the model.
+    ///
+    /// `Editor::flip_canvas` is called for the flip and again for its undo, so
+    /// a record left behind would put the next re-render where the text used to
+    /// be — un-mirroring the layer against a picture that had turned over. The
+    /// mirror is exact, which is what lets a flip keep the record where a
+    /// resize drops it: undoing a flip is another flip.
+    #[test]
+    fn a_canvas_flip_mirrors_a_text_layers_placement() {
+        use umber_core::FlipAxis;
+        let mut ed = Editor::default();
+        let before = a_record("A caption");
+        assert!(ed.layers.set_text(0, before.clone()));
+        let canvas = ed.doc.size;
+
+        ed.flip_canvas(FlipAxis::Horizontal);
+        let flipped = ed.layers.text_at(0).expect("the record survived").clone();
+        assert_ne!(
+            flipped.placement, before.placement,
+            "the record was not mirrored at all"
+        );
+        assert_eq!(
+            flipped.placement,
+            before
+                .placement
+                .flipped(FlipAxis::Horizontal, canvas)
+                .expect("inside the canvas")
+        );
+
+        // Undoing a flip is another flip, and it has to be exact.
+        ed.flip_canvas(FlipAxis::Horizontal);
+        assert_eq!(
+            ed.layers.text_at(0).expect("still a record").placement,
+            before.placement
+        );
+        assert!(ed.notice.is_none(), "nothing was lost, so nothing is said");
+    }
+
+    /// **A resize takes every record off and says how many**, for the reason it
+    /// clears the history: a placement is a rectangle of a canvas that no longer
+    /// exists, and a canvas that shrank has cropped the pixels the record
+    /// describes.
+    ///
+    /// A resize that changes nothing changes nothing, which is the case a
+    /// `drop_text_objects` called unconditionally would get wrong — pressing
+    /// Apply on a dialog nobody touched would quietly make every caption in the
+    /// document paint.
+    #[test]
+    fn resizing_a_document_takes_its_text_records_off_and_names_the_loss() {
+        let mut ed = Editor::default();
+        assert!(ed.layers.set_text(0, a_record("A caption")));
+
+        // The same size is not a resize.
+        let same = ed.doc;
+        assert!(!ed.apply_canvas(same));
+        assert!(
+            ed.layers.text_at(0).is_some(),
+            "an untouched dialog dropped it"
+        );
+        assert!(ed.notice.is_none());
+
+        let bigger = Document::new(ed.doc.size.x + 64, ed.doc.size.y);
+        assert!(ed.apply_canvas(bigger));
+        assert!(
+            ed.layers.text_at(0).is_none(),
+            "a resized document kept a placement of the canvas it no longer has"
+        );
+        let notice = ed.notice.as_ref().expect("the loss was silent");
+        assert!(notice.lines[0].contains('1'), "{:?}", notice.lines);
+        assert!(
+            !notice.lines[0].contains('—'),
+            "no em-dash in a notice: {:?}",
+            notice.lines
+        );
     }
 
     /// The edit target only means anything on a layer that has a mask, and
