@@ -1586,8 +1586,8 @@ mod tests {
         let mut worst = 0.0f32;
         let mut worst_at = (false, 0.0, 0.0, 0.0, 0.0);
         for build_up in [false, true] {
-            for size in [6.0, 20.0, 80.0] {
-                for spacing in [0.05, 0.1, 0.25] {
+            for size in [2.0, 6.0, 20.0, 80.0] {
+                for spacing in [0.02, 0.05, 0.1, 0.25] {
                     for hardness in [0.0, 0.5, 1.0] {
                         let brush = Brush {
                             hardness,
@@ -1612,7 +1612,33 @@ mod tests {
                             // instead of this.
                             let mid = dabs[dabs.len() / 2];
                             let got = mark_at(&dabs, vec2(mid.pos[0], mid.pos[1]), build_up);
-                            let error = (got - brush.coverage_at(pressure)).abs();
+                            let want = brush.coverage_at(pressure);
+                            // The faintest mark this many dabs of one level can
+                            // build to. Below it `tip::per_dab_for_stroke` answers
+                            // that floor rather than the target, deliberately and
+                            // with its own guard, so measuring here would measure
+                            // the `R8Unorm` scratch's width instead of this. It is
+                            // 0.175 at size 80 and a 2% spacing, which is where
+                            // this used to read as a conversion error.
+                            let off = brush.off_heading(Vec2::X);
+                            let floor = 1.0
+                                - (1.0 - tip::SCRATCH_LEVEL).powf(tip::stack_depth(
+                                    brush.step_at(pressure, off),
+                                    brush.reach_at(pressure, off),
+                                    brush.hardness_at(pressure),
+                                    brush.radius_at(pressure),
+                                ));
+                            if build_up && want <= floor {
+                                // What it must *not* do is vanish — unless the
+                                // curve asked for nothing, which every ramp
+                                // reaching zero does at zero pressure.
+                                assert!(
+                                    got > 0.0 || want <= 0.0,
+                                    "size {size} spacing {spacing} at pressure {pressure} asked {want} and painted nothing"
+                                );
+                                continue;
+                            }
+                            let error = (got - want).abs();
                             if error > worst {
                                 worst = error;
                                 worst_at = (build_up, size, spacing, hardness, pressure);

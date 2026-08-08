@@ -2071,14 +2071,19 @@ mod tests {
         assert_eq!(dab_inner(0.81, 400.0), 0.81);
         // And a solid dab still gets its pixel, whatever its size.
         assert!(dab_inner(1.0, 10.0) < 1.0);
-        // The depth follows: the same brush stacks shallower at the light end of
-        // its own size ramp than at the heavy end. Both steps are `step_at`'s
-        // floor of 0.25, so only the margin differs between these two.
-        let light = stack_depth(0.25, 1.5, 0.81, 1.5);
-        let heavy = stack_depth(0.25, 3.0, 0.81, 3.0);
+        // The depth follows, and the **step ratio is held fixed** so this
+        // isolates the margin: same step, same reach, different radius. Taking
+        // the two from a real light and a real heavy dab instead varies
+        // `step / reach` as well, and then this passes whether the margin is read
+        // or not — measured, by mutating `stack_depth` to ignore its radius.
+        // That is the shape of guard `CLAUDE.md`'s exhaustiveness section
+        // dissects: it looked like a test of the margin and was a test of the
+        // spacing.
+        let soft = stack_depth(0.25, 1.5, 0.81, 1.5);
+        let hard = stack_depth(0.25, 1.5, 0.81, 400.0);
         assert!(
-            light < heavy - 0.5,
-            "the margin did not reach the depth: {light} against {heavy}"
+            soft < hard - 0.5,
+            "the margin did not reach the depth: {soft} against {hard}"
         );
     }
 
