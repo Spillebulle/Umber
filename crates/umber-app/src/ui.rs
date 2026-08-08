@@ -98,6 +98,26 @@ pub struct UiActions {
     /// which is the frame the button was clicked in. Same arrangement, and the
     /// same reason, as [`UiActions::delete_picked`].
     pub place_text: bool,
+    /// Set the selected text layer again from what the Text panel is showing:
+    /// re-render in place, over the union of where the text was and where it is
+    /// going. The caller's for [`UiActions::place_text`]'s reasons and one more
+    /// — it reads the layer back off the GPU for the undo patch.
+    ///
+    /// **Not a float.** The record already says where the text goes, so putting
+    /// a box up would make "a float exists only with the transform tool in hand"
+    /// learn a second tool at each of the three places it is checked; moving and
+    /// turning stays the transform tool's job.
+    pub update_text: bool,
+    /// Take the record off the selected layer, leaving every pixel. It changes
+    /// no pixel, so there is no undo entry and nothing for the GPU to do — but
+    /// it goes through the caller anyway, because the panel may not reach past
+    /// the editor to reset what it is editing.
+    pub convert_text_to_paint: bool,
+    /// Set the text being edited in the palette's colour rather than the one the
+    /// record holds, at the next Update. Through the caller because
+    /// `TextState::editing` is written in one place per frame, exactly as the
+    /// layer ticks are.
+    pub take_text_colour: bool,
     pub add_layer: bool,
     /// Put the ticked layers — or the selected one — into a new folder. The
     /// caller's, because it commits a float first; nothing else about it

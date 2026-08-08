@@ -981,6 +981,11 @@ impl UmberApp {
             });
             return false;
         }
+        // Cleared as the float is installed, which is the one write that keeps
+        // it in step: a placement the artist abandoned must not leave a record
+        // for the next paste's commit to write onto a layer it did not set.
+        // `place_text` fills it immediately after this returns.
+        self.editor.float_text = None;
         self.editor.float = Some(Floating {
             xf: Transform::identity(rect),
             slot,
@@ -1045,6 +1050,7 @@ impl UmberApp {
         let Some(float) = self.editor.float.take() else {
             return;
         };
+        let set_from = self.editor.float_text.take();
         let doc = self.editor.doc.size;
         let params = FloatParams {
             inverse: float.xf.inverse(),
@@ -1073,10 +1079,59 @@ impl UmberApp {
         // the layer before the commit below touches it. Once per gesture, at
         // pointer-up, exactly as a stroke's is.
         let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, float.slot, damage);
+        // **A placement becomes a record only where it lands on nothing**, and
+        // the reading is free: `before` is the pixels the commit is about to
+        // write over, which for a paste is the destination rectangle alone.
+        //
+        // The rule is not fussiness. A record says "these pixels are this text",
+        // and setting it again means clearing what the old text drew and drawing
+        // the new — which needs the layer to hold nothing else there, because
+        // alpha compositing is not invertible and there is no way back to what
+        // was underneath. Placed over a picture, the record would be a promise
+        // Update could only keep by destroying paint. Placed on nothing it is
+        // exact, and `LayerStack::refusal_at` keeps it exact from then on.
+        //
+        // Everything is straight-alpha in the layer's own form here, and alpha
+        // is the fourth byte; a fully transparent pixel is the one thing that
+        // cannot be hiding a colour.
+        let landed_on_nothing = before.chunks_exact(4).all(|px| px[3] == 0);
+        let record = set_from.filter(|_| landed_on_nothing).map(|set| {
+            Box::new(umber_core::textobj::TextObject::new(
+                set.block.clone(),
+                set.face.clone(),
+                set.colour,
+                umber_core::textobj::Placement::of(&float.xf),
+            ))
+        });
+        let placed_over_paint = record.is_none() && !landed_on_nothing;
+        let patch = PixelPatch::new(damage, float.slot, before);
         self.editor.history.record(Edit::new(
             EditKind::Transform,
-            PixelPatch::new(damage, float.slot, before),
+            match &record {
+                // The record and the pixels go into **one** entry, so an undo
+                // cannot take the text off the canvas and leave the layer
+                // claiming it — see `EditBody::Text`. `was` is what the layer
+                // held, which for a placement is nothing, and the gate above
+                // makes that structural rather than an assumption.
+                Some(_) => EditBody::Text { patch, was: None },
+                None => EditBody::Pixels(patch),
+            },
         ));
+        if let Some(record) = record {
+            // By the float's own **slot**, not by the selected row: the slot was
+            // snapshotted when the float began, exactly so that selecting
+            // another layer mid-gesture cannot land the commit somewhere else,
+            // and the record has to follow the pixels.
+            if let Some(at) = self
+                .editor
+                .layers
+                .layers()
+                .iter()
+                .position(|l| l.slot() == Some(float.slot))
+            {
+                self.editor.layers.set_text(at, *record);
+            }
+        }
 
         let mut enc = gfx
             .gpu
@@ -1093,6 +1148,22 @@ impl UmberApp {
         // claim about the artist's intent that nothing supports.
         if float.lifted {
             self.editor.carry_selection(&float.xf);
+        }
+        if placed_over_paint {
+            // Named rather than discovered. The text is down and every pixel of
+            // it is there; what is lost is that it can be set again, and the
+            // only way somebody would otherwise find out is by looking for an
+            // Update button that is not offered.
+            self.editor.notice = Some(Notice {
+                title: "The text was placed as paint".to_string(),
+                lines: vec![
+                    "It landed on a layer that already had something on it, so Umber \
+                     cannot tell the text from the picture underneath and will not offer \
+                     to set it again. Undo, add a layer, and place it there to keep it \
+                     editable."
+                        .to_string(),
+                ],
+            });
         }
         self.editor.mark_modified();
     }
@@ -1458,8 +1529,8 @@ impl UmberApp {
     /// what an explicit click may do and the drawing loop may not, exactly as
     /// the export and the blocking readback are.
     fn place_text(&mut self) {
-        let setting = match self.editor.text.set() {
-            Ok(setting) => setting,
+        let (setting, face) = match self.editor.text.set_and_record() {
+            Ok(both) => both,
             Err(err) => {
                 // Every one of these is a finished sentence rather than a code:
                 // the panel is where the artist was looking, and being told
@@ -1480,10 +1551,245 @@ impl UmberApp {
                 return;
             }
         };
-        let Some(clip) = setting.clip(self.editor.color) else {
+        let colour = self.editor.text_colour();
+        let Some(clip) = setting.clip(colour) else {
             return;
         };
-        self.float_a_clip(&clip, "set");
+        let block = self.editor.text.block.clone();
+        if self.float_a_clip(&clip, "set") {
+            // **After** the float, never before: `begin_float` clears this as
+            // it installs one, so setting it first would be thrown away, and a
+            // placement that was refused must not leave a record waiting for
+            // the next paste to commit. See `Editor::float_text`.
+            self.editor.float_text = Some(Box::new(crate::editor::PlacedText {
+                block,
+                face,
+                colour,
+            }));
+        }
+    }
+
+    /// Set the selected text layer again from what the Text panel is showing.
+    ///
+    /// **In place, and deliberately not as a float.** The record already says
+    /// where the text goes, so there is nothing for a box to decide; putting one
+    /// up would make "a float exists only with the transform tool in hand" —
+    /// checked in three places — learn a second tool, which is the sixth call
+    /// site `docs/text-tool.md` §4 is worried about. Moving and turning stays
+    /// the transform tool's job.
+    ///
+    /// The whole of it is: rasterise the new text through the placement's own
+    /// matrix, read back the rectangle it is about to occupy together with the
+    /// one the old text occupied, write that union with the old text gone and
+    /// the new one in it, and record both the pixels and the record in one undo
+    /// entry.
+    ///
+    /// Blocking, on a font file, on the rasteriser and on a GPU readback. That
+    /// is what an explicit click may do; nothing here is reachable from the
+    /// drawing loop, which is exactly why this is a button and not a re-render
+    /// per keystroke.
+    fn update_text_layer(&mut self) {
+        use umber_core::text;
+        use umber_core::textobj::{Placement, TextObject};
+
+        let Some(editing) = self.editor.text.editing.as_ref() else {
+            return;
+        };
+        let (slot, colour) = (editing.slot, editing.colour);
+        let was = editing.original.clone();
+        // By slot, never by the selected row: the panel is keyed by slot for
+        // the reason a `PixelPatch` names one, and a reorder between the click
+        // and this must not write the caption onto another layer.
+        let Some(at) = self
+            .editor
+            .layers
+            .layers()
+            .iter()
+            .position(|l| l.slot() == Some(slot))
+        else {
+            return;
+        };
+
+        // **The exact face, never `FontLibrary::resolve`'s substitute.** The
+        // panel's own pickers may name something else by now — a family the
+        // artist scrolled to — and what decides the letterforms is what the
+        // *panel* is showing, so this resolves the pair in the boxes and
+        // refuses when that pair is not here. Re-rendering in a substituted
+        // face changes the picture silently, which is what `TextFace::resolve`
+        // exists to refuse.
+        let wanted = umber_core::textobj::TextFace {
+            family: self.editor.text.family.clone(),
+            style: self.editor.text.style.clone(),
+            postscript: String::new(),
+        };
+        let Some(face) = wanted.resolve(self.editor.text.fonts.library()).cloned() else {
+            self.editor.notice = Some(Notice {
+                title: "That font is not on this machine".to_string(),
+                lines: vec![wanted.missing_notice()],
+            });
+            return;
+        };
+        let Some(data) = face.load() else {
+            self.editor.notice = Some(Notice {
+                title: "Nothing was set".to_string(),
+                lines: vec![crate::textpanel::refusal(
+                    umber_core::text::TextError::Unreadable,
+                )],
+            });
+            return;
+        };
+        let record_face = umber_core::textobj::TextFace::of(
+            &face,
+            data.font()
+                .as_ref()
+                .map(umber_core::textobj::postscript_name)
+                .unwrap_or_default(),
+        );
+
+        let block = self.editor.text.block.clone();
+        let doc = self.editor.doc.size;
+        // Two rasterisations, and the first one earns its keep. `set_through`
+        // measures the ink through the map, so where the buffer's top-left
+        // lands depends on the block — a longer caption has a different ink
+        // origin in the block's own space. Setting once at identity says both
+        // where that origin is *and* how large the block is in identity space,
+        // which is what the source rectangle has to become.
+        let identity = match text::set_through(&face, &data, &block, umber_core::Affine::IDENTITY) {
+            Ok(placed) => placed,
+            Err(err) => {
+                self.editor.notice = Some(Notice {
+                    title: "Nothing was set".to_string(),
+                    lines: vec![crate::textpanel::refusal(err)],
+                });
+                return;
+            }
+        };
+
+        // The source rectangle grows with the text, and `Transform::reseat` is
+        // what lets it: the centre of the source is the pivot for the scale and
+        // the rotation, so `Transform::identity(new_rect)` would throw away
+        // every drag the artist made. Reseating leaves `apply` identical for
+        // every point, so nothing already on the canvas moves by a millionth of
+        // a pixel.
+        let mut xf = was.placement.transform();
+        let source = umber_core::PixelRect {
+            x: was.placement.source.x,
+            y: was.placement.source.y,
+            width: identity.setting.width,
+            height: identity.setting.height,
+        };
+        xf.reseat(source);
+        let m = xf.matrix();
+        // Block space to the document: the block's ink origin lands where the
+        // old setting's top-left sat, and the placement's own matrix carries it
+        // from there. So a caption that grows grows to the right and down from
+        // where it is, and one that is turned stays turned.
+        let anchor = glam::Vec2::new(source.x as f32, source.y as f32)
+            - glam::Vec2::new(identity.at.x as f32, identity.at.y as f32);
+        let map = umber_core::Affine {
+            m: m.m,
+            t: m.m * anchor + m.t,
+        };
+        let placed = match text::set_through(&face, &data, &block, map) {
+            Ok(placed) => placed,
+            Err(err) => {
+                self.editor.notice = Some(Notice {
+                    title: "Nothing was set".to_string(),
+                    lines: vec![crate::textpanel::refusal(err)],
+                });
+                return;
+            }
+        };
+        let Some((new_rect, pixels)) = placed.layer_rect(colour, doc) else {
+            self.editor.notice = Some(Notice {
+                title: "Nothing was set".to_string(),
+                lines: vec![
+                    "At this size the text falls entirely off the canvas. Make it \
+                     smaller, or move it back with the transform tool."
+                        .to_string(),
+                ],
+            });
+            return;
+        };
+        // Everywhere the old text was and everywhere the new one is going. Too
+        // tight on the first half leaves letters of the old caption standing;
+        // too tight on the second is a mark that is never written.
+        let old_rect = xf.dest_rect(doc);
+        let union = match old_rect {
+            Some(old) => union_rect(old, new_rect),
+            None => new_rect,
+        };
+
+        let id = self.editor.session.active_id();
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(canvas) = gfx.canvases.get_mut(&id) else {
+            return;
+        };
+        // One blocking read, which is both the undo patch and the check below.
+        let before = canvas.read_layer_rect(&gfx.gpu.device, &gfx.gpu.queue, slot, union);
+
+        // **The half of the invariant that Place could not establish.** A
+        // placement only records where it landed on nothing, and the paint gate
+        // keeps that true inside the *old* rectangle from then on. What neither
+        // covers is the part of the union outside it: the artist may have
+        // painted there before the text was ever placed, and clearing it to
+        // make room would destroy that paint with no way back.
+        if !rect_is_clear_outside(union, old_rect, &before) {
+            self.editor.notice = Some(Notice {
+                title: "There is paint where the text would grow".to_string(),
+                lines: vec![
+                    "Setting it again would have to clear that paint, and Umber cannot \
+                     put it back afterwards. Move the paint to another layer, or make \
+                     the text smaller."
+                        .to_string(),
+                ],
+            });
+            return;
+        }
+
+        // The union with the old text gone and the new one in it, in one write.
+        // Zeroes are a fully transparent premultiplied pixel, which is what
+        // clearing means in this form.
+        let mut buffer = vec![0u8; (union.area() * 4) as usize];
+        blit_into(&mut buffer, union, &pixels, new_rect);
+        canvas.write_layer_rect(&gfx.gpu.queue, slot, union, &buffer);
+
+        let now = TextObject::new(block, record_face, colour, Placement::of(&xf));
+        self.editor.history.record(Edit::new(
+            EditKind::Transform,
+            EditBody::Text {
+                patch: PixelPatch::new(union, slot, before),
+                was: Some(Box::new(was)),
+            },
+        ));
+        self.editor.layers.set_text(at, now.clone());
+        // The panel is now editing *this* record: without it "nothing has
+        // changed" would go on comparing against the caption before the edit,
+        // so Update would stay live and a second press would record an entry
+        // for replacing the text with itself.
+        if let Some(editing) = self.editor.text.editing.as_mut() {
+            editing.original = now;
+        }
+        self.editor.mark_modified();
+        self.request_redraw();
+    }
+
+    /// Take the record off the selected layer, keeping every pixel.
+    ///
+    /// **This is the whole of "convert to paint".** It changes no pixel, so
+    /// there is nothing to undo and no [`EditKind`] for it — the layer simply
+    /// stops claiming the pixels can be set again, and `refusal_at` lets a
+    /// brush through from the next stroke on.
+    fn convert_text_to_paint(&mut self) {
+        let at = self.editor.layers.active_index();
+        if self.editor.layers.take_text(at).is_none() {
+            return;
+        }
+        // The panel is pointed at a layer that is no longer text, so the next
+        // frame's `sync_editing` puts the composing block back. Marked modified
+        // because the *file* changes: the record is written into it.
+        self.editor.mark_modified();
+        self.request_redraw();
     }
 
     /// Move the document to `position` in the history — the number of recorded
@@ -1530,6 +1836,14 @@ impl UmberApp {
         let Some(slot) = self.editor.layers.active_slot() else {
             return;
         };
+        // **A clear takes the text record off, and `refusal_at` deliberately
+        // does not refuse it.** Clearing genuinely means to replace the pixels,
+        // so the record has to go with them — leave it and the next save writes
+        // text over a blank layer with a fingerprint that agrees, and reopening
+        // re-renders a caption somebody cleared. Nothing to undo here either
+        // way: the history is thrown out two lines below.
+        let at = self.editor.layers.active_index();
+        self.editor.layers.take_text(at);
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(canvas) = gfx.canvases.get_mut(&id) else {
@@ -3046,6 +3360,22 @@ impl UmberApp {
         }
         if actions.place_text {
             self.place_text();
+        }
+        if actions.take_text_colour {
+            // One writer per frame, as the layer ticks are: the panel is drawn
+            // from `Editor::text_colour` read before this line, so a change
+            // landing half way through would leave the preview and the button
+            // disagreeing about what Update will paint.
+            let colour = self.editor.color;
+            if let Some(editing) = self.editor.text.editing.as_mut() {
+                editing.colour = colour;
+            }
+        }
+        if actions.update_text {
+            self.update_text_layer();
+        }
+        if actions.convert_text_to_paint {
+            self.convert_text_to_paint();
         }
         if actions.group_layers {
             self.group_layers();
@@ -4635,6 +4965,91 @@ fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> Pix
         .map(|(rect, bytes)| PatchPiece::new(*rect, bytes))
         .collect();
     PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
+}
+
+/// The smallest rectangle holding both.
+///
+/// A free function so the arithmetic is checked without a device, which is what
+/// `docs`' division between a model and what paints it asks for everywhere else.
+/// Both are already clamped to the canvas by the callers that produce them —
+/// `Transform::dest_rect` and `Placed::layer_rect` — so a union of the two is
+/// inside it too, and there is nothing here to clamp again.
+fn union_rect(a: PixelRect, b: PixelRect) -> PixelRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    PixelRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+/// Is every pixel of `outer` that lies **outside** `inner` fully transparent?
+///
+/// `bytes` is `outer`'s own pixels, row-major, four bytes each, in the layer's
+/// premultiplied form — where an alpha of zero is the one value that cannot be
+/// hiding a colour.
+///
+/// What this decides is whether a text layer may grow. A record is only ever
+/// made where the placement landed on nothing, and the paint gate keeps that
+/// true inside the rectangle the text occupies; what neither covers is the part
+/// of the new rectangle that was never inside the old one, where the artist may
+/// have painted before the text was placed. Clearing that to make room would
+/// destroy paint with no way back, because alpha compositing is not invertible.
+///
+/// `inner` is an `Option` because a placement's destination can fall entirely
+/// off the canvas; `None` means the whole of `outer` has to be clear.
+///
+/// A free function for [`union_rect`]'s reason, and it is the half of the
+/// invariant with an argument behind it rather than a rectangle.
+fn rect_is_clear_outside(outer: PixelRect, inner: Option<PixelRect>, bytes: &[u8]) -> bool {
+    if bytes.len() as u64 != outer.area() * 4 {
+        // A short read is not permission. Refusing is the safe direction: the
+        // artist is told the text cannot grow, rather than paint being cleared
+        // on the strength of pixels nobody looked at.
+        return false;
+    }
+    for row in 0..outer.height {
+        for col in 0..outer.width {
+            let (x, y) = (outer.x + col, outer.y + row);
+            if let Some(inner) = inner
+                && x >= inner.x
+                && x < inner.x + inner.width
+                && y >= inner.y
+                && y < inner.y + inner.height
+            {
+                continue;
+            }
+            let at = ((row * outer.width + col) * 4 + 3) as usize;
+            if bytes[at] != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Copy `src`, which covers `from`, into `dest`, which covers `to`.
+///
+/// Four bytes a pixel, row-major, and `from` is assumed inside `to` — every
+/// caller builds `to` as a union that contains it. Rows are copied whole rather
+/// than pixel by pixel, so a caption is one `copy_from_slice` per scanline.
+fn blit_into(dest: &mut [u8], to: PixelRect, src: &[u8], from: PixelRect) {
+    let width = from.width.min(to.width) as usize * 4;
+    for row in 0..from.height {
+        let y = from.y + row;
+        if y < to.y || y >= to.y + to.height || from.x < to.x {
+            continue;
+        }
+        let d = (((y - to.y) * to.width + (from.x - to.x)) * 4) as usize;
+        let s = (row * from.width * 4) as usize;
+        if d + width <= dest.len() && s + width <= src.len() {
+            dest[d..d + width].copy_from_slice(&src[s..s + width]);
+        }
+    }
 }
 
 /// What to tell somebody whose paste was refused.

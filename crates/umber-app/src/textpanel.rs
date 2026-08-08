@@ -292,6 +292,53 @@ pub struct TextState {
     /// that makes one cache entry safe; see `brushlib::tip_preview` and the
     /// rule in CLAUDE.md about a cache with two call sites.
     preview: Option<Preview>,
+    /// The text layer this panel is currently *editing*, if it is editing one.
+    ///
+    /// See [`Editing`]. `None` is the composing state, which is what the panel
+    /// has always been.
+    pub editing: Option<Editing>,
+    /// The composing state, put aside while a text layer is selected.
+    ///
+    /// **Put aside rather than overwritten**, because a block being composed
+    /// belongs to the person and a layer's record belongs to the picture — the
+    /// same division that keeps [`TextState`] above the `--- documents ---`
+    /// line. Clicking a text layer to fix a typo and losing the caption you
+    /// were half way through typing is the failure this exists to prevent.
+    stashed: Option<Composed>,
+}
+
+/// The three fields that say what a block of text *is*, as the panel holds them.
+///
+/// A struct only so the composing state can be swapped out whole while a layer's
+/// record is being edited: the panel body reads [`TextState::block`],
+/// [`TextState::family`] and [`TextState::style`] and does not need to know
+/// which of the two it is drawing, which is what keeps this change out of every
+/// control in the module.
+#[derive(Clone, Debug)]
+pub struct Composed {
+    pub block: TextBlock,
+    pub family: String,
+    pub style: String,
+}
+
+/// A text layer the panel is editing, and what it was when it was picked up.
+///
+/// **Keyed by the document and the *slot*, never by the row's position.** Stack
+/// order is a `Vec` order, so a reorder would otherwise make the panel show one
+/// layer's record while Update wrote to another; a slot never changes hands
+/// while the layer holds it. The document is in the key because a slot is a
+/// slice of one document's texture array, so slot 3 is a different layer in
+/// every tab — exactly the reason `Thumbs`' cache is keyed by document.
+pub struct Editing {
+    pub doc: crate::session::DocId,
+    pub slot: u32,
+    /// The record as it was when this layer was picked up. What Update replaces,
+    /// what an undo puts back, and what "has anything actually changed" is
+    /// measured against.
+    pub original: umber_core::textobj::TextObject,
+    /// The colour the edited text will be set in. Starts as the record's own —
+    /// see [`Editor::text_colour`](crate::editor::Editor::text_colour).
+    pub colour: umber_core::Color,
 }
 
 /// What the panel drew, and what it had to rasterise twice to be able to say.
@@ -363,6 +410,8 @@ impl Default for TextState {
             search: String::new(),
             loaded: None,
             preview: None,
+            editing: None,
+            stashed: None,
         }
     }
 }
@@ -400,17 +449,103 @@ impl TextState {
     /// Blocking on the rasteriser, and on a file read the first time a face is
     /// used, which is what an explicit click may do.
     pub fn set(&mut self) -> Result<umber_core::text::Setting, TextError> {
+        self.set_and_record().map(|(setting, _)| setting)
+    }
+
+    /// The same, with the record of **which face it was actually set in**.
+    ///
+    /// The two together rather than a second lookup beside [`Self::set`],
+    /// because they have to agree: `FontLibrary::resolve` is total, so the face
+    /// the pixels were made with is not necessarily the pair the pickers name,
+    /// and a record naming the picker's choice would re-render somebody's
+    /// caption in a different typeface the day that font turned up.
+    ///
+    /// The PostScript name is read here because this is where the font's bytes
+    /// are already in hand — see [`umber_core::textobj::postscript_name`], which
+    /// exists for exactly that reason.
+    pub fn set_and_record(
+        &mut self,
+    ) -> Result<(umber_core::text::Setting, umber_core::textobj::TextFace), TextError> {
         // Cloned before the borrow, because `face_and_data` fills the cache and
         // therefore holds `self` — a paragraph is cloned once per Place, which
         // is a click, not once per frame.
         let block = self.block.clone();
         let (face, data) = self.face_and_data().ok_or(TextError::Unreadable)?;
-        text::set(&face, data, &block)
+        let record = umber_core::textobj::TextFace::of(
+            &face,
+            data.font()
+                .as_ref()
+                .map(umber_core::textobj::postscript_name)
+                .unwrap_or_default(),
+        );
+        text::set(&face, data, &block).map(|setting| (setting, record))
     }
+}
+
+/// Point the panel at whatever the Layers panel has selected.
+///
+/// A text layer selected means the panel shows **that layer's** record and its
+/// controls act on it; anything else means the composing state, which is what
+/// the panel has always been. Called once at the top of the body, so there is
+/// one place the two can be swapped and no control below has to know which it
+/// is drawing.
+///
+/// **The switch is a swap, not a copy.** What is composed is stashed and comes
+/// back; what is edited is discarded, because the layer still holds the record
+/// it was read from and re-reading it is the honest answer to "what does this
+/// layer say". Selecting a second text layer therefore abandons unapplied edits
+/// to the first — which is the only behaviour that cannot show one layer's
+/// record while writing to another, and it is why the key below carries the
+/// slot rather than the row.
+fn sync_editing(ed: &mut Editor) {
+    let doc = ed.session.active_id();
+    // The selected entry, and only if it is a text layer whose slot is real.
+    // A folder holds neither, and `set_text` already refuses one.
+    let at = ed.layers.active_index();
+    let target = ed
+        .layers
+        .active_slot()
+        .filter(|_| ed.layers.active_text().is_some())
+        .map(|slot| (doc, slot));
+    let held = ed.text.editing.as_ref().map(|e| (e.doc, e.slot));
+    if held == target {
+        return;
+    }
+    // Off whatever was being edited: the composing block comes back.
+    if ed.text.editing.take().is_some()
+        && let Some(back) = ed.text.stashed.take()
+    {
+        ed.text.block = back.block;
+        ed.text.family = back.family;
+        ed.text.style = back.style;
+    }
+    let Some((doc, slot)) = target else {
+        return;
+    };
+    let Some(record) = ed.layers.text_at(at).cloned() else {
+        return;
+    };
+    ed.text.stashed = Some(Composed {
+        block: std::mem::take(&mut ed.text.block),
+        family: std::mem::take(&mut ed.text.family),
+        style: std::mem::take(&mut ed.text.style),
+    });
+    ed.text.block = record.block.clone();
+    ed.text.family = record.face.family.clone();
+    ed.text.style = record.face.style.clone();
+    ed.text.editing = Some(Editing {
+        doc,
+        slot,
+        colour: record.colour,
+        original: record,
+    });
 }
 
 /// The Text panel body.
 pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {
+    // Before anything is drawn, so every control below acts on the block the
+    // panel is actually showing.
+    sync_editing(ed);
     // The scan starts the first time somebody opens this module, not at
     // start-up: it is several hundred file reads for a feature most sessions
     // never reach.
@@ -511,7 +646,158 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     let refused = preview(ui, p, ed);
 
     ui.add_space(8.0);
-    place_row(ui, p, ed, refused, actions);
+    if ed.text.editing.is_some() {
+        edit_row(ui, p, ed, refused, actions);
+    } else {
+        place_row(ui, p, ed, refused, actions);
+    }
+}
+
+/// The two controls a **text layer** gets in place of Place.
+///
+/// Place is not drawn at all here rather than drawn disabled, which is the
+/// opposite call the style marks get and the same one a folder's missing
+/// opacity gets: there is something else in that place doing the job, so an
+/// extra dead button would be a control with nothing to say. `begin_float`
+/// still refuses a paste onto this layer, and says why — the gate catches the
+/// route that goes round the panel.
+fn edit_row(
+    ui: &mut Ui,
+    p: &Palette,
+    ed: &Editor,
+    refused: Option<TextError>,
+    actions: &mut UiActions,
+) {
+    let editing = ed.text.editing.as_ref().expect("the caller checked");
+    let missing = editing
+        .original
+        .face
+        .resolve(ed.text.fonts.library())
+        .is_none();
+    if missing {
+        // **Named before anything is pressed, not after.** The face the record
+        // asks for is not on this machine, so the saved pixels are all there is
+        // — `TextFace::resolve` is exact and never substitutes, because
+        // re-rendering somebody's caption in a face its author did not choose
+        // changes the picture silently.
+        controls::note(ui, p, &editing.original.face.missing_notice());
+        ui.add_space(6.0);
+    }
+    // A record carries its own colour, so setting it again in whatever happens
+    // to be in the palette would repaint the caption every time somebody fixed
+    // a typo. This is how the artist asks for that instead.
+    let same = ed.color.to_srgb_u8() == editing.colour.to_srgb_u8();
+    let state = update_state(
+        missing,
+        ed.text.block.text.trim().is_empty(),
+        refused,
+        unchanged(ed),
+    );
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let response = controls::text_button(ui, p, "Update text", true, state.enabled);
+            if response.clicked() {
+                actions.update_text = true;
+            }
+            response.on_hover_text(state.tooltip.as_ref());
+
+            let colour = controls::text_button(ui, p, "Colour in hand", false, !same);
+            if colour.clicked() {
+                actions.take_text_colour = true;
+            }
+            colour.on_hover_text(if same {
+                "The text is already set in the colour the palette is holding."
+            } else {
+                "Set this text in the colour the palette is holding, the next time \
+                 Update is pressed."
+            });
+        });
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let response = controls::text_button(ui, p, "Convert to paint", false, true);
+            if response.clicked() {
+                actions.convert_text_to_paint = true;
+            }
+            response.on_hover_text(
+                "Keep every pixel and stop treating this layer as text. It can then be \
+                 painted and pasted on, and it cannot be set again.",
+            );
+        });
+    });
+}
+
+/// Whether anything in the panel differs from the record the layer holds.
+///
+/// What keeps Update from being a live button that would record an undo entry
+/// for replacing a caption with itself. Read off the *record* rather than a
+/// dirty flag, so there is nothing to fall out of step with what the controls
+/// wrote — and it compares the fields a re-render actually reads, which is why
+/// the placement is not among them.
+fn unchanged(ed: &Editor) -> bool {
+    let Some(editing) = ed.text.editing.as_ref() else {
+        return false;
+    };
+    let was = &editing.original;
+    ed.text.block == was.block
+        && ed.text.family.eq_ignore_ascii_case(&was.face.family)
+        && ed.text.style.eq_ignore_ascii_case(&was.face.style)
+        && editing.colour.to_srgb_u8() == was.colour.to_srgb_u8()
+}
+
+/// Whether Update may be pressed, and what to say about it.
+///
+/// A pure function of four readings, separate from [`edit_row`] for the reason
+/// [`place_state`] is separate from [`place_row`]: the decision is the part that
+/// can be wrong, and reading it out of a running window is not a test anybody
+/// can run on CI.
+///
+/// The order is the order of the sentences somebody would want. A missing font
+/// comes first because nothing else about the layer can be acted on until it is
+/// there; "nothing has changed" comes last, because it is the only one that is
+/// not a problem.
+fn update_state(
+    missing_font: bool,
+    empty: bool,
+    refused: Option<TextError>,
+    unchanged: bool,
+) -> Place {
+    if missing_font {
+        return Place {
+            enabled: false,
+            tooltip: "The font this text was set in is not on this machine, so Umber \
+                      cannot set it again without changing the letterforms. Install the \
+                      font, or convert the layer to paint."
+                .into(),
+        };
+    }
+    if empty {
+        return Place {
+            enabled: false,
+            tooltip: "Type something first. To take the text off the canvas, undo the \
+                      edit that put it there."
+                .into(),
+        };
+    }
+    if let Some(err) = refused {
+        return Place {
+            enabled: false,
+            tooltip: refusal(err).into(),
+        };
+    }
+    if unchanged {
+        return Place {
+            enabled: false,
+            tooltip: "Nothing has changed, so there is nothing to set again.".into(),
+        };
+    }
+    Place {
+        enabled: true,
+        tooltip: "Draw this text again on the layer, where it already is. \
+                  The transform tool is what moves and turns it."
+            .into(),
+    }
 }
 
 /// Which family: a search field, and under it the dropdown this interface has
@@ -1079,7 +1365,7 @@ fn preview_key(ed: &Editor) -> u64 {
     ed.text.family.hash(&mut h);
     ed.text.style.hash(&mut h);
     ed.text.fonts.generation().hash(&mut h);
-    ed.color.to_srgb_u8().hash(&mut h);
+    ed.text_colour().to_srgb_u8().hash(&mut h);
     h.finish()
 }
 
@@ -1102,7 +1388,7 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
     let ratio = PREVIEW_EM / ed.text.block.size.clamp(text::MIN_SIZE, text::MAX_SIZE);
     small.size = PREVIEW_EM;
     small.tracking *= ratio;
-    let colour = ed.color;
+    let colour = ed.text_colour();
     let block = ed.text.block.clone();
 
     // Through the cache, so the font file is read once per face rather than

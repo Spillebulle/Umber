@@ -92,6 +92,23 @@ pub struct Floating {
     pub drag: Option<(Handle, Vec2)>,
 }
 
+/// What a floating block of text was set from, waiting for the commit that will
+/// record it on the layer.
+///
+/// Only what [`umber_core::textobj::TextObject`] needs and does not already
+/// have: the placement comes from the [`Transform`] at the moment it is put
+/// down, because that is the whole of what the artist did to it in between.
+#[derive(Clone, Debug)]
+pub struct PlacedText {
+    pub block: umber_core::text::TextBlock,
+    pub face: umber_core::textobj::TextFace,
+    /// The colour the coverage was painted in, snapshotted at the placement for
+    /// the reason [`Editor::stroke_style`] is snapshotted at the press: the
+    /// palette can move while the box is being dragged, and the record has to
+    /// describe the pixels that actually land.
+    pub colour: Color,
+}
+
 /// How near a handle a press has to land, in *screen* pixels. Divided by the
 /// zoom at the point of use, exactly as the polygon lasso's close distance is:
 /// a fixed document distance would be impossible to hit at 10% and impossible
@@ -418,6 +435,24 @@ pub struct Editor {
     /// Transient, like [`Editor::stroke`]: everything that would leave the
     /// document behind commits it first, so it never crosses a tab switch.
     pub float: Option<Floating>,
+    /// What the floating pixels were **set from**, where they were set rather
+    /// than pasted or lifted.
+    ///
+    /// Beside [`Editor::float`] rather than a field on `Floating`, which is
+    /// `Copy` and read by value at three call sites; a `TextBlock` holds a
+    /// `String`, so folding it in would take the `Copy` away from all of them
+    /// for a field only the commit reads.
+    ///
+    /// **One writer clears it and one reads it, which is what keeps the two in
+    /// step without a rule anybody has to remember.** `App::begin_float` clears
+    /// it as it installs a float, so nothing a cancelled placement left behind
+    /// can attach itself to the next paste; `App::place_text` sets it
+    /// immediately afterwards; `App::finish_transform` takes it. There is no
+    /// third site to forget.
+    ///
+    /// Above the `--- documents ---` line with the float itself, and for the
+    /// same reason: every path that leaves the document commits first.
+    pub float_text: Option<Box<PlacedText>>,
     /// What was last copied, ready to be pasted.
     ///
     /// Genuinely session-wide rather than per-document — copying out of one tab
@@ -611,6 +646,7 @@ impl Default for Editor {
             edit_target: EditTarget::Layer,
             stroke: StrokeBuilder::new(),
             float: None,
+            float_text: None,
             clipboard: None,
             selection_draft: None,
             selection_outline: Vec::new(),
@@ -850,6 +886,22 @@ impl Editor {
     /// Adopt the picker's HSV as the painting colour.
     pub fn commit_picker(&mut self) {
         self.color = self.hsv.to_color(1.0);
+    }
+
+    /// What the Text module will set in.
+    ///
+    /// The palette colour, unless the panel is **editing a layer's record**, in
+    /// which case it is the colour that record holds. A text layer set again in
+    /// whatever happened to be in the palette would change its colour every time
+    /// somebody fixed a typo, which is the picture changing behind an edit that
+    /// did not ask for it; `textpanel`'s "Use the colour in hand" is how the
+    /// artist asks.
+    ///
+    /// One reading, here, because three things have to agree about it — the
+    /// preview, the key the preview is cached under, and what Place and Update
+    /// actually paint.
+    pub fn text_colour(&self) -> Color {
+        self.text.editing.as_ref().map_or(self.color, |e| e.colour)
     }
 
     /// Point the picker at a colour chosen elsewhere, preserving hue for greys.
