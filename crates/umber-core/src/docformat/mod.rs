@@ -1473,15 +1473,39 @@ mod tests {
         let px = solid(size, [10, 20, 30, 255]);
         let bytes = text_document(size, &px);
 
-        for body in [b"not json at all".to_vec(), {
-            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
-            let mut held = Vec::new();
-            std::io::Read::read_to_end(&mut zip.by_name(&text_src(0)).unwrap(), &mut held).unwrap();
-            String::from_utf8(held)
-                .unwrap()
-                .replace("\"version\":1", "\"version\":99")
-                .into_bytes()
-        }] {
+        for body in [
+            b"not json at all".to_vec(),
+            {
+                let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+                let mut held = Vec::new();
+                std::io::Read::read_to_end(&mut zip.by_name(&text_src(0)).unwrap(), &mut held)
+                    .unwrap();
+                String::from_utf8(held)
+                    .unwrap()
+                    .replace("\"version\":1", "\"version\":99")
+                    .into_bytes()
+            },
+            // **The record's own size bound, from the reading end.** Every other
+            // entry in a document is sized by the canvas, which
+            // `MAX_TOTAL_BYTES` bounds; this one is sized by how much somebody
+            // typed, so a small archive can claim a large record and the
+            // document-wide figure does not reach it.
+            //
+            // What this drives is `TextObject::from_json`'s length check, and
+            // **it does not reach `read_capped_entry`'s cap** — measured, by
+            // taking the cap out: the record is still dropped and this test
+            // still passes, because the parse refuses it a moment later. The cap
+            // is an allocation bound and its only observable effect is the
+            // megabytes not spent decompressing a record that was going to be
+            // refused, so nothing here can hold it in place. Said rather than
+            // implied, because the comment claiming otherwise is easier to write
+            // than the guard.
+            format!(
+                "{{\"version\":1,\"text\":\"{}\"}}",
+                "x".repeat(crate::textobj::MAX_RECORD_BYTES + 16)
+            )
+            .into_bytes(),
+        ] {
             let doc = docimport::read_openraster(&with_entry(&bytes, &text_src(0), body))
                 .expect("the picture still opens");
             assert!(doc.layers[0].text.is_none());
