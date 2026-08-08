@@ -5822,6 +5822,114 @@ fn an_inner_outline_is_confined_to_the_layers_own_alpha() {
     );
 }
 
+/// **Each outline position draws the width it claims, on the side it claims.**
+///
+/// The three are one measurement taken three ways, off the effect slice's own
+/// alpha, along a row through the middle of a square whose left edge is at x = 24.
+/// A band's extent is what the position *means*, so this is the test that would
+/// have caught a Centre that was quietly an Outside of half the width — which is
+/// what a blanket knockout forced, and is why `docs/layer-effects.md` §3.3 was
+/// reversed: that control is Photoshop's "Layer knocks out **drop shadow**" and it
+/// is named for the drop shadow because it is the drop shadow's.
+///
+/// Width 8 throughout, so Centre reaches 4 each side and the three are told apart
+/// by where the band sits rather than by how wide it is.
+#[test]
+fn each_outline_position_draws_the_band_it_claims() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+
+    // The run of texels along y = 32, up to the middle of the canvas, where the
+    // effect has alpha. The **left half only**: the square has a right edge with a
+    // band of its own, and reading the whole row would report the two bands and
+    // the gap between them as one span.
+    let span = |h: &Harness, slot: u32| -> Option<(u32, u32)> {
+        let lit: Vec<u32> = (0..32)
+            .filter(|x| slice_alpha(h, slot, *x, 32) > 128)
+            .collect();
+        Some((*lit.first()?, *lit.last()?))
+    };
+
+    // Outside: entirely beyond the edge, so it ends where the shape begins.
+    let ring = [outline(Color::WHITE, 8.0, OutlinePosition::Outside)];
+    let baked = h.bake(&[effected(draw, &ring)], 1);
+    let outside = span(&h, baked.draws[0].slot).expect("an outside band");
+    assert_eq!(
+        outside,
+        (16, 23),
+        "an outside band of 8 should run 16..23, up to but not into the shape"
+    );
+
+    // Centre: half in and half out, so it straddles x = 24. Four each side.
+    let ring = [outline(Color::WHITE, 8.0, OutlinePosition::Centre)];
+    let baked = h.bake(&[effected(draw, &ring)], 1);
+    let centre = span(&h, baked.draws[0].slot).expect("a centred band");
+    assert_eq!(
+        centre,
+        (20, 27),
+        "a centred band of 8 should straddle the edge at 24, four each side — \
+         a band of (16, 23) is an Outside wearing Centre's name, which is what a \
+         blanket knockout forced"
+    );
+
+    // Inside: entirely within the shape.
+    let ring = [outline(Color::WHITE, 8.0, OutlinePosition::Inside)];
+    let baked = h.bake(&[effected(draw, &ring)], 1);
+    let inside = span(&h, baked.draws[0].slot).expect("an inside band");
+    assert_eq!(
+        inside,
+        (24, 31),
+        "an inside band of 8 should run 24..31, from the edge inwards"
+    );
+}
+
+/// **Only a drop shadow knocks its own layer out.**
+///
+/// The reversal of §3.3 stated as the thing it makes possible: a centred outline
+/// survives under an opaque layer's own shape, where a knockout applied to
+/// everything compositing below the layer would have removed exactly the half
+/// that makes it centred. Read off the effect slice, because the composite would
+/// hide the inner half under the layer — which is the *point*: it is hidden by
+/// ordinary compositing rather than deleted at bake time, so it comes back
+/// through a translucent layer.
+///
+/// The shadow's half is asserted beside it, so the test cannot pass by the
+/// knockout having been removed altogether.
+#[test]
+fn the_knockout_belongs_to_the_drop_shadow_alone() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+
+    // Well inside the shape, where a knockout leaves nothing.
+    let (x, y) = (32, 32);
+
+    // A shadow grown past the shape: knocked out inside it.
+    let shadow = [Effect {
+        spread: 8.0,
+        softness: 0.0,
+        distance: 0.0,
+        ..Effect::drop_shadow()
+    }];
+    let baked = h.bake(&[effected(draw, &shadow)], 1);
+    assert_eq!(
+        slice_alpha(&h, baked.draws[0].slot, x, y),
+        0,
+        "a drop shadow must be knocked out under its own shape"
+    );
+
+    // A centred outline wide enough to reach the same texel: **not** knocked out.
+    // Sixteen wide, so its inner half reaches eight texels in from x = 24.
+    let ring = [outline(Color::WHITE, 16.0, OutlinePosition::Centre)];
+    let baked = h.bake(&[effected(draw, &ring)], 1);
+    assert!(
+        slice_alpha(&h, baked.draws[0].slot, x, y) > 128,
+        "a centred outline's inner half was knocked out: it is hidden by the \
+         layer at composite time, not removed at bake time"
+    );
+}
+
 /// The cache rebakes when the pixels or the parameters move, and not otherwise.
 ///
 /// The whole of §5's contract, and it is invisible any other way: a stale bake

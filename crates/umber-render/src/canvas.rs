@@ -1564,7 +1564,8 @@ struct EffectUniforms {
     radius: i32,
     down: i32,
     spread: f32,
-    inner: u32,
+    /// [`EffectShape`]'s discriminant.
+    shape: u32,
     slot: i32,
     mask_slot: i32,
     has_mask: u32,
@@ -1576,7 +1577,45 @@ struct EffectUniforms {
     grow: u32,
     k: i32,
     invert: u32,
-    _pad: u32,
+    /// Remove the layer's own shape from the effect at resolve time. **A drop
+    /// shadow and nothing else** — see `effect.wgsl`'s header, and
+    /// [`EffectShape`].
+    knockout: u32,
+}
+
+/// What shape the grow pass builds. Mirrors `effect.wgsl`'s `SHAPE_*`.
+///
+/// **This is where `docs/layer-effects.md` §3.3's correction lives.** That
+/// section makes the knockout a property of a *side* of the stack — anything
+/// compositing under the layer gets it — and cites Photoshop's control, whose
+/// name is "Layer knocks out **drop shadow**". It is named for the drop shadow
+/// because it is the drop shadow's, and generalising it made a centred outline
+/// undrawable: a stroke sits *on* the edge, so removing it wherever the layer
+/// covers deletes exactly the half somebody asked for.
+///
+/// So the confinement is per kind and position, chosen here, and only
+/// [`EffectShape::Dilate`] pairs with a knockout at resolve time. What that buys
+/// beyond a working Centre: an outline's confinement now happens *before* the
+/// blur, so a soft stroke is soft on both sides where it used to be sheared flat
+/// against the layer's own edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectShape {
+    /// The coverage grown by the spread. A drop shadow, and the only shape whose
+    /// confinement is the resolve's knockout.
+    Dilate = 0,
+    /// The outward band times `1 - coverage`, which is what "outside the edge"
+    /// means rather than a knockout.
+    Outer = 1,
+    /// The inward band, whole. `LayerDraw::clipped` bounds it, and multiplying by
+    /// the coverage here as well would apply the layer's alpha twice.
+    Inner = 2,
+    /// Both bands mixed by the coverage. Reads the outward band out of the plane
+    /// a [`EffectShape::Raw`] pass wrote, which is why a centred outline is the
+    /// one effect that floods **twice**.
+    Centre = 3,
+    /// A band with no confinement, the first half of a centred outline. Never an
+    /// effect on its own.
+    Raw = 4,
 }
 
 /// How many pass blocks the bake's uniform buffer holds.
@@ -1608,15 +1647,18 @@ const EFFECT_PASS_BLOCKS: u64 =
 
 /// The most passes one effect can ask for, which is what bounds the plan.
 ///
-/// Twenty-four is the measured worst — a 10000² canvas, where the flood's step
-/// count is `ceil(log2(10000)) + 1` = 15, plus extract, seed, grow, downsample,
-/// four box passes and the resolve. Thirty-two rather than twenty-four so that
-/// adding a pass to the pipeline does not silently start dropping effects; the
-/// cost of the slack is uniform bytes and nothing else.
+/// A **centred outline** is the worst, because it is the one effect that floods
+/// twice: two seeds, two sets of `ceil(log2(span)) + 1` steps and two grows, plus
+/// the extract, the downsample, four box passes and the resolve. At 32768 —
+/// `max_texture_dimension_2d` on a device that offers it — that is 40.
+/// Forty-eight rather than forty so that adding a pass to the pipeline does not
+/// silently start dropping effects; the slack costs uniform bytes and nothing
+/// else.
 ///
-/// `the_pass_budget_covers_the_effects_the_model_permits` is what says the two
-/// figures still agree with what `plan_effect` actually emits.
-const EFFECT_MAX_PASSES_PER_EFFECT: usize = 32;
+/// `the_pass_budget_covers_the_effects_the_model_permits` derives the figure from
+/// the planner's own arithmetic rather than restating it, which is what caught
+/// the first draft at a fifth of what it needed.
+const EFFECT_MAX_PASSES_PER_EFFECT: usize = 48;
 
 /// Stride of one [`EffectUniforms`] block.
 ///
@@ -1649,6 +1691,9 @@ enum EffectPass {
 enum EffectTarget {
     Coverage,
     Grown,
+    /// The outward band a centred outline's first flood produced, held while its
+    /// second flood runs. See [`EffectShape::Centre`].
+    Band,
     Blur(usize),
     Seed(usize),
     /// A slice of the layer array: the effect's own, and the only target of the
@@ -1699,6 +1744,11 @@ struct EffectScratch {
     /// whenever a radius crossed [`EFFECT_FULL_RES_SOFTNESS`].
     blur: [wgpu::TextureView; 2],
     seeds: Option<[wgpu::TextureView; 2]>,
+    /// Holds a centred outline's outward band while its inward flood runs.
+    /// Lazily allocated like the seed pair and for the same reason: it is the one
+    /// position that needs two fields, and a document with no centred outline
+    /// should not pay 100 MB at 10000² for the possibility of one.
+    band: Option<wgpu::TextureView>,
     /// Held so the views above outlive the bind groups that reference them.
     #[allow(dead_code)]
     textures: Vec<wgpu::Texture>,
@@ -1754,9 +1804,13 @@ enum EffectBind {
     /// shape without the coverage beside it and the resolve reads both.
     SrcCoverage = 12,
     ResolveCoverage = 13,
+    /// The band plane as `src`, plus the coverage and one of the flood pair: a
+    /// centred outline's combining grow. See [`EffectShape::Centre`].
+    CombineSeed0 = 14,
+    CombineSeed1 = 15,
 }
 
-const EFFECT_BIND_COUNT: usize = 14;
+const EFFECT_BIND_COUNT: usize = 16;
 
 /// One effect's slice, and what it was baked from.
 ///
@@ -5529,13 +5583,42 @@ impl CanvasRenderer {
         self.effects.bakes
     }
 
-    /// Whether a bake may run every frame on a canvas this size.
+    /// Whether *any* bake may run every frame on a canvas this size.
     ///
     /// See [`EFFECT_LIVE_PIXELS`]. Public because the *caller* is what knows a
     /// stroke is in flight, and because a panel that wanted to explain the lag
-    /// would need to be able to ask.
+    /// would need to be able to ask. [`Self::effect_bakes_live`] is the per-effect
+    /// question and is the one the bake actually asks.
     pub fn effects_bake_live(&self) -> bool {
         u64::from(self.doc_size.x) * u64::from(self.doc_size.y) <= EFFECT_LIVE_PIXELS
+    }
+
+    /// Whether **this** effect may be rebaked every frame of a stroke.
+    ///
+    /// Above [`EFFECT_LIVE_PIXELS`] the answer is per effect rather than one gate
+    /// on the canvas, and `docs/layer-effects.md` §5.1 is why: what cannot hold at
+    /// canvas scale is "memory at canvas scale and the stroke's distance field,
+    /// not the shadow and not the frame budget". The measurements bear that out —
+    /// at 10000² a 16 px outline is 20.4 ms and over a 60 Hz frame while a soft
+    /// shadow is 4.1 ms and comfortably inside one.
+    ///
+    /// A canvas-wide gate was what shipped first and it is worse in a way an
+    /// artist cannot see: one expensive outline anywhere in the stack would switch
+    /// the live rebake off for a cheap shadow on another layer, so the shadow
+    /// following the brush would depend on a setting somewhere else. Two clauses
+    /// are what a large canvas allows:
+    ///
+    /// * **no distance field**, which is the flood's 20 ms and its 800 MB of seed
+    ///   textures — and it is the *common* case, since a drop shadow's default
+    ///   spread is zero;
+    /// * **a downsampled blur**, because a full-resolution tent at 31 px is
+    ///   22.5 ms at that size, which is over a frame on its own.
+    fn effect_bakes_live(&self, effect: &Effect) -> bool {
+        if self.effects_bake_live() {
+            return true;
+        }
+        let (down, radius) = tent_for(effect.softness);
+        effect_field(effect).reach <= 0.0 && (radius == 0 || down > 1)
     }
 
     /// Bake every stale effect and return the draw list the composite takes.
@@ -5714,11 +5797,12 @@ impl CanvasRenderer {
         // Plan the whole bake before recording any of it: every pass reads its
         // numbers out of one uniform buffer at submit time, so the blocks have to
         // be written before the first pass rather than as each is worked out.
-        let live = frame.stroke_live && self.effects_bake_live();
         let mut steps: Vec<EffectStep> = Vec::new();
         let mut previous_source: Option<u32> = None;
         for ((position, effect), slot) in kept.iter().zip(&slots) {
             let entry = &stack[*position];
+            // Per effect, not per canvas — see `effect_bakes_live`.
+            let live = frame.stroke_live && self.effect_bakes_live(effect);
             let stroke_here = frame.stroke_live && frame.active_index as usize == *position;
             let stamp = CachedEffect {
                 source: entry.draw.slot,
@@ -5843,24 +5927,13 @@ impl CanvasRenderer {
     fn plan_effect(&self, steps: &mut Vec<EffectStep>, effect: &Effect, slot: u32) {
         let size = self.doc_size;
         let full = [size.x as f32, size.y as f32];
-        let inner = u32::from(effect.is_inner());
-        // An inside outline is a band of the **inward** distance, which is the
-        // outward distance of the complement — so the same flood with its seed
-        // test inverted, and no second field and no signed one. A centred outline
-        // is deliberately the *outer* half of its width: the inner half sits
-        // under the layer and §3.3's knockout removes it whatever the layer's
-        // opacity, so drawing it would be a pass that produces nothing.
-        let (reach, invert) = match (effect.kind, effect.position) {
-            (EffectKind::Outline, OutlinePosition::Inside) => (effect.spread, 1),
-            (EffectKind::Outline, OutlinePosition::Centre) => (effect.spread * 0.5, 0),
-            _ => (effect.spread, 0),
-        };
+        let plan = effect_field(effect);
         let base = EffectUniforms {
             size: full,
             src_size: full,
-            spread: reach,
-            inner,
-            invert,
+            spread: plan.reach,
+            shape: plan.shape as u32,
+            invert: u32::from(plan.invert),
             ..EffectUniforms::default()
         };
 
@@ -5868,14 +5941,72 @@ impl CanvasRenderer {
         // with no spread is a blur of the coverage and nothing else, which is the
         // setting every application opens one at — so the flood, which is the
         // expensive half of this whole feature, is skipped for the common case.
-        let grow = reach > 0.0;
+        let grow = plan.reach > 0.0;
         if grow {
+            // A centred outline is the one position that floods **twice**: its
+            // band straddles the edge, so it needs the outward distance and the
+            // inward one, and one ping-pong pair cannot hold both. The outward
+            // half goes into the band plane first, unconfined, and the inward
+            // pass then combines the two. `plan.shape` is `Centre` for the second
+            // grow; the first is `Raw`.
+            if plan.shape == EffectShape::Centre {
+                self.plan_field(
+                    steps,
+                    &EffectUniforms {
+                        shape: EffectShape::Raw as u32,
+                        invert: 0,
+                        ..base
+                    },
+                    EffectTarget::Band,
+                    false,
+                );
+                self.plan_field(steps, &base, EffectTarget::Grown, true);
+            } else {
+                self.plan_field(steps, &base, EffectTarget::Grown, false);
+            }
+        }
+        // With nothing to grow, the shape **is** the coverage and no grow pass is
+        // recorded: `fs_grow` with `grow == 0` hands the coverage straight back, so
+        // the pass was a full-screen copy of a texture already in hand. That is the
+        // common case — a drop shadow's default spread is zero, and its
+        // displacement is what makes it a shadow. The bind groups below are what
+        // pay for it, and they are what a placeholder cannot be: the shape's source
+        // is a *binding*, so choosing it is choosing a bind group.
+        let shape = if grow {
+            (
+                EffectBind::SrcGrown as usize,
+                EffectBind::ResolveGrown as usize,
+            )
+        } else {
+            (
+                EffectBind::SrcCoverage as usize,
+                EffectBind::ResolveCoverage as usize,
+            )
+        };
+        self.plan_soften_and_resolve(steps, effect, &base, shape, slot);
+    }
+
+    /// One jump flood and the grow pass that reads it.
+    ///
+    /// `combine` runs the grow through the bind groups that hold the band plane,
+    /// which is what a centred outline's *second* field needs and nothing else
+    /// does.
+    fn plan_field(
+        &self,
+        steps: &mut Vec<EffectStep>,
+        base: &EffectUniforms,
+        target: EffectTarget,
+        combine: bool,
+    ) {
+        let size = self.doc_size;
+        let reach = base.spread;
+        {
             steps.push(EffectStep {
                 pass: EffectPass::Seed,
                 target: EffectTarget::Seed(0),
                 bind: EffectBind::Coverage as usize,
                 viewport: size,
-                cfg: base,
+                cfg: *base,
             });
             // `ceil(log2(reach)) + 1` halving steps, largest first. One more than
             // the log because the last step at k = 1 is what settles a
@@ -5903,41 +6034,38 @@ impl CanvasRenderer {
                         EffectBind::Flood1 as usize
                     },
                     viewport: size,
-                    cfg: EffectUniforms { k, ..base },
+                    cfg: EffectUniforms { k, ..*base },
                 });
                 from = 1 - from;
                 k /= 2;
             }
             steps.push(EffectStep {
                 pass: EffectPass::Grow,
-                target: EffectTarget::Grown,
-                bind: if from == 0 {
-                    EffectBind::Grow0 as usize
-                } else {
-                    EffectBind::Grow1 as usize
+                target,
+                bind: match (combine, from) {
+                    (false, 0) => EffectBind::Grow0 as usize,
+                    (false, _) => EffectBind::Grow1 as usize,
+                    (true, 0) => EffectBind::CombineSeed0 as usize,
+                    (true, _) => EffectBind::CombineSeed1 as usize,
                 },
                 viewport: size,
-                cfg: EffectUniforms { grow: 1, ..base },
+                cfg: EffectUniforms { grow: 1, ..*base },
             });
         }
-        // With nothing to grow, the shape **is** the coverage and no grow pass is
-        // recorded: `fs_grow` with `grow == 0` hands the coverage straight back, so
-        // the pass was a full-screen copy of a texture already in hand. That is the
-        // common case — a drop shadow's default spread is zero, and its
-        // displacement is what makes it a shadow. The bind groups below are what
-        // pay for it, and they are what a placeholder cannot be: the shape's source
-        // is a *binding*, so choosing it is choosing a bind group.
-        let shape = if grow {
-            (
-                EffectBind::SrcGrown as usize,
-                EffectBind::ResolveGrown as usize,
-            )
-        } else {
-            (
-                EffectBind::SrcCoverage as usize,
-                EffectBind::ResolveCoverage as usize,
-            )
-        };
+    }
+
+    /// The tent, the displacement, the tint and the knockout.
+    fn plan_soften_and_resolve(
+        &self,
+        steps: &mut Vec<EffectStep>,
+        effect: &Effect,
+        base: &EffectUniforms,
+        shape: (usize, usize),
+        slot: u32,
+    ) {
+        let size = self.doc_size;
+        let full = [size.x as f32, size.y as f32];
+        let base = *base;
 
         // The tent: two box passes per axis, on a downsample where the radius is
         // wide enough for one to represent it. A radius of zero records no pass
@@ -6028,7 +6156,13 @@ impl CanvasRenderer {
                 src_size,
                 offset: [dx, dy],
                 down: read_down,
-                inner,
+                // **The knockout is the drop shadow's alone.** An outline's
+                // confinement happened in the grow, where it belongs: it is what
+                // "outside the edge" or "inside it" means, and it has to be
+                // applied before the blur so a soft stroke is soft on both sides.
+                // The shadow's has to be applied *after* the displacement,
+                // because what it must not cover is where the layer is now.
+                knockout: u32::from(effect.kind == EffectKind::DropShadow),
                 ..EffectUniforms::default()
             },
         });
@@ -6057,12 +6191,16 @@ impl CanvasRenderer {
         let needs_seeds = steps
             .iter()
             .any(|s| matches!(s.pass, EffectPass::Seed | EffectPass::Flood));
-        self.ensure_effect_scratch(device, needs_seeds);
+        let needs_band = steps.iter().any(|s| matches!(s.target, EffectTarget::Band));
+        self.ensure_effect_scratch(device, needs_seeds, needs_band);
         let Some(scratch) = self.effects.scratch.as_ref() else {
             return Err("no working set".into());
         };
         if needs_seeds && scratch.seeds.is_none() {
             return Err("no seed pair".into());
+        }
+        if needs_band && scratch.band.is_none() {
+            return Err("no band plane".into());
         }
 
         for (i, step) in steps.iter().enumerate() {
@@ -6077,6 +6215,10 @@ impl CanvasRenderer {
             let target = match step.target {
                 EffectTarget::Coverage => &scratch.coverage,
                 EffectTarget::Grown => &scratch.grown,
+                EffectTarget::Band => match scratch.band.as_ref() {
+                    Some(view) => view,
+                    None => return Err("a centred outline with no band plane".into()),
+                },
                 EffectTarget::Blur(n) => &scratch.blur[n],
                 EffectTarget::Seed(n) => match scratch.seeds.as_ref() {
                     Some(pair) => &pair[n],
@@ -6138,27 +6280,27 @@ impl CanvasRenderer {
     }
 
     /// Build the canvas-sized working set if it is missing or the wrong shape.
-    fn ensure_effect_scratch(&mut self, device: &wgpu::Device, seeds: bool) {
+    fn ensure_effect_scratch(&mut self, device: &wgpu::Device, seeds: bool, band: bool) {
         let stale = match self.effects.scratch.as_ref() {
             None => true,
             Some(s) => {
                 s.size != self.doc_size
                     || s.bound_capacity != self.layers.capacity
                     || (seeds && s.seeds.is_none())
+                    || (band && s.band.is_none())
             }
         };
         if !stale {
             return;
         }
-        // Keeping the seed pair once it has been allocated: an effect whose
+        // Keeping the lazy planes once they have been allocated: an effect whose
         // spread is being dragged crosses zero repeatedly, and reallocating
-        // 800 MB at 10000² on the way past would be worse than holding it.
-        let keep_seeds = seeds
-            || self
-                .effects
-                .scratch
-                .as_ref()
-                .is_some_and(|s| s.seeds.is_some());
+        // 800 MB at 10000² on the way past would be worse than holding it. The
+        // same for the band plane, which switching an outline between Centre and
+        // Outside would otherwise take and give back on alternate frames.
+        let had = self.effects.scratch.as_ref();
+        let keep_seeds = seeds || had.is_some_and(|s| s.seeds.is_some());
+        let keep_band = band || had.is_some_and(|s| s.band.is_some());
         self.effects.scratch = Some(EffectScratch::new(
             device,
             &self.shared,
@@ -6166,6 +6308,7 @@ impl CanvasRenderer {
             &self.layers,
             &self.stroke_view,
             keep_seeds,
+            keep_band,
         ));
     }
 
@@ -7260,6 +7403,7 @@ impl EffectScratch {
         layers: &LayerStore,
         stroke_view: &wgpu::TextureView,
         seeds: bool,
+        band: bool,
     ) -> Self {
         let mut textures = Vec::new();
         let mut plane = |label: &str| {
@@ -7290,6 +7434,9 @@ impl EffectScratch {
         let coverage = plane("umber-effect-coverage");
         let grown = plane("umber-effect-grown");
         let blur = [plane("umber-effect-blur-0"), plane("umber-effect-blur-1")];
+        // Before the placeholders below, because both closures hold `textures`
+        // and only one may at a time.
+        let band = band.then(|| plane("umber-effect-band"));
         // Bound wherever a pass does not read a coverage field, so that a
         // texture this pass is *writing* is never also named by its bind group.
         // A texture rather than nothing, because the layout is one layout for all
@@ -7458,6 +7605,9 @@ impl EffectScratch {
             &coverage,
             none,
         ));
+        let band_src = band.as_ref().unwrap_or(b);
+        binds.push(bind("effect-combine-0", a, band_src, &coverage, seed0));
+        binds.push(bind("effect-combine-1", a, band_src, &coverage, seed1));
         debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
 
         Self {
@@ -7466,6 +7616,7 @@ impl EffectScratch {
             grown,
             blur,
             seeds,
+            band,
             textures,
             uniforms,
             binds,
@@ -7501,6 +7652,52 @@ fn effect_draw(effect: &Effect, slot: u32, entry: &LayerEffects<'_>) -> LayerDra
         visible: entry.draw.visible,
         mask: None,
         clipped: effect.is_inner() || entry.draw.clipped,
+    }
+}
+
+/// What shape one effect is, how far its field has to reach, and which way its
+/// flood is seeded.
+///
+/// **One statement of it**, because three places ask: the planner, the live-bake
+/// gate and the working set's allocation. Reading it three times is three chances
+/// to disagree about whether an effect needs a flood at all — and the answer
+/// decides both the cost and, for a centred outline, whether the band plane has
+/// to exist.
+struct EffectField {
+    shape: EffectShape,
+    /// How far the band or the dilate reaches, in document pixels. Zero means no
+    /// distance field is needed at all.
+    reach: f32,
+    /// Seed the flood on the complement, which turns the field into an *inward*
+    /// distance. An inside outline's whole mechanism.
+    invert: bool,
+}
+
+fn effect_field(effect: &Effect) -> EffectField {
+    match (effect.kind, effect.position) {
+        // The full width, straddling the edge: half of it each side. This is the
+        // one position that needs two fields — see `EffectShape::Centre` — and
+        // the reach is the half width, which is what each band is.
+        (EffectKind::Outline, OutlinePosition::Centre) => EffectField {
+            shape: EffectShape::Centre,
+            reach: effect.spread * 0.5,
+            invert: true,
+        },
+        (EffectKind::Outline, OutlinePosition::Inside) => EffectField {
+            shape: EffectShape::Inner,
+            reach: effect.spread,
+            invert: true,
+        },
+        (EffectKind::Outline, OutlinePosition::Outside) => EffectField {
+            shape: EffectShape::Outer,
+            reach: effect.spread,
+            invert: false,
+        },
+        (EffectKind::DropShadow, _) => EffectField {
+            shape: EffectShape::Dilate,
+            reach: effect.spread,
+            invert: false,
+        },
     }
 }
 
