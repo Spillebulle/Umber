@@ -980,22 +980,25 @@ impl Pen<'_> {
     /// The measured *cost*, on the other hand, is real: two columns and two
     /// rows of the buffer cannot be drawn in. On Archivo's `g` at 24 px in a
     /// 16x20 box that is 22.9 of coverage truncated, against 0.06 for the
-    /// un-inset clamp. It is invisible in practice only because both callers
-    /// pad generously — `set` by a whole em on every side, `cputext::draw` by
-    /// `ppem` — so nothing either of them draws comes within two pixels of an
-    /// edge. **If anybody is ever tempted to tighten that padding, the inset is
-    /// the thing to reconsider first**, and the honest summary is that it is
-    /// cheap insurance against a storage detail rather than a fix for a
-    /// visible bug.
+    /// un-inset clamp. **Both callers pay for it rather than risking it, and
+    /// they now pay differently.** `cputext::draw` still pads by `ppem`, which
+    /// is the generous-and-reasoned-about answer the sentence above described.
+    /// [`set_through`] no longer pads at all: it *measures*, through
+    /// [`BoundsPen`] and with [`MARGIN`] left over, so what used to be an em of
+    /// slack is three pixels of it. That tightening is the one this comment
+    /// warned would make the inset worth reconsidering, and the answer was to
+    /// keep it and put two of `MARGIN`'s three pixels aside for it — a constant
+    /// rather than a proportion of the size, which is what makes it affordable
+    /// at a scale of twenty.
     ///
-    /// It is reached at all because outlines routinely stray past the advance
-    /// width — a script face's swash further than most — and the padding is
-    /// generous rather than infinite.
-    /// With a map in force the clamp is **unreachable rather than merely
-    /// unlikely**, because the buffer was sized from the very points this is
-    /// about to be handed — see [`BoundsPen`] and [`MARGIN`]. It stays because
-    /// the other caller, `cputext::draw`, pads by an em and reasons about it, and
-    /// because a clamp that never fires costs two comparisons.
+    /// So with a map in force the clamp is **unreachable rather than merely
+    /// unlikely**: the buffer was sized from the very points this is about to be
+    /// handed, by the same arithmetic, and the control hull [`BoundsPen`]
+    /// records is a superset of the flattened curve.
+    /// `no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp` is that claim as
+    /// a test. It stays anyway, because `cputext::draw` reasons its way to
+    /// safety rather than measuring it, and because a clamp that never fires
+    /// costs two comparisons.
     fn at(&self, x: f32, y: f32) -> Point {
         let p = self.map.apply(Vec2::new(self.dx + x, self.baseline - y)) - self.corner;
         point(
@@ -1491,5 +1494,292 @@ mod tests {
         b.line_spacing = 0.55;
         let s = set_with(&lib, "Regular", &b).unwrap();
         assert!(s.coverage.iter().any(|&c| c > 200), "nothing was drawn");
+    }
+
+    // --- the affine path ---------------------------------------------------
+    //
+    // Everything below is [`set_through`] with a map that is not the identity,
+    // which is the whole point of the module's second entry point and had no
+    // test at all until the four the identity path already had started failing.
+
+    fn set_map(lib: &FontLibrary, b: &TextBlock, map: Affine) -> Result<Placed, TextError> {
+        let face = lib.resolve("Archivo", "Regular").expect("a face");
+        let data = face.load().expect("bytes");
+        set_through(face, &data, b, map)
+    }
+
+    fn scale(s: f32) -> Affine {
+        Affine {
+            m: glam::Mat2::from_diagonal(Vec2::splat(s)),
+            t: Vec2::ZERO,
+        }
+    }
+
+    /// **Scaling a placement is a re-set, not a resample**, and this is that
+    /// sentence as an assertion: a block set through a scale of `s` is the same
+    /// picture as the same block set at `s` times the point size.
+    ///
+    /// It is the strongest form the claim can take here. A bilinear resample
+    /// would agree about the *size* and disagree about every antialiased edge —
+    /// its fringe is `s` pixels wide where a fresh rasterisation's is one — so
+    /// comparing dimensions alone would pass under the bug this exists to
+    /// prevent. What pins the sharpness is the fringe count: the proportion of
+    /// partly covered pixels has to *fall* as the block grows, because a fringe
+    /// is a perimeter and the ink is an area.
+    ///
+    /// Exactness is not available and is not wanted: `skrifa` is asked for the
+    /// outline at the block's own size and the points are multiplied afterwards,
+    /// where setting at `size * s` asks for it at the larger size. For a face
+    /// with no `opsz` axis those differ only by float rounding — which is
+    /// precisely why driving the point size from the handle looks equivalent and
+    /// is not, for a face that *has* one.
+    ///
+    /// **The metric proves it discriminates rather than being trusted to.** The
+    /// test resamples the identity block itself and checks that the bound it
+    /// asserts on the rasterised one *fails* for the resampled one. A sharpness
+    /// measure nobody has shown a blurred picture to is a number, not a test —
+    /// this module has already shipped one guard that passed for the wrong
+    /// reason, and the fringe fraction was invented here rather than borrowed.
+    #[test]
+    fn a_block_set_through_a_scale_is_rasterised_at_that_size_rather_than_resampled() {
+        let lib = library();
+        let fringe = |s: &Setting| -> f64 {
+            let ink = s.coverage.iter().filter(|&&c| c != 0).count();
+            let edge = s
+                .coverage
+                .iter()
+                .filter(|&&c| (20..=235).contains(&c))
+                .count();
+            edge as f64 / ink.max(1) as f64
+        };
+        // What `Float` does today, and the thing this whole path exists to stop
+        // happening to text: a bilinear magnification of the small picture.
+        let resample = |src: &Setting, s: f32| -> Setting {
+            let (w, h) = (
+                (src.width as f32 * s).round().max(1.0) as u32,
+                (src.height as f32 * s).round().max(1.0) as u32,
+            );
+            let tap = |x: i64, y: i64| -> f32 {
+                let x = x.clamp(0, src.width as i64 - 1) as usize;
+                let y = y.clamp(0, src.height as i64 - 1) as usize;
+                src.coverage[y * src.width as usize + x] as f32
+            };
+            let mut coverage = Vec::with_capacity((w * h) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let sx = (x as f32 + 0.5) / s - 0.5;
+                    let sy = (y as f32 + 0.5) / s - 0.5;
+                    let (fx, fy) = (sx.floor(), sy.floor());
+                    let (tx, ty) = (sx - fx, sy - fy);
+                    let (x0, y0) = (fx as i64, fy as i64);
+                    let top = tap(x0, y0) * (1.0 - tx) + tap(x0 + 1, y0) * tx;
+                    let bot = tap(x0, y0 + 1) * (1.0 - tx) + tap(x0 + 1, y0 + 1) * tx;
+                    coverage.push((top * (1.0 - ty) + bot * ty).round() as u8);
+                }
+            }
+            Setting {
+                width: w,
+                height: h,
+                coverage,
+                missing: Vec::new(),
+                mixed_directions: false,
+            }
+        };
+        let base = block("Umber");
+        let at_identity = set_map(&lib, &base, Affine::IDENTITY).expect("ink");
+        for s in [2.0_f32, 5.0, 12.0] {
+            let mapped = set_map(&lib, &base, scale(s)).expect("ink");
+            let mut bigger = base.clone();
+            bigger.size = base.size * s;
+            let reset = set_with(&lib, "Regular", &bigger).expect("ink");
+            // The same picture, to within the rounding above and the one pixel
+            // the trim's floor and ceiling can differ by.
+            assert!(
+                mapped.setting.width.abs_diff(reset.width) <= 2
+                    && mapped.setting.height.abs_diff(reset.height) <= 2,
+                "scale {s}: {}x{} through the map, {}x{} re-set",
+                mapped.setting.width,
+                mapped.setting.height,
+                reset.width,
+                reset.height
+            );
+            // And it is sharp: the fringe is a perimeter, so it thins as the
+            // area grows. A resample's fringe would grow with the scale and
+            // this ratio would hold roughly constant.
+            let bound = fringe(&at_identity.setting) * 0.8;
+            assert!(
+                fringe(&mapped.setting) < bound,
+                "scale {s}: fringe {:.3} against {:.3} at identity — resampled?",
+                fringe(&mapped.setting),
+                fringe(&at_identity.setting)
+            );
+            // And the bound has teeth: the resampled picture of the same block
+            // at the same size does not clear it.
+            let blurred = resample(&at_identity.setting, s);
+            assert!(
+                fringe(&blurred) >= bound,
+                "scale {s}: a bilinear magnification scored {:.3} against a \
+                 bound of {bound:.3}, so this assertion proves nothing",
+                fringe(&blurred)
+            );
+        }
+    }
+
+    /// The identity is the *exact* identity, not an approximation of one, which
+    /// is what lets [`set`] be [`set_through`] rather than a second rasteriser
+    /// beside it.
+    #[test]
+    fn setting_through_the_identity_is_setting_it() {
+        let lib = library();
+        for text in ["Umber", "A\u{E000}B", "gggg\nHHHH", "Wide line here\nx"] {
+            let b = block(text);
+            let direct = set_with(&lib, "Regular", &b).expect("ink");
+            let through = set_map(&lib, &b, Affine::IDENTITY).expect("ink");
+            assert_eq!(through.setting, direct, "{text:?}");
+        }
+    }
+
+    /// A rotation turns an ascender into width, so the box has to be measured
+    /// *through* the map rather than measured once and scaled — and the ink has
+    /// to land where the map put it.
+    #[test]
+    fn a_block_set_through_a_rotation_is_measured_through_it() {
+        let lib = library();
+        let b = block("Umber");
+        let upright = set_map(&lib, &b, Affine::IDENTITY).expect("ink");
+        let turned = set_map(
+            &lib,
+            &b,
+            Affine {
+                m: glam::Mat2::from_angle(std::f32::consts::FRAC_PI_2),
+                t: Vec2::ZERO,
+            },
+        )
+        .expect("ink");
+        // A quarter turn swaps the axes, to within the trim's rounding.
+        assert!(
+            turned.setting.width.abs_diff(upright.setting.height) <= 2
+                && turned.setting.height.abs_diff(upright.setting.width) <= 2,
+            "{}x{} is not {}x{} turned",
+            turned.setting.width,
+            turned.setting.height,
+            upright.setting.width,
+            upright.setting.height
+        );
+        // And it went where the map sent it: the block's own space has its ink
+        // at positive x, so a quarter turn about the origin puts it at negative
+        // x. `Placed::at` is signed for exactly this.
+        assert!(
+            turned.at.x < 0,
+            "a quarter turn left the ink at x = {}",
+            turned.at.x
+        );
+    }
+
+    /// Every map a `Transform` can hold still sets the block.
+    ///
+    /// This is the sweep that would have caught the signed-origin bug on the
+    /// spot: `InkRect`'s origin is negative for most text and was being carried
+    /// in a `u32`, so [`Pen::mapped`]'s `corner` came out at about four billion,
+    /// every point was clamped onto the buffer's own origin and the whole block
+    /// came back [`TextError::NoInk`]. Nothing here asserts a picture — the
+    /// tests above do that — only that a map does not make the module answer
+    /// "you typed nothing that makes a mark" about text that plainly does.
+    #[test]
+    fn every_map_a_transform_can_hold_still_sets_the_block() {
+        let lib = library();
+        // Short strings and left sidebearings under a pixel, which is what puts
+        // the measured origin below zero.
+        for text in ["A", "x", "Umber", "gj", "Wide line here\nx"] {
+            let b = block(text);
+            for s in [0.2_f32, 0.5, 1.0, 3.0, 20.0, -1.0] {
+                for turn in [0.0_f32, 0.4, 1.7, -2.9] {
+                    let map = Affine {
+                        m: glam::Mat2::from_angle(turn) * glam::Mat2::from_diagonal(Vec2::splat(s)),
+                        t: Vec2::new(-500.0 * s, 37.0),
+                    };
+                    let out = set_map(&lib, &b, map);
+                    assert!(
+                        matches!(out, Ok(_) | Err(TextError::TooLarge { .. })),
+                        "{text:?} at scale {s} turned {turn}: {:?}",
+                        out.map(|p| (p.setting.width, p.setting.height))
+                    );
+                }
+            }
+        }
+    }
+
+    /// No point a mapped pen is handed ever reaches its clamp.
+    ///
+    /// Named by [`MARGIN`] and by [`Pen::at`], and it is two claims because the
+    /// guarantee is a composition of two:
+    ///
+    /// * [`Pen::at`] and [`BoundsPen::at`] compute the **identical** point, so
+    ///   what was measured is what will be drawn. Stated over a spread of maps
+    ///   and offsets rather than by reading the two expressions and agreeing
+    ///   they look alike — they were written apart and can drift apart.
+    /// * [`Bounds::pixels`] leaves [`MARGIN`] whole pixels outside the box on
+    ///   every side, and `MARGIN` is three where the clamp bites at two.
+    ///
+    /// Together: every control point lands at least 2 inside the buffer and at
+    /// most `size - 2` into it, so `clamp` is the identity on all of them. The
+    /// flattened curve is inside the control hull, so it follows for every point
+    /// the rasteriser actually sees.
+    #[test]
+    fn no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp() {
+        let maps = [
+            Affine::IDENTITY,
+            scale(0.3),
+            scale(17.0),
+            Affine {
+                m: glam::Mat2::from_angle(1.1) * glam::Mat2::from_diagonal(Vec2::new(4.0, -2.0)),
+                t: Vec2::new(-90.0, 250.0),
+            },
+        ];
+        for map in maps {
+            // Half of it: the two pens agree, exactly.
+            for (dx, baseline) in [(0.0, 0.0), (3.5, 40.0), (-12.0, 7.25)] {
+                let mut bp = BoundsPen {
+                    map,
+                    dx,
+                    baseline,
+                    seen: None,
+                };
+                let mut raster = Rasterizer::new(4, 4);
+                let pen = Pen::mapped(&mut raster, dx, baseline, map, Vec2::ZERO);
+                for (x, y) in [(0.0, 0.0), (11.5, -3.25), (-40.0, 900.0)] {
+                    bp.at(x, y);
+                    let want = bp.seen.expect("a point").max;
+                    // `Pen::at` clamps into its buffer, so compare the map
+                    // rather than the clamp: a 4x4 raster would clamp
+                    // everything. The arithmetic before the clamp is the claim.
+                    let got = pen.map.apply(Vec2::new(pen.dx + x, pen.baseline - y)) - pen.corner;
+                    assert_eq!(got, want, "the two pens disagree at ({x}, {y})");
+                    bp.seen = None;
+                }
+            }
+            // The other half: the box the measurement produces keeps `MARGIN`
+            // on every side, so nothing inside it can reach `size - 2`.
+            for (min, max) in [
+                (Vec2::new(0.4, 12.0), Vec2::new(30.0, 40.0)),
+                (Vec2::new(-800.5, -3.25), Vec2::new(-1.0, 0.0)),
+                (Vec2::new(5.0, 5.0), Vec2::new(5.0, 5.0)),
+            ] {
+                let r = Bounds { min, max }.pixels().expect("a box");
+                let lo = min - r.min.as_vec2();
+                let hi = max - r.min.as_vec2();
+                let size = r.size.as_vec2();
+                assert!(
+                    lo.x >= MARGIN - 1.0 && lo.y >= MARGIN - 1.0,
+                    "{min:?} sits {lo:?} into a box that should hold it {MARGIN} in"
+                );
+                assert!(
+                    hi.x <= size.x - (MARGIN - 1.0) && hi.y <= size.y - (MARGIN - 1.0),
+                    "{max:?} at {hi:?} reaches the far edge of {size:?}"
+                );
+                // Which is the clamp's own bound, stated in its own terms.
+                assert!(lo.x > 0.0 && hi.x < size.x - 2.0 && lo.y > 0.0 && hi.y < size.y - 2.0);
+            }
+        }
     }
 }
