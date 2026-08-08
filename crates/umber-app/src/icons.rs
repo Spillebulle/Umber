@@ -397,29 +397,34 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             // than an arc: at 16 px a chamfer and a curve are the same picture,
             // and the polyline is what every other mark here is made of.
             //
-            // The bowls are drawn **wide of what the letter wants**, and that is
-            // measured rather than eyeballed: an `icon_toggle` shrinks its 20 pt
-            // box by two, so this is a 16 px mark, and a heavy stroke that
-            // reaches from a bowl's top edge halfway to its bottom one closes
-            // the counter up and leaves a blob. Each counter is about six units
-            // of the 24 here, which is four pixels of hole at the size it is
-            // actually drawn at.
-            run(vec![at(7.6, 4.0), at(7.6, 20.0)]);
+            // The bowls are drawn **wide of what the letter wants**, and the
+            // figures below are the reason rather than taste. An `icon_toggle`
+            // shrinks its 20 pt box by two, so this is a 16 px mark: `scale` is
+            // 2/3 and the stroke is 1.93 px. The upper bowl spans 7.8 units
+            // gross and the lower 8.2, which after the stroke leaves 4.9 and 5.3
+            // of counter, or 3.3 and 3.5 pixels of hole. Drawn to the letter's
+            // own proportions the holes close up and the mark is a blob.
+            //
+            // The stem is at 6.9 and the widest bowl reaches 17.1, so the mark
+            // is centred in the 24 box. It was not at first, and the offset is
+            // exactly the sort of thing that reads as a wobble beside the
+            // `Italic` next to it without anybody being able to say why.
+            run(vec![at(6.9, 4.0), at(6.9, 20.0)]);
             run(vec![
-                at(7.6, 4.0),
-                at(13.6, 4.0),
-                at(16.6, 6.2),
-                at(16.6, 9.6),
-                at(13.6, 11.8),
-                at(7.6, 11.8),
+                at(6.9, 4.0),
+                at(12.9, 4.0),
+                at(15.9, 6.2),
+                at(15.9, 9.6),
+                at(12.9, 11.8),
+                at(6.9, 11.8),
             ]);
             run(vec![
-                at(7.6, 11.8),
-                at(14.4, 11.8),
-                at(17.8, 14.0),
-                at(17.8, 17.8),
-                at(14.4, 20.0),
-                at(7.6, 20.0),
+                at(6.9, 11.8),
+                at(13.7, 11.8),
+                at(17.1, 14.0),
+                at(17.1, 17.8),
+                at(13.7, 20.0),
+                at(6.9, 20.0),
             ]);
         }
 
