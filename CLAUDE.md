@@ -922,10 +922,19 @@ are the contiguous run immediately below it whose `depth` is greater.
   dab reads as a single dab.
 - **The invalidation rule is `CanvasRenderer::slot_revision`, bumped inside
   every method that writes a slice** — commit, float commit, `write_layer_rect`,
-  clear, mask fill, flip, resize. That is exhaustive by construction, because a
-  layer's pixels cannot change without going through one of them; a `touch` call
+  clear, mask fill, flip, resize. Putting it inside the method rather than
   beside each of the eight call sites in `app.rs` is the "forgotten at the
-  sixth" failure written out in advance. `Thumbs::wanted` is the whole policy —
+  sixth" failure written out in advance.
+  **This file called that "exhaustive by construction" and it was false for
+  exactly one method.** `render_float` writes the float's *preview* slice every
+  frame of a drag and bumped nothing, and nothing noticed because a thumbnail is
+  never taken of the float's spare — so the one consumer that existed could not
+  see the gap. Layer effects found it, because their cache is keyed on the slot
+  the *draw* carries and a float swaps that slot. "By construction" is a claim
+  about a set of methods somebody has to have enumerated; it is true now,
+  `a_dragged_float_carries_the_effect_derived_from_it` is what holds it, and the
+  lesson is that a rule enforced inside N methods still needs somebody to check
+  that N is all of them. `Thumbs::wanted` is the whole policy —
   the active layer first, then stack order — and it is a model with no drawing
   in it.
 - **"Nothing on this layer" is a cached answer, not a missing one**, or a blank
