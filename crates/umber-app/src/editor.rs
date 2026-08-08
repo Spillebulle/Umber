@@ -92,6 +92,20 @@ pub struct Floating {
     pub drag: Option<(Handle, Vec2)>,
 }
 
+/// "one text layer" or "3 text layers", for a notice that has to count them.
+///
+/// A function rather than `"{n} text layer(s)"` because a bracketed plural is a
+/// thing a program writes and not a thing a person does, and this project's own
+/// rule for user-facing text is that it reads the way somebody writes. One is
+/// spelled out for the same reason: "1 text layer" is a form filling in a field.
+fn text_layers(count: usize) -> String {
+    if count == 1 {
+        "one text layer".to_string()
+    } else {
+        format!("{count} text layers")
+    }
+}
+
 /// What a floating block of text was set from, waiting for the commit that will
 /// record it on the layer.
 ///
@@ -1157,8 +1171,9 @@ impl Editor {
                     title: "Text on this document is paint now".to_string(),
                     lines: vec![format!(
                         "The canvas changed size, so Umber no longer knows where the text \
-                         on {dropped} layer(s) goes. Every pixel is still there. What is \
-                         lost is that those layers can be set again."
+                         on {} goes. Every pixel is still there. What is lost is that it \
+                         can be set again.",
+                        text_layers(dropped)
                     )],
                 });
             }
@@ -1223,9 +1238,10 @@ impl Editor {
             self.notice = Some(Notice {
                 title: "Some text is paint now".to_string(),
                 lines: vec![format!(
-                    "{dropped} text layer(s) sat outside the canvas, so Umber could not \
-                     mirror where the text goes. Every pixel is still there. What is lost \
-                     is that those layers can be set again."
+                    "{} sat outside the canvas, so Umber could not mirror where the text \
+                     goes. Every pixel is still there. What is lost is that it can be set \
+                     again.",
+                    text_layers(dropped)
                 )],
             });
         }
@@ -2440,7 +2456,16 @@ mod tests {
             "a resized document kept a placement of the canvas it no longer has"
         );
         let notice = ed.notice.as_ref().expect("the loss was silent");
-        assert!(notice.lines[0].contains('1'), "{:?}", notice.lines);
+        assert!(
+            notice.lines[0].contains("one text layer"),
+            "{:?}",
+            notice.lines
+        );
+        // A bracketed plural is a thing a program writes, not a thing a person
+        // does, and everything here is read by somebody who was painting.
+        assert!(!notice.lines[0].contains("(s)"), "{:?}", notice.lines);
+        assert_eq!(text_layers(1), "one text layer");
+        assert_eq!(text_layers(3), "3 text layers");
         assert!(
             !notice.lines[0].contains('—'),
             "no em-dash in a notice: {:?}",
