@@ -114,6 +114,26 @@ pub const VERSION: u32 = 1;
 /// none at all when it is over, with a [`crate::SaveWarning`] naming the layer;
 /// the reader refuses to read an entry longer than this without decompressing
 /// it, which is what stops a small archive claiming a large record.
+///
+/// # Why this is not `MAX_EFFECTS_BYTES`, and what the two do share
+///
+/// A layer effects record has the same hazard and its bound is deliberately a
+/// different *kind* of figure. `docimport::openraster::MAX_EFFECTS_BYTES` is
+/// **derived** — one effect per kind, `effect::MAX_ENABLED` per document, times a
+/// measured bytes-per-effect, doubled — so the model already makes an over-long
+/// record unwritable and the bound is needed on the reading side alone. This one
+/// **cannot be derived**: [`crate::text::MAX_PIXELS`] bounds the area a block
+/// renders to, not how much somebody typed, so a legal block really can outrun
+/// any figure chosen here. That is the whole reason this is public and checked at
+/// both ends where that one is private and checked at one.
+///
+/// So one shared constant would be wrong in both directions: at a mebibyte the
+/// effects bound would be sixteen times looser than its own model permits, and at
+/// 64 KiB this one would refuse tens of thousands of characters somebody could
+/// legitimately set. **What they do share is where the figure lives: with
+/// whichever side can violate it.** A bound only a stranger's file can breach
+/// belongs in the reader; one the writer can breach belongs beside the model, so
+/// the refusal and the warning are one statement rather than two.
 pub const MAX_RECORD_BYTES: usize = 1 << 20;
 
 /// The longest a family, a style or a PostScript name may be in a record.

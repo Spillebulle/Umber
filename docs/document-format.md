@@ -52,6 +52,8 @@ umber/history/index.json    the saved undo history, when there is one — see be
 umber/history/0000-000.png  …and one PNG per piece of each recorded edit
                             (an entry that stores no pixels — a canvas flip —
                             writes none)
+umber/masks/000.png         a layer's mask, when it has one
+umber/effects/000.ron       a layer's effects, when it has any — see below
 ```
 
 `stack.xml` for a two-layer document:
@@ -87,12 +89,12 @@ which is what a save actually spends its time on. A layer nobody has painted on
 is written as a single transparent pixel rather than as nothing, so that it
 survives rather than disappearing from the stack.
 
-## Umber's five extra attributes
+## Umber's extra attributes
 
-Five things Umber knows have nowhere to go in baseline ORA. They are written as
-extra attributes, which every XML reader ignores if it does not recognise them,
-so the file remains an ordinary `.ora` everywhere else. The `umber-` prefix keeps
-them clear of anything the specification may add later.
+Several things Umber knows have nowhere to go in baseline ORA. They are written
+as extra attributes, which every XML reader ignores if it does not recognise
+them, so the file remains an ordinary `.ora` everywhere else. The `umber-`
+prefix keeps them clear of anything the specification may add later.
 
 | Attribute | On | Meaning |
 |---|---|---|
@@ -101,6 +103,8 @@ them clear of anything the specification may add later.
 | `umber-blend` | a `<layer>` | Umber's own mode name, where the SVG one is inexact. |
 | `umber-background` | the bottom `<layer>` | That layer *is* the document background, and this is its colour. |
 | `umber-history` | `<image>` | Names the entry describing a saved undo history. |
+| `umber-mask` | a masked `<layer>` | Names the entry holding the layer's mask. |
+| `umber-effects` | an effected `<layer>` | Names the entry holding the layer's effects — see below. |
 | `umber-clip`, `umber-lock`, `umber-link` | a `<layer>` | Clipped to the one below; locked; in a link group. Written only when set. |
 | `umber-link-group` | a linked `<layer>` | *Which* link group, as a number — see below. |
 
@@ -136,6 +140,49 @@ running build's is **refused**, before a pixel is decoded, with a message saying
 so and pointing at the two ways out: update Umber, or open it in another
 OpenRaster application — which still works, because the file is still an ORA.
 Additions an older build can safely ignore do not need a bump.
+
+The revisions so far, and each is what a file *contains* rather than what wrote
+it. **1** is everything baseline. **2** is a layer mask or a clipped layer, both
+of which change the picture in a build that ignores them. **3** is layer
+effects. The writer emits the lowest of these that describes the file, so a
+document with no mask, no clipping and no effects still declares 1 and still
+opens in every Umber there has ever been.
+
+## Layer effects
+
+A layer's effects — a drop shadow, a stroke — go in a RON record under
+`umber/effects/`, named by `umber-effects` on the `<layer>`. That is the mask's
+shape, and the attribute is what makes it work: a single table for the whole
+document would have to be keyed by something, and a stack position shifts, a
+name is not unique, and a layer's id is a within-session identity that is never
+written down. An attribute travels with its element and needs no key at all.
+
+Effects are what took `umber-version` to 3, and the argument is not what an
+older build *shows* — that is a layer without its shadow, which is merely
+plainer. It is what an older build *writes*. Effects are non-destructive, so the
+parameters are the whole feature: a build that has never heard of the attribute
+opens the document, saves it, and `umber/effects/` is gone for good. That is the
+same property masks and clipping were refused for.
+
+Saving an effected layer raises a warning, once for the document, because no
+other OpenRaster application can read the record and those layers will look
+plain everywhere else. Umber's own reader loses nothing: a record comes back as
+the effects it was written from, parameter for parameter, with a colour that
+does not move.
+
+Both writers are connected: Save reads the stack it is looking at, and the
+autosave takes a layer's effects with its name when the capture begins, so a
+file's parameters and its pixels always come from the same instant. They had to
+be wired together. Wiring Save alone would have made an effect's survival depend
+on which path last touched the file, with the five-minute timer stripping what
+Save had kept.
+
+Nothing in the interface can make an effect yet, so today this is a format with
+no author. That is deliberate: the parameters are settled and round-trip before
+anything can create one, so the first control cannot ship a document Umber
+cannot reopen.
+
+`docs/layer-effects.md` is the whole design.
 
 ## The undo history
 

@@ -32,6 +32,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 use umber_core::Harmony;
 use umber_core::input::PressureSource;
 
@@ -968,6 +970,32 @@ pub fn flush_if_idle(ctx: &egui::Context, ed: &Editor) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The right to be the only test calling [`apply`].
+    ///
+    /// `apply` publishes the undo budget to a **process-global**
+    /// (`umber_core::history::set_default_budget`), which is deliberate — a
+    /// `History` is built by three things that cannot see a `Prefs`, so the
+    /// setting reaches them the way `shortcuts::publish` does. The cost is that
+    /// every test calling `apply` writes one variable, and the harness runs
+    /// them on parallel threads.
+    ///
+    /// Measured before it was fixed: `the_undo_budget_reaches_the_history_and_
+    /// back` failed **10 runs in 40** at sixteen threads. It publishes 1024 MB
+    /// and asserts it; three other tests publish the default and land between
+    /// the two lines. It survived the whole-workspace run because six hundred
+    /// other tests change the interleaving, which is the worst shape for this —
+    /// green on the gate, red on whoever next runs `cargo test prefs`.
+    ///
+    /// Hold the guard for the **whole** test; binding it with `let _ =` drops it
+    /// on the spot and buys nothing. Poisoning is recovered from so one failing
+    /// test reports its own assertion rather than turning every later one into a
+    /// mutex error — `gputest::lock`'s reasoning, and this is that idiom for a
+    /// global that is not a device.
+    fn prefs_lock() -> MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
     use winit::keyboard::KeyCode;
 
     fn turned(triangle: f32, square: f32) -> WheelAngles {
@@ -1020,6 +1048,7 @@ mod tests {
     /// that are — which is the step that would be easy to leave out.
     #[test]
     fn the_wheels_rotation_survives_a_restart() {
+        let _serial = prefs_lock();
         let prefs = Prefs {
             wheel_rotates: false,
             ..Prefs::default()
@@ -1098,6 +1127,7 @@ mod tests {
     /// keeping two.
     #[test]
     fn each_wheel_shapes_angle_survives_a_restart() {
+        let _serial = prefs_lock();
         let prefs = Prefs {
             wheel_angles: turned(30.0, 200.0),
             ..Prefs::default()
@@ -1246,6 +1276,7 @@ mod tests {
     /// would arrive underneath another test's document.
     #[test]
     fn the_undo_budget_reaches_the_history_and_back() {
+        let _serial = prefs_lock();
         let prefs = Prefs {
             undo_budget_mb: 1024,
             ..Prefs::default()
@@ -1331,6 +1362,7 @@ mod tests {
 
     #[test]
     fn the_autosave_settings_survive_a_restart() {
+        let _serial = prefs_lock();
         let prefs = Prefs {
             autosave: false,
             autosave_interval_minutes: 20,

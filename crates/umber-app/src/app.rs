@@ -854,10 +854,31 @@ impl UmberApp {
                 // only true when the slice that comes free happens to be the
                 // one at the top of the range.
                 lines: vec![
+                    // No figure: it used to say "of 129", and the ceiling now
+                    // carries headroom for effect slices, so a count naming it
+                    // is a number the painter cannot check against anything on
+                    // screen.
+                    //
+                    // And no "fewer layers, or fewer masks", which is what this
+                    // said until the comment above was read against it. That is
+                    // precisely the remedy that does not work — a delete and a
+                    // `remove_mask` both *park* the slice — so it was the
+                    // control-that-lies this project refuses, in the one place
+                    // somebody is already stuck. Reopening genuinely works: the
+                    // stack is rebuilt from a fresh pool and the numbering
+                    // packs back down from zero.
+                    //
+                    // **And it names what that costs**, because it costs
+                    // something: `SaveHistory::new` skips structural entries,
+                    // which are exactly the ones holding parked slices, so the
+                    // reopened document cannot undo the deletes that got it
+                    // here. An advice that works and quietly throws away undo
+                    // history is the same class of failure as one that does
+                    // not work — the artist has to be able to weigh it.
                     "A transform needs a spare texture slice to preview into, and \
-                     this document is using every one Umber has. A layer takes one \
-                     and a mask takes another, of 129. Fewer layers, or fewer \
-                     masks, will make room."
+                     this document is using every one Umber has. Saving and \
+                     reopening the document will pack them back down, though \
+                     deleted layers cannot be brought back afterwards."
                         .to_string(),
                 ],
             });
@@ -1474,9 +1495,21 @@ impl UmberApp {
     /// `SlotPool::give_back` can compact. So where the live stack itself
     /// reaches the ceiling, no eviction whatever can help, and without the
     /// guard `free_until` would empty the undo stack, drain the redo stack and
-    /// then answer false. On a legal document — 64 layers each with a mask — a
-    /// single pen-down with the transform tool in hand would have destroyed the
-    /// whole session's history and refused the transform anyway.
+    /// then answer false.
+    ///
+    /// **`live_slot_ceiling` is one past the highest slot *number* a live layer
+    /// holds, not a count of live layers**, and reading it as a count is the
+    /// mistake to avoid here. Parked slices push the numbering up and
+    /// `SlotPool::give_back` compacts only the *tail*, so a layer created while
+    /// most of the range is parked takes a number near the top and holds it
+    /// there however much history is then given up. Two live layers are enough.
+    /// This is why the guard is not made redundant by the slice ceiling being
+    /// far above what a stack can claim on its own.
+    ///
+    /// The document this used to be described with was 64 layers each with a
+    /// mask, and that was **already** wrong: 128 slices against the ceiling of
+    /// 129 left `has_headroom` true, so the first `if` returned and the guard
+    /// never ran. It is further from the ceiling now, at 256.
     fn free_headroom(&mut self) -> bool {
         let room = self.editor.layers.room();
         if room.has_headroom() {
@@ -2113,17 +2146,7 @@ impl UmberApp {
                 .iter()
                 .zip(&pixels)
                 .zip(&masks)
-                .map(|((layer, px), mask)| SaveLayer {
-                    visible: layer.visible,
-                    opacity: layer.opacity,
-                    mask: mask.as_deref(),
-                    clipped: layer.clipped,
-                    locked: layer.locked,
-                    link: layer.link,
-                    depth: layer.depth,
-                    folder: layer.is_folder(),
-                    ..SaveLayer::new(&layer.name, layer.blend, px)
-                })
+                .map(|((layer, px), mask)| save_layer(layer, px, mask.as_deref()))
                 .collect();
 
             // The undo history, resolved against the stack it belongs to. No
@@ -4368,6 +4391,45 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// One layer as an explicit Save writes it.
+///
+/// A free function rather than a closure inside the save, so that what it
+/// carries can be **tested by value** — and this is not tidiness. The guard
+/// over the two `SaveLayer` construction sites is textual: it counts the sites
+/// and requires each to state `effects:`. That catches the line being
+/// *deleted* and is defeated by one that still names the field while passing
+/// nothing. `effects: &[]` is both what this path held before it was wired and
+/// what `..SaveLayer::new(…)` still defaults to, so it is the likelier
+/// regression of the two, and it was the one nothing caught.
+/// `a_save_carries_the_effects_the_layer_holds` closes it.
+///
+/// The autosave's equivalent already had a behavioural test
+/// (`effects_are_snapshotted_when_the_capture_begins_not_when_it_is_written`),
+/// which is why only this half was exposed — two paths sharing a rule do not
+/// share a guard unless somebody arranges it.
+fn save_layer<'a>(
+    layer: &'a umber_core::Layer,
+    px: &'a [u8],
+    mask: Option<&'a [u8]>,
+) -> SaveLayer<'a> {
+    SaveLayer {
+        visible: layer.visible,
+        opacity: layer.opacity,
+        mask,
+        // Straight off the layer, because a save reads the stack it is looking
+        // at. The autosave cannot do this — its pixels arrive over several
+        // frames, so its metadata is snapshotted when the capture begins — and
+        // the two have to write the same file. See `autosave::LayerMeta`.
+        effects: layer.effects(),
+        clipped: layer.clipped,
+        locked: layer.locked,
+        link: layer.link,
+        depth: layer.depth,
+        folder: layer.is_folder(),
+        ..SaveLayer::new(&layer.name, layer.blend, px)
+    }
+}
+
 /// Make sure a chosen path ends in the extension Umber saves with.
 ///
 /// Not every platform's save dialog appends the filter's extension, and a
@@ -4437,6 +4499,110 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The behavioural half of the guard below, and the half that was missing.
+    ///
+    /// That one is textual and catches the `effects:` line being deleted. It is
+    /// defeated by `effects: &[]`, which still names the field — and which is
+    /// both what this path held before it was wired and what
+    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
+    /// directions: neutering the value fails *this* test and passes that one;
+    /// deleting the line fails that one and passes this.
+    #[test]
+    fn a_save_carries_the_effects_the_layer_holds() {
+        let mut stack = umber_core::LayerStack::new();
+        assert!(
+            stack.set_effect(0, umber_core::Effect::drop_shadow()),
+            "the model should accept one effect on a fresh layer"
+        );
+
+        let layer = &stack.layers()[0];
+        assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
+
+        let written = save_layer(layer, &[], None);
+        assert_eq!(
+            written.effects,
+            layer.effects(),
+            "a Save must write the effects the layer is holding, not an empty slice",
+        );
+    }
+
+    /// **Every writer of a `SaveLayer` states its effects, and this is a text
+    /// guard on purpose.**
+    ///
+    /// There are two — Save, here, and the autosave — and both build the
+    /// struct with `..SaveLayer::new(…)`, which **defaults** `effects` to
+    /// empty. So deleting the field from either compiles and passes, and the
+    /// failure is silent in the worst way: the document opens with its effects
+    /// and is written back without them, which is precisely the
+    /// open-and-save-loses-it failure `umber-version` 3 was raised to prevent,
+    /// reproduced inside the build that raised it and invisible to the version
+    /// gate because that gate is `version > VERSION`.
+    ///
+    /// The autosave's half is checked by *behaviour* —
+    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` reopens
+    /// the file it wrote. Save's cannot be: it reads every layer back off the
+    /// GPU first, so exercising it needs a device and a whole document. What
+    /// is left is the shape.
+    ///
+    /// **The file list is hand-written, and a writer in a third file is
+    /// invisible to this.** An earlier draft of this comment claimed "a third
+    /// one arrives already covered", which is false, and is exactly the claim
+    /// CLAUDE.md warns is easier to write than the guard: `include_str!` takes
+    /// a literal, so nothing here can discover a file it was not told about.
+    /// Adding a writer means adding its file below. What the list *is* total
+    /// over is the writers inside each file it names.
+    ///
+    /// **Wiring one and not the other would be worse than wiring neither**, and
+    /// that is why this insists on both at once rather than on Save alone: an
+    /// effect surviving or not depending on whether Save or the five-minute
+    /// timer last touched the file is not a rule anybody can learn, where
+    /// losing them consistently is at least a bug somebody reports.
+    ///
+    /// **Its reach is uneven and every claim here was run rather than
+    /// reasoned.** Three mutations:
+    ///
+    /// * Delete Save's `effects:` line — **fails**, 1 literal against 0.
+    /// * Move Save's construction behind an alias, so `app.rs` no longer holds
+    ///   the literal text at all, which is what "extracted into a helper" looks
+    ///   like — **fails** on `literals > 0`. A critic predicted this would pass
+    ///   and it did, against the version *before* the source was cut at
+    ///   `#[cfg(test)]`: the self-reference kept the count at 1 and propped the
+    ///   assertion up. Cutting the test off fixed both holes at once.
+    /// * Delete the autosave's `effects:` line — **passes**, because
+    ///   `autosave.rs` names the field three times outside its tests, on
+    ///   `LayerMeta`, in `snapshot` and in `run_task`, so a lower bound of one
+    ///   is still met. That writer is covered by *behaviour* instead
+    ///   (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails
+    ///   on it), which is the stronger guard and the reason the weaker one is
+    ///   only asked to carry the writer that cannot have one.
+    #[test]
+    fn every_writer_of_a_save_layer_states_its_effects() {
+        // **Everything from `#[cfg(test)]` on is cut off first, and that is
+        // not tidiness.** This test's own body names both strings it counts,
+        // and its failure message named one of them — so the first draft read
+        // two `SaveLayer {` in this file where there is one, and two
+        // `effects:` where there is one, and passed on a coincidence. It did
+        // still fail under the mutation, by 1 against 2, which is exactly how
+        // a guard that passes for the wrong reason survives review. A text
+        // guard has to be told not to read itself.
+        for (file, whole) in [
+            ("app.rs", include_str!("app.rs")),
+            ("autosave.rs", include_str!("autosave.rs")),
+        ] {
+            let source = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            let literals = source.match_indices("SaveLayer {").count();
+            assert!(literals > 0, "{file} builds no SaveLayer any more");
+            let stated = source.match_indices("effects:").count();
+            assert!(
+                stated >= literals,
+                "{file} builds {literals} SaveLayer(s) outside its tests and \
+                 names the field {stated} time(s); `..SaveLayer::new` defaults \
+                 it to empty, so the one that does not name it drops a layer's \
+                 effects in silence"
+            );
+        }
+    }
 
     #[test]
     fn a_modifier_overrides_the_strips_setting_for_one_gesture_and_no_longer() {

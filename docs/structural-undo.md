@@ -1,5 +1,14 @@
 # Structural undo
 
+> **The slot ceiling moved after this was written.** `LayerStack::MAX_SLOTS` is
+> **256**, not 129 — it is the device's `max_texture_array_layers` guarantee
+> rather than `MAX * 2 + 1`, and 127 of it is reserved as the layer-effect
+> budget. Growth is no longer plain doubling either: it doubles inside a byte
+> budget and rounds to a quantum past it. Every figure below that names 129, or
+> describes growth as doubling, needs re-deriving before it is acted on; the
+> arguments do not change, the arithmetic does. See `docs/layer-effects.md`
+> §6.3 and `grown_capacity` in `canvas.rs`.
+
 Umber's undo covers painting, transforms and the two canvas flips. Adding a
 layer, deleting one, reordering the stack, grouping, and adding or removing a
 mask are not recorded — and two of those **clear the whole history**:

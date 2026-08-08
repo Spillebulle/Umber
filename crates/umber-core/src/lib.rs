@@ -16,6 +16,7 @@ pub mod docformat;
 pub mod docimport;
 pub mod document;
 pub mod dynamics;
+pub mod effect;
 pub mod export;
 pub mod fonts;
 pub mod geom;
@@ -50,6 +51,9 @@ pub use docformat::{SaveDocument, SaveError, SaveLayer, SaveWarning};
 pub use docimport::{ImportError, ImportedDocument, ImportedLayer};
 pub use document::{Anchor, Background, CanvasCopy, Document, Unit};
 pub use dynamics::{DabInput, DabTarget, Modulation, Modulations};
+// `Outline`, never `Stroke` — see `effect`'s module docs. The interface's word
+// for it is `EffectKind::label`'s and lives nowhere else.
+pub use effect::{Effect, EffectKind, OutlinePosition};
 pub use export::{ExportError, ExportFormat, ExportLoss, ExportOptions};
 pub use fonts::{Face, FontLibrary};
 pub use geom::{FlipAxis, PixelRect, Rect};
