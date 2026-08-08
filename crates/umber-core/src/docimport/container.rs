@@ -62,6 +62,13 @@ pub fn read_optional_entry(
 /// entry. A four-megabyte file that hangs the application is a worse outcome
 /// than every malformed case this module handles well.
 ///
+/// **A text record is the second entry of that shape**, and it arrived by the
+/// same reasoning independently: `umber/text/<n>.json` is as long as somebody
+/// typed, which the canvas does not bound either. Two callers with two figures
+/// is what the parameter is for — [`crate::textobj::MAX_RECORD_BYTES`] is the
+/// other one — and the fact that the second case reached this signature without
+/// changing it is the check on the first.
+///
 /// So the caller states what its own content can be, and the check happens
 /// against the *declared* size before a byte is decompressed as well as against
 /// what actually arrives — the header is only a claim.

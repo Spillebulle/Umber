@@ -55,6 +55,15 @@
 //! * **[`EFFECTS_ATTR`]** on a `<layer>` carrying layer effects, naming an
 //!   entry under `umber/effects/`. Same shape as the mask and for the same
 //!   reason; see that constant.
+//! * **[`TEXT_ATTR`]** on a `<layer>` whose pixels were *set* rather than
+//!   painted, naming a record under `umber/text/`. See that constant and
+//!   [`crate::textobj`]. **It is the one extension an older build can be
+//!   actively *wrong* about**, and the two above are what make that precise
+//!   rather than dramatic: a mask and an effect each took [`VERSION`] up, so an
+//!   older build meeting one *refuses the document* and cannot be wrong about
+//!   anything in it. Text declares nothing, so such a build opens the file, and
+//!   the fingerprint in the record is what stands in for the version — it is
+//!   why [`VERSION`] did not have to move, not a nicety beside it.
 //! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
 //!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
@@ -149,6 +158,7 @@ use crate::color::Color;
 use crate::docimport::srgb;
 use crate::document::Background;
 use crate::effect::Effect;
+use crate::geom::PixelRect;
 use crate::layer::{BlendMode, LayerStack};
 
 pub use history::{HISTORY_ATTR, SaveHistory};
@@ -220,6 +230,17 @@ pub const VERSION: u32 = 3;
 /// [`VERSION`] unconditionally would lock every file this build touches away
 /// from older ones in exchange for nothing: a revision number is a statement
 /// about what a file *contains*, not about what wrote it.
+///
+/// **A text record is deliberately absent from this, and that is the whole of
+/// why [`TEXT_ATTR`] did not move [`VERSION`].** An older build ignores the
+/// attribute, decodes the ordinary layer PNG and shows the identical picture,
+/// and — unlike an effect — it cannot silently *drop* anything by saving,
+/// because the fingerprint in the record is what makes this build refuse a
+/// record whose pixels have moved. So a document of nothing but text layers
+/// still declares 1, and one carrying an effect as well declares 3 for the
+/// effect alone. `text_never_raises_the_revision_a_document_declares` drives all
+/// four combinations, because that is a claim about the two features *together*
+/// and neither of them could have made it by itself.
 fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
     // Folders are skipped throughout, and not merely because they never carry
     // any of this today: `clipped` is a public field on `Layer` and nothing
@@ -302,6 +323,34 @@ pub const LINK_GROUP_ATTR: &str = "umber-link-group";
 /// Where a layer's mask goes inside the archive.
 pub fn mask_src(index: usize) -> String {
     format!("umber/masks/{index:03}.png")
+}
+
+/// `<layer>` attribute naming the archive entry holding what *set* the layer.
+///
+/// Outside the ORA layer stack, under `umber/`, exactly as [`MASK_ATTR`] is and
+/// for a reason of its own: `stack.xml` must not carry a paragraph of somebody's
+/// prose. An attribute value is XML-escaped text, so a poem with `<`, `&` and a
+/// newline in it would go into the one file every other OpenRaster reader parses,
+/// and it would be the largest thing in it.
+///
+/// **This did not move [`VERSION`], and unlike the locks and the links it is not
+/// obvious.** An older build ignores the attribute and decodes the ordinary
+/// layer PNG, so it shows the identical picture and loses only that the text can
+/// be set again — plainer, not wrong, which is the line the version is drawn on.
+/// What makes that honest rather than merely convenient is that such a build can
+/// also *paint* on the layer and save it: the record would then describe pixels
+/// it did not make, and re-rendering would destroy the brushwork. So the record
+/// carries a fingerprint of the layer image it rendered, and a mismatch on the
+/// way back in discards the record and keeps the picture. See
+/// [`crate::textobj`], and `docs/text-tool.md` §3.
+pub const TEXT_ATTR: &str = "umber-text";
+
+/// Where a layer's text record goes inside the archive.
+///
+/// Indexed exactly as [`mask_src`] and [`effects_src`] are — by the layer's
+/// position in the *file*, top first.
+pub fn text_src(index: usize) -> String {
+    format!("umber/text/{index:03}.json")
 }
 
 /// `<layer>` attribute naming the archive entry holding the layer's effects.
@@ -398,6 +447,13 @@ pub struct SaveLayer<'a> {
     pub locked: bool,
     /// Which link group this layer belongs to, if any. See [`LINK_GROUP_ATTR`].
     pub link: Option<u8>,
+    /// What set this layer's pixels, where they were set rather than painted.
+    ///
+    /// Written as its own archive entry under `umber/text/` and pointed at by
+    /// [`TEXT_ATTR`], with a fingerprint of the layer image *this save* is
+    /// writing — never one the caller supplies, because a fingerprint the model
+    /// carried could be stale and this one cannot. See [`crate::textobj`].
+    pub text: Option<&'a crate::textobj::TextObject>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     pub depth: u8,
     /// This entry is a folder: it becomes a nested `<stack>` and has no `src`,
@@ -427,6 +483,7 @@ impl<'a> SaveLayer<'a> {
             clipped: false,
             locked: false,
             link: None,
+            text: None,
             depth: 0,
             folder: false,
         }
@@ -496,6 +553,25 @@ pub enum SaveWarning {
         mode: &'static str,
         used: &'static str,
     },
+    /// The layer's text record could not be written, so the layer is paint in the
+    /// file. Every pixel is there; what is lost is that the text can be set
+    /// again.
+    ///
+    /// `why` carries the reason rather than the sentence assuming one, because
+    /// there are two and the artist can act on the difference: a record over
+    /// [`crate::textobj::MAX_RECORD_BYTES`], or a figure that is not a figure.
+    /// Saying "too much text" for the second is a notice that lies.
+    ///
+    /// Named rather than passed over for the reason every import warning is: a
+    /// text layer that had quietly stopped being editable by the time somebody
+    /// reopened the document is a loss discovered instead of reported. **An
+    /// autosave drops this**, along with every other save warning, and that is
+    /// right — a notice nobody asked for, over a copy nobody asked for, is the
+    /// dialog that reappears every five minutes.
+    TextNotRecorded {
+        layer: String,
+        why: crate::textobj::NotRecorded,
+    },
     /// Some layers carry effects, which no other OpenRaster reader can see.
     ///
     /// Named in the same breath as an approximated blend mode because it is
@@ -535,6 +611,12 @@ impl std::fmt::Display for SaveWarning {
                 "Layer “{layer}”: OpenRaster has no exact equivalent of {mode}, so it is \
                  written as {used}. Umber reopens it as {mode}; other applications will \
                  composite it slightly differently where the layer is partly transparent."
+            ),
+            Self::TextNotRecorded { layer, why } => write!(
+                f,
+                "Layer “{layer}”: {}, so it was saved as paint. The picture is complete, but \
+                 the text cannot be edited again after the document is reopened.",
+                why.reason()
             ),
             Self::EffectsNotPortable { layers } => write!(
                 f,
@@ -770,6 +852,47 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             None => None,
         };
 
+        // The text record, fingerprinted against the layer image **this save is
+        // writing** rather than against anything the caller holds. That is what
+        // makes the fingerprint unable to be stale, and it is why the record's
+        // own type carries none: see `textobj`'s module docs.
+        //
+        // A record too large for `textobj::MAX_RECORD_BYTES` is not written and
+        // is *named*, because a text layer that silently stopped being editable
+        // at the next open would be a loss nobody was told about. The picture is
+        // whole either way — the pixels are the layer's ordinary PNG.
+        let text_entry = match layer.text {
+            Some(text) => {
+                let print = crate::textobj::Fingerprint::of(
+                    PixelRect {
+                        x: placed.at.0,
+                        y: placed.at.1,
+                        width: placed.size.x,
+                        height: placed.size.y,
+                    },
+                    &placed.pixels,
+                );
+                match text.to_json(&print) {
+                    Ok(json) => {
+                        let src = text_src(i);
+                        // Deflated: this is JSON, which is text, and the one
+                        // entry in the archive that compresses well.
+                        zip.start_file(&src, deflated())?;
+                        zip.write_all(&json)?;
+                        Some(src)
+                    }
+                    Err(why) => {
+                        warnings.push(SaveWarning::TextNotRecorded {
+                            layer: layer.name.to_string(),
+                            why,
+                        });
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         // The effects, as RON under `umber/effects/`, where no other reader
         // will look. `docs/layer-effects.md` §8.1 and [`EFFECTS_ATTR`].
         //
@@ -815,6 +938,7 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                 exact,
                 selected,
                 mask_src.as_deref(),
+                text_entry.as_deref(),
                 effects_src.as_deref(),
             ),
         });
@@ -1074,6 +1198,7 @@ fn layer_xml(
     exact: bool,
     selected: bool,
     mask: Option<&str>,
+    text: Option<&str>,
     effects: Option<&str>,
 ) -> String {
     let mut out = format!(
@@ -1093,6 +1218,12 @@ fn layer_xml(
     }
     if let Some(mask) = mask {
         out.push_str(&format!(" {MASK_ATTR}=\"{mask}\""));
+    }
+    // The entry's *name*, never the record: see [`TEXT_ATTR`]. A path Umber
+    // built, so there is nothing in it to escape. The same is true of the
+    // effects entry beside it.
+    if let Some(text) = text {
+        out.push_str(&format!(" {TEXT_ATTR}=\"{text}\""));
     }
     if let Some(effects) = effects {
         out.push_str(&format!(" {EFFECTS_ATTR}=\"{effects}\""));
@@ -1406,6 +1537,301 @@ mod tests {
 
     fn layer<'a>(name: &'a str, pixels: &'a [u8]) -> SaveLayer<'a> {
         SaveLayer::new(name, BlendMode::Normal, pixels)
+    }
+
+    // --- text layers --------------------------------------------------------
+
+    fn text_object() -> crate::textobj::TextObject {
+        use crate::text::{Align, TextBlock};
+        use crate::textobj::{Placement, TextFace, TextObject};
+        TextObject::new(
+            TextBlock {
+                text: "A caption <&> a second line".into(),
+                size: 24.0,
+                line_spacing: 1.0,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: "Archivo-Regular".into(),
+            },
+            Color::from_srgb_u8(10, 20, 30, 255),
+            Placement::identity(PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+        )
+    }
+
+    /// A one-text-layer document, and the text record inside it.
+    fn text_document(size: UVec2, px: &[u8]) -> Vec<u8> {
+        let text = text_object();
+        let layers = vec![SaveLayer {
+            text: Some(&text),
+            ..layer("Caption", px)
+        }];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: px,
+            history: None,
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        bytes
+    }
+
+    /// What set a layer comes back, and the string comes back **out of its own
+    /// archive entry** rather than out of `stack.xml`.
+    ///
+    /// The prose in the fixture carries `<`, `&` and `>` deliberately: an
+    /// attribute would have had to escape all three, in the one file every other
+    /// OpenRaster reader parses, and it would have been the largest thing in it.
+    #[test]
+    fn a_text_layer_comes_back_as_text() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let bytes = text_document(size, &px);
+
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains(&format!("{TEXT_ATTR}=\"{}\"", text_src(0))),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains("A caption"),
+            "the prose must not be in stack.xml:\n{xml}"
+        );
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let text = doc.layers[0].text.as_deref().expect("the record came back");
+        assert_eq!(*text, text_object());
+
+        // And the stack it opens as holds it, with painting refused on it.
+        let opened = doc.open();
+        assert!(opened.stack.text_at(0).is_some());
+        assert_eq!(
+            opened.stack.refusal_at(0, crate::layer::EditTarget::Layer),
+            Some(crate::layer::EditRefusal::Text)
+        );
+    }
+
+    /// **`umber-version` did not move for text**, and this is the test the claim
+    /// rests on.
+    ///
+    /// A record is an attribute an older build ignores beside a layer PNG it
+    /// decodes, so it opens the document and shows the identical picture. That is
+    /// "plainer", not "wrong", which is the line `VERSION` is drawn on — and the
+    /// fingerprint is what keeps it true in the case that argument nearly missed,
+    /// which `a_text_layer_painted_on_by_an_older_build_opens_as_paint` is.
+    #[test]
+    fn a_document_of_text_layers_still_declares_the_revision_it_needs() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let xml = read_stack_xml(&text_document(size, &px));
+        assert!(
+            xml.contains(&format!("{VERSION_ATTR}=\"1\"")),
+            "a text layer is not a reason to shut older builds out:\n{xml}"
+        );
+    }
+
+    /// **All four combinations of a text record and an effect**, because the
+    /// claim "text raises nothing" is about the two features *together* and
+    /// neither of them could have made it alone.
+    ///
+    /// The trap this is written against is a test that asserts 3 and passes for
+    /// the wrong reason: effects take a document to 3 on their own, so a text
+    /// test whose fixture happened to carry one would confirm nothing. Here the
+    /// text-only row is the load-bearing one and the effect rows are what say
+    /// the figure still moves when it should.
+    #[test]
+    fn text_never_raises_the_revision_a_document_declares() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [1, 2, 3, 255]);
+        let text = text_object();
+        let outline = crate::effect::Effect::outline();
+
+        for (with_text, with_effect, want) in [
+            (false, false, 1),
+            (true, false, 1),
+            (false, true, 3),
+            (true, true, 3),
+        ] {
+            let mut one = layer("Caption", &px);
+            if with_text {
+                one.text = Some(&text);
+            }
+            if with_effect {
+                one.effects = std::slice::from_ref(&outline);
+            }
+            let layers = vec![one];
+            let (bytes, _) = encode(&SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                background: Background::Transparent,
+                dpi: Document::DEFAULT_DPI,
+                merged: &px,
+                history: None,
+            })
+            .expect("encode");
+            let xml = read_stack_xml(&bytes);
+            assert!(
+                xml.contains(&format!("{VERSION_ATTR}=\"{want}\"")),
+                "text {with_text}, effect {with_effect} should declare {want}:\n{xml}"
+            );
+        }
+    }
+
+    /// **The guard `docs/text-tool.md` §3 names.** An older build opens the
+    /// document, the artist paints on the text layer, it is saved again with the
+    /// record still beside pixels it did not make — and this build must open it as
+    /// paint rather than re-render over that painting.
+    ///
+    /// The simulation is exactly that: the same archive with a different layer
+    /// PNG in it. Nothing else about the file changes, which is the point — the
+    /// record is untouched and still says what it always said.
+    #[test]
+    fn a_text_layer_painted_on_by_an_older_build_opens_as_paint() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let bytes = text_document(size, &px);
+
+        // One pixel changed, in a PNG of the same size at the same offset — so
+        // the fingerprint's rectangle still matches and only the hash does not.
+        // The weaker of the two halves, deliberately.
+        let painted = {
+            let mut over = solid(size, [10, 20, 30, 255]);
+            over[0] = 255;
+            encode_png(size, &over).unwrap()
+        };
+        let doc = docimport::read_openraster(&with_entry(&bytes, "data/layer000.png", painted))
+            .expect("the picture still opens");
+
+        assert!(
+            doc.layers[0].text.is_none(),
+            "a record that does not fingerprint the pixels must be dropped"
+        );
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, crate::docimport::ImportWarning::TextDropped { .. })),
+            "and it must say so: {:?}",
+            doc.warnings
+        );
+        // The painting is what is kept, which is the whole of the trade.
+        assert_eq!(doc.layers[0].pixels[0], 255);
+    }
+
+    /// A record from a newer revision, and one that is simply rubbish, are both
+    /// discarded rather than refusing the document. `docformat::VERSION` is what
+    /// refuses a *document*; a record is discarded, for the reason a history
+    /// manifest is.
+    #[test]
+    fn an_unreadable_text_record_drops_the_text_and_keeps_the_picture() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let bytes = text_document(size, &px);
+
+        for body in [
+            b"not json at all".to_vec(),
+            {
+                let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+                let mut held = Vec::new();
+                std::io::Read::read_to_end(&mut zip.by_name(&text_src(0)).unwrap(), &mut held)
+                    .unwrap();
+                String::from_utf8(held)
+                    .unwrap()
+                    .replace("\"version\":1", "\"version\":99")
+                    .into_bytes()
+            },
+            // **The record's own size bound, from the reading end.** A layer, a
+            // mask and the merged image are all sized by the canvas, which
+            // `MAX_TOTAL_BYTES` bounds; this one is sized by how much somebody
+            // typed, so a small archive can claim a large record and the
+            // document-wide figure does not reach it. An effects record is the
+            // other entry of that shape and has its own figure — see
+            // `textobj::MAX_RECORD_BYTES` for why the two are separate numbers.
+            //
+            // What this drives is `TextObject::from_json`'s length check, and
+            // **it does not reach `read_optional_entry_bounded`'s limit** —
+            // measured, by taking the limit out: the record is still dropped and
+            // this test still passes, because the parse refuses it a moment
+            // later. That limit is an allocation bound and its only observable
+            // effect is the megabytes not spent decompressing a record that was
+            // going to be refused, so nothing here can hold it in place. Said
+            // rather than implied, because the comment claiming otherwise is
+            // easier to write than the guard.
+            format!(
+                "{{\"version\":1,\"text\":\"{}\"}}",
+                "x".repeat(crate::textobj::MAX_RECORD_BYTES + 16)
+            )
+            .into_bytes(),
+        ] {
+            let doc = docimport::read_openraster(&with_entry(&bytes, &text_src(0), body))
+                .expect("the picture still opens");
+            assert!(doc.layers[0].text.is_none());
+            assert!(
+                doc.warnings
+                    .iter()
+                    .any(|w| matches!(w, crate::docimport::ImportWarning::TextDropped { .. }))
+            );
+        }
+    }
+
+    /// A record too long to write is **named**, and the layer is saved as paint.
+    ///
+    /// Written rather than truncated, and named rather than passed over: a text
+    /// layer that had quietly stopped being editable by the time somebody
+    /// reopened the document is the discovered loss the warnings exist for.
+    #[test]
+    fn text_that_will_not_fit_the_record_is_saved_as_paint_and_said_so() {
+        let size = UVec2::new(4, 4);
+        let px = solid(size, [10, 20, 30, 255]);
+        let mut text = text_object();
+        text.block.text = "x".repeat(crate::textobj::MAX_RECORD_BYTES + 1);
+        let layers = vec![SaveLayer {
+            text: Some(&text),
+            ..layer("Caption", &px)
+        }];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &px,
+            history: None,
+        })
+        .expect("encode");
+        assert_eq!(
+            warnings,
+            vec![SaveWarning::TextNotRecorded {
+                layer: "Caption".into(),
+                why: crate::textobj::NotRecorded::TooLarge,
+            }]
+        );
+        // And the sentence names the length rather than blaming a figure.
+        assert!(warnings[0].to_string().contains("too much text"));
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            !xml.contains(TEXT_ATTR),
+            "no attribute may point at a record that was not written:\n{xml}"
+        );
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(
+            doc.layers[0].text.is_none() && doc.warnings.is_empty(),
+            "a layer with no attribute says nothing at all: {:?}",
+            doc.warnings
+        );
     }
 
     // --- folders ------------------------------------------------------------
@@ -2978,6 +3404,26 @@ mod tests {
         let mut body = Vec::new();
         std::io::Read::read_to_end(&mut zip.by_name("stack.xml").unwrap(), &mut body).unwrap();
         String::from_utf8(body).unwrap()
+    }
+
+    /// Rebuild an archive with one entry's bytes replaced.
+    ///
+    /// What an older build that painted on a text layer leaves behind: the same
+    /// document with a different layer PNG in it, and the text record still
+    /// beside it.
+    fn with_entry(bytes: &[u8], target: &str, body: Vec<u8>) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut out = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let mut held = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut held).unwrap();
+            out.start_file(&name, stored()).unwrap();
+            out.write_all(if name == target { &body } else { &held })
+                .unwrap();
+        }
+        out.finish().unwrap().into_inner()
     }
 
     /// Rebuild an archive with `stack.xml` passed through `f`.
