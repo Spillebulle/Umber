@@ -1640,23 +1640,40 @@ struct EffectScratch {
 /// Built once per scratch and reused by every effect, because the views they
 /// name are fixed for the document's life. Only the uniform block changes per
 /// pass, and that is a dynamic offset.
+///
+/// **There are twelve rather than four because a colour attachment may not also
+/// be bound**, and every one of these passes writes into the same small set of
+/// textures the others read. That is the constraint `flip.wgsl` works around with
+/// a scratch and `commit_blended` works around with a copy; here it is worked
+/// around by binding a 1x1 stand-in wherever an entry point does not read a slot.
+/// Two of them are not obvious and both were validation errors before they were
+/// bind groups: the extract writes the coverage, so it must not bind it, and the
+/// **resolve writes a slice of the layer array**, so it must not bind the array —
+/// even though `fs_resolve` never reads it.
 #[allow(clippy::enum_variant_names)]
 enum EffectBind {
-    /// `src` is the stroke scratch, for the extract.
+    /// The real layer array and the stroke scratch. The only pass that reads
+    /// either, and the only one whose target is not in this list.
     Extract = 0,
-    /// `src` is the grown shape.
-    Grown = 1,
-    /// `src` is one of the blur pair.
-    Blur0 = 2,
-    Blur1 = 3,
-    /// `seeds` is one of the flood pair.
-    Seed0 = 4,
-    Seed1 = 5,
-    /// No real seeds bound: the placeholder stands in.
-    NoSeeds = 6,
+    /// The coverage, and nothing else: the seed pass, and a grow with no spread.
+    Coverage = 1,
+    /// The coverage and one of the flood pair.
+    Grow0 = 2,
+    Grow1 = 3,
+    /// One of the flood pair alone.
+    Flood0 = 4,
+    Flood1 = 5,
+    /// One coverage field as `src`, for a blur pass.
+    SrcGrown = 6,
+    SrcBlur0 = 7,
+    SrcBlur1 = 8,
+    /// The same, plus the coverage the knockout needs.
+    ResolveGrown = 9,
+    ResolveBlur0 = 10,
+    ResolveBlur1 = 11,
 }
 
-const EFFECT_BIND_COUNT: usize = 7;
+const EFFECT_BIND_COUNT: usize = 12;
 
 /// One effect's slice, and what it was baked from.
 ///
@@ -5736,7 +5753,7 @@ impl CanvasRenderer {
             steps.push(EffectStep {
                 pass: EffectPass::Seed,
                 target: EffectTarget::Seed(0),
-                bind: EffectBind::NoSeeds as usize,
+                bind: EffectBind::Coverage as usize,
                 viewport: size,
                 cfg: base,
             });
@@ -5750,9 +5767,9 @@ impl CanvasRenderer {
                     pass: EffectPass::Flood,
                     target: EffectTarget::Seed(1 - from),
                     bind: if from == 0 {
-                        EffectBind::Seed0 as usize
+                        EffectBind::Flood0 as usize
                     } else {
-                        EffectBind::Seed1 as usize
+                        EffectBind::Flood1 as usize
                     },
                     viewport: size,
                     cfg: EffectUniforms { k, ..base },
@@ -5764,9 +5781,9 @@ impl CanvasRenderer {
                 pass: EffectPass::Grow,
                 target: EffectTarget::Grown,
                 bind: if from == 0 {
-                    EffectBind::Seed0 as usize
+                    EffectBind::Grow0 as usize
                 } else {
-                    EffectBind::Seed1 as usize
+                    EffectBind::Grow1 as usize
                 },
                 viewport: size,
                 cfg: EffectUniforms { grow: 1, ..base },
@@ -5775,7 +5792,7 @@ impl CanvasRenderer {
             steps.push(EffectStep {
                 pass: EffectPass::Grow,
                 target: EffectTarget::Grown,
-                bind: EffectBind::NoSeeds as usize,
+                bind: EffectBind::Coverage as usize,
                 viewport: size,
                 cfg: base,
             });
@@ -5795,7 +5812,7 @@ impl CanvasRenderer {
                 steps.push(EffectStep {
                     pass: EffectPass::Down,
                     target: EffectTarget::Blur(0),
-                    bind: EffectBind::Grown as usize,
+                    bind: EffectBind::SrcGrown as usize,
                     viewport: small,
                     cfg: EffectUniforms {
                         size: small_f,
@@ -5816,11 +5833,11 @@ impl CanvasRenderer {
             {
                 let first = i == 0 && down == 1;
                 let bind = if first {
-                    EffectBind::Grown as usize
+                    EffectBind::SrcGrown as usize
                 } else if from == 0 {
-                    EffectBind::Blur0 as usize
+                    EffectBind::SrcBlur0 as usize
                 } else {
-                    EffectBind::Blur1 as usize
+                    EffectBind::SrcBlur1 as usize
                 };
                 let to = if first { 0 } else { 1 - from };
                 steps.push(EffectStep {
@@ -5844,14 +5861,14 @@ impl CanvasRenderer {
         let (bind, src_size, read_down) = match blurred {
             Some((i, small)) => (
                 if i == 0 {
-                    EffectBind::Blur0 as usize
+                    EffectBind::ResolveBlur0 as usize
                 } else {
-                    EffectBind::Blur1 as usize
+                    EffectBind::ResolveBlur1 as usize
                 },
                 small,
                 down as i32,
             ),
-            None => (EffectBind::Grown as usize, full, 1),
+            None => (EffectBind::ResolveGrown as usize, full, 1),
         };
         let (dx, dy) = effect.offset();
         let c = effect.color;
@@ -7130,6 +7147,54 @@ impl EffectScratch {
         let coverage = plane("umber-effect-coverage");
         let grown = plane("umber-effect-grown");
         let blur = [plane("umber-effect-blur-0"), plane("umber-effect-blur-1")];
+        // Bound wherever a pass does not read a coverage field, so that a
+        // texture this pass is *writing* is never also named by its bind group.
+        // A texture rather than nothing, because the layout is one layout for all
+        // seven passes and every binding in it has to be filled.
+        let blank = {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("umber-effect-blank"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: STROKE_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.push(t);
+            view
+        };
+        // And the same for the layer array, which the *resolve* writes a slice
+        // of — so every pass but the extract binds this instead.
+        let blank_array = {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("umber-effect-blank-array"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: LAYER_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = t.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("umber-effect-blank-array"),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            textures.push(t);
+            view
+        };
 
         let mut seed_plane = |label: &str, w: u32, h: u32| {
             let t = device.create_texture(&wgpu::TextureDescriptor {
@@ -7174,7 +7239,11 @@ impl EffectScratch {
         // reused by every effect for the document's life. The views they name are
         // fixed; only the uniform block varies per pass, and that is a dynamic
         // offset.
-        let bind = |label: &str, src: &wgpu::TextureView, seed: &wgpu::TextureView| {
+        let bind = |label: &str,
+                    array: &wgpu::TextureView,
+                    src: &wgpu::TextureView,
+                    cov: &wgpu::TextureView,
+                    seed: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &shared.effect_layout,
@@ -7194,7 +7263,7 @@ impl EffectScratch {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&layers.array_view),
+                        resource: wgpu::BindingResource::TextureView(array),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -7202,7 +7271,7 @@ impl EffectScratch {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&coverage),
+                        resource: wgpu::BindingResource::TextureView(cov),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -7214,14 +7283,24 @@ impl EffectScratch {
         let none = &seed_placeholder;
         let seed0 = seeds.as_ref().map_or(none, |s| &s[0]);
         let seed1 = seeds.as_ref().map_or(none, |s| &s[1]);
+        let a = &blank_array;
+        let b = &blank;
+        // In [`EffectBind`]'s order, and the order is the enum's discriminants —
+        // `debug_assert` below is the only thing holding the two together, which
+        // is why they are written adjacently.
         let mut binds = Vec::with_capacity(EFFECT_BIND_COUNT);
-        binds.push(bind("effect-extract-bg", stroke_view, none));
-        binds.push(bind("effect-grown-bg", &grown, none));
-        binds.push(bind("effect-blur0-bg", &blur[0], none));
-        binds.push(bind("effect-blur1-bg", &blur[1], none));
-        binds.push(bind("effect-seed0-bg", &grown, seed0));
-        binds.push(bind("effect-seed1-bg", &grown, seed1));
-        binds.push(bind("effect-noseed-bg", &grown, none));
+        binds.push(bind("effect-extract", &layers.array_view, stroke_view, b, none));
+        binds.push(bind("effect-coverage", a, b, &coverage, none));
+        binds.push(bind("effect-grow-0", a, b, &coverage, seed0));
+        binds.push(bind("effect-grow-1", a, b, &coverage, seed1));
+        binds.push(bind("effect-flood-0", a, b, b, seed0));
+        binds.push(bind("effect-flood-1", a, b, b, seed1));
+        binds.push(bind("effect-src-grown", a, &grown, b, none));
+        binds.push(bind("effect-src-blur-0", a, &blur[0], b, none));
+        binds.push(bind("effect-src-blur-1", a, &blur[1], b, none));
+        binds.push(bind("effect-resolve-grown", a, &grown, &coverage, none));
+        binds.push(bind("effect-resolve-blur-0", a, &blur[0], &coverage, none));
+        binds.push(bind("effect-resolve-blur-1", a, &blur[1], &coverage, none));
         debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
 
         Self {
