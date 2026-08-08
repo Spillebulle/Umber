@@ -546,6 +546,15 @@ fn load_layer(
 /// real at the site that makes it and invisible at the call site. Refused
 /// whole rather than deduplicated, because the record is one unit and nothing
 /// in it says which of the two the artist meant.
+///
+/// **A record out of a stranger's file cannot recurse the parser**, and that
+/// was measured rather than assumed, because a stack overflow would be a crash
+/// where everything else here is a warning. The deserialiser is driven by
+/// `Vec<Effect>`'s *shape* rather than by the input, and an [`Effect`] is a
+/// flat struct of scalars — so a million open brackets is refused at the
+/// second one, "Expected opening `(` for struct `Effect`", without descending
+/// at all. The entry's size is bounded by [`container::read_optional_entry`],
+/// exactly as a layer's PNG and a mask's are.
 fn load_effects(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
