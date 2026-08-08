@@ -180,6 +180,26 @@ pub enum Icon {
     /// above give: this enum is shared, and inserting into the middle of it is
     /// a merge that compiles and draws the wrong marks.
     Harmony,
+    // The Text module's two style controls. At the end for the reason every
+    // group above is: this enum is shared, and renumbering it would be a merge
+    // that compiles and draws the wrong marks.
+    /// A capital `B`, **drawn heavier than every other mark here** — the weight
+    /// is the content of it, not the letter. Set this text in the family's own
+    /// bold.
+    ///
+    /// A letter rather than an abstraction, for the one reason that overrides
+    /// this interface's usual taste for a symbol: `B` and `I` are what every
+    /// application on every platform draws for these two, so a mark somebody
+    /// had to learn would be worse. Drawn rather than *set* in Archivo, exactly
+    /// as [`Icon::Text`] is: a glyph would take its weight and proportions from
+    /// the font instead of from the stroke beside it, and it would change shape
+    /// the day the interface changed typeface — which for this one mark would
+    /// be doubly odd, since what it means is a weight.
+    Bold,
+    /// A slanted capital `I` between two bars: set this text in the family's own
+    /// italic. The bars are what stop a lone oblique stroke reading as a
+    /// divider. See [`Icon::Bold`] for why these two are letters.
+    Italic,
 }
 
 /// Draw `icon` centred in `rect`.
@@ -360,6 +380,48 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(at(8.2, 13.0), at(15.8, 13.0));
             line(at(2.5, 20.0), at(7.5, 20.0));
             line(at(16.5, 20.0), at(21.5, 20.0));
+        }
+
+        Icon::Bold => {
+            // Deliberately the one mark in the set drawn at a heavier stroke.
+            // Everything else here shares `stroke` so the icons read as one
+            // family; this one *means* weight, so a `B` at the common weight
+            // would say "the letter B" and nothing more. Its pair, `Italic`,
+            // keeps the common weight, which is what makes the two a contrast
+            // rather than two heavy marks.
+            let heavy = Stroke::new((3.4 * scale).max(1.5), colour);
+            let run = |pts: Vec<Pos2>| {
+                painter.add(Shape::line(pts, heavy));
+            };
+            // The stem, then two bowls hung off it. Three segments a bowl rather
+            // than an arc: at 16 px a chamfer and a curve are the same picture,
+            // and the polyline is what every other mark here is made of.
+            run(vec![at(8.5, 4.8), at(8.5, 19.2)]);
+            run(vec![
+                at(8.5, 4.8),
+                at(13.6, 4.8),
+                at(16.2, 6.6),
+                at(16.2, 9.6),
+                at(13.6, 11.4),
+                at(8.5, 11.4),
+            ]);
+            run(vec![
+                at(8.5, 11.4),
+                at(14.6, 11.4),
+                at(17.6, 13.4),
+                at(17.6, 17.2),
+                at(14.6, 19.2),
+                at(8.5, 19.2),
+            ]);
+        }
+
+        Icon::Italic => {
+            line(at(9.6, 5.0), at(18.0, 5.0));
+            line(at(6.0, 19.0), at(14.4, 19.0));
+            // The stem leans by four units over fourteen, which is about 16° —
+            // the slant a text italic actually carries. Steeper reads as a
+            // slash.
+            line(at(14.0, 5.0), at(10.0, 19.0));
         }
 
         Icon::SelectReplace | Icon::SelectAdd | Icon::SelectSubtract | Icon::SelectIntersect => {

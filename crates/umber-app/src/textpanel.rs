@@ -611,38 +611,211 @@ fn font_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     }
 }
 
-/// Which style within the family.
+/// Which style within the family, and the two marks that reach for the obvious
+/// ones directly.
 ///
 /// The list is walked **inside** the menu body, which only runs while the menu
 /// is open. Collecting it outside is the shape that reads more naturally and
 /// builds a `String` per style of the family on every frame the panel is
 /// open — a variable font is nine of them, and the panel is open for as long as
 /// somebody is composing.
+///
+/// **The dropdown is the whole control and the toggles are a shortcut into it.**
+/// A family's bold may be called Bold, Demi, Heavy, Black, Gras or Negrita, so
+/// the list has to be there; but "make this bold" is what somebody actually
+/// wants, and hunting for the right word in a list of nine is not that. The two
+/// marks write the same field the list does — [`TextState::style`] stays the one
+/// source of truth — and there is no third piece of state saying whether the
+/// text "is bold".
 fn style_picker(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
-    let crate::textpanel::TextState {
-        family,
-        style,
-        fonts,
-        ..
-    } = &ed.text;
     let mut chosen = None;
-    widgets::dropdown(
-        ui,
-        p,
-        widgets::Dropdown::new(style).width(DropdownWidth::Fill),
-        |ui| {
-            for face in fonts.library().family(family) {
-                if ui
-                    .selectable_label(face.style.eq_ignore_ascii_case(style), face.label())
-                    .clicked()
+    let mut pressed = None;
+    {
+        let crate::textpanel::TextState {
+            family,
+            style,
+            fonts,
+            ..
+        } = &ed.text;
+        let library = fonts.library();
+        let bold = emphasis(library, family, style, Emphasis::Bold);
+        let italic = emphasis(library, family, style, Emphasis::Italic);
+        ui.horizontal(|ui| {
+            // Sized by the controls beside it rather than by the layout, which
+            // is `DropdownWidth::Exact`'s own case: it shares this line with two
+            // marks and `Fill` would take the room they want. Read afresh here
+            // rather than from a constant, for the reason the selection strip's
+            // combine line reads `available_width` after its hint.
+            let marks = 2.0 * (widgets::ICON_TOGGLE + ui.spacing().item_spacing.x);
+            let room = (ui.available_width() - marks).max(0.0);
+            widgets::dropdown(
+                ui,
+                p,
+                widgets::Dropdown::new(style).width(DropdownWidth::Exact(room)),
+                |ui| {
+                    for face in library.family(family) {
+                        if ui
+                            .selectable_label(face.style.eq_ignore_ascii_case(style), face.label())
+                            .clicked()
+                        {
+                            chosen = Some(face.style.clone());
+                        }
+                    }
+                },
+            );
+            for (which, toggle) in [(Emphasis::Bold, &bold), (Emphasis::Italic, &italic)] {
+                if widgets::icon_toggle(ui, p, which.icon(), toggle.on, toggle.enabled, toggle.tip)
                 {
-                    chosen = Some(face.style.clone());
+                    pressed = Some(which);
                 }
             }
-        },
-    );
+        });
+    }
+    // The list wins if somebody managed both in one frame: it is the explicit
+    // choice, where a mark is a shorthand for one.
     if let Some(style) = chosen {
         ed.text.style = style;
+        return;
+    }
+    if let Some(which) = pressed {
+        apply_emphasis(ed, which);
+    }
+}
+
+/// Carry out what pressing one of the two style marks means.
+///
+/// Separate from [`style_picker`] so a test can press it: the only thing about
+/// this that can be wrong is which face it lands on, and that is not a thing to
+/// read out of a running window.
+///
+/// It asks [`emphasis`] again rather than being handed the answer the control
+/// was drawn from — the same function, so the same decision, which is the
+/// `plan_`/`can_` arrangement one step along: the control asks whether it may,
+/// and the act asks what to do. False where the mark was refused; a disabled
+/// control cannot report that, but a keystroke route to the same command one day
+/// could.
+fn apply_emphasis(ed: &mut Editor, which: Emphasis) -> bool {
+    let target = {
+        let library = ed.text.fonts.library();
+        let (bold, italic) = emphasis(library, &ed.text.family, &ed.text.style, which).want;
+        library
+            .restyle(&ed.text.family, &ed.text.style, bold, italic)
+            .map(|face| face.style.clone())
+    };
+    match target {
+        Some(style) => {
+            ed.text.style = style;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Which of the two style marks is being asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Emphasis {
+    Bold,
+    Italic,
+}
+
+impl Emphasis {
+    fn icon(self) -> Icon {
+        match self {
+            Emphasis::Bold => Icon::Bold,
+            Emphasis::Italic => Icon::Italic,
+        }
+    }
+}
+
+/// What one of the two style marks is showing, whether it may be pressed, and
+/// what to say about it.
+struct Toggle {
+    /// Whether the face in hand already is this. Read off the face rather than
+    /// held, so there is nothing to fall out of step with the style name.
+    on: bool,
+    enabled: bool,
+    /// `&'static str` and not a `format!`, because this row is drawn on every
+    /// frame the panel is open and two `String`s a frame is the per-frame
+    /// allocation the rest of this module is careful about. Naming the target
+    /// style would read a little better and the dropdown beside it says the
+    /// name a moment later anyway.
+    tip: &'static str,
+    /// The `(bold, italic)` pair pressing it asks
+    /// [`FontLibrary::restyle`](umber_core::fonts::FontLibrary::restyle) for.
+    ///
+    /// Carried on the answer rather than worked out again at the press, so the
+    /// control and the act cannot disagree about what was offered.
+    want: (bool, bool),
+}
+
+/// Whether Bold or Italic may be pressed for this `(family, style)`, and what to
+/// say about it.
+///
+/// A pure function of the library and two names, separate from what draws it for
+/// the reason [`place_state`] is: the decision is the part that can be wrong,
+/// and reading it out of a running window is not a test anybody can run on CI.
+///
+/// **A refused mark is drawn disabled rather than not drawn at all**, which is
+/// the opposite of the call a folder's missing opacity control gets, and the
+/// difference is what the absence would mean. There are two of these and they
+/// are always the same two, so one of them missing reads as "you have not found
+/// it yet"; and the disabled state carries real news — *this typeface has no
+/// italic on this machine* — which is a thing somebody needs to know before
+/// they go looking for the setting that would produce one. There is none, in
+/// Umber or anywhere honest: see `FontLibrary::restyle` for why a sheared
+/// upright and a smeared outline are refused.
+fn emphasis(library: &FontLibrary, family: &str, style: &str, which: Emphasis) -> Toggle {
+    // The *exact* face, never `resolve`'s substitute: these marks are about the
+    // family the picker names, and the substitution note above them is what
+    // says that family is not here. Reaching into the substitute would make
+    // Bold light up for a typeface the artist has not chosen.
+    let face = library.exact(family, style);
+    let bold = face.is_some_and(|f| f.is_bold());
+    let italic = face.is_some_and(|f| f.italic);
+    let (on, want) = match which {
+        Emphasis::Bold => (bold, (!bold, italic)),
+        Emphasis::Italic => (italic, (bold, !italic)),
+    };
+    let enabled = library.can_restyle(family, style, want.0, want.1);
+    Toggle {
+        on,
+        enabled,
+        tip: emphasis_tip(which, enabled, on),
+        want,
+    }
+}
+
+/// The sentence for each of the eight states one of these marks can be in.
+///
+/// Written out rather than assembled from clauses, and matched with **no
+/// wildcard**, so a state cannot be added without a sentence being written for
+/// it. Four of the eight are refusals and each names what Umber will not do
+/// instead, because "this control is dead" with no reason is the thing a
+/// disabled control is only worth drawing to avoid.
+fn emphasis_tip(which: Emphasis, enabled: bool, on: bool) -> &'static str {
+    match (which, enabled, on) {
+        (Emphasis::Bold, true, false) => "Set this text in the family's own bold.",
+        (Emphasis::Bold, true, true) => "Take the bold off, back to the regular weight.",
+        (Emphasis::Bold, false, false) => {
+            "This family has no bold on this machine. Umber will not thicken an outline to \
+             fake one, because a smeared letter looks wrong at every size. Install the \
+             family's bold weight, or choose another font."
+        }
+        (Emphasis::Bold, false, true) => {
+            "This family has only its bold on this machine, so there is no lighter weight to \
+             go back to. Umber will not thin an outline to invent one."
+        }
+        (Emphasis::Italic, true, false) => "Set this text in the family's own italic.",
+        (Emphasis::Italic, true, true) => "Take the italic off and go back to the upright face.",
+        (Emphasis::Italic, false, false) => {
+            "This family has no italic on this machine. Umber will not slant an upright face \
+             to fake one, because a sheared letter is not the shape its designer drew. \
+             Install the family's italic, or choose another font."
+        }
+        (Emphasis::Italic, false, true) => {
+            "This family has only its italic on this machine, so there is no upright face to \
+             go back to."
+        }
     }
 }
 
@@ -796,26 +969,33 @@ fn build_preview(ui: &Ui, ed: &mut Editor, key: u64) -> Preview {
         };
     };
 
-    let picture = match text::set(&face, data, &small) {
-        Ok(setting) => {
-            let [r, g, b, _] = colour.to_srgb_u8();
-            let pixels: Vec<egui::Color32> = setting
-                .coverage
-                .iter()
-                .map(|&c| egui::Color32::from_rgba_unmultiplied(r, g, b, c))
-                .collect();
-            let image = egui::ColorImage {
-                size: [setting.width as usize, setting.height as usize],
-                pixels,
-                source_size: vec2(setting.width as f32, setting.height as f32),
-            };
-            Some(
-                ui.ctx()
-                    .load_texture("text-preview", image, egui::TextureOptions::LINEAR),
-            )
-        }
-        Err(_) => None,
-    };
+    // **Through `Setting::clip`, which is the same call Place makes**, rather
+    // than colouring the coverage again here. A second copy of two lines looks
+    // harmless and had already drifted: this took `[r, g, b, _]` and used the
+    // coverage as the alpha, where `clip` multiplies the coverage by the
+    // colour's own alpha — so a colour picked at less than full opacity
+    // previewed solid and landed thinner. Nothing reaches a translucent
+    // `Editor::color` today, which is exactly why it would have gone on being
+    // wrong. A `Clip` holds straight-alpha sRGB, which is what
+    // `from_rgba_unmultiplied` wants, so this is a conversion and not an
+    // arithmetic of its own.
+    let picture = text::set(&face, data, &small).ok().and_then(|setting| {
+        let clip = setting.clip(colour)?;
+        let pixels: Vec<egui::Color32> = clip
+            .pixels()
+            .chunks_exact(4)
+            .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+            .collect();
+        let image = egui::ColorImage {
+            size: [setting.width as usize, setting.height as usize],
+            pixels,
+            source_size: vec2(setting.width as f32, setting.height as f32),
+        };
+        Some(
+            ui.ctx()
+                .load_texture("text-preview", image, egui::TextureOptions::LINEAR),
+        )
+    });
 
     // The real block, for the figure and the notices. `missing` and
     // `mixed_directions` are read off *this* setting rather than the small one:
@@ -1554,6 +1734,214 @@ mod tests {
             library.families().len().to_string(),
             "the unfiltered figure counts something other than the filtered one"
         );
+    }
+
+    /// **Pressing Bold changes the picture.**
+    ///
+    /// Measured by rasterising, twice, through the panel's own path — not by
+    /// reading a weight off a struct, which is what would pass while the
+    /// location was being dropped on the floor somewhere between here and
+    /// `skrifa`. Archivo carries nine weights in one file, so its bold is a
+    /// variable *instance* rather than a second file: if the axes were being
+    /// ignored the two settings would come out byte for byte identical, which is
+    /// the failure `cputext.rs` exists to avoid on the splash and the one the
+    /// interface's own text still has.
+    ///
+    /// Ink rather than a pixel: a heavier weight puts more coverage down over
+    /// the same word, which is a statement about the mark rather than about
+    /// where the rasteriser happened to put an edge.
+    #[test]
+    fn pressing_bold_actually_puts_a_heavier_mark_on_the_canvas() {
+        let ink = |ed: &mut Editor| -> u64 {
+            ed.text
+                .set()
+                .expect("ink")
+                .coverage
+                .iter()
+                .map(|&c| c as u64)
+                .sum()
+        };
+
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.text.block.text = "UMBER".to_string();
+        ed.text.block.size = 64.0;
+        let regular = ink(&mut ed);
+        let was = ed.text.style.clone();
+
+        assert!(
+            apply_emphasis(&mut ed, Emphasis::Bold),
+            "Archivo has a bold and it was refused"
+        );
+        assert_ne!(ed.text.style, was, "the style name did not move");
+        let bold = ink(&mut ed);
+        assert!(
+            bold > regular * 5 / 4,
+            "bold ({bold}) is not meaningfully heavier than regular ({regular})"
+        );
+
+        // The face it landed on is one the picker lists, never a name made up
+        // here, and it really is heavy.
+        let face = ed.text.face().expect("a face").clone();
+        assert!(face.is_bold(), "{face:?}");
+        assert!(
+            ed.text
+                .fonts
+                .library()
+                .exact(&ed.text.family, &ed.text.style)
+                .is_some(),
+            "the mark left the panel naming a style the library does not have"
+        );
+
+        // And it comes back off, onto a real lighter face, with a lighter mark.
+        assert!(apply_emphasis(&mut ed, Emphasis::Bold));
+        assert!(!ed.text.face().expect("a face").is_bold());
+        assert!(ink(&mut ed) < bold);
+    }
+
+    /// The italic mark is refused for a family that has none, and refusing is
+    /// the whole feature: the alternative is shearing the upright outlines, which
+    /// this codebase will not do. See `FontLibrary::restyle`.
+    ///
+    /// The shipped library is Archivo's one upright file, so this is the state
+    /// the panel opens in on a machine whose scan has not landed.
+    #[test]
+    fn the_italic_mark_is_refused_rather_than_shearing_an_upright_face() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        let before = ed.text.style.clone();
+
+        let italic = emphasis(
+            ed.text.fonts.library(),
+            &ed.text.family,
+            &ed.text.style,
+            Emphasis::Italic,
+        );
+        assert!(
+            !italic.enabled,
+            "an italic was offered for a family with none"
+        );
+        assert!(!italic.on);
+        assert!(
+            italic.tip.contains("no italic"),
+            "the refusal does not say why: {}",
+            italic.tip
+        );
+
+        // Bold is offered on the same family, which is what makes the pair a
+        // reading of the library rather than a control that is simply off.
+        let bold = emphasis(
+            ed.text.fonts.library(),
+            &ed.text.family,
+            &ed.text.style,
+            Emphasis::Bold,
+        );
+        assert!(bold.enabled, "Archivo's bold was refused");
+
+        // And the refused mark changes nothing if it is reached anyway.
+        assert!(!apply_emphasis(&mut ed, Emphasis::Italic));
+        assert_eq!(ed.text.style, before);
+    }
+
+    /// A family the machine does not have offers neither mark, rather than
+    /// bolding whatever `resolve` substituted.
+    ///
+    /// The substitution note above the marks is what says the family is missing.
+    /// A live Bold there would be a control acting on a typeface nobody chose,
+    /// and it would write that typeface's style name into the panel's own field.
+    #[test]
+    fn a_family_that_is_not_here_offers_neither_mark() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.text.family = "A Foundry Face Nobody Has".to_string();
+        for which in [Emphasis::Bold, Emphasis::Italic] {
+            let toggle = emphasis(
+                ed.text.fonts.library(),
+                &ed.text.family,
+                &ed.text.style,
+                which,
+            );
+            assert!(
+                !toggle.enabled,
+                "{which:?} was offered for a missing family"
+            );
+            assert!(!toggle.on);
+            assert!(!apply_emphasis(&mut ed, which));
+        }
+    }
+
+    /// Every state one of these marks can be in has a finished sentence.
+    ///
+    /// All eight, because `emphasis_tip`'s wildcard-free `match` is what forces
+    /// one to exist and this is what checks it is a sentence rather than a code.
+    /// The four refusals each have to say what Umber will *not* do, or a
+    /// disabled control is not worth drawing.
+    #[test]
+    fn every_state_a_style_mark_can_be_in_has_a_finished_sentence() {
+        for which in [Emphasis::Bold, Emphasis::Italic] {
+            for enabled in [true, false] {
+                for on in [true, false] {
+                    let tip = emphasis_tip(which, enabled, on);
+                    let at = format!("{which:?}, enabled {enabled}, on {on}");
+                    assert!(tip.ends_with('.'), "{at} is not a sentence: {tip:?}");
+                    assert!(tip.len() > 20, "{at} is a code, not a sentence: {tip:?}");
+                    // No em-dash in anything the interface draws.
+                    assert!(!tip.contains('—'), "{at} carries an em-dash: {tip:?}");
+                    if !enabled {
+                        assert!(
+                            tip.contains("this machine"),
+                            "{at} does not say the family lacks the face: {tip:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Every style the picker offers can actually be set.**
+    ///
+    /// The style list is the family's own subfamily names and a variable font's
+    /// named instances, so a row of it should always resolve back to the face it
+    /// came from and always rasterise. Two ways that could be false and both are
+    /// checked: a style name that two faces of one family share, where `exact`
+    /// would hand back the wrong one, and an instance whose location the
+    /// rasteriser cannot take.
+    #[test]
+    fn every_style_the_picker_offers_can_actually_be_set() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.text.block.text = "Hxg".to_string();
+        ed.text.block.size = 24.0;
+
+        let styles: Vec<String> = ed
+            .text
+            .fonts
+            .library()
+            .family(&ed.text.family)
+            .iter()
+            .map(|f| f.style.clone())
+            .collect();
+        assert!(styles.len() > 4, "only {styles:?}");
+
+        for style in styles {
+            ed.text.style = style.clone();
+            let face = ed
+                .text
+                .fonts
+                .library()
+                .exact(&ed.text.family, &style)
+                .expect("a listed style resolves")
+                .clone();
+            assert!(
+                face.style.eq_ignore_ascii_case(&style),
+                "{style} resolved to {}",
+                face.style
+            );
+            assert!(
+                ed.text.set().is_ok(),
+                "{style} is in the list and will not set"
+            );
+        }
     }
 
     /// The Text module at the panel's real width, in the states it can be in.

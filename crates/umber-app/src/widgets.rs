@@ -102,6 +102,15 @@ pub fn slider_row(
     changed
 }
 
+/// The side of an [`icon_toggle`], in points.
+///
+/// This widget's own geometry, beside it rather than in `theme::metrics`, the
+/// arrangement `PICK_AT`/`PICK_HIT`/`PICK_MARK` already keeps. It is `pub`
+/// because a caller sharing a line with one has to size itself around it —
+/// `textpanel`'s style dropdown does — and a `20.0` typed at that call site is
+/// the second statement of a size that drifts the first time this is restyled.
+pub const ICON_TOGGLE: f32 = 20.0;
+
 /// A square icon that is either on or off, and can be unavailable.
 ///
 /// The Layers panel's flags — clip, lock, link — are all of this shape:
@@ -124,7 +133,7 @@ pub fn icon_toggle(
     tip: &str,
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::splat(20.0),
+        Vec2::splat(ICON_TOGGLE),
         if enabled {
             Sense::click()
         } else {
