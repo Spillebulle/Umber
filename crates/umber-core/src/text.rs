@@ -49,11 +49,47 @@
 //!   codepoint" and splitting a run across the answers is the piece that looks
 //!   trivial and is not; naming what is missing is honest, and it is the rule
 //!   every import in this codebase already follows.
+//!
+//! # Scaling a placement is a re-set, not a resample
+//!
+//! `Float` scales by sampling, which is right for photographic pixels and is the
+//! one thing text cannot tolerate: at twice the size a caption is soft and at a
+//! third of it it is mush. So [`set_through`] takes the affine the transform
+//! tool is holding and rasterises the outlines **already scaled and turned**,
+//! straight into document space. Every frame of a drag is a fresh sharp
+//! rasterisation, the antialiasing is computed at the size the pixels will
+//! actually be, and the float's own matrix has nothing left to do.
+//!
+//! [`set`] is that same function at [`Affine::IDENTITY`] and is the only place
+//! either is written down. `docs/text-tool.md` §4(c) is the argument, including
+//! the two cheaper answers it refuses; two of its details did not survive
+//! contact:
+//!
+//! * **`skrifa`'s `DrawSettings` does not take an affine.** At 0.42.1 — the
+//!   version `epaint` pins and this crate uses — it carries a size, a variation
+//!   location, a scratch buffer and a path style, and nothing else. So the map
+//!   goes in [`Pen`], which is where the y-flip already lives and is the same
+//!   arithmetic one step later. It is emphatically **not** `Size::new(size *
+//!   scale)`: that is the "drive the point size from the handle" answer §4(c)
+//!   refuses, and it would change what the shapes *are* — optical sizing and a
+//!   variable font's `opsz` axis both read the size — as well as having no
+//!   answer for a rotation.
+//! * **The block is measured before it is drawn**, by [`bounds_through`], which
+//!   walks each outline through the same map and records where the points went.
+//!   [`set`] used to pad by a whole em on every side because nothing knew how
+//!   far an outline strays past its advance width. That padding is 2.6x the
+//!   buffer for a single line at identity and *twenty times an em* under a scale
+//!   of twenty, which is the difference between a caption that re-sets inside a
+//!   frame and one that does not. Measuring costs a second walk of each outline,
+//!   which is O(glyphs) against a rasterisation that is O(pixels).
 
 use crate::clipboard::Clip;
 use crate::color::Color;
 use crate::fonts::{Face, FontData};
+use crate::geom::PixelRect;
+use crate::transform::Affine;
 use ab_glyph_rasterizer::{Point, Rasterizer, point};
+use glam::{IVec2, UVec2, Vec2};
 use harfrust::{ShaperData, ShaperInstance, UnicodeBuffer};
 use skrifa::instance::{Location, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
@@ -88,6 +124,31 @@ pub const MAX_SIZE: f32 = 1000.0;
 /// The smallest. Below about four pixels an em nothing legible survives the
 /// rasteriser, and a zero would be a division by zero in the scale.
 pub const MIN_SIZE: f32 = 4.0;
+
+/// How far outside a block's own ink its rasterisation buffer reaches, in
+/// **document** pixels.
+///
+/// Three, and each of them is spent: one for the antialiased edge of the
+/// outermost contour, and two for [`Pen::at`]'s inset, which cannot draw in the
+/// last two columns and rows of the buffer it is given.
+///
+/// **In document pixels rather than in the block's own space, which is the whole
+/// reason it can be this small.** [`set`] used to pad by `size` — a whole em on
+/// every side — because nothing measured how far an outline strays past its
+/// advance width, and that is 2.6x the buffer for a single line. Under a scale
+/// of twenty it would be twenty ems of *document* buffer, three quarters of it
+/// empty, on the one path that has to finish inside a frame.
+/// [`bounds_through`] measures the ink instead, from the points the drawing pen
+/// will itself be handed, so the only thing left to pay for is the storage
+/// detail and the edge.
+///
+/// **The inset is why this is three and not one.** `Pen::at`'s docs say that if
+/// anybody tightens the padding the inset is the first thing to reconsider.
+/// This is that tightening, and the answer is to keep the inset — it is cheap
+/// insurance against a rasteriser storage detail — and to pay for it here,
+/// where it costs a constant rather than a proportion of the size.
+/// `no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp` is the guard.
+const MARGIN: f32 = 3.0;
 
 /// Where a line sits within the block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -203,12 +264,110 @@ impl Setting {
     }
 }
 
+/// A block set through an affine, and where its ink landed.
+///
+/// **Not [`crate::clipboard::Placed`]**, which is straight-alpha pixels and a
+/// rectangle a paste has already been resolved onto a canvas. This is coverage
+/// and the place the map put it, which may be partly or wholly off the canvas —
+/// [`Self::layer_rect`] is what crops it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub setting: Setting,
+    /// Where the top-left of `setting` sits in the space the map maps *into*.
+    ///
+    /// Signed, because a block dragged off the top or the left of the canvas has
+    /// ink at negative coordinates. Nothing here crops: this module has never
+    /// been told how large the document is, and the two callers that know —
+    /// [`Self::layer_rect`] and `Clip::place` — disagree about what to do with
+    /// the overhang.
+    pub at: IVec2,
+}
+
+impl Placed {
+    /// The document rectangle this covers and the premultiplied layer bytes for
+    /// it, in `colour`, cropped to a `doc`-sized canvas.
+    ///
+    /// `None` where none of it lands on the canvas at all.
+    ///
+    /// **One pass, and that is not tidiness.** The three steps this replaces —
+    /// paint the coverage, premultiply it, crop it — are each a full copy of a
+    /// rectangle that on a large drag is tens of megabytes, and they run every
+    /// frame. The colour is constant over the block, so what varies per pixel is
+    /// one byte; a 256-entry table built from
+    /// [`crate::docimport::srgb::encode_pixel`] turns the whole conversion into
+    /// a lookup and keeps the *exact* arithmetic the paste path uses, rather than
+    /// a second premultiply that could round differently.
+    pub fn layer_rect(&self, colour: Color, doc: UVec2) -> Option<(PixelRect, Vec<u8>)> {
+        let [r, g, b, a] = colour.to_srgb_u8();
+        let (w, h) = (self.setting.width as i64, self.setting.height as i64);
+        let x0 = self.at.x as i64;
+        let y0 = self.at.y as i64;
+        // The overlap of the block with the canvas, in the block's own pixels.
+        let cx0 = x0.max(0);
+        let cy0 = y0.max(0);
+        let cx1 = (x0 + w).min(doc.x as i64);
+        let cy1 = (y0 + h).min(doc.y as i64);
+        if cx1 <= cx0 || cy1 <= cy0 {
+            return None;
+        }
+        let rect = PixelRect {
+            x: cx0 as u32,
+            y: cy0 as u32,
+            width: (cx1 - cx0) as u32,
+            height: (cy1 - cy0) as u32,
+        };
+        let table: Vec<[u8; 4]> = (0..=255u32)
+            .map(|cov| {
+                crate::docimport::srgb::encode_pixel([
+                    r,
+                    g,
+                    b,
+                    ((cov * a as u32 + 127) / 255) as u8,
+                ])
+            })
+            .collect();
+        let mut pixels = Vec::with_capacity((rect.area() * 4) as usize);
+        for y in cy0..cy1 {
+            let row = ((y - y0) * w) as usize;
+            for x in cx0..cx1 {
+                let cov = self.setting.coverage[row + (x - x0) as usize];
+                pixels.extend_from_slice(&table[cov as usize]);
+            }
+        }
+        Some((rect, pixels))
+    }
+}
+
 /// Set `block` in `face`.
 ///
 /// The face is loaded by the caller — [`Face::load`] blocks on a file read, and
 /// this is called from an interface that redraws — so what arrives here is
 /// bytes and a location on the variable axes.
+///
+/// [`set_through`] at [`Affine::IDENTITY`], and deliberately not a second
+/// rasteriser beside it: a scaled placement and an unscaled one differ by one
+/// affine and nothing else, so two loops would be two things to keep in step
+/// about every antialiased edge. The identity is the exact identity — `Pen::at`
+/// applies `Affine::IDENTITY` and lands on the same point it did before there
+/// was a map at all.
 pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, TextError> {
+    set_through(face, data, block, Affine::IDENTITY).map(|placed| placed.setting)
+}
+
+/// Set `block` in `face`, with every outline drawn through `map`.
+///
+/// `map` takes the block's own space — document pixels with the block's ink
+/// starting near the origin, which is what [`set`] produces — to wherever the
+/// caller wants it. For a floating placement that is `Transform::matrix`
+/// composed with where the block was first put down, and the point of handing it
+/// here rather than to a sampler is in the module docs: the rasteriser then
+/// antialiases at the size the pixels will be.
+pub fn set_through(
+    face: &Face,
+    data: &FontData,
+    block: &TextBlock,
+    map: Affine,
+) -> Result<Placed, TextError> {
     if block.text.is_empty() {
         return Err(TextError::Empty);
     }
@@ -275,47 +434,43 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
     // the artist asked for. `leading` is the gap the font states *between*
     // lines; ascent and descent are the box one line occupies.
     let line_height = ((metrics.ascent - metrics.descent) + metrics.leading) * block.line_spacing;
-    // Generous on every side: outlines routinely reach past the advance width —
-    // accents above, descenders below, overshoot on round letters, and a swash
-    // or a script face further than any of them. The block is trimmed to its
-    // ink afterwards, so this costs a transient rather than a margin.
-    let pad = size;
-    let width = (block_width + pad * 2.0).ceil().max(1.0);
-    let height = (line_height * lines.len() as f32 + pad * 2.0)
-        .ceil()
-        .max(1.0);
-    if width * height > MAX_PIXELS as f32 {
-        return Err(TextError::TooLarge {
-            width: width as u32,
-            height: height as u32,
-        });
-    }
-    let (bw, bh) = (width as usize, height as usize);
-    let mut cover = vec![0u8; bw * bh];
 
-    // One rasteriser per line, merged with a `max`.
+    // Where a line's glyph origins sit in the block's own space: x from the
+    // alignment, y down from the top of the first line's box.
     //
-    // Per *line* rather than per glyph, because glyphs within a line genuinely
-    // overlap — tight tracking, a script face's connecting strokes, a mark over
-    // a letter — and separate buffers composited would show a seam where they
-    // do. Per line rather than one for the whole block, because the rasteriser
-    // holds an `f32` an accumulator pixel: a block at the cap would be a quarter
-    // of a gigabyte of transient for a picture that is 64 MB.
-    let line_box = (line_height + pad * 2.0).ceil().max(1.0) as usize;
-    let mut raster = Rasterizer::new(bw, line_box);
+    // **Not rounded to a whole row.** The old code offset each line's finished
+    // coverage by `(i * line_height).round()`, because the merge was an integer
+    // row shift; the baseline is now a float the pen carries, so a fractional
+    // line height lands where the face asked for it instead of accumulating a
+    // rounding error down a paragraph.
+    let origin = |i: usize, line: &Line| -> Vec2 {
+        let x = match block.align {
+            Align::Left => 0.0,
+            Align::Centre => (block_width - line.width) * 0.5,
+            Align::Right => block_width - line.width,
+        };
+        Vec2::new(x, metrics.ascent + i as f32 * line_height)
+    };
     let outlines = font.outline_glyphs();
+    let settings = || DrawSettings::unhinted(Size::new(size), &location);
+
+    // --- where the ink goes -------------------------------------------------
+    //
+    // Every outline is walked once through `map` before any of it is drawn, and
+    // the block's buffer is the union of what came back. See [`MARGIN`] for what
+    // that buys over the whole em of padding this used to guess with, and the
+    // module docs for why it has to be measured through the map rather than
+    // measured once and scaled: a rotation turns an ascender into width.
+    //
+    // It also makes `Pen::at`'s clamp unreachable rather than merely unlikely,
+    // because the box is computed from the very points the drawing pen will be
+    // handed. `no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp` is that
+    // claim as a test.
+    let mut ink: Option<Bounds> = None;
+    let mut per_line: Vec<Option<Bounds>> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
-        if line.glyphs.is_empty() {
-            continue;
-        }
-        raster.reset(bw, line_box);
-        let x0 = pad
-            + match block.align {
-                Align::Left => 0.0,
-                Align::Centre => (block_width - line.width) * 0.5,
-                Align::Right => block_width - line.width,
-            };
-        let baseline = pad + metrics.ascent;
+        let at = origin(i, line);
+        let mut here: Option<Bounds> = None;
         for glyph in &line.glyphs {
             // `.notdef` is **skipped, not drawn**, and it keeps its advance.
             //
@@ -335,22 +490,97 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
             let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
                 continue;
             };
-            let mut pen = Pen::new(&mut raster, x0 + glyph.x, baseline - glyph.y);
+            let mut pen = BoundsPen {
+                map,
+                dx: at.x + glyph.x,
+                baseline: at.y - glyph.y,
+                seen: None,
+            };
+            let _ = outline.draw(settings(), &mut pen);
+            here = Bounds::union(here, pen.seen);
+        }
+        ink = Bounds::union(ink, here);
+        per_line.push(here);
+    }
+    // Nothing was drawn: a line of spaces, or a line the face had no glyph for.
+    // The same answer the trim used to give, one pass earlier.
+    let Some(ink) = ink else {
+        return Err(TextError::NoInk);
+    };
+    let Some(box_) = ink.pixels() else {
+        // A map carrying an infinity or a NaN. Not reachable from a `Transform`
+        // — `MIN_SCALE` keeps the matrix invertible and the angle is a real
+        // number — but this is a `pub fn` taking an `Affine` from anywhere, and
+        // the failure without the guard is silent: `as usize` saturates a NaN to
+        // zero, so the block comes back as `NoInk` and the caller reports that
+        // nothing was typed.
+        return Err(TextError::NotFinite);
+    };
+    if box_.area() as u64 > MAX_PIXELS {
+        return Err(TextError::TooLarge {
+            width: box_.width,
+            height: box_.height,
+        });
+    }
+    let (bw, bh) = (box_.width as usize, box_.height as usize);
+    let mut cover = vec![0u8; bw * bh];
+
+    // One rasteriser per line, reused, merged with a `max`.
+    //
+    // Per *line* rather than per glyph, because glyphs within a line genuinely
+    // overlap — tight tracking, a script face's connecting strokes, a mark over
+    // a letter — and separate buffers composited would show a seam where they
+    // do. Per line rather than one for the whole block, because the rasteriser
+    // holds an `f32` an accumulator pixel: a block at the cap would be a quarter
+    // of a gigabyte of transient for a picture that is 64 MB.
+    //
+    // A line's buffer is now its **own** mapped ink rather than the block's full
+    // width, which is what keeps that bound true under a rotation: turn a
+    // paragraph 45° and every line's bounding box is nearly the block's, so a
+    // buffer sized to the block would be one transient per line of very nearly
+    // the whole thing.
+    let boxes: Vec<Option<PixelRect>> = per_line.iter().map(|b| b.and_then(Bounds::pixels)).collect();
+    let (rw, rh) = boxes.iter().flatten().fold((1usize, 1usize), |(w, h), r| {
+        (w.max(r.width as usize), h.max(r.height as usize))
+    });
+    let mut raster = Rasterizer::new(rw, rh);
+    for ((i, line), b) in lines.iter().enumerate().zip(&boxes) {
+        let Some(b) = *b else { continue };
+        let at = origin(i, line);
+        let (lw, lh) = (b.width as usize, b.height as usize);
+        raster.reset(lw, lh);
+        let corner = Vec2::new(b.x as f32, b.y as f32);
+        for glyph in &line.glyphs {
+            if glyph.id == 0 {
+                continue;
+            }
+            let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
+                continue;
+            };
+            let mut pen = Pen::mapped(
+                &mut raster,
+                at.x + glyph.x,
+                at.y - glyph.y,
+                map,
+                corner,
+            );
             // A glyph that will not draw is skipped rather than abandoning the
             // line: a caption missing one letter beats a caption missing all of
             // them, which is `cputext.rs`'s rule and the same one.
-            let _ = outline.draw(DrawSettings::unhinted(Size::new(size), &location), &mut pen);
+            let _ = outline.draw(settings(), &mut pen);
         }
-        let dy = (i as f32 * line_height).round() as isize;
+        let dx = b.x as i64 - box_.x as i64;
+        let dy = b.y as i64 - box_.y as i64;
         raster.for_each_pixel_2d(|px, py, coverage| {
             if coverage <= 0.0 {
                 return;
             }
-            let y = py as isize + dy;
-            if y < 0 || y as usize >= bh {
+            let x = px as i64 + dx;
+            let y = py as i64 + dy;
+            if x < 0 || y < 0 || x as usize >= bw || y as usize >= bh {
                 return;
             }
-            let at = y as usize * bw + px as usize;
+            let at = y as usize * bw + x as usize;
             let v = (coverage.min(1.0) * 255.0 + 0.5) as u8;
             // A `max`, exactly as the dab pass composites coverage: two lines
             // whose descenders and ascenders meet must saturate at 1.0 rather
@@ -359,13 +589,120 @@ pub fn set(face: &Face, data: &FontData, block: &TextBlock) -> Result<Setting, T
         });
     }
 
-    trim(cover, bw, bh).map(|(coverage, width, height)| Setting {
-        width,
-        height,
-        coverage,
-        missing,
-        mixed_directions: mixed,
+    let (coverage, width, height, offset) = trim(cover, bw, bh)?;
+    Ok(Placed {
+        setting: Setting {
+            width,
+            height,
+            coverage,
+            missing,
+            mixed_directions: mixed,
+        },
+        at: IVec2::new(box_.x as i32, box_.y as i32) + offset,
     })
+}
+
+/// An axis-aligned box being accumulated, in the space a map maps into.
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl Bounds {
+    fn add(&mut self, p: Vec2) {
+        self.min = self.min.min(p);
+        self.max = self.max.max(p);
+    }
+
+    fn union(a: Option<Bounds>, b: Option<Bounds>) -> Option<Bounds> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(Bounds {
+                min: a.min.min(b.min),
+                max: a.max.max(b.max),
+            }),
+            (some, None) | (None, some) => some,
+        }
+    }
+
+    /// The whole pixels this covers, padded by [`MARGIN`].
+    ///
+    /// `None` for a box that is not a pair of numbers, and the check is written
+    /// against the *padded* corners rather than against `min` and `max` so that
+    /// an addition that overflows to an infinity is caught too. The rectangle is
+    /// also clamped into `i32`, because a `PixelRect` is unsigned and the caller
+    /// has to be able to hold the offset: a block a hundred million pixels off
+    /// the canvas is refused as too large rather than wrapping to somewhere
+    /// plausible.
+    fn pixels(self) -> Option<PixelRect> {
+        let lo = self.min - Vec2::splat(MARGIN);
+        let hi = self.max + Vec2::splat(MARGIN);
+        let lo = Vec2::new(lo.x.floor(), lo.y.floor());
+        let hi = Vec2::new(hi.x.ceil(), hi.y.ceil());
+        if !lo.is_finite() || !hi.is_finite() {
+            return None;
+        }
+        const LIMIT: f32 = i32::MAX as f32;
+        if lo.x < -LIMIT || lo.y < -LIMIT || hi.x > LIMIT || hi.y > LIMIT {
+            return None;
+        }
+        Some(PixelRect {
+            x: lo.x as i32 as u32,
+            y: lo.y as i32 as u32,
+            width: (hi.x - lo.x).max(1.0) as u32,
+            height: (hi.y - lo.y).max(1.0) as u32,
+        })
+    }
+}
+
+/// Records where an outline's points land under a map, drawing nothing.
+///
+/// It sees the **control** points, so the box is a superset of the curve: the
+/// rasteriser flattens a quadratic or a cubic into points inside its own control
+/// hull, so every point [`Pen`] is later handed is inside what this measured.
+/// That containment is what makes `Pen::at`'s clamp unreachable, and it is why
+/// this is a second walk of the outline rather than a read of
+/// `GlyphMetrics::bounds` — a font with a wrong `glyf` bounding box is a real
+/// thing, and trusting one would put a clamped, smeared contour on somebody's
+/// canvas rather than merely a slightly loose buffer.
+struct BoundsPen {
+    map: Affine,
+    dx: f32,
+    baseline: f32,
+    seen: Option<Bounds>,
+}
+
+impl BoundsPen {
+    fn at(&mut self, x: f32, y: f32) {
+        let p = self.map.apply(Vec2::new(self.dx + x, self.baseline - y));
+        match &mut self.seen {
+            Some(b) => b.add(p),
+            none => *none = Some(Bounds { min: p, max: p }),
+        }
+    }
+}
+
+impl OutlinePen for BoundsPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.at(x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.at(x, y);
+    }
+
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.at(cx, cy);
+        self.at(x, y);
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.at(cx0, cy0);
+        self.at(cx1, cy1);
+        self.at(x, y);
+    }
+
+    fn close(&mut self) {}
 }
 
 /// One glyph, positioned in pixels relative to the start of its line.
@@ -463,13 +800,25 @@ fn has_mixed_directions(text: &str) -> bool {
     text.chars().any(rtl) && text.chars().any(ltr)
 }
 
-/// Cut the block down to the pixels that actually hold ink.
+/// Cut the block down to the pixels that actually hold ink, and say how far in
+/// the cut started.
 ///
-/// What makes the transform box hug the text rather than the generous padding
-/// the rasteriser needed. `None` where nothing was drawn, which is a line of
-/// spaces or a line the face had no glyph for — [`TextError::NoInk`], and a
-/// different sentence from "you have not typed anything".
-fn trim(cover: Vec<u8>, w: usize, h: usize) -> Result<(Vec<u8>, u32, u32), TextError> {
+/// What makes the transform box hug the text rather than the [`MARGIN`] the
+/// rasteriser needed. `Err` where nothing was drawn, which is a line of spaces
+/// or a line the face had no glyph for — [`TextError::NoInk`], and a different
+/// sentence from "you have not typed anything".
+///
+/// **The offset is why this still exists** now that the buffer is measured
+/// rather than guessed. The measurement is of the *control hull*, which is a
+/// superset of the curve, and the margin is three pixels on every side; so the
+/// buffer is a few pixels larger than the ink in a way that varies with the
+/// glyphs and the map. Trimming makes [`Setting`]'s promise — a rectangle of
+/// coverage trimmed to its own ink — true whatever the map, which is what lets
+/// the transform box hug a rotated block as tightly as an upright one, and the
+/// offset is what keeps [`Placed::at`] pointing at the trimmed corner rather
+/// than the buffer's.
+#[allow(clippy::type_complexity)]
+fn trim(cover: Vec<u8>, w: usize, h: usize) -> Result<(Vec<u8>, u32, u32, IVec2), TextError> {
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
     for y in 0..h {
         for x in 0..w {
@@ -489,7 +838,12 @@ fn trim(cover: Vec<u8>, w: usize, h: usize) -> Result<(Vec<u8>, u32, u32), TextE
     for y in y0..y1 {
         out.extend_from_slice(&cover[y * w + x0..y * w + x1]);
     }
-    Ok((out, tw as u32, th as u32))
+    Ok((
+        out,
+        tw as u32,
+        th as u32,
+        IVec2::new(x0 as i32, y0 as i32),
+    ))
 }
 
 /// Feeds glyph outlines to the rasteriser, flipping to y-down as it goes.
@@ -514,6 +868,13 @@ pub struct Pen<'r> {
     raster: &'r mut Rasterizer,
     dx: f32,
     baseline: f32,
+    /// Applied after the y-flip, so a point reaches the rasteriser already
+    /// scaled and turned. [`Affine::IDENTITY`] for [`Self::new`], where it is
+    /// the exact identity rather than an approximation of one.
+    map: Affine,
+    /// Where the rasteriser's own `(0, 0)` sits in the space `map` maps into.
+    /// Zero for [`Self::new`], whose buffer *is* that space.
+    corner: Vec2,
     last: Point,
     start: Point,
     bounds: (f32, f32),
@@ -530,11 +891,35 @@ impl<'r> Pen<'r> {
     /// fact. It also removes the third statement of `(width, height)` in
     /// [`set`], which already says it to `Rasterizer::new` and to `reset`.
     pub fn new(raster: &'r mut Rasterizer, dx: f32, baseline: f32) -> Self {
+        Self::mapped(raster, dx, baseline, Affine::IDENTITY, Vec2::ZERO)
+    }
+
+    /// The same, with every point taken through `map` and then measured from
+    /// `corner`.
+    ///
+    /// This is the whole of how a placement is scaled and turned without being
+    /// resampled: the outline is drawn where it will finally *be*, so the
+    /// rasteriser antialiases at that size. `corner` is where the buffer's own
+    /// origin sits in the mapped space, which is what lets a line be rasterised
+    /// into a buffer no larger than its own ink.
+    ///
+    /// [`Self::new`] is this at the identity and at the origin, and the
+    /// arithmetic reduces to exactly what it was before there was a map —
+    /// `Mat2::IDENTITY * p + 0 - 0` is `p`, in every bit.
+    pub fn mapped(
+        raster: &'r mut Rasterizer,
+        dx: f32,
+        baseline: f32,
+        map: Affine,
+        corner: Vec2,
+    ) -> Self {
         let (w, h) = raster.dimensions();
         Self {
             raster,
             dx,
             baseline,
+            map,
+            corner,
             last: point(0.0, 0.0),
             start: point(0.0, 0.0),
             bounds: (w as f32, h as f32),
@@ -589,10 +974,16 @@ impl Pen<'_> {
     /// It is reached at all because outlines routinely stray past the advance
     /// width — a script face's swash further than most — and the padding is
     /// generous rather than infinite.
+    /// With a map in force the clamp is **unreachable rather than merely
+    /// unlikely**, because the buffer was sized from the very points this is
+    /// about to be handed — see [`BoundsPen`] and [`MARGIN`]. It stays because
+    /// the other caller, `cputext::draw`, pads by an em and reasons about it, and
+    /// because a clamp that never fires costs two comparisons.
     fn at(&self, x: f32, y: f32) -> Point {
+        let p = self.map.apply(Vec2::new(self.dx + x, self.baseline - y)) - self.corner;
         point(
-            (self.dx + x).clamp(0.0, (self.bounds.0 - 2.0).max(0.0)),
-            (self.baseline - y).clamp(0.0, (self.bounds.1 - 2.0).max(0.0)),
+            p.x.clamp(0.0, (self.bounds.0 - 2.0).max(0.0)),
+            p.y.clamp(0.0, (self.bounds.1 - 2.0).max(0.0)),
         )
     }
 }
