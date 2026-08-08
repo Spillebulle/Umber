@@ -296,6 +296,13 @@ fn fs_step(@builtin(position) f: vec4<f32>) -> @location(0) vec2<u32> {
 fn fs_grow(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
     let p = vec2<i32>(f.xy);
     let inside = coverage_at(p);
+    // **Unreachable, and kept as a guard rather than as a path.** Nothing plans a
+    // grow pass at all where the reach is zero — `plan_effect` skips it and points
+    // the blur and the resolve straight at the coverage, which is the same answer
+    // without a full-screen copy. What this catches is a *later* change planning
+    // one anyway: with `spread` at zero the band below is
+    // `1 - smoothstep(-0.5, 0.5, d)`, which is the coverage hard-thresholded, so
+    // an unguarded fall-through would silently lose the layer's antialiasing.
     if (c.grow == 0u) {
         return inside;
     }

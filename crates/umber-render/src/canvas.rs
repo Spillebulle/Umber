@@ -7670,6 +7670,13 @@ struct EffectField {
     reach: f32,
     /// Seed the flood on the complement, which turns the field into an *inward*
     /// distance. An inside outline's whole mechanism.
+    ///
+    /// **For [`EffectShape::Centre`] this is the *second* flood's**, and the
+    /// planner overrides it to `0` for the first: that one has to be the outward
+    /// field, because the combining pass reads the outward band out of the band
+    /// plane and computes the inward one itself. Reading this field as "which way
+    /// the flood goes" is right for every other shape and is half the story for
+    /// that one.
     invert: bool,
 }
 
@@ -7677,7 +7684,9 @@ fn effect_field(effect: &Effect) -> EffectField {
     match (effect.kind, effect.position) {
         // The full width, straddling the edge: half of it each side. This is the
         // one position that needs two fields — see `EffectShape::Centre` — and
-        // the reach is the half width, which is what each band is.
+        // the reach is the half width, which is what *each* band is, so the two
+        // together span `spread`. `invert` is the second flood's; the planner
+        // runs the first with it clear. See the field.
         (EffectKind::Outline, OutlinePosition::Centre) => EffectField {
             shape: EffectShape::Centre,
             reach: effect.spread * 0.5,
