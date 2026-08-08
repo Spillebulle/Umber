@@ -378,10 +378,23 @@ change.
 ### 4.3 `required_version` gains one clause, and it is the right kind
 
 > A folder whose opacity is below 1 or whose blend mode is not Normal takes
-> `umber-version` to **3**.
+> `umber-version` to **4**.
 
 That is the same predicate as §3.1, which is what stops the file and the shader
 disagreeing.
+
+**It says 4 rather than 3 because layer effects landed first and took 3.** This
+document proposed 3, `docs/layer-effects.md` §8.2 proposed 3, and only one
+feature can have a number. The rule both stated was that whichever landed second
+records the decision rather than leaving `required_version` to reconcile it;
+effects shipped their clause in `docformat::required_version`, `VERSION` is at 3
+for them, and `docformat::VERSION`'s own doc comment names this section and says
+so. So the number here is settled, and it is settled in the document that has to
+be read by whoever implements it rather than only in a Rust comment.
+
+Nothing else in this section changes. The two clauses are independent — a
+document may need one, the other or both — and the "lowest revision that
+describes the file" rule below is what makes that free.
 
 It is exactly the case the version mechanism is for, and `docformat`'s own
 comments say so before this feature exists: "a group opacity is the one thing a
@@ -394,8 +407,8 @@ document that opens showing something else is the masks-and-clipping case that
 took the version to 2.
 
 `required_version` emitting the lowest revision that describes the file does the
-rest for free: **a document whose folders are all plain still declares 1 or 2 and
-still opens in every Umber that came before.** No existing file is shut out, and
+rest for free: **a document whose folders are all plain still declares 1, 2 or 3
+and still opens in every Umber that came before.** No existing file is shut out, and
 `a_document_of_folders_still_declares_the_revision_it_needs` becomes the guard
 for both halves — it already checks the *absence* of `opacity` and
 `composite-op` on a folder tag, and gains the presence case beside it.

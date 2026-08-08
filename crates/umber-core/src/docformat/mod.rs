@@ -52,6 +52,9 @@
 //!   so a document using nothing new still opens in an older build.
 //! * **[`MASK_ATTR`]** on a masked `<layer>`, naming an entry under `umber/`.
 //!   The mask is deliberately not a layer of the ORA stack; see that constant.
+//! * **[`EFFECTS_ATTR`]** on a `<layer>` carrying layer effects, naming an
+//!   entry under `umber/effects/`. Same shape as the mask and for the same
+//!   reason; see that constant.
 //! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
 //!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
@@ -145,6 +148,7 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::color::Color;
 use crate::docimport::srgb;
 use crate::document::Background;
+use crate::effect::Effect;
 use crate::layer::{BlendMode, LayerStack};
 
 pub use history::{HISTORY_ATTR, SaveHistory};
@@ -190,7 +194,24 @@ pub const EXTENSION: &str = "ora";
 /// setting the flag again and is not worth refusing somebody's painting over.
 /// They are only ever written on a file that carries something else, or on one
 /// declaring revision 1 — see [`required_version`].
-pub const VERSION: u32 = 2;
+///
+/// **3 is layer effects**, and `docs/layer-effects.md` §8.2 is the argument —
+/// which was put to the author as an open judgement and confirmed, because it
+/// is the one call that could reasonably have gone the other way. The short
+/// form: what an older build *shows* is merely plainer, a layer without its
+/// shadow, which is the folder case. What it *writes* is the problem. Effects
+/// are non-destructive and the parameters are the whole feature, so an older
+/// build opens the document, ignores an attribute it has never heard of, and
+/// the next save drops `umber/effects/` on the floor — permanently, having done
+/// nothing but open and save. That is exactly the property masks and clipping
+/// were refused for.
+///
+/// **`docs/group-compositing.md` §4.3 also proposes 3, for a folder with an
+/// opacity or a blend mode of its own. Effects landed first and took 3, so
+/// group compositing takes 4.** Only one feature can have a number, and the
+/// decision belongs in whichever lands second rather than to
+/// [`required_version`] to reconcile.
+pub const VERSION: u32 = 3;
 
 /// The lowest revision that describes `layers`.
 ///
@@ -200,16 +221,28 @@ pub const VERSION: u32 = 2;
 /// from older ones in exchange for nothing: a revision number is a statement
 /// about what a file *contains*, not about what wrote it.
 fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
-    // Folders are skipped, and not merely because they never carry either
-    // today: `clipped` is a public field on `Layer` and nothing stops it being
-    // set on a folder, where it means nothing and is written nowhere. Reading
-    // it here would push a document to revision 2 — shutting it out of every
-    // older Umber — for a flag with no effect on the picture at all.
-    if layers
-        .iter()
-        .filter(|l| !l.folder)
-        .any(|l| l.mask.is_some() || l.clipped)
-    {
+    // Folders are skipped throughout, and not merely because they never carry
+    // any of this today: `clipped` is a public field on `Layer` and nothing
+    // stops it being set on a folder, where it means nothing and is written
+    // nowhere. Reading it here would push a document to revision 2 — shutting
+    // it out of every older Umber — for a flag with no effect on the picture at
+    // all.
+    //
+    // The same filter governs effects, and there it is load-bearing in the
+    // other direction: `encode` skips a folder's effects too, so the two agree
+    // about what the file actually contains. A folder cannot hold one anyway —
+    // `LayerStack::plan_set_effect` refuses it, because a folder has no
+    // coverage to derive an effect from until group compositing lands
+    // (`docs/layer-effects.md` §9.5) — and when it can, both halves change
+    // together or a file carries effects while declaring a revision that does
+    // not describe them.
+    let layers = || layers.iter().filter(|l| !l.folder);
+
+    // Highest first: a version number is a statement about what a file
+    // contains, and effects are the newest thing it can contain.
+    if layers().any(|l| !l.effects.is_empty()) {
+        3
+    } else if layers().any(|l| l.mask.is_some() || l.clipped) {
         2
     } else {
         1
@@ -271,6 +304,41 @@ pub fn mask_src(index: usize) -> String {
     format!("umber/masks/{index:03}.png")
 }
 
+/// `<layer>` attribute naming the archive entry holding the layer's effects.
+///
+/// **The mask's shape, deliberately** — outside the ORA layer stack, under
+/// `umber/`, named by an attribute on the element. `docs/layer-effects.md` §8.1
+/// has the argument, and the load-bearing half is the *attribute*: a single
+/// document-wide table would have to be keyed by something, and every candidate
+/// is wrong. A stack position shifts the moment a layer is reordered, a name is
+/// not unique, and `Layer::id` is explicitly a within-session identity that is
+/// never written down. An attribute on the element travels with the element and
+/// needs no key at all.
+///
+/// Serialising the parameters into the attribute value itself was the
+/// alternative. It works, and it puts an escaped RON blob in the middle of
+/// `stack.xml` that every other reader has to skip past and every human has to
+/// read around. One zip entry per effected layer is cheaper to read in both
+/// senses.
+///
+/// Nothing here is a new extension mechanism: the `umber-` prefix *is* the
+/// mechanism, and every other ORA reader ignores both the attribute and the
+/// directory. What they see is the layer without its effects — which is
+/// precisely why this is what took [`VERSION`] to 3, and why an effected layer
+/// raises [`SaveWarning::EffectsNotPortable`].
+pub const EFFECTS_ATTR: &str = "umber-effects";
+
+/// Where a layer's effects go inside the archive.
+///
+/// Indexed exactly as [`mask_src`] is — by the layer's position in the *file*,
+/// top first, which is the numbering `data/layer000.png` already uses. So a
+/// folder leaves a gap here as it does there, and for the same reason: the
+/// number is a name, and renumbering the layers consecutively would make it
+/// stop matching the entry it belongs to.
+pub fn effects_src(index: usize) -> String {
+    format!("umber/effects/{index:03}.ron")
+}
+
 /// `<layer>` attribute marking the selected layer, spelled `"true"`.
 pub const SELECTED_ATTR: &str = "umber-selected";
 
@@ -315,6 +383,15 @@ pub struct SaveLayer<'a> {
     /// carries the same value in all three colour channels. See
     /// [`MASK_ATTR`].
     pub mask: Option<&'a [u8]>,
+    /// The layer's effects, in composite order — exactly what
+    /// `Layer::effects` hands back. See [`EFFECTS_ATTR`].
+    ///
+    /// Written whole, enabled or not: a switched-off effect is still a set of
+    /// parameters somebody dialled, and dropping it at the save would be the
+    /// silent loss this whole entry exists to prevent. It is also what makes
+    /// [`required_version`] read the *presence* of an effect rather than
+    /// `enabled_effect_count`.
+    pub effects: &'a [Effect],
     /// Bounded by the alpha of the nearest unclipped layer below.
     pub clipped: bool,
     /// Refuses edits until unlocked.
@@ -346,6 +423,7 @@ impl<'a> SaveLayer<'a> {
             blend,
             pixels,
             mask: None,
+            effects: &[],
             clipped: false,
             locked: false,
             link: None,
@@ -418,6 +496,35 @@ pub enum SaveWarning {
         mode: &'static str,
         used: &'static str,
     },
+    /// Some layers carry effects, which no other OpenRaster reader can see.
+    ///
+    /// Named in the same breath as an approximated blend mode because it is
+    /// the same kind of loss — the file is still a plain `.ora` and still holds
+    /// every pixel, and what another application shows is the layer unadorned.
+    ///
+    /// **Once for the document, with a count, and not once per layer.**
+    /// `docs/layer-effects.md` §8.3 says "told once at the save", and the
+    /// reasoning is the one [`crate::docimport::ImportWarning::
+    /// EffectsOverBudget`] already gives for itself: thirty effected layers
+    /// would be thirty lines of the same sentence with a different name in
+    /// them, which is the noise that stops the list being read at all.
+    /// [`Self::BlendApproximated`] is per layer and is not a precedent — it
+    /// names a *different mode* each time, where this says one thing however
+    /// many layers it is true of.
+    ///
+    /// **Counted on layers whose effects are switched *on*.** A layer whose
+    /// every effect is disabled draws plain in Umber too, so a warning about it
+    /// would name a loss that did not happen — the trap `export::losses`
+    /// already avoids by asking whether *this* document has transparency. The
+    /// record is still written and [`required_version`] still reads presence
+    /// rather than enablement, because the parameters are what an older build
+    /// would drop; only the sentence is about what is visible.
+    ///
+    /// It is emphatically **not** a loss for Umber. The parameters are in the
+    /// file, [`EFFECTS_ATTR`] points at them, and [`required_version`] declares
+    /// the revision that says so, which is why an older Umber refuses the
+    /// document rather than quietly dropping them.
+    EffectsNotPortable { layers: usize },
 }
 
 impl std::fmt::Display for SaveWarning {
@@ -428,6 +535,17 @@ impl std::fmt::Display for SaveWarning {
                 "Layer “{layer}”: OpenRaster has no exact equivalent of {mode}, so it is \
                  written as {used}. Umber reopens it as {mode}; other applications will \
                  composite it slightly differently where the layer is partly transparent."
+            ),
+            Self::EffectsNotPortable { layers } => write!(
+                f,
+                "{layers} {} layer effects. Umber saves them and reopens them, but no other \
+                 OpenRaster application can read them, so {} look plain everywhere else.",
+                if *layers == 1 {
+                    "layer has"
+                } else {
+                    "layers have"
+                },
+                if *layers == 1 { "it will" } else { "they will" },
             ),
         }
     }
@@ -602,6 +720,9 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
 
     let mut warnings = Vec::new();
     let mut entries = Vec::with_capacity(doc.layers.len());
+    // Layers carrying an effect somebody can see, counted for the one warning
+    // raised about all of them — see `SaveWarning::EffectsNotPortable`.
+    let mut effected = 0usize;
 
     // Top first, which is the order `stack.xml` wants. The `src` numbering
     // follows the same order so a file listing reads the way the layers panel
@@ -649,6 +770,32 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             None => None,
         };
 
+        // The effects, as RON under `umber/effects/`, where no other reader
+        // will look. `docs/layer-effects.md` §8.1 and [`EFFECTS_ATTR`].
+        //
+        // Written for a layer and never for a folder, which is the same
+        // `!l.folder` filter `required_version` applies — so the entries in the
+        // archive and the revision the file declares cannot disagree about what
+        // it holds. A folder can carry none anyway: `plan_set_effect` refuses
+        // one, because there is no coverage to derive it from until group
+        // compositing lands.
+        let effects_src = match layer.effects.is_empty() {
+            true => None,
+            false => {
+                let src = effects_src(i);
+                zip.start_file(&src, deflated())?;
+                zip.write_all(encode_effects(layer.effects)?.as_bytes())?;
+                // Counted here and reported once below. Only where something
+                // is switched *on*: a layer whose effects are all disabled
+                // draws plain in Umber as well, so naming it would report a
+                // loss that did not happen.
+                if layer.effects.iter().any(|e| e.enabled) {
+                    effected += 1;
+                }
+                Some(src)
+            }
+        };
+
         let (op, exact) = composite_op(layer.blend);
         if !exact {
             warnings.push(SaveWarning::BlendApproximated {
@@ -668,8 +815,15 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                 exact,
                 selected,
                 mask_src.as_deref(),
+                effects_src.as_deref(),
             ),
         });
+    }
+
+    // One sentence for the document, however many layers carry an effect. See
+    // `SaveWarning::EffectsNotPortable` for why this is not per layer.
+    if effected > 0 {
+        warnings.push(SaveWarning::EffectsNotPortable { layers: effected });
     }
 
     // The background goes in last, so it is the bottom of the stack — and it is
@@ -775,6 +929,40 @@ pub fn blend_id(mode: BlendMode) -> String {
 /// `composite-op` every ORA also carries.
 pub fn blend_from_id(id: &str) -> Option<BlendMode> {
     BlendMode::ALL.into_iter().find(|m| blend_id(*m) == id)
+}
+
+/// A layer's effects as the archive holds them: a RON sequence, in composite
+/// order.
+///
+/// RON rather than JSON, unlike the history's manifest, and the difference is
+/// not a preference. [`Effect`] already derives serde and its serialised
+/// spelling is *pinned as literal text* in `effect`'s own tests — the field
+/// names, the variant names and the colour's shape — because a derived spelling
+/// that reaches a file is a format rather than a name. `brushes.ron` is where
+/// that spelling is already read and written, so writing it the same way here
+/// means one form to keep pinned instead of two. It is also the only form that
+/// lets `Effect`'s per-field `#[serde(default)]`s do their job: a parameter
+/// added in a later build has to load out of a file written before it existed.
+///
+/// Pretty rather than compact, and `struct_names(false)` exactly as
+/// `preset::write` uses: the whole point of a ZIP of readable parts is that
+/// somebody can unzip one and look. It costs a few hundred bytes in a deflated
+/// entry.
+///
+/// **`new_line("\n")` is where this parts company with `preset::write`, and it
+/// is not a preference.** `PrettyConfig::new()` takes the *platform's* line
+/// ending, so the same document saved on Windows and on Linux differed byte for
+/// byte inside `umber/effects/` — a document travels and `brushes.ron` does
+/// not, which is the whole of why the precedent does not carry. Nothing reads
+/// the bytes back for comparison today, so this was invisible; it would have
+/// been found by whoever first diffed two `.ora`s or checked one into version
+/// control.
+fn encode_effects(effects: &[Effect]) -> Result<String, SaveError> {
+    let config = ron::ser::PrettyConfig::new()
+        .struct_names(false)
+        .new_line("\n");
+    ron::ser::to_string_pretty(&effects, config)
+        .map_err(|e| SaveError::Io(std::io::Error::other(e)))
 }
 
 /// The background colour as [`BACKGROUND_ATTR`] spells it: `#rrggbb`, sRGB.
@@ -886,6 +1074,7 @@ fn layer_xml(
     exact: bool,
     selected: bool,
     mask: Option<&str>,
+    effects: Option<&str>,
 ) -> String {
     let mut out = format!(
         "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" \
@@ -904,6 +1093,9 @@ fn layer_xml(
     }
     if let Some(mask) = mask {
         out.push_str(&format!(" {MASK_ATTR}=\"{mask}\""));
+    }
+    if let Some(effects) = effects {
+        out.push_str(&format!(" {EFFECTS_ATTR}=\"{effects}\""));
     }
     // Written only when set, so a file from a document nobody has flagged
     // anything on is byte for byte the file this module always wrote.
@@ -1197,6 +1389,7 @@ mod tests {
     use super::*;
     use crate::docimport::{self, ImportError};
     use crate::document::Document;
+    use crate::effect::OutlinePosition;
 
     /// Layer-texture bytes: a solid colour over the whole canvas.
     fn solid(size: UVec2, px: [u8; 4]) -> Vec<u8> {
@@ -1561,9 +1754,16 @@ mod tests {
         // A document that carries a mask needs the revision that was raised
         // for one, so an older build refuses it rather than opening a picture
         // with the mask silently gone.
+        //
+        // **2 as a literal, not `VERSION`.** It read `VERSION` until effects
+        // took that to 3, at which point this assertion said "the newest
+        // revision this build knows about" rather than "the revision a mask
+        // needs" — and it would then have passed for a writer that declared
+        // every file at the newest number, which is exactly what
+        // `required_version` exists to prevent.
         assert!(
-            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"{VERSION}\"")),
-            "a masked document must declare the revision it needs"
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"2\"")),
+            "a masked document must declare revision 2 and no higher"
         );
         // And the mask lives outside the ORA stack, so no other reader shows it
         // as a layer nobody made.
@@ -1605,6 +1805,516 @@ mod tests {
                 .any(|u| u.slot == mask_slot && u.pixels == mask),
             "the mask's pixels were not handed over for upload"
         );
+    }
+
+    // --- layer effects --------------------------------------------------
+
+    /// An effect that reads back as the *same effect*, parameter for
+    /// parameter, and the colour bit for bit.
+    ///
+    /// `saving_and_reopening_does_not_move_a_pixel` is the pattern and the
+    /// reason is the same one: an effect's colour is four linear `f32`s, RON
+    /// writes an `f32` as text, and a shortened one is a colour that drifts a
+    /// little every time a document is saved and reopened. So the components
+    /// are awkward rather than round, and they are compared **as bits** —
+    /// `PartialEq` on `f32` would let a `-0.0` for a `0.0` past, and equality
+    /// on the whole struct would not say which field moved.
+    ///
+    /// It goes all the way to a `LayerStack`, because that is the round trip
+    /// somebody actually makes: `Layer::effects` in, `Layer::effects` out.
+    #[test]
+    fn an_effect_survives_a_save_and_a_reopen_bit_for_bit() {
+        let size = UVec2::new(4, 4);
+        let pixels = solid(size, [10, 20, 30, 255]);
+
+        let mut shadow = Effect::drop_shadow();
+        shadow.color = Color::new(0.123_456_79, 0.007_812_5, 0.999_999_94, 0.333_333_34);
+        shadow.opacity = 0.618_034;
+        shadow.angle = 37.5;
+        shadow.distance = 11.25;
+        shadow.softness = 2.5;
+        shadow.spread = 0.125;
+        shadow.blend = BlendMode::Screen;
+        // Carried by every effect and read by an outline alone, which is
+        // exactly why a shadow is the one to check it on: a writer that only
+        // wrote the fields a kind reads would drop it here.
+        shadow.position = OutlinePosition::Inside;
+
+        let mut outline = Effect::outline();
+        outline.position = OutlinePosition::Centre;
+        // Disabled, and still written: a switched-off effect is a set of
+        // parameters somebody dialled.
+        outline.enabled = false;
+
+        let effects = [shadow, outline];
+        let layers = vec![SaveLayer {
+            effects: &effects,
+            ..layer("Ink", &pixels)
+        }];
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+        assert_eq!(
+            warnings,
+            vec![SaveWarning::EffectsNotPortable { layers: 1 }],
+            "an effected layer is a loss for every other reader and must say so"
+        );
+
+        // Outside the ORA layer stack, exactly as a mask is, so no other
+        // reader shows anything it did not before.
+        let names: Vec<String> = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+            .unwrap()
+            .file_names()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "umber/effects/000.ron"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("data/")).count(),
+            1,
+            "the effects must not be a layer"
+        );
+        let xml = read_stack_xml(&bytes);
+        assert!(
+            xml.contains(&format!("{EFFECTS_ATTR}=\"umber/effects/000.ron\"")),
+            "{xml}"
+        );
+
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(
+            doc.layers[0].effects, effects,
+            "{:?}",
+            doc.layers[0].effects
+        );
+
+        // And through the stack, which is where the invariants live.
+        let opened = doc.open();
+        let back = opened.stack.get(0).expect("the layer").effects();
+        assert_eq!(back.len(), 2);
+        for (before, after) in effects.iter().zip(back) {
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.enabled, after.enabled);
+            assert_eq!(before.blend, after.blend);
+            assert_eq!(before.position, after.position);
+            for (a, b) in before.color.to_array().iter().zip(after.color.to_array()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "the colour moved");
+            }
+            for (a, b) in [
+                (before.opacity, after.opacity),
+                (before.spread, after.spread),
+                (before.softness, after.softness),
+                (before.angle, after.angle),
+                (before.distance, after.distance),
+            ] {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{before:?} came back as {after:?}"
+                );
+            }
+        }
+    }
+
+    /// **`required_version` still emits the lowest revision the file needs.**
+    ///
+    /// The sibling of `a_document_of_folders_still_declares_the_revision_it_
+    /// needs`, and the guard that has to hold for every one of these numbers
+    /// to be worth writing. The temptation whenever a revision is added is to
+    /// declare the newest one and be done; that shuts every document this
+    /// build touches out of every older Umber in exchange for nothing.
+    ///
+    /// Written as a sweep over the whole ladder rather than as three tests, so
+    /// a fourth revision has one place to be added and cannot be added by
+    /// relaxing an existing assertion.
+    #[test]
+    fn a_document_declares_the_lowest_revision_that_describes_it() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [7, 8, 9, 255]);
+        let mask = solid(size, [128, 128, 128, 255]);
+        let effects = [Effect::drop_shadow()];
+
+        let plain = || layer("Ink", &pixels);
+        let masked = || SaveLayer {
+            mask: Some(&mask),
+            ..plain()
+        };
+        let clipped = || SaveLayer {
+            clipped: true,
+            ..plain()
+        };
+        let effected = || SaveLayer {
+            effects: &effects,
+            ..plain()
+        };
+        // An effect *and* a mask: the highest of the two, not the sum and not
+        // whichever was tested last.
+        let both = || SaveLayer {
+            mask: Some(&mask),
+            ..effected()
+        };
+
+        for (expected, layers) in [
+            (1, vec![plain()]),
+            (2, vec![masked()]),
+            (2, vec![clipped()]),
+            (3, vec![effected()]),
+            (3, vec![both()]),
+            (3, vec![plain(), effected()]),
+        ] {
+            assert_eq!(
+                required_version(&layers),
+                expected,
+                "{} layer(s), flags {:?}",
+                layers.len(),
+                layers
+                    .iter()
+                    .map(|l| (l.mask.is_some(), l.clipped, l.effects.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // A disabled effect is still an effect in the file, so it still needs
+        // the revision that describes one. Reading `enabled_effect_count` here
+        // would let an older build open the document and drop the parameters,
+        // which is the whole failure the bump exists for.
+        let off = [Effect {
+            enabled: false,
+            ..Effect::outline()
+        }];
+        let layers = vec![SaveLayer {
+            effects: &off,
+            ..plain()
+        }];
+        assert_eq!(required_version(&layers), 3);
+
+        // And the number reaches the file rather than only the function.
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+        let xml = read_stack_xml(&bytes);
+        assert!(xml.contains(&format!("{VERSION_ATTR}=\"3\"")), "{xml}");
+    }
+
+    /// **Every finite `f32` an effect can hold survives the record**, which is
+    /// the claim `an_effect_survives_a_save_and_a_reopen_bit_for_bit` makes on
+    /// six values and this one makes on the axis.
+    ///
+    /// Six hand-picked numbers cannot answer "does RON's `f32` round-trip",
+    /// because the failure mode of a text encoder is a *class* of values —
+    /// subnormals, the extremes, whatever needs the ninth significant digit —
+    /// and a test author picks the ones they thought of. So this sweeps bit
+    /// patterns rather than numbers, over `opacity` and `angle` together
+    /// because a shared serialiser could still be given per-field attributes.
+    ///
+    /// **Measured before it was written**, over 398,459 finite patterns
+    /// including both infinities, both zeroes, `MIN_POSITIVE`, the smallest
+    /// subnormal of each sign, `MAX`, `MIN` and `EPSILON`: not one moved. The
+    /// sweep here is cut to five thousand, which is 0.04 s against twenty
+    /// thousand's 0.31 — the point is to catch a *class* of value, and every
+    /// class is reachable at either size. The specials are listed explicitly
+    /// so they are in it whatever the sample does.
+    ///
+    /// **NaN is excluded and that is a real limit, stated rather than hidden.**
+    /// RON writes `NaN` and reads back the *canonical* quiet NaN of that sign —
+    /// so `0x7fc0_0000` and `0xffc0_0000` do survive whole, and only a
+    /// non-canonical *payload* is lost. Nothing in Umber can produce one and
+    /// nothing can see the difference, but a later reader of this test should
+    /// not conclude that every bit pattern survives, because one class does
+    /// not.
+    #[test]
+    fn every_finite_parameter_an_effect_can_hold_survives_the_record() {
+        let mut values: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x807F_FFFF),
+            f32::MAX,
+            f32::MIN,
+            f32::EPSILON,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0 / 3.0,
+            core::f32::consts::PI,
+        ];
+        // A plain linear congruential walk, so the sample is the same on every
+        // machine and every run — a random one would make this flaky in the
+        // one way a format test must never be.
+        let mut state: u32 = 0x9E37_79B9;
+        while values.len() < 5_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f32::from_bits(state);
+            if !v.is_nan() {
+                values.push(v);
+            }
+        }
+
+        for v in values {
+            let effect = Effect {
+                opacity: v,
+                angle: v,
+                ..Effect::outline()
+            };
+            let text = encode_effects(&[effect]).expect("encode");
+            let back: Vec<Effect> = ron::from_str(&text).expect("read back");
+            assert_eq!(back.len(), 1);
+            assert_eq!(
+                back[0].opacity.to_bits(),
+                v.to_bits(),
+                "{v:?} ({:#x}) moved, written as `{text}`",
+                v.to_bits()
+            );
+            assert_eq!(back[0].angle.to_bits(), v.to_bits(), "{v:?}");
+        }
+    }
+
+    /// The record is a plain RON sequence at a path this module names, and
+    /// both halves are format rather than decoration.
+    ///
+    /// What it deliberately does **not** do is pin the whole text: the field
+    /// names, the variant names and the colour's shape are already pinned as
+    /// literals in `effect`'s own tests, against the compact spelling, which
+    /// is where a rename has to be caught. Pinning the pretty-printed form
+    /// here as well would fail on a `ron` release that changed its
+    /// indentation, which is a false alarm about a real guard.
+    #[test]
+    fn the_effects_record_is_a_ron_sequence_where_this_module_says() {
+        assert_eq!(effects_src(0), "umber/effects/000.ron");
+        assert_eq!(effects_src(12), "umber/effects/012.ron");
+
+        let text = encode_effects(&[Effect::outline(), Effect::drop_shadow()]).expect("encode");
+        assert!(text.trim_start().starts_with('['), "{text}");
+        assert!(text.trim_end().ends_with(']'), "{text}");
+        let back: Vec<Effect> = ron::from_str(&text).expect("read back");
+        assert_eq!(back, vec![Effect::outline(), Effect::drop_shadow()]);
+    }
+
+    /// **The portability warning names a loss somebody can see, once for the
+    /// document.**
+    ///
+    /// Two rules and each was wrong in the first draft.
+    ///
+    /// *Once.* `docs/layer-effects.md` §8.3 says "told once at the save", and
+    /// per layer it was thirty lines of one sentence with a different name in
+    /// them — the noise `ImportWarning::EffectsOverBudget` is explicitly
+    /// written to avoid, in the same feature, arguing against itself.
+    ///
+    /// *Seen.* A layer whose every effect is switched off draws plain **in
+    /// Umber too**, so telling the artist it will look plain elsewhere reports
+    /// a loss that did not happen. That is the trap `export::losses` already
+    /// avoids by asking whether *this* document has transparency. The record is
+    /// still written and the revision is still 3, because the parameters are
+    /// what an older build would drop; only the sentence is about what shows.
+    #[test]
+    fn only_a_visible_effect_is_named_as_a_loss_and_only_once() {
+        let size = UVec2::new(2, 2);
+        let px = solid(size, [1, 2, 3, 255]);
+        let on = [Effect::drop_shadow()];
+        let off = [Effect {
+            enabled: false,
+            ..Effect::outline()
+        }];
+
+        let warnings_for = |layers: Vec<SaveLayer<'_>>| {
+            encode(&SaveDocument {
+                size,
+                layers: &layers,
+                active: 0,
+                background: Background::Transparent,
+                dpi: Document::DEFAULT_DPI,
+                merged: &px,
+                history: None,
+            })
+            .expect("encode")
+            .1
+        };
+
+        // Nothing switched on: the record is written, and nothing is claimed.
+        let quiet = warnings_for(vec![SaveLayer {
+            effects: &off,
+            ..layer("Off", &px)
+        }]);
+        assert!(quiet.is_empty(), "{quiet:?}");
+
+        // Three effected layers, one sentence, and the count is of layers
+        // carrying something visible rather than of layers or of effects.
+        let loud = warnings_for(vec![
+            SaveLayer {
+                effects: &on,
+                ..layer("A", &px)
+            },
+            SaveLayer {
+                effects: &off,
+                ..layer("B", &px)
+            },
+            SaveLayer {
+                effects: &on,
+                ..layer("C", &px)
+            },
+        ]);
+        assert_eq!(loud, vec![SaveWarning::EffectsNotPortable { layers: 2 }]);
+
+        // And it reads as a sentence at both counts, because a count of one is
+        // the common case and "1 layers have" is how that goes wrong.
+        assert!(
+            SaveWarning::EffectsNotPortable { layers: 1 }
+                .to_string()
+                .starts_with("1 layer has layer effects"),
+            "{}",
+            SaveWarning::EffectsNotPortable { layers: 1 }
+        );
+        assert!(
+            SaveWarning::EffectsNotPortable { layers: 2 }
+                .to_string()
+                .starts_with("2 layers have layer effects")
+        );
+    }
+
+    /// **A document does not depend on the machine that wrote it**, and
+    /// `PrettyConfig`'s default line ending would have made it.
+    ///
+    /// `ron::ser::PrettyConfig::new()` takes the platform's newline, so the
+    /// same document saved on Windows and on Linux held different bytes inside
+    /// `umber/effects/`. Nothing in Umber reads those bytes back for
+    /// comparison, so it would not have failed a test; it would have been found
+    /// by whoever first diffed two `.ora`s or put one in version control.
+    ///
+    /// The other half is `preset::write`, which shares the config and keeps the
+    /// platform ending. That is *right* there and wrong here for one reason: a
+    /// `brushes.ron` stays on the machine that wrote it and a document travels.
+    #[test]
+    fn the_effects_record_carries_no_platform_line_ending() {
+        let text = encode_effects(&[Effect::drop_shadow(), Effect::outline()]).expect("encode");
+        assert!(text.contains('\n'), "it is meant to be pretty: {text:?}");
+        assert!(
+            !text.contains('\r'),
+            "a document must not differ by the machine that wrote it: {text:?}"
+        );
+    }
+
+    /// A record whose sequence is **not** in composite order comes back in it.
+    ///
+    /// `ImportedDocument::open`'s comment claims this — "it re-derives the
+    /// order, so a file whose sequence was written by a build that ordered them
+    /// differently still comes back right" — and nothing exercised it, because
+    /// every other test's fixture happens to be in rank order already and the
+    /// sort is then the identity. A guard whose fixture cannot distinguish the
+    /// mutation is a guard for a claim nobody is making.
+    ///
+    /// It matters because the order is not the writer's to promise: an inside
+    /// outline ranks *above* the layer and a drop shadow below it, and which
+    /// way round they land decides whether the shadow draws over the outline.
+    #[test]
+    fn a_record_out_of_composite_order_comes_back_in_it() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [4, 5, 6, 255]);
+        let inside = Effect {
+            position: OutlinePosition::Inside,
+            ..Effect::outline()
+        };
+        let shadow = Effect::drop_shadow();
+        assert!(shadow.rank() < inside.rank(), "the fixture is backwards");
+
+        // Written the wrong way round on purpose.
+        let effects = [inside, shadow];
+        let layers = vec![SaveLayer {
+            effects: &effects,
+            ..layer("Ink", &pixels)
+        }];
+        let (bytes, _) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+
+        // The reader hands back what the file said, in the file's order: it is
+        // not the reader's business to sort, and a reader that did would hide
+        // the stack failing to.
+        let doc = docimport::read_openraster(&bytes).expect("read back");
+        assert_eq!(doc.layers[0].effects, [inside, shadow]);
+
+        // The stack is where the invariant lives, and it puts them right.
+        let opened = doc.open();
+        assert_eq!(opened.stack.get(0).unwrap().effects(), &[shadow, inside]);
+    }
+
+    /// **A folder writes no effects, and `required_version` counts none**, so
+    /// the archive and the number the file declares cannot disagree.
+    ///
+    /// Unreachable through the model — `LayerStack::plan_set_effect` refuses a
+    /// folder, because a folder holds no slot and there is no coverage to
+    /// derive an effect from until group compositing lands
+    /// (`docs/layer-effects.md` §9.5) — and `SaveLayer::effects` is a public
+    /// field, so the case has to have an answer anyway. The answer is that
+    /// **both halves skip a folder together**: writing the entry while the
+    /// version clause skipped it would produce a file carrying effects and
+    /// declaring revision 1, which every older Umber would open and then drop.
+    ///
+    /// This is what has to change when a folder can carry one, and changing
+    /// only one half is what this test exists to catch.
+    #[test]
+    fn a_folder_writes_no_effects_and_declares_no_revision_for_them() {
+        let size = UVec2::new(2, 2);
+        let pixels = solid(size, [7, 8, 9, 255]);
+        let effects = [Effect::drop_shadow()];
+        let layers = vec![
+            SaveLayer {
+                depth: 1,
+                ..layer("Inside", &pixels)
+            },
+            SaveLayer {
+                effects: &effects,
+                ..SaveLayer::folder("Group", 0, true)
+            },
+        ];
+        assert_eq!(required_version(&layers), 1);
+
+        let (bytes, warnings) = encode(&SaveDocument {
+            size,
+            layers: &layers,
+            active: 0,
+            background: Background::Transparent,
+            dpi: Document::DEFAULT_DPI,
+            merged: &pixels,
+            history: None,
+        })
+        .expect("encode");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let names: Vec<String> = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+            .unwrap()
+            .file_names()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("umber/effects/")),
+            "{names:?}"
+        );
+        let xml = read_stack_xml(&bytes);
+        assert!(xml.contains(&format!("{VERSION_ATTR}=\"1\"")), "{xml}");
+        assert!(!xml.contains(EFFECTS_ATTR), "{xml}");
     }
 
     /// Two independent link groups out and back, and the old spelling still

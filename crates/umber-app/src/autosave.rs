@@ -91,7 +91,7 @@ use std::time::{Duration, Instant, SystemTime};
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
-use umber_core::{Background, BlendMode};
+use umber_core::{Background, BlendMode, Effect};
 use umber_render::{CanvasRenderer, DocumentCapture, Gpu};
 
 use crate::editor::Editor;
@@ -991,6 +991,20 @@ pub struct LayerMeta {
     /// The slice holding the layer's mask, when it has one — another slice of
     /// the same array, so it is read by exactly the same capture.
     pub mask: Option<u32>,
+    /// The layer's effects, in composite order.
+    ///
+    /// **Here rather than read off the stack at write time**, and that is the
+    /// snapshot rule this struct exists for rather than an incidental choice.
+    /// An effect is derived from nothing the capture reads — no slice, no
+    /// pixels — so taking it later would be free and would be *wrong*: the
+    /// readback spans frames and the encode spans a thread, so a shadow dialled
+    /// or switched off in between would produce a file whose parameters and
+    /// whose pixels came from different moments. Exactly the reason the names
+    /// are here.
+    ///
+    /// A `Vec` of `Copy` structs, so the clone costs what the names already
+    /// cost — and it is built once every few minutes, never on a frame.
+    pub effects: Vec<Effect>,
     pub clipped: bool,
     pub locked: bool,
     pub link: Option<u8>,
@@ -1839,6 +1853,9 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 blend: l.blend,
                 slot: l.slot(),
                 mask: l.mask(),
+                // Taken with the names, at the instant the capture begins —
+                // see `LayerMeta::effects`.
+                effects: l.effects().to_vec(),
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -1903,6 +1920,9 @@ fn run_task(task: Task) -> Vec<Report> {
                     .mask_index(i)
                     .and_then(|k| pixels.layers.get(k))
                     .map(Vec::as_slice),
+                // The snapshot's, not the live stack's: this runs on the
+                // writer thread, minutes after the document was described.
+                effects: &l.effects,
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -2249,6 +2269,7 @@ mod tests {
                 depth: 0,
                 folder: false,
                 mask: None,
+                effects: Vec::new(),
                 clipped: false,
                 locked: false,
                 link: None,
@@ -2494,6 +2515,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&internal);
         let _ = std::fs::remove_dir_all(&documents);
+    }
+
+    /// **The autosave writes a layer's effects, and both writers had to be
+    /// wired in the same change.**
+    ///
+    /// `app.rs`'s Save and this are the two places a `SaveLayer` is built, and
+    /// both take it through `..SaveLayer::new(…)` — which *defaults*
+    /// `effects` to empty. So dropping the field from either still compiles,
+    /// and the failure is silent: a document opens with its effects and is
+    /// written back without them. Wiring only Save would have been worse than
+    /// wiring neither, because then survival would depend on which path last
+    /// touched the file — Save keeping them and the autosave stripping them
+    /// five minutes later, unattended, which is not a rule an artist can
+    /// learn. Hence a runtime guard on each; this is the autosave's.
+    #[test]
+    fn the_autosave_writes_the_effects_the_snapshot_was_taken_with() {
+        let internal = scratch("effects-internal");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        doc.layers[0].effects = vec![Effect::drop_shadow(), Effect::outline()];
+        let ours = internal.join("Untitled 1-7777777777777777.ora");
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours.clone()),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+
+        let back = umber_core::docimport::import(&ours).expect("reopen the copy");
+        assert_eq!(
+            back.layers[0].effects,
+            vec![Effect::drop_shadow(), Effect::outline()],
+            "an autosave dropped the layer's effects"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
+    /// **The effects come off the snapshot, taken when the capture began.**
+    ///
+    /// The readback spans frames and the encode spans a thread, so anything
+    /// read at write time can have moved since the pixels did. Names are
+    /// snapshotted for exactly this reason and effects join them — a shadow
+    /// dialled or switched off during the readback would otherwise produce a
+    /// file whose parameters and whose pixels came from different moments.
+    ///
+    /// Effects are the tempting exception, because they are derived from
+    /// nothing the capture reads: taking them later would cost nothing and be
+    /// wrong anyway. That is what this pins.
+    #[test]
+    fn effects_are_snapshotted_when_the_capture_begins_not_when_it_is_written() {
+        let mut editor = Editor::default();
+        let id = editor.session.active_id();
+        assert!(editor.layers.set_effect(0, Effect::drop_shadow()));
+
+        let taken = snapshot(&editor, id).expect("the tab is open");
+        assert_eq!(taken.layers[0].effects, vec![Effect::drop_shadow()]);
+
+        // What an artist may do while the readback is still running.
+        let louder = Effect {
+            distance: 99.0,
+            ..Effect::drop_shadow()
+        };
+        assert!(editor.layers.set_effect(0, louder));
+        assert!(editor.layers.set_effect(0, Effect::outline()));
+
+        assert_eq!(
+            taken.layers[0].effects,
+            vec![Effect::drop_shadow()],
+            "the snapshot followed the document instead of holding its instant"
+        );
     }
 
     #[test]
@@ -2793,6 +2890,7 @@ mod tests {
             depth,
             folder: false,
             mask,
+            effects: Vec::new(),
             clipped: false,
             locked: false,
             link: None,
@@ -2810,6 +2908,7 @@ mod tests {
                 depth: 0,
                 folder: true,
                 mask: None,
+                effects: Vec::new(),
                 clipped: false,
                 locked: false,
                 link: None,

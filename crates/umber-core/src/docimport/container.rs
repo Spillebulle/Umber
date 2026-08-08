@@ -36,12 +36,41 @@ pub fn read_entry(
 }
 
 /// Read one entry whole if it is present.
+///
+/// Bounded at [`ImportedDocument::MAX_TOTAL_BYTES`], which is a sanity bound
+/// for a *canvas*. Anything whose own size is bounded by something much smaller
+/// should say so — see [`read_optional_entry_bounded`].
 pub fn read_optional_entry(
     zip: &mut Zip<'_>,
     name: &str,
     format: SourceFormat,
 ) -> Result<Option<Vec<u8>>, ImportError> {
-    let limit = ImportedDocument::MAX_TOTAL_BYTES;
+    read_optional_entry_bounded(zip, name, format, ImportedDocument::MAX_TOTAL_BYTES)
+}
+
+/// The same, for an entry whose content has a bound of its own.
+///
+/// **A limit measured in gigabytes is the wrong one for a parameter record**,
+/// and effects are the first entry in the archive whose *cardinality* is
+/// unbounded by the format. `umber/effects/<n>.ron` at
+/// [`ImportedDocument::MAX_TOTAL_BYTES`] is a decompression bomb with a very
+/// good ratio: RON is about fifteen bytes per effect and deflates around 500:1,
+/// so a 569 KB archive entry expands to 300 MB and twenty million effects, and
+/// the `Vec` is fully materialised before any budget or duplicate check sees
+/// it. Measured: 8 seconds and several gigabytes resident for that one, ~55
+/// seconds at the 2 GiB ceiling, and sixty-four layers may each name the same
+/// entry. A four-megabyte file that hangs the application is a worse outcome
+/// than every malformed case this module handles well.
+///
+/// So the caller states what its own content can be, and the check happens
+/// against the *declared* size before a byte is decompressed as well as against
+/// what actually arrives — the header is only a claim.
+pub fn read_optional_entry_bounded(
+    zip: &mut Zip<'_>,
+    name: &str,
+    format: SourceFormat,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, ImportError> {
     let mut entry = match zip.by_name(name) {
         Ok(e) => e,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
@@ -59,7 +88,7 @@ pub fn read_optional_entry(
         });
     }
 
-    let mut out = Vec::with_capacity(entry.size().min(1 << 20) as usize);
+    let mut out = Vec::with_capacity(entry.size().min(limit).min(1 << 20) as usize);
     // `take` as well as the declared-size check: the header is only a claim,
     // and the actual stream can be longer than it says.
     entry

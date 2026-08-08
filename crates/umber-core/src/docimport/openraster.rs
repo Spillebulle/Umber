@@ -17,11 +17,12 @@
 //! # Umber's own documents come through here
 //!
 //! [`crate::docformat`] writes ORA, so this is also the reader for Umber's own
-//! saved files. Five extra attributes carry what baseline ORA has nowhere to
-//! put — `umber-version`, `umber-selected`, `umber-blend`, `umber-background`
-//! and `umber-history`, all documented there — and they are read here rather
-//! than in a second reader, because two readers for one format is two things to
-//! keep in step. A file written by anything else simply has none of them.
+//! saved files. Its extra attributes carry what baseline ORA has nowhere to
+//! put — `umber-version`, `umber-selected`, `umber-blend`, `umber-background`,
+//! `umber-history`, `umber-mask` and `umber-effects`, all documented there —
+//! and they are read here rather than in a second reader, because two readers
+//! for one format is two things to keep in step. A file written by anything
+//! else simply has none of them.
 //!
 //! `umber-background` is the one that changes what this reader *does* rather
 //! than what it concludes: the layer carrying it is the document background,
@@ -61,15 +62,34 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
-    history, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds,
+    disable_effects_over_budget, flat, history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
 use crate::document::Background;
+use crate::effect::{self, Effect};
 use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
+
+/// Largest `umber/effects/<n>.ron` this reader will decompress.
+///
+/// **Derived from what a legal record can hold, not picked.** One layer may
+/// carry at most one effect per kind, and a *document* may carry at most
+/// `effect::MAX_ENABLED` enabled ones — so no honest record is longer than
+/// every effect Umber can draw. Measured, `docformat::encode_effects` writes a
+/// two-effect record in 546 bytes, so about 273 bytes each; 127 of them is
+/// under 35 KB and this is 64 KiB, which is nearly double the largest record
+/// the model permits and leaves room for parameters not yet invented.
+///
+/// The bound exists because effects are the first archive entry whose size
+/// follows a *count* rather than the canvas — see
+/// [`container::read_optional_entry_bounded`] for the measured bomb it refuses.
+/// It is deliberately not `MAX_ENABLED * some_bytes_per_effect`: that would be
+/// a second statement of the serialised form, which changes whenever a
+/// parameter is added, and would turn a generous margin into a tripwire.
+const MAX_EFFECTS_BYTES: u64 = 64 * 1024;
 
 /// A `<layer>` as `stack.xml` describes it, with its groups' effects already
 /// folded in. Collected before any PNG is decoded so the layer count can be
@@ -93,6 +113,16 @@ struct LayerSpec {
     /// `umber-mask`: the archive entry holding this layer's mask, outside the
     /// ORA layer stack. See [`docformat::MASK_ATTR`].
     mask_src: Option<String>,
+    /// `umber-effects`: the archive entry holding this layer's effects, outside
+    /// the ORA layer stack. See [`docformat::EFFECTS_ATTR`].
+    ///
+    /// Read off a `<layer>` and deliberately **not** off a nested `<stack>`: a
+    /// folder can hold no effect — `LayerStack::plan_set_effect` refuses one,
+    /// because there is no coverage to derive it from until group compositing
+    /// lands — and the writer skips a folder for exactly that reason, so
+    /// reading one here would be reading something nothing writes. When a
+    /// folder can carry an effect, both halves move together.
+    effects_src: Option<String>,
     /// `umber-clip`, `umber-lock`, and the link group.
     clipped: bool,
     locked: bool,
@@ -159,6 +189,17 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         // pixels, so a document of nothing but empty groups has nothing to show
         // and nowhere to paint.
         return flattened_fallback(&mut zip, size, dpi, warnings);
+    }
+
+    // A document can name more enabled effects than Umber can draw, and it has
+    // to open anyway. `ImportedDocument::open` calls this too, for the
+    // guarantee; here is the only place there is a `warnings` to say so in.
+    let disabled = disable_effects_over_budget(&mut layers);
+    if disabled > 0 {
+        warnings.push(ImportWarning::EffectsOverBudget {
+            disabled,
+            max: effect::MAX_ENABLED,
+        });
     }
 
     // The undo history, when the document says it has one. Read last, and
@@ -333,6 +374,7 @@ fn parse_stack(
                                 selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
                                 background: None,
                                 mask_src: None,
+                                effects_src: None,
                                 clipped: false,
                                 locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                                 // A folder can belong to a link group — read
@@ -394,6 +436,7 @@ fn parse_stack(
                                 .get(docformat::BACKGROUND_ATTR)
                                 .and_then(docformat::background_from_id),
                             mask_src: attrs.string(docformat::MASK_ATTR),
+                            effects_src: attrs.string(docformat::EFFECTS_ATTR),
                             clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
                             locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                             link: attrs
@@ -491,7 +534,87 @@ fn load_layer(
     layer.locked = spec.locked;
     layer.link = spec.link;
     layer.mask = load_mask(zip, spec, canvas, warnings);
+    layer.effects = load_effects(zip, spec, warnings);
     Ok(layer)
+}
+
+/// A layer's effects, when the file names them.
+///
+/// A RON sequence under `umber/effects/`, written by [`docformat`] and read by
+/// nothing else. See [`docformat::EFFECTS_ATTR`].
+///
+/// **A record that will not read costs the layer its effects and nothing
+/// else**, and the layer still arrives — the mask's rule, not the saved
+/// history's. The history is dropped whole because its entries are a sequence
+/// in which each restores the pixels the next expects; effects are independent
+/// per layer, so keeping the rest is keeping something correct rather than
+/// something half right. It is a warning because it is a real loss: an effect
+/// is the only record of itself, and a document reopened without one and saved
+/// again has lost it for good.
+///
+/// **`kind` is what makes a malformed record malformed**, and that is
+/// deliberate: [`crate::effect::Effect`] gives `kind` no serde default, so a
+/// record whose kind is absent or is a name this build has never heard of is
+/// *refused* rather than read as an arbitrary effect. Every other field
+/// defaults to its own neutral, so a record written by an older build loads.
+///
+/// **Two effects of one kind are refused here, and it has to be here**, which
+/// is the one refusal in this function that serde cannot make. A layer holds at
+/// most one per kind, so a record naming two drop shadows is malformed and a
+/// file is judged by its reader.
+///
+/// The *rule* is not this module's, though — it is
+/// [`LayerStack::duplicate_effect_kind`], which
+/// [`LayerStack::plan_set_effects`] also asks, so the model refuses the same
+/// set the reader refuses. Two guards each deciding for themselves what a
+/// duplicate was would be worse than one, and the reader has to ask before
+/// there is a stack to ask of. Refused whole rather than deduplicated, because
+/// the record is one unit and nothing in it says which of the two the artist
+/// meant.
+///
+/// **A record out of a stranger's file cannot recurse the parser**, and that
+/// was measured rather than assumed, because a stack overflow would be a crash
+/// where everything else here is a warning. The deserialiser is driven by
+/// `Vec<Effect>`'s *shape* rather than by the input, and an [`Effect`] is a
+/// flat struct of scalars — so a million open brackets is refused at the
+/// second one, "Expected opening `(` for struct `Effect`", without descending
+/// at all.
+///
+/// **It cannot be a decompression bomb either, and that needed a bound of its
+/// own** — see [`MAX_EFFECTS_BYTES`]. Every other entry in the archive is a
+/// canvas and answers to `ImportedDocument::MAX_TOTAL_BYTES`; a record's size
+/// follows how many effects it names, which the *format* does not bound at all.
+fn load_effects(
+    zip: &mut Zip<'_>,
+    spec: &LayerSpec,
+    warnings: &mut Vec<ImportWarning>,
+) -> Vec<Effect> {
+    let Some(src) = spec.effects_src.as_ref() else {
+        return Vec::new();
+    };
+    let mut read = || -> Result<Vec<Effect>, String> {
+        let bytes = container::read_optional_entry_bounded(zip, src, FORMAT, MAX_EFFECTS_BYTES)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("`{src}` is not in the file"))?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+        let effects: Vec<Effect> = ron::from_str(text).map_err(|e| e.to_string())?;
+        // The model's rule, asked rather than restated — see
+        // `LayerStack::duplicate_effect_kind`.
+        if let Some(kind) = LayerStack::duplicate_effect_kind(&effects) {
+            return Err(format!("it names two {kind:?} effects"));
+        }
+        Ok(effects)
+    };
+    match read() {
+        Ok(effects) => effects,
+        Err(reason) => {
+            warnings.push(ImportWarning::EffectsIgnored {
+                layer: spec.name.clone(),
+                reason,
+            });
+            Vec::new()
+        }
+    }
 }
 
 /// A layer's mask, when the file names one.
@@ -818,6 +941,140 @@ mod tests {
                 source: "dst-in".into()
             }]
         );
+    }
+
+    // --- layer effects --------------------------------------------------
+
+    /// A record written by hand, read as the effects it names, and reaching
+    /// the layer it was written for rather than the one beside it.
+    ///
+    /// The fixture lists the effected layer *first*, which is uppermost in an
+    /// ORA and last in a `LayerStack` — so a reader that read the record
+    /// against the file's order rather than the stack's would put a shadow on
+    /// the wrong layer, and this is the ordering that catches it.
+    #[test]
+    fn a_layers_effects_are_read_onto_that_layer() {
+        let ora = fixtures::ora(
+            2,
+            2,
+            &[
+                OraLayer::new("Top", 2, 2, &[0, 0, 255, 255])
+                    .effects("[(kind: DropShadow, angle: 90.0, distance: 4.0)]"),
+                OraLayer::new("Bottom", 2, 2, &[255, 0, 0, 255]),
+            ],
+        );
+        let doc = read(&ora).unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+        assert_eq!(doc.layers[0].name, "Bottom");
+        assert!(doc.layers[0].effects.is_empty());
+        assert_eq!(doc.layers[1].name, "Top");
+        assert_eq!(doc.layers[1].effects.len(), 1);
+        let effect = doc.layers[1].effects[0];
+        assert_eq!(effect.kind, crate::effect::EffectKind::DropShadow);
+        assert_eq!(effect.angle, 90.0);
+        assert_eq!(effect.distance, 4.0);
+        // Every field the record left out reads at its own **neutral**, not at
+        // the kind's own starting point — `Effect::drop_shadow` opens at 5.0
+        // softness and 0.75 opacity, and neither may leak in here. This is the
+        // per-field `#[serde(default)]` rule seen from the file rather than
+        // from the struct.
+        assert_eq!(effect.softness, 0.0);
+        assert_eq!(effect.opacity, 1.0);
+        assert!(effect.enabled, "an effect in a file is one somebody made");
+
+        // And it survives being installed in a stack.
+        let opened = doc.open();
+        assert!(opened.stack.get(0).unwrap().effects().is_empty());
+        assert_eq!(opened.stack.get(1).unwrap().effects(), &[effect]);
+    }
+
+    /// **A record with no `kind` is refused, and the layer still arrives.**
+    ///
+    /// Two rules meeting. `Effect` deliberately gives `kind` no serde default,
+    /// so a record that omits it — or names a kind this build has never heard
+    /// of — cannot be read as an arbitrary effect; that refusal has to survive
+    /// the trip through the file, which is what the first half checks. And the
+    /// refusal costs the *layer* nothing: the picture is all there, and losing
+    /// it over a decoration would be far worse than losing the decoration.
+    ///
+    /// The named loss is the whole point. An effect is the only record of
+    /// itself, so a document reopened without one and saved again has lost it
+    /// for good — which is exactly the silent loss this module refuses.
+    #[test]
+    fn an_effects_record_with_no_kind_is_refused_and_the_layer_still_arrives() {
+        for record in [
+            // No kind at all.
+            "[(spread: 8.0)]",
+            // A kind from a build this one does not know.
+            "[(kind: InnerGlow, spread: 8.0)]",
+            // One good effect and one bad: the sequence is one record, so the
+            // good one goes with it rather than being read past.
+            "[(kind: Outline),(spread: 8.0)]",
+            // Not RON at all.
+            "not a record",
+            // Empty, which is a truncated write rather than "no effects".
+            "",
+            // **Two of one kind**, which serde cannot refuse and the install
+            // loop would not either: `set_effect` replaces whatever the layer
+            // held of that kind, so the second would quietly overwrite the
+            // first and the document would hold one where the file said two.
+            // The one refusal in `load_effects` that is not the deserialiser's.
+            "[(kind: Outline, spread: 1.0),(kind: Outline, spread: 9.0)]",
+        ] {
+            let ora = fixtures::ora(
+                2,
+                2,
+                &[OraLayer::new("Ink", 2, 2, &[1, 2, 3, 255]).effects(record)],
+            );
+            let doc = read(&ora).unwrap();
+            assert_eq!(doc.layers.len(), 1, "{record}");
+            assert!(doc.layers[0].effects.is_empty(), "{record}");
+            assert!(
+                doc.warnings.iter().any(
+                    |w| matches!(w, ImportWarning::EffectsIgnored { layer, .. } if layer == "Ink")
+                ),
+                "{record} was dropped in silence: {:?}",
+                doc.warnings
+            );
+            // The pixels are untouched, which is the half that matters. The
+            // fixture places every layer at (1,1), so that is where to look.
+            assert_eq!(&doc.layers[0].pixels[12..16], [1, 2, 3, 255], "{record}");
+        }
+    }
+
+    /// A record the file names and does not contain. Same answer, and it has
+    /// to be reached without the `?` in `read` turning it into a refusal of
+    /// the whole document.
+    #[test]
+    fn an_effects_record_that_is_not_in_the_file_is_named() {
+        let ora = fixtures::ora(
+            2,
+            2,
+            &[OraLayer::new("Ink", 2, 2, &[1, 2, 3, 255]).effects_named_but_absent()],
+        );
+        let doc = read(&ora).unwrap();
+        assert_eq!(doc.layers.len(), 1);
+        assert!(doc.layers[0].effects.is_empty());
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::EffectsIgnored { .. })),
+            "{:?}",
+            doc.warnings
+        );
+    }
+
+    /// A layer that names no record says nothing at all.
+    ///
+    /// The other half of every warning rule here: a list that speaks about
+    /// every document is a list nobody reads, and every ORA from every other
+    /// application is in this case.
+    #[test]
+    fn a_layer_with_no_effects_raises_nothing() {
+        let doc = read(&two_layer_ora()).unwrap();
+        assert!(doc.layers.iter().all(|l| l.effects.is_empty()));
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
     #[test]

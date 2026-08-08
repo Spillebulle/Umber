@@ -2150,6 +2150,12 @@ impl UmberApp {
                     visible: layer.visible,
                     opacity: layer.opacity,
                     mask: mask.as_deref(),
+                    // Straight off the layer, because a save reads the stack
+                    // it is looking at. The autosave cannot do this — its
+                    // pixels arrive over several frames, so its metadata is
+                    // snapshotted when the capture begins — and the two have
+                    // to write the same file. See `autosave::LayerMeta`.
+                    effects: layer.effects(),
                     clipped: layer.clipped,
                     locked: layer.locked,
                     link: layer.link,
@@ -4470,6 +4476,83 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every writer of a `SaveLayer` states its effects, and this is a text
+    /// guard on purpose.**
+    ///
+    /// There are two — Save, here, and the autosave — and both build the
+    /// struct with `..SaveLayer::new(…)`, which **defaults** `effects` to
+    /// empty. So deleting the field from either compiles and passes, and the
+    /// failure is silent in the worst way: the document opens with its effects
+    /// and is written back without them, which is precisely the
+    /// open-and-save-loses-it failure `umber-version` 3 was raised to prevent,
+    /// reproduced inside the build that raised it and invisible to the version
+    /// gate because that gate is `version > VERSION`.
+    ///
+    /// The autosave's half is checked by *behaviour* —
+    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` reopens
+    /// the file it wrote. Save's cannot be: it reads every layer back off the
+    /// GPU first, so exercising it needs a device and a whole document. What
+    /// is left is the shape.
+    ///
+    /// **The file list is hand-written, and a writer in a third file is
+    /// invisible to this.** An earlier draft of this comment claimed "a third
+    /// one arrives already covered", which is false, and is exactly the claim
+    /// CLAUDE.md warns is easier to write than the guard: `include_str!` takes
+    /// a literal, so nothing here can discover a file it was not told about.
+    /// Adding a writer means adding its file below. What the list *is* total
+    /// over is the writers inside each file it names.
+    ///
+    /// **Wiring one and not the other would be worse than wiring neither**, and
+    /// that is why this insists on both at once rather than on Save alone: an
+    /// effect surviving or not depending on whether Save or the five-minute
+    /// timer last touched the file is not a rule anybody can learn, where
+    /// losing them consistently is at least a bug somebody reports.
+    ///
+    /// **Its reach is uneven and every claim here was run rather than
+    /// reasoned.** Three mutations:
+    ///
+    /// * Delete Save's `effects:` line — **fails**, 1 literal against 0.
+    /// * Move Save's construction behind an alias, so `app.rs` no longer holds
+    ///   the literal text at all, which is what "extracted into a helper" looks
+    ///   like — **fails** on `literals > 0`. A critic predicted this would pass
+    ///   and it did, against the version *before* the source was cut at
+    ///   `#[cfg(test)]`: the self-reference kept the count at 1 and propped the
+    ///   assertion up. Cutting the test off fixed both holes at once.
+    /// * Delete the autosave's `effects:` line — **passes**, because
+    ///   `autosave.rs` names the field three times outside its tests, on
+    ///   `LayerMeta`, in `snapshot` and in `run_task`, so a lower bound of one
+    ///   is still met. That writer is covered by *behaviour* instead
+    ///   (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails
+    ///   on it), which is the stronger guard and the reason the weaker one is
+    ///   only asked to carry the writer that cannot have one.
+    #[test]
+    fn every_writer_of_a_save_layer_states_its_effects() {
+        // **Everything from `#[cfg(test)]` on is cut off first, and that is
+        // not tidiness.** This test's own body names both strings it counts,
+        // and its failure message named one of them — so the first draft read
+        // two `SaveLayer {` in this file where there is one, and two
+        // `effects:` where there is one, and passed on a coincidence. It did
+        // still fail under the mutation, by 1 against 2, which is exactly how
+        // a guard that passes for the wrong reason survives review. A text
+        // guard has to be told not to read itself.
+        for (file, whole) in [
+            ("app.rs", include_str!("app.rs")),
+            ("autosave.rs", include_str!("autosave.rs")),
+        ] {
+            let source = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            let literals = source.match_indices("SaveLayer {").count();
+            assert!(literals > 0, "{file} builds no SaveLayer any more");
+            let stated = source.match_indices("effects:").count();
+            assert!(
+                stated >= literals,
+                "{file} builds {literals} SaveLayer(s) outside its tests and \
+                 names the field {stated} time(s); `..SaveLayer::new` defaults \
+                 it to empty, so the one that does not name it drops a layer's \
+                 effects in silence"
+            );
+        }
+    }
 
     #[test]
     fn a_modifier_overrides_the_strips_setting_for_one_gesture_and_no_longer() {
