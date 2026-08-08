@@ -17,7 +17,7 @@ use umber_core::{
     SelectionOp, StrokeBuilder, TipMask, Transform,
     input::{PressureModel, PressureSource},
 };
-use umber_render::{LayerDraw, StrokeStyle};
+use umber_render::{LayerDraw, LayerEffects, StrokeStyle};
 
 /// How near the first vertex a click has to land to close a polygon, in
 /// *screen* pixels. Divided by the zoom at the point of use.
@@ -1635,28 +1635,72 @@ impl Editor {
     /// composite a stack index has to map it through
     /// [`Editor::active_draw_index`].
     pub fn layer_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerDraw> {
+        self.effected_draws(float)
+            .into_iter()
+            .map(|e| e.draw)
+            .collect()
+    }
+
+    /// The same flattening, with each layer's effects beside its draw.
+    ///
+    /// [`Editor::layer_draws`] is this with the effects thrown away, so the two
+    /// cannot disagree about folders, about visibility or about which slice a
+    /// floating transform substitutes — one rule, in one place, which is the
+    /// arrangement the whole of that method's docs argue for.
+    ///
+    /// Nothing here decides which effects are *drawn*: that is
+    /// `CanvasRenderer::bake_effects`', because it is the crate that knows how
+    /// many effect slices there are and which of them are already baked. What is
+    /// decided here is only which of them could be — an effect that would mark
+    /// nothing is filtered out by `umber_render::effect_marks_nothing`, so the
+    /// draw list and the bake read one rule rather than agreeing by discipline.
+    ///
+    /// A folder carries no effects: `LayerStack::set_effect` refuses one, because
+    /// a folder holds no coverage to derive from until group compositing lands.
+    /// So the `filter_map` below drops folders exactly as it always did and never
+    /// has to ask.
+    pub fn effected_draws(&self, float: Option<(u32, u32)>) -> Vec<LayerEffects<'_>> {
         self.layers
             .layers()
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
-                Some(LayerDraw {
-                    slot: match (l.slot()?, float) {
-                        (slot, Some((from, to))) if from == slot => to,
-                        (slot, _) => slot,
+                Some(LayerEffects {
+                    draw: LayerDraw {
+                        slot: match (l.slot()?, float) {
+                            (slot, Some((from, to))) if from == slot => to,
+                            (slot, _) => slot,
+                        },
+                        opacity: l.opacity,
+                        blend: l.blend.index(),
+                        visible: self.layers.effective_visible(i),
+                        // The mask is *not* swapped for the preview slice: a
+                        // floating transform moves the layer's pixels, not what
+                        // hides them, and the preview has to be masked exactly as
+                        // the committed result will be.
+                        mask: l.mask(),
+                        clipped: l.clipped,
                     },
-                    opacity: l.opacity,
-                    blend: l.blend.index(),
-                    visible: self.layers.effective_visible(i),
-                    // The mask is *not* swapped for the preview slice: a
-                    // floating transform moves the layer's pixels, not what
-                    // hides them, and the preview has to be masked exactly as
-                    // the committed result will be.
-                    mask: l.mask(),
-                    clipped: l.clipped,
+                    effects: l.effects(),
                 })
             })
             .collect()
+    }
+
+    /// The lowest texture-array slice a baked effect may take.
+    ///
+    /// One past everything `LayerStack` has claimed, plus one for the slice a
+    /// floating transform previews into — which `CanvasRenderer::begin_float`
+    /// takes at exactly `slot_capacity_needed()`.
+    ///
+    /// **`slot_capacity_needed` and not the highest slot in the draw list**, and
+    /// the difference is a document quietly damaged. A slice parked in an undo
+    /// entry is claimed and is in no layer, so it appears in no draw; it is below
+    /// this number because `SlotPool` compacts only its tail. An effect written
+    /// at the top of the draw list instead would be an effect written over a
+    /// deleted layer's pixels, discovered when somebody undid the delete.
+    pub fn effect_slot_base(&self) -> u32 {
+        self.layers.slot_capacity_needed() + 1
     }
 
     /// Where the selected layer sits in [`Editor::layer_draws`].

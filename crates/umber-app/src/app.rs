@@ -31,7 +31,8 @@ use umber_core::{
     PixelRect, SelectionOp, Transform,
 };
 use umber_render::{
-    CanvasRenderer, CompositeParams, DabStyle, FloatParams, FloatSource, Gpu, ProbeParams,
+    CanvasRenderer, CompositeParams, DabStyle, EffectFrame, FloatParams, FloatSource, Gpu,
+    ProbeParams,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -2660,7 +2661,34 @@ impl UmberApp {
             );
         }
 
-        let layer_draws = self.editor.layer_draws(canvas.float_preview());
+        // Before the composite and into the same encoder, for the reason the
+        // float's preview is: an effect is an ordinary draw pointing at an
+        // ordinary slice, so those slices have to hold this frame's picture by
+        // the time the stack is drawn. Every stale effect is rebaked from the
+        // layer **plus the scratch**, which is what makes a shadow follow the
+        // brush; a document with no effects is a comparison and a `Vec` and
+        // touches no GPU at all.
+        //
+        // The active *draw* index has to come back out of this, because effect
+        // draws sit between the layers and shift it — hand the composite the
+        // plain one and the stroke previews on the wrong layer.
+        let baked = {
+            let stack = self.editor.effected_draws(canvas.float_preview());
+            canvas.bake_effects(
+                &gfx.gpu.device,
+                &gfx.gpu.queue,
+                &mut encoder,
+                self.editor.effect_slot_base(),
+                &stack,
+                EffectFrame {
+                    active_index: self.editor.active_draw_index(),
+                    stroke: self.editor.stroke_style,
+                    stroke_live: self.editor.stroke.is_active(),
+                },
+            )
+        };
+        let layer_draws = baked.draws;
+        let active_draw = baked.active_index;
 
         // A smudging brush needs to know what it is passing over. The read is
         // asynchronous: this records a sample and collects whichever earlier one
@@ -2675,7 +2703,7 @@ impl UmberApp {
                 &mut encoder,
                 &ProbeParams {
                     layers: &layer_draws,
-                    active_index: self.editor.active_draw_index(),
+                    active_index: active_draw,
                     stroke: self.editor.stroke_style,
                     doc_point: point,
                     radius,
@@ -2701,7 +2729,7 @@ impl UmberApp {
                 camera: &self.editor.camera,
                 pivot: self.editor.canvas_pivot,
                 layers: &layer_draws,
-                active_index: self.editor.active_draw_index(),
+                active_index: active_draw,
                 stroke: self.editor.stroke_style,
                 backdrop: self.editor.palette().backdrop_display(),
                 export: false,
