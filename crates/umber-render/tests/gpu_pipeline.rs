@@ -4685,9 +4685,12 @@ fn a_hard_edged_rectangular_lift_is_exact() {
 /// a texel centre exactly. For a power-of-two size both the divide and the
 /// multiply are exact in binary and the tap is provably the one texel; for 100
 /// they are not, so a coordinate can come back a unit in the last place off its
-/// texel centre and the bilinear filter picks up a sliver of a neighbour. Every
-/// canvas in this file is 64 or 512, so the only sizes ever tested were the ones
-/// where the arithmetic cannot fail. Umber's canvases are any size at all.
+/// texel centre and the bilinear filter picks up a sliver of a neighbour. **No
+/// float or sampler test in this file had ever used a non-power-of-two canvas** —
+/// they are 64 and 512, and the three `resize` calls to 128, 32 and 96 are about
+/// resizing rather than about sampling — so the only sizes this path was ever
+/// tested at were the ones where the arithmetic cannot fail. Umber's canvases are
+/// any size at all.
 #[test]
 fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
     let Some(gpu) = shared_gpu() else {
@@ -4769,30 +4772,34 @@ fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
             dest: Some(rect),
         };
 
-        // **Three frames of a drag, then the commit, all inside one gesture.**
-        // Drawing the preview repeatedly is the property that actually matters:
-        // a drag re-runs this every frame, so anything losing a level once loses
-        // one per frame and the picture rots under the hand holding it.
+        // One frame, one encoder, one submit.
         //
-        // It has to be one `begin_float` to mean that. A second `begin_float`
-        // would take the *committed* layer as its new `base`, so the float would
-        // blend over its own earlier result and every partly covered pixel would
-        // gain alpha — which is not a defect in the blit but a second gesture
-        // pasting on top of the first, and is what an earlier draft of this test
-        // measured and blamed on the sampler.
+        // **There is deliberately no loop here, and an earlier draft's was worth
+        // removing twice over.** It drew the preview three times to claim it was
+        // showing that "a drag does not rot the picture frame by frame", and it
+        // could not show that: `render_float` restores the damaged rectangle out
+        // of `float.base` *before* it draws, so repeating it with the same params
+        // is idempotent by construction and three iterations cannot fail where one
+        // passes. It also broke `draw_float`'s own documented rule — one uniform
+        // write per encoder, because `Queue::write_buffer` is flushed ahead of the
+        // encoder's commands, so all three passes read the last write. Benign only
+        // because the three writes were identical, which is the same fact that
+        // made the loop vacuous.
+        //
+        // What a real multi-frame drag would need is an encoder and a submit per
+        // frame with a *different* matrix each time, which is a different test
+        // and would be about `span()`'s restore rather than about the blit.
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        for _ in 0..3 {
-            canvas.draw_float(&gpu.queue, &mut enc, &params);
-        }
+        canvas.draw_float(&gpu.queue, &mut enc, &params);
         gpu.queue.submit(Some(enc.finish()));
         assert_eq!(
             canvas.read_layer_rect(&gpu.device, &gpu.queue, preview, rect),
             pixels,
-            "on a {side}-square canvas three frames of an identity drag moved the \
-             pixels they were handed, so re-rasterising text through the transform \
-             would degrade the picture as it was dragged"
+            "on a {side}-square canvas the previewed identity blit moved the \
+             pixels it was handed, so re-rasterising text through the transform \
+             would degrade the picture it was supposed to keep sharp"
         );
 
         let mut enc = gpu

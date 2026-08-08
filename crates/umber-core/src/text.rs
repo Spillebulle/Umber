@@ -74,8 +74,8 @@
 //!   refuses, and it would change what the shapes *are* — optical sizing and a
 //!   variable font's `opsz` axis both read the size — as well as having no
 //!   answer for a rotation.
-//! * **The block is measured before it is drawn**, by [`bounds_through`], which
-//!   walks each outline through the same map and records where the points went.
+//! * **The block is measured before it is drawn**, by [`BoundsPen`], which walks
+//!   each outline through the same map and records where the points went.
 //!   [`set`] used to pad by a whole em on every side because nothing knew how
 //!   far an outline strays past its advance width. That padding is 2.6x the
 //!   buffer for a single line at identity and *twenty times an em* under a scale
@@ -138,9 +138,9 @@ pub const MIN_SIZE: f32 = 4.0;
 /// advance width, and that is 2.6x the buffer for a single line. Under a scale
 /// of twenty it would be twenty ems of *document* buffer, three quarters of it
 /// empty, on the one path that has to finish inside a frame.
-/// [`bounds_through`] measures the ink instead, from the points the drawing pen
-/// will itself be handed, so the only thing left to pay for is the storage
-/// detail and the edge.
+/// [`BoundsPen`] measures the ink instead, from the points the drawing pen will
+/// itself be handed, so the only thing left to pay for is the storage detail and
+/// the edge.
 ///
 /// **The inset is why this is three and not one.** `Pen::at`'s docs say that if
 /// anybody tightens the padding the inset is the first thing to reconsider.
@@ -148,6 +148,14 @@ pub const MIN_SIZE: f32 = 4.0;
 /// insurance against a rasteriser storage detail — and to pay for it here,
 /// where it costs a constant rather than a proportion of the size.
 /// `no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp` is the guard.
+///
+/// **The three are not spent symmetrically, and the tidy reading of that
+/// sentence is wrong.** `Pen::at` clamps to `[0, size - 2]`, so the *near* side
+/// needs none of them — a point at the box's own minimum lands at 3.0 and the
+/// lower bound is 0.0 — and the *far* side needs the two. Two would therefore be
+/// exactly sufficient. The third is one pixel of headroom against the floor and
+/// ceiling in [`Bounds::pixels`] rounding a hair the wrong way, which is cheap
+/// where the alternative is a clipped contour.
 const MARGIN: f32 = 3.0;
 
 /// Where a line sits within the block.
@@ -289,10 +297,20 @@ impl Placed {
     ///
     /// `None` where none of it lands on the canvas at all.
     ///
-    /// **One pass, and that is not tidiness.** The three steps this replaces —
+    /// **Nothing calls this yet**, and the paragraph below is written in the
+    /// future tense it deserves rather than the present tense it had. The caller
+    /// is `app.rs`'s transform region once a text float carries the block it was
+    /// set from; until then a placement goes through [`Setting::clip`] and
+    /// `Clip::place` like a paste, and this saves nobody anything.
+    /// `the_layer_rect_of_a_block_off_the_top_left_reads_its_own_coverage` is what
+    /// stops it rotting in the meantime — the arithmetic here is the part with a
+    /// signed origin in it, which is the thing that has already been wrong once
+    /// in this module.
+    ///
+    /// **One pass, and that will not be tidiness.** The three steps it replaces —
     /// paint the coverage, premultiply it, crop it — are each a full copy of a
-    /// rectangle that on a large drag is tens of megabytes, and they run every
-    /// frame. The colour is constant over the block, so what varies per pixel is
+    /// rectangle that on a large drag is tens of megabytes, and they would run
+    /// every frame. The colour is constant over the block, so what varies per pixel is
     /// one byte; a 256-entry table built from
     /// [`crate::docimport::srgb::encode_pixel`] turns the whole conversion into
     /// a lookup and keeps the *exact* arithmetic the paste path uses, rather than
@@ -628,9 +646,31 @@ impl Bounds {
     ///
     /// `None` for a box that is not a pair of numbers, and the check is written
     /// against the *padded* corners rather than against `min` and `max` so that
-    /// an addition that overflows to an infinity is caught too. It is also
-    /// bounded into `i32`, so that a block a hundred million pixels off the
-    /// canvas is refused rather than wrapping to somewhere plausible.
+    /// an addition that overflows to an infinity is caught too.
+    ///
+    /// **[`LIMIT`](Self::pixels) is 2^24 and not `i32::MAX`, for two reasons that
+    /// meet at the same number.** This used to bound at `i32::MAX as f32`, which
+    /// is a claim with two holes in it:
+    ///
+    /// * `i32::MAX as f32` rounds *up* to 2147483648.0, one past what an `i32`
+    ///   holds, so `lo.x as i32` could saturate to `i32::MAX` — and
+    ///   [`Placed::at`] then adds `trim`'s offset to it with a plain `IVec2 +
+    ///   IVec2`, which panics in debug and wraps in release.
+    /// * [`MARGIN`] is 3.0, and one `ulp` of an f32 exceeds 6 once the magnitude
+    ///   passes about 6.7e7 — so beyond there `min - MARGIN == min` exactly, the
+    ///   padding this function exists to add silently evaporates, and
+    ///   [`Pen::at`]'s clamp starts biting the very points the measurement was
+    ///   supposed to keep inside the buffer.
+    ///
+    /// At 2^24 (16.7 million) an `ulp` is 2.0, so `MARGIN` still lands a whole
+    /// pixel of padding on the near side and the box is still honest. It is also
+    /// far past anything reachable: a coordinate that large with [`MAX_PIXELS`]'s
+    /// 16-megapixel cap on the *area* means a block flung a thousand canvases
+    /// away, and `MIN_SCALE` keeps a `Transform` nowhere near it.
+    ///
+    /// The old comment claimed "a block a hundred million pixels off the canvas
+    /// is refused"; a hundred million is 1e8, the bound was 2.1e9, and it was not
+    /// refused — it was the magnitude at which the margin had already gone.
     fn pixels(self) -> Option<InkRect> {
         let lo = self.min - Vec2::splat(MARGIN);
         let hi = self.max + Vec2::splat(MARGIN);
@@ -639,7 +679,7 @@ impl Bounds {
         if !lo.is_finite() || !hi.is_finite() {
             return None;
         }
-        const LIMIT: f32 = i32::MAX as f32;
+        const LIMIT: f32 = (1 << 24) as f32;
         if lo.x < -LIMIT || lo.y < -LIMIT || hi.x > LIMIT || hi.y > LIMIT {
             return None;
         }
@@ -1625,17 +1665,81 @@ mod tests {
         }
     }
 
-    /// The identity is the *exact* identity, not an approximation of one, which
-    /// is what lets [`set`] be [`set_through`] rather than a second rasteriser
-    /// beside it.
+    /// [`Affine::IDENTITY`] moves no point **in the last bit**, which is what
+    /// lets [`set`] be [`set_through`] rather than a second rasteriser beside it.
+    ///
+    /// **Stated against the arithmetic, because the obvious version of this test
+    /// cannot fail.** Comparing `set(…)` with `set_through(…, IDENTITY)` is
+    /// comparing a one-line wrapper with the thing it wraps — the same call with
+    /// the same arguments — so it holds for every possible body of
+    /// `set_through`, including a badly broken one. That is exactly the guard
+    /// that passes for the wrong reason this module has already thrown one of
+    /// out for, and it was the first version of this test.
+    ///
+    /// What is actually load-bearing is that [`Pen::at`]'s extra arithmetic —
+    /// `map.apply(p) - corner` where the map is the identity and the corner is
+    /// zero — is bit-for-bit the bare `p` it replaced. `Mat2::IDENTITY * p` is a
+    /// pair of multiply-adds by exactly 1.0 and 0.0, so it is exact for every
+    /// finite input including subnormals; this pins that rather than trusting it,
+    /// over the awkward values as well as the ordinary ones.
+    ///
+    /// **There is exactly one exception and it is the sign of zero.** `-0.0`
+    /// comes back as `+0.0`, because the identity is a sum rather than a copy and
+    /// `-0.0 + 0.0` is `+0.0` by IEEE 754. This test found that, which is the
+    /// right way round, and it is provably harmless rather than tolerated: the
+    /// two zeroes compare equal under every operator downstream — `clamp`, the
+    /// `min`/`max` in [`Bounds::add`], and the rasteriser's own comparisons and
+    /// multiplications — so no coverage byte can differ. It is worth recording
+    /// because "the exact identity" appears three times in this module's docs and
+    /// is, at the bit level, very slightly less than true.
     #[test]
-    fn setting_through_the_identity_is_setting_it() {
-        let lib = library();
-        for text in ["Umber", "A\u{E000}B", "gggg\nHHHH", "Wide line here\nx"] {
-            let b = block(text);
-            let direct = set_with(&lib, "Regular", &b).expect("ink");
-            let through = set_map(&lib, &b, Affine::IDENTITY).expect("ink");
-            assert_eq!(through.setting, direct, "{text:?}");
+    fn setting_through_the_identity_moves_no_point_at_all() {
+        for p in [
+            Vec2::ZERO,
+            Vec2::new(1.0, -1.0),
+            Vec2::new(0.1, 12345.678),
+            Vec2::new(-4096.5, 1e-30),
+            Vec2::new(f32::MIN_POSITIVE, -f32::MIN_POSITIVE),
+            Vec2::new(1e30, -1e30),
+        ] {
+            let through = Affine::IDENTITY.apply(p) - Vec2::ZERO;
+            assert_eq!(
+                through.to_array().map(f32::to_bits),
+                p.to_array().map(f32::to_bits),
+                "the identity moved {p:?}"
+            );
+        }
+        // The one exception, asserted rather than skipped: a negative zero comes
+        // back positive, and nothing else about it changes.
+        let z = Affine::IDENTITY.apply(Vec2::new(-0.0, -0.0)) - Vec2::ZERO;
+        assert_eq!(
+            z.to_array().map(f32::to_bits),
+            [0, 0],
+            "not a positive zero"
+        );
+        assert_eq!(z, Vec2::new(-0.0, -0.0), "and it still compares equal");
+        // And the composition the two entry points actually differ by: the pen
+        // hands the rasteriser the same point either way. `Pen::new` is
+        // `Pen::mapped` at the identity and at the origin, so this reads both
+        // through the real `at` rather than restating what it computes.
+        let mut raster = Rasterizer::new(64, 64);
+        let bare = Pen::new(&mut raster, 6.0, 14.0);
+        let points: Vec<Point> = [(0.0, 0.0), (11.5, -3.25), (30.0, 9.75), (-2.5, 0.125)]
+            .iter()
+            .map(|&(x, y)| bare.at(x, y))
+            .collect();
+        let mut raster = Rasterizer::new(64, 64);
+        let mapped = Pen::mapped(&mut raster, 6.0, 14.0, Affine::IDENTITY, Vec2::ZERO);
+        for (i, &(x, y)) in [(0.0, 0.0), (11.5, -3.25), (30.0, 9.75), (-2.5, 0.125)]
+            .iter()
+            .enumerate()
+        {
+            let got = mapped.at(x, y);
+            assert_eq!(
+                (got.x.to_bits(), got.y.to_bits()),
+                (points[i].x.to_bits(), points[i].y.to_bits()),
+                "the mapped pen moved ({x}, {y})"
+            );
         }
     }
 
@@ -1709,15 +1813,88 @@ mod tests {
         }
     }
 
+    /// [`Placed::layer_rect`] crops to the canvas and reads its **own** coverage
+    /// while doing it, for a block hanging off the top left.
+    ///
+    /// The one piece of arithmetic in this module with a signed origin in it that
+    /// is not exercised by anything else, on the function nothing calls yet. A
+    /// block dragged off the top or the left has `at` negative, so the row index
+    /// is `(y - y0) * w` for a negative `y0` — get that wrong by the sign and it
+    /// reads somebody else's row, or panics, which is precisely the shape of the
+    /// bug that made four tests fail on this branch.
+    ///
+    /// Driven against a hand-built [`Setting`] whose coverage is `x + y * w`, so
+    /// every pixel names its own position and a misindexed read is a wrong
+    /// *value* rather than a plausible one.
+    #[test]
+    fn the_layer_rect_of_a_block_off_the_top_left_reads_its_own_coverage() {
+        let (w, h) = (10u32, 6u32);
+        let setting = Setting {
+            width: w,
+            height: h,
+            coverage: (0..w * h).map(|i| (i % 251) as u8).collect(),
+            missing: Vec::new(),
+            mixed_directions: false,
+        };
+        let doc = UVec2::new(8, 5);
+        let white = Color::from_srgb_u8(255, 255, 255, 255);
+
+        // Hanging off the top left by (3, 2), and off the right by 5.
+        let placed = Placed {
+            setting: setting.clone(),
+            at: IVec2::new(-3, -2),
+        };
+        let (rect, pixels) = placed.layer_rect(white, doc).expect("some of it lands");
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (0, 0, 7, 4),
+            "the crop is wrong: {rect:?}"
+        );
+        assert_eq!(pixels.len(), (rect.area() * 4) as usize);
+        // Every pixel is the coverage of the block cell it came from, taken
+        // through the same table the function builds. Reading the alpha is
+        // enough: it is linear 8-bit and the colour is white, so the alpha *is*
+        // the coverage the block held there.
+        for row in 0..rect.height {
+            for col in 0..rect.width {
+                let block_x = col as i64 - placed.at.x as i64;
+                let block_y = row as i64 - placed.at.y as i64;
+                let cov = setting.coverage[(block_y * w as i64 + block_x) as usize];
+                let got = pixels[((row * rect.width + col) * 4 + 3) as usize];
+                let want = crate::docimport::srgb::encode_pixel([255, 255, 255, cov])[3];
+                assert_eq!(got, want, "at ({col}, {row}) the block held {cov}");
+            }
+        }
+
+        // Wholly off the canvas is `None` rather than an empty rectangle, on both
+        // axes and in both directions.
+        for at in [
+            IVec2::new(-(w as i32), 0),
+            IVec2::new(0, -(h as i32)),
+            IVec2::new(doc.x as i32, 0),
+            IVec2::new(0, doc.y as i32),
+        ] {
+            assert!(
+                Placed {
+                    setting: setting.clone(),
+                    at,
+                }
+                .layer_rect(white, doc)
+                .is_none(),
+                "a block at {at:?} is not on a {doc:?} canvas"
+            );
+        }
+    }
+
     /// No point a mapped pen is handed ever reaches its clamp.
     ///
     /// Named by [`MARGIN`] and by [`Pen::at`], and it is two claims because the
     /// guarantee is a composition of two:
     ///
-    /// * [`Pen::at`] and [`BoundsPen::at`] compute the **identical** point, so
-    ///   what was measured is what will be drawn. Stated over a spread of maps
-    ///   and offsets rather than by reading the two expressions and agreeing
-    ///   they look alike — they were written apart and can drift apart.
+    /// * [`Pen::at`] and [`BoundsPen::at`] compute the **identical** point, and
+    ///   `at`'s clamp is the identity on it — read through the real `at`, into a
+    ///   buffer sized from the measurement exactly as [`set_through`] sizes it.
+    ///   Both halves at once, which is the only way either is worth asserting.
     /// * [`Bounds::pixels`] leaves [`MARGIN`] whole pixels outside the box on
     ///   every side, and `MARGIN` is three where the clamp bites at two.
     ///
@@ -1725,6 +1902,12 @@ mod tests {
     /// most `size - 2` into it, so `clamp` is the identity on all of them. The
     /// flattened curve is inside the control hull, so it follows for every point
     /// the rasteriser actually sees.
+    ///
+    /// **This is not true for a coordinate past about 6.7e7**, and the limit is
+    /// f32 rather than the logic: `ulp` exceeds 6 there, so `min - MARGIN == min`
+    /// and `max + MARGIN == max`, the margin evaporates and the far point lands
+    /// exactly on the clamp. No `Transform` reaches it — [`Bounds::pixels`]
+    /// refuses past 2^24 for this reason — and the sweep below is well inside.
     #[test]
     fn no_point_a_mapped_pen_is_handed_ever_reaches_its_clamp() {
         let maps = [
@@ -1736,8 +1919,18 @@ mod tests {
                 t: Vec2::new(-90.0, 250.0),
             },
         ];
+        // The points a glyph's outline might hand either pen, in font units.
+        let outline = [(0.0, 0.0), (11.5, -3.25), (-40.0, 900.0), (300.0, 42.0)];
         for map in maps {
-            // Half of it: the two pens agree, exactly.
+            // Half of it, and it must go **through `Pen::at`**. An earlier
+            // version of this test re-typed `at`'s body into the assertion and
+            // compared that against `BoundsPen` — which passes for any body
+            // `Pen::at` might have, and is therefore a test of the transcription.
+            // The way to reach the real `at` is to give the rasteriser the buffer
+            // the real caller gives it: measure first, size the raster from the
+            // measurement, pass the measured corner. That is what `set_through`
+            // does, so this is the real composition rather than a stand-in, and
+            // it lets the clamp be *exercised* instead of stepped around.
             for (dx, baseline) in [(0.0, 0.0), (3.5, 40.0), (-12.0, 7.25)] {
                 let mut bp = BoundsPen {
                     map,
@@ -1745,17 +1938,41 @@ mod tests {
                     baseline,
                     seen: None,
                 };
-                let mut raster = Rasterizer::new(4, 4);
-                let pen = Pen::mapped(&mut raster, dx, baseline, map, Vec2::ZERO);
-                for (x, y) in [(0.0, 0.0), (11.5, -3.25), (-40.0, 900.0)] {
+                for &(x, y) in &outline {
                     bp.at(x, y);
-                    let want = bp.seen.expect("a point").max;
-                    // `Pen::at` clamps into its buffer, so compare the map
-                    // rather than the clamp: a 4x4 raster would clamp
-                    // everything. The arithmetic before the clamp is the claim.
-                    let got = pen.map.apply(Vec2::new(pen.dx + x, pen.baseline - y)) - pen.corner;
-                    assert_eq!(got, want, "the two pens disagree at ({x}, {y})");
-                    bp.seen = None;
+                }
+                let box_ = bp.seen.expect("points").pixels().expect("a box");
+                let corner = box_.min.as_vec2();
+                let mut raster = Rasterizer::new(box_.size.x as usize, box_.size.y as usize);
+                let pen = Pen::mapped(&mut raster, dx, baseline, map, corner);
+
+                let mut each = BoundsPen {
+                    map,
+                    dx,
+                    baseline,
+                    seen: None,
+                };
+                for &(x, y) in &outline {
+                    each.seen = None;
+                    each.at(x, y);
+                    let want = each.seen.expect("a point").max - corner;
+                    let got = pen.at(x, y);
+                    // The two pens agree, and the clamp did not bite: `at`
+                    // returns the *unclamped* mapped point, which is only true
+                    // because the buffer was sized from these very points.
+                    assert_eq!(
+                        (got.x, got.y),
+                        (want.x, want.y),
+                        "the clamp bit, or the pens disagree, at ({x}, {y}) under {map:?}"
+                    );
+                    // Said again in the clamp's own terms, so a future change to
+                    // `at` that clamped differently cannot pass by agreeing with
+                    // a differently-measured box.
+                    let size = box_.size.as_vec2();
+                    assert!(
+                        got.x > 0.0 && got.y > 0.0 && got.x < size.x - 2.0 && got.y < size.y - 2.0,
+                        "({x}, {y}) landed at {got:?}, on the clamp of {size:?}"
+                    );
                 }
             }
             // The other half: the box the measurement produces keeps `MARGIN`

@@ -41,9 +41,16 @@
 //!    part that is arithmetic rather than hardware, and it is four bytes a pixel
 //!    of the destination.
 //!
-//! The rows are wall clock and this machine was not quiet; see the header the
-//! run prints. Medians over [`RUNS`] repetitions, because a single reading at
-//! these magnitudes is dominated by whatever else the machine was doing.
+//! The rows are wall clock over [`RUNS`] repetitions, and the **fastest** of them
+//! is the figure to quote, with the median printed beside it so the gap says how
+//! quiet the machine was. [`timings`] is where that choice is argued, and it is
+//! a departure from `measure-history.rs`'s median made for a reason this example
+//! has already been caught by once.
+//!
+//! `ms/Mpx` is printed per row rather than left to be worked out, because the
+//! rate is **not** constant — it is worst for small blocks, where the per-glyph
+//! setup has nothing to amortise over — and a single average multiplied by an
+//! area is how a budget ends up flattering itself.
 
 use std::time::Instant;
 use umber_core::fonts::FontLibrary;
@@ -109,45 +116,56 @@ fn main() {
         };
         println!("--- {what} ---");
         println!(
-            "  {:>6}  {:>13}  {:>9}  {:>9}  {:>9}",
-            "scale", "destination", "shape", "raster", "upload"
+            "  {:>6}  {:>13}  {:>9}  {:>9}  {:>9}  {:>6}  {:>9}",
+            "scale", "destination", "shape", "raster", "(median)", "ms/Mpx", "upload"
         );
         for &s in SCALES {
             let map = Affine {
                 m: glam::Mat2::from_diagonal(glam::Vec2::splat(s)),
                 t: glam::Vec2::ZERO,
             };
-            // Shaping and layout alone, with nothing rasterised: the identity
-            // map over an empty string is not a proxy for it, so this is the
-            // real call at a scale small enough that the raster is a rounding
-            // error, subtracted from the full one below. Reported separately
-            // because if it dominated the answer would be to cache the shaped
-            // run and not to budget the area at all.
-            let full = median(RUNS, || {
+            // Shaping and layout alone, subtracted from the full call below.
+            //
+            // **The blank block is built once, outside the timed closure.** It
+            // was inside, so a `clone` and a `chars().map().collect()` were
+            // counted as shaping and then subtracted from the raster — small,
+            // and wrong in the direction that makes the expensive column look
+            // cheaper.
+            //
+            // Every line is still shaped, laid out and measured; what a line of
+            // spaces does not do is *draw*. It returns `NoInk` before the
+            // coverage buffer and the rasteriser are allocated, so this is not
+            // "the same allocations without the pixels" — an earlier comment
+            // here claimed that and it is not true. It is the shaper and the
+            // layout, which is what the column is for: if shaping dominated,
+            // the answer would be to cache the shaped run rather than to budget
+            // the area at all.
+            let mut blank = block.clone();
+            blank.text = blank
+                .text
+                .chars()
+                .map(|c| if c == '\n' { c } else { ' ' })
+                .collect();
+            let full = timings(RUNS, || {
                 let _ = text::set_through(face, &data, &block, map);
             });
-            let shaping = median(RUNS, || {
-                // `NoInk` is the cheapest possible complete pass through the
-                // shaper: every line is shaped, laid out and measured, and
-                // nothing is drawn. It is the shaping cost with the same
-                // allocations and none of the pixels.
-                let mut blank = block.clone();
-                blank.text = blank
-                    .text
-                    .chars()
-                    .map(|c| if c == '\n' { c } else { ' ' })
-                    .collect();
+            let shaping = timings(RUNS, || {
                 let _ = text::set_through(face, &data, &blank, map);
             });
             match text::set_through(face, &data, &block, map) {
                 Ok(placed) => {
                     let px = u64::from(placed.setting.width) * u64::from(placed.setting.height);
+                    let mpx = px as f64 / (1 << 20) as f64;
+                    let raster = (full.best - shaping.best).max(0.0);
                     println!(
-                        "  {s:>6.2}  {:>5}x{:<7} {:>7.2} ms {:>7.2} ms {:>6.1} MB",
+                        "  {s:>6.2}  {:>5}x{:<7} {:>7.3} ms {:>7.2} ms {:>7.2} ms {:>6.1} \
+                         {:>6.1} MB",
                         placed.setting.width,
                         placed.setting.height,
-                        shaping,
-                        (full - shaping).max(0.0),
+                        shaping.best,
+                        raster,
+                        (full.median - shaping.median).max(0.0),
+                        raster / mpx.max(1e-9),
                         px as f64 * 4.0 / (1 << 20) as f64,
                     );
                 }
@@ -156,9 +174,9 @@ fn main() {
                     // what stops the budget below from ever being asked about a
                     // block the module would refuse anyway.
                     println!(
-                        "  {s:>6.2}  {:>13}  {:>7.2} ms          -          -",
+                        "  {s:>6.2}  {:>13}  {:>7.3} ms          -          -        -          -",
                         refusal(err),
-                        shaping
+                        shaping.best
                     );
                 }
             }
@@ -169,11 +187,36 @@ fn main() {
     budget_note();
 }
 
-/// The median of `runs` timings of `f`, in milliseconds.
+/// The fastest and the middling of `runs` timings of `f`, in milliseconds.
+struct Timing {
+    best: f64,
+    median: f64,
+}
+
+/// Time `f` `runs` times and report both.
 ///
-/// The median and not the mean, for `measure-history.rs`'s reason: one
-/// scheduling hiccup moves a mean and cannot move a median.
-fn median(runs: usize, mut f: impl FnMut()) -> f64 {
+/// **The `best` column is the one to quote, and that is a departure from
+/// `measure-history.rs`'s median.** A median is the right answer to "one
+/// scheduling hiccup moved the mean" — it resists an *outlier*. It does not
+/// resist *sustained* load, because under contention every sample is slow and
+/// the middle one is slow too. This is pure single-threaded CPU work with no
+/// device and no I/O in it, so load can only ever add: the minimum is the
+/// closest reading available to what the code costs, and the median is reported
+/// beside it so the gap between them says how quiet the machine actually was.
+///
+/// This is not a stylistic preference. The first figures published from this
+/// example were taken while another crate was building and were up to 1.6x their
+/// own quiet value, which is the mistake `CLAUDE.md` already records against
+/// `measure-clipboard.rs` — "the first figures written into these docs were
+/// three times too slow because the machine was building six other things at the
+/// time". Reporting the minimum is what stops the same reading being wrong the
+/// next time somebody runs this on a busy laptop, rather than relying on them
+/// noticing that they should not have.
+///
+/// **A wide gap is the signal to re-run, not to average.** If `best` and
+/// `median` differ by more than a few tens of percent the machine was busy, and
+/// the honest response is another run on a quiet one.
+fn timings(runs: usize, mut f: impl FnMut()) -> Timing {
     let mut times: Vec<f64> = (0..runs)
         .map(|_| {
             let t = Instant::now();
@@ -182,7 +225,10 @@ fn median(runs: usize, mut f: impl FnMut()) -> f64 {
         })
         .collect();
     times.sort_by(f64::total_cmp);
-    times[runs / 2]
+    Timing {
+        best: times[0],
+        median: times[runs / 2],
+    }
 }
 
 fn refusal(err: text::TextError) -> String {

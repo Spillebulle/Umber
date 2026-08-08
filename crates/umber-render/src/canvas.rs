@@ -295,47 +295,61 @@ const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
 /// that cannot tolerate a bilinear resample. The cost is then the *destination*
 /// area, which is unbounded in the way a drag is unbounded, so it needs a
 /// budget. Measured by `umber-core/examples/measure-text.rs` — re-run it rather
-/// than trusting this table — on a 13th-generation laptop CPU, release, with
-/// another crate building beside it, medians of nine runs:
+/// than trusting this table — on a 13th-generation laptop CPU, release. **The
+/// figures are the fastest of nine runs, not the median**, and that is not a
+/// stylistic difference: a median resists an outlier and does not resist
+/// sustained load, and the first table published here was taken while another
+/// crate was building and overstated the worst row by 1.6x. `timings` in that
+/// example is where the choice is argued.
 ///
-/// | block | destination | rasterise |
-/// |---|---|---|
-/// | "Umber" at 72 px, placed | 212×54 | 0.14 ms |
-/// | the same, dragged to 4x | 848×213 | 1.22 ms |
-/// | the same, dragged to 16x | 3390×848 | **19.98 ms** |
-/// | three lines at 72 px, dragged to 4x | 2988×890 | 16.75 ms |
-/// | "Umber" at 1000 px, placed | 2943×735 | 9.55 ms |
+/// | block | destination | Mpx | rasterise | ms/Mpx |
+/// |---|---|---|---|---|
+/// | "Umber" at 72 px, placed | 212×54 | 0.011 | 0.10 ms | 9.6 |
+/// | the same, dragged to 4x | 848×213 | 0.17 | 0.90 ms | 5.2 |
+/// | the same, to 8x | 1695×424 | 0.69 | 3.47 ms | 5.1 |
+/// | the same, to 16x | 3390×848 | 2.74 | 12.24 ms | 4.5 |
+/// | three lines at 72 px, placed | 747×223 | 0.16 | 0.85 ms | 5.3 |
+/// | the same, to 2x | 1495×445 | 0.63 | 2.65 ms | 4.2 |
+/// | the same, to 4x | 2988×890 | 2.54 | 9.66 ms | 3.8 |
+/// | the same, to 8x | 5974×1780 | 10.1 | 36.33 ms | 3.6 |
+/// | "Umber" at 1000 px, placed | 2943×735 | 2.06 | 8.99 ms | 4.4 |
 ///
-/// So **roughly 4 to 9 ms per megapixel of destination**, linear in the area,
-/// the constant falling as the block grows because the per-glyph setup
-/// amortises. Shaping is 0.01 to 0.09 ms and does not move with the scale at
-/// all, which is what says the budget belongs on the area and not on a cache of
-/// shaped runs.
+/// Every row this doc reasons from is in that table, which is worth stating
+/// because the first version of it cited four figures that were not in it and
+/// told the reader to "read off the rows above".
 ///
-/// **The rate is not constant and this figure sits where it is worst, which is
-/// worth saying rather than leaving to be recomputed.** Read off the rows above:
-/// 3.8 ms/Mpx at 10.6 megapixels, 6.3 at 2.7, and **9.1 at 0.72** — the largest
-/// blocks are the most efficient, so quoting a single average and multiplying
-/// flatters exactly the size this constant is set at. The two measurements
-/// nearest a megapixel are 4.52 ms for 0.67 Mpx and 6.56 ms for 0.72, and 16.75
-/// for 2.66, which puts a megapixel at something like 6 to 9 ms — a third to a
-/// half of a 60 Hz frame, on the thread that also builds the interface — and two
-/// megapixels over a whole one. It is a judgement at the same place
-/// [`EFFECT_LIVE_PIXELS`]'s is, and the same kind of judgement: nothing was
-/// measured between the rows and the cost scales with the area.
+/// **The rate is not constant, and it is worst for *small* blocks** — the
+/// per-glyph setup has nothing to amortise over, which is why the placed caption
+/// reads 9.6 while everything over half a megapixel sits between 3.6 and 5.3.
+/// Shaping is 0.01 to 0.07 ms and does not move with the scale at all, which is
+/// what says the budget belongs on the area and not on a cache of shaped runs.
+///
+/// So a megapixel is **about 5 ms**, read off the two rows either side of it
+/// (0.69 Mpx at 5.1 ms/Mpx and 2.74 at 4.5), and it leaves two thirds of a 60 Hz
+/// frame for everything else.
+///
+/// **Two megapixels is about 9 ms and is *inside* a frame, so "the next power of
+/// two does not fit" is not the argument and this doc claimed it was.** The
+/// argument is the remainder: 9 ms leaves 7.7 ms for egui to lay out and
+/// tessellate the whole interface, for the upload of 8 MB, and for the composite
+/// — where 5 ms leaves 11.7. **What the interface itself costs has not been
+/// measured**, so the margin is a judgement and not a subtraction; it is a
+/// judgement at the same place [`EFFECT_LIVE_PIXELS`]'s is, and if somebody
+/// measures the frame properly this is the constant that should move.
 ///
 /// **[`text::MAX_PIXELS`](umber_core::text::MAX_PIXELS) does not stand in for
-/// this and that is the whole reason this exists.** Extrapolating the largest
-/// measured row, 16.8 megapixels is about 63 ms of rasterisation: nearly four
-/// frames. The cap bounds an allocation and leaves the drag unbounded. (The
-/// commit that added this said 110 ms, which multiplied the cap by a rate
-/// measured on blocks a tenth its size; the conclusion is unchanged and the
-/// figure was wrong, and a commit message cannot be amended.)
+/// this and that is the whole reason this exists.** At the 3.6 ms/Mpx the largest
+/// row measures, its 16 megapixels is about 58 ms of rasterisation: three and a
+/// half frames. The cap bounds an allocation and leaves the drag unbounded.
+/// (Two commit messages on this branch give that figure as 110 ms and then 63;
+/// both multiplied the cap by a rate measured on smaller blocks, the second from
+/// a loaded run. The conclusion never changed and a commit message cannot be
+/// amended, so the arithmetic lives here.)
 ///
-/// **What it bites on is a drag and never a placement.** A caption at its own
-/// size is eleven kilopixels, ninety times under this; the paragraph is one
-/// hundred and sixty-seven. Reaching it means having dragged a corner to
-/// several times the size the text was set at.
+/// **What it bites on is a drag and never a placement.** The caption at its own
+/// size is eleven kilopixels — ninety times under this — and the paragraph is six
+/// times under. Reaching it means having dragged a corner to several times the
+/// size the text was set at.
 ///
 /// # It degrades latency, and deliberately not quality
 ///
@@ -359,27 +373,53 @@ const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
 ///
 /// So the degradation is in **when** the re-rasterisation runs, never in what it
 /// produces. Above this figure it runs when the matrix settles rather than on
-/// every frame of the drag, and what the artist sees meanwhile is the last true
-/// rasterisation — sharp, and a frame or two behind the handles. A release stops
-/// the matrix, so the next frame catches up and the commit is a rasterisation of
-/// the matrix it is committing. Exactly the shape [`EFFECT_LIVE_PIXELS`] already
-/// uses, where above the budget the bake waits for the pixels to change and the
-/// shadow lags a stroke.
+/// every frame of the drag; a release stops the matrix, so the next frame catches
+/// up and the commit is always a rasterisation of the matrix it is committing.
+/// Whatever is on screen is always a true rasterisation of *some* matrix, which is
+/// what makes it a latency cost rather than a quality one.
 ///
-/// **And so nothing on screen says anything**, which is the same conclusion for
-/// the same reason: a picture one frame late is still the right picture, where a
-/// picture that is soft is not. A notice would fire on every frame of every
-/// large drag to report that Umber is keeping its promise.
+/// # What deferring actually looks like, which is not a lagging shadow
+///
+/// This doc said "exactly the shape [`EFFECT_LIVE_PIXELS`] already uses, where
+/// the bake waits for the pixels to change and the shadow lags a stroke", and
+/// that comparison is **too flattering and the difference matters to whoever
+/// writes the caller.**
+///
+/// A late drop shadow is still attached to the layer it belongs to; it is the
+/// right picture, a stroke behind. A deferred text rasterisation is not: the
+/// float's pixels sit where the *previous* matrix put them while the transform
+/// box is drawn at the current one, so the text visibly **comes away from its own
+/// handles** and slides back when the hand stops. That is a worse artefact than a
+/// lag, and it is the thing this policy trades the blur for.
+///
+/// It also is not "a frame or two". The deferral lasts as long as the
+/// rasterisation takes, which at the cap is about 58 ms — so at the sizes this
+/// gate bites, the box can be most of a tenth of a second ahead of the picture.
+///
+/// **Whether that is the right trade is the caller's decision and it has not been
+/// made**, because there is no caller. Two options are open to it and neither is
+/// settled here: draw the box at the *stale* matrix too, so the two agree and the
+/// whole float lags together as the shadow does; or keep the box live and accept
+/// the detachment. The first is honest and makes the handles feel heavy; the
+/// second keeps the handles crisp and lets the picture trail them. What is
+/// settled is only the part this constant owns — that the pixels are never soft.
+///
+/// **Nothing on screen says anything either way**, which is the one part the
+/// shadow's reasoning does carry over: a picture that is a moment behind is still
+/// the right picture, where a picture that is soft is not, and a notice would fire
+/// on every frame of every large drag to report that Umber is keeping its promise.
 const TEXT_RESET_LIVE_PIXELS: u64 = 1024 * 1024;
 
 /// May a block of text landing in `dest` be re-rasterised on **this** frame of a
 /// drag, or does it wait for the matrix to settle?
 ///
-/// See [`TEXT_RESET_LIVE_PIXELS`] for the figure and for why the answer above it
-/// is "later" rather than "blurrily". The per-block question rather than one gate
-/// on the canvas, for [`CanvasRenderer::effect_bakes_live`]'s reason: what costs
-/// the frame is the area the text covers, and a large canvas holding a caption
-/// should re-rasterise it every frame.
+/// See [`TEXT_RESET_LIVE_PIXELS`] for the figure, for why the answer above it is
+/// "later" rather than "blurrily", and for what deferring actually looks like —
+/// which is not the lagging drop shadow it is tempting to compare it to. The
+/// per-block question rather than one gate on the canvas, for
+/// [`CanvasRenderer::effects_bake_live`]'s reason: what costs the frame is the
+/// area the text covers, and a large canvas holding a caption should
+/// re-rasterise it every frame.
 ///
 /// **Nothing calls this yet.** It is `pub` because the decision belongs in this
 /// crate — beside the constant it reads, and beside the upload it bounds — while
