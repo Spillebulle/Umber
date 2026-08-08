@@ -4768,6 +4768,15 @@ mod tests {
     ///   (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails
     ///   on it), which is the stronger guard and the reason the weaker one is
     ///   only asked to carry the writer that cannot have one.
+    /// * Delete Save's `text:` line — **fails**, 0 against 1. It did not, on
+    ///   the first draft: `match_indices("text:")` matches the middle of
+    ///   `Context::`, three of which stand in this file outside its tests, so
+    ///   the count was 3 and the guard was vacuous for the one field it had
+    ///   just been widened to carry. Hence the word-boundary count below, which
+    ///   is where a substring guard's whole reach lives.
+    /// * Delete the autosave's `text:` line — **passes**, 2 against 1, for the
+    ///   `effects:` reason above and covered the same way, by
+    ///   `the_autosave_writes_the_text_the_snapshot_was_taken_with`.
     #[test]
     fn every_writer_of_a_save_layer_states_its_effects_and_its_text() {
         // **Everything from `#[cfg(test)]` on is cut off first, and that is
@@ -4778,6 +4787,24 @@ mod tests {
         // still fail under the mutation, by 1 against 2, which is exactly how
         // a guard that passes for the wrong reason survives review. A text
         // guard has to be told not to read itself.
+        // **A field name is counted at a word boundary, and that is a fix
+        // rather than a refinement.** A bare `match_indices("text:")` matches
+        // the middle of `Context::`, which `app.rs` writes three times outside
+        // its tests — so the guard read 3 against 1 literal and passed with the
+        // field deleted. Measured, not reasoned: the mutation was run, and it
+        // passed. Anything before the name that could be part of an identifier
+        // or a path means this is not the field.
+        let named = |source: &str, field: &str| {
+            source
+                .match_indices(field)
+                .filter(|(at, _)| {
+                    source[..*at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':')
+                })
+                .count()
+        };
         for (file, whole) in [
             ("app.rs", include_str!("app.rs")),
             ("autosave.rs", include_str!("autosave.rs")),
@@ -4794,7 +4821,7 @@ mod tests {
                 ("effects:", "drops a layer's effects"),
                 ("text:", "writes a text layer back as plain paint"),
             ] {
-                let stated = source.match_indices(field).count();
+                let stated = named(source, field);
                 assert!(
                     stated >= literals,
                     "{file} builds {literals} SaveLayer(s) outside its tests and \
