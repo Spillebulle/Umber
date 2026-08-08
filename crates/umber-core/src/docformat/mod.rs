@@ -52,6 +52,9 @@
 //!   so a document using nothing new still opens in an older build.
 //! * **[`MASK_ATTR`]** on a masked `<layer>`, naming an entry under `umber/`.
 //!   The mask is deliberately not a layer of the ORA stack; see that constant.
+//! * **[`EFFECTS_ATTR`]** on a `<layer>` carrying layer effects, naming an
+//!   entry under `umber/effects/`. Same shape as the mask and for the same
+//!   reason; see that constant.
 //! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
 //!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
@@ -145,6 +148,7 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::color::Color;
 use crate::docimport::srgb;
 use crate::document::Background;
+use crate::effect::Effect;
 use crate::layer::{BlendMode, LayerStack};
 
 pub use history::{HISTORY_ATTR, SaveHistory};
@@ -190,7 +194,24 @@ pub const EXTENSION: &str = "ora";
 /// setting the flag again and is not worth refusing somebody's painting over.
 /// They are only ever written on a file that carries something else, or on one
 /// declaring revision 1 — see [`required_version`].
-pub const VERSION: u32 = 2;
+///
+/// **3 is layer effects**, and `docs/layer-effects.md` §8.2 is the argument —
+/// which was put to the author as an open judgement and confirmed, because it
+/// is the one call that could reasonably have gone the other way. The short
+/// form: what an older build *shows* is merely plainer, a layer without its
+/// shadow, which is the folder case. What it *writes* is the problem. Effects
+/// are non-destructive and the parameters are the whole feature, so an older
+/// build opens the document, ignores an attribute it has never heard of, and
+/// the next save drops `umber/effects/` on the floor — permanently, having done
+/// nothing but open and save. That is exactly the property masks and clipping
+/// were refused for.
+///
+/// **`docs/group-compositing.md` §4.3 also proposes 3, for a folder with an
+/// opacity or a blend mode of its own. Effects landed first and took 3, so
+/// group compositing takes 4.** Only one feature can have a number, and the
+/// decision belongs in whichever lands second rather than to
+/// [`required_version`] to reconcile.
+pub const VERSION: u32 = 3;
 
 /// The lowest revision that describes `layers`.
 ///
@@ -200,16 +221,28 @@ pub const VERSION: u32 = 2;
 /// from older ones in exchange for nothing: a revision number is a statement
 /// about what a file *contains*, not about what wrote it.
 fn required_version(layers: &[SaveLayer<'_>]) -> u32 {
-    // Folders are skipped, and not merely because they never carry either
-    // today: `clipped` is a public field on `Layer` and nothing stops it being
-    // set on a folder, where it means nothing and is written nowhere. Reading
-    // it here would push a document to revision 2 — shutting it out of every
-    // older Umber — for a flag with no effect on the picture at all.
-    if layers
-        .iter()
-        .filter(|l| !l.folder)
-        .any(|l| l.mask.is_some() || l.clipped)
-    {
+    // Folders are skipped throughout, and not merely because they never carry
+    // any of this today: `clipped` is a public field on `Layer` and nothing
+    // stops it being set on a folder, where it means nothing and is written
+    // nowhere. Reading it here would push a document to revision 2 — shutting
+    // it out of every older Umber — for a flag with no effect on the picture at
+    // all.
+    //
+    // The same filter governs effects, and there it is load-bearing in the
+    // other direction: `encode` skips a folder's effects too, so the two agree
+    // about what the file actually contains. A folder cannot hold one anyway —
+    // `LayerStack::plan_set_effect` refuses it, because a folder has no
+    // coverage to derive an effect from until group compositing lands
+    // (`docs/layer-effects.md` §9.5) — and when it can, both halves change
+    // together or a file carries effects while declaring a revision that does
+    // not describe them.
+    let layers = || layers.iter().filter(|l| !l.folder);
+
+    // Highest first: a version number is a statement about what a file
+    // contains, and effects are the newest thing it can contain.
+    if layers().any(|l| !l.effects.is_empty()) {
+        3
+    } else if layers().any(|l| l.mask.is_some() || l.clipped) {
         2
     } else {
         1
@@ -271,6 +304,41 @@ pub fn mask_src(index: usize) -> String {
     format!("umber/masks/{index:03}.png")
 }
 
+/// `<layer>` attribute naming the archive entry holding the layer's effects.
+///
+/// **The mask's shape, deliberately** — outside the ORA layer stack, under
+/// `umber/`, named by an attribute on the element. `docs/layer-effects.md` §8.1
+/// has the argument, and the load-bearing half is the *attribute*: a single
+/// document-wide table would have to be keyed by something, and every candidate
+/// is wrong. A stack position shifts the moment a layer is reordered, a name is
+/// not unique, and `Layer::id` is explicitly a within-session identity that is
+/// never written down. An attribute on the element travels with the element and
+/// needs no key at all.
+///
+/// Serialising the parameters into the attribute value itself was the
+/// alternative. It works, and it puts an escaped RON blob in the middle of
+/// `stack.xml` that every other reader has to skip past and every human has to
+/// read around. One zip entry per effected layer is cheaper to read in both
+/// senses.
+///
+/// Nothing here is a new extension mechanism: the `umber-` prefix *is* the
+/// mechanism, and every other ORA reader ignores both the attribute and the
+/// directory. What they see is the layer without its effects — which is
+/// precisely why this is what took [`VERSION`] to 3, and why an effected layer
+/// raises [`SaveWarning::EffectsNotPortable`].
+pub const EFFECTS_ATTR: &str = "umber-effects";
+
+/// Where a layer's effects go inside the archive.
+///
+/// Indexed exactly as [`mask_src`] is — by the layer's position in the *file*,
+/// top first, which is the numbering `data/layer000.png` already uses. So a
+/// folder leaves a gap here as it does there, and for the same reason: the
+/// number is a name, and renumbering the layers consecutively would make it
+/// stop matching the entry it belongs to.
+pub fn effects_src(index: usize) -> String {
+    format!("umber/effects/{index:03}.ron")
+}
+
 /// `<layer>` attribute marking the selected layer, spelled `"true"`.
 pub const SELECTED_ATTR: &str = "umber-selected";
 
@@ -315,6 +383,15 @@ pub struct SaveLayer<'a> {
     /// carries the same value in all three colour channels. See
     /// [`MASK_ATTR`].
     pub mask: Option<&'a [u8]>,
+    /// The layer's effects, in composite order — exactly what
+    /// `Layer::effects` hands back. See [`EFFECTS_ATTR`].
+    ///
+    /// Written whole, enabled or not: a switched-off effect is still a set of
+    /// parameters somebody dialled, and dropping it at the save would be the
+    /// silent loss this whole entry exists to prevent. It is also what makes
+    /// [`required_version`] read the *presence* of an effect rather than
+    /// `enabled_effect_count`.
+    pub effects: &'a [Effect],
     /// Bounded by the alpha of the nearest unclipped layer below.
     pub clipped: bool,
     /// Refuses edits until unlocked.
@@ -346,6 +423,7 @@ impl<'a> SaveLayer<'a> {
             blend,
             pixels,
             mask: None,
+            effects: &[],
             clipped: false,
             locked: false,
             link: None,
@@ -418,6 +496,19 @@ pub enum SaveWarning {
         mode: &'static str,
         used: &'static str,
     },
+    /// The layer carries effects, which no other OpenRaster reader can see.
+    ///
+    /// Named in the same breath as an approximated blend mode because it is
+    /// the same kind of loss — the file is still a plain `.ora` and still holds
+    /// every pixel, and what another application shows is the layer unadorned.
+    /// `docs/layer-effects.md` §8.3: the artist should be told once at the save
+    /// rather than discovering it in GIMP.
+    ///
+    /// It is emphatically **not** a loss for Umber. The parameters are in the
+    /// file, [`EFFECTS_ATTR`] points at them, and [`required_version`] declares
+    /// the revision that says so, which is why an older Umber refuses the
+    /// document rather than quietly dropping them.
+    EffectsNotPortable { layer: String },
 }
 
 impl std::fmt::Display for SaveWarning {
@@ -428,6 +519,12 @@ impl std::fmt::Display for SaveWarning {
                 "Layer “{layer}”: OpenRaster has no exact equivalent of {mode}, so it is \
                  written as {used}. Umber reopens it as {mode}; other applications will \
                  composite it slightly differently where the layer is partly transparent."
+            ),
+            Self::EffectsNotPortable { layer } => write!(
+                f,
+                "Layer “{layer}” has layer effects. Umber saves them and reopens them, but \
+                 no other OpenRaster application can read them, so the layer will look \
+                 plain everywhere else."
             ),
         }
     }
@@ -649,6 +746,28 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
             None => None,
         };
 
+        // The effects, as RON under `umber/effects/`, where no other reader
+        // will look. `docs/layer-effects.md` §8.1 and [`EFFECTS_ATTR`].
+        //
+        // Written for a layer and never for a folder, which is the same
+        // `!l.folder` filter `required_version` applies — so the entries in the
+        // archive and the revision the file declares cannot disagree about what
+        // it holds. A folder can carry none anyway: `plan_set_effect` refuses
+        // one, because there is no coverage to derive it from until group
+        // compositing lands.
+        let effects_src = match layer.effects.is_empty() {
+            true => None,
+            false => {
+                let src = effects_src(i);
+                zip.start_file(&src, deflated())?;
+                zip.write_all(encode_effects(layer.effects)?.as_bytes())?;
+                warnings.push(SaveWarning::EffectsNotPortable {
+                    layer: layer.name.to_string(),
+                });
+                Some(src)
+            }
+        };
+
         let (op, exact) = composite_op(layer.blend);
         if !exact {
             warnings.push(SaveWarning::BlendApproximated {
@@ -668,6 +787,7 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                 exact,
                 selected,
                 mask_src.as_deref(),
+                effects_src.as_deref(),
             ),
         });
     }
@@ -775,6 +895,29 @@ pub fn blend_id(mode: BlendMode) -> String {
 /// `composite-op` every ORA also carries.
 pub fn blend_from_id(id: &str) -> Option<BlendMode> {
     BlendMode::ALL.into_iter().find(|m| blend_id(*m) == id)
+}
+
+/// A layer's effects as the archive holds them: a RON sequence, in composite
+/// order.
+///
+/// RON rather than JSON, unlike the history's manifest, and the difference is
+/// not a preference. [`Effect`] already derives serde and its serialised
+/// spelling is *pinned as literal text* in `effect`'s own tests — the field
+/// names, the variant names and the colour's shape — because a derived spelling
+/// that reaches a file is a format rather than a name. `brushes.ron` is where
+/// that spelling is already read and written, so writing it the same way here
+/// means one form to keep pinned instead of two. It is also the only form that
+/// lets `Effect`'s per-field `#[serde(default)]`s do their job: a parameter
+/// added in a later build has to load out of a file written before it existed.
+///
+/// Pretty rather than compact, and `struct_names(false)` exactly as
+/// `preset::write` uses: the whole point of a ZIP of readable parts is that
+/// somebody can unzip one and look. It costs a few hundred bytes in a deflated
+/// entry.
+fn encode_effects(effects: &[Effect]) -> Result<String, SaveError> {
+    let config = ron::ser::PrettyConfig::new().struct_names(false);
+    ron::ser::to_string_pretty(&effects, config)
+        .map_err(|e| SaveError::Io(std::io::Error::other(e)))
 }
 
 /// The background colour as [`BACKGROUND_ATTR`] spells it: `#rrggbb`, sRGB.
@@ -886,6 +1029,7 @@ fn layer_xml(
     exact: bool,
     selected: bool,
     mask: Option<&str>,
+    effects: Option<&str>,
 ) -> String {
     let mut out = format!(
         "<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" \
@@ -904,6 +1048,9 @@ fn layer_xml(
     }
     if let Some(mask) = mask {
         out.push_str(&format!(" {MASK_ATTR}=\"{mask}\""));
+    }
+    if let Some(effects) = effects {
+        out.push_str(&format!(" {EFFECTS_ATTR}=\"{effects}\""));
     }
     // Written only when set, so a file from a document nobody has flagged
     // anything on is byte for byte the file this module always wrote.
@@ -1561,9 +1708,16 @@ mod tests {
         // A document that carries a mask needs the revision that was raised
         // for one, so an older build refuses it rather than opening a picture
         // with the mask silently gone.
+        //
+        // **2 as a literal, not `VERSION`.** It read `VERSION` until effects
+        // took that to 3, at which point this assertion said "the newest
+        // revision this build knows about" rather than "the revision a mask
+        // needs" — and it would then have passed for a writer that declared
+        // every file at the newest number, which is exactly what
+        // `required_version` exists to prevent.
         assert!(
-            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"{VERSION}\"")),
-            "a masked document must declare the revision it needs"
+            read_stack_xml(&bytes).contains(&format!("{VERSION_ATTR}=\"2\"")),
+            "a masked document must declare revision 2 and no higher"
         );
         // And the mask lives outside the ORA stack, so no other reader shows it
         // as a layer nobody made.

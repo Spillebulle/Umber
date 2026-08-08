@@ -61,11 +61,12 @@ use quick_xml::events::Event;
 use super::blend::{self, Fidelity};
 use super::container::{self, Attrs, Zip};
 use super::{
-    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds, flat,
-    history, srgb,
+    ImportError, ImportWarning, ImportedDocument, ImportedLayer, SourceFormat, check_bounds,
+    disable_effects_over_budget, flat, history, srgb,
 };
 use crate::color::Color;
 use crate::docformat;
+use crate::effect::Effect;
 use crate::document::Background;
 use crate::layer::{BlendMode, LayerStack};
 
@@ -93,6 +94,16 @@ struct LayerSpec {
     /// `umber-mask`: the archive entry holding this layer's mask, outside the
     /// ORA layer stack. See [`docformat::MASK_ATTR`].
     mask_src: Option<String>,
+    /// `umber-effects`: the archive entry holding this layer's effects, outside
+    /// the ORA layer stack. See [`docformat::EFFECTS_ATTR`].
+    ///
+    /// Read off a `<layer>` and deliberately **not** off a nested `<stack>`: a
+    /// folder can hold no effect — `LayerStack::plan_set_effect` refuses one,
+    /// because there is no coverage to derive it from until group compositing
+    /// lands — and the writer skips a folder for exactly that reason, so
+    /// reading one here would be reading something nothing writes. When a
+    /// folder can carry an effect, both halves move together.
+    effects_src: Option<String>,
     /// `umber-clip`, `umber-lock`, and the link group.
     clipped: bool,
     locked: bool,
@@ -160,6 +171,12 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         // and nowhere to paint.
         return flattened_fallback(&mut zip, size, dpi, warnings);
     }
+
+    // A document can name more enabled effects than Umber can draw, and it has
+    // to open anyway. Settled here rather than at the install, where the
+    // refusal would have nowhere to be reported — see
+    // `disable_effects_over_budget`.
+    disable_effects_over_budget(&mut layers, &mut warnings);
 
     // The undo history, when the document says it has one. Read last, and
     // against the layers that actually *loaded* rather than against the specs:
@@ -333,6 +350,7 @@ fn parse_stack(
                                 selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
                                 background: None,
                                 mask_src: None,
+                                effects_src: None,
                                 clipped: false,
                                 locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                                 // A folder can belong to a link group — read
@@ -394,6 +412,7 @@ fn parse_stack(
                                 .get(docformat::BACKGROUND_ATTR)
                                 .and_then(docformat::background_from_id),
                             mask_src: attrs.string(docformat::MASK_ATTR),
+                            effects_src: attrs.string(docformat::EFFECTS_ATTR),
                             clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
                             locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                             link: attrs
@@ -491,7 +510,54 @@ fn load_layer(
     layer.locked = spec.locked;
     layer.link = spec.link;
     layer.mask = load_mask(zip, spec, canvas, warnings);
+    layer.effects = load_effects(zip, spec, warnings);
     Ok(layer)
+}
+
+/// A layer's effects, when the file names them.
+///
+/// A RON sequence under `umber/effects/`, written by [`docformat`] and read by
+/// nothing else. See [`docformat::EFFECTS_ATTR`].
+///
+/// **A record that will not read costs the layer its effects and nothing
+/// else**, and the layer still arrives — the mask's rule, not the saved
+/// history's. The history is dropped whole because its entries are a sequence
+/// in which each restores the pixels the next expects; effects are independent
+/// per layer, so keeping the rest is keeping something correct rather than
+/// something half right. It is a warning because it is a real loss: an effect
+/// is the only record of itself, and a document reopened without one and saved
+/// again has lost it for good.
+///
+/// **`kind` is what makes a malformed record malformed**, and that is
+/// deliberate: [`crate::effect::Effect`] gives `kind` no serde default, so a
+/// record whose kind is absent or is a name this build has never heard of is
+/// *refused* rather than read as an arbitrary effect. Every other field
+/// defaults to its own neutral, so a record written by an older build loads.
+fn load_effects(
+    zip: &mut Zip<'_>,
+    spec: &LayerSpec,
+    warnings: &mut Vec<ImportWarning>,
+) -> Vec<Effect> {
+    let Some(src) = spec.effects_src.as_ref() else {
+        return Vec::new();
+    };
+    let mut read = || -> Result<Vec<Effect>, String> {
+        let bytes = container::read_optional_entry(zip, src, FORMAT)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("`{src}` is not in the file"))?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+        ron::from_str(text).map_err(|e| e.to_string())
+    };
+    match read() {
+        Ok(effects) => effects,
+        Err(reason) => {
+            warnings.push(ImportWarning::EffectsIgnored {
+                layer: spec.name.clone(),
+                reason,
+            });
+            Vec::new()
+        }
+    }
 }
 
 /// A layer's mask, when the file names one.

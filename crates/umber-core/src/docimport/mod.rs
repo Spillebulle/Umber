@@ -60,6 +60,7 @@ use std::path::Path;
 use glam::UVec2;
 
 use crate::document::{Background, Document};
+use crate::effect;
 use crate::history::{Edit, EditBody, History, PatchPiece, PixelPatch};
 use crate::layer::{BlendMode, LayerStack};
 
@@ -161,6 +162,18 @@ pub struct ImportedLayer {
     /// still reported as lost, and that is the `psd` crate's limit rather than
     /// a decision: see `photoshop`'s module docs.
     pub mask: Option<Vec<u8>>,
+    /// The layer's effects, in composite order.
+    ///
+    /// Filled by ORA and by nothing else. Photoshop's `.psd` carries layer
+    /// effects and `photoshop.rs` does not read them — see
+    /// `docs/layer-effects.md` §8.3, which says why the prior is poor and that
+    /// whether `psd` 0.3.5 can even reach them has not been checked.
+    ///
+    /// Enabled and disabled alike, exactly as the file held them: a switched-off
+    /// effect is a set of parameters somebody dialled, and it costs the budget
+    /// nothing. [`ImportedDocument::open`] is where they reach a
+    /// [`LayerStack`].
+    pub effects: Vec<crate::effect::Effect>,
     /// Bounded by the alpha of the nearest unclipped layer below.
     pub clipped: bool,
     /// Refuses edits until unlocked.
@@ -194,6 +207,7 @@ impl ImportedLayer {
             blend,
             pixels,
             mask: None,
+            effects: Vec::new(),
             clipped: false,
             locked: false,
             link: None,
@@ -223,6 +237,7 @@ impl fmt::Debug for ImportedLayer {
             .field("blend", &self.blend.label())
             .field("pixels", &format_args!("{} bytes", self.pixels.len()))
             .field("mask", &self.mask.is_some())
+            .field("effects", &self.effects.len())
             .field("clipped", &self.clipped)
             .field("locked", &self.locked)
             .field("link", &self.link)
@@ -336,6 +351,28 @@ impl ImportedDocument {
                 dst.link = layer.link;
                 dst.slot()
             };
+            // Through `set_effect` rather than onto the field, because
+            // `Layer::effects` is private and the invariants it carries — at
+            // most one per kind, always in composite order — are the stack's to
+            // maintain. It re-derives the order, so a file whose sequence was
+            // written by a build that ordered them differently still comes back
+            // right.
+            //
+            // A refusal cannot bite here and is asserted rather than assumed:
+            // the budget was settled by `disable_effects_over_budget` before
+            // this ran, the index is the one the entry was just pushed at, and
+            // a folder carries none because `parse_stack` only reads the
+            // attribute off a `<layer>`. What is left is the release-build
+            // behaviour of a caller that built an `ImportedDocument` by hand and
+            // put an effect on a folder, which loses that effect and nothing
+            // else.
+            for effect in layer.effects.iter().copied() {
+                let installed = stack.set_effect(i, effect);
+                debug_assert!(
+                    installed,
+                    "an imported effect was refused by the stack it was read for"
+                );
+            }
             // A folder holds no pixels and takes no slice, so there is nothing
             // to upload and nothing to clear.
             let Some(slot) = slot else { continue };
@@ -528,6 +565,37 @@ pub enum ImportWarning {
     /// the layer's alpha in the first place. Two losses that read identically
     /// to the artist would be one warning; these do not.
     MaskUnsupported { layer: String, what: String },
+    /// The layer names an effects record that could not be read, so the layer
+    /// arrives without its effects.
+    ///
+    /// **That layer's effects go whole and nothing else is touched**, which is
+    /// deliberately *not* the saved history's "anything that does not line up
+    /// exactly is dropped, whole" — and the difference is what the two things
+    /// are. A history is a *sequence* in which each entry restores the pixels
+    /// the next expects, so one missing from the middle is a wrong history
+    /// rather than a short one. Effects are independent: one layer's say
+    /// nothing about another's, and nothing downstream reads across them. So
+    /// this is the mask's rule instead ([`Self::MaskIgnored`]) — keep the
+    /// picture, lose the decoration, and say so. Refusing the document over an
+    /// unreadable side file would cost the artist their painting to protect a
+    /// shadow.
+    ///
+    /// "Whole" still means whole *within the layer*: the record is one RON
+    /// sequence, so a single malformed effect in it takes that layer's others
+    /// with it rather than being skipped past.
+    EffectsIgnored { layer: String, reason: String },
+    /// The document holds more enabled effects than Umber can draw, so the
+    /// excess were switched off.
+    ///
+    /// Raised once for the document rather than once per layer, because it is
+    /// a statement about the document — thirty lines each saying the same
+    /// number would be the noise that stops this list being read.
+    ///
+    /// **Switched off, not removed.** The parameters stay in the layer and in
+    /// the next save, so the artist can turn one off and another on; deleting
+    /// them would be the silent loss, and `Effect::enabled` already means "no
+    /// draw and no bake, and therefore nothing charged against the budget".
+    EffectsOverBudget { disabled: usize, max: usize },
     /// A layer could not be brought across at all.
     LayerSkipped { layer: String, reason: String },
     /// Layer structure was lost and the flattened image was used instead.
@@ -577,6 +645,17 @@ impl fmt::Display for ImportWarning {
             Self::MaskUnsupported { layer, what } => {
                 write!(f, "Layer “{layer}”: {what} was not imported.")
             }
+            Self::EffectsIgnored { layer, reason } => write!(
+                f,
+                "Layer “{layer}” has layer effects that could not be read ({reason}), so it \
+                 opens without them."
+            ),
+            Self::EffectsOverBudget { disabled, max } => write!(
+                f,
+                "This document has more layer effects than Umber can draw at once, so \
+                 {disabled} of them were switched off. The limit is {max}; switch one off to \
+                 turn another back on."
+            ),
             Self::LayerSkipped { layer, reason } => {
                 write!(f, "Layer “{layer}” could not be imported: {reason}.")
             }
@@ -697,6 +776,50 @@ impl std::error::Error for ImportError {
             Self::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+/// Switch off whatever effects will not fit, and say how many.
+///
+/// **A file can be over the budget and Umber still has to open it.**
+/// `effect::MAX_ENABLED` is 127 and a full stack of 64 layers carrying both
+/// kinds asks for 128, so this is one bad document rather than an abstract
+/// bound — and it is reachable by other routes too, since the cap governs
+/// *adding* an effect and an undo, a paste and a layer leaving a folder can
+/// each arrive over it (`docs/layer-effects.md` §6.1).
+///
+/// **Why here rather than at the install.** [`ImportedDocument::open`] is where
+/// effects reach a [`LayerStack`], and `LayerStack::set_effect` would refuse
+/// the excess all by itself — by returning `false`, into a caller with nowhere
+/// to put a warning, which is precisely the `None`-into-`.flatten()` silence
+/// CLAUDE.md's "Partial exhaustiveness" section ends on. Whether a refusal is a
+/// diagnostic or a shrug is decided by its *caller*. So the decision is made
+/// here, where `warnings` is in hand, and `open` is handed a set that fits.
+///
+/// The order is bottom to top and, within a layer, composite order — the order
+/// the stack itself is in, so it is stable across a save and a reopen rather
+/// than depending on which layer happened to be read first.
+fn disable_effects_over_budget(layers: &mut [ImportedLayer], warnings: &mut Vec<ImportWarning>) {
+    let mut kept = 0usize;
+    let mut disabled = 0usize;
+    for layer in layers.iter_mut() {
+        for e in &mut layer.effects {
+            if !e.enabled {
+                continue;
+            }
+            if effect::within_budget(kept + 1) {
+                kept += 1;
+            } else {
+                e.enabled = false;
+                disabled += 1;
+            }
+        }
+    }
+    if disabled > 0 {
+        warnings.push(ImportWarning::EffectsOverBudget {
+            disabled,
+            max: effect::MAX_ENABLED,
+        });
     }
 }
 
