@@ -1101,8 +1101,10 @@ impl Editor {
     ///
     /// The pixels are the renderer's — see `CanvasRenderer::flip_layers` — and
     /// the history entry is `app.rs`'s, because it has to be recorded only if
-    /// the GPU work actually happened. What is here is the selection, which is
-    /// geometry and belongs to the document.
+    /// the GPU work actually happened. What is here is everything on the document
+    /// that carries a **direction or a position**: the selection, which is
+    /// geometry, and every layer effect's lighting. `LayerStack::flip_text`
+    /// belongs here too and nothing calls it yet.
     ///
     /// **Called for the flip and again for its undo**, and it is its own
     /// inverse on both halves, which is the whole reason the history can record

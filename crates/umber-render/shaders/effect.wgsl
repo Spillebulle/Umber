@@ -334,8 +334,19 @@ fn fs_grow(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
         }
         // A drop shadow's dilate: the union, because the shadow is the whole
         // shape grown rather than a band of it.
-        default: {
+        case SHAPE_DILATE: {
             return max(inside, band);
+        }
+        // **Nothing, and that is the point.** WGSL demands a `default` and this
+        // one used to be `SHAPE_DILATE`, which meant a mode the shader had never
+        // heard of drew the union of the shape and the band — a filled silhouette
+        // in the effect's colour rather than a ring, which is the loudest possible
+        // wrong picture arriving as the quietest possible failure. Drawing nothing
+        // is a bug somebody reports. `the_shader_knows_every_shape_the_planner_
+        // can_ask_for` is what makes a shape added on the Rust side and not here a
+        // red test rather than a silhouette.
+        default: {
+            return 0.0;
         }
     }
 }

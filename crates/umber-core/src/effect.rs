@@ -411,10 +411,21 @@ impl Effect {
 
     /// Does this composite **under** the layer?
     ///
-    /// An outer effect, in `docs/layer-effects.md` §3.3's sense: its confinement
-    /// is *baked* — the bake multiplies it by `1 − coverage`, so it cannot paint
-    /// under the layer's own opaque pixels — because doing it at composite time
-    /// would need an inverse clip the shader has no notion of.
+    /// Position in the draw list and nothing else. It used to say the confinement
+    /// followed from it — that an outer effect is multiplied by `1 − coverage` at
+    /// bake time — and that is `docs/layer-effects.md` §3.3's rule, which has been
+    /// **reversed**: the knockout is the *drop shadow's*, not a property of a side
+    /// of the stack. Photoshop's control is called "Layer knocks out drop shadow"
+    /// and is named for the shadow because it is the shadow's; generalising it made
+    /// a centred outline undrawable, since a stroke sits *on* the edge and removing
+    /// it wherever the layer covers deletes the half somebody asked for.
+    ///
+    /// So an Outside outline is confined in the *grow* (which is what "outside the
+    /// edge" means, and where it belongs so a soft stroke is soft on both sides), a
+    /// Centre outline is not confined at all, and a drop shadow keeps the knockout
+    /// at resolve time — after its blur and its displacement, because what it must
+    /// not cover is where the layer is now. `umber-render`'s `EffectShape` is where
+    /// that lives.
     pub fn is_outer(self) -> bool {
         self.rank() < LAYER_RANK
     }

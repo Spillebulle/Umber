@@ -657,7 +657,9 @@ impl UmberApp {
         }
     }
 
-    /// Mirror every layer's pixels and the selection with them.
+    /// Mirror every layer's pixels, and everything on the document that carries a
+    /// direction with them — the selection and every effect's lighting, both
+    /// through `Editor::flip_canvas`.
     ///
     /// The one route, shared by the command and by stepping over it in either
     /// direction — a flip is its own inverse, so a second implementation for
