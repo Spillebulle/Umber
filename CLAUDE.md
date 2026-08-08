@@ -3782,6 +3782,30 @@ parts that mattered are not the obvious ones.
   `the_release_workflow_stages_every_asset_the_installer_names` — a test failure
   that looks like a real regression and is a missing file. `git cat-file -p
   HEAD:<path> > <path>` is the way back.
+- **The sync client can delete a *live* agent's whole worktree, and it has.**
+  Two worktrees created in one round vanished mid-session — directory, branch,
+  ref, reflog and `.git/worktrees/` metadata, with no remnant — while the seven
+  older ones in the same folder survived. Nothing was lost only because neither
+  agent had written code yet. **The mitigation when a task must not lose work to
+  the environment is to run it in the shared checkout, one agent at a time, and
+  commit early and often**; a commit is the only thing that survives a sweep.
+  That costs the wall-clock parallelism this section otherwise exists for, so it
+  is a fallback and not the default — but a task whose files barely overlap is a
+  cheap one to serialise.
+  **The harness and the filesystem then disagreed**: it went on refusing the
+  agent's Bash calls as "isolated in the worktree …" that no longer existed. An
+  agent in that state cannot fix itself and should not try.
+- **An agent refusing a brief's instruction can be the agent being right, and
+  this is the case to remember.** That agent had been told, correctly at the
+  time, to run `git merge --ff-only main` as its first act. By the time it ran,
+  its worktree was gone and its working directory had fallen back to **the
+  shared checkout** — where that command would have operated on `main` itself,
+  and where checking out its own branch to merge would have moved the artist's
+  working tree onto an agent branch. It refused, ran only reads, reported, and
+  asked for a new tree. **A brief is written against a state of the world that
+  can change under it**, so "report rather than proceed" has to beat "do as
+  briefed" whenever the two conflict — and a coordinator should say so rather
+  than relying on judgement.
 - **The sync client is a third party to every one of these worktrees.** On a
   machine where the checkout is inside OneDrive, files vanish and reappear
   underneath running agents: eleven untracked scratch copies were swept
