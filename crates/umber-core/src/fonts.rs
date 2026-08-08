@@ -287,10 +287,20 @@ pub struct Face {
     /// This is why a *style* is not just a name. A variable font is one file
     /// carrying a continuum, and the styles somebody expects to pick from are
     /// its **named instances**; without them Archivo offers "Regular" alone
-    /// while the file it comes out of holds nine weights and every width. It is
-    /// also the reason `cputext.rs` exists at all — `ab_glyph` ignores
-    /// variation axes and renders the default master whatever weight is asked
-    /// for, which is why the interface has no bold.
+    /// while the file it comes out of holds nine weights and every width.
+    ///
+    /// **Two rasterisers are in this binary and only one of them applies
+    /// these**, which is worth being exact about because the sentence that used
+    /// to sit here was not. `crate::text::set` hands the location to `skrifa`
+    /// and `harfrust` and therefore genuinely draws the weight asked for —
+    /// `a_named_instance_is_actually_drawn_at_its_own_weight` and
+    /// `pressing_bold_actually_puts_a_heavier_mark_on_the_canvas` are what say
+    /// so, both by rasterising and comparing rather than by reading a field.
+    /// egui's own text goes through `ab_glyph`, which ignores variation axes and
+    /// renders the default master whatever weight is asked for — **which is why
+    /// the *interface* has no bold**, and it is the reason `cputext.rs` exists
+    /// for the splash. That limit belongs to the panels, not to what the text
+    /// tool puts on the canvas.
     pub variations: Vec<(String, f32)>,
 }
 
