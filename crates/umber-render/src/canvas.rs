@@ -228,7 +228,7 @@ const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 /// what `.min(MAX_SLOTS)` did.** That clamp had been acting as a *tight* bound
 /// on the overshoot: at a ceiling of 129 a document needing its 129th slice
 /// doubled from 128 to 256 and was clamped straight back to 129. At a ceiling of
-/// 256 the same document gets 256 — 4.29 GB at 2048² where 2.06 GB was asked
+/// 256 the same document gets 256 — 4.29 GB at 2048² where 2.16 GB was asked
 /// for, with the old array still alive during the copy, and `ensure_slots` never
 /// shrinks so it is permanent for the session. **A legal document with no
 /// effects in it reaches this**: 64 layers each with a mask is 128 slices and
@@ -5970,7 +5970,7 @@ mod tests {
     ///
     /// 64 layers each with a mask is 128 slices and a legal document with no
     /// effects in it; `begin_float` then asks for the 129th. Under plain
-    /// doubling that allocates 256 — 4.29 GB at 2048² against the 2.06 GB
+    /// doubling that allocates 256 — 4.29 GB at 2048² against the 2.16 GB
     /// asked for, with the old array still alive during the copy and no
     /// shrinking afterwards.
     ///

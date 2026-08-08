@@ -653,7 +653,7 @@ impl LayerStack {
     /// live defect.** Doubling *overshoots*, and `.min(MAX_SLOTS)` used to trim
     /// the overshoot back because the ceiling was 129 — so raising it here to
     /// 256 made a document needing its 129th slice allocate 256 of them, 4.29 GB
-    /// at 2048² against the 2.06 GB it asked for, permanently, from a legal
+    /// at 2048² against the 2.16 GB it asked for, permanently, from a legal
     /// stack of 64 masked layers. `grown_capacity` in `umber-render` is the
     /// repair and doubles only while the whole array stays inside a byte budget.
     /// This sentence claimed the overshoot could not happen while it was
