@@ -57,9 +57,13 @@
 //!   reason; see that constant.
 //! * **[`TEXT_ATTR`]** on a `<layer>` whose pixels were *set* rather than
 //!   painted, naming a record under `umber/text/`. See that constant and
-//!   [`crate::textobj`]: it is the one extension so far that an older build can
-//!   be actively *wrong* about rather than merely ignorant of, and the
-//!   fingerprint in the record is what makes it safe without moving [`VERSION`].
+//!   [`crate::textobj`]. **It is the one extension an older build can be
+//!   actively *wrong* about**, and the two above are what make that precise
+//!   rather than dramatic: a mask and an effect each took [`VERSION`] up, so an
+//!   older build meeting one *refuses the document* and cannot be wrong about
+//!   anything in it. Text declares nothing, so such a build opens the file, and
+//!   the fingerprint in the record is what stands in for the version — it is
+//!   why [`VERSION`] did not have to move, not a nicety beside it.
 //! * **[`CLIP_ATTR`]**, **[`LOCK_ATTR`]** and **[`LINK_ATTR`]** on `<layer>`,
 //!   each spelled `"true"` and each written only when set.
 //! * **[`SELECTED_ATTR`]** on one `<layer>` — which layer was being painted on.
@@ -1749,21 +1753,23 @@ mod tests {
                     .replace("\"version\":1", "\"version\":99")
                     .into_bytes()
             },
-            // **The record's own size bound, from the reading end.** Every other
-            // entry in a document is sized by the canvas, which
+            // **The record's own size bound, from the reading end.** A layer, a
+            // mask and the merged image are all sized by the canvas, which
             // `MAX_TOTAL_BYTES` bounds; this one is sized by how much somebody
             // typed, so a small archive can claim a large record and the
-            // document-wide figure does not reach it.
+            // document-wide figure does not reach it. An effects record is the
+            // other entry of that shape and has its own figure — see
+            // `textobj::MAX_RECORD_BYTES` for why the two are separate numbers.
             //
             // What this drives is `TextObject::from_json`'s length check, and
-            // **it does not reach `read_capped_entry`'s cap** — measured, by
-            // taking the cap out: the record is still dropped and this test
-            // still passes, because the parse refuses it a moment later. The cap
-            // is an allocation bound and its only observable effect is the
-            // megabytes not spent decompressing a record that was going to be
-            // refused, so nothing here can hold it in place. Said rather than
-            // implied, because the comment claiming otherwise is easier to write
-            // than the guard.
+            // **it does not reach `read_optional_entry_bounded`'s limit** —
+            // measured, by taking the limit out: the record is still dropped and
+            // this test still passes, because the parse refuses it a moment
+            // later. That limit is an allocation bound and its only observable
+            // effect is the megabytes not spent decompressing a record that was
+            // going to be refused, so nothing here can hold it in place. Said
+            // rather than implied, because the comment claiming otherwise is
+            // easier to write than the guard.
             format!(
                 "{{\"version\":1,\"text\":\"{}\"}}",
                 "x".repeat(crate::textobj::MAX_RECORD_BYTES + 16)
