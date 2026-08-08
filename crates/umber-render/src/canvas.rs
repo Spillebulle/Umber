@@ -1121,9 +1121,19 @@ pub struct BakedStack {
     /// Bottom to top, effect draws spliced in around the layers they belong to,
     /// in `docs/layer-effects.md` §4's order. This is what the composite takes.
     pub draws: Vec<LayerDraw>,
-    /// Where [`EffectFrame::active_index`]'s layer ended up. `u32::MAX` stays
-    /// `u32::MAX`, which the shader's `i == active_index` never matches.
+    /// Effects the document holds and this bake could not draw, because there was
+    /// no slice or no room in the pass budget for them. Non-zero says the document
+    /// is over budget, which is a thing to say out loud rather than a thing to be
+    /// quiet about — see [`CanvasRenderer::effects_dropped`].
     pub dropped: usize,
+    /// Where [`EffectFrame::active_index`]'s layer ended up, once effect draws are
+    /// spliced in around it. `u32::MAX` stays `u32::MAX`, which the shader's
+    /// `i == active_index` never matches.
+    ///
+    /// The composite has to be given **this** and not the plain index, or the
+    /// stroke in flight previews on whichever draw happens to sit at the old
+    /// number — an effect, or the wrong layer — and jumps into place at
+    /// pointer-up.
     pub active_index: u32,
 }
 
@@ -1533,8 +1543,8 @@ struct ThumbUniforms {
 /// Mirrors `Cfg` in `effect.wgsl`, byte for byte.
 ///
 /// The arithmetic, because there is no `vec3` here to make it interesting and
-/// that is exactly why: one `vec4<f32>` (16) + four `vec2<f32>` (32) + fourteen
-/// scalars (56) = 104, rounded up to the struct's 16-byte alignment = **112**.
+/// that is exactly why: one `vec4<f32>` (16) + four `vec2<f32>` (32) + fifteen
+/// scalars (60) = 108, rounded up to the struct's 16-byte alignment = **112**.
 /// Every `vec2` sits on an 8-byte boundary and the scalars are 4-aligned, so
 /// both sides pack the obvious way. Padding is a scalar, not a vector — see the
 /// uniform-layout note in CLAUDE.md.
@@ -1571,13 +1581,42 @@ struct EffectUniforms {
 
 /// How many pass blocks the bake's uniform buffer holds.
 ///
-/// A bake is extract + seed + `log2(reach)` flood steps + grow + downsample +
-/// four box passes + resolve, which is under twenty at any radius a canvas can
-/// hold; twenty-four effects' worth is 512 blocks. At the 256-byte alignment
-/// `downlevel_defaults` guarantees that is 128 KiB, allocated once per document
-/// that has an effect and never on the drawing path. A bake that would overrun
-/// it stops early and logs, rather than writing past the end.
-const EFFECT_PASS_BLOCKS: u64 = 512;
+/// One effect is extract + seed + `ceil(log2(reach)) + 1` flood steps + grow +
+/// downsample + four box passes + resolve. The flood is what makes that
+/// unbounded-looking, and it is bounded by the canvas rather than by the spread —
+/// see [`CanvasRenderer::plan_effect`] — so at 10000² the worst effect is
+/// **twenty-four** passes and [`EFFECT_MAX_PASSES_PER_EFFECT`] is that figure with
+/// room over it.
+///
+/// **The buffer is sized for `effect::MAX_ENABLED` of them, which the model will
+/// really install**: 64 layers times two kinds is 128, and the cap is 127. At 512
+/// blocks — five times too few — the whole bake was refused, `plain()` came back,
+/// and `effects_dropped` reported **zero** while nothing drew, every frame, for
+/// as long as the document was open. A panel reading that figure would have said
+/// the document was within its budget while showing none of it, which is the
+/// silent version of the failure §6.1a exists to prevent. The plan is now bounded
+/// as well, so an overrun is *impossible* rather than merely unlikely, and an
+/// effect that will not fit is dropped through the same visible path as one that
+/// has no slice.
+///
+/// At the 256-byte alignment `downlevel_defaults` guarantees this is 780 KiB, and
+/// it is noise against the 16 KiB *binding* limit because exactly one block is
+/// bound at a time — the buffer's own size is not a bound anything checks. It is
+/// allocated once per document that has an effect, and never on the drawing path.
+const EFFECT_PASS_BLOCKS: u64 =
+    EFFECT_MAX_PASSES_PER_EFFECT as u64 * umber_core::effect::MAX_ENABLED as u64;
+
+/// The most passes one effect can ask for, which is what bounds the plan.
+///
+/// Twenty-four is the measured worst — a 10000² canvas, where the flood's step
+/// count is `ceil(log2(10000)) + 1` = 15, plus extract, seed, grow, downsample,
+/// four box passes and the resolve. Thirty-two rather than twenty-four so that
+/// adding a pass to the pipeline does not silently start dropping effects; the
+/// cost of the slack is uniform bytes and nothing else.
+///
+/// `the_pass_budget_covers_the_effects_the_model_permits` is what says the two
+/// figures still agree with what `plan_effect` actually emits.
+const EFFECT_MAX_PASSES_PER_EFFECT: usize = 32;
 
 /// Stride of one [`EffectUniforms`] block.
 ///
@@ -1709,9 +1748,15 @@ enum EffectBind {
     ResolveGrown = 9,
     ResolveBlur0 = 10,
     ResolveBlur1 = 11,
+    /// The coverage itself as `src`, for an effect with no spread: there is
+    /// nothing to grow, so the shape *is* the coverage and the grow pass is not
+    /// recorded at all. Two bind groups rather than one because the blur reads the
+    /// shape without the coverage beside it and the resolve reads both.
+    SrcCoverage = 12,
+    ResolveCoverage = 13,
 }
 
-const EFFECT_BIND_COUNT: usize = 12;
+const EFFECT_BIND_COUNT: usize = 14;
 
 /// One effect's slice, and what it was baked from.
 ///
@@ -5524,32 +5569,49 @@ impl CanvasRenderer {
         stack: &[LayerEffects<'_>],
         frame: EffectFrame,
     ) -> BakedStack {
-        let plain = || BakedStack {
+        // The draw list with no effects in it, and **the count of what that
+        // cost**. The count is a parameter rather than zero: every route to this
+        // list except the first is a refusal, and a refusal that reported nothing
+        // dropped would be the silent degradation §6.1a forbids — a panel reading
+        // the figure would say the document was within its budget while showing
+        // none of it.
+        let plain = |dropped: usize| BakedStack {
             draws: stack.iter().map(|e| e.draw).collect(),
-            dropped: 0,
+            dropped,
             active_index: frame.active_index,
         };
 
         // Every effect the document would draw, bottom to top, as
         // (stack position, effect).
-        let wanted: Vec<(usize, Effect)> = stack
-            .iter()
-            .enumerate()
-            .flat_map(|(i, entry)| {
-                entry
-                    .effects
+        //
+        // **At most one per kind per layer, enforced here as well as upstream.**
+        // `LayerStack::set_effect` guarantees it and `duplicate_effect_kind` is
+        // what the reader asks, but this is a public function taking a bare
+        // `&[Effect]`, and the failure a second one produces is not obvious: the
+        // cache is keyed on `(slot, mask, kind)`, so both draws would read the
+        // *second* effect's pixels while `record` kept one stamp — two entries in
+        // the draw list showing one effect, rebaking every frame for ever. Cheaper
+        // to drop the later one and say so than to make a caller's slip into that.
+        let mut wanted: Vec<(usize, Effect)> = Vec::new();
+        for (i, entry) in stack.iter().enumerate() {
+            for effect in entry.effects.iter().filter(|e| !effect_marks_nothing(e)) {
+                if wanted
                     .iter()
-                    .filter(|e| !effect_marks_nothing(e))
-                    .map(move |e| (i, *e))
-            })
-            .collect();
+                    .any(|(at, e)| *at == i && e.kind == effect.kind)
+                {
+                    log::warn!("layer {i} carries two {:?} effects", effect.kind);
+                    continue;
+                }
+                wanted.push((i, *effect));
+            }
+        }
         if wanted.is_empty() {
             // A document with no effects produces exactly the draw list it
             // produced before this feature existed, entry for entry — the
             // regression that matters most. Nothing is allocated and the scratch
             // is given back.
             self.effects.forget_all();
-            return plain();
+            return plain(0);
         }
 
         // A `base` below anything the stack itself uses is a caller that has read
@@ -5563,19 +5625,41 @@ impl CanvasRenderer {
         if base <= highest {
             log::error!("effect slices would start at {base}, over slot {highest} in use");
             self.effects.forget_all();
-            return plain();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
         }
 
         // A slice count, and it is not the same bound as the byte budget: `127`
         // effect slices at 10000² would be 50 GB, which is stage 3's problem.
         // What this stops is the one that is fatal — a slice past the depth the
-        // device guarantees.
+        // device guarantees. `MAX_SLOTS - base` can be **zero**: `SlotPool` hands
+        // out up to slot 255, so `slot_capacity_needed` can reach 256 and `base`
+        // 257, which enough delete-then-add cycles reach through parked slices.
         let capacity = MAX_EFFECT_SLICES.min(MAX_SLOTS.saturating_sub(base as usize));
+        if capacity == 0 {
+            // Nothing can be drawn, and it has to be said rather than fallen
+            // through: below, `slots` would be empty and `top` would fall back to
+            // `base` — 257, which is over the ceiling `ensure_slots` debug-asserts
+            // and, in a release build, a fresh 256-slice array allocated and
+            // copied every frame.
+            log::warn!("no slices left for effects: they start at {base} of {MAX_SLOTS}");
+            self.effects.forget_all();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
+        }
 
         // Over budget: keep the effects **highest** in the stack, so the layer
         // somebody is working on keeps its own. Stated rather than truncated —
         // `dropped` is what the panel reports.
-        let dropped = wanted.len().saturating_sub(capacity);
+        //
+        // **Two budgets, and the tighter of the two decides.** Slices are the one
+        // §6.3 derives from the device; passes are this crate's own uniform
+        // buffer, and at `MAX_ENABLED` effects the second bites first on a large
+        // canvas. Routing both through one figure is what stops the pass budget
+        // being a *silent* refusal — which it was, when overrunning it abandoned
+        // the whole bake and left `dropped` reporting zero.
+        let affordable = capacity.min(EFFECT_PASS_BLOCKS as usize / EFFECT_MAX_PASSES_PER_EFFECT);
+        let dropped = wanted.len().saturating_sub(affordable);
         let kept = &wanted[dropped..];
         self.effects.dropped = dropped;
         if dropped > 0 {
@@ -5609,15 +5693,23 @@ impl CanvasRenderer {
                     // slice nobody wrote.
                     log::error!("no effect slice for {key:?}");
                     self.effects.forget_all();
-                    return plain();
+                    self.effects.dropped = wanted.len();
+                    return plain(wanted.len());
                 }
             }
         }
 
         // The array has to be deep enough for the highest slice a draw names
-        // before any of them is written or read.
-        let top = slots.iter().copied().max().map_or(base, |s| s + 1);
-        self.ensure_slots(device, queue, top);
+        // before any of them is written or read — **and no deeper**. Falling back
+        // to `base` where nothing was assigned would pre-allocate the float's
+        // spare slice for a document that has no float, and at `base == 257` it
+        // asks for a slice past the ceiling: a `debug_assert` on the drawing path,
+        // or in a release build a 256-slice array allocated and copied every
+        // frame. `capacity == 0` is refused above, so this is belt and braces
+        // rather than the only guard.
+        if let Some(highest) = slots.iter().copied().max() {
+            self.ensure_slots(device, queue, highest + 1);
+        }
 
         // Plan the whole bake before recording any of it: every pass reads its
         // numbers out of one uniform buffer at submit time, so the blocks have to
@@ -5665,7 +5757,8 @@ impl CanvasRenderer {
             // trusting a stamp recorded for a pass that did not run.
             log::error!("effect bake abandoned: {what}");
             self.effects.forget_all();
-            return plain();
+            self.effects.dropped = wanted.len();
+            return plain(wanted.len());
         }
         self.baked(stack, kept, &slots, frame)
     }
@@ -5826,20 +5919,30 @@ impl CanvasRenderer {
                 viewport: size,
                 cfg: EffectUniforms { grow: 1, ..base },
             });
-        } else {
-            steps.push(EffectStep {
-                pass: EffectPass::Grow,
-                target: EffectTarget::Grown,
-                bind: EffectBind::Coverage as usize,
-                viewport: size,
-                cfg: base,
-            });
         }
+        // With nothing to grow, the shape **is** the coverage and no grow pass is
+        // recorded: `fs_grow` with `grow == 0` hands the coverage straight back, so
+        // the pass was a full-screen copy of a texture already in hand. That is the
+        // common case — a drop shadow's default spread is zero, and its
+        // displacement is what makes it a shadow. The bind groups below are what
+        // pay for it, and they are what a placeholder cannot be: the shape's source
+        // is a *binding*, so choosing it is choosing a bind group.
+        let shape = if grow {
+            (
+                EffectBind::SrcGrown as usize,
+                EffectBind::ResolveGrown as usize,
+            )
+        } else {
+            (
+                EffectBind::SrcCoverage as usize,
+                EffectBind::ResolveCoverage as usize,
+            )
+        };
 
         // The tent: two box passes per axis, on a downsample where the radius is
         // wide enough for one to represent it. A radius of zero records no pass
         // at all, which is the exact identity the feather and the grain both
-        // keep — `grown` is what the resolve then reads.
+        // keep — the shape itself is what the resolve then reads.
         let (down, radius) = tent_for(effect.softness);
         let mut blurred = None;
         if radius > 0 {
@@ -5850,7 +5953,7 @@ impl CanvasRenderer {
                 steps.push(EffectStep {
                     pass: EffectPass::Down,
                     target: EffectTarget::Blur(0),
-                    bind: EffectBind::SrcGrown as usize,
+                    bind: shape.0,
                     viewport: small,
                     cfg: EffectUniforms {
                         size: small_f,
@@ -5862,7 +5965,7 @@ impl CanvasRenderer {
                 from = 0;
             }
             // Four box passes, two per axis: a tent is the box convolved with
-            // itself and convolution is per axis. The first reads `grown` when
+            // itself and convolution is per axis. The first reads the shape when
             // there was no downsample, which is what makes the two resolutions one
             // code path rather than two.
             for (i, axis) in [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
@@ -5871,7 +5974,7 @@ impl CanvasRenderer {
             {
                 let first = i == 0 && down == 1;
                 let bind = if first {
-                    EffectBind::SrcGrown as usize
+                    shape.0
                 } else if from == 0 {
                     EffectBind::SrcBlur0 as usize
                 } else {
@@ -5906,7 +6009,7 @@ impl CanvasRenderer {
                 small,
                 down as i32,
             ),
-            None => (EffectBind::ResolveGrown as usize, full, 1),
+            None => (shape.1, full, 1),
         };
         let (dx, dy) = effect.offset();
         let c = effect.color;
@@ -5939,6 +6042,12 @@ impl CanvasRenderer {
         encoder: &mut wgpu::CommandEncoder,
         steps: &[EffectStep],
     ) -> Result<(), String> {
+        // Unreachable: `bake_effects` bounds the number of effects it plans by
+        // this buffer's capacity, and drops the rest through the *visible* path.
+        // Kept because what it prevents is a dynamic offset past the end of a
+        // buffer, which is a validation error and therefore fatal — and because
+        // this used to be the only bound, which made an overrun a silent refusal
+        // of the whole bake with `dropped` reporting zero.
         if steps.len() as u64 > EFFECT_PASS_BLOCKS {
             return Err(format!(
                 "{} passes against {EFFECT_PASS_BLOCKS} uniform blocks",
@@ -7341,6 +7450,14 @@ impl EffectScratch {
         binds.push(bind("effect-resolve-grown", a, &grown, &coverage, none));
         binds.push(bind("effect-resolve-blur-0", a, &blur[0], &coverage, none));
         binds.push(bind("effect-resolve-blur-1", a, &blur[1], &coverage, none));
+        binds.push(bind("effect-src-coverage", a, &coverage, b, none));
+        binds.push(bind(
+            "effect-resolve-coverage",
+            a,
+            &coverage,
+            &coverage,
+            none,
+        ));
         debug_assert_eq!(binds.len(), EFFECT_BIND_COUNT);
 
         Self {
@@ -8033,6 +8150,55 @@ mod tests {
                 .guaranteed_format_features(wgpu::Features::empty())
                 .allowed_usages
                 .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    /// **The pass budget covers every effect the model will let somebody
+    /// install**, and the figure it is measured against is the worst one
+    /// `plan_effect` can emit.
+    ///
+    /// Not a restatement of the constants: the count is derived here from the same
+    /// arithmetic the planner uses — the flood's step count is
+    /// `ceil(log2(span)) + 1` for a `span` the canvas bounds, plus the extract, the
+    /// seed, the grow, the downsample, four box passes and the resolve — over the
+    /// largest canvas `max_texture_dimension_2d` permits, which is the case the
+    /// buffer has to be sized for and is not the case anybody measures.
+    ///
+    /// It is worth having because the first draft of this budget was **five times
+    /// too small** and failed in the worst possible direction: overrunning it
+    /// abandoned the whole bake, so no effect drew at all, every frame, while
+    /// `effects_dropped` reported zero. A panel built on that figure would have
+    /// said the document was within its budget while showing none of it.
+    #[test]
+    fn the_pass_budget_covers_the_effects_the_model_permits() {
+        // The flood, at the widest span a canvas can force.
+        let longest = wgpu::Limits::downlevel_defaults().max_texture_dimension_2d;
+        let span = longest;
+        let mut floods = 0;
+        let mut k = 1i64 << (32 - span.leading_zeros());
+        while k >= 1 {
+            floods += 1;
+            k /= 2;
+        }
+        // extract + seed + floods + grow + down + four box + resolve.
+        let worst = 1 + 1 + floods + 1 + 1 + 4 + 1;
+        assert!(
+            worst <= EFFECT_MAX_PASSES_PER_EFFECT,
+            "one effect can ask for {worst} passes against a budget of \
+             {EFFECT_MAX_PASSES_PER_EFFECT}"
+        );
+        assert!(
+            EFFECT_PASS_BLOCKS >= (worst * umber_core::effect::MAX_ENABLED) as u64,
+            "{} blocks will not hold {} effects at {worst} passes each",
+            EFFECT_PASS_BLOCKS,
+            umber_core::effect::MAX_ENABLED
+        );
+        // And the buffer's own size, because a dynamic offset past the end of it is
+        // a validation error and therefore fatal.
+        let last = (EFFECT_PASS_BLOCKS - 1) * EFFECT_BLOCK_STRIDE;
+        assert!(
+            last + std::mem::size_of::<EffectUniforms>() as u64
+                <= EFFECT_PASS_BLOCKS * EFFECT_BLOCK_STRIDE
         );
     }
 

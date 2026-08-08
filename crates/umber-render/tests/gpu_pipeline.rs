@@ -5931,6 +5931,19 @@ fn an_effect_over_budget_is_dropped_from_the_bottom_and_counted() {
     assert_eq!(baked.draws[0].slot, 0, "the bottom layer lost its effect");
     assert_eq!(baked.draws[1].slot, 255, "the top layer kept its own");
     assert_eq!(baked.draws[2].slot, 1);
+
+    // **No slices left at all**, which is reachable: `SlotPool` hands out up to
+    // slot 255, so `slot_capacity_needed` can reach 256 and the base 257 — enough
+    // delete-then-add cycles get there through parked slices. Both figures are
+    // over the array's own ceiling, and falling through would ask `ensure_slots`
+    // for a 257th slice: a `debug_assert` on the drawing path, or in a release
+    // build a fresh 256-slice array allocated and copied every frame.
+    for base in [256, 257] {
+        let baked = h.bake(&stack, base);
+        assert_eq!(baked.draws.len(), 2, "base {base}: {:?}", baked.draws);
+        assert_eq!(baked.dropped, 2, "base {base} did not say what it dropped");
+        assert_eq!(h.canvas.effects_dropped(), 2);
+    }
 }
 
 /// A shadow baked mid-stroke is the shadow the commit produces.
