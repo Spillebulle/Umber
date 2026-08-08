@@ -2338,6 +2338,28 @@ The rules, and they are cheap:
   assumed, and the comment names the hole instead of claiming the array cannot
   be forgotten. The only complete fix is a macro deriving the enum and `ALL`
   from one list, judged against this codebase's taste for per-variant rustdoc.
+- **A guard's inputs must span the domain the *code* sees, not the one the
+  constants describe.** The effect pass budget took its canvas dimension from
+  `downlevel_defaults()`, which is what a canvas is guaranteed to *reach* —
+  while `using_resolution` raises that same limit from the adapter, so the real
+  domain was sixteen times larger. The arithmetic was right and it was asking
+  about a smaller world than the one it protected, reading 37 passes against a
+  real worst of 45. **`using_resolution` has now caused two bugs in one
+  session** — this, and `MAX_SLOTS = 257` — both by looking like it raises a
+  limit it does not, or not raising one it does. Check which of the two it is
+  doing to any limit you reason about.
+- **A test can agree for the wrong reason, and the cheap way to find out is to
+  mutate the code it claims to cover.** An outline-position test read the
+  *layer's* slice instead of the effect's, and the layer's first lit texel
+  happened to be the number it wanted. Marking the shader's arm with a constant
+  and finding the output unmoved is what settled it — two minutes, where no
+  amount of re-reading the assertion would have.
+- **Where a property cannot be tested, make it structural and say which it
+  is.** The effect extract's wet-stroke flag has to equal the flag its effects
+  record, and producing a layer whose effects disagree needs a canvas over
+  4096 square. One binding read by all three sites is the guarantee; a comment
+  saying "these three agree" would have been the discipline that eventually
+  stops holding.
 - **A guard's comment must not claim more reach than the mutation
   demonstrates.** Two of the four carried a doc comment promising exhaustiveness
   the code did not have, and the guard's own first draft made the same mistake

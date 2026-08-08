@@ -255,26 +255,43 @@ having visibly different falloffs.
 
 ### 3.3 Knockout, and the one asymmetry
 
-An **outer** effect must not paint under the layer's own opaque pixels — with the
-layer at 100% it makes no difference, and at 50% a drop shadow showing through
-its own object is wrong. Photoshop spells this "Layer knocks out drop shadow" and
-defaults it on.
+**This section said "an outer effect" and meant "a drop shadow", and three code
+sites now say so.** The correction is left visible because the paragraph it
+replaces ended by claiming it was written down so it would not be forgotten —
+which is exactly the shape of a thing that is confidently wrong.
 
-The knockout is **baked**, not composited: the bake has the layer's coverage in
-hand already, so multiplying the effect by `1 − coverage` costs nothing there.
-Doing it at composite time would need an *inverse* clip, which the shader has no
-notion of and would be a new mechanism for one case.
+**The knockout belongs to the drop shadow, per *kind*, not to a whole side of the
+stack.** Photoshop's control is called "Layer knocks out drop shadow" because it
+*is* the shadow's. A drop shadow must not paint under its own object — at 100%
+opacity it makes no difference and at 50% it is plainly wrong — and it is
+**baked**, not composited: the bake has the layer's coverage in hand, so
+multiplying by `1 − coverage` costs nothing there, where doing it at composite
+time would need an *inverse* clip the shader has no notion of.
 
-An **inner** effect is the opposite — it is confined *to* the layer's alpha — and
-that is `LayerDraw::clipped`, which already means "bounded by the alpha of the
-nearest unclipped layer below". An inner effect drawn immediately above its own
-layer, with `clipped: true`, reads exactly the right value: `clip_alpha` is set
-from the layer after its mask and after its wet stroke. **No new mechanism at
-all.**
+**A stroke is the case that disproves the generalisation.** A stroke is meant to
+sit *on* the edge, so knocking it out where the layer covers deletes the half the
+artist asked for — and Centre becomes Outside wearing a different name. So:
 
-That asymmetry — outer effects bake their confinement, inner effects use the clip
-flag — is the kind of thing that gets forgotten and reintroduced as a uniform.
-It is written here so it is not.
+- **Outside** needs no knockout. Its `1 − coverage` is what "outside the edge"
+  *means*, and it belongs in the **grow** rather than the resolve. Two things fell
+  out of moving it that were not predicted: it now happens *before* the blur, so a
+  soft stroke is soft on **both** sides where it used to be sheared flat against
+  the layer's edge.
+- **Centre** is unconfined, hidden by an opaque layer because the layer is drawn
+  over it and visible through a translucent one — which falls out of ordinary
+  compositing rather than needing a case. It **floods twice**, which makes it the
+  most expensive bake there is.
+- **Inside** gets its field by seeding the flood on the *complement*: the same
+  flood with its test inverted.
+
+An **inner** effect's confinement is still `LayerDraw::clipped`, which already
+means "bounded by the alpha of the nearest unclipped layer below" — set on a draw
+sitting immediately above its own layer, it reads exactly the right value. **No
+new mechanism at all.**
+
+**The outer-glow question must be asked again rather than inherited.** Whether a
+glow is knocked out is not known here, and assuming it follows the shadow is the
+mistake this section already made once. `effect.wgsl`'s header says so too.
 
 ---
 
