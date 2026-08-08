@@ -1389,9 +1389,8 @@ fn convert(settings: &Settings, materials: &Materials) -> Converted {
     // above 1.0 — so an absent column and the ten of thirteen sub-tools set to
     // 100 all arrive byte for byte as they did before.
     if let Some(flow) = settings.percent("BrushFlow") {
-        brush.opacity = (brush.opacity
-            * tip::dab_stack_alpha(flow, brush.spacing, brush.hardness))
-        .clamp(0.0, 1.0);
+        brush.opacity = (brush.opacity * tip::dab_stack_alpha(flow, brush.spacing, brush.hardness))
+            .clamp(0.0, 1.0);
     }
 
     // ---- pressure ------------------------------------------------------

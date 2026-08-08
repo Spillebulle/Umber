@@ -149,7 +149,10 @@ fn main() {
             None => println!("  tip none"),
         }
 
-        println!("  grain strength {:.4}  grain_scale {:.1}", b.grain, b.grain_scale);
+        println!(
+            "  grain strength {:.4}  grain_scale {:.1}",
+            b.grain, b.grain_scale
+        );
         match &tool.paper {
             Some(tile) => {
                 let measured = tip::grain_coverage(tile, b.grain, b.spacing);
