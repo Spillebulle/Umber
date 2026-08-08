@@ -1044,13 +1044,19 @@ const CALIBRATION: f32 = 0.6;
 /// [`CALIBRATION`], and the flat depth that reaches the same place is returned.
 ///
 /// The bisection is affordable because this is a **per-stroke** figure, not a
-/// per-dab one — it depends on nothing but the spacing and the hardness. Forty
+/// per-dab one — it depends on nothing but the spacing and the hardness, so
+/// `StrokeBuilder::begin` takes it once and `emit` pays one `powf`. Forty
 /// halvings of a monotone function is exact to a float, and the alternative
 /// (solving the weighted product per dab) is a bisection on the drawing path.
+/// The walk is bounded by [`centre_line_falloffs`]' own clamp rather than by the
+/// spacing rail, which is not a bound on the value — a hand-written
+/// `brushes.ron` may say anything — so the worst case is a thousand weights and
+/// forty passes over them, once, beside a submission `start_stroke` already
+/// makes.
 ///
 /// At least one, because a dab always covers its own centre; and exactly one for
-/// a brush whose dabs do not overlap at all, which makes the conversion the
-/// identity.
+/// a brush whose dabs do not overlap enough to reach [`CALIBRATION`] between
+/// them, which makes the conversion the identity.
 pub fn stack_depth(spacing: f32, hardness: f32) -> f32 {
     let falloffs: Vec<f32> = centre_line_falloffs(spacing, hardness).collect();
     let stacked = |per_dab: f32| {

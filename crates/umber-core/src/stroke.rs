@@ -598,6 +598,13 @@ impl StrokeBuilder {
         // What the *mark* is to reach at this pressure — which is what
         // `coverage_at` means, what the brush editor's curve draws, and under
         // the `max` blend exactly what one dab carries.
+        //
+        // The modulation goes in *before* the conversion, so it is a factor on
+        // the mark rather than on one dab. Under `max` those are the same number
+        // and this is the order it has always been in; under build-up they are
+        // not, and a Speed→Opacity mapping stating "half strength when moving
+        // fast" has to mean half the mark, for the same reason the pressure
+        // curve does.
         let mark = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
         // Under build-up the scratch accumulates instead, so the dab has to
         // carry less for the stroke to arrive at the same place. `stack_depth`
