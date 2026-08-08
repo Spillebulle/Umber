@@ -1686,8 +1686,21 @@ mod tests {
             "an ordinary block was refused: {ordinary}"
         );
 
+        // **The fixture had to grow, and that is the change working rather than
+        // the test rotting.** One line of this at `MAX_SIZE` used to clear
+        // `text::MAX_PIXELS` because `set` padded by a whole em on every side
+        // without knowing how far an outline actually strays past its advance
+        // width. Measuring the block through its own transform took that away —
+        // 2.6x the buffer at identity — so the same caption now *fits*, and the
+        // panel was right to stop refusing it.
+        //
+        // Several lines rather than a longer line, because width alone runs into
+        // the coordinate ceiling before the area cap and would be refused for the
+        // wrong reason. What is being pinned is the *area* branch.
         let past_the_cap = panel_text(|ed| {
-            ed.text.block.text = "A caption nobody could fit on a canvas".to_string();
+            ed.text.block.text = std::iter::repeat_n("A caption nobody could fit on a canvas", 6)
+                .collect::<Vec<_>>()
+                .join("\n");
             ed.text.block.size = text::MAX_SIZE;
         });
         assert!(

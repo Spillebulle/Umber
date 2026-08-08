@@ -4663,6 +4663,160 @@ fn a_hard_edged_rectangular_lift_is_exact() {
     );
 }
 
+/// **A float drawn at the exact identity comes back byte for byte, including
+/// its partly covered pixels, on a canvas whose size is not a power of two.**
+///
+/// This is the load-bearing GPU property under `docs/text-tool.md` §4(c), and
+/// nothing needed it until now. Re-rasterising text through the transform means
+/// the floating texture holds pixels *already* scaled and turned, so
+/// `FloatParams::inverse` is `Affine::IDENTITY` and `fs_sample` becomes a blit.
+/// The whole plan rests on that blit changing nothing — if it costs even a level
+/// of alpha per frame, then a drag is a picture degrading as it is dragged, which
+/// is worse than the resample it replaces because it never settles.
+///
+/// It is not covered by `a_hard_edged_rectangular_lift_is_exact`, twice over.
+/// That one moves by a whole-pixel translation rather than the identity, and its
+/// block is **opaque**, so it says nothing about a partly covered pixel — which
+/// is every edge of every glyph and the only thing a resample visibly harms.
+///
+/// **The canvas is 100 square deliberately.** `fs_sample` divides the document
+/// point by `doc_size` to get a texture coordinate and the sampler multiplies it
+/// back by the size, and the fragment centre is at `pixel + 0.5`, which lands on
+/// a texel centre exactly. For a power-of-two size both the divide and the
+/// multiply are exact in binary and the tap is provably the one texel; for 100
+/// they are not, so a coordinate can come back a unit in the last place off its
+/// texel centre and the bilinear filter picks up a sliver of a neighbour. **No
+/// float or sampler test in this file had ever used a non-power-of-two canvas** —
+/// they are 64 and 512, and the three `resize` calls to 128, 32 and 96 are about
+/// resizing rather than about sampling — so the only sizes this path was ever
+/// tested at were the ones where the arithmetic cannot fail. Umber's canvases are
+/// any size at all.
+#[test]
+fn a_float_drawn_at_the_identity_is_an_exact_blit_of_its_own_pixels() {
+    let Some(gpu) = shared_gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    for side in [100u32, 64] {
+        let mut canvas = CanvasRenderer::new(&gpu.device, UVec2::splat(side), TARGET_FORMAT);
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear_all_layers(&mut enc);
+        canvas.clear_stroke(&mut enc);
+        gpu.queue.submit(Some(enc.finish()));
+
+        // Layer-texture form, and **every pixel of it is exactly valid
+        // premultiplied without needing the encoder to say so**, which is what
+        // lets the assertion below be about bytes. Two kinds, alternating by row:
+        //
+        // * an opaque pixel, where premultiplied and straight are the same bytes
+        //   whatever the colour, so the colour channels carry real information;
+        // * a black pixel at a partial coverage, where the premultiplied colour
+        //   is zero in every space there is, so the alpha can run over every
+        //   level a coverage byte takes.
+        //
+        // Between them they cover the colour and the fringe. `docimport::srgb`'s
+        // encoder is the honest way to build a coloured fringe and is
+        // `pub(crate)`; asking for it to be opened up for a fixture would be
+        // widening an interface to make a test easier, and these bytes make the
+        // same claim.
+        //
+        // The coverage runs high-frequency along each row on purpose: a tap that
+        // strayed even a unit in the last place off its texel centre would pick
+        // up a neighbour several levels away, where a smooth ramp would hide it.
+        let rect = PixelRect {
+            x: 7,
+            y: 11,
+            width: 51,
+            height: 33,
+        };
+        let pixels: Vec<u8> = (0..rect.area())
+            .flat_map(|i| {
+                let (x, y) = (i % u64::from(rect.width), i / u64::from(rect.width));
+                if y % 2 == 0 {
+                    [(x * 37 % 256) as u8, (x * 91 % 256) as u8, 17, 255]
+                } else {
+                    [0, 0, 0, (x * 149 % 256) as u8]
+                }
+            })
+            .collect();
+        assert!(
+            pixels.chunks_exact(4).any(|p| (1..255).contains(&p[3])),
+            "the fixture has no partly covered pixel, so this test would pass on \
+             a blit that only handled opaque ones"
+        );
+
+        let preview = canvas
+            .begin_float(
+                &gpu.device,
+                &gpu.queue,
+                1,
+                &FloatSource {
+                    slot: 0,
+                    rect,
+                    pixels: Some(&pixels),
+                    mask: None,
+                },
+            )
+            .expect("no room for a preview");
+
+        // The identity, and the destination the pixels are already at. This is
+        // exactly what a text float would pass every frame: the map went into the
+        // rasteriser, so there is nothing left for the sampler to do.
+        let params = FloatParams {
+            inverse: Transform::identity(rect).inverse(),
+            dest: Some(rect),
+        };
+
+        // One frame, one encoder, one submit.
+        //
+        // **There is deliberately no loop here, and an earlier draft's was worth
+        // removing twice over.** It drew the preview three times to claim it was
+        // showing that "a drag does not rot the picture frame by frame", and it
+        // could not show that: `render_float` restores the damaged rectangle out
+        // of `float.base` *before* it draws, so repeating it with the same params
+        // is idempotent by construction and three iterations cannot fail where one
+        // passes. It also broke `draw_float`'s own documented rule — one uniform
+        // write per encoder, because `Queue::write_buffer` is flushed ahead of the
+        // encoder's commands, so all three passes read the last write. Benign only
+        // because the three writes were identical, which is the same fact that
+        // made the loop vacuous.
+        //
+        // What a real multi-frame drag would need is an encoder and a submit per
+        // frame with a *different* matrix each time, which is a different test
+        // and would be about `span()`'s restore rather than about the blit.
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.draw_float(&gpu.queue, &mut enc, &params);
+        gpu.queue.submit(Some(enc.finish()));
+        assert_eq!(
+            canvas.read_layer_rect(&gpu.device, &gpu.queue, preview, rect),
+            pixels,
+            "on a {side}-square canvas the previewed identity blit moved the \
+             pixels it was handed, so re-rasterising text through the transform \
+             would degrade the picture it was supposed to keep sharp"
+        );
+
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.commit_float(&gpu.queue, &mut enc, rect, &params);
+        gpu.queue.submit(Some(enc.finish()));
+        canvas.end_float();
+        assert_eq!(
+            canvas.read_layer_rect(&gpu.device, &gpu.queue, 0, rect),
+            pixels,
+            "on a {side}-square canvas the committed identity blit is not the \
+             pixels it was handed"
+        );
+    }
+}
+
 /// A selection dragged off the edge of the canvas. Its bounding rectangle is
 /// clamped, so the mask's own rectangle now shares a border with the document —
 /// which is where `fs_mask`'s arithmetic decision about "outside the mask" and
