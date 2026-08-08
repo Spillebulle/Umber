@@ -4493,9 +4493,15 @@ mod tests {
     /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` reopens
     /// the file it wrote. Save's cannot be: it reads every layer back off the
     /// GPU first, so exercising it needs a device and a whole document. What
-    /// is left is the shape, and the shape is worth pinning because the rule is
-    /// about *every* such writer rather than about one line — a third one
-    /// arrives already covered.
+    /// is left is the shape.
+    ///
+    /// **The file list is hand-written, and a writer in a third file is
+    /// invisible to this.** An earlier draft of this comment claimed "a third
+    /// one arrives already covered", which is false, and is exactly the claim
+    /// CLAUDE.md warns is easier to write than the guard: `include_str!` takes
+    /// a literal, so nothing here can discover a file it was not told about.
+    /// Adding a writer means adding its file below. What the list *is* total
+    /// over is the writers inside each file it names.
     ///
     /// **Wiring one and not the other would be worse than wiring neither**, and
     /// that is why this insists on both at once rather than on Save alone: an
@@ -4503,14 +4509,23 @@ mod tests {
     /// timer last touched the file is not a rule anybody can learn, where
     /// losing them consistently is at least a bug somebody reports.
     ///
-    /// **Its reach is uneven and that is measured, not assumed.** Deleting
-    /// Save's line fails this; deleting the autosave's does not, because
-    /// `autosave.rs` names the field three times outside its tests — on
-    /// `LayerMeta`, in `snapshot` and in `run_task` — so a lower bound of one
-    /// literal is still met. That writer is covered by *behaviour* instead
-    /// (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails on
-    /// the same mutation), which is the stronger guard and the reason the
-    /// weaker one is only asked to cover the writer that cannot have it.
+    /// **Its reach is uneven and every claim here was run rather than
+    /// reasoned.** Three mutations:
+    ///
+    /// * Delete Save's `effects:` line — **fails**, 1 literal against 0.
+    /// * Move Save's construction behind an alias, so `app.rs` no longer holds
+    ///   the literal text at all, which is what "extracted into a helper" looks
+    ///   like — **fails** on `literals > 0`. A critic predicted this would pass
+    ///   and it did, against the version *before* the source was cut at
+    ///   `#[cfg(test)]`: the self-reference kept the count at 1 and propped the
+    ///   assertion up. Cutting the test off fixed both holes at once.
+    /// * Delete the autosave's `effects:` line — **passes**, because
+    ///   `autosave.rs` names the field three times outside its tests, on
+    ///   `LayerMeta`, in `snapshot` and in `run_task`, so a lower bound of one
+    ///   is still met. That writer is covered by *behaviour* instead
+    ///   (`the_autosave_writes_the_effects_the_snapshot_was_taken_with` fails
+    ///   on it), which is the stronger guard and the reason the weaker one is
+    ///   only asked to carry the writer that cannot have one.
     #[test]
     fn every_writer_of_a_save_layer_states_its_effects() {
         // **Everything from `#[cfg(test)]` on is cut off first, and that is
