@@ -508,7 +508,22 @@ fn sync_editing(ed: &mut Editor) {
         .filter(|_| ed.layers.active_text().is_some())
         .map(|slot| (doc, slot));
     let held = ed.text.editing.as_ref().map(|e| (e.doc, e.slot));
-    if held == target {
+    // **The record can change under the panel, and an undo is how.** Stepping
+    // back over a text edit puts the older record on the layer; the panel would
+    // otherwise go on showing the newer caption over a canvas that no longer has
+    // it, with Update reading "nothing has changed" and therefore disabled — the
+    // two irreconcilable, and the panel the one telling the lie. A canvas flip
+    // is the same shape one field along, since it mirrors the placement.
+    //
+    // Compared against `original` and never against what the controls hold: the
+    // artist is typing into those, so a comparison there would reload the panel
+    // out from under every keystroke.
+    let adrift = ed
+        .text
+        .editing
+        .as_ref()
+        .is_some_and(|e| ed.layers.active_text() != Some(&e.original));
+    if held == target && !adrift {
         return;
     }
     // Off whatever was being edited: the composing block comes back.
@@ -2882,6 +2897,63 @@ mod tests {
         );
         assert_eq!(ed.text.block.text, "Top");
         assert_eq!(ed.layers.active_slot(), Some(top));
+    }
+
+    /// **A record that changes under the panel is picked up again**, which an
+    /// undo is the ordinary way to do.
+    ///
+    /// Stepping back over a text edit puts the older record on the layer. The
+    /// panel would otherwise go on showing the newer caption over a canvas that
+    /// no longer has it, with Update reading "nothing has changed" and therefore
+    /// disabled: the two irreconcilable, and the panel the one telling the lie.
+    ///
+    /// **And the block being composed still comes back afterwards**, which is
+    /// the half a reload written carelessly loses: the stash is restored and
+    /// re-taken, rather than overwritten with the record it is being swapped
+    /// for.
+    #[test]
+    fn a_record_that_changed_under_the_panel_is_read_again() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.text.block.text = "Half a caption".to_string();
+
+        assert!(ed.layers.set_text(0, a_record("Set again")));
+        sync_editing(&mut ed);
+        assert_eq!(ed.text.block.text, "Set again");
+
+        // What an undo does: the older record goes back on the layer, with
+        // nothing about the panel changed.
+        assert!(ed.layers.take_text(0).is_some());
+        assert!(ed.layers.set_text(0, a_record("As it was")));
+        sync_editing(&mut ed);
+        assert_eq!(
+            ed.text.block.text, "As it was",
+            "the panel kept showing a caption the layer no longer has"
+        );
+        assert_eq!(
+            ed.text
+                .editing
+                .as_ref()
+                .map(|e| e.original.block.text.clone()),
+            Some("As it was".to_string()),
+            "Update would compare against the record that was undone"
+        );
+
+        // Typing does **not** reload it: the comparison is against the record
+        // the panel picked up, never against what the controls hold, or every
+        // keystroke would be thrown away.
+        ed.text.block.text.push('!');
+        sync_editing(&mut ed);
+        assert_eq!(ed.text.block.text, "As it was!");
+
+        // And the composing block is still there to come back to.
+        assert!(ed.layers.take_text(0).is_some());
+        sync_editing(&mut ed);
+        assert!(ed.text.editing.is_none());
+        assert_eq!(
+            ed.text.block.text, "Half a caption",
+            "the reload swallowed the stashed composing block"
+        );
     }
 
     /// Update is offered exactly when setting the text again would do something
