@@ -41,7 +41,27 @@ pub fn read_optional_entry(
     name: &str,
     format: SourceFormat,
 ) -> Result<Option<Vec<u8>>, ImportError> {
-    let limit = ImportedDocument::MAX_TOTAL_BYTES;
+    read_capped_entry(zip, name, format, ImportedDocument::MAX_TOTAL_BYTES)
+}
+
+/// The same, refusing anything longer than `cap`.
+///
+/// **Every entry needs a bound and not every bound is
+/// [`ImportedDocument::MAX_TOTAL_BYTES`].** That figure is what a *stack of
+/// layers* costs, so it bounds every entry whose size follows the canvas — which
+/// is all of them except the ones whose size follows a **count**. A text record
+/// is as long as somebody's typing and a layer effect list is as long as the
+/// effects on it; both are small in every real document and neither is bounded at
+/// all by two gibibytes. A caller with a figure of its own passes it here rather
+/// than reading first and measuring afterwards, because the point of a cap is to
+/// refuse before the decompression rather than after it.
+pub fn read_capped_entry(
+    zip: &mut Zip<'_>,
+    name: &str,
+    format: SourceFormat,
+    cap: u64,
+) -> Result<Option<Vec<u8>>, ImportError> {
+    let limit = cap.min(ImportedDocument::MAX_TOTAL_BYTES);
     let mut entry = match zip.by_name(name) {
         Ok(e) => e,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),

@@ -46,6 +46,40 @@
 //! history entry rather than putting it straight back on the free list; and a
 //! mask slice is ordinary RGBA, of which the composite reads one channel.
 //!
+//! # A text layer is a layer that remembers what painted it
+//!
+//! [`Layer::text`] is a [`TextObject`] — a string, a face, the figures and the
+//! placement — and a layer holding one is a **text layer**. It is an `Option` on
+//! an ordinary layer rather than a third [`Layer`] kind beside a folder, and that
+//! shape is the whole reason nothing else here changed: a text layer holds a
+//! slot, composites through the same single pass, takes a mask, clips, links,
+//! reorders, is deleted and comes back out of a structural undo entry exactly as
+//! any other layer does, and [`LayerStack::MAX`] means what it always meant. The
+//! record travels *inside* the [`Layer`], so a folder deleted with text in it
+//! parks the text along with the slice and an undo brings both back, with
+//! nothing written to make that happen.
+//!
+//! What it does need is one refusal. A text layer cannot also hold brush
+//! strokes — the record would then describe pixels that are half somebody's
+//! painting, and re-rendering it would destroy their work — so painting on one
+//! is refused at [`LayerStack::refusal_at`], which is the **one gate** the lock
+//! and the folder are already refused at. See [`EditRefusal`], and
+//! `docs/text-tool.md` §3 for the argument.
+//!
+//! Two things follow that are easy to get backwards:
+//!
+//! * **A stroke on a text layer's *mask* is allowed.** A mask bounds the alpha
+//!   the composite reads and changes not one of the layer's own pixels, so it
+//!   cannot put the record out of step with them. That is why the gate takes an
+//!   [`EditTarget`] rather than answering about a layer.
+//! * **A canvas flip does not cost a text layer its record**, because
+//!   [`crate::textobj::Placement::flipped`] mirrors the placement exactly.
+//!   Dropping it would destroy something no undo could put back — undoing a flip
+//!   is another flip — which is the failure `Selection::flipped` exists to avoid.
+//!   A *resize* does drop it, for the reason a resize clears the undo history:
+//!   the placement is a rectangle of a canvas that no longer exists, and the
+//!   pixels may have been cropped.
+//!
 //! # Folders
 //!
 //! The stack is still one `Vec` and every existing caller still indexes it by
@@ -100,9 +134,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use glam::UVec2;
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
+use crate::geom::FlipAxis;
+use crate::textobj::TextObject;
 
 /// The slices of one document's layer array: which are in use, and which
 /// number the next one would take.
@@ -289,6 +326,55 @@ pub enum EditTarget {
     Mask,
 }
 
+/// Why an edit that would write pixels is refused.
+///
+/// **One answer rather than three booleans**, because a gate that has to ask
+/// three questions is a gate that will one day ask two. There were already two —
+/// `begin_stroke` refuses a locked layer and refuses a folder — and text is the
+/// third; asking [`LayerStack::refusal_at`] is what makes them one test with one
+/// reason, which is also what lets the interface say *which* it was.
+///
+/// An `enum` and not a `bool`, matched exhaustively wherever it is turned into
+/// words, so a fourth refusal cannot be added without something being said about
+/// it. `matches!` over this is exactly what the rule about partial
+/// exhaustiveness forbids: it answers **false** for a variant it has never heard
+/// of, which here means letting a stroke through a gate that exists to stop it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditRefusal {
+    /// A folder holds no pixels, so there is nowhere for the edit to land.
+    Folder,
+    /// The layer is locked, by its own flag or by a folder it is inside.
+    Locked,
+    /// The layer holds text that can still be edited, so painting on it would
+    /// leave a record describing pixels it did not make.
+    Text,
+}
+
+impl EditRefusal {
+    /// Every refusal, for a test that has to walk them.
+    pub const ALL: [EditRefusal; 3] = [Self::Folder, Self::Locked, Self::Text];
+
+    /// What to tell somebody who asked for an edit this refuses.
+    ///
+    /// A finished sentence written for the user, and deliberately not one that
+    /// names a control: there is no "convert to paint" command yet, and a notice
+    /// promising one would be the lying control this project refuses everywhere.
+    /// [`LayerStack::take_text`] is that command's model half when it arrives.
+    ///
+    /// Exhaustive with no catch-all, so a fourth variant fails the build here
+    /// rather than going out as a blank line.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Folder => "A folder holds no pixels, so there is nothing here to paint on.",
+            Self::Locked => "This layer is locked.",
+            Self::Text => {
+                "This layer holds text that can still be edited, so it cannot be \
+                           painted on."
+            }
+        }
+    }
+}
+
 /// How a layer combines with everything beneath it.
 ///
 /// The numeric values are consumed directly by `composite.wgsl`; keep them in
@@ -417,6 +503,24 @@ pub struct Layer {
     /// Slice holding this layer's mask, when it has one. Another slot of the
     /// same array — see the module docs.
     mask: Option<SlotClaim>,
+    /// What set this layer's pixels, where they were set rather than painted.
+    ///
+    /// A layer holding one is a **text layer**: its pixels can be produced again
+    /// from the record, so the string, the face and the size are editable rather
+    /// than gone. Painting on it is refused — see [`LayerStack::refusal_at`] —
+    /// because a record describing pixels that are half somebody's brushwork is
+    /// a re-render that destroys their work.
+    ///
+    /// `Box`ed because it holds three `String`s and a [`crate::TextBlock`] and
+    /// nearly every layer has none: [`Layer`] is cloned by
+    /// [`LayerStack::restore_shape`] and lives in `Vec`s that are shuffled on
+    /// every reorder, and one pointer is what that costs a layer without text.
+    ///
+    /// **Not written to the file from here.** `docformat` writes it as its own
+    /// archive entry under `umber/text/`, fingerprinted against the layer's PNG;
+    /// see [`crate::textobj`] for why the fingerprint exists and why it is not a
+    /// field of the record in memory.
+    text: Option<Box<TextObject>>,
 }
 
 impl Layer {
@@ -444,6 +548,23 @@ impl Layer {
         self.mask.is_some()
     }
 
+    /// What set this layer's pixels, where it was set rather than painted.
+    pub fn text(&self) -> Option<&TextObject> {
+        self.text.as_deref()
+    }
+
+    /// Is this a text layer — one whose pixels can be produced again from a
+    /// record?
+    pub fn is_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// Roughly what the record costs, for [`StackShape::byte_len`]. Zero for a
+    /// layer with none, which is nearly all of them.
+    pub fn text_bytes(&self) -> usize {
+        self.text.as_ref().map_or(0, |t| t.byte_len())
+    }
+
     /// A fresh layer holding `slot`, with every flag at the value a layer
     /// nobody has touched has.
     ///
@@ -466,6 +587,7 @@ impl Layer {
             id,
             slot,
             mask: None,
+            text: None,
         }
     }
 
@@ -1083,6 +1205,96 @@ impl LayerStack {
         self.layers[self.active].mask()
     }
 
+    // --- text ---------------------------------------------------------------
+
+    /// Record what set the layer at `index`, making it a text layer.
+    ///
+    /// False for an index off the end and **false for a folder**, which holds no
+    /// pixels for a record to describe: a folder carrying one would be written to
+    /// the file as an entry beside a layer image that does not exist, and every
+    /// reader of [`Layer::is_text`] would then have a text layer with nothing in
+    /// it. The refusal is here rather than at the call site for the reason every
+    /// other refusal in this module is.
+    pub fn set_text(&mut self, index: usize, text: TextObject) -> bool {
+        match self.layers.get_mut(index) {
+            Some(layer) if !layer.folder => {
+                layer.text = Some(Box::new(text));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The record for the layer at `index`.
+    pub fn text_at(&self, index: usize) -> Option<&TextObject> {
+        self.layers.get(index)?.text()
+    }
+
+    /// The record for the selected entry.
+    pub fn active_text(&self) -> Option<&TextObject> {
+        self.layers[self.active].text()
+    }
+
+    /// Take the record off, leaving the pixels exactly where they are.
+    ///
+    /// **This is what "convert to paint" is**, and it is the whole of it: the
+    /// layer keeps every pixel and stops claiming they can be set again, so
+    /// [`LayerStack::refusal_at`] lets a brush through from the next stroke on.
+    /// There is deliberately nothing to undo here — no pixel changes — which is
+    /// also why it is not an [`crate::EditKind`]; see `docs/text-tool.md` §3.
+    pub fn take_text(&mut self, index: usize) -> Option<Box<TextObject>> {
+        self.layers.get_mut(index)?.text.take()
+    }
+
+    /// Take every record off, keeping every pixel.
+    ///
+    /// What a **resize** does, for the reason a resize clears the undo history: a
+    /// placement is a rectangle of a canvas that no longer exists, and a canvas
+    /// that shrank has cropped the pixels the record describes, so re-rendering
+    /// would put back a part of the text the artist cut away. Translating the
+    /// placement by the anchor's offset would be exact for a canvas that only
+    /// *grew*, and two behaviours behind one command is how the cropping case
+    /// comes to be the one nobody tested.
+    ///
+    /// Returns how many were dropped, so the caller can say so rather than
+    /// leaving somebody to find out that their text is paint now.
+    pub fn drop_text_objects(&mut self) -> usize {
+        let mut dropped = 0;
+        for layer in &mut self.layers {
+            dropped += usize::from(layer.text.take().is_some());
+        }
+        dropped
+    }
+
+    /// Mirror every record with the canvas.
+    ///
+    /// **Called from wherever the layer pixels are flipped, and it is one call
+    /// site**: `app.rs`'s `mirror_document` is the single route a flip takes, and
+    /// it is shared by the command and by both undo directions. Forgetting it
+    /// would leave a record describing un-mirrored text over mirrored pixels, and
+    /// the next re-render would un-mirror the layer.
+    ///
+    /// The mirror is exact rather than approximate — see
+    /// [`crate::textobj::Placement::flipped`] — which is why a flip does not cost
+    /// a text layer its record the way a resize does. A record whose source
+    /// rectangle is somehow not inside the canvas cannot be mirrored into it and
+    /// is dropped instead, because a record that lies about where its pixels are
+    /// is worse than none; the count comes back for the same reason
+    /// [`LayerStack::drop_text_objects`]'s does.
+    pub fn flip_text(&mut self, axis: FlipAxis, canvas: UVec2) -> usize {
+        let mut dropped = 0;
+        for layer in &mut self.layers {
+            let Some(text) = layer.text.take() else {
+                continue;
+            };
+            match text.flipped(axis, canvas) {
+                Some(flipped) => layer.text = Some(Box::new(flipped)),
+                None => dropped += 1,
+            }
+        }
+        dropped
+    }
+
     /// Remove a layer, handing it over.
     ///
     /// **The layers come back rather than their slot numbers, and that is the
@@ -1183,6 +1395,44 @@ impl LayerStack {
     /// locked because of a folder would offer an unlock that did nothing.
     pub fn active_is_locked(&self) -> bool {
         self.effective_locked(self.active)
+    }
+
+    /// **Why an edit on this entry would be refused**, or `None` where it goes
+    /// ahead. The one gate.
+    ///
+    /// This is the question `begin_stroke`, `begin_float`, `clear_active_layer`
+    /// and every other operation that writes pixels asks — one call, one answer,
+    /// one reason to show. It subsumes the two tests those already made (a lock
+    /// and a folder) and adds the third (text), which is the point: three
+    /// separate booleans is how the fourth gate comes to check only two of them.
+    ///
+    /// `target` matters, and it is the half that is easy to get backwards. A
+    /// stroke on a text layer's **mask** is allowed: a mask bounds the alpha the
+    /// composite reads and changes none of the layer's own pixels, so it cannot
+    /// put the record out of step with them. A lock and a folder refuse both
+    /// targets — a lock is a statement about the whole layer, and a folder has
+    /// neither slice.
+    ///
+    /// The order is the order of the sentences somebody would want: what a folder
+    /// cannot do at all, then what a lock forbids until it is unlocked, then what
+    /// text forbids until it is converted.
+    pub fn refusal_at(&self, index: usize, target: EditTarget) -> Option<EditRefusal> {
+        let layer = self.layers.get(index)?;
+        if layer.folder {
+            return Some(EditRefusal::Folder);
+        }
+        if self.effective_locked(index) {
+            return Some(EditRefusal::Locked);
+        }
+        if layer.is_text() && target == EditTarget::Layer {
+            return Some(EditRefusal::Text);
+        }
+        None
+    }
+
+    /// [`LayerStack::refusal_at`] for the selected entry.
+    pub fn active_refusal(&self, target: EditTarget) -> Option<EditRefusal> {
+        self.refusal_at(self.active, target)
     }
 
     /// Is any layer locked?
@@ -1953,7 +2203,15 @@ impl StackShape {
                 .iter()
                 .map(|e| match e {
                     ShapeEntry::Kept { .. } => 0,
-                    ShapeEntry::Gone { layer } => std::mem::size_of::<Layer>() + layer.name.len(),
+                    // The text record too. Kilobytes against a canvas-sized
+                    // slice, so it will change no eviction anybody ever sees —
+                    // counted for the reason the slices are, which is that a
+                    // budget blind to part of what it holds is one that will be
+                    // wrong later, and the string is the one thing parked here
+                    // with no bound but `textobj::MAX_RECORD_BYTES`.
+                    ShapeEntry::Gone { layer } => {
+                        std::mem::size_of::<Layer>() + layer.name.len() + layer.text_bytes()
+                    }
                 })
                 .sum::<usize>()
             + self.masks.len() * std::mem::size_of::<(u32, Option<SlotClaim>)>()
@@ -3277,5 +3535,224 @@ mod tests {
         );
         assert_eq!(s.subtree(1), 0..2);
         assert_eq!(s.subtree(3), 2..4);
+    }
+
+    // --- text layers --------------------------------------------------------
+
+    fn some_text() -> TextObject {
+        use crate::text::{Align, TextBlock};
+        use crate::textobj::{Placement, TextFace};
+        TextObject::new(
+            TextBlock {
+                text: "Caption".into(),
+                size: 24.0,
+                line_spacing: 1.0,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: "Archivo-Regular".into(),
+            },
+            Color::BLACK,
+            Placement::identity(crate::geom::PixelRect {
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 20,
+            }),
+        )
+    }
+
+    /// **The paint gate, and it is one gate.** Painting on a text layer is
+    /// refused with a reason, and painting on its **mask** is not — a mask bounds
+    /// the alpha the composite reads and changes none of the layer's own pixels,
+    /// so it cannot put the record out of step with them.
+    #[test]
+    fn painting_on_a_text_layer_is_refused_and_painting_on_its_mask_is_not() {
+        let mut s = LayerStack::new();
+        assert_eq!(
+            s.refusal_at(0, EditTarget::Layer),
+            None,
+            "plain paint layer"
+        );
+        assert!(s.set_text(0, some_text()));
+
+        assert_eq!(
+            s.refusal_at(0, EditTarget::Layer),
+            Some(EditRefusal::Text),
+            "a brush must not reach a text layer's own pixels"
+        );
+        assert_eq!(
+            s.refusal_at(0, EditTarget::Mask),
+            None,
+            "a stroke on the mask cannot make the record wrong"
+        );
+        assert_eq!(s.active_refusal(EditTarget::Layer), Some(EditRefusal::Text));
+
+        // Taking the record off is what "convert to paint" is, and the pixels
+        // are untouched by it.
+        assert!(s.take_text(0).is_some());
+        assert_eq!(s.refusal_at(0, EditTarget::Layer), None);
+        assert!(s.take_text(0).is_none(), "and it is idempotent");
+    }
+
+    /// The three refusals share the one gate, in the order the sentences read.
+    ///
+    /// A lock beats text because unlocking is what somebody would do next either
+    /// way, and a folder beats both because it has no pixels for any of this to
+    /// be about.
+    #[test]
+    fn a_lock_and_a_folder_are_refused_at_the_same_gate_text_is() {
+        let mut s = grouped();
+        // The folder at 3, a layer inside it at 1.
+        assert_eq!(
+            s.refusal_at(3, EditTarget::Layer),
+            Some(EditRefusal::Folder)
+        );
+        assert_eq!(s.refusal_at(1, EditTarget::Layer), None);
+
+        assert!(s.set_text(1, some_text()));
+        assert_eq!(s.refusal_at(1, EditTarget::Layer), Some(EditRefusal::Text));
+
+        // A lock on the *folder* reaches the layer inside it, and reads as a
+        // lock rather than as text: it is the one of the two that can be undone
+        // by clicking something.
+        s.get_mut(3).unwrap().locked = true;
+        assert_eq!(
+            s.refusal_at(1, EditTarget::Layer),
+            Some(EditRefusal::Locked)
+        );
+        assert_eq!(
+            s.refusal_at(1, EditTarget::Mask),
+            Some(EditRefusal::Locked),
+            "a lock refuses the mask too, where text does not"
+        );
+
+        // Every refusal has something to say, and `reason` is exhaustive so a
+        // fourth cannot arrive without a sentence.
+        for refusal in EditRefusal::ALL {
+            assert!(!refusal.reason().is_empty());
+            assert!(
+                !refusal.reason().contains('—'),
+                "no em-dash in a notice: {}",
+                refusal.reason()
+            );
+        }
+    }
+
+    /// A folder cannot carry a record: it holds no pixels for one to describe,
+    /// and a folder claiming to be a text layer would be written into a file
+    /// beside a layer image that does not exist.
+    #[test]
+    fn a_folder_cannot_be_a_text_layer() {
+        let mut s = grouped();
+        assert!(!s.set_text(3, some_text()), "the folder");
+        assert!(s.text_at(3).is_none());
+        assert!(
+            !s.set_text(9, some_text()),
+            "and nor can an index off the end"
+        );
+    }
+
+    /// **Deleting a folder parks the text along with the slices, and an undo
+    /// brings both back** — with nothing written to make that happen, because the
+    /// record travels inside the `Layer`.
+    ///
+    /// That is the whole argument for text being a field on a layer rather than a
+    /// third kind beside a folder: every path that already moves a `Layer` moves
+    /// the record for free.
+    #[test]
+    fn a_text_layer_deleted_inside_a_folder_comes_back_as_text() {
+        let mut s = grouped();
+        assert!(s.set_text(1, some_text()));
+        let before = s.shape(64 * 64 * 4);
+        let removed = s.remove(3).expect("the folder and its contents");
+        assert_eq!(removed.len(), 3);
+        assert!(
+            removed.iter().any(|l| l.is_text()),
+            "the record left the stack with its layer"
+        );
+
+        let parked = before.with_removed(removed);
+        // Charged to the undo budget beside the slices, for the reason a parked
+        // slice is: a budget blind to part of what it holds is one that will be
+        // wrong later.
+        // Two slices, because the folder holds none, plus the record on top of
+        // them.
+        assert!(
+            parked.byte_len() >= 2 * 64 * 64 * 4 + some_text().byte_len(),
+            "the record is charged beside the slices, not instead of them"
+        );
+
+        s.restore_shape(parked);
+        assert_eq!(s.len(), 4);
+        assert_eq!(
+            s.text_at(1).map(|t| t.block.text.clone()),
+            Some("Caption".into()),
+            "the record came back with the layer, and nothing wrote it down"
+        );
+    }
+
+    /// **A canvas flip mirrors the record rather than dropping it.** Undoing a
+    /// flip is another flip, so a record dropped here is one no undo could put
+    /// back — the failure `Selection::flipped` exists to avoid, in the same place.
+    #[test]
+    fn a_canvas_flip_mirrors_a_text_layers_record() {
+        let canvas = UVec2::new(100, 80);
+        let mut s = LayerStack::new();
+        assert!(s.set_text(0, some_text()));
+
+        assert_eq!(s.flip_text(FlipAxis::Horizontal, canvas), 0, "none dropped");
+        let flipped = s.text_at(0).expect("still text").placement;
+        assert_eq!(flipped.source.x, 100 - 10 - 40);
+        assert_eq!(flipped.scale, [-1.0, 1.0]);
+
+        // And flipping again is exactly where it started, because that is what
+        // undoing a flip is.
+        assert_eq!(s.flip_text(FlipAxis::Horizontal, canvas), 0);
+        assert_eq!(s.text_at(0).unwrap().placement, some_text().placement);
+    }
+
+    /// **A resize drops every record**, for the reason a resize clears the undo
+    /// history: a placement is a rectangle of a canvas that no longer exists, and
+    /// a canvas that shrank has cropped the pixels the record describes. The
+    /// pixels are all kept; what goes is the claim that they can be set again.
+    #[test]
+    fn a_resize_drops_every_text_record_and_keeps_every_pixel() {
+        let mut s = LayerStack::new();
+        s.add();
+        assert!(s.set_text(0, some_text()));
+        assert!(s.set_text(1, some_text()));
+        let slots: Vec<Option<u32>> = s.layers().iter().map(Layer::slot).collect();
+
+        assert_eq!(s.drop_text_objects(), 2, "and it says how many");
+        assert!(s.layers().iter().all(|l| !l.is_text()));
+        assert_eq!(
+            s.layers().iter().map(Layer::slot).collect::<Vec<_>>(),
+            slots,
+            "not one pixel moved"
+        );
+        assert_eq!(s.drop_text_objects(), 0);
+    }
+
+    /// A text layer is an ordinary entry: one stack position, one slice, and
+    /// `MAX` means what it always meant.
+    ///
+    /// Said out loud because "a layer kind" sounds like something that would have
+    /// to be counted differently, and the whole reason this shape was chosen is
+    /// that it does not.
+    #[test]
+    fn a_text_layer_costs_the_stack_exactly_what_a_layer_costs() {
+        let mut s = LayerStack::new();
+        let before = (s.len(), s.slot_capacity_needed());
+        assert!(s.set_text(0, some_text()));
+        assert_eq!((s.len(), s.slot_capacity_needed()), before);
+
+        // And it takes a mask, clips and links like any other layer.
+        assert!(s.add_mask(0).is_some());
+        s.get_mut(0).unwrap().clipped = true;
+        assert!(s.get(0).unwrap().is_text() && s.get(0).unwrap().has_mask());
     }
 }

@@ -168,6 +168,16 @@ pub struct ImportedLayer {
     /// Which link group this layer belongs to, if any. See
     /// [`crate::docformat::LINK_GROUP_ATTR`].
     pub link: Option<u8>,
+    /// What set this layer's pixels, where the file said and the fingerprint
+    /// agreed.
+    ///
+    /// `None` for every format but Umber's own — no other application records
+    /// one — and `None` too where the record was unreadable, from a newer
+    /// revision, or **fingerprinted a different image than the one in the file**,
+    /// which is what a build that painted over the text leaves behind. Every one
+    /// of those raises an [`ImportWarning::TextDropped`] and the layer opens as
+    /// ordinary paint, which is what it now is. See [`crate::textobj`].
+    pub text: Option<Box<crate::textobj::TextObject>>,
     /// How deeply nested, 0 at the top level. See [`crate::layer`]'s docs.
     ///
     /// Only ORA can carry nesting today. `.kra` has groups and `.psd` has them
@@ -197,6 +207,7 @@ impl ImportedLayer {
             clipped: false,
             locked: false,
             link: None,
+            text: None,
             depth: 0,
             folder: false,
         }
@@ -226,6 +237,7 @@ impl fmt::Debug for ImportedLayer {
             .field("clipped", &self.clipped)
             .field("locked", &self.locked)
             .field("link", &self.link)
+            .field("text", &self.text.is_some())
             .finish()
     }
 }
@@ -336,6 +348,12 @@ impl ImportedDocument {
                 dst.link = layer.link;
                 dst.slot()
             };
+            // Through `LayerStack::set_text`, which refuses a folder — the
+            // reader never puts a record on one, and the refusal is the model's
+            // to make rather than something two call sites both remember.
+            if let Some(text) = layer.text {
+                stack.set_text(i, *text);
+            }
             // A folder holds no pixels and takes no slice, so there is nothing
             // to upload and nothing to clear.
             let Some(slot) = slot else { continue };
@@ -543,6 +561,20 @@ pub enum ImportWarning {
     /// a sequence in which each restores the pixels the next one expects, so one
     /// missing from the middle is not a shorter history but a wrong one.
     HistoryDropped { reason: String },
+    /// The layer said its pixels were set as text, and the record could not be
+    /// trusted, so the layer opens as ordinary paint.
+    ///
+    /// Only ever raised where the file actually claimed one — a layer with no
+    /// [`crate::docformat::TEXT_ATTR`] says nothing, which is every layer of every
+    /// document any other application wrote.
+    ///
+    /// The commonest reason by far is the one this warning exists for: **the
+    /// pixels are no longer the ones the text made.** A build that has never
+    /// heard of the attribute opens the document, the artist paints on the layer,
+    /// and it is saved again with the record still beside pixels it did not
+    /// make. Re-rendering then would destroy that painting, so the record goes
+    /// and the picture stays. Nothing in the picture is ever lost to this.
+    TextDropped { layer: String, reason: String },
 }
 
 impl fmt::Display for ImportWarning {
@@ -591,6 +623,10 @@ impl fmt::Display for ImportWarning {
             Self::HistoryDropped { reason } => write!(
                 f,
                 "The saved undo history was not restored ({reason}), so the document opens with an empty one. Nothing in the picture was lost."
+            ),
+            Self::TextDropped { layer, reason } => write!(
+                f,
+                "Layer “{layer}” was saved as text, and {reason}, so it opens as ordinary paint. Every pixel is there; the text cannot be edited again."
             ),
         }
     }

@@ -67,7 +67,9 @@ use super::{
 use crate::color::Color;
 use crate::docformat;
 use crate::document::Background;
+use crate::geom::PixelRect;
 use crate::layer::{BlendMode, LayerStack};
+use crate::textobj;
 
 const FORMAT: SourceFormat = SourceFormat::OpenRaster;
 
@@ -93,6 +95,9 @@ struct LayerSpec {
     /// `umber-mask`: the archive entry holding this layer's mask, outside the
     /// ORA layer stack. See [`docformat::MASK_ATTR`].
     mask_src: Option<String>,
+    /// `umber-text`: the archive entry holding what *set* this layer's pixels.
+    /// See [`docformat::TEXT_ATTR`].
+    text_src: Option<String>,
     /// `umber-clip`, `umber-lock`, and the link group.
     clipped: bool,
     locked: bool,
@@ -333,6 +338,11 @@ fn parse_stack(
                                 selected: attrs.get(docformat::SELECTED_ATTR) == Some("true"),
                                 background: None,
                                 mask_src: None,
+                                // A folder holds no pixels, so there is nothing
+                                // for a record to describe. `LayerStack::set_text`
+                                // refuses one too, which is the model's half of
+                                // the same rule.
+                                text_src: None,
                                 clipped: false,
                                 locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                                 // A folder can belong to a link group — read
@@ -394,6 +404,7 @@ fn parse_stack(
                                 .get(docformat::BACKGROUND_ATTR)
                                 .and_then(docformat::background_from_id),
                             mask_src: attrs.string(docformat::MASK_ATTR),
+                            text_src: attrs.string(docformat::TEXT_ATTR),
                             clipped: attrs.get(docformat::CLIP_ATTR) == Some("true"),
                             locked: attrs.get(docformat::LOCK_ATTR) == Some("true"),
                             link: attrs
@@ -471,6 +482,13 @@ fn load_layer(
         }),
     }
 
+    // The text record, checked against **this** image while it is still the
+    // bytes the file holds. Before the blit and before `srgb::encode_buffer`,
+    // because what the writer fingerprinted is the placed, straight-alpha image
+    // it wrote — see `textobj::Fingerprint`, which says why the canvas-sized
+    // layer-texture buffer is the wrong thing to hash.
+    let text = load_text(zip, spec, &image, warnings);
+
     let mut pixels = vec![0u8; canvas.x as usize * canvas.y as usize * 4];
     container::blit(
         &mut pixels,
@@ -482,6 +500,7 @@ fn load_layer(
     srgb::encode_buffer(&mut pixels);
 
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
+    layer.text = text;
     // How many `<stack>` elements this layer was inside. Carried even though
     // the layer itself is not a folder: it is what puts the layer *in* one.
     layer.depth = spec.depth;
@@ -527,6 +546,68 @@ fn load_mask(
             None
         }
     }
+}
+
+/// What set a layer's pixels, when the file names a record **and the record
+/// fingerprints the image that is actually there**.
+///
+/// The second half is the whole of it, and it is why `umber-version` did not
+/// move. An Umber that has never heard of [`docformat::TEXT_ATTR`] opens the
+/// document, shows the identical picture, lets the artist paint on the text
+/// layer, and saves — leaving a record beside pixels it did not make. Trusting it
+/// would mean re-rendering over that painting, which is the one outcome this
+/// codebase loses a history over. So: the rectangle the layer image occupies and
+/// a hash of its bytes are compared against what the writer recorded, and
+/// **anything that does not line up exactly is dropped, whole**. The layer then
+/// opens as ordinary paint, which is what it now is.
+///
+/// Every refusal is a warning rather than a silence. A layer whose text has
+/// become paint looks identical and behaves differently, and finding that out by
+/// trying to edit it is exactly the discovered loss the rule about warnings
+/// exists for.
+fn load_text(
+    zip: &mut Zip<'_>,
+    spec: &LayerSpec,
+    image: &flat::Image,
+    warnings: &mut Vec<ImportWarning>,
+) -> Option<Box<textobj::TextObject>> {
+    let src = spec.text_src.as_ref()?;
+    let mut refuse = |reason: String| -> Option<Box<textobj::TextObject>> {
+        warnings.push(ImportWarning::TextDropped {
+            layer: spec.name.clone(),
+            reason,
+        });
+        None
+    };
+    // Capped at the record's own bound rather than at `MAX_TOTAL_BYTES`: this
+    // entry's size follows how much somebody typed, not the canvas, so the
+    // document-wide figure does not bound it at all. See `read_capped_entry`.
+    let bytes =
+        match container::read_capped_entry(zip, src, FORMAT, textobj::MAX_RECORD_BYTES as u64) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return refuse("the record of it is not in the file".into()),
+            Err(e) => return refuse(format!("its record could not be read ({e})")),
+        };
+    let (text, print) = match textobj::TextObject::from_json(&bytes) {
+        Ok(pair) => pair,
+        Err(e) => return refuse(e.to_string()),
+    };
+    // A negative offset cannot be what this writer wrote — `trim` produces one
+    // inside the canvas — and it cannot be compared against a `PixelRect`
+    // either, so it is a mismatch like any other.
+    let (Ok(x), Ok(y)) = (u32::try_from(spec.x), u32::try_from(spec.y)) else {
+        return refuse("its pixels are no longer the ones the text made".into());
+    };
+    let rect = PixelRect {
+        x,
+        y,
+        width: image.size.x,
+        height: image.size.y,
+    };
+    if !print.matches(rect, &image.rgba) {
+        return refuse("its pixels are no longer the ones the text made".into());
+    }
+    Some(Box::new(text))
 }
 
 /// Last resort: the composite every ORA is required to carry.
