@@ -371,8 +371,21 @@ fn most_ordinary<'a>(faces: impl Iterator<Item = &'a Face>) -> Option<&'a Face> 
     faces.min_by_key(|f| (f.italic, f.weight.abs_diff(REGULAR_WEIGHT), f.weight))
 }
 
-/// Whether `candidate` sits where `from` does on every variable axis an emphasis
-/// is not allowed to move.
+/// [`axis_agreement`]'s best answer: the two sit at the same place on every axis
+/// an emphasis may not move.
+const AXES_AGREE: u8 = 0;
+
+/// One of the two faces does not state where it is, so there is nothing to
+/// compare. Ranked between the other two so it can neither beat an agreement nor
+/// lose to a disagreement — see [`axis_agreement`].
+const AXES_UNKNOWN: u8 = 1;
+
+/// They are at different places on an axis that was not asked to move.
+const AXES_DISAGREE: u8 = 2;
+
+/// How well `candidate` matches where `from` sits on every variable axis an
+/// emphasis is **not** allowed to move. Lower is better; it is the first term of
+/// [`FontLibrary::restyle`]'s sort key.
 ///
 /// A modern family in one file is a **grid rather than a row**: a two-axis face
 /// carries every weight at every width, so "the bold of Condensed Light" and
@@ -383,36 +396,46 @@ fn most_ordinary<'a>(faces: impl Iterator<Item = &'a Face>) -> Option<&'a Face> 
 ///
 /// `wght`, `ital` and `slnt` are skipped because those are exactly what is being
 /// changed. Every other axis of `candidate` is looked up **by tag** in `from`
-/// rather than walked in step. Both faces usually come out of one `fvar` table
-/// and [`read_faces`] records them in its order, so walking would agree — but
-/// two files of one family (a roman and an italic) need not order their axes
-/// alike, and there is a case much closer to home:
+/// rather than walked in step: both faces usually come out of one `fvar` table
+/// and [`read_faces`] records them in its order, so walking would agree, but two
+/// files of one family (a roman and an italic) need not order their axes alike.
 ///
-/// **A variable font's own default instance carries no variations at all.**
+/// **Three answers rather than two, and the middle one is the whole of why.** A
+/// variable font's own default instance carries **no variations at all** —
 /// [`read_faces`] records it that way deliberately, because an empty list is
-/// what tells `crate::text::set` there is nothing to instance. So a face-in-hand
-/// that happens to be the default has nothing to compare against, every tag
-/// misses, and this answers `true` for every candidate — the preference goes
-/// **inert** and the choice falls through to the weight rule, which is what it
-/// was before this function existed. That is a gap rather than a wrong answer,
-/// and it is the honest cost of the empty-is-the-identity fast path; closing it
-/// means recording the default's own axis values and giving `set` a different
-/// way to spot the identity.
+/// what tells `crate::text::set` there is nothing to instance — so a face with an
+/// empty list has not said where it is on any axis. Read as agreement that cuts
+/// both ways and one way is a *wrong face*: with the default master as a
+/// candidate, "agrees with everything" made it tie with the correctly-widthed
+/// face on every term and let the library's own order decide, so a condensed face
+/// asked for its bold could be handed the wide default. `AXES_UNKNOWN` keeps it
+/// behind a real agreement and ahead of a real disagreement, which is the only
+/// ranking that is honest about not knowing. Where **`from`** is the default the
+/// term goes uniform and the choice falls through to the weight rule, which is
+/// what it was before this function existed: a gap, not a wrong answer, and the
+/// honest cost of the empty-is-the-identity fast path. Closing that half means
+/// recording the default's own axis values and giving `set` another way to spot
+/// the identity.
 ///
 /// Near-equality, and the tolerance is deliberately tiny: both sides are `f32`s
-/// read off disk unmodified, so they agree bit for bit or they are different
+/// read off disk unmodified, so they agree bit for bit or they are at different
 /// axis positions. A tolerance wide enough to be "forgiving" would merge the two
-/// ends of a custom 0..1 axis. Being slightly too strict costs a lost preference
-/// and never a wrong face, which is the direction to fail in.
-fn same_other_axes(candidate: &Face, from: &Face) -> bool {
-    candidate.variations.iter().all(|(tag, want)| {
-        matches!(tag.as_str(), "wght" | "ital" | "slnt")
-            || from
-                .variations
-                .iter()
-                .find(|(t, _)| t == tag)
-                .is_none_or(|(_, have)| (want - have).abs() < 1e-6)
-    })
+/// ends of a custom 0..1 axis such as Recursive's `CASL`.
+fn axis_agreement(candidate: &Face, from: &Face) -> u8 {
+    if candidate.variations.is_empty() || from.variations.is_empty() {
+        return AXES_UNKNOWN;
+    }
+    for (tag, want) in &candidate.variations {
+        if matches!(tag.as_str(), "wght" | "ital" | "slnt") {
+            continue;
+        }
+        match from.variations.iter().find(|(t, _)| t == tag) {
+            Some((_, have)) if (want - have).abs() < 1e-6 => {}
+            Some(_) => return AXES_DISAGREE,
+            None => return AXES_UNKNOWN,
+        }
+    }
+    AXES_AGREE
 }
 
 /// The bytes of one face, held long enough to draw with.
@@ -521,9 +544,14 @@ impl FontLibrary {
     /// is `pub` for one reason: the states a style control can be refused in need
     /// families the shipped typeface cannot produce — one carrying a bold and no
     /// bold italic, one of a single heavy weight, an italic-only script face —
-    /// and `textpanel`'s guard for those sentences lives in another crate. A
-    /// library assembled this way holds no bytes, so nothing can be *drawn* with
-    /// it; it is a set of names to reason about.
+    /// and `textpanel`'s guard for those sentences lives in another crate.
+    ///
+    /// A [`Face`] is a name and a [`Source`], and `Source` is `pub`, so a caller
+    /// **can** hand over one that names real bytes; the tests here do not, and
+    /// this comment used to claim the function could not. What it does guarantee
+    /// is [`Self::insert`]'s: the `(family, style)` name is unique and the family
+    /// is not empty, so nothing added this way can break what
+    /// [`Self::is_bold_anchor`] relies on.
     pub fn add_face(&mut self, face: Face) {
         self.insert(face);
     }
@@ -572,12 +600,25 @@ impl FontLibrary {
     /// preferences file and in this panel, so a name that does not identify a
     /// face is the thing to refuse.
     ///
-    /// The cost is that this is a linear scan per insert where the order key was
-    /// a binary search, so a scan is quadratic in the faces it finds. That is
-    /// several thousand string comparisons on a large machine, against hundreds
-    /// of megabytes of file reads in the same loop, and it is on a worker thread
-    /// either way — see the module docs.
+    /// **A face with no family name is refused too.** [`read_face`] cannot
+    /// produce one — it returns `None` where the `name` table has no usable
+    /// family — but [`Self::add_face`] is a public door, and one empty name
+    /// becomes an empty row in the family picker *and* [`Self::resolve`]'s
+    /// whole-library fallback for every family that is missing, which is the
+    /// substitute every caption in a moved document would come back in.
+    ///
+    /// The cost is that the duplicate check is a linear scan per insert where the
+    /// order key was a binary search, so a scan is quadratic in the faces it
+    /// finds. Measured on a real Windows installation, 452 faces is about a
+    /// hundred thousand comparisons and 0.65 ms, against 149 ms for the warm
+    /// scan and 1.58 s cold in the same loop; a designer's collection is a few
+    /// million comparisons. It is on a worker thread either way — see the module
+    /// docs — and the figure to re-measure before changing this is that ratio,
+    /// not the count.
     fn insert(&mut self, face: Face) {
+        if face.family.trim().is_empty() {
+            return;
+        }
         if self.exact(&face.family, &face.style).is_some() {
             return;
         }
@@ -711,7 +752,7 @@ impl FontLibrary {
     ///
     /// Which face, when there is one: among the family's faces of the slant
     /// asked for and on the side of [`BOLD_THRESHOLD`] asked for, the one
-    /// nearest a target weight. `same_other_axes` is ahead of the weight in the
+    /// nearest a target weight. `axis_agreement` is ahead of the weight in the
     /// sort key, so the width and every other axis somebody chose survives; ties
     /// on both break to the lighter face, and a tie on *that* falls to the
     /// library's own order, which is `style` alphabetically within a weight.
@@ -746,13 +787,28 @@ impl FontLibrary {
             })
             .min_by_key(|f| {
                 (
-                    // `false` sorts first, so a face agreeing with the one in
-                    // hand about the width wins whatever the weights say.
-                    !from.is_none_or(|c| same_other_axes(f, c)),
+                    // Ahead of the weight, so a face agreeing with the one in
+                    // hand about the width wins whatever the weights say. With
+                    // no face in hand the term is uniform and decides nothing.
+                    from.map_or(AXES_UNKNOWN, |c| axis_agreement(f, c)),
                     f.weight.abs_diff(want),
                     f.weight,
                 )
             })
+    }
+
+    /// Whether any face of this family is here at all.
+    ///
+    /// What tells "that font is not on this machine" from "that font is here and
+    /// the style recorded beside it is not". [`Self::exact`] answers about the
+    /// **pair**, so reading its `None` as a missing family is how a mark came to
+    /// tell somebody to install a font they already had — and `Substitution` has
+    /// carried the distinction all along, because the panel draws a different
+    /// sentence for each.
+    pub fn has_family(&self, name: &str) -> bool {
+        self.faces
+            .iter()
+            .any(|f| f.family.eq_ignore_ascii_case(name))
     }
 
     /// Whether [`Self::restyle`] would answer.
@@ -1600,6 +1656,83 @@ mod tests {
                 .map(|f| &*f.style),
             Some("Condensed Regular")
         );
+    }
+
+    /// **A face that states no axis position must not be read as agreeing with
+    /// every width**, and this is the case that guards the rule rather than the
+    /// case that happens to pass under it.
+    ///
+    /// `read_faces` records a variable font's own default instance with an empty
+    /// `variations` list, deliberately, because that is what tells `text::set`
+    /// there is nothing to instance. Exactly one face per file is like that, and
+    /// it is a *candidate* like any other. Under a two-way comparison it agreed
+    /// with everything, tied the correctly-widthed face on every term of the sort
+    /// key, and let the library's own alphabetical order decide — so a condensed
+    /// face asked for its bold could be handed the wide default master. The
+    /// sibling case, where the *face in hand* is the default, is the documented
+    /// gap and is checked here too: the preference goes uniform and the weight
+    /// rule decides, which is a plainer answer rather than a wrong one.
+    #[test]
+    fn a_face_that_states_no_axis_position_does_not_claim_every_width() {
+        let mut lib = FontLibrary::default();
+        let one = |style: &str, weight: u16, wdth: Option<f32>| Face {
+            family: "Grid".to_string(),
+            style: style.to_string(),
+            weight,
+            italic: false,
+            source: Source::File {
+                path: PathBuf::from("Grid[wdth,wght].ttf"),
+                index: 0,
+            },
+            variations: match wdth {
+                Some(wdth) => vec![
+                    ("wdth".to_string(), wdth),
+                    ("wght".to_string(), weight as f32),
+                ],
+                // The file's default master, as `read_faces` records it.
+                None => Vec::new(),
+            },
+        };
+        lib.insert(one("Condensed Regular", 400, Some(75.0)));
+        lib.insert(one("Condensed Bold", 700, Some(75.0)));
+        // The default master is a bold, and sorts *before* "Condensed Bold"
+        // alphabetically at the same weight — which is what made the old
+        // comparison hand it back.
+        lib.insert(one("Bold", 700, None));
+
+        assert_eq!(
+            lib.restyle("Grid", "Condensed Regular", true, false)
+                .map(|f| &*f.style),
+            Some("Condensed Bold"),
+            "a face stating no width was taken to agree with this one"
+        );
+
+        // And the other half, which is the documented gap: with the default
+        // master *in hand* nothing is known about its width, so the weight rule
+        // decides and either bold is an honest answer.
+        lib.insert(one("Condensed Light", 300, Some(75.0)));
+        assert!(
+            lib.restyle("Grid", "Bold", false, false).is_some(),
+            "a default master in hand should still reach a lighter face"
+        );
+    }
+
+    /// A face with no family name never enters the library.
+    ///
+    /// `read_face` cannot make one, but `add_face` is a public door, and one
+    /// empty name is an empty row in the family picker *and* `resolve`'s
+    /// whole-library fallback for every family that is missing — so every caption
+    /// in a moved document would come back set in nothing.
+    #[test]
+    fn a_face_with_no_family_name_is_refused() {
+        let mut lib = FontLibrary::default();
+        lib.add_builtin("archivo", TEST_FONT);
+        let before = lib.faces().len();
+        for family in ["", "   "] {
+            lib.add_face(made(family, "Regular", 400, false));
+        }
+        assert_eq!(lib.faces().len(), before, "{:?}", lib.families());
+        assert_eq!(lib.families(), vec!["Archivo"]);
     }
 
     /// **A style name identifies a face**, so two faces of one family that share

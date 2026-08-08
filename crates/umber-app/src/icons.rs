@@ -397,13 +397,16 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             // than an arc: at 16 px a chamfer and a curve are the same picture,
             // and the polyline is what every other mark here is made of.
             //
-            // The bowls are drawn **wide of what the letter wants**, and the
+            // The bowls are drawn **deeper than the letter wants**, and the
             // figures below are the reason rather than taste. An `icon_toggle`
-            // shrinks its 20 pt box by two, so this is a 16 px mark: `scale` is
-            // 2/3 and the stroke is 1.93 px. The upper bowl spans 7.8 units
-            // gross and the lower 8.2, which after the stroke leaves 4.9 and 5.3
-            // of counter, or 3.3 and 3.5 pixels of hole. Drawn to the letter's
-            // own proportions the holes close up and the mark is a blob.
+            // shrinks its 20 pt box by two, so this is a 16 pt mark: `scale` is
+            // 2/3 and the stroke is 1.93 pt. The upper bowl is 7.8 units tall and
+            // the lower 8.2, which after the stroke leaves 4.9 and 5.3 of
+            // counter, or 3.3 and 3.5 points of hole. At the letter's own
+            // proportions the holes close up and the mark is a blob.
+            //
+            // Points, not pixels: on a 2× display there is twice as much to go
+            // round, so the blob is a claim about the worst case only.
             //
             // The stem is at 6.9 and the widest bowl reaches 17.1, so the mark
             // is centred in the 24 box. It was not at first, and the offset is
