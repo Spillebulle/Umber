@@ -684,12 +684,26 @@ fn edit_row(
     actions: &mut UiActions,
 ) {
     let editing = ed.text.editing.as_ref().expect("the caller checked");
-    let missing = editing
+    let frozen = editing
         .original
         .face
         .resolve(ed.text.fonts.library())
         .is_none();
-    if missing {
+    // **The pair the *pickers* name, which is what `update_text_layer` actually
+    // resolves.** The two readings are usually the same face, because the
+    // pickers were loaded from the record; but the artist can scroll to a family
+    // this machine has not got, and a control read off the record alone would
+    // then be live and the click would raise a dialog. That is the `plan_`/`can_`
+    // arrangement one step along: the control asks whether it may, and the act
+    // asks what to do, off the same reading.
+    let face_here = umber_core::textobj::TextFace {
+        family: ed.text.family.clone(),
+        style: ed.text.style.clone(),
+        postscript: String::new(),
+    }
+    .resolve(ed.text.fonts.library())
+    .is_some();
+    if frozen {
         // **Named before anything is pressed, not after.** The face the record
         // asks for is not on this machine, so the saved pixels are all there is
         // — `TextFace::resolve` is exact and never substitutes, because
@@ -703,7 +717,8 @@ fn edit_row(
     // a typo. This is how the artist asks for that instead.
     let same = ed.color.to_srgb_u8() == editing.colour.to_srgb_u8();
     let state = update_state(
-        missing,
+        frozen,
+        face_here,
         ed.text.block.text.trim().is_empty(),
         refused,
         unchanged(ed),
@@ -772,18 +787,37 @@ fn unchanged(ed: &Editor) -> bool {
 /// comes first because nothing else about the layer can be acted on until it is
 /// there; "nothing has changed" comes last, because it is the only one that is
 /// not a problem.
+///
+/// **Two font readings, not one, and they are different questions.** `frozen`
+/// is whether the face the *record* names is here, which is what decides
+/// whether this layer may be set again at all — re-rendering it in another face
+/// is a change to the picture, so the way out is Convert to paint rather than a
+/// silent substitution. `face_here` is whether the face the *pickers* name is
+/// here, which is what `update_text_layer` will try to load; without it the
+/// artist could scroll to a family this machine has not got and press a live
+/// button that raised a dialog.
 fn update_state(
-    missing_font: bool,
+    frozen: bool,
+    face_here: bool,
     empty: bool,
     refused: Option<TextError>,
     unchanged: bool,
 ) -> Place {
-    if missing_font {
+    if frozen {
         return Place {
             enabled: false,
             tooltip: "The font this text was set in is not on this machine, so Umber \
                       cannot set it again without changing the letterforms. Install the \
                       font, or convert the layer to paint."
+                .into(),
+        };
+    }
+    if !face_here {
+        return Place {
+            enabled: false,
+            tooltip: "The font named in the boxes above is not on this machine. Umber \
+                      will not set this text in a substitute. Choose a font the list \
+                      has."
                 .into(),
         };
     }
@@ -2968,33 +3002,58 @@ mod tests {
             width: 9000,
             height: 9000,
         };
-        for (missing, empty, refused, unchanged, why) in [
-            (true, false, None, false, "a missing font"),
-            (false, true, None, false, "nothing typed"),
-            (false, false, Some(too_large), false, "past the cap"),
-            (false, false, None, true, "nothing changed"),
-            (true, true, Some(too_large), true, "everything at once"),
+        let mut said: Vec<String> = Vec::new();
+        for (frozen, face_here, empty, refused, unchanged, why) in [
+            (true, true, false, None, false, "the record's font is gone"),
+            (
+                false,
+                false,
+                false,
+                None,
+                false,
+                "the picker names a font that is not here",
+            ),
+            (false, true, true, None, false, "nothing typed"),
+            (false, true, false, Some(too_large), false, "past the cap"),
+            (false, true, false, None, true, "nothing changed"),
+            (
+                true,
+                false,
+                true,
+                Some(too_large),
+                true,
+                "everything at once",
+            ),
         ] {
-            let state = update_state(missing, empty, refused, unchanged);
+            let state = update_state(frozen, face_here, empty, refused, unchanged);
             assert!(!state.enabled, "Update was live for {why}");
             assert!(state.tooltip.ends_with('.'), "{why}: {}", state.tooltip);
             assert!(!state.tooltip.contains('—'), "{why}: {}", state.tooltip);
+            said.push(state.tooltip.to_string());
         }
-        let state = update_state(false, false, None, false);
+        let state = update_state(false, true, false, None, false);
         assert!(state.enabled, "Update was refused with nothing wrong");
         assert!(!state.tooltip.contains('—'), "{}", state.tooltip);
 
         // A missing font outranks everything: nothing else about the layer can
         // be acted on until the font is there.
         assert_eq!(
-            update_state(true, false, Some(too_large), true).tooltip,
-            update_state(true, false, None, false).tooltip
+            update_state(true, true, false, Some(too_large), true).tooltip,
+            update_state(true, true, false, None, false).tooltip
         );
         assert!(
-            update_state(true, false, None, false)
+            update_state(true, true, false, None, false)
                 .tooltip
                 .contains("Install the font")
         );
+
+        // **The two font readings are two different sentences**, because they
+        // send somebody two different places: install the font this text was
+        // set in, or pick one the list has. The first was the whole refusal
+        // until the second was added, and a picker naming a font that is not
+        // here left Update live over a click that raised a dialog.
+        assert_ne!(said[0], said[1], "one sentence for two font refusals");
+        assert!(said[1].contains("boxes above"), "{}", said[1]);
     }
 
     /// **A record naming a font this machine has not got freezes the layer**,
@@ -3032,7 +3091,9 @@ mod tests {
                 .resolve(&record.face.family, &record.face.style)
                 .is_some()
         );
-        assert!(!update_state(true, false, None, false).enabled);
+        // Frozen whatever the pickers now name: re-rendering in another face is
+        // a change to the picture, so the way out is Convert to paint.
+        assert!(!update_state(true, true, false, None, false).enabled);
 
         // The panel draws the notice, which is what makes the frozen state
         // something an artist can act on rather than a dead button.
