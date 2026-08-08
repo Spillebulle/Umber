@@ -5637,8 +5637,16 @@ impl CanvasRenderer {
         }
 
         if let Err(what) = self.run_effect_steps(device, queue, encoder, &steps) {
+            // **The plain list, not the spliced one.** A bake that stopped part
+            // way has left some of its slices unwritten, and a draw pointing at
+            // one of those is whatever the driver left there — which is worse
+            // than a picture with no shadow in it, and is exactly the failure
+            // the over-budget rule refuses to produce silently. Every entry goes
+            // with it, so the next frame rebakes from nothing rather than
+            // trusting a stamp recorded for a pass that did not run.
             log::error!("effect bake abandoned: {what}");
-            self.effects.forget_entries();
+            self.effects.forget_all();
+            return plain();
         }
         self.baked(stack, kept, &slots, frame)
     }
