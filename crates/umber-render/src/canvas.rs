@@ -1649,15 +1649,26 @@ const EFFECT_PASS_BLOCKS: u64 =
 ///
 /// A **centred outline** is the worst, because it is the one effect that floods
 /// twice: two seeds, two sets of `ceil(log2(span)) + 1` steps and two grows, plus
-/// the extract, the downsample, four box passes and the resolve. At 32768 —
-/// `max_texture_dimension_2d` on a device that offers it — that is 40.
-/// Forty-eight rather than forty so that adding a pass to the pipeline does not
-/// silently start dropping effects; the slack costs uniform bytes and nothing
-/// else.
+/// the extract, the downsample, four box passes and the resolve. Derived rather
+/// than counted by hand — 45 at 32768 square and 47 at 65536, which is past every
+/// `max_texture_dimension_2d` a device reports.
+///
+/// **The span is the canvas's longest side and not the downlevel limit**, which
+/// is the reading that made the guard read 37: `Gpu::new` asks for
+/// `using_resolution`, so `downlevel_defaults`' 2048 is what a canvas is
+/// guaranteed to *reach* and says nothing about the largest one a device allows.
+///
+/// Forty-eight leaves three passes of headroom at 32768 and one at 65536, which
+/// is thin — so **check this figure when a pass is added**, and note that
+/// overrunning it is graceful rather than fatal: `bake_effects` keeps
+/// `EFFECT_PASS_BLOCKS / EFFECT_MAX_PASSES_PER_EFFECT` effects and
+/// `run_effect_steps` refuses a plan past the buffer, both of which are counted
+/// in `dropped` and neither of which is a validation error.
 ///
 /// `the_pass_budget_covers_the_effects_the_model_permits` derives the figure from
 /// the planner's own arithmetic rather than restating it, which is what caught
-/// the first draft at a fifth of what it needed.
+/// the first draft at a fifth of what it needed — and then caught its own second
+/// draft counting one field where the worst case floods twice.
 const EFFECT_MAX_PASSES_PER_EFFECT: usize = 48;
 
 /// Stride of one [`EffectUniforms`] block.
@@ -8377,28 +8388,53 @@ mod tests {
     /// said the document was within its budget while showing none of it.
     #[test]
     fn the_pass_budget_covers_the_effects_the_model_permits() {
-        // The flood, at the widest span a canvas can force.
-        let longest = wgpu::Limits::downlevel_defaults().max_texture_dimension_2d;
-        let span = longest;
-        let mut floods = 0;
-        let mut k = 1i64 << (32 - span.leading_zeros());
-        while k >= 1 {
-            floods += 1;
-            k /= 2;
+        // **The span is the canvas's longest side, and not
+        // `downlevel_defaults().max_texture_dimension_2d`.** `Gpu::new` asks for
+        // `using_resolution`, which raises exactly that limit from the adapter —
+        // so the downlevel figure of 2048 is what a canvas is *guaranteed* to
+        // reach and says nothing about the largest one a device will allow. Using
+        // it made this guard read 37 where the real worst is 45, which is the
+        // difference between eleven passes of headroom and three.
+        let worst_at = |longest: u32| {
+            let span = longest.max(1);
+            let mut floods = 0;
+            let mut k = 1i64 << (32 - span.leading_zeros());
+            while k >= 1 {
+                floods += 1;
+                k /= 2;
+            }
+            // **Two fields, because a centred outline is the worst case and it
+            // floods twice.** The first draft counted one — the guard whose
+            // comment claims more reach than the code has, since a `Centre`
+            // position added to the planner afterwards would have been invisible
+            // to it.
+            let field = 1 + floods + 1; // seed, the flood steps, grow
+            // extract + two fields + down + four box + resolve.
+            1 + 2 * field + 1 + 4 + 1
+        };
+
+        // Past every `max_texture_dimension_2d` a device reports today: 16384 is
+        // the common desktop figure, 32768 the generous one, and 65536 is over
+        // both. A device beyond that overruns the per-effect budget and degrades
+        // **visibly** rather than fatally — `bake_effects` keeps
+        // `EFFECT_PASS_BLOCKS / EFFECT_MAX_PASSES_PER_EFFECT` effects and
+        // `run_effect_steps` refuses a plan past the buffer, both counted in
+        // `dropped` — which is why an upper bound here is a guard and not a
+        // promise about hardware nobody has.
+        for longest in [2048, 8192, 16384, 32768, 65536] {
+            let worst = worst_at(longest);
+            assert!(
+                worst <= EFFECT_MAX_PASSES_PER_EFFECT,
+                "at {longest} square one effect asks for {worst} passes against a \
+                 budget of {EFFECT_MAX_PASSES_PER_EFFECT}"
+            );
+            assert!(
+                EFFECT_PASS_BLOCKS >= (worst * umber_core::effect::MAX_ENABLED) as u64,
+                "{} blocks will not hold {} effects at {worst} passes each",
+                EFFECT_PASS_BLOCKS,
+                umber_core::effect::MAX_ENABLED
+            );
         }
-        // extract + seed + floods + grow + down + four box + resolve.
-        let worst = 1 + 1 + floods + 1 + 1 + 4 + 1;
-        assert!(
-            worst <= EFFECT_MAX_PASSES_PER_EFFECT,
-            "one effect can ask for {worst} passes against a budget of \
-             {EFFECT_MAX_PASSES_PER_EFFECT}"
-        );
-        assert!(
-            EFFECT_PASS_BLOCKS >= (worst * umber_core::effect::MAX_ENABLED) as u64,
-            "{} blocks will not hold {} effects at {worst} passes each",
-            EFFECT_PASS_BLOCKS,
-            umber_core::effect::MAX_ENABLED
-        );
         // And the buffer's own size, because a dynamic offset past the end of it is
         // a validation error and therefore fatal.
         let last = (EFFECT_PASS_BLOCKS - 1) * EFFECT_BLOCK_STRIDE;
