@@ -1550,10 +1550,15 @@ mod pictures {
     /// "none", which looks exactly like a stroke that failed to draw.
     const OFF: f32 = 120.0;
 
-    /// The widths drawn. 20 is the one §13 asks for; 2 and 8 are where the
-    /// method is expected to be fine and 64 is where it is expected not to be,
-    /// and the answer is only useful if it says *where* the line falls.
-    const WIDTHS: [u32; 4] = [2, 8, 20, 64];
+    /// The widths drawn.
+    ///
+    /// 20 is the one §13 asks for; 2 and 8 are where the method is expected to
+    /// be fine and 64 is where it is expected not to be. **32 and 48 are here
+    /// because the answer stage 1 needs is a number, and four points with a
+    /// factor of three between the last two cannot give one** — the first
+    /// version of this sweep could say only "fine at 20, wrong at 64", which
+    /// is a range and not a threshold.
+    const WIDTHS: [u32; 6] = [2, 8, 20, 32, 48, 64];
 
     /// A field of alpha in pixel-index space: the value at integer `(i, j)` is
     /// texel `(i, j)`, so a continuous coordinate `x` is at index `x - 0.5`.
