@@ -516,13 +516,13 @@ pub fn set_through(
         // nothing was typed.
         return Err(TextError::NotFinite);
     };
-    if box_.area() as u64 > MAX_PIXELS {
+    if box_.area() > MAX_PIXELS {
         return Err(TextError::TooLarge {
-            width: box_.width,
-            height: box_.height,
+            width: box_.size.x,
+            height: box_.size.y,
         });
     }
-    let (bw, bh) = (box_.width as usize, box_.height as usize);
+    let (bw, bh) = (box_.size.x as usize, box_.size.y as usize);
     let mut cover = vec![0u8; bw * bh];
 
     // One rasteriser per line, reused, merged with a `max`.
@@ -539,17 +539,20 @@ pub fn set_through(
     // paragraph 45° and every line's bounding box is nearly the block's, so a
     // buffer sized to the block would be one transient per line of very nearly
     // the whole thing.
-    let boxes: Vec<Option<PixelRect>> = per_line.iter().map(|b| b.and_then(Bounds::pixels)).collect();
+    let boxes: Vec<Option<InkRect>> = per_line
+        .iter()
+        .map(|b| b.and_then(Bounds::pixels))
+        .collect();
     let (rw, rh) = boxes.iter().flatten().fold((1usize, 1usize), |(w, h), r| {
-        (w.max(r.width as usize), h.max(r.height as usize))
+        (w.max(r.size.x as usize), h.max(r.size.y as usize))
     });
     let mut raster = Rasterizer::new(rw, rh);
     for ((i, line), b) in lines.iter().enumerate().zip(&boxes) {
         let Some(b) = *b else { continue };
         let at = origin(i, line);
-        let (lw, lh) = (b.width as usize, b.height as usize);
+        let (lw, lh) = (b.size.x as usize, b.size.y as usize);
         raster.reset(lw, lh);
-        let corner = Vec2::new(b.x as f32, b.y as f32);
+        let corner = b.min.as_vec2();
         for glyph in &line.glyphs {
             if glyph.id == 0 {
                 continue;
@@ -557,20 +560,16 @@ pub fn set_through(
             let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
                 continue;
             };
-            let mut pen = Pen::mapped(
-                &mut raster,
-                at.x + glyph.x,
-                at.y - glyph.y,
-                map,
-                corner,
-            );
+            let mut pen = Pen::mapped(&mut raster, at.x + glyph.x, at.y - glyph.y, map, corner);
             // A glyph that will not draw is skipped rather than abandoning the
             // line: a caption missing one letter beats a caption missing all of
             // them, which is `cputext.rs`'s rule and the same one.
             let _ = outline.draw(settings(), &mut pen);
         }
-        let dx = b.x as i64 - box_.x as i64;
-        let dy = b.y as i64 - box_.y as i64;
+        // Both origins are signed and both are already bounded into `i32`, so
+        // this difference is exact and cannot wrap.
+        let dx = b.min.x as i64 - box_.min.x as i64;
+        let dy = b.min.y as i64 - box_.min.y as i64;
         raster.for_each_pixel_2d(|px, py, coverage| {
             if coverage <= 0.0 {
                 return;
@@ -598,7 +597,7 @@ pub fn set_through(
             missing,
             mixed_directions: mixed,
         },
-        at: IVec2::new(box_.x as i32, box_.y as i32) + offset,
+        at: box_.min + offset,
     })
 }
 
@@ -629,12 +628,10 @@ impl Bounds {
     ///
     /// `None` for a box that is not a pair of numbers, and the check is written
     /// against the *padded* corners rather than against `min` and `max` so that
-    /// an addition that overflows to an infinity is caught too. The rectangle is
-    /// also clamped into `i32`, because a `PixelRect` is unsigned and the caller
-    /// has to be able to hold the offset: a block a hundred million pixels off
-    /// the canvas is refused as too large rather than wrapping to somewhere
-    /// plausible.
-    fn pixels(self) -> Option<PixelRect> {
+    /// an addition that overflows to an infinity is caught too. It is also
+    /// bounded into `i32`, so that a block a hundred million pixels off the
+    /// canvas is refused rather than wrapping to somewhere plausible.
+    fn pixels(self) -> Option<InkRect> {
         let lo = self.min - Vec2::splat(MARGIN);
         let hi = self.max + Vec2::splat(MARGIN);
         let lo = Vec2::new(lo.x.floor(), lo.y.floor());
@@ -646,12 +643,37 @@ impl Bounds {
         if lo.x < -LIMIT || lo.y < -LIMIT || hi.x > LIMIT || hi.y > LIMIT {
             return None;
         }
-        Some(PixelRect {
-            x: lo.x as i32 as u32,
-            y: lo.y as i32 as u32,
-            width: (hi.x - lo.x).max(1.0) as u32,
-            height: (hi.y - lo.y).max(1.0) as u32,
+        Some(InkRect {
+            min: IVec2::new(lo.x as i32, lo.y as i32),
+            size: UVec2::new((hi.x - lo.x).max(1.0) as u32, (hi.y - lo.y).max(1.0) as u32),
         })
+    }
+}
+
+/// A whole-pixel rectangle whose origin is **signed**.
+///
+/// Deliberately not [`PixelRect`], and that distinction was a bug rather than a
+/// preference. A block's ink starts a little to the left of and above the pen's
+/// own origin — a left sidebearing is often under a pixel and [`MARGIN`] then
+/// takes three more off — so `min` is routinely negative for text nobody has
+/// dragged anywhere, and under a map it can be negative by thousands. Squeezing
+/// that into `PixelRect`'s `u32` and reading it back out as one made
+/// [`Pen::mapped`]'s `corner` about four billion, so every point of the line
+/// collapsed onto the clamp and the block came back [`TextError::NoInk`]:
+/// `set("A")` set nothing, while `set("Umber")` worked because a capital `U` has
+/// a wide enough sidebearing to keep `min` positive. Four tests caught it and it
+/// is exactly the class of thing they exist for, so the type says signed now
+/// instead of the arithmetic hoping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InkRect {
+    /// Top-left, in the space the map maps into.
+    min: IVec2,
+    size: UVec2,
+}
+
+impl InkRect {
+    fn area(self) -> u64 {
+        self.size.x as u64 * self.size.y as u64
     }
 }
 
@@ -838,12 +860,7 @@ fn trim(cover: Vec<u8>, w: usize, h: usize) -> Result<(Vec<u8>, u32, u32, IVec2)
     for y in y0..y1 {
         out.extend_from_slice(&cover[y * w + x0..y * w + x1]);
     }
-    Ok((
-        out,
-        tw as u32,
-        th as u32,
-        IVec2::new(x0 as i32, y0 as i32),
-    ))
+    Ok((out, tw as u32, th as u32, IVec2::new(x0 as i32, y0 as i32)))
 }
 
 /// Feeds glyph outlines to the rasteriser, flipping to y-down as it goes.
