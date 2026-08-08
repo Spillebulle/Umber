@@ -1021,18 +1021,40 @@ mod tests {
     /// A face name out of a file somebody else wrote is cleaned to something that
     /// can go in a sentence, on the way in **and** on the way out, so what a
     /// notice shows is what a reopen gives back.
+    ///
+    /// **The two halves are driven separately, and that is the whole point of the
+    /// test.** A round trip through `to_json` cleans on the way out, so it leaves
+    /// the *reader's* clean unguarded — measured, by taking that one out: the round
+    /// trip still passed. A record this build did not write, out of a hand-edited
+    /// file or a later revision, is exactly the case where only the reader's half
+    /// runs, so it gets its own raw JSON.
     #[test]
     fn a_face_name_from_a_hostile_file_is_cleaned_on_both_sides() {
-        let mut obj = object();
-        obj.face.family = format!("  Arch\u{7}ivo{}  ", "x".repeat(MAX_NAME_BYTES));
         let print = Fingerprint::of(rect(0, 0, 1, 1), b"x");
-        let (back, _) = TextObject::from_json(&obj.to_json(&print).unwrap()).unwrap();
+        let dirty = format!("  Arch\u{7}ivo{}  ", "x".repeat(MAX_NAME_BYTES));
+        let clean = |s: &str| {
+            !s.contains('\u{7}') && s.len() <= MAX_NAME_BYTES && s.trim() == s && !s.is_empty()
+        };
 
-        assert!(!back.face.family.contains('\u{7}'), "no control characters");
-        assert!(back.face.family.len() <= MAX_NAME_BYTES);
-        assert_eq!(back.face.family.trim(), back.face.family, "trimmed");
-        // And it is a fixed point: cleaning what came back changes nothing, so a
-        // second save and reopen gives the identical record.
+        // The writer's half: what goes into the archive is already fit to read.
+        let mut obj = object();
+        obj.face.family = dirty.clone();
+        let written = String::from_utf8(obj.to_json(&print).unwrap()).unwrap();
+        assert!(
+            !written.contains("\\u0007"),
+            "the record itself must be clean: {written}"
+        );
+
+        // The reader's half, on JSON this build did not write. Every field the
+        // record needs, with a family nobody would want in a sentence.
+        let raw = written.replace(
+            &written[written.find("\"family\"").unwrap()..written.find("\"style\"").unwrap()],
+            &format!("\"family\":{},", serde_json::to_string(&dirty).unwrap()),
+        );
+        let (back, _) = TextObject::from_json(raw.as_bytes()).expect("still a record");
+        assert!(clean(&back.face.family), "{:?}", back.face.family);
+
+        // And it is a fixed point: a second save and reopen gives the same face.
         let (again, _) = TextObject::from_json(&back.to_json(&print).unwrap()).unwrap();
         assert_eq!(again.face, back.face);
     }
