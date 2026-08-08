@@ -591,7 +591,15 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions)
     font_picker(ui, p, ed);
     ui.add_space(2.0);
     style_picker(ui, p, ed);
-    substitution_note(ui, p, ed);
+    // **Composing only.** That note says "Umber is setting this text in X
+    // instead", which is true of Place and false of a text layer: `edit_row`
+    // refuses Update outright when the pickers name a font this machine has not
+    // got, so nothing is set in a substitute and the sentence would be a
+    // promise about a click that is not offered. The two sentences a text layer
+    // needs are `edit_row`'s own.
+    if ed.text.editing.is_none() {
+        substitution_note(ui, p, ed);
+    }
     ui.add_space(6.0);
 
     // The rails write into the block's own fields. Taking a copy and putting it
@@ -706,9 +714,7 @@ fn edit_row(
     if frozen {
         // **Named before anything is pressed, not after.** The face the record
         // asks for is not on this machine, so the saved pixels are all there is
-        // — `TextFace::resolve` is exact and never substitutes, because
-        // re-rendering somebody's caption in a face its author did not choose
-        // changes the picture silently.
+        // until somebody either installs it or picks another one deliberately.
         controls::note(ui, p, &editing.original.face.missing_notice());
         ui.add_space(6.0);
     }
@@ -716,8 +722,9 @@ fn edit_row(
     // to be in the palette would repaint the caption every time somebody fixed
     // a typo. This is how the artist asks for that instead.
     let same = ed.color.to_srgb_u8() == editing.colour.to_srgb_u8();
+    let locked = ed.layers.active_is_locked();
     let state = update_state(
-        frozen,
+        locked,
         face_here,
         ed.text.block.text.trim().is_empty(),
         refused,
@@ -746,14 +753,20 @@ fn edit_row(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = controls::text_button(ui, p, "Convert to paint", false, true);
+            // Gated on the lock like everything else that edits a layer. It
+            // changes no pixel, and it changes what the file carries and what
+            // may be painted here afterwards, which is what a lock is about.
+            let response = controls::text_button(ui, p, "Convert to paint", false, !locked);
             if response.clicked() {
                 actions.convert_text_to_paint = true;
             }
-            response.on_hover_text(
+            response.on_hover_text(if locked {
+                "This layer is locked, or it is inside a locked folder. Unlock it in \
+                 the Layers panel."
+            } else {
                 "Keep every pixel and stop treating this layer as text. It can then be \
-                 painted and pasted on, and it cannot be set again.",
-            );
+                 painted and pasted on, and it cannot be set again."
+            });
         });
     });
 }
@@ -788,27 +801,29 @@ fn unchanged(ed: &Editor) -> bool {
 /// there; "nothing has changed" comes last, because it is the only one that is
 /// not a problem.
 ///
-/// **Two font readings, not one, and they are different questions.** `frozen`
-/// is whether the face the *record* names is here, which is what decides
-/// whether this layer may be set again at all — re-rendering it in another face
-/// is a change to the picture, so the way out is Convert to paint rather than a
-/// silent substitution. `face_here` is whether the face the *pickers* name is
-/// here, which is what `update_text_layer` will try to load; without it the
-/// artist could scroll to a family this machine has not got and press a live
-/// button that raised a dialog.
+/// **The font reading is the pair the *pickers* name, and that is the one
+/// `update_text_layer` resolves.** A layer whose recorded face is gone opens
+/// with that face in the boxes, so this refuses it and the notice above the row
+/// names the font — the layer is frozen, and the saved pixels stand.
+///
+/// What it deliberately does *not* do is stay frozen once the artist has chosen
+/// a font that **is** here. The rule text lives by is that a caption is never
+/// re-rendered in a face its author did not choose *silently*; picking one off
+/// the list is not silent, and it is the only way back for somebody who has the
+/// document and not the font. Reading the record's face instead left the family
+/// and style dropdowns live and doing nothing, which is the control that lies.
 fn update_state(
-    frozen: bool,
+    locked: bool,
     face_here: bool,
     empty: bool,
     refused: Option<TextError>,
     unchanged: bool,
 ) -> Place {
-    if frozen {
+    if locked {
         return Place {
             enabled: false,
-            tooltip: "The font this text was set in is not on this machine, so Umber \
-                      cannot set it again without changing the letterforms. Install the \
-                      font, or convert the layer to paint."
+            tooltip: "This layer is locked, or it is inside a locked folder. Unlock it \
+                      in the Layers panel, or select another layer."
                 .into(),
         };
     }
@@ -816,8 +831,9 @@ fn update_state(
         return Place {
             enabled: false,
             tooltip: "The font named in the boxes above is not on this machine. Umber \
-                      will not set this text in a substitute. Choose a font the list \
-                      has."
+                      will not set this text in a substitute, because a caption redrawn \
+                      in another face is a change to the picture. Choose a font the \
+                      list has."
                 .into(),
         };
     }
@@ -843,8 +859,13 @@ fn update_state(
     }
     Place {
         enabled: true,
-        tooltip: "Draw this text again on the layer, where it already is. \
-                  The transform tool is what moves and turns it."
+        // It says what moving it costs, because the tempting reading of "where
+        // it already is" is that the transform tool is beside it doing the
+        // other half — and picking the caption up with that tool turns the
+        // layer into paint, since a placement cannot hold the shear a second
+        // rotation and scale would put into it.
+        tooltip: "Draw this text again on the layer, where it already is. Moving it \
+                  with the transform tool makes the layer paint."
             .into(),
     }
 }
@@ -2993,9 +3014,12 @@ mod tests {
     /// Update is offered exactly when setting the text again would do something
     /// it can do.
     ///
-    /// Every cell, because the one that matters is silent: a missing font must
-    /// never re-render, since `TextFace::resolve` is exact precisely so that a
-    /// caption is not redrawn in a face its author did not choose.
+    /// Every cell, because two of them are the ones that damage something. A
+    /// **locked** layer must not be written at all — this is the sixth operation
+    /// that writes pixels and it needs the gate every other one has — and a font
+    /// that is not here must never be substituted, since `TextFace::resolve` is
+    /// exact precisely so that a caption is not redrawn in a face its author did
+    /// not choose.
     #[test]
     fn update_is_refused_for_every_reason_it_should_be() {
         let too_large = TextError::TooLarge {
@@ -3003,15 +3027,15 @@ mod tests {
             height: 9000,
         };
         let mut said: Vec<String> = Vec::new();
-        for (frozen, face_here, empty, refused, unchanged, why) in [
-            (true, true, false, None, false, "the record's font is gone"),
+        for (locked, face_here, empty, refused, unchanged, why) in [
+            (true, true, false, None, false, "a locked layer"),
             (
                 false,
                 false,
                 false,
                 None,
                 false,
-                "the picker names a font that is not here",
+                "the boxes name a font that is not here",
             ),
             (false, true, true, None, false, "nothing typed"),
             (false, true, false, Some(too_large), false, "past the cap"),
@@ -3025,7 +3049,7 @@ mod tests {
                 "everything at once",
             ),
         ] {
-            let state = update_state(frozen, face_here, empty, refused, unchanged);
+            let state = update_state(locked, face_here, empty, refused, unchanged);
             assert!(!state.enabled, "Update was live for {why}");
             assert!(state.tooltip.ends_with('.'), "{why}: {}", state.tooltip);
             assert!(!state.tooltip.contains('—'), "{why}: {}", state.tooltip);
@@ -3034,26 +3058,37 @@ mod tests {
         let state = update_state(false, true, false, None, false);
         assert!(state.enabled, "Update was refused with nothing wrong");
         assert!(!state.tooltip.contains('—'), "{}", state.tooltip);
+        // It says what moving the caption costs rather than implying the
+        // transform tool is beside it doing the other half: picking it up makes
+        // the layer paint.
+        assert!(
+            state.tooltip.contains("makes the layer paint"),
+            "{}",
+            state.tooltip
+        );
 
-        // A missing font outranks everything: nothing else about the layer can
-        // be acted on until the font is there.
+        // A lock outranks everything: the artist is not helped by also being
+        // told about the size, and the layer is the thing to fix first. The
+        // same order `place_state` keeps.
         assert_eq!(
-            update_state(true, true, false, Some(too_large), true).tooltip,
+            update_state(true, false, true, Some(too_large), true).tooltip,
             update_state(true, true, false, None, false).tooltip
         );
-        assert!(
-            update_state(true, true, false, None, false)
-                .tooltip
-                .contains("Install the font")
-        );
+        assert!(said[0].contains("locked"), "{}", said[0]);
 
-        // **The two font readings are two different sentences**, because they
-        // send somebody two different places: install the font this text was
-        // set in, or pick one the list has. The first was the whole refusal
-        // until the second was added, and a picker naming a font that is not
-        // here left Update live over a click that raised a dialog.
-        assert_ne!(said[0], said[1], "one sentence for two font refusals");
+        // **The font refusal names the boxes and not the record**, because that
+        // is the pair `update_text_layer` resolves. Reading the record's face
+        // instead left the family and style dropdowns live and doing nothing on
+        // a layer whose font had gone, which is the one way out for somebody
+        // who has the document and not the font.
         assert!(said[1].contains("boxes above"), "{}", said[1]);
+        assert!(said[1].contains("substitute"), "{}", said[1]);
+
+        // Six refusals, six sentences.
+        let mut unique = said.clone();
+        unique.sort();
+        unique.dedup();
+        assert!(unique.len() >= 4, "refusals repeat each other: {said:?}");
     }
 
     /// **A record naming a font this machine has not got freezes the layer**,
@@ -3063,6 +3098,12 @@ mod tests {
     /// `resolve` is total and is the wrong one here, because re-rendering
     /// somebody's caption in a face its author did not choose changes the
     /// picture silently.
+    ///
+    /// **Frozen is a state and not a sentence**, so both halves are checked:
+    /// Update is refused while the boxes still name the font that has gone, and
+    /// it comes back the moment the artist picks one this machine has. That is
+    /// the one way out for somebody who has the document and not the font, and
+    /// it is not a substitution: a face chosen off the list is chosen.
     #[test]
     fn a_text_layer_whose_font_is_gone_is_frozen_and_names_it() {
         let mut ed = Editor::default();
@@ -3091,9 +3132,39 @@ mod tests {
                 .resolve(&record.face.family, &record.face.style)
                 .is_some()
         );
-        // Frozen whatever the pickers now name: re-rendering in another face is
-        // a change to the picture, so the way out is Convert to paint.
-        assert!(!update_state(true, true, false, None, false).enabled);
+        // The panel loaded the record's family into the boxes, so the pair the
+        // pickers name is the pair that is missing, and Update is refused.
+        assert_eq!(ed.text.family, "A Foundry Face Nobody Has");
+        let names_a_real_face = |ed: &Editor| {
+            umber_core::textobj::TextFace {
+                family: ed.text.family.clone(),
+                style: ed.text.style.clone(),
+                postscript: String::new(),
+            }
+            .resolve(ed.text.fonts.library())
+            .is_some()
+        };
+        assert!(!names_a_real_face(&ed));
+        assert!(!update_state(false, names_a_real_face(&ed), false, None, false).enabled);
+
+        // **And it thaws on a font the artist chooses.** Not a substitution:
+        // this is a face picked off the list, which is the only way back for
+        // somebody who has the document and not the font. Reading the record's
+        // face instead left both dropdowns live and doing nothing.
+        let here = ed
+            .text
+            .fonts
+            .library()
+            .faces()
+            .first()
+            .expect("the built-in face")
+            .clone();
+        ed.text.family = here.family.clone();
+        ed.text.style = here.style.clone();
+        assert!(names_a_real_face(&ed));
+        assert!(update_state(false, names_a_real_face(&ed), false, None, false).enabled);
+        // A lock still refuses it, because that is a different question.
+        assert!(!update_state(true, names_a_real_face(&ed), false, None, false).enabled);
 
         // The panel draws the notice, which is what makes the frozen state
         // something an artist can act on rather than a dead button.

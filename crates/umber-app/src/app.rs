@@ -675,6 +675,19 @@ impl UmberApp {
                 // `None` is a layer that has left the stack, which is a patch
                 // that no longer names anything either; the record goes with
                 // it rather than being put somewhere it does not belong.
+                // **The GPU is found before the record moves, not after.** The
+                // whole point of this arm is that the two cannot come apart, so
+                // an early return between them would be this arm's own failure.
+                // `undo` and `redo` ask `canvas_is_ready` before taking the
+                // entry, so neither of these can fire today — which is a reason
+                // to write the order down rather than to rely on it.
+                let id = self.editor.session.active_id();
+                let Some(gfx) = self.gfx.as_mut() else {
+                    return EditBody::Text { patch, was };
+                };
+                if !gfx.canvases.contains_key(&id) {
+                    return EditBody::Text { patch, was };
+                }
                 let mut held = None;
                 if let Some(at) = at {
                     held = self.editor.layers.take_text(at);
@@ -684,13 +697,8 @@ impl UmberApp {
                         self.editor.layers.set_text(at, *text);
                     }
                 }
-                let id = self.editor.session.active_id();
-                let Some(gfx) = self.gfx.as_mut() else {
-                    return EditBody::Text { patch, was: held };
-                };
-                let Some(canvas) = gfx.canvases.get_mut(&id) else {
-                    return EditBody::Text { patch, was: held };
-                };
+                let gfx = self.gfx.as_mut().expect("checked a line ago");
+                let canvas = gfx.canvases.get_mut(&id).expect("checked a line ago");
                 EditBody::Text {
                     patch: swap_patch(canvas, &gfx.gpu, &patch),
                     was: held,
@@ -874,11 +882,21 @@ impl UmberApp {
         //
         // `EditTarget::Layer` and never the strip's setting: a float is pixels
         // in the layer's own slice whatever the Layers panel is pointed at.
-        if let Some(why) = self
+        //
+        // **Text refuses a paste and lets a lift through**, which is the one
+        // asymmetry here and it is the same shape as the mask's. A paste puts
+        // *other* pixels over a caption and leaves the record naming a picture
+        // it did not make; a lift moves the caption's own pixels, and
+        // `finish_transform` takes the record off with them, into the undo
+        // entry, so the two never disagree. Refusing the lift instead would
+        // mean a placed caption could never be moved at all, which is a
+        // capability this build had before text layers existed.
+        let refusal = self
             .editor
             .layers
             .active_refusal(umber_core::EditTarget::Layer)
-        {
+            .filter(|why| pixels.is_some() || *why != EditRefusal::Text);
+        if let Some(why) = refusal {
             if pixels.is_some() {
                 self.editor.notice = Some(paste_refusal(why));
             }
@@ -1095,6 +1113,14 @@ impl UmberApp {
         // is the fourth byte; a fully transparent pixel is the one thing that
         // cannot be hiding a colour.
         let landed_on_nothing = before.chunks_exact(4).all(|px| px[3] == 0);
+        // **Taken before the filter, because `record.is_none()` is two different
+        // things.** It is true when a *placement* was refused the record, and
+        // equally true for every ordinary paste and every lift, which carry no
+        // `set_from` at all. Reading the notice off it put "The text was placed
+        // as paint" on the screen after every transform commit in the
+        // application — a lift's `before` spans the pixels it took, so
+        // `landed_on_nothing` is false for essentially all of them.
+        let was_text = set_from.is_some();
         let record = set_from.filter(|_| landed_on_nothing).map(|set| {
             Box::new(umber_core::textobj::TextObject::new(
                 set.block.clone(),
@@ -1103,18 +1129,41 @@ impl UmberApp {
                 umber_core::textobj::Placement::of(&float.xf),
             ))
         });
-        let placed_over_paint = record.is_none() && !landed_on_nothing;
+        let placed_over_paint = was_text && record.is_none();
+        // A lift off a text layer moves the pixels and leaves the record naming
+        // where they used to be, so the record goes with them. It is dropped
+        // rather than composed: a placement is a rotation and a scale about one
+        // source rectangle, and a second such map applied to it is a shear in
+        // general, which no `Placement` can hold. Dropped **into the undo
+        // entry**, so Ctrl+Z brings it back with the pixels.
+        let lifted_text = float
+            .lifted
+            .then(|| {
+                self.editor
+                    .layers
+                    .layers()
+                    .iter()
+                    .position(|l| l.slot() == Some(float.slot))
+            })
+            .flatten()
+            .and_then(|at| self.editor.layers.take_text(at));
         let patch = PixelPatch::new(damage, float.slot, before);
+        // The record and the pixels go into **one** entry, so an undo cannot
+        // take the text off the canvas and leave the layer claiming it, or put
+        // a lifted caption back without the record that describes it — see
+        // `EditBody::Text`. `was` is what the layer held: nothing for a
+        // placement, and the record a lift has just taken off.
+        let took_a_record = lifted_text.is_some();
+        let carries_text = record.is_some() || took_a_record;
         self.editor.history.record(Edit::new(
             EditKind::Transform,
-            match &record {
-                // The record and the pixels go into **one** entry, so an undo
-                // cannot take the text off the canvas and leave the layer
-                // claiming it — see `EditBody::Text`. `was` is what the layer
-                // held, which for a placement is nothing, and the gate above
-                // makes that structural rather than an assumption.
-                Some(_) => EditBody::Text { patch, was: None },
-                None => EditBody::Pixels(patch),
+            if carries_text {
+                EditBody::Text {
+                    patch,
+                    was: lifted_text,
+                }
+            } else {
+                EditBody::Pixels(patch)
             },
         ));
         if let Some(record) = record {
@@ -1148,6 +1197,19 @@ impl UmberApp {
         // claim about the artist's intent that nothing supports.
         if float.lifted {
             self.editor.carry_selection(&float.xf);
+        }
+        if took_a_record {
+            // Named rather than discovered, and undoable: the record went into
+            // the entry above, so Ctrl+Z brings the caption back editable.
+            self.editor.notice = Some(Notice {
+                title: "That text is paint now".to_string(),
+                lines: vec![
+                    "Moving text with the transform tool leaves Umber unable to say \
+                     where it goes, so the layer is ordinary paint from here. Every \
+                     pixel is there, and undo puts it back as text."
+                        .to_string(),
+                ],
+            });
         }
         if placed_over_paint {
             // Named rather than discovered. The text is down and every pixel of
@@ -1625,6 +1687,15 @@ impl UmberApp {
         let Some(editing) = self.editor.text.editing.as_ref() else {
             return;
         };
+        // **The one gate this operation has, and it is a sixth operation that
+        // writes pixels.** `refusal_at` cannot supply it on its own: it answers
+        // `Locked` before `Text`, and this whole path exists for a layer that
+        // answers `Text`. So the lock is read directly, exactly as
+        // `clear_active_layer` reads it, and the button is disabled to match —
+        // this catches a route that goes round the button.
+        if self.editor.layers.active_is_locked() {
+            return;
+        }
         let (slot, colour) = (editing.slot, editing.colour);
         let was = editing.original.clone();
         // By slot, never by the selected row: the panel is keyed by slot for
@@ -1818,6 +1889,13 @@ impl UmberApp {
     /// stops claiming the pixels can be set again, and `refusal_at` lets a
     /// brush through from the next stroke on.
     fn convert_text_to_paint(&mut self) {
+        // Gated on the lock like every other edit to a layer, and the button is
+        // disabled to match. It changes no pixel, but it changes what the file
+        // carries and what may be painted on the layer afterwards, which is
+        // exactly what a lock is a statement about.
+        if self.editor.layers.active_is_locked() {
+            return;
+        }
         let at = self.editor.layers.active_index();
         if self.editor.layers.take_text(at).is_none() {
             return;
@@ -1873,19 +1951,22 @@ impl UmberApp {
         let Some(slot) = self.editor.layers.active_slot() else {
             return;
         };
-        // **A clear takes the text record off, and `refusal_at` deliberately
-        // does not refuse it.** Clearing genuinely means to replace the pixels,
-        // so the record has to go with them — leave it and the next save writes
-        // text over a blank layer with a fingerprint that agrees, and reopening
-        // re-renders a caption somebody cleared. Nothing to undo here either
-        // way: the history is thrown out two lines below.
-        let at = self.editor.layers.active_index();
-        self.editor.layers.take_text(at);
         let id = self.editor.session.active_id();
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(canvas) = gfx.canvases.get_mut(&id) else {
             return;
         };
+        // **A clear takes the text record off, and `refusal_at` deliberately
+        // does not refuse it.** Clearing genuinely means to replace the pixels,
+        // so the record has to go with them — leave it and the next save writes
+        // text over a blank layer with a fingerprint that agrees, and reopening
+        // re-renders a caption somebody cleared. Nothing to undo here either
+        // way: the history is thrown out below.
+        //
+        // After the GPU is in hand, so a document with no renderer cannot lose
+        // its record while keeping its pixels.
+        let at = self.editor.layers.active_index();
+        self.editor.layers.take_text(at);
         let mut enc = gfx
             .gpu
             .device
@@ -5301,11 +5382,15 @@ mod tests {
     ///   on it), which is the stronger guard and the reason the weaker one is
     ///   only asked to carry the writer that cannot have one.
     /// * Delete Save's `text:` line — **fails**, 0 against 1. It did not, on
-    ///   the first draft: `match_indices("text:")` matches the middle of
-    ///   `Context::`, three of which stand in this file outside its tests, so
-    ///   the count was 3 and the guard was vacuous for the one field it had
-    ///   just been widened to carry. Hence the word-boundary count below, which
-    ///   is where a substring guard's whole reach lives.
+    ///   either of the first two drafts, and both were found by running it
+    ///   rather than by reading it. `match_indices("text:")` matches the middle
+    ///   of `Context::`, three of which stand in this file outside its tests;
+    ///   a word boundary fixed that and left `text::set_through`, which
+    ///   `update_text_layer` writes twice; and a boundary on both sides left
+    ///   *this doc comment*, which names both fields in backticks several
+    ///   times. Three counts of 3 against 1 literal, each looking like a guard.
+    ///   Hence the count below, which is where a substring guard's whole reach
+    ///   lives, and hence the habit: measure it, do not read it.
     /// * Delete the autosave's `text:` line — **passes**, 2 against 1, for the
     ///   `effects:` reason above and covered the same way, by
     ///   `the_autosave_writes_the_text_the_snapshot_was_taken_with`.
@@ -5319,21 +5404,42 @@ mod tests {
         // still fail under the mutation, by 1 against 2, which is exactly how
         // a guard that passes for the wrong reason survives review. A text
         // guard has to be told not to read itself.
-        // **A field name is counted at a word boundary, and that is a fix
-        // rather than a refinement.** A bare `match_indices("text:")` matches
-        // the middle of `Context::`, which `app.rs` writes three times outside
-        // its tests — so the guard read 3 against 1 literal and passed with the
-        // field deleted. Measured, not reasoned: the mutation was run, and it
-        // passed. Anything before the name that could be part of an identifier
-        // or a path means this is not the field.
+        // **A field name is counted at a word boundary and outside comments,
+        // and both halves are fixes rather than refinements.** Each was
+        // measured by running the mutation, and each time the guard passed
+        // with the field deleted:
+        //
+        // * `match_indices("text:")` matches the middle of `Context::`, which
+        //   this file writes three times outside its tests. Hence the check on
+        //   the character *before* — nothing that could be part of an
+        //   identifier or a path — and on the one *after*, which is what tells
+        //   the field `text:` from the path `text::set_through`.
+        // * A doc comment that *names* the field counts as stating it. This
+        //   file's own paragraphs above say "`effects:` line" and "`text:`
+        //   line" several times, which put the count back over the bar the
+        //   moment somebody wrote down what the guard was for. So the source is
+        //   cut at `//` first. That can clip a string holding a `//`, which
+        //   only ever lowers a count and therefore only makes this stricter.
+        let uncommented = |source: &str| {
+            source
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let named = |source: &str, field: &str| {
             source
                 .match_indices(field)
                 .filter(|(at, _)| {
-                    source[..*at]
+                    let before = source[..*at]
                         .chars()
                         .next_back()
-                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':')
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != ':');
+                    let after = source[at + field.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c != ':');
+                    before && after
                 })
                 .count()
         };
@@ -5341,7 +5447,8 @@ mod tests {
             ("app.rs", include_str!("app.rs")),
             ("autosave.rs", include_str!("autosave.rs")),
         ] {
-            let source = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            let source = uncommented(whole.split("#[cfg(test)]").next().unwrap_or(whole));
+            let source = source.as_str();
             let literals = source.match_indices("SaveLayer {").count();
             assert!(literals > 0, "{file} builds no SaveLayer any more");
             // Both fields, because both default to something a writer that
