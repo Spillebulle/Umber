@@ -5918,6 +5918,60 @@ fn a_live_stroke_bakes_the_shadow_the_commit_would() {
     }
 }
 
+/// The shadow follows the brush: a live stroke rebakes on **every** frame.
+///
+/// §5.1's whole argument, and the thing the design says makes the difference
+/// between a feature and a limitation — "drawing an outlined shape and not
+/// seeing the outline until you lift is the kind of thing that makes a feature
+/// unusable rather than merely limited". Nothing else here catches it: the
+/// stamp's slice revisions do not move until the commit and its parameters never
+/// move at all, so an ordinary freshness check would find the entry fresh from
+/// the second frame on and freeze the shadow where the pen went down.
+#[test]
+fn a_live_stroke_rebakes_the_effect_on_every_frame() {
+    let mut h = harness_or_skip!();
+    let draw = layer(0, 1.0, BlendMode::Normal);
+    let ring = [outline(Color::WHITE, 4.0, OutlinePosition::Outside)];
+    let style = StrokeStyle {
+        color: Color::WHITE,
+        opacity: 1.0,
+        ..Default::default()
+    };
+    let live = EffectFrame {
+        active_index: 0,
+        stroke: style,
+        stroke_live: true,
+    };
+
+    h.stamp(&[dab(16.0, 32.0, 8.0, 1.0)]);
+    let first = h.bake_frame(&[effected(draw, &ring)], 1, live);
+    let slot = first.draws[0].slot;
+    let bakes = h.canvas.effect_bakes();
+    assert!(
+        slice_alpha(&h, slot, 16, 21) > 0,
+        "the first frame of the stroke did not reach the bake"
+    );
+    assert_eq!(
+        slice_alpha(&h, slot, 48, 32),
+        0,
+        "the far end of the stroke has not been painted yet"
+    );
+
+    // The next frame of the same stroke: more dabs in the scratch, nothing else
+    // changed anywhere.
+    h.stamp(&[dab(48.0, 32.0, 8.0, 1.0)]);
+    h.bake_frame(&[effected(draw, &ring)], 1, live);
+    assert!(
+        h.canvas.effect_bakes() > bakes,
+        "the second frame of a stroke did not rebake"
+    );
+    assert!(
+        slice_alpha(&h, slot, 48, 21) > 0,
+        "the shadow did not follow the brush: the outline is missing where the \
+         stroke has just been"
+    );
+}
+
 /// Ending a stroke without committing it still rebakes.
 ///
 /// A cancel writes no pixels, so no slice revision moves and every other part of
