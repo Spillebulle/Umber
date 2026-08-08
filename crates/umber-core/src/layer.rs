@@ -296,7 +296,13 @@ pub enum EditTarget {
 /// step with the `switch` in `blend_rgb`.
 ///
 /// Serialised because a *brush* carries one too — see [`crate::Brush::blend`] —
-/// and a brush is what a preset file holds. Deliberately the same enum rather
+/// and a brush is what a preset file holds. **An [`Effect`] now carries one as
+/// well, into a *document*** rather than into a preset, which is what makes the
+/// serde spelling of these five variants an `.ora`'s business and not only
+/// `brushes.ron`'s; `effect::tests::the_serialised_names_of_a_blend_mode_are_
+/// these_exact_strings` is what pins it, and `docformat::blend_id`'s pin cannot,
+/// because that one is the `Debug` spelling and a `#[serde(rename)]` moves only
+/// the other. Deliberately the same enum rather
 /// than a second one beside it: the arithmetic is one shared WGSL function, so
 /// a layer set to Multiply and a brush set to Multiply mean the same thing, and
 /// two enums would eventually stop agreeing about which modes exist.
@@ -2145,10 +2151,13 @@ impl StackShape {
                     // are noise beside a parked slice, and both are counted for
                     // the reason `name.len()` always was: a figure that skips
                     // the parts it thinks are small is one nobody can check.
+                    // `capacity`, not `len`, because the block held is the
+                    // capacity — and `plan_set_effect` builds the vector by
+                    // `collect` and then `push`es, so the two routinely differ.
                     ShapeEntry::Gone { layer } => {
                         std::mem::size_of::<Layer>()
                             + layer.name.len()
-                            + layer.effects.len() * std::mem::size_of::<Effect>()
+                            + layer.effects.capacity() * std::mem::size_of::<Effect>()
                     }
                 })
                 .sum::<usize>()
@@ -3587,7 +3596,11 @@ mod tests {
     /// as the budget lets it go, and one short of what was asked for.
     ///
     /// Shared by the tests below, which are all about what happens *at* the
-    /// budget and would otherwise each restate how to get there.
+    /// budget and would otherwise each restate how to get there. Folder-free,
+    /// which is what "an ordinary document" means for reaching the cap: a
+    /// folder occupies one of [`LayerStack::MAX`]'s entries and is refused
+    /// effects, so any stack holding one asks for fewer than 128 and cannot
+    /// meet it.
     fn stack_at_the_budget() -> LayerStack {
         let mut s = LayerStack::new();
         while s.len() < LayerStack::MAX {
@@ -3595,10 +3608,16 @@ mod tests {
         }
         for i in 0..s.len() {
             for effect in [Effect::drop_shadow(), Effect::outline()] {
-                s.set_effect(i, effect);
+                // The last one is refused; that is the point of the fixture and
+                // each test below asserts the refusal in its own terms.
+                let _ = s.set_effect(i, effect);
             }
         }
-        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+        assert_eq!(
+            s.enabled_effect_count(),
+            effect::MAX_ENABLED,
+            "the fixture's precondition, not the property under test"
+        );
         s
     }
 
@@ -3705,6 +3724,17 @@ mod tests {
     /// enabled and the document is said to be over its budget. Refusing here
     /// would mean an undo that silently dropped somebody's effects, which is
     /// worse than either.
+    ///
+    /// **The overflow is exactly one, and that is a bound rather than an
+    /// incident.** A stack holds at most [`LayerStack::MAX`] entries and a
+    /// layer at most one effect per kind, so no sequence of undos can put more
+    /// than `MAX × EffectKind::ALL.len()` enabled effects in a document —
+    /// `MAX_ENABLED + 1` today. **Which means the draw list reaches 192 while
+    /// `MAX_DRAWS` is 191**, since a layer draw and an effect draw are counted
+    /// together. That is reachable *now*, with two kinds, rather than waiting
+    /// on a third, and it is the number `canvas.rs` and `composite.wgsl` are
+    /// about to be sized against. §6.1's degrade-visibly path is what covers
+    /// it; nothing here can, and nothing here should pretend to.
     #[test]
     fn undoing_a_delete_may_take_a_document_over_the_effect_budget() {
         let mut s = stack_at_the_budget();
@@ -3727,6 +3757,15 @@ mod tests {
             "an undo puts back what was deleted, budget or no budget"
         );
         assert!(!effect::within_budget(s.enabled_effect_count()));
+
+        // And that is the ceiling, not one point on a scale: every layer now
+        // holds one of each kind, which is all a stack of MAX entries can hold.
+        assert_eq!(s.len(), LayerStack::MAX);
+        assert_eq!(
+            s.enabled_effect_count(),
+            LayerStack::MAX * EffectKind::ALL.len(),
+            "the most enabled effects any document can hold"
+        );
     }
 
     #[test]

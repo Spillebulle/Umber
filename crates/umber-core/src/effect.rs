@@ -82,9 +82,9 @@ use crate::layer::BlendMode;
 /// what it starts from** rather than anything Umber chose:
 ///
 /// ```text
-/// MAX_SLOTS         = 256                        // max_texture_array_layers
-/// MAX_EFFECT_SLICES = MAX_SLOTS − (MAX × 2 + 1)  // = 127
-/// MAX_DRAWS         = MAX + MAX_EFFECT_SLICES    // = 191
+/// DEVICE_SLICES     = 256                            // max_texture_array_layers
+/// MAX_EFFECT_SLICES = DEVICE_SLICES − (MAX × 2 + 1)  // = 127
+/// MAX_DRAWS         = MAX + MAX_EFFECT_SLICES        // = 191
 /// ```
 ///
 /// `downlevel_defaults()` inherits `max_texture_array_layers` from `defaults()`
@@ -92,13 +92,22 @@ use crate::layer::BlendMode;
 /// 256 is the ceiling and a 257th slice is a `create_texture` validation error —
 /// which `crash::device_error` makes fatal. An effect draw reads an effect slice
 /// one for one, which is why the draw budget can never exceed the slice budget.
+/// `DEVICE_SLICES` is written out rather than spelled `LayerStack::MAX_SLOTS`
+/// because that constant is 129 in this tree and is being raised to 256 on
+/// another branch; the derivation has never depended on it.
 ///
-/// **Written as a literal because this branch cannot see the other half yet.**
-/// `LayerStack::MAX_SLOTS` is still 129 here and `MAX_EFFECT_SLICES` is being
-/// added to that consts block on another branch; deriving from what this tree
-/// holds would give nonsense. In the merged tree the two are pinned together by
-/// a test, and `MAX_DRAWS` in `canvas.rs` and in `composite.wgsl` join them — a
-/// truncated draw list is the one outcome that must stay unreachable, because a
+/// **Which is why the derivation is asserted here rather than promised for the
+/// merge.** [`BUDGET_DERIVATION`] is a `const` assertion over
+/// `LayerStack::MAX` and the device figure, both of which this tree holds, so
+/// raising `MAX` without re-deriving the budget fails the *build* — and it
+/// names nothing the capacity branch is touching, so it merges either way. What
+/// is genuinely not statable here is `MAX_DRAWS` against `canvas.rs` and
+/// `composite.wgsl`, and the third statement of it that
+/// `docs/layer-effects.md` §6.3 wants — `DEVICE_SLICES` against
+/// `downlevel_defaults().max_texture_array_layers`, which `umber-core` cannot
+/// see because it may not depend on wgpu. **That one exists nowhere in the
+/// tree yet** and belongs beside `canvas.rs`'s own `MAX_SLOTS`. A truncated
+/// draw list is the outcome all of them exist to keep unreachable, because a
 /// list cut off mid-group leaves an accumulator open.
 ///
 /// A *disabled* effect costs nothing: it produces no draw, so it is not counted.
@@ -120,6 +129,26 @@ use crate::layer::BlendMode;
 /// undo cannot be refused. [`LayerStack::set_effect`] is the gate, and it is the
 /// only thing that writes an effect.
 pub const MAX_ENABLED: usize = 127;
+
+/// The device's guaranteed `max_texture_array_layers`, which is where
+/// [`MAX_ENABLED`] comes from. See that constant.
+pub const DEVICE_SLICES: usize = 256;
+
+/// [`MAX_ENABLED`] is what the derivation says it is, checked at **compile
+/// time**.
+///
+/// A literal budget with a comment naming its derivation is a budget that goes
+/// wrong silently the first time [`crate::LayerStack::MAX`] moves: raise it to
+/// 100 and the correct figure is 55, while 127 would ask the device for 72
+/// slices past its guarantee — the fatal `create_texture` validation error the
+/// whole derivation exists to avoid. Everything it reads is in this tree, and
+/// it deliberately does not mention `LayerStack::MAX_SLOTS`, which is being
+/// raised elsewhere.
+const BUDGET_DERIVATION: () = assert!(
+    MAX_ENABLED == DEVICE_SLICES - (crate::layer::LayerStack::MAX * 2 + 1),
+    "the effect budget no longer follows from the device's slice guarantee"
+);
+const _: () = BUDGET_DERIVATION;
 
 /// Where the layer's own draw sits in `docs/layer-effects.md` §4's numbering.
 ///
@@ -216,6 +245,12 @@ impl OutlinePosition {
 /// own **neutral**: nothing grown, nothing softened, nothing displaced, Normal,
 /// opaque, black. A file that omits `kind` is *refused* rather than read as an
 /// arbitrary one.
+///
+/// `enabled` is the one that is a **policy rather than a neutral**, and it is
+/// worth naming because it is also the one default that costs the budget: an
+/// effect written into a file is one somebody made, so it defaults to *on*. The
+/// neutral reading would be off, and it would make an effect that predates the
+/// field silently stop drawing.
 ///
 /// What the defaults are for is unchanged and is the reason `Brush` has them: a
 /// file written before a parameter existed still loads. The direction that
@@ -633,12 +668,53 @@ mod tests {
         assert_eq!(back.distance, 0.0, "not the drop shadow's 5.0");
         assert_eq!(back.angle, 0.0);
         assert_eq!(back.position, OutlinePosition::Outside);
+
+        // `spread` is the field the reading above *supplies*, so it is the one
+        // field whose own default nothing else here can see — and an outline's
+        // own starting width is 3.0, which is exactly the kind of value that
+        // would look right and be another kind's.
+        let bare: Effect = ron::from_str("(kind: Outline)").unwrap();
+        assert_eq!(bare.spread, 0.0, "not the outline's own starting 3.0");
     }
 
     /// An effect with no kind is refused rather than read as an arbitrary one.
+    ///
+    /// The successful parse beside it is what makes the refusal `kind`'s: the
+    /// two inputs differ in nothing else, so a later change that took some
+    /// other field's default away could not leave this passing for the wrong
+    /// reason. Asserting on the error's *wording* would be a promise about
+    /// `ron`'s messages instead.
     #[test]
     fn an_effect_with_no_kind_is_not_read() {
         assert!(ron::from_str::<Effect>("(spread: 8.0)").is_err());
+        assert!(ron::from_str::<Effect>("(kind: Outline, spread: 8.0)").is_ok());
+    }
+
+    /// **A `BlendMode`'s serde spelling reaches a document for the first time
+    /// here, and nothing pinned it.**
+    ///
+    /// `docformat::blend_id` pins the `Debug` spelling, which `CLAUDE.md` says
+    /// in as many words cannot see a `#[serde(rename)]`; and the only serde
+    /// text anywhere is whatever a fixture happens to carry —
+    /// `builtin-brushes.ron`'s 252 `blend:` fields are every one of them
+    /// `Normal`, which is one data point wearing the costume of coverage. So
+    /// renaming `Multiply` through serde left the whole suite green while
+    /// changing what every `brushes.ron` carries; an [`Effect`] puts the same
+    /// spelling in `umber/effects/<n>.ron`, and there an unknown variant is a
+    /// hard parse error rather than a downgrade — the effect file does not
+    /// load at all. Multiply is [`Effect::drop_shadow`]'s default, so it is the
+    /// variant most likely to be in one.
+    ///
+    /// It lives here rather than beside the blend-mode tests in `docformat`
+    /// because this module is what made it a document format. If those two are
+    /// ever brought together, beside the enum is the better home for both.
+    #[test]
+    fn the_serialised_names_of_a_blend_mode_are_these_exact_strings() {
+        let spelled: Vec<String> = BlendMode::ALL
+            .into_iter()
+            .map(|m| ron::to_string(&m).unwrap())
+            .collect();
+        assert_eq!(spelled, ["Normal", "Multiply", "Screen", "Overlay", "Add"]);
     }
 
     /// §4's order, for every subset of the effects that exist.
@@ -769,10 +845,9 @@ mod tests {
         assert_eq!(still.offset(), (0.0, 0.0));
     }
 
-    /// The budget's boundary, which nothing in the model can currently reach —
-    /// see [`MAX_ENABLED`]. Tested here as arithmetic so that the day a third
-    /// effect kind makes it reachable, the rule it will be enforced by has
-    /// already been checked.
+    /// The budget's boundary as arithmetic. `layer.rs`'s tests are what meet it
+    /// through the real gate, on a document somebody could build — see
+    /// [`MAX_ENABLED`], which is live rather than aspirational.
     #[test]
     fn the_budget_admits_exactly_its_own_figure_and_no_more() {
         assert!(within_budget(0));
