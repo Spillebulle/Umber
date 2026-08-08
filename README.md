@@ -174,14 +174,16 @@ can read yours.
 face and its size, and a preview of the setting" align="right" width="270">
 
 Type in any font on this machine and place what you set on the canvas, where the
-transform tool moves, scales and turns it before it goes down.
+transform tool moves, scales and turns it before it goes down. A text layer stays
+text: reopen the document and you can still fix the typo.
 
 | | |
 |---|---|
 | Fonts | every one installed, plus a folder of your own if you point Umber at one |
 | Shaping | kerning, ligatures and mark positioning, so a word joins up rather than coming out as loose letters |
 | Lines | break where you break them; nothing wraps on its own yet |
-| Set | family, style, size, line spacing, tracking and alignment |
+| Set | family, style, bold, italic, colour, size, line spacing, tracking and alignment |
+| Bold and italic | a family's own faces, never a fake slant or a smeared outline. Umber says so when a family has neither |
 
 Placing it works exactly like a paste, so `Esc` abandons it and one undo takes
 it back off. It is pixels once it is down, not something that can be re-typed.

@@ -652,6 +652,53 @@ draws the module and `cputext.rs` is the splash's own use of the same `Pen`.
   writers, `text` on `autosave.rs`'s `LayerMeta` and its snapshot, and
   `every_writer_of_a_save_layer_states_its_effects` widened — it counts the
   literal `effects:` and is blind to a second field.
+- **Bold and italic are a family's own faces or they are nothing.**
+  `FontLibrary::restyle` answers with a real face of the family, and its `None`
+  *is* the feature: Umber never smears an outline to make a bold and never
+  shears one to make an oblique, so where a family has neither the mark is
+  **disabled with a sentence**. `Lacking` has five and each says what is
+  actually missing, because `can_restyle` answers about *this slant on one side
+  of the weight* — and sentences written as though it answered about the whole
+  family told somebody to install a bold that was two rows above it in the list
+  beside them.
+- **Which rasteriser honours variation axes was misread for months, and
+  `Face::variations`' comment is what misread it.** `umber-core::text` draws
+  through `skrifa` with `DrawSettings::unhinted(…, &location)` and shapes with
+  `harfrust`'s `ShaperInstance::from_variations`, so it **does** instance a
+  variable font; `cputext.rs` takes the same route. `ab_glyph` is what ignores
+  axes, and it is **egui's** — so "the interface has no bold" was always a
+  statement about the interface and never about the text tool. Read as the
+  latter it says bold is impossible, which is why nobody built it.
+- **What lights the Bold control is `is_bold_anchor`, never `Face::is_bold`.**
+  `is_bold` is `BOLD_THRESHOLD`'s partition and Archivo has four upright faces
+  above it, so lighting from it said SemiBold *was* bold — and a lit mark asks
+  for the regular weight, so no press ever reached Bold from SemiBold, ExtraBold
+  or Black. The anchor asks whether the bold you would be given is the one you
+  already have. `restyle`'s target keys on whether the **slant** moved for the
+  same reason; keying on the boldness half handed SemiBold straight back.
+- **A guard on a model is not a guard on the panel**, and this is the
+  generalisable one. `every_weight_of_a_family_reaches_its_bold_in_one_press`
+  tests `is_bold_anchor` and cannot see whether the panel *calls* it — a critic
+  reverted that one call site and all 1,485 tests stayed green. What catches it
+  is `pressing_bold_actually_puts_a_heavier_mark_on_the_canvas`, which measures
+  ink. **Any test of a two-state reading has to start from a case where the two
+  readings disagree**, or it is testing the reading it happens to like.
+- **A style name identifies one face of its family.** `insert` refuses a
+  duplicate on the name alone, stricter than its sort key, because `exact`
+  answering with whichever sorted first let `restyle` hand back a name that
+  resolved to a different face — and drew two identical picker rows, both
+  highlighted.
+- **A face recorded with no `variations` has stated no axis position, and that
+  is not agreement.** A variable font's default master is recorded that way
+  deliberately; read as "agrees with every width" it let a condensed face be
+  handed the wide default. `axis_agreement` has three answers and ranks unknown
+  between them.
+- **The preview's colouring was a second copy of `Setting::clip`'s arithmetic
+  and had drifted**, using coverage as alpha where `clip` multiplies by the
+  colour's own alpha. Nothing produces a translucent `Editor::color` today,
+  which is exactly why it would have gone on being wrong — the same reason a
+  fixture carrying one value is not coverage. It routes through `Setting::clip`
+  now.
 - **A loss is named in the panel, not discovered.** Lines break only where the
   artist breaks them, a line mixing left-to-right and right-to-left writing is
   shaped but not reordered, and a character the face has no glyph for is left
