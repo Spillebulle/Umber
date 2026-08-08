@@ -23,6 +23,7 @@ use crate::dynamics::{
 };
 use crate::geom::Rect;
 use crate::input::InputPoint;
+use crate::tip;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
@@ -576,7 +577,17 @@ impl StrokeBuilder {
         if m.size_log != 0.0 {
             radius = (radius * m.size_log.exp()).clamp(0.05, Brush::MAX_SIZE);
         }
-        let coverage = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
+        // What the *mark* is to reach at this pressure — which is what
+        // `coverage_at` means, what the brush editor's curve draws, and under
+        // the `max` blend exactly what one dab carries.
+        //
+        // The modulation goes in *before* the conversion, so it is a factor on
+        // the mark rather than on one dab. Under `max` those are the same number
+        // and this is the order it has always been in; under build-up they are
+        // not, and a Speed→Opacity mapping stating "half strength when moving
+        // fast" has to mean half the mark, for the same reason the pressure
+        // curve does.
+        let mark = (self.brush.coverage_at(pressure) * m.opacity).clamp(0.0, 1.0);
 
         // Jitter in log space, so the variation is symmetric about the nominal
         // radius and cannot produce a negative one however large the setting.
@@ -635,10 +646,58 @@ impl StrokeBuilder {
         // `dab_ratio` instead — see the note there.
         let aspect = (self.brush.dab_ratio + m.ratio).max(1.0);
 
+        let hardness = (self.brush.hardness_at(pressure) + m.hardness).clamp(0.0, 1.0);
+        // Under build-up the scratch accumulates where the `max` saturates, so
+        // the dab has to carry less for the *stroke* to arrive at `mark`. Exactly
+        // `mark` for every brush that does not build up, which is nearly all of
+        // them — see `tip::per_dab_for_stroke` for why the alternative was two
+        // reports of one brush a version apart, capped at opposite ends.
+        //
+        // After the jitter and beside the hardness rather than up beside `mark`,
+        // because the depth is a property of *this dab*: `dab.wgsl` softens the
+        // falloff by a pixel of the dab's own radius, so a brush whose size
+        // follows pressure stacks to a different depth at each end of its ramp,
+        // and the light end is where a single per-stroke figure was tens of
+        // levels out. Reading the jittered radius does make a scattering brush's
+        // coverage follow its RNG, which is new — but it draws no numbers of its
+        // own, so the stream is untouched and
+        // `a_brush_with_no_new_dynamics_emits_exactly_what_it_used_to` still
+        // holds. It is also the radius the shader will use, which is the whole
+        // point.
+        //
+        // A smudging brush that builds up gets a smaller `cov`, and `cov` is also
+        // the weight `fs_colored` blends the colour attachment with — so its
+        // smear leans further towards an average over the stroke and less towards
+        // the most recent dabs. `preview_mark` mirrors it, so the row and the
+        // canvas still agree, and no shipped preset combines the three; it is
+        // named here because the alternative is somebody finding it.
+        let coverage = if self.brush.build_up {
+            // The step and the reach from the brush's own two functions rather
+            // than from the spacing: `step_at` floors the step at a quarter of a
+            // pixel, so on a small dab the floor and not the spacing decides how
+            // many dabs land on a point.
+            let off = self.brush.off_heading(self.heading);
+            let depth = tip::stack_depth(
+                self.brush.step_at(pressure, off),
+                self.brush.reach_at(pressure, off),
+                hardness,
+                // The **short** semi-axis, because that is what `dab.wgsl` puts in
+                // `VsOut.radius` and therefore what its antialiasing margin is a
+                // pixel of. Handing over the long one makes an elliptical dab look
+                // harder than it is drawn: measured at 17.6 levels of 255 on a
+                // 10:1 chisel. `aspect` is the dab's own, so this is the same
+                // number the vertex shader builds the quad from.
+                radius / aspect.max(1.0),
+            );
+            tip::per_dab_for_stroke(mark, depth)
+        } else {
+            mark
+        };
+
         self.pending.push(Dab {
             pos: [centre.x, centre.y],
             radius,
-            hardness: (self.brush.hardness_at(pressure) + m.hardness).clamp(0.0, 1.0),
+            hardness,
             coverage,
             color: self.dab_color(&m),
             aspect,
@@ -1461,6 +1520,188 @@ mod tests {
             "hardness did not follow pressure: {first} to {last}"
         );
         assert!(dabs.iter().all(|d| (0.0..=1.0).contains(&d.hardness)));
+    }
+
+    /// Accumulate the mark a row of dabs makes at one point on the stroke's
+    /// centre line, under whichever coverage rule the brush asks for.
+    ///
+    /// `dab.wgsl`'s own arithmetic, transcribed: `local` is the fragment's
+    /// position in the dab's own frame, `aa` and `inner` are the shader's two
+    /// lines verbatim, the falloff is the same `smoothstep`, and the two blends
+    /// are the two the pipeline offers.
+    ///
+    /// **The antialiasing margin is in it deliberately**, unlike
+    /// `tip::dab_stack_alpha`'s, and leaving it out is what this test was written
+    /// wrong the first time: a pixel of falloff is a third of the radius on a
+    /// 3 px dab, so a small brush is genuinely softer than its hardness says and
+    /// piles up shallower. A simulation that ignored it agreed with a conversion
+    /// that ignored it and both disagreed with the canvas.
+    fn mark_at(dabs: &[Dab], at: Vec2, build_up: bool) -> f32 {
+        let mut alpha = 0.0f32;
+        for dab in dabs {
+            // Into the dab's own frame, where the ellipse is the unit circle, so
+            // `aspect` is in the reading. It used not to be, and then every one of
+            // these simulations agreed with a conversion that had the same gap.
+            let short = dab.radius / dab.aspect.max(1.0);
+            let (sin, cos) = dab.angle.sin_cos();
+            let rel = at - vec2(dab.pos[0], dab.pos[1]);
+            let local = vec2(
+                (rel.x * cos + rel.y * sin) / dab.radius,
+                (rel.y * cos - rel.x * sin) / short,
+            );
+            let d = local.length();
+            if d >= 1.0 {
+                continue;
+            }
+            // `dab.wgsl` takes `aa` from `VsOut.radius`, which is the short axis.
+            let aa = (1.0 / short.max(1.0)).clamp(0.001, 0.5);
+            let inner = dab.hardness.clamp(0.0, 1.0 - aa);
+            let t = if inner >= 1.0 {
+                0.0
+            } else {
+                ((d - inner) / (1.0 - inner)).clamp(0.0, 1.0)
+            };
+            let cov = dab.coverage * (1.0 - t * t * (3.0 - 2.0 * t));
+            if build_up {
+                alpha += cov * (1.0 - alpha);
+            } else {
+                alpha = alpha.max(cov);
+            }
+        }
+        alpha
+    }
+
+    /// **The mark a stroke makes is what `coverage_at` says, under either
+    /// coverage rule** — which is the promise the brush editor's
+    /// "Pressure → opacity" curve makes by drawing that function.
+    ///
+    /// It held for the `max` blend by construction: coverage saturates, so one
+    /// dab's figure is the whole mark's. Build-up composites instead, and the
+    /// same curve then reached the canvas compounded once per overlapping dab: a
+    /// Clip Studio pencil whose author set 4% at a feather touch painted 31% of
+    /// the layer, and everything above about a third of its pressure range
+    /// saturated flat at full. Capped at both ends, with the curve beside it
+    /// still drawing 0.04 to 1.0 — reported twice, a version apart, in opposite
+    /// directions. `tip::per_dab_for_stroke` is the conversion and this is what
+    /// says the two rules now agree about the mark.
+    ///
+    /// **Size is swept as well as hardness**, and 6 px is in it because that is
+    /// the reported brush: `dab.wgsl` keeps a pixel of falloff whatever the
+    /// hardness, which on a 3 px radius is a third of the dab, so a small brush
+    /// stacks far shallower than its nominal hardness suggests. The conversion
+    /// reads `stack_depth` per dab for exactly that reason and this is what says
+    /// so; a version of both that ignored the margin agreed with itself and
+    /// disagreed with the canvas by tens of levels.
+    ///
+    /// **`dab_ratio` is in the sweep**, because `dab.wgsl` takes its antialiasing
+    /// margin from the dab's *short* semi-axis: handing `stack_depth` the long one
+    /// makes a chisel look harder than it is drawn, worth 17.6 levels of 255 at
+    /// 10:1, and every CPU simulation of the dab pass had the same gap so they all
+    /// agreed with it. Mutating `emit` to pass `radius` fails this.
+    ///
+    /// Measured worst case 0.0369, which is 9.4 levels of 255, on a fully soft
+    /// 6 px dab at a 25% spacing — the shape difference between a flat stack and
+    /// a stack of falloffs, which is `per_dab_for_stroke`'s own documented
+    /// accuracy. The bound has room over that and none at all for the defect it
+    /// exists to catch: 68 levels at the light end and 105 in the middle.
+    #[test]
+    fn a_building_stroke_reaches_the_coverage_its_curve_asks_for() {
+        let mut worst = 0.0f32;
+        let mut worst_at = (false, 0.0, 0.0, 0.0, 0.0);
+        for build_up in [false, true] {
+            for size in [2.0, 6.0, 20.0, 80.0] {
+                for spacing in [0.02, 0.05, 0.1, 0.25] {
+                    for hardness in [0.0, 0.5, 1.0] {
+                        for dab_ratio in [1.0, 4.0, 10.0] {
+                            let brush = Brush {
+                                hardness,
+                                dab_ratio,
+                                pressure_opacity: true,
+                                opacity_curve: ResponseCurve::LINEAR,
+                                build_up,
+                                ..unsmoothed(size, spacing)
+                            };
+                            for step in 0..=8 {
+                                let pressure = step as f32 / 8.0;
+                                let mut s = StrokeBuilder::new();
+                                s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+                                s.extend(InputPoint::new(vec2(200.0, 0.0), pressure, 0.1));
+                                let dabs: Vec<Dab> = s.drain_pending().collect();
+                                // At a dab's own centre half way along, so the point
+                                // is covered from both sides and no end of the stroke
+                                // is in the reading. **A dab's centre and not an
+                                // arbitrary point**: a soft dab's falloff has already
+                                // begun a quarter of a radius out, so a `max` stroke
+                                // read between two centres is legitimately below its
+                                // own coverage and the reading would measure that
+                                // instead of this.
+                                let mid = dabs[dabs.len() / 2];
+                                let got = mark_at(&dabs, vec2(mid.pos[0], mid.pos[1]), build_up);
+                                let want = brush.coverage_at(pressure);
+                                // The faintest mark this many dabs of one level can
+                                // build to. Below it `tip::per_dab_for_stroke` answers
+                                // that floor rather than the target, deliberately and
+                                // with its own guard, so measuring here would measure
+                                // the `R8Unorm` scratch's width instead of this. It is
+                                // 0.175 at size 80 and a 2% spacing, which is where
+                                // this used to read as a conversion error.
+                                let off = brush.off_heading(Vec2::X);
+                                let floor = 1.0
+                                    - (1.0 - tip::SCRATCH_LEVEL).powf(tip::stack_depth(
+                                        brush.step_at(pressure, off),
+                                        brush.reach_at(pressure, off),
+                                        brush.hardness_at(pressure),
+                                        brush.radius_at(pressure),
+                                    ));
+                                if build_up && want <= floor {
+                                    // Below the floor the mark is the floor, which
+                                    // `tip.rs`'s `the_floor_is_a_cap_and_these_are_
+                                    // its_numbers` measures. Nothing to assert here:
+                                    // `mark_at` accumulates in exact `f32`, so a
+                                    // `got > 0.0` test can never fail however small the
+                                    // dab is, and a guard that cannot fail is worse
+                                    // than none. The stored reading lives in the
+                                    // example and in that test.
+                                    continue;
+                                }
+                                let error = (got - want).abs();
+                                if error > worst {
+                                    worst = error;
+                                    worst_at = (build_up, size, spacing, hardness, pressure);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst < 0.05,
+            "worst mark {worst} against its own curve, at (build_up, size, spacing, hardness, pressure) {worst_at:?}"
+        );
+    }
+
+    /// The other half of the pair: the conversion must not touch a brush that
+    /// does not build up, and `max` must still receive the curve verbatim.
+    ///
+    /// Byte for byte, not nearly — `per_dab_for_stroke` is the exact identity at
+    /// a depth of one, and every brush in the shipped library but eight takes
+    /// that path.
+    #[test]
+    fn a_stroke_that_does_not_build_up_carries_the_curve_verbatim() {
+        let brush = Brush {
+            pressure_opacity: true,
+            opacity_curve: ResponseCurve::EASE_IN,
+            build_up: false,
+            ..unsmoothed(20.0, 0.1)
+        };
+        for step in 0..=8 {
+            let pressure = step as f32 / 8.0;
+            let mut s = StrokeBuilder::new();
+            s.begin(brush, WHITE, InputPoint::new(Vec2::ZERO, pressure, 0.0));
+            let dab = s.drain_pending().next().expect("a dab");
+            assert_eq!(dab.coverage, brush.coverage_at(pressure));
+        }
     }
 
     #[test]
