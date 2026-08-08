@@ -5415,6 +5415,100 @@ mod tests {
         assert_eq!(stack.active_refusal(EditTarget::Layer), None);
     }
 
+    /// **A text layer may only grow into pixels that are not there**, and this
+    /// is the check that decides it.
+    ///
+    /// A placement records only where it landed on nothing, and `refusal_at`
+    /// keeps that true inside the rectangle the text occupies. What neither
+    /// covers is the part of the *new* rectangle that was never inside the old
+    /// one: the artist may have painted there before the text was ever placed,
+    /// and clearing it to make room would destroy paint with no way back,
+    /// because alpha compositing is not invertible.
+    #[test]
+    fn text_grows_only_into_pixels_that_are_not_there() {
+        let outer = PixelRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 3,
+        };
+        let inner = PixelRect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 1,
+        };
+        let mut bytes = vec![0u8; (outer.area() * 4) as usize];
+        assert!(rect_is_clear_outside(outer, Some(inner), &bytes));
+        assert!(rect_is_clear_outside(outer, None, &bytes));
+
+        // Paint *inside* the old rectangle is the text itself, which is exactly
+        // what a re-render is allowed to clear.
+        let at = |x: u32, y: u32| ((y * outer.width + x) * 4 + 3) as usize;
+        bytes[at(1, 1)] = 255;
+        bytes[at(2, 1)] = 200;
+        assert!(
+            rect_is_clear_outside(outer, Some(inner), &bytes),
+            "the old text's own pixels were read as somebody's paint"
+        );
+        // With no old rectangle there is nothing that may be cleared at all.
+        assert!(!rect_is_clear_outside(outer, None, &bytes));
+
+        // One pixel of paint outside it, at the lowest alpha that is not
+        // nothing, refuses the whole thing.
+        bytes[at(3, 2)] = 1;
+        assert!(
+            !rect_is_clear_outside(outer, Some(inner), &bytes),
+            "a re-render would have cleared paint it cannot put back"
+        );
+
+        // A short read is not permission. Refusing is the safe direction.
+        assert!(!rect_is_clear_outside(outer, Some(inner), &[0u8; 4]));
+    }
+
+    /// The union is everywhere the old text was and everywhere the new one is
+    /// going, and the write covers exactly it.
+    ///
+    /// Too tight on the first half leaves letters of the old caption standing;
+    /// too tight on the second is a mark that is never written, which is
+    /// `StrokeBuilder::bounds`' failure one feature along.
+    #[test]
+    fn the_rewritten_rectangle_covers_where_the_text_was_and_where_it_goes() {
+        let rect = |x, y, width, height| PixelRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let a = rect(10, 20, 30, 10);
+        let b = rect(5, 25, 10, 40);
+        let u = union_rect(a, b);
+        assert_eq!(u, rect(5, 20, 35, 45));
+        // Order does not change it, and a rectangle unions with itself.
+        assert_eq!(union_rect(b, a), u);
+        assert_eq!(union_rect(a, a), a);
+        // Contained is absorbed.
+        assert_eq!(union_rect(a, rect(15, 22, 2, 2)), a);
+
+        // And what is written into the union really is the new text where the
+        // new text goes, with everything else left as the caller cleared it.
+        let mut dest = vec![0u8; (u.area() * 4) as usize];
+        let src = vec![7u8; (b.area() * 4) as usize];
+        blit_into(&mut dest, u, &src, b);
+        for y in u.y..u.y + u.height {
+            for x in u.x..u.x + u.width {
+                let at = (((y - u.y) * u.width + (x - u.x)) * 4) as usize;
+                let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+                assert_eq!(
+                    dest[at],
+                    if inside { 7 } else { 0 },
+                    "({x}, {y}) is {}",
+                    if inside { "inside" } else { "outside" }
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_modifier_overrides_the_strips_setting_for_one_gesture_and_no_longer() {
         // Every cell, against every setting. The two things this is here to

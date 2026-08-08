@@ -2772,6 +2772,251 @@ mod tests {
         }
     }
 
+    // --- editing a placed text layer ----------------------------------------
+
+    /// A record for the layer of a default document, in the built-in face so it
+    /// resolves on every machine.
+    fn a_record(caption: &str) -> umber_core::textobj::TextObject {
+        use umber_core::textobj::{Placement, TextFace, TextObject};
+        let ed = Editor::default();
+        let face = ed.text.face().expect("the built-in face").clone();
+        TextObject::new(
+            TextBlock {
+                text: caption.to_string(),
+                size: 48.0,
+                line_spacing: 1.2,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: face.family,
+                style: face.style,
+                postscript: String::new(),
+            },
+            umber_core::Color::from_srgb_u8(30, 30, 30, 255),
+            Placement::identity(umber_core::PixelRect {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+        )
+    }
+
+    /// **Selecting a text layer shows that layer's record, and the block being
+    /// composed comes back afterwards.**
+    ///
+    /// A block being composed belongs to the person and a record belongs to the
+    /// picture — the division that keeps `TextState` above the
+    /// `--- documents ---` line. Clicking a text layer to fix a typo and losing
+    /// the caption you were half way through typing is what the stash prevents.
+    #[test]
+    fn selecting_a_text_layer_shows_its_record_and_gives_the_composed_block_back() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        ed.text.block.text = "Half a caption".to_string();
+        ed.text.block.size = 31.0;
+
+        // Nothing selected is a text layer, so nothing changes.
+        sync_editing(&mut ed);
+        assert!(ed.text.editing.is_none());
+        assert_eq!(ed.text.block.text, "Half a caption");
+
+        assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        sync_editing(&mut ed);
+        let editing = ed.text.editing.as_ref().expect("the layer is text");
+        assert_eq!(editing.slot, ed.layers.active_slot().expect("a slot"));
+        assert_eq!(editing.doc, ed.session.active_id());
+        assert_eq!(
+            ed.text.block.text, "On the canvas",
+            "the panel is still showing the composed block"
+        );
+        assert_eq!(ed.text.block.size, 48.0);
+        // The colour is the record's, not the palette's — otherwise fixing a
+        // typo would repaint the caption in whatever happened to be in hand.
+        assert_eq!(ed.text_colour(), a_record("x").colour);
+        assert_ne!(ed.text_colour(), ed.color);
+
+        // Off it again, and what was being composed is back.
+        assert!(ed.layers.take_text(0).is_some());
+        sync_editing(&mut ed);
+        assert!(ed.text.editing.is_none());
+        assert_eq!(ed.text.block.text, "Half a caption");
+        assert_eq!(ed.text.block.size, 31.0);
+        assert_eq!(ed.text_colour(), ed.color);
+    }
+
+    /// **The panel cannot show one layer's record while editing another's**,
+    /// which is what keying on the slot rather than the row buys.
+    ///
+    /// Stack order is a `Vec` order, so a reorder moves every row and moves no
+    /// slot. A panel keyed on the selected *position* would go on believing it
+    /// was editing the layer it picked up while Update wrote to whichever layer
+    /// had moved into that row.
+    #[test]
+    fn the_panel_follows_the_layer_it_is_editing_rather_than_the_row() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        let bottom = ed.layers.active_slot().expect("a slot");
+        assert!(ed.layers.set_text(0, a_record("Bottom")));
+        sync_editing(&mut ed);
+        assert_eq!(ed.text.editing.as_ref().map(|e| e.slot), Some(bottom));
+
+        // A second text layer, selected: the panel switches to it whole.
+        let top = ed.layers.add().expect("room");
+        assert_ne!(top, bottom);
+        assert!(ed.layers.set_text(1, a_record("Top")));
+        ed.layers.set_active(1);
+        sync_editing(&mut ed);
+        assert_eq!(ed.text.editing.as_ref().map(|e| e.slot), Some(top));
+        assert_eq!(ed.text.block.text, "Top");
+
+        // Reordering moves the rows and moves no slot, so the panel is still
+        // editing the same layer and still showing its record.
+        assert!(ed.layers.move_down(1).is_some());
+        sync_editing(&mut ed);
+        assert_eq!(
+            ed.text.editing.as_ref().map(|e| e.slot),
+            Some(top),
+            "the panel followed the row instead of the layer"
+        );
+        assert_eq!(ed.text.block.text, "Top");
+        assert_eq!(ed.layers.active_slot(), Some(top));
+    }
+
+    /// Update is offered exactly when setting the text again would do something
+    /// it can do.
+    ///
+    /// Every cell, because the one that matters is silent: a missing font must
+    /// never re-render, since `TextFace::resolve` is exact precisely so that a
+    /// caption is not redrawn in a face its author did not choose.
+    #[test]
+    fn update_is_refused_for_every_reason_it_should_be() {
+        let too_large = TextError::TooLarge {
+            width: 9000,
+            height: 9000,
+        };
+        for (missing, empty, refused, unchanged, why) in [
+            (true, false, None, false, "a missing font"),
+            (false, true, None, false, "nothing typed"),
+            (false, false, Some(too_large), false, "past the cap"),
+            (false, false, None, true, "nothing changed"),
+            (true, true, Some(too_large), true, "everything at once"),
+        ] {
+            let state = update_state(missing, empty, refused, unchanged);
+            assert!(!state.enabled, "Update was live for {why}");
+            assert!(state.tooltip.ends_with('.'), "{why}: {}", state.tooltip);
+            assert!(!state.tooltip.contains('—'), "{why}: {}", state.tooltip);
+        }
+        let state = update_state(false, false, None, false);
+        assert!(state.enabled, "Update was refused with nothing wrong");
+        assert!(!state.tooltip.contains('—'), "{}", state.tooltip);
+
+        // A missing font outranks everything: nothing else about the layer can
+        // be acted on until the font is there.
+        assert_eq!(
+            update_state(true, false, Some(too_large), true).tooltip,
+            update_state(true, false, None, false).tooltip
+        );
+        assert!(
+            update_state(true, false, None, false)
+                .tooltip
+                .contains("Install the font")
+        );
+    }
+
+    /// **A record naming a font this machine has not got freezes the layer**,
+    /// and the panel says which font before anything is pressed.
+    ///
+    /// `TextFace::resolve` is exact and never substitutes — `FontLibrary`'s own
+    /// `resolve` is total and is the wrong one here, because re-rendering
+    /// somebody's caption in a face its author did not choose changes the
+    /// picture silently.
+    #[test]
+    fn a_text_layer_whose_font_is_gone_is_frozen_and_names_it() {
+        let mut ed = Editor::default();
+        ed.text.fonts.hold_at_builtin();
+        let mut record = a_record("A caption");
+        record.face.family = "A Foundry Face Nobody Has".to_string();
+        record.face.postscript = "AFontNobodyHas-Regular".to_string();
+        assert!(ed.layers.set_text(0, record.clone()));
+        sync_editing(&mut ed);
+
+        let editing = ed.text.editing.as_ref().expect("editing");
+        assert!(
+            editing
+                .original
+                .face
+                .resolve(ed.text.fonts.library())
+                .is_none(),
+            "the face resolved, so this case is not the one being tested"
+        );
+        // And `FontLibrary::resolve` would have answered with something, which
+        // is exactly the difference.
+        assert!(
+            ed.text
+                .fonts
+                .library()
+                .resolve(&record.face.family, &record.face.style)
+                .is_some()
+        );
+        assert!(!update_state(true, false, None, false).enabled);
+
+        // The panel draws the notice, which is what makes the frozen state
+        // something an artist can act on rather than a dead button.
+        let drawn = panel_text(|ed| {
+            let mut record = a_record("A caption");
+            record.face.family = "A Foundry Face Nobody Has".to_string();
+            record.face.postscript = "AFontNobodyHas-Regular".to_string();
+            assert!(ed.layers.set_text(0, record));
+        });
+        assert!(
+            drawn.contains("A Foundry Face Nobody Has"),
+            "the missing font was not named: {drawn}"
+        );
+        assert!(
+            drawn.contains("Install the font"),
+            "the notice does not say what would fix it: {drawn}"
+        );
+    }
+
+    /// **The panel draws Update and Convert to paint for a text layer, and
+    /// Place for anything else** — one control in that place, never a dead
+    /// Place beside a live Update.
+    ///
+    /// Read off the shapes the real body emitted, because a test of
+    /// `update_state` cannot see whether the row is drawn at all. That is the
+    /// failure a critic found in this module before: the reading was right and
+    /// the call site had been reverted.
+    #[test]
+    fn a_text_layer_gets_update_and_convert_where_an_ordinary_one_gets_place() {
+        let ordinary = panel_text(|ed| ed.text.block.text = "Umber".to_string());
+        assert!(ordinary.contains("Place"), "{ordinary}");
+        assert!(!ordinary.contains("Update text"), "{ordinary}");
+        assert!(!ordinary.contains("Convert to paint"), "{ordinary}");
+
+        let text_layer = panel_text(|ed| {
+            assert!(ed.layers.set_text(0, a_record("On the canvas")));
+        });
+        assert!(
+            text_layer.contains("Update text"),
+            "no way to set a text layer again: {text_layer}"
+        );
+        assert!(
+            text_layer.contains("Convert to paint"),
+            "no way out of being a text layer: {text_layer}"
+        );
+        assert!(
+            !text_layer.contains("Place"),
+            "a dead Place was drawn beside a live Update: {text_layer}"
+        );
+        // And it really is showing the layer's own caption.
+        assert!(
+            text_layer.contains("On the canvas"),
+            "the panel drew a blank slate over a text layer: {text_layer}"
+        );
+    }
+
     /// The Text module at the panel's real width, in the states it can be in.
     ///
     /// Written rather than asserted for the reason `layers_panel_preview` is:
