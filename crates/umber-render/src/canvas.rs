@@ -306,16 +306,31 @@ const EFFECT_LIVE_PIXELS: u64 = 4096 * 4096;
 /// | three lines at 72 px, dragged to 4x | 2988×890 | 16.75 ms |
 /// | "Umber" at 1000 px, placed | 2943×735 | 9.55 ms |
 ///
-/// So **4 to 9 ms per megapixel of destination**, linear in the area, the
-/// constant falling as the block grows because the per-glyph setup amortises.
-/// Shaping is 0.01 to 0.09 ms and does not move with the scale at all, which is
-/// what says the budget belongs on the area and not on a cache of shaped runs.
+/// So **roughly 4 to 9 ms per megapixel of destination**, linear in the area,
+/// the constant falling as the block grows because the per-glyph setup
+/// amortises. Shaping is 0.01 to 0.09 ms and does not move with the scale at
+/// all, which is what says the budget belongs on the area and not on a cache of
+/// shaped runs.
 ///
-/// A megapixel is therefore a quarter to a half of a 60 Hz frame, on the thread
-/// that also builds the interface, and the next power of two is over a whole
-/// frame at the worst rate measured. It is a judgement at the same place
+/// **The rate is not constant and this figure sits where it is worst, which is
+/// worth saying rather than leaving to be recomputed.** Read off the rows above:
+/// 3.8 ms/Mpx at 10.6 megapixels, 6.3 at 2.7, and **9.1 at 0.72** — the largest
+/// blocks are the most efficient, so quoting a single average and multiplying
+/// flatters exactly the size this constant is set at. The two measurements
+/// nearest a megapixel are 4.52 ms for 0.67 Mpx and 6.56 ms for 0.72, and 16.75
+/// for 2.66, which puts a megapixel at something like 6 to 9 ms — a third to a
+/// half of a 60 Hz frame, on the thread that also builds the interface — and two
+/// megapixels over a whole one. It is a judgement at the same place
 /// [`EFFECT_LIVE_PIXELS`]'s is, and the same kind of judgement: nothing was
 /// measured between the rows and the cost scales with the area.
+///
+/// **[`text::MAX_PIXELS`](umber_core::text::MAX_PIXELS) does not stand in for
+/// this and that is the whole reason this exists.** Extrapolating the largest
+/// measured row, 16.8 megapixels is about 63 ms of rasterisation: nearly four
+/// frames. The cap bounds an allocation and leaves the drag unbounded. (The
+/// commit that added this said 110 ms, which multiplied the cap by a rate
+/// measured on blocks a tenth its size; the conclusion is unchanged and the
+/// figure was wrong, and a commit message cannot be amended.)
 ///
 /// **What it bites on is a drag and never a placement.** A caption at its own
 /// size is eleven kilopixels, ninety times under this; the paragraph is one
