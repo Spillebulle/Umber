@@ -457,10 +457,14 @@ pub enum SaveWarning {
         mode: &'static str,
         used: &'static str,
     },
-    /// The layer's text record was longer than
-    /// [`crate::textobj::MAX_RECORD_BYTES`], so it was not written and the layer
-    /// is paint in the file. Every pixel is there; what is lost is that the text
-    /// can be set again.
+    /// The layer's text record could not be written, so the layer is paint in the
+    /// file. Every pixel is there; what is lost is that the text can be set
+    /// again.
+    ///
+    /// `why` carries the reason rather than the sentence assuming one, because
+    /// there are two and the artist can act on the difference: a record over
+    /// [`crate::textobj::MAX_RECORD_BYTES`], or a figure that is not a figure.
+    /// Saying "too much text" for the second is a notice that lies.
     ///
     /// Named rather than passed over for the reason every import warning is: a
     /// text layer that had quietly stopped being editable by the time somebody
@@ -468,7 +472,10 @@ pub enum SaveWarning {
     /// autosave drops this**, along with every other save warning, and that is
     /// right — a notice nobody asked for, over a copy nobody asked for, is the
     /// dialog that reappears every five minutes.
-    TextNotRecorded { layer: String },
+    TextNotRecorded {
+        layer: String,
+        why: crate::textobj::NotRecorded,
+    },
 }
 
 impl std::fmt::Display for SaveWarning {
@@ -480,11 +487,11 @@ impl std::fmt::Display for SaveWarning {
                  written as {used}. Umber reopens it as {mode}; other applications will \
                  composite it slightly differently where the layer is partly transparent."
             ),
-            Self::TextNotRecorded { layer } => write!(
+            Self::TextNotRecorded { layer, why } => write!(
                 f,
-                "Layer “{layer}”: there is too much text on it to record, so it was saved as \
-                 paint. The picture is complete, but the text cannot be edited again after \
-                 the document is reopened."
+                "Layer “{layer}”: {}, so it was saved as paint. The picture is complete, but \
+                 the text cannot be edited again after the document is reopened.",
+                why.reason()
             ),
         }
     }
@@ -727,7 +734,7 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                     &placed.pixels,
                 );
                 match text.to_json(&print) {
-                    Some(json) => {
+                    Ok(json) => {
                         let src = text_src(i);
                         // Deflated: this is JSON, which is text, and the one
                         // entry in the archive that compresses well.
@@ -735,9 +742,10 @@ pub fn encode(doc: &SaveDocument<'_>) -> Result<(Vec<u8>, Vec<SaveWarning>), Sav
                         zip.write_all(&json)?;
                         Some(src)
                     }
-                    None => {
+                    Err(why) => {
                         warnings.push(SaveWarning::TextNotRecorded {
                             layer: layer.name.to_string(),
+                            why,
                         });
                         None
                     }
@@ -1545,9 +1553,12 @@ mod tests {
         assert_eq!(
             warnings,
             vec![SaveWarning::TextNotRecorded {
-                layer: "Caption".into()
+                layer: "Caption".into(),
+                why: crate::textobj::NotRecorded::TooLarge,
             }]
         );
+        // And the sentence names the length rather than blaming a figure.
+        assert!(warnings[0].to_string().contains("too much text"));
         let xml = read_stack_xml(&bytes);
         assert!(
             !xml.contains(TEXT_ATTR),

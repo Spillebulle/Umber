@@ -351,8 +351,20 @@ impl ImportedDocument {
             // Through `LayerStack::set_text`, which refuses a folder — the
             // reader never puts a record on one, and the refusal is the model's
             // to make rather than something two call sites both remember.
+            //
+            // **The answer is not discarded.** `ImportedLayer::text` is a public
+            // field, so a later reader that did put a record on a folder would
+            // otherwise have it dropped in silence, with no `TextDropped` beside
+            // it — a refusal read as a shrug, which is the trap this codebase has
+            // already paid for once. There is nowhere to raise a warning from
+            // here (the list was consumed before `open` was called), so the
+            // assertion is what says the reader must not produce one.
             if let Some(text) = layer.text {
-                stack.set_text(i, *text);
+                let placed = stack.set_text(i, *text);
+                debug_assert!(
+                    placed,
+                    "a reader put a text record on an entry that cannot hold one"
+                );
             }
             // A folder holds no pixels and takes no slice, so there is nothing
             // to upload and nothing to clear.

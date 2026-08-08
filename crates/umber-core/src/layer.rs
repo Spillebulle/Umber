@@ -66,13 +66,20 @@
 //! and the folder are already refused at. See [`EditRefusal`], and
 //! `docs/text-tool.md` §3 for the argument.
 //!
+//! **Three of the four rules below are the model's half only, and nothing in
+//! `umber-app` calls them yet.** The gate, the flip's mirror and the resize's
+//! drop are each one call in one place, and each is named at its own method with
+//! what goes wrong until it is made. That is the honest state of a wave-one
+//! change: `docformat` and `docimport` are wired, so a record survives a save and
+//! an open, and the three edits that would have to keep it in step do not yet ask.
+//!
 //! Two things follow that are easy to get backwards:
 //!
 //! * **A stroke on a text layer's *mask* is allowed.** A mask bounds the alpha
 //!   the composite reads and changes not one of the layer's own pixels, so it
 //!   cannot put the record out of step with them. That is why the gate takes an
 //!   [`EditTarget`] rather than answering about a layer.
-//! * **A canvas flip does not cost a text layer its record**, because
+//! * **A canvas flip need not cost a text layer its record**, because
 //!   [`crate::textobj::Placement::flipped`] mirrors the placement exactly.
 //!   Dropping it would destroy something no undo could put back — undoing a flip
 //!   is another flip — which is the failure `Selection::flipped` exists to avoid.
@@ -335,8 +342,8 @@ pub enum EditTarget {
 /// reason, which is also what lets the interface say *which* it was.
 ///
 /// An `enum` and not a `bool`, matched exhaustively wherever it is turned into
-/// words, so a fourth refusal cannot be added without something being said about
-/// it. `matches!` over this is exactly what the rule about partial
+/// words, so a further refusal cannot be added without something being said
+/// about it. `matches!` over this is exactly what the rule about partial
 /// exhaustiveness forbids: it answers **false** for a variant it has never heard
 /// of, which here means letting a stroke through a gate that exists to stop it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,11 +355,27 @@ pub enum EditRefusal {
     /// The layer holds text that can still be edited, so painting on it would
     /// leave a record describing pixels it did not make.
     Text,
+    /// There is no entry at that position.
+    ///
+    /// Not a state a caller should be able to reach — the selected index is
+    /// always valid and a row of the list carries its own — and it is a
+    /// **refusal** rather than a permission anyway, because this is a gate.
+    /// Answering `None` for an index off the end would make one `Option` carry
+    /// both "go ahead" and "no such layer", on the one function whose whole
+    /// purpose is to say no.
+    Missing,
 }
 
 impl EditRefusal {
-    /// Every refusal, for a test that has to walk them.
-    pub const ALL: [EditRefusal; 3] = [Self::Folder, Self::Locked, Self::Text];
+    /// Every refusal.
+    ///
+    /// **Guarded by an exhaustive match in a test rather than by iterating
+    /// itself**, which is the rule this codebase learned from a hand-written
+    /// `[EditKind; 11]` that still compiled at the wrong length: a test that
+    /// walks this array can only ever check what is already in it. See
+    /// `every_refusal_is_named_in_the_all_array`, which also names the hole that
+    /// remedy still leaves.
+    pub const ALL: [EditRefusal; 4] = [Self::Folder, Self::Locked, Self::Text, Self::Missing];
 
     /// What to tell somebody who asked for an edit this refuses.
     ///
@@ -361,16 +384,23 @@ impl EditRefusal {
     /// promising one would be the lying control this project refuses everywhere.
     /// [`LayerStack::take_text`] is that command's model half when it arrives.
     ///
-    /// Exhaustive with no catch-all, so a fourth variant fails the build here
+    /// Exhaustive with no catch-all, so a further variant fails the build here
     /// rather than going out as a blank line.
     pub fn reason(self) -> &'static str {
         match self {
             Self::Folder => "A folder holds no pixels, so there is nothing here to paint on.",
-            Self::Locked => "This layer is locked.",
+            // **Both halves, because a lock reaches down from a folder.**
+            // `refusal_at` reads `effective_locked`, so this is shown for a layer
+            // whose own padlock is open and whose folder's is shut; naming only
+            // the layer would send somebody to unlock the wrong row.
+            Self::Locked => "This layer is locked, or it is inside a locked folder.",
+            // "Painted on" alone is too narrow: the same gate refuses a paste
+            // and a lift, and neither is painting.
             Self::Text => {
-                "This layer holds text that can still be edited, so it cannot be \
-                           painted on."
+                "This layer holds text that can still be edited, so nothing may be \
+                 painted or pasted onto it."
             }
+            Self::Missing => "That layer is no longer there.",
         }
     }
 }
@@ -1248,13 +1278,19 @@ impl LayerStack {
 
     /// Take every record off, keeping every pixel.
     ///
-    /// What a **resize** does, for the reason a resize clears the undo history: a
-    /// placement is a rectangle of a canvas that no longer exists, and a canvas
-    /// that shrank has cropped the pixels the record describes, so re-rendering
-    /// would put back a part of the text the artist cut away. Translating the
-    /// placement by the anchor's offset would be exact for a canvas that only
-    /// *grew*, and two behaviours behind one command is how the cropping case
-    /// comes to be the one nobody tested.
+    /// What a **resize** should do, for the reason a resize clears the undo
+    /// history: a placement is a rectangle of a canvas that no longer exists, and
+    /// a canvas that shrank has cropped the pixels the record describes, so
+    /// re-rendering would put back a part of the text the artist cut away.
+    /// Translating the placement by the anchor's offset would be exact for a
+    /// canvas that only *grew*, and two behaviours behind one command is how the
+    /// cropping case comes to be the one nobody tested.
+    ///
+    /// **Nothing calls it yet.** `Editor::apply_canvas` drops the selection and
+    /// clears the history and does not reach here, so a resize currently leaves a
+    /// record describing a canvas that has gone. Wave two wires it, beside the
+    /// history clear; see [`LayerStack::refusal_at`] for the same note about the
+    /// paint gate and why the record cannot yet be reached anyway.
     ///
     /// Returns how many were dropped, so the caller can say so rather than
     /// leaving somebody to find out that their text is paint now.
@@ -1268,11 +1304,13 @@ impl LayerStack {
 
     /// Mirror every record with the canvas.
     ///
-    /// **Called from wherever the layer pixels are flipped, and it is one call
-    /// site**: `app.rs`'s `mirror_document` is the single route a flip takes, and
-    /// it is shared by the command and by both undo directions. Forgetting it
-    /// would leave a record describing un-mirrored text over mirrored pixels, and
-    /// the next re-render would un-mirror the layer.
+    /// **It belongs beside wherever the layer pixels are flipped, and there is one
+    /// such place**: `app.rs`'s `mirror_document` is the single route a flip
+    /// takes, shared by the command and by both undo directions. **Nothing calls
+    /// it yet** — `mirror_document` reaches `flip_layers` and `flip_canvas` and
+    /// neither of those reaches here — so a flip currently mirrors the pixels and
+    /// leaves the record un-mirrored. Wave two wires it, in that one place;
+    /// forgetting it means the next re-render un-mirrors the layer.
     ///
     /// The mirror is exact rather than approximate — see
     /// [`crate::textobj::Placement::flipped`] — which is why a flip does not cost
@@ -1398,13 +1436,22 @@ impl LayerStack {
     }
 
     /// **Why an edit on this entry would be refused**, or `None` where it goes
-    /// ahead. The one gate.
+    /// ahead. The one gate an operation that writes pixels should ask.
     ///
-    /// This is the question `begin_stroke`, `begin_float`, `clear_active_layer`
-    /// and every other operation that writes pixels asks — one call, one answer,
-    /// one reason to show. It subsumes the two tests those already made (a lock
-    /// and a folder) and adds the third (text), which is the point: three
-    /// separate booleans is how the fourth gate comes to check only two of them.
+    /// It is the two tests `begin_stroke` and `begin_float` already make — a lock
+    /// and a folder — with text as the third, in one call with one answer and one
+    /// reason to show. Three separate booleans is how the fourth gate comes to
+    /// check only two of them.
+    ///
+    /// **Nothing calls it yet, and that is said here rather than left to be
+    /// discovered.** `Editor::begin_stroke` still reads `active_is_locked` and
+    /// `stroke_target` separately, and nothing sets [`Layer::text`] outside a
+    /// document that carried a record, so there is at present no text layer for a
+    /// brush to reach. The paint gate is wave two's to wire, in
+    /// `Editor::begin_stroke` and `App::begin_float`, and until it is **a text
+    /// layer can be painted on** — which the fingerprint does *not* cover, since
+    /// a save takes its fingerprint from the pixels it is writing. See
+    /// `docs/text-tool.md` §3 and this module's docs.
     ///
     /// `target` matters, and it is the half that is easy to get backwards. A
     /// stroke on a text layer's **mask** is allowed: a mask bounds the alpha the
@@ -1413,19 +1460,38 @@ impl LayerStack {
     /// targets — a lock is a statement about the whole layer, and a folder has
     /// neither slice.
     ///
+    /// **"Clear layer" is not one of the operations this refuses**, and that is
+    /// deliberate. It genuinely means to replace the pixels, so it must take the
+    /// record off instead — [`LayerStack::take_text`] — or the next save would
+    /// record text over a blank layer with a fingerprint that agrees, and
+    /// reopening would re-render text somebody had cleared.
+    ///
     /// The order is the order of the sentences somebody would want: what a folder
     /// cannot do at all, then what a lock forbids until it is unlocked, then what
     /// text forbids until it is converted.
     pub fn refusal_at(&self, index: usize, target: EditTarget) -> Option<EditRefusal> {
-        let layer = self.layers.get(index)?;
+        // Fails closed. An index off the end is a caller bug rather than a
+        // permission, and this is a gate: see [`EditRefusal::Missing`].
+        let Some(layer) = self.layers.get(index) else {
+            return Some(EditRefusal::Missing);
+        };
         if layer.folder {
             return Some(EditRefusal::Folder);
         }
         if self.effective_locked(index) {
             return Some(EditRefusal::Locked);
         }
-        if layer.is_text() && target == EditTarget::Layer {
-            return Some(EditRefusal::Text);
+        if layer.is_text() {
+            // An exhaustive `match` and not `target == EditTarget::Layer`, which
+            // is `matches!` wearing an equality: it would answer **permitted**
+            // for a target this build has never heard of, on the gate that exists
+            // to refuse. `Editor::stroke_target` already matches this enum
+            // exhaustively, and two readers of one enum must not disagree about
+            // whether it is closed.
+            match target {
+                EditTarget::Layer => return Some(EditRefusal::Text),
+                EditTarget::Mask => {}
+            }
         }
         None
     }
@@ -3596,6 +3662,45 @@ mod tests {
         assert!(s.take_text(0).is_some());
         assert_eq!(s.refusal_at(0, EditTarget::Layer), None);
         assert!(s.take_text(0).is_none(), "and it is idempotent");
+    }
+
+    /// **The gate fails closed.** An index off the end is a caller bug and not a
+    /// permission, and answering `None` there would make one `Option` mean both
+    /// "go ahead" and "no such layer" on the one function whose purpose is to
+    /// refuse.
+    #[test]
+    fn the_gate_refuses_a_layer_that_is_not_there() {
+        let s = LayerStack::new();
+        assert_eq!(
+            s.refusal_at(7, EditTarget::Layer),
+            Some(EditRefusal::Missing)
+        );
+        assert_eq!(
+            s.refusal_at(7, EditTarget::Mask),
+            Some(EditRefusal::Missing)
+        );
+    }
+
+    /// [`EditRefusal::ALL`] is checked by an **exhaustive match whose arms index
+    /// it**, never by walking it: a test that iterates the array can only ever
+    /// check what somebody remembered to put in it, and a hand-written length is
+    /// exactly what shipped an `[EditKind; 11]` that was short.
+    ///
+    /// **It is still not total, and the hole is worth naming rather than
+    /// implying it is closed**: an arm that returns the wrong index compiles and
+    /// passes. What this does catch is a variant added and not listed, which is
+    /// the failure that actually happens.
+    #[test]
+    fn every_refusal_is_named_in_the_all_array() {
+        for refusal in EditRefusal::ALL {
+            let at = match refusal {
+                EditRefusal::Folder => 0,
+                EditRefusal::Locked => 1,
+                EditRefusal::Text => 2,
+                EditRefusal::Missing => 3,
+            };
+            assert_eq!(EditRefusal::ALL[at], refusal);
+        }
     }
 
     /// The three refusals share the one gate, in the order the sentences read.

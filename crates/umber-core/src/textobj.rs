@@ -116,6 +116,18 @@ pub const VERSION: u32 = 1;
 /// it, which is what stops a small archive claiming a large record.
 pub const MAX_RECORD_BYTES: usize = 1 << 20;
 
+/// The longest a family, a style or a PostScript name may be in a record.
+///
+/// A bound of its own because [`MAX_RECORD_BYTES`] does not usefully reach these:
+/// a record is a file somebody else wrote, and nothing stops it carrying most of
+/// a mebibyte in the family field. That string reaches [`TextFace::label`] and
+/// from there a notice, which is a sentence a person reads. A hundred and
+/// twenty-eight bytes is comfortably past the longest real face name — "Source
+/// Han Sans HW SC ExtraLight" is twenty-six — and it is enforced by
+/// [`clean_name`] on the way in *and* on the way out, so a name too long to write
+/// is one that comes back the same.
+pub const MAX_NAME_BYTES: usize = 128;
+
 /// The exact face a block of text was set in.
 ///
 /// Three names rather than one, because they answer different questions when the
@@ -185,6 +197,12 @@ impl TextFace {
     /// Two sentences and no em-dash, because this is a notice and not a comment.
     /// It names the font, says the picture is untouched, and says what would fix
     /// it — which is the whole of what an artist can act on.
+    ///
+    /// **Nothing draws it yet**, because nothing in this build can ask to edit a
+    /// text layer. It says "install the font to edit it again", which is a promise
+    /// about a control wave two adds; drawing it before then would be the lying
+    /// notice this project refuses, so the panel that shows it is the panel that
+    /// makes it true.
     pub fn missing_notice(&self) -> String {
         let mut out = format!("This text was set in {}", self.label());
         if !self.postscript.is_empty() {
@@ -377,13 +395,18 @@ impl Fingerprint {
 
     /// Is this the same image?
     ///
-    /// A hash, so this is "no reason to think otherwise" rather than proof. The
-    /// failure direction is what makes that acceptable: a collision would keep a
-    /// record that should have been dropped, and the worst that record can then
-    /// do is re-render text over pixels a **text layer** holds, because
-    /// [`crate::layer::EditRefusal::Text`] is what stops a brush ever reaching
-    /// one. It is not what stands between an older build's brushwork and a
-    /// re-render; the rectangle and 64 bits together are.
+    /// A hash, so this is "no reason to think otherwise" rather than proof — and
+    /// **the rectangle and 64 bits are all that stands between an older build's
+    /// brushwork and a re-render**, which is worth stating plainly rather than
+    /// appealing to a gate. The gate that refuses a brush on a text layer belongs
+    /// to *this* build; the case this exists for is a build that has never heard
+    /// of any of it, painting freely on the layer and saving. So there is no
+    /// second line of defence behind this one.
+    ///
+    /// The trade is still sound: the rectangle catches nearly every real case,
+    /// because paint added to a layer moves its non-transparent bounding box, and
+    /// a 64-bit collision on the remainder is not something an accident produces.
+    /// It is a hash and not a signature, and it is not described as one anywhere.
     pub fn matches(&self, rect: PixelRect, bytes: &[u8]) -> bool {
         self.rect == rect && self.hash == hash_bytes(bytes)
     }
@@ -398,6 +421,13 @@ impl Fingerprint {
 /// writes the same twelve lines out for the same reason.
 ///
 /// Not a cryptographic hash and not a signature — see the module docs.
+///
+/// **What it costs is bounded by the trimmed image and not by the canvas**, which
+/// for a caption is a few kilobytes and nothing at all. A text layer whose ink
+/// genuinely spans a 10000² canvas is the other end: a byte at a time, that is a
+/// few tenths of a second — once on the save, beside the blocking readback and
+/// the PNG encode it already pays for, and once on the open beside the decode.
+/// Worth knowing before somebody puts a fingerprint on something larger.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -467,18 +497,34 @@ impl TextObject {
     /// carries none, so there is nothing here that can be stale. See the module
     /// docs.
     ///
-    /// `None` where the encoded record is longer than [`MAX_RECORD_BYTES`].
-    /// Nothing is written in that case and the save says so, rather than
-    /// producing a record the reader will refuse.
-    pub fn to_json(&self, print: &Fingerprint) -> Option<Vec<u8>> {
+    /// **It refuses everything the reader would refuse, and says which.** A
+    /// record written that [`Self::from_json`] then declines is the failure
+    /// [`MAX_RECORD_BYTES`] exists to prevent, one field over: the layer would
+    /// quietly stop being editable at the next open, with the save having said
+    /// nothing. So the placement is checked here as well as there, and the reason
+    /// travels out so the notice names it rather than blaming the length —
+    /// `serde_json` refuses a non-finite figure, which used to come back as "too
+    /// much text".
+    pub fn to_json(&self, print: &Fingerprint) -> Result<Vec<u8>, NotRecorded> {
+        if !self.placement.is_sane()
+            || !self.block.size.is_finite()
+            || !self.block.line_spacing.is_finite()
+            || !self.block.tracking.is_finite()
+        {
+            return Err(NotRecorded::Impossible);
+        }
         // Compact rather than pretty, and that is not only a matter of size.
         // `ron::ser::PrettyConfig::new` takes the *platform's* line ending, so a
         // pretty-printed record would make the same document differ byte for
         // byte between Windows and Linux — right for a preferences file, wrong
         // for one that travels. `serde_json::to_vec` emits no line endings at
         // all.
-        let json = serde_json::to_vec(&Record::of(self, print)).ok()?;
-        (json.len() <= MAX_RECORD_BYTES).then_some(json)
+        let json =
+            serde_json::to_vec(&Record::of(self, print)).map_err(|_| NotRecorded::Impossible)?;
+        if json.len() > MAX_RECORD_BYTES {
+            return Err(NotRecorded::TooLarge);
+        }
+        Ok(json)
     }
 
     /// Read a record back, with the fingerprint it was written with.
@@ -501,6 +547,33 @@ impl TextObject {
             });
         }
         record.into_object()
+    }
+}
+
+/// Why a record could not be **written**.
+///
+/// Its own enum rather than [`RecordError`] because the sentences face the other
+/// way: these become part of a [`crate::SaveWarning`] about a document being
+/// saved, where those become part of an [`crate::ImportWarning`] about one being
+/// opened. Two variants because the artist can act on the difference — one is
+/// "there is too much of it" and the other is a figure that is not a figure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotRecorded {
+    /// The encoded record is longer than [`MAX_RECORD_BYTES`].
+    TooLarge,
+    /// A figure that cannot be written or could not be read back: a zero scale,
+    /// an infinite size, an empty source rectangle.
+    Impossible,
+}
+
+impl NotRecorded {
+    /// The clause that goes inside the save warning's sentence. Exhaustive, so a
+    /// third reason cannot arrive without words for it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TooLarge => "there is too much text on it to record",
+            Self::Impossible => "its size or placement is not a figure Umber can record",
+        }
     }
 }
 
@@ -642,9 +715,12 @@ impl Record {
         Self {
             version: VERSION,
             text: obj.block.text.clone(),
-            family: obj.face.family.clone(),
-            style: obj.face.style.clone(),
-            postscript: obj.face.postscript.clone(),
+            // Cleaned on the way out as well as on the way in, so what a notice
+            // shows is what a reopen gives back. A font's own name tables are not
+            // this module's to trust either: they are a file somebody else wrote.
+            family: clean_name(&obj.face.family),
+            style: clean_name(&obj.face.style),
+            postscript: clean_name(&obj.face.postscript),
             size: obj.block.size,
             line_spacing: obj.block.line_spacing,
             tracking: obj.block.tracking,
@@ -690,9 +766,9 @@ impl Record {
                     align,
                 },
                 face: TextFace {
-                    family: self.family,
-                    style: self.style,
-                    postscript: self.postscript,
+                    family: clean_name(&self.family),
+                    style: clean_name(&self.style),
+                    postscript: clean_name(&self.postscript),
                 },
                 colour,
                 placement,
@@ -703,6 +779,28 @@ impl Record {
             },
         ))
     }
+}
+
+/// A face name fit to put in a sentence: no control characters, trimmed, and no
+/// longer than [`MAX_NAME_BYTES`].
+///
+/// The same rule `palette::clean_line` follows and for the same reason — what a
+/// notice shows has to be what a save and a reopen give back, so it is applied on
+/// both sides rather than at the point of drawing. A control character is not
+/// whitespace, which is exactly the trap that once wrote a colour named `"\u{7}"`
+/// back out as "Untitled palette".
+///
+/// Truncation is on a **character** boundary, because slicing a `String` at a
+/// byte in the middle of one panics.
+fn clean_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(MAX_NAME_BYTES));
+    for c in name.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
 }
 
 fn rect_array(rect: PixelRect) -> [u32; 4] {
@@ -817,6 +915,22 @@ mod tests {
             assert_eq!(align_from_id(align_id(align)), Some(align));
         }
         assert_eq!(align_from_id("middle"), None);
+
+        // **`Align::ALL` is checked by an exhaustive match whose arms index it**,
+        // not by walking it. `align_from_id` searches that array, so an alignment
+        // added to the enum and not to `ALL` would be written to disk by
+        // `align_id` — which is exhaustive and would force a name — and then
+        // refused as `Nonsense` on every reopen, dropping the whole record. The
+        // array lives in `text.rs`, which this change may not touch, so the guard
+        // for it lives here beside the reader that depends on it.
+        for align in Align::ALL {
+            let at = match align {
+                Align::Left => 0,
+                Align::Centre => 1,
+                Align::Right => 2,
+            };
+            assert_eq!(Align::ALL[at], align);
+        }
     }
 
     /// A colour keeps its alpha, which the background's six-digit spelling
@@ -871,15 +985,56 @@ mod tests {
         }
     }
 
+    /// **The writer refuses exactly what the reader would**, and names which of
+    /// the two reasons it was. A record written that the reader then declines is a
+    /// text layer that stops being editable at the next open with the save having
+    /// said nothing, which is the loss `MAX_RECORD_BYTES` exists to prevent.
     #[test]
-    fn a_record_over_the_bound_is_not_written() {
+    fn a_record_the_reader_would_refuse_is_not_written() {
+        let print = Fingerprint::of(rect(0, 0, 1, 1), b"x");
+
+        let mut long = object();
+        long.block.text = "x".repeat(MAX_RECORD_BYTES + 1);
+        assert_eq!(long.to_json(&print), Err(NotRecorded::TooLarge));
+
+        // A figure that is not a figure, which `serde_json` refuses on its own
+        // and used to come back as "too much text".
+        let mut wild = object();
+        wild.block.size = f32::INFINITY;
+        assert_eq!(wild.to_json(&print), Err(NotRecorded::Impossible));
+
+        // And a placement the reader's own `is_sane` would decline, which the
+        // writer used to produce happily.
+        let mut flat = object();
+        flat.placement.source.width = 0;
+        assert_eq!(flat.to_json(&print), Err(NotRecorded::Impossible));
+        let mut still = object();
+        still.placement.scale = [0.0, 1.0];
+        assert_eq!(still.to_json(&print), Err(NotRecorded::Impossible));
+
+        for why in [NotRecorded::TooLarge, NotRecorded::Impossible] {
+            assert!(!why.reason().is_empty());
+            assert!(!why.reason().contains('—'), "{}", why.reason());
+        }
+    }
+
+    /// A face name out of a file somebody else wrote is cleaned to something that
+    /// can go in a sentence, on the way in **and** on the way out, so what a
+    /// notice shows is what a reopen gives back.
+    #[test]
+    fn a_face_name_from_a_hostile_file_is_cleaned_on_both_sides() {
         let mut obj = object();
-        obj.block.text = "x".repeat(MAX_RECORD_BYTES + 1);
-        assert!(
-            obj.to_json(&Fingerprint::of(rect(0, 0, 1, 1), b"x"))
-                .is_none(),
-            "a record the reader would refuse must not be written"
-        );
+        obj.face.family = format!("  Arch\u{7}ivo{}  ", "x".repeat(MAX_NAME_BYTES));
+        let print = Fingerprint::of(rect(0, 0, 1, 1), b"x");
+        let (back, _) = TextObject::from_json(&obj.to_json(&print).unwrap()).unwrap();
+
+        assert!(!back.face.family.contains('\u{7}'), "no control characters");
+        assert!(back.face.family.len() <= MAX_NAME_BYTES);
+        assert_eq!(back.face.family.trim(), back.face.family, "trimmed");
+        // And it is a fixed point: cleaning what came back changes nothing, so a
+        // second save and reopen gives the identical record.
+        let (again, _) = TextObject::from_json(&back.to_json(&print).unwrap()).unwrap();
+        assert_eq!(again.face, back.face);
     }
 
     #[test]
