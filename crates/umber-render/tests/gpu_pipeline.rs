@@ -5918,6 +5918,34 @@ fn a_live_stroke_bakes_the_shadow_the_commit_would() {
     }
 }
 
+/// A spread wider than the canvas, and one that is not a number at all, are
+/// baked rather than crashed on.
+///
+/// `spread` is an `f32` a document carries, so "nobody would type that" is not a
+/// bound. Unbounded, the flood's step count is a shift by `32 - leading_zeros` of
+/// a saturating cast, which at a spread near four billion is a shift of 32 — a
+/// panic, on the drawing path, out of a file. The step count is bounded by the
+/// longest side of the canvas instead, which reaches every texel anyway.
+///
+/// The assertion is only that it produced a picture and did not die; what the
+/// picture *is* for a NaN spread is not a thing worth pinning.
+#[test]
+fn an_absurd_spread_is_baked_rather_than_crashed_on() {
+    let mut h = harness_or_skip!();
+    h.write_block(0, SHAPE, [255, 255, 255, 255]);
+    let draw = layer(0, 1.0, BlendMode::Normal);
+
+    for spread in [1.0e9, f32::MAX, f32::INFINITY, f32::NAN] {
+        let ring = [outline(Color::WHITE, spread, OutlinePosition::Outside)];
+        let baked = h.bake(&[effected(draw, &ring)], 1);
+        assert_eq!(baked.draws.len(), 2, "spread {spread} produced no draw");
+        // A spread that covers the canvas leaves nothing for the outline to
+        // occupy once the knockout has taken the shape out of it, so this reads
+        // that the pass ran rather than what it wrote.
+        let _ = slice_alpha(&h, baked.draws[0].slot, 4, 4);
+    }
+}
+
 /// The shadow follows the brush: a live stroke rebakes on **every** frame.
 ///
 /// §5.1's whole argument, and the thing the design says makes the difference

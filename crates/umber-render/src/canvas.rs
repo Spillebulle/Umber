@@ -5794,8 +5794,19 @@ impl CanvasRenderer {
             // `ceil(log2(reach)) + 1` halving steps, largest first. One more than
             // the log because the last step at k = 1 is what settles a
             // neighbouring texel, and the flood is only exact once it has run.
+            //
+            // **Bounded by the canvas, and that is not tidiness.** A spread wider
+            // than the longest side reaches every texel already, so more steps
+            // buy nothing — and unbounded this is a shift by `32 - leading_zeros`
+            // of a saturating `as u32`, which at a spread near four billion is a
+            // shift of 32 and therefore a panic on the drawing path. `spread` is
+            // an `f32` a file carries, so "nobody would type that" is not a
+            // bound. `max(1.0)` before the `min` also disposes of a NaN, since
+            // `f32::max` answers the operand that is not one.
+            let longest = size.x.max(size.y) as f32;
+            let span = reach.ceil().max(1.0).min(longest) as u32;
             let mut from = 0usize;
-            let mut k = 1i32 << (32 - (reach.ceil().max(1.0) as u32).leading_zeros());
+            let mut k = 1i32 << (32 - span.leading_zeros());
             while k >= 1 {
                 steps.push(EffectStep {
                     pass: EffectPass::Flood,
