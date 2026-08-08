@@ -178,8 +178,10 @@ impl SlotPool {
     /// The compaction is not tidiness. `next` is what
     /// [`LayerStack::slot_capacity_needed`] reports, which is what the renderer
     /// allocates to and what `CanvasRenderer::begin_float` reserves its preview
-    /// slice at; and `ensure_slots` doubles and **never shrinks**. So a `next`
-    /// left high is a texture array left large, for the rest of the session.
+    /// slice at; and `ensure_slots` **never shrinks**. So a `next` left high is
+    /// a texture array left large, for the rest of the session. (It doubles
+    /// only while the array is cheap — see `grown_capacity` — but that bounds
+    /// the *overshoot*, not this.)
     ///
     /// It is not on its own enough, and the two things beside it are worth
     /// naming here because each looks redundant next to this one:
@@ -643,9 +645,19 @@ impl LayerStack {
     /// `the_slice_ceiling_agrees_with_umber_core`.
     ///
     /// Nothing is allocated by raising it. `CanvasRenderer` starts at
-    /// `INITIAL_SLOTS` of four and `ensure_slots` doubles towards what the
-    /// stack actually claims, so a document with no masks and no effects pays
-    /// for the headroom in nothing but this pool's ceiling.
+    /// `INITIAL_SLOTS` of four and `ensure_slots` grows towards what the stack
+    /// actually claims, so a document with no masks and no effects pays for the
+    /// headroom in nothing but this pool's ceiling.
+    ///
+    /// **"Grows towards" and not "doubles towards", and the difference was a
+    /// live defect.** Doubling *overshoots*, and `.min(MAX_SLOTS)` used to trim
+    /// the overshoot back because the ceiling was 129 — so raising it here to
+    /// 256 made a document needing its 129th slice allocate 256 of them, 4.29 GB
+    /// at 2048² against the 2.06 GB it asked for, permanently, from a legal
+    /// stack of 64 masked layers. `grown_capacity` in `umber-render` is the
+    /// repair and doubles only while the whole array stays inside a byte budget.
+    /// This sentence claimed the overshoot could not happen while it was
+    /// happening.
     pub const MAX_SLOTS: u32 = 256;
 
     /// How many independent link groups a document may hold.

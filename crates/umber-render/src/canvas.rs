@@ -5911,7 +5911,11 @@ mod tests {
         }
 
         // Raising it allocates nothing: the array starts at `INITIAL_SLOTS` and
-        // `ensure_slots` doubles towards what is actually claimed.
+        // `ensure_slots` grows towards what is actually claimed. That it does
+        // not *overshoot* towards the ceiling is `grown_capacity`'s doing and
+        // is guarded separately — see
+        // `a_document_does_not_double_its_layer_array_to_reach_one_more_slice`,
+        // which exists because raising this constant is what broke it.
         assert!(INITIAL_SLOTS < MAX_SLOTS as u32);
     }
 
