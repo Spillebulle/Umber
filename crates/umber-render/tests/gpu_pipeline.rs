@@ -5597,46 +5597,124 @@ fn a_layer_knocks_its_own_drop_shadow_out() {
 ///
 /// The shape is centred on a texel *boundary*, so texel `i` mirrors to `63 - i`
 /// with nothing to interpolate.
+///
+/// **Both resolutions**, and the second one is why this test is written as a
+/// sweep. The blur runs on a 4x downsample above `EFFECT_FULL_RES_SOFTNESS` and
+/// at full resolution below it, and nothing exercised the first — which is how a
+/// mis-centred upsample survived: it displaced the whole shadow a pixel and a
+/// half diagonally, on that path alone, whatever the effect's own angle. A
+/// diagonal shift is exactly what a mirror test sees.
 #[test]
 fn a_softened_shadow_is_mirrored_about_both_axes() {
     let mut h = harness_or_skip!();
     h.write_block(0, SHAPE, [255, 255, 255, 255]);
-
     let draw = layer(0, 1.0, BlendMode::Normal);
-    // No displacement, so the only thing that could break the symmetry is the
-    // kernel. A spread as well as a softness, so the effect draws at all.
+
+    // 9 is under the threshold and 34 is over it, so one of these runs the tent
+    // whole and the other runs it on a quarter-resolution copy.
+    for softness in [9.0, 34.0] {
+        // No displacement, so the only thing that could break the symmetry is the
+        // kernel. A spread as well as a softness, so the effect draws at all.
+        let soft = [Effect {
+            spread: 2.0,
+            softness,
+            distance: 0.0,
+            ..Effect::drop_shadow()
+        }];
+        let stack = [effected(draw, &soft)];
+        let baked = h.bake(&stack, 1);
+        let slot = baked.draws[0].slot;
+        assert_ne!(slot, 0, "the effect draw is not the layer's own");
+
+        for (x, y) in [(20, 32), (14, 26), (30, 12), (8, 8), (24, 20)] {
+            let a = slice_alpha(&h, slot, x, y);
+            for (mx, my) in [
+                (DOC - 1 - x, y),
+                (x, DOC - 1 - y),
+                (DOC - 1 - x, DOC - 1 - y),
+            ] {
+                let b = slice_alpha(&h, slot, mx, my);
+                assert!(
+                    a.abs_diff(b) <= 1,
+                    "softness {softness}: ({x},{y})={a} against ({mx},{my})={b}: \
+                     the blur is lopsided"
+                );
+            }
+        }
+        // And it actually softened something, or the symmetry above is the
+        // symmetry of an empty texture.
+        let ramp: Vec<u8> = (8..24).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+        assert!(
+            ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] < ramp[15],
+            "softness {softness}: no falloff in the shadow: {ramp:?}"
+        );
+    }
+}
+
+/// A shadow of a layer that runs to the edge of the canvas fades **at** that
+/// edge.
+///
+/// The rule the selection's feather already keeps in as many words — "outside the
+/// canvas counts as unselected, so a selection against the document edge fades at
+/// it, as Photoshop's and GIMP's do" — and the one a `textureLoad` most naturally
+/// gets wrong, because clamp-to-edge makes a box pass sum the border row over and
+/// over. Matching the feather's kernel and then not matching its boundary is the
+/// worse half of both.
+///
+/// The shape is a band flush against the **left** edge and spanning the whole
+/// height, which is what makes the reading discriminating. Being uniform in `y`,
+/// its shadow is the same all the way down *if* the vertical box pass replicates
+/// the border row, and weaker at the top and bottom rows if it reads zero — so one
+/// comparison between the middle of an edge column and the middle of the canvas
+/// answers the question, with no value worked out by hand.
+///
+/// The first draft of this test put the band along the top and asserted that the
+/// knockout reached row zero. It passed under both rules: the knockout is
+/// `1 - coverage` and the band covers that row either way, so the assertion was
+/// about something else entirely.
+#[test]
+fn a_shadow_of_a_layer_against_the_canvas_edge_fades_at_it() {
+    let mut h = harness_or_skip!();
+    h.write_block(
+        0,
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: DOC,
+        },
+        [255, 255, 255, 255],
+    );
+    let draw = layer(0, 1.0, BlendMode::Normal);
     let soft = [Effect {
-        spread: 2.0,
+        spread: 3.0,
         softness: 9.0,
         distance: 0.0,
         ..Effect::drop_shadow()
     }];
-    let stack = [effected(draw, &soft)];
-    let baked = h.bake(&stack, 1);
+    let baked = h.bake(&[effected(draw, &soft)], 1);
     let slot = baked.draws[0].slot;
-    assert_ne!(slot, 0, "the effect draw is not the layer's own");
 
-    for (x, y) in [(20, 32), (14, 26), (30, 12), (8, 8), (24, 20)] {
-        let a = slice_alpha(&h, slot, x, y);
-        for (mx, my) in [
-            (DOC - 1 - x, y),
-            (x, DOC - 1 - y),
-            (DOC - 1 - x, DOC - 1 - y),
-        ] {
-            let b = slice_alpha(&h, slot, mx, my);
-            assert!(
-                a.abs_diff(b) <= 1,
-                "({x},{y})={a} against ({mx},{my})={b}: the blur is lopsided"
-            );
-        }
-    }
-    // And it actually softened something, or the symmetry above is the symmetry
-    // of an empty texture.
-    let ramp: Vec<u8> = (8..24).map(|x| slice_alpha(&h, slot, x, 32)).collect();
+    // Right of the band, where the shadow reaches into open canvas: a real
+    // falloff, which is what says the shadow exists at all.
+    let across: Vec<u8> = (20..40).map(|x| slice_alpha(&h, slot, x, 32)).collect();
     assert!(
-        ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] < ramp[15],
-        "no falloff in the shadow: {ramp:?}"
+        across[0] > across[19] && across[0] > 0,
+        "no shadow beside the band: {across:?}"
     );
+
+    // The same column at the top and bottom rows. Half the tent's support is off
+    // the canvas there, so the shadow has to be plainly weaker than in the middle.
+    // `u32`, because three quarters of a `u8` over 85 is not a `u8`.
+    let middle = u32::from(slice_alpha(&h, slot, 24, DOC / 2));
+    for y in [0, DOC - 1] {
+        let edge = u32::from(slice_alpha(&h, slot, 24, y));
+        assert!(
+            edge < middle * 3 / 4,
+            "row {y} reads {edge} against {middle} in the middle: the kernel is \
+             replicating the border instead of fading at it"
+        );
+    }
 }
 
 /// The distance field is a **disc**, not a square.

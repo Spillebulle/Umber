@@ -188,10 +188,22 @@ const MAX_DRAWS: usize = MAX_LAYERS + MAX_EFFECT_SLICES;
 /// covers every canvas `max_texture_dimension_2d` permits four times over, which
 /// is also what lets 65535 stand for "no seed" without ever colliding with one.
 ///
-/// Not among the formats `downlevel_defaults` guarantees as a render
-/// attachment, so [`CanvasRenderer::effects_available`] asks the adapter rather
-/// than assuming — the whole point of requesting downlevel limits is that a
-/// desktop build must not depend on what a mobile GPU refuses.
+/// **A render target on every device, and that was checked rather than
+/// assumed.** `TextureFormat::guaranteed_format_features` gives `Rg16Uint`
+/// `attachment` on `Features::empty()`, so it is part of what the WebGPU
+/// specification requires rather than something an adapter may refuse — which is
+/// the question that had to be asked, because the whole point of requesting
+/// `downlevel_defaults` is that a desktop build must not depend on what a mobile
+/// GPU will not do. `the_seed_format_is_a_render_target_on_every_device` is the
+/// pin; a wgpu bump that moved it would otherwise be a fatal `create_texture`
+/// validation error on somebody else's machine and on nobody's here.
+///
+/// The first draft carried an `effects_available(&Adapter)` beside this instead,
+/// and it was never called — a control that would have greyed itself out if
+/// anything had asked it. An uncalled guard is a promise nothing keeps;
+/// `examples/measure-effects.rs` still asks the adapter, which is the right place
+/// for the caution, because a measuring tool must not die on the first
+/// allocation a device refuses.
 const SEED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Uint;
 
 /// How much smaller than the canvas a wide blur runs.
@@ -5449,26 +5461,6 @@ impl CanvasRenderer {
 
     // --- layer effects ------------------------------------------------------
 
-    /// Can this device bake an effect at all?
-    ///
-    /// The jump flood stores a seed *coordinate* in an [`SEED_FORMAT`] target,
-    /// and that format is not among the ones `downlevel_defaults` guarantees as a
-    /// render attachment. Asked of the adapter rather than assumed, because the
-    /// whole point of requesting downlevel limits is that a desktop build must
-    /// not start depending on what a mobile GPU refuses — and the honest
-    /// behaviour where it does refuse is to draw the layer without its effects,
-    /// which is what every other ORA reader already does with the file.
-    ///
-    /// Not asked on the drawing path: [`Self::bake_effects`] reads it through the
-    /// same `Adapter` the pipelines were built with, once per bake, and a bake
-    /// only happens where something is stale.
-    pub fn effects_available(adapter: &wgpu::Adapter) -> bool {
-        adapter
-            .get_texture_format_features(SEED_FORMAT)
-            .allowed_usages
-            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-    }
-
     /// How many effects the last [`Self::bake_effects`] could not draw.
     ///
     /// Non-zero means the document holds more enabled effects than there are
@@ -8007,6 +7999,41 @@ mod tests {
         // would name rows past the bottom of the texture, which is a validation
         // error and therefore an abort.
         assert_eq!(band_rows(u64::MAX, 256, 7), 7);
+    }
+
+    /// **The jump flood's seed target is a render attachment on every device the
+    /// specification describes**, which is not something to take on trust.
+    ///
+    /// `guaranteed_format_features` is what the WebGPU spec requires of *any*
+    /// adapter, as against `Adapter::get_texture_format_features`, which is what
+    /// the one in front of you happens to offer. Asking the second would pass on
+    /// this machine and say nothing about anybody else's, and the failure it hides
+    /// is a `create_texture` validation error — fatal, because
+    /// `crash::device_error` makes every uncaptured error fatal. Same shape as
+    /// `the_slice_ceiling_agrees_with_umber_core`, and for the same reason.
+    ///
+    /// A test rather than a `const` assertion only because that method is not a
+    /// `const fn`.
+    #[test]
+    fn the_seed_format_is_a_render_target_on_every_device() {
+        let features = SEED_FORMAT.guaranteed_format_features(wgpu::Features::empty());
+        assert!(
+            features
+                .allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            "{SEED_FORMAT:?} is no longer a guaranteed render target: {:?}",
+            features.allowed_usages
+        );
+        // And the coverage fields, which are the other half of the bake's own
+        // allocations. `R8Unorm` is the stroke scratch's format too, so this is
+        // already relied on elsewhere — stated here because the bake is what would
+        // break next.
+        assert!(
+            STROKE_FORMAT
+                .guaranteed_format_features(wgpu::Features::empty())
+                .allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
     }
 
     /// A softness of zero records **no blur pass**, which is the exact identity

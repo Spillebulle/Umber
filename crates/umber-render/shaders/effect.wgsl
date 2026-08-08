@@ -132,8 +132,27 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(p[vi], 0.0, 1.0);
 }
 
+// Read one texel of a coverage field. **Outside the field is zero, not the
+// nearest edge texel**, and that is the rule rather than a detail.
+//
+// Clamp-to-edge is what a `textureLoad` most naturally spells and it is wrong
+// here in exactly the way it is wrong for the selection's feather, whose docs say
+// so: "outside the canvas counts as unselected, so a selection against the
+// document edge fades at it, as Photoshop's and GIMP's do". Replicated instead, a
+// box pass near the border sums the border row over and over, so a layer running
+// to the edge of the canvas — a background wash, a panel of flat colour — keeps a
+// shadow at full strength along that edge rather than falling off. Matching the
+// feather's kernel and then not matching its boundary would be the worse half of
+// both.
+//
+// It is also what a displaced read wants: `fs_resolve` samples the field at
+// `p - offset`, which for a shadow thrown outward runs off the field, and
+// clamping there smears the border column across the margin.
 fn at(t: texture_2d<f32>, p: vec2<i32>, lim: vec2<i32>) -> f32 {
-    return textureLoad(t, clamp(p, vec2<i32>(0), lim - vec2<i32>(1)), 0).r;
+    if (any(p < vec2<i32>(0)) || any(p >= lim)) {
+        return 0.0;
+    }
+    return textureLoad(t, p, 0).r;
 }
 
 fn coverage_at(p: vec2<i32>) -> f32 {
@@ -281,7 +300,17 @@ fn fs_box(@builtin(position) f: vec4<f32>) -> @location(0) f32 {
 // texel, which is what an outline needs.
 fn bilinear(p: vec2<f32>) -> f32 {
     let lim = vec2<i32>(c.src_size);
-    let uv = (p - vec2<f32>(0.5)) / f32(c.down);
+    // **`p / down - 0.5`, and not `(p - 0.5) / down`.** `fs_down` writes small
+    // texel `n` from full-resolution texels `[n·down, n·down + down)`, so what it
+    // holds is centred at full coordinate `n·down + down/2` — which means the
+    // small-space coordinate of a full-resolution position `p` is `p/down - 0.5`.
+    // The other spelling is `p/down - 0.5/down`, which is right at `down == 1` and
+    // reads three eighths of a small texel off at 4: a shadow displaced a pixel
+    // and a half up and to the left whatever its angle, on the downsampled path
+    // alone. The coincidence at `down == 1` is what hid it, and no test ran the
+    // other path until one did — `a_softened_shadow_is_mirrored_about_both_axes`
+    // now sweeps both, and a diagonal shift is exactly what a mirror test sees.
+    let uv = p / f32(c.down) - vec2<f32>(0.5);
     let base = vec2<i32>(floor(uv));
     let fr = fract(uv);
     let a00 = at(src, base + vec2<i32>(0, 0), lim);
