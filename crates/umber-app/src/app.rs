@@ -666,15 +666,6 @@ impl UmberApp {
                 // the caption on whichever layer had moved into that row. A
                 // slot never changes hands while a patch naming it is held —
                 // that is what parking a deleted slice buys.
-                let at = self
-                    .editor
-                    .layers
-                    .layers()
-                    .iter()
-                    .position(|l| l.slot() == Some(patch.slot));
-                // `None` is a layer that has left the stack, which is a patch
-                // that no longer names anything either; the record goes with
-                // it rather than being put somewhere it does not belong.
                 // **The GPU is found before the record moves, not after.** The
                 // whole point of this arm is that the two cannot come apart, so
                 // an early return between them would be this arm's own failure.
@@ -688,15 +679,7 @@ impl UmberApp {
                 if !gfx.canvases.contains_key(&id) {
                     return EditBody::Text { patch, was };
                 }
-                let mut held = None;
-                if let Some(at) = at {
-                    held = self.editor.layers.take_text(at);
-                    if let Some(text) = was {
-                        // `set_text` refuses a folder, and a folder holds no
-                        // slot, so this cannot be one.
-                        self.editor.layers.set_text(at, *text);
-                    }
-                }
+                let held = swap_text_at_slot(&mut self.editor.layers, patch.slot, was);
                 let gfx = self.gfx.as_mut().expect("checked a line ago");
                 let canvas = gfx.canvases.get_mut(&id).expect("checked a line ago");
                 EditBody::Text {
@@ -5109,6 +5092,40 @@ fn swap_patch(canvas: &mut CanvasRenderer, gpu: &Gpu, patch: &PixelPatch) -> Pix
     PixelPatch::from_pieces(patch.rect, patch.slot, pieces)
 }
 
+/// Put `was` on the layer holding `slot`, and hand back the record it had.
+///
+/// **The layer is found by the slot and never by a position.** Stack order is a
+/// `Vec` order — a reorder moves every row and moves no slot — so an entry that
+/// recorded where the layer *sat* would put the caption on whichever layer had
+/// since moved into that row. A slot cannot change hands while a patch naming it
+/// is held, which is exactly what parking a deleted slice buys.
+///
+/// A layer that has left the stack answers `None` and takes the record with it:
+/// the patch beside it no longer names anything either, so there is nowhere the
+/// record could go that would not be somewhere it does not belong.
+///
+/// A free function so `App::reverse`'s riskiest line can be driven without an
+/// `UmberApp`, which cannot be built in a test — the same reason
+/// [`paste_refusal`] is one. The history module's own model of this arm
+/// hard-codes index 0 and therefore cannot see any of it.
+fn swap_text_at_slot(
+    layers: &mut umber_core::LayerStack,
+    slot: u32,
+    was: Option<Box<umber_core::TextObject>>,
+) -> Option<Box<umber_core::TextObject>> {
+    let at = layers
+        .layers()
+        .iter()
+        .position(|l| l.slot() == Some(slot))?;
+    let held = layers.take_text(at);
+    if let Some(text) = was {
+        // `set_text` refuses a folder, and a folder holds no slot, so the layer
+        // found above cannot be one.
+        layers.set_text(at, *text);
+    }
+    held
+}
+
 /// The smallest rectangle holding both.
 ///
 /// A free function so the arithmetic is checked without a device, which is what
@@ -5581,6 +5598,94 @@ mod tests {
         );
         assert!(stack.take_text(0).is_some());
         assert_eq!(stack.active_refusal(EditTarget::Layer), None);
+    }
+
+    /// A record for a test stack.
+    fn a_record(caption: &str) -> umber_core::TextObject {
+        umber_core::TextObject::new(
+            umber_core::text::TextBlock {
+                text: caption.to_string(),
+                size: 48.0,
+                line_spacing: 1.2,
+                tracking: 0.0,
+                align: umber_core::text::Align::Left,
+            },
+            umber_core::TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: String::new(),
+            },
+            Color::new(0.1, 0.1, 0.1, 1.0),
+            umber_core::Placement::identity(PixelRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 24,
+            }),
+        )
+    }
+
+    /// **An undo puts the record back on the layer the patch names, not the row
+    /// it used to be in.**
+    ///
+    /// Stack order is a `Vec` order: a reorder moves every row and moves no
+    /// slot. An entry that recorded a *position* would put the caption on
+    /// whichever layer had since moved into that row, which is a layer nobody
+    /// edited quietly gaining somebody else's text.
+    ///
+    /// This is `App::reverse`'s riskiest line, driven directly, because
+    /// `UmberApp` is built around an `EventLoopProxy` and cannot exist in a test
+    /// — and because the history module's own model of this arm hard-codes index
+    /// 0 and can see none of it.
+    ///
+    /// **The target has to end up somewhere that is not index 0**, which the
+    /// first draft of this got wrong: it reordered the stack so the layer
+    /// holding the record landed at the bottom, which is exactly the position a
+    /// hard-coded implementation would use. Replacing the lookup with a literal
+    /// `0` left it green. Measured, not reasoned.
+    #[test]
+    fn an_undo_puts_the_record_back_on_the_layer_the_patch_names() {
+        let mut stack = umber_core::LayerStack::new();
+        let bottom = stack.active_slot().expect("a fresh stack has a layer");
+        let top = stack.add().expect("room for a second");
+        assert_ne!(bottom, top);
+        assert!(stack.set_text(0, a_record("The lower one")));
+
+        // Reordered, so the layer holding the record is no longer in the row it
+        // was in — and, load-bearing, no longer in row 0.
+        assert!(stack.move_up(0).is_some());
+        assert_eq!(stack.layers()[0].slot(), Some(top));
+        assert_eq!(stack.layers()[1].slot(), Some(bottom));
+        assert!(stack.text_at(0).is_none());
+
+        let held = swap_text_at_slot(&mut stack, bottom, Some(Box::new(a_record("As it was"))));
+        assert_eq!(
+            held.map(|t| t.block.text.clone()),
+            Some("The lower one".to_string()),
+            "the record came off the wrong layer"
+        );
+        assert_eq!(
+            stack.text_at(1).map(|t| t.block.text.clone()),
+            Some("As it was".to_string())
+        );
+        assert!(
+            stack.text_at(0).is_none(),
+            "a layer nobody edited was given somebody else's caption"
+        );
+
+        // `None` takes the record off, which is what undoing a *placement* does.
+        assert!(swap_text_at_slot(&mut stack, bottom, None).is_some());
+        assert!(stack.text_at(1).is_none());
+
+        // A slot no layer holds answers nothing and changes nothing, which is a
+        // patch whose layer has left the stack.
+        assert!(stack.set_text(1, a_record("Still here")));
+        assert!(swap_text_at_slot(&mut stack, 99, Some(Box::new(a_record("Nowhere")))).is_none());
+        assert_eq!(
+            stack.text_at(1).map(|t| t.block.text.clone()),
+            Some("Still here".to_string())
+        );
+        assert!(stack.text_at(0).is_none());
     }
 
     /// **A text layer may only grow into pixels that are not there**, and this
