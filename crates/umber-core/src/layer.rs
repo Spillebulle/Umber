@@ -1805,16 +1805,17 @@ impl LayerStack {
             // for a target this build has never heard of, on the gate that exists
             // to refuse.
             //
-            // **`Editor::stroke_target` is not the precedent for this**, and this
-            // comment claimed it was. That one reads
-            // `match (self.edit_target, self.layers.active_mask())` with a
-            // catch-all `_ =>` falling through to the *layer's* slot — so a third
-            // `EditTarget` there is a stroke silently landing on the layer, which
-            // is the same silence in the other direction and is `editor.rs`'s to
-            // close. Two readers of one enum disagreeing about whether it is
-            // closed is exactly the shape "Partial exhaustiveness is worse than
-            // none" describes, and the honest statement is that this half is shut
-            // and that one is not.
+            // `Editor::stroke_target` is the other reader of this enum and is
+            // exhaustive too — but it was not when this comment first cited it as
+            // the precedent, and the history is the point. It read
+            // `match (self.edit_target, self.layers.active_mask())` with one
+            // catch-all falling through to the *layer's* slot, so a third variant
+            // there would have been a stroke landing silently on the layer's
+            // pixels. Both halves are shut now, and what closed the second was
+            // somebody reading the claim made about it here. **Two readers of one
+            // enum must not disagree about whether it is closed**, and a comment
+            // asserting that they agree is worth exactly as much as the last time
+            // anybody checked.
             match target {
                 EditTarget::Layer => return Some(EditRefusal::Text),
                 EditTarget::Mask => {}
