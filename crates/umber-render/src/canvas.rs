@@ -21,6 +21,11 @@ use wgpu::util::DeviceExt;
 /// — the hardware decodes to linear, blends, and re-encodes on write.
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// What one pixel of [`LAYER_FORMAT`] costs. Four, and it is named because
+/// [`grown_capacity`] reasons in bytes and a bare `* 4` beside a canvas size
+/// reads as arbitrary.
+const LAYER_BYTES_PER_PIXEL: u64 = 4;
+
 /// The same bits, viewed without the transfer function.
 ///
 /// Used by one pass and one pass only: [`CanvasRenderer::flip_layers`], which
@@ -121,13 +126,22 @@ const _: () = assert!(
 /// somewhere to preview.
 ///
 /// **Raising [`MAX_LAYERS`] *lowers* this, and lowers [`MAX_DRAWS`] with it.**
-/// The ceiling is fixed by the device, so every layer added takes two slices
-/// out of the effect budget: `MAX_DRAWS` is `MAX_SLOTS - MAX_LAYERS - 1`, which
-/// is 155 at a stack cap of 100 and **1** at 127. That is the opposite of what
-/// "derived" suggests and nothing fails when it happens — `MAX_DRAWS >=
-/// MAX_LAYERS` still holds everywhere the const assertion above allows. Anyone
-/// raising the stack cap has to decide whether the effect budget left is one
-/// worth having.
+/// The ceiling is fixed by the device, so every layer added takes two slices out
+/// of the effect budget. This is `MAX_SLOTS - (MAX_LAYERS * 2 + 1)` — 55 at a
+/// stack cap of 100 and **1** at 127 — while `MAX_DRAWS` is
+/// `MAX_SLOTS - MAX_LAYERS - 1`, which is 155 and 128 at the same two. They are
+/// different quantities and this comment ran them together, quoting the effect
+/// budget's 1 as though it were the draw cap; at 127 layers `MAX_DRAWS >=
+/// MAX_LAYERS` is true because it is 128, not because 1 would have satisfied it.
+/// The test loop computes both.
+///
+/// **Something does fail when it happens**, and this comment claimed otherwise:
+/// `effect::BUDGET_DERIVATION` is a `const` assertion over `LayerStack::MAX`, so
+/// raising the stack cap without re-deriving the model's own cap is a compile
+/// error naming the reason. That was true when this was written — the model
+/// branch had not landed — and false from the merge onwards. Anyone raising the
+/// stack cap still has to decide whether the effect budget left is one worth
+/// having; they will simply be told rather than left to find out.
 ///
 /// It also does not carry through to the shader, which holds `MAX_DRAWS` as a
 /// literal `191u`. That is a fourth number and it is changed by hand;
@@ -179,9 +193,64 @@ const fn effect_slices(layers: usize, ceiling: usize) -> usize {
     ceiling - (layers * 2 + 1)
 }
 
-/// Texture-array slices allocated up front. Growth doubles this, so a typical
-/// document never pays for a copy.
+/// Texture-array slices allocated up front. Growth doubles this while the array
+/// is cheap, so a typical document never pays for a copy — see
+/// [`grown_capacity`].
 const INITIAL_SLOTS: u32 = 4;
+
+/// How large the layer array may grow **by doubling**.
+///
+/// Doubling is the right way to grow a collection whose elements are cheap and
+/// the wrong way to grow one whose elements are canvas-sized. A slice is
+/// `width × height × 4`, so the same "one more slice" costs 256 KiB at 256² and
+/// 400 MB at 10000², and the overshoot is what a budget counted in *slices*
+/// cannot see. Stating it in bytes is what makes the policy canvas-aware.
+///
+/// A quarter of a gigabyte of speculative texture is the trade: enough that an
+/// ordinary document never reallocates twice for the same layer, small enough
+/// that the waste can never dominate a working set. At 2048² it allows doubling
+/// to 16 slices; at 10000² it allows none at all, which is correct — nothing
+/// should speculatively allocate 400 MB.
+const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
+
+/// The capacity to allocate so that `needed` slices exist, given how large one
+/// slice is.
+///
+/// **Double while the resulting array would stay inside
+/// [`GROWTH_DOUBLING_BUDGET_BYTES`]; past that, grow to exactly `needed`.**
+///
+/// A pure function so the policy is testable without a device, which is the
+/// arrangement [`band_rows`] already keeps and the only one that works here: the
+/// case that matters is a 129th slice at 2048², and allocating it for real is
+/// two gigabytes of texture nobody can ask a CI runner for.
+///
+/// **This exists because raising `MAX_SLOTS` from 129 to 256 silently changed
+/// what `.min(MAX_SLOTS)` did.** That clamp had been acting as a *tight* bound
+/// on the overshoot: at a ceiling of 129 a document needing its 129th slice
+/// doubled from 128 to 256 and was clamped straight back to 129. At a ceiling of
+/// 256 the same document gets 256 — 4.29 GB at 2048² where 2.06 GB was asked
+/// for, with the old array still alive during the copy, and `ensure_slots` never
+/// shrinks so it is permanent for the session. **A legal document with no
+/// effects in it reaches this**: 64 layers each with a mask is 128 slices and
+/// `begin_float` then asks for the 129th.
+///
+/// Restoring a 129 clamp was the obvious repair and is wrong — it breaks the
+/// moment an effect claims a slice. A budget in bytes does not depend on a
+/// ceiling that has already moved twice.
+fn grown_capacity(current: u32, needed: u32, slice_bytes: u64) -> u32 {
+    let mut capacity = current.max(1);
+    while capacity < needed
+        && u64::from(capacity)
+            .saturating_mul(2)
+            .saturating_mul(slice_bytes)
+            <= GROWTH_DOUBLING_BUDGET_BYTES
+    {
+        capacity = capacity.saturating_mul(2);
+    }
+    // Past the budget, exactly what was asked for. `max` rather than a branch:
+    // where doubling did reach `needed` this keeps the amortised capacity.
+    capacity.max(needed)
+}
 
 const DAB_STRIDE: u64 = std::mem::size_of::<Dab>() as u64;
 
@@ -2104,7 +2173,10 @@ impl CanvasRenderer {
     ///
     /// Growth reallocates the array and copies every existing slice, so it
     /// doubles rather than growing by one — a document that reaches eight
-    /// layers pays for two copies, not eight.
+    /// layers pays for two copies, not eight. **Only while the array is cheap**:
+    /// past a byte budget it grows to exactly what was asked for, because a
+    /// slice is canvas-sized and doubling one is not an optimisation but a
+    /// gigabyte. [`grown_capacity`] is the whole policy and has the argument.
     ///
     /// **The `.min` below fails open and the assertion is what stops it.**
     /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
@@ -2124,11 +2196,10 @@ impl CanvasRenderer {
         if needed <= self.layers.capacity {
             return;
         }
-        let mut capacity = self.layers.capacity.max(1);
-        while capacity < needed {
-            capacity *= 2;
-        }
-        let capacity = capacity.min(MAX_SLOTS as u32);
+        let slice_bytes =
+            u64::from(self.doc_size.x) * u64::from(self.doc_size.y) * LAYER_BYTES_PER_PIXEL;
+        let capacity =
+            grown_capacity(self.layers.capacity, needed, slice_bytes).min(MAX_SLOTS as u32);
         log::info!(
             "growing layer storage {} -> {} slots",
             self.layers.capacity,
@@ -5883,6 +5954,85 @@ mod tests {
             size <= limit,
             "the composite uniform is {size} bytes against a {limit}-byte binding limit"
         );
+    }
+
+    /// One slice of a square canvas, in bytes.
+    fn slice_of(side: u64) -> u64 {
+        side * side * LAYER_BYTES_PER_PIXEL
+    }
+
+    /// **The regression this policy exists for, stated as the allocation it
+    /// makes.**
+    ///
+    /// 64 layers each with a mask is 128 slices and a legal document with no
+    /// effects in it; `begin_float` then asks for the 129th. Under plain
+    /// doubling that allocates 256 — 4.29 GB at 2048² against the 2.06 GB
+    /// asked for, with the old array still alive during the copy and no
+    /// shrinking afterwards.
+    ///
+    /// It passed for the wrong reason before `MAX_SLOTS` moved: `.min(129)`
+    /// clamped the overshoot away, so the doubling was never exercised and the
+    /// clamp was load-bearing without saying so. **Nothing measured the
+    /// allocated capacity at all** — the only two assertions in the suite are
+    /// `< 8` and `>= 8` — which is why raising the ceiling to 256 changed the
+    /// behaviour in silence.
+    #[test]
+    fn a_document_does_not_double_its_layer_array_to_reach_one_more_slice() {
+        // 2048², the canvas the arithmetic was worked out on.
+        assert_eq!(grown_capacity(128, 129, slice_of(2048)), 129);
+        // And at 10000², where the overshoot alone would be 50 GB.
+        assert_eq!(grown_capacity(128, 129, slice_of(10_000)), 129);
+        // The clamp in `ensure_slots` is not what is doing this: 129 is well
+        // under the 256 ceiling, so a reverted policy would return 256 here
+        // and the clamp would pass it straight through.
+        assert!(129 < MAX_SLOTS as u32);
+    }
+
+    /// Growth stays amortised while a slice is cheap, which is the whole reason
+    /// doubling is there.
+    #[test]
+    fn a_small_canvas_still_doubles() {
+        // 256², 256 KiB a slice: a handful of slices is nothing, so a document
+        // adding its fifth layer gets room for eight.
+        assert_eq!(grown_capacity(4, 5, slice_of(256)), 8);
+        // And from one, up to the first power of two that holds it.
+        assert_eq!(grown_capacity(1, 5, slice_of(256)), 8);
+    }
+
+    /// The budget is in bytes, so the same slice count behaves differently on
+    /// different canvases — which is the point of stating it that way.
+    #[test]
+    fn the_growth_budget_is_measured_in_bytes_not_slices() {
+        // 16 MiB a slice: doubling to 16 slices is 256 MiB and allowed, to 32
+        // is 512 MiB and refused.
+        assert_eq!(grown_capacity(8, 9, slice_of(2048)), 16);
+        assert_eq!(grown_capacity(16, 17, slice_of(2048)), 17);
+        // 400 MB a slice: one slice is already over the budget, so every
+        // growth is exact and nothing is allocated on speculation.
+        for needed in [2u32, 3, 9, 100] {
+            assert_eq!(
+                grown_capacity(needed - 1, needed, slice_of(10_000)),
+                needed,
+                "{needed} slices at 10000²"
+            );
+        }
+    }
+
+    /// Total, and never short of what was asked for. The second is the one that
+    /// would be a validation error rather than a waste.
+    #[test]
+    fn the_growth_rule_always_reaches_what_was_asked_for() {
+        for side in [1u64, 64, 256, 2048, 10_000] {
+            for needed in 1..=MAX_SLOTS as u32 {
+                for current in [0u32, 1, 4, needed.saturating_sub(1)] {
+                    let got = grown_capacity(current, needed, slice_of(side));
+                    assert!(got >= needed, "{side}²: {current} -> {needed} gave {got}");
+                }
+            }
+        }
+        // A degenerate canvas has no bytes to budget against and must still
+        // terminate rather than spinning or overflowing.
+        assert!(grown_capacity(1, 200, 0) >= 200);
     }
 
     #[test]
