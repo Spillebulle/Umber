@@ -1803,9 +1803,18 @@ impl LayerStack {
             // An exhaustive `match` and not `target == EditTarget::Layer`, which
             // is `matches!` wearing an equality: it would answer **permitted**
             // for a target this build has never heard of, on the gate that exists
-            // to refuse. `Editor::stroke_target` already matches this enum
-            // exhaustively, and two readers of one enum must not disagree about
-            // whether it is closed.
+            // to refuse.
+            //
+            // **`Editor::stroke_target` is not the precedent for this**, and this
+            // comment claimed it was. That one reads
+            // `match (self.edit_target, self.layers.active_mask())` with a
+            // catch-all `_ =>` falling through to the *layer's* slot — so a third
+            // `EditTarget` there is a stroke silently landing on the layer, which
+            // is the same silence in the other direction and is `editor.rs`'s to
+            // close. Two readers of one enum disagreeing about whether it is
+            // closed is exactly the shape "Partial exhaustiveness is worse than
+            // none" describes, and the honest statement is that this half is shut
+            // and that one is not.
             match target {
                 EditTarget::Layer => return Some(EditRefusal::Text),
                 EditTarget::Mask => {}
@@ -4137,6 +4146,49 @@ mod tests {
             Some("Caption".into()),
             "the record came back with the layer, and nothing wrote it down"
         );
+    }
+
+    /// **Both of `byte_len`'s new terms, and each on its own.**
+    ///
+    /// The text and the effects sides added a term to the same sum four days
+    /// apart, and a fixture carrying only one of them leaves the other
+    /// contributing zero — so deleting it from the expression fails nothing. That
+    /// is exactly what the test above did until this was written: it parks text
+    /// and no effect, with a `>=`, so the effects term was unguarded on **both**
+    /// sides of the merge. `byte_len` is asserted in this file and nowhere else in
+    /// the workspace, which is what makes that a real hole rather than a
+    /// duplicate.
+    ///
+    /// The comparisons differ in **one** thing at a time, so neither term can be
+    /// met by the other's bytes. Both were checked by mutation, separately.
+    #[test]
+    fn a_parked_layer_is_charged_for_its_text_and_for_its_effects() {
+        let park = |text: bool, effect: bool| {
+            let mut s = LayerStack::new();
+            s.add();
+            if text {
+                assert!(s.set_text(1, some_text()));
+            }
+            if effect {
+                assert!(s.set_effect(1, Effect::outline()));
+            }
+            let before = s.shape(64 * 64 * 4);
+            let removed = s.remove(1).expect("not the last layer");
+            before.with_removed(removed).byte_len()
+        };
+
+        let bare = park(false, false);
+        assert!(
+            park(true, false) >= bare + some_text().byte_len(),
+            "the text record is charged"
+        );
+        assert!(
+            park(false, true) >= bare + std::mem::size_of::<Effect>(),
+            "the effect is charged"
+        );
+        // And together, so neither term can be standing in for the other.
+        assert!(park(true, true) > park(true, false));
+        assert!(park(true, true) > park(false, true));
     }
 
     /// **A canvas flip mirrors the record rather than dropping it.** Undoing a

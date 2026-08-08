@@ -67,12 +67,18 @@
 //!
 //! # The record has a size bound of its own
 //!
-//! [`MAX_RECORD_BYTES`]. Every other entry in a saved document is sized by the
-//! *canvas*, which [`crate::ImportedDocument::MAX_TOTAL_BYTES`] already bounds;
-//! this one is sized by how much somebody typed, so that bound does not reach
-//! it. A record over the limit is **not written**, and the save says so, rather
-//! than writing one the reader will refuse: a text layer that quietly stopped
-//! being editable at the next open would be a loss nobody was told about.
+//! [`MAX_RECORD_BYTES`]. A layer, a mask and the merged image are all sized by
+//! the *canvas*, which [`crate::ImportedDocument::MAX_TOTAL_BYTES`] bounds; this
+//! one is sized by how much somebody typed, so that bound does not reach it. A
+//! record over the limit is **not written**, and the save says so, rather than
+//! writing one the reader will refuse: a text layer that quietly stopped being
+//! editable at the next open would be a loss nobody was told about.
+//!
+//! **It is the second entry of that shape and not the first.** A layer effects
+//! record got there first and is sized by a *count* rather than by the canvas
+//! too, which is why `docimport::container::read_optional_entry_bounded` already
+//! existed to be called; the two figures are deliberately different numbers and
+//! [`MAX_RECORD_BYTES`] says why.
 
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
@@ -105,10 +111,10 @@ pub const VERSION: u32 = 1;
 /// The most a single text record may occupy in the archive.
 ///
 /// One mebibyte, and it is a bound on the *record* rather than on the canvas —
-/// see the module docs for why nothing else in a saved document bounds it. A
-/// mebibyte of UTF-8 is on the order of a million characters, which is a few
-/// hundred pages of prose in one layer; [`crate::text::MAX_PIXELS`] will refuse
-/// to set anything near it long before this bites at any legible size.
+/// see the module docs for why the canvas-sized entries' bound does not reach
+/// this one. A mebibyte of UTF-8 is on the order of a million characters, which
+/// is a few hundred pages of prose in one layer; [`crate::text::MAX_PIXELS`] will
+/// refuse to set anything near it long before this bites at any legible size.
 ///
 /// It bounds both directions. The writer measures the encoded record and writes
 /// none at all when it is over, with a [`crate::SaveWarning`] naming the layer;

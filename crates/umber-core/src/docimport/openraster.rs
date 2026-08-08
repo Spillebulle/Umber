@@ -605,9 +605,14 @@ fn load_layer(
 /// at all.
 ///
 /// **It cannot be a decompression bomb either, and that needed a bound of its
-/// own** — see [`MAX_EFFECTS_BYTES`]. Every other entry in the archive is a
-/// canvas and answers to `ImportedDocument::MAX_TOTAL_BYTES`; a record's size
-/// follows how many effects it names, which the *format* does not bound at all.
+/// own** — see [`MAX_EFFECTS_BYTES`]. A layer, a mask and the merged image are
+/// each a canvas and answer to `ImportedDocument::MAX_TOTAL_BYTES`; a record's
+/// size follows how many effects it names, which the *format* does not bound at
+/// all. **A text record is the other entry of that shape**, and it took the same
+/// route with a figure of its own — see [`load_text`] and
+/// [`textobj::MAX_RECORD_BYTES`]. Two callers with two numbers is what the
+/// `limit` parameter is for; a shared one would be sixteen times looser than the
+/// effect model permits, or far too tight for a paragraph.
 fn load_effects(
     zip: &mut Zip<'_>,
     spec: &LayerSpec,
