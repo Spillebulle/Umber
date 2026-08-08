@@ -211,6 +211,14 @@ const INITIAL_SLOTS: u32 = 4;
 /// that the waste can never dominate a working set. At 2048² it allows doubling
 /// to 16 slices; at 10000² it allows none at all, which is correct — nothing
 /// should speculatively allocate 400 MB.
+///
+/// **What it actually bounds is the overshoot, at half of itself.** Doubling
+/// runs only while the resulting array is inside this, so
+/// `capacity × slice ≤ this`; and it stops the first time `capacity >= needed`,
+/// so `capacity < 2 × needed` and the waste is under `capacity / 2` slices.
+/// 134 MB, on any canvas, at any slice count — measured worst 133 MB, at 512²
+/// reaching for a 129th slice.
+/// `the_overshoot_is_bounded_at_half_the_budget_on_every_canvas` sweeps it.
 const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 
 /// The capacity to allocate so that `needed` slices exist, given how large one
@@ -6019,6 +6027,45 @@ mod tests {
                 needed,
                 "{needed} slices at 10000²"
             );
+        }
+    }
+
+    /// **The overshoot is bounded at half the budget, on every canvas size and
+    /// every slice count**, which is the property the whole rule exists for and
+    /// is stronger than the three cases above.
+    ///
+    /// The proof is two lines: doubling only ever runs while the *resulting*
+    /// array is inside the budget, so `capacity × slice_bytes ≤ budget`; and it
+    /// stops the first time `capacity >= needed`, so `capacity < 2 × needed` and
+    /// therefore `capacity − needed < capacity / 2`. The waste is under
+    /// `budget / 2` — 134 MB — whatever the canvas.
+    ///
+    /// Swept rather than argued, because a proof about the code is not a
+    /// statement about the code. Measured, the worst is 133 MB at 512² asking
+    /// for a 129th slice; it falls away at both ends, because a small canvas
+    /// doubles freely over slices that are tiny and a large one never doubles
+    /// at all. At 10000² the waste is exactly zero at every count.
+    #[test]
+    fn the_overshoot_is_bounded_at_half_the_budget_on_every_canvas() {
+        let mut worst = 0u64;
+        for side in [1u64, 64, 256, 512, 1024, 2048, 4096, 10_000] {
+            let slice = slice_of(side);
+            for needed in 1..=MAX_SLOTS as u32 {
+                let cap = grown_capacity(0, needed, slice);
+                let waste = u64::from(cap - needed) * slice;
+                assert!(
+                    waste * 2 <= GROWTH_DOUBLING_BUDGET_BYTES,
+                    "{side}² needing {needed} wasted {waste} bytes"
+                );
+                worst = worst.max(waste);
+            }
+        }
+        // The figure quoted above, so it cannot drift from what is measured.
+        assert_eq!(worst, 133_169_152);
+        // And a canvas whose slices are larger than the budget never
+        // speculates at all.
+        for needed in 1..=MAX_SLOTS as u32 {
+            assert_eq!(grown_capacity(0, needed, slice_of(10_000)), needed);
         }
     }
 
