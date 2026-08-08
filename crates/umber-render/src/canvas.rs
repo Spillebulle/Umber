@@ -135,13 +135,16 @@ const _: () = assert!(
 /// MAX_LAYERS` is true because it is 128, not because 1 would have satisfied it.
 /// The test loop computes both.
 ///
-/// **Something does fail when it happens**, and this comment claimed otherwise:
-/// `effect::BUDGET_DERIVATION` is a `const` assertion over `LayerStack::MAX`, so
-/// raising the stack cap without re-deriving the model's own cap is a compile
-/// error naming the reason. That was true when this was written — the model
-/// branch had not landed — and false from the merge onwards. Anyone raising the
-/// stack cap still has to decide whether the effect budget left is one worth
-/// having; they will simply be told rather than left to find out.
+/// **Something does fail when it happens**, and this comment claimed otherwise.
+/// Raising `umber-core`'s `LayerStack::MAX` is a **compile** error:
+/// `effect::BUDGET_DERIVATION` is a `const` assertion over it, naming the
+/// reason. Raising [`MAX_LAYERS`] *here* alone is a **test** failure instead,
+/// `the_three_draw_capacities_agree`'s equality against that constant — worth
+/// separating, because the whole point of preferring the first is that a
+/// compile error cannot be skipped. Either way somebody is told. The original
+/// claim was true when it was written, before the model landed, and false from
+/// the merge onwards; anyone raising the stack cap still has to decide whether
+/// the effect budget left is one worth having.
 ///
 /// It also does not carry through to the shader, which holds `MAX_DRAWS` as a
 /// literal `191u`. That is a fourth number and it is changed by hand;
@@ -193,10 +196,48 @@ const fn effect_slices(layers: usize, ceiling: usize) -> usize {
     ceiling - (layers * 2 + 1)
 }
 
-/// Texture-array slices allocated up front. Growth doubles this while the array
-/// is cheap, so a typical document never pays for a copy — see
-/// [`grown_capacity`].
+/// Texture-array slices allocated up front, **before** the byte budget is
+/// consulted. Growth doubles from here while the array is cheap, so a typical
+/// document never pays for a copy — see [`grown_capacity`].
+///
+/// Four is only cheap on a canvas where a slice is. Taken literally it is
+/// 1.6 GB at 10000², of which 1.14 GB is speculation on behalf of a document
+/// that has one layer — nine times the 134 MB [`grown_capacity`] bounds itself
+/// by, decided twenty lines from the constant that states that bound. So it
+/// goes through [`initial_slots`], which is the same budget applied to the same
+/// question.
 const INITIAL_SLOTS: u32 = 4;
+
+/// What one slice of a canvas this size costs.
+///
+/// One statement of it, because [`initial_slots`] and
+/// [`CanvasRenderer::ensure_slots`] both budget against it and two spellings
+/// would be two chances to budget against different numbers. Saturating,
+/// though `max_texture_dimension_2d` keeps a canvas four orders of magnitude
+/// below where this could wrap: the value only ever decides whether to
+/// speculate, so a saturated one reads as "far too big to speculate on", which
+/// is the right answer to an impossible canvas — where a debug-build panic, or
+/// a release-build *wrap* to something small enough to authorise unlimited
+/// doubling, would be the wrong two.
+fn slice_bytes(doc_size: UVec2) -> u64 {
+    u64::from(doc_size.x)
+        .saturating_mul(u64::from(doc_size.y))
+        .saturating_mul(LAYER_BYTES_PER_PIXEL)
+}
+
+/// [`INITIAL_SLOTS`], but never more speculation than the growth budget allows.
+///
+/// A renderer holds no pixels when this is asked, so allocating fewer costs a
+/// copy the first time a second layer arrives and nothing else — where
+/// allocating more is a gigabyte nobody asked for, on the canvas where every
+/// other path here has already decided not to speculate.
+fn initial_slots(slice_bytes: u64) -> u32 {
+    let affordable = GROWTH_DOUBLING_BUDGET_BYTES
+        .checked_div(slice_bytes)
+        .unwrap_or(u64::from(INITIAL_SLOTS))
+        .clamp(1, u64::from(INITIAL_SLOTS)) as u32;
+    affordable.min(INITIAL_SLOTS)
+}
 
 /// How large the layer array may grow **by doubling**.
 ///
@@ -209,8 +250,19 @@ const INITIAL_SLOTS: u32 = 4;
 /// A quarter of a gigabyte of speculative texture is the trade: enough that an
 /// ordinary document never reallocates twice for the same layer, small enough
 /// that the waste can never dominate a working set. At 2048² it allows doubling
-/// to 16 slices; at 10000² it allows none at all, which is correct — nothing
-/// should speculatively allocate 400 MB.
+/// to 16 slices; at 10000² it allows none, which is correct — nothing should
+/// speculatively allocate 400 MB.
+///
+/// **Two paths spend slices and only these two consult this.**
+/// [`grown_capacity`] does, and [`initial_slots`] does.
+/// [`CanvasRenderer::resize`] does **not**: it rebuilds the array at
+/// `self.layers.capacity`, a figure decided against the *old* canvas, so a
+/// 512² document that legitimately holds 256 slices for 256 MiB becomes 4.29 GB
+/// the moment somebody resizes it to 2048². That is not this rule's doing and
+/// it predates it, but it is the one door left open, and shutting it needs the
+/// live slot count that only the caller has — `resize` cannot shrink safely on
+/// its own, because it does not know which slices hold pixels. Reported rather
+/// than guessed at.
 ///
 /// **What it actually bounds is the overshoot, at half of itself.** Doubling
 /// runs only while the resulting array is inside this, so
@@ -218,7 +270,9 @@ const INITIAL_SLOTS: u32 = 4;
 /// so `capacity < 2 × needed` and the waste is under `capacity / 2` slices.
 /// 134 MB, on any canvas, at any slice count — measured worst 133 MB, at 512²
 /// reaching for a 129th slice.
-/// `the_overshoot_is_bounded_at_half_the_budget_on_every_canvas` sweeps it.
+/// `the_overshoot_is_bounded_at_half_the_budget_on_every_canvas` sweeps it,
+/// over every starting capacity as well as every target, because the bound is
+/// a statement about the call and not about a cold start.
 const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 
 /// The capacity to allocate so that `needed` slices exist, given how large one
@@ -245,6 +299,26 @@ const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 /// Restoring a 129 clamp was the obvious repair and is wrong — it breaks the
 /// moment an effect claims a slice. A budget in bytes does not depend on a
 /// ceiling that has already moved twice.
+///
+/// **What exact growth costs is O(N) *allocations*, not merely O(N) copies, and
+/// that is the sharper of the two.** Measured, a 2048² document going from 16
+/// slices to 128 one layer at a time is 112 growths, 134 GB copied in total —
+/// fine, 1.2 GB a click at device bandwidth — but also 112 separate requests
+/// for a fresh multi-gigabyte texture with the old one still live, the largest
+/// 2.13 GB against a 4.28 GB peak. A `create_texture` failure there is an
+/// uncaptured device error, which is fatal, so the failure mode of getting this
+/// wrong is not a slow click.
+///
+/// **The alternative is rounding up to a whole `budget / slice_bytes` quantum
+/// past the budget instead of to `needed` exactly**, which cuts 112 growths to
+/// 7 and 134 GB to 7.5, for a waste bound that goes from half the budget to the
+/// whole of it. It degenerates to this rule exactly where the rule matters
+/// most — at 10000² the quantum is one slice. It is not taken here for one
+/// reason: it puts the 129th slice of a 2048² document at 144 rather than 129,
+/// and "restore what the 129 boundary used to allocate" is the property this
+/// fix was asked for. That is a trade between 240 MB held for ever and 105
+/// allocations not made, and it is the reviewer's to settle rather than
+/// something to change quietly here.
 fn grown_capacity(current: u32, needed: u32, slice_bytes: u64) -> u32 {
     let mut capacity = current.max(1);
     while capacity < needed
@@ -2014,7 +2088,7 @@ impl CanvasRenderer {
     }
 
     fn with_shared(device: &wgpu::Device, doc_size: UVec2, shared: Shared) -> Self {
-        let layers = LayerStore::new(device, doc_size, INITIAL_SLOTS);
+        let layers = LayerStore::new(device, doc_size, initial_slots(slice_bytes(doc_size)));
 
         let stroke = make_stroke_texture(device, doc_size);
         let stroke_view = stroke.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2204,10 +2278,15 @@ impl CanvasRenderer {
         if needed <= self.layers.capacity {
             return;
         }
-        let slice_bytes =
-            u64::from(self.doc_size.x) * u64::from(self.doc_size.y) * LAYER_BYTES_PER_PIXEL;
-        let capacity =
-            grown_capacity(self.layers.capacity, needed, slice_bytes).min(MAX_SLOTS as u32);
+        let capacity = grown_capacity(
+            self.layers.capacity,
+            needed,
+            // `self.doc_size`, which `resize` rewrites before anything can ask
+            // again, so the budget is always against the canvas the array is
+            // actually being built for.
+            slice_bytes(self.doc_size),
+        )
+        .min(MAX_SLOTS as u32);
         log::info!(
             "growing layer storage {} -> {} slots",
             self.layers.capacity,
@@ -6000,6 +6079,33 @@ mod tests {
         assert!(129 < MAX_SLOTS as u32);
     }
 
+    /// The array a renderer is *born* with answers to the same budget.
+    ///
+    /// It is allocated before `ensure_slots` can be asked anything, so a
+    /// literal four slices is 1.6 GB at 10000² — 1.14 GB of it speculation for
+    /// a document with one layer, nine times the bound
+    /// [`GROWTH_DOUBLING_BUDGET_BYTES`] states twenty lines above it. Two
+    /// constants disagreeing about the same question.
+    #[test]
+    fn the_array_a_renderer_starts_with_answers_to_the_budget_too() {
+        // Cheap canvases are untouched: four is four.
+        assert_eq!(initial_slots(slice_of(256)), INITIAL_SLOTS);
+        assert_eq!(initial_slots(slice_of(2048)), INITIAL_SLOTS);
+        // 4096²: 64 MiB a slice, so four is 256 MiB — exactly the budget.
+        assert_eq!(initial_slots(slice_of(4096)), 4);
+        // 10000²: 400 MB a slice, so one is already over and one is what it
+        // takes. Never zero — a renderer with no slices has nowhere to paint.
+        assert_eq!(initial_slots(slice_of(10_000)), 1);
+        // 8192²: 256 MiB a slice, one fits exactly.
+        assert_eq!(initial_slots(slice_of(8192)), 1);
+        // Total, including the degenerate canvas `slice_bytes` can report.
+        for side in [1u64, 64, 512, 2048, 4096, 10_000, 40_000] {
+            let n = initial_slots(slice_of(side));
+            assert!((1..=INITIAL_SLOTS).contains(&n), "{side}² asked for {n}");
+        }
+        assert_eq!(initial_slots(0), INITIAL_SLOTS);
+    }
+
     /// Growth stays amortised while a slice is cheap, which is the whole reason
     /// doubling is there.
     #[test]
@@ -6044,28 +6150,47 @@ mod tests {
     /// statement about the code. Measured, the worst is 133 MB at 512² asking
     /// for a 129th slice; it falls away at both ends, because a small canvas
     /// doubles freely over slices that are tiny and a large one never doubles
-    /// at all. At 10000² the waste is exactly zero at every count.
+    /// at all. Against this call a canvas at 10000² adds no waste at all.
+    ///
+    /// **`current` is swept and the first draft did not sweep it**, which made
+    /// this exactly the guard CLAUDE.md warns about: one whose comment claims
+    /// more reach than its mutations demonstrate. Starting every case from a
+    /// cold zero, `let mut capacity = current.max(1).next_power_of_two();`
+    /// passes it untouched — and that mutation wastes **102 GB** at 10000²
+    /// growing from 129 slices to 130. The test whose whole purpose is "can
+    /// this still overshoot" could not see an overshoot three orders of
+    /// magnitude past its own bound.
+    ///
+    /// The range is `0..needed` and not `0..=MAX_SLOTS`, because that is the
+    /// function's contract: `ensure_slots` returns early unless
+    /// `needed > capacity`, so it is never called with `current >= needed`.
+    /// Sweeping above `needed` would measure `current - needed` slices of an
+    /// array that already exists and call the excess this function's fault.
     #[test]
     fn the_overshoot_is_bounded_at_half_the_budget_on_every_canvas() {
         let mut worst = 0u64;
         for side in [1u64, 64, 256, 512, 1024, 2048, 4096, 10_000] {
             let slice = slice_of(side);
             for needed in 1..=MAX_SLOTS as u32 {
-                let cap = grown_capacity(0, needed, slice);
-                let waste = u64::from(cap - needed) * slice;
-                assert!(
-                    waste * 2 <= GROWTH_DOUBLING_BUDGET_BYTES,
-                    "{side}² needing {needed} wasted {waste} bytes"
-                );
-                worst = worst.max(waste);
+                for current in 0..needed {
+                    let cap = grown_capacity(current, needed, slice);
+                    let waste = u64::from(cap - needed) * slice;
+                    assert!(
+                        waste * 2 <= GROWTH_DOUBLING_BUDGET_BYTES,
+                        "{side}² growing {current} -> {needed} wasted {waste} bytes"
+                    );
+                    worst = worst.max(waste);
+                }
             }
         }
         // The figure quoted above, so it cannot drift from what is measured.
         assert_eq!(worst, 133_169_152);
         // And a canvas whose slices are larger than the budget never
-        // speculates at all.
+        // speculates at all, from any starting capacity.
         for needed in 1..=MAX_SLOTS as u32 {
-            assert_eq!(grown_capacity(0, needed, slice_of(10_000)), needed);
+            for current in 0..needed {
+                assert_eq!(grown_capacity(current, needed, slice_of(10_000)), needed);
+            }
         }
     }
 
