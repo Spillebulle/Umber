@@ -2157,6 +2157,16 @@ The rules, and they are cheap:
   demonstrates.** Two of the four carried a doc comment promising exhaustiveness
   the code did not have, and the guard's own first draft made the same mistake
   one level up. The claim is easier to write than the guard.
+  **This recurs, and the recursion is the thing to expect.** The slot-growth
+  bound's sweep called `grown_capacity(0, needed, slice)` — always a cold
+  start — while its comment claimed the bound held for every current capacity.
+  A mutation to `current.max(1).next_power_of_two()` wastes **102 GB** at
+  10000² and walked through it untouched, because at `current = 0` it is the
+  identity. A guard written to answer "can this still overshoot" was blind to
+  an overshoot three orders of magnitude past its own bound. **Check that a
+  guard's inputs span the contract its comment states**, not merely that it
+  fails on the bug you had in mind; the sweep is now over `0..needed`, which
+  is the function's actual domain.
 - **A `None` returned into a `.flatten()` is not a refusal, it is a silence.**
   `SaveHistory::new` answers `None` when a patch names a slot no layer holds,
   and its call site reads
@@ -3549,6 +3559,22 @@ parts that mattered are not the obvious ones.
   the shared checkout and switched the working tree onto it. Tie the cleanup to
   the agent being finished with, not to its branch being merged, and do the
   whole sweep once at the end.
+- **Commit before mutating.** An agent undoing a mutation test with
+  `git checkout -- <path>` destroyed its own uncommitted work in the same
+  stroke, because the file held both. It redid it from context and nothing was
+  lost, but the habit is free: mutation testing is now a routine part of how
+  work is verified here, and `git checkout` is how a mutation is reverted, so
+  the two collide by default rather than by accident.
+- **A merged branch can still be wrong in the *combination*, and only an
+  independent pass over `main` finds it.** Three branches each had a critic that
+  found real defects, and all three were green. Merged, `MAX_SLOTS` moving from
+  129 to 256 silently changed what `ensure_slots` does without a line of it
+  being touched — the `.min(MAX_SLOTS)` had been acting as a *tight* bound, so a
+  legal document went from allocating 129 slices to 256. No branch critic could
+  have seen it; each branch was self-consistent. **Run a reviewer over the merge
+  itself**, tell it that commits made *at merge time* have been reviewed by
+  nobody, and ask it specifically for claims that were true on one branch and
+  are false now — that class was three of its six findings.
 - **Verify the claim that failed last time, personally.** When a review finds
   that a guard covered a *copy* of the code rather than the code, do not accept
   "fixed" on report — re-run the mutation yourself. Doing so is two minutes and

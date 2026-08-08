@@ -92,9 +92,13 @@ use crate::layer::BlendMode;
 /// 256 is the ceiling and a 257th slice is a `create_texture` validation error —
 /// which `crash::device_error` makes fatal. An effect draw reads an effect slice
 /// one for one, which is why the draw budget can never exceed the slice budget.
-/// `DEVICE_SLICES` is written out rather than spelled `LayerStack::MAX_SLOTS`
-/// because that constant is 129 in this tree and is being raised to 256 on
-/// another branch; the derivation has never depended on it.
+/// `DEVICE_SLICES` is written out rather than spelled `LayerStack::MAX_SLOTS`,
+/// which now also holds 256. Two literals for one quantity is the cost, and it
+/// is paid deliberately: this derivation is about what the *device* guarantees,
+/// where `MAX_SLOTS` is about how many slices Umber will hand out, and the two
+/// agreeing today is a fact rather than a definition. They are tied by
+/// `the_slice_ceiling_agrees_with_umber_core` in `umber-render`, which is the
+/// only crate that can see both.
 ///
 /// **Which is why the derivation is asserted here rather than promised for the
 /// merge.** [`BUDGET_DERIVATION`] is a `const` assertion over
@@ -105,8 +109,10 @@ use crate::layer::BlendMode;
 /// `composite.wgsl`, and the third statement of it that
 /// `docs/layer-effects.md` §6.3 wants — `DEVICE_SLICES` against
 /// `downlevel_defaults().max_texture_array_layers`, which `umber-core` cannot
-/// see because it may not depend on wgpu. **That one exists nowhere in the
-/// tree yet** and belongs beside `canvas.rs`'s own `MAX_SLOTS`. A truncated
+/// see because it may not depend on wgpu. **That one lives in `canvas.rs`**,
+/// beside that crate's own `MAX_SLOTS`, as a `const` assertion against
+/// `downlevel_defaults()` — so the device figure is checked where wgpu is
+/// visible and reaches this crate only through the test named above. A truncated
 /// draw list is the outcome all of them exist to keep unreachable, because a
 /// list cut off mid-group leaves an accumulator open.
 ///
@@ -141,9 +147,8 @@ pub const DEVICE_SLICES: usize = 256;
 /// wrong silently the first time [`crate::LayerStack::MAX`] moves: raise it to
 /// 100 and the correct figure is 55, while 127 would ask the device for 72
 /// slices past its guarantee — the fatal `create_texture` validation error the
-/// whole derivation exists to avoid. Everything it reads is in this tree, and
-/// it deliberately does not mention `LayerStack::MAX_SLOTS`, which is being
-/// raised elsewhere.
+/// whole derivation exists to avoid. Everything it reads is in this crate,
+/// which is what makes it a compile error rather than a test.
 const BUDGET_DERIVATION: () = assert!(
     MAX_ENABLED == DEVICE_SLICES - (crate::layer::LayerStack::MAX * 2 + 1),
     "the effect budget no longer follows from the device's slice guarantee"
