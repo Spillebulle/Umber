@@ -2146,23 +2146,7 @@ impl UmberApp {
                 .iter()
                 .zip(&pixels)
                 .zip(&masks)
-                .map(|((layer, px), mask)| SaveLayer {
-                    visible: layer.visible,
-                    opacity: layer.opacity,
-                    mask: mask.as_deref(),
-                    // Straight off the layer, because a save reads the stack
-                    // it is looking at. The autosave cannot do this — its
-                    // pixels arrive over several frames, so its metadata is
-                    // snapshotted when the capture begins — and the two have
-                    // to write the same file. See `autosave::LayerMeta`.
-                    effects: layer.effects(),
-                    clipped: layer.clipped,
-                    locked: layer.locked,
-                    link: layer.link,
-                    depth: layer.depth,
-                    folder: layer.is_folder(),
-                    ..SaveLayer::new(&layer.name, layer.blend, px)
-                })
+                .map(|((layer, px), mask)| save_layer(layer, px, mask.as_deref()))
                 .collect();
 
             // The undo history, resolved against the stack it belongs to. No
@@ -4407,6 +4391,45 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// One layer as an explicit Save writes it.
+///
+/// A free function rather than a closure inside the save, so that what it
+/// carries can be **tested by value** — and this is not tidiness. The guard
+/// over the two `SaveLayer` construction sites is textual: it counts the sites
+/// and requires each to state `effects:`. That catches the line being
+/// *deleted* and is defeated by one that still names the field while passing
+/// nothing. `effects: &[]` is both what this path held before it was wired and
+/// what `..SaveLayer::new(…)` still defaults to, so it is the likelier
+/// regression of the two, and it was the one nothing caught.
+/// `a_save_carries_the_effects_the_layer_holds` closes it.
+///
+/// The autosave's equivalent already had a behavioural test
+/// (`effects_are_snapshotted_when_the_capture_begins_not_when_it_is_written`),
+/// which is why only this half was exposed — two paths sharing a rule do not
+/// share a guard unless somebody arranges it.
+fn save_layer<'a>(
+    layer: &'a umber_core::Layer,
+    px: &'a [u8],
+    mask: Option<&'a [u8]>,
+) -> SaveLayer<'a> {
+    SaveLayer {
+        visible: layer.visible,
+        opacity: layer.opacity,
+        mask,
+        // Straight off the layer, because a save reads the stack it is looking
+        // at. The autosave cannot do this — its pixels arrive over several
+        // frames, so its metadata is snapshotted when the capture begins — and
+        // the two have to write the same file. See `autosave::LayerMeta`.
+        effects: layer.effects(),
+        clipped: layer.clipped,
+        locked: layer.locked,
+        link: layer.link,
+        depth: layer.depth,
+        folder: layer.is_folder(),
+        ..SaveLayer::new(&layer.name, layer.blend, px)
+    }
+}
+
 /// Make sure a chosen path ends in the extension Umber saves with.
 ///
 /// Not every platform's save dialog appends the filter's extension, and a
@@ -4527,6 +4550,33 @@ mod tests {
     ///   on it), which is the stronger guard and the reason the weaker one is
     ///   only asked to carry the writer that cannot have one.
     #[test]
+    /// The behavioural half of the guard below, and the half that was missing.
+    ///
+    /// That one is textual and catches the `effects:` line being deleted. It is
+    /// defeated by `effects: &[]`, which still names the field — and which is
+    /// both what this path held before it was wired and what
+    /// `..SaveLayer::new(…)` defaults to. Verified by mutation in both
+    /// directions: neutering the value fails *this* test and passes that one;
+    /// deleting the line fails that one and passes this.
+    #[test]
+    fn a_save_carries_the_effects_the_layer_holds() {
+        let mut stack = umber_core::LayerStack::new();
+        assert!(
+            stack.set_effect(0, umber_core::Effect::drop_shadow()),
+            "the model should accept one effect on a fresh layer"
+        );
+
+        let layer = &stack.layers()[0];
+        assert_eq!(layer.effects().len(), 1, "precondition: the layer holds it");
+
+        let written = save_layer(layer, &[], None);
+        assert_eq!(
+            written.effects,
+            layer.effects(),
+            "a Save must write the effects the layer is holding, not an empty slice",
+        );
+    }
+
     fn every_writer_of_a_save_layer_states_its_effects() {
         // **Everything from `#[cfg(test)]` on is cut off first, and that is
         // not tidiness.** This test's own body names both strings it counts,
