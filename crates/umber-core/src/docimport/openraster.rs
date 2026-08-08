@@ -560,15 +560,17 @@ fn load_layer(
 ///
 /// **Two effects of one kind are refused here, and it has to be here**, which
 /// is the one refusal in this function that serde cannot make. A layer holds at
-/// most one per kind — `LayerStack::plan_set_effect` maintains it — and
-/// [`ImportedDocument::open`](super::ImportedDocument::open) installs them one
-/// at a time, so a record naming two drop shadows would have the second
-/// *replace* the first and the document would silently hold one where the file
-/// said two. `set_effect` returning `true` both times is exactly the shrug
-/// CLAUDE.md's "Partial exhaustiveness" section warns about: the refusal is
-/// real at the site that makes it and invisible at the call site. Refused
-/// whole rather than deduplicated, because the record is one unit and nothing
-/// in it says which of the two the artist meant.
+/// most one per kind, so a record naming two drop shadows is malformed and a
+/// file is judged by its reader.
+///
+/// The *rule* is not this module's, though — it is
+/// [`LayerStack::duplicate_effect_kind`], which
+/// [`LayerStack::plan_set_effects`] also asks, so the model refuses the same
+/// set the reader refuses. Two guards each deciding for themselves what a
+/// duplicate was would be worse than one, and the reader has to ask before
+/// there is a stack to ask of. Refused whole rather than deduplicated, because
+/// the record is one unit and nothing in it says which of the two the artist
+/// meant.
 ///
 /// **A record out of a stranger's file cannot recurse the parser**, and that
 /// was measured rather than assumed, because a stack overflow would be a crash
@@ -596,10 +598,10 @@ fn load_effects(
             .ok_or_else(|| format!("`{src}` is not in the file"))?;
         let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
         let effects: Vec<Effect> = ron::from_str(text).map_err(|e| e.to_string())?;
-        for (i, effect) in effects.iter().enumerate() {
-            if effects[..i].iter().any(|e| e.kind == effect.kind) {
-                return Err(format!("it names two {:?} effects", effect.kind));
-            }
+        // The model's rule, asked rather than restated — see
+        // `LayerStack::duplicate_effect_kind`.
+        if let Some(kind) = LayerStack::duplicate_effect_kind(&effects) {
+            return Err(format!("it names two {kind:?} effects"));
         }
         Ok(effects)
     };

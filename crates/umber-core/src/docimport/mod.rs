@@ -378,36 +378,30 @@ impl ImportedDocument {
             // written by a build that ordered them differently still comes back
             // right.
             //
-            // Two ways this can lose an effect, and neither is left to a `bool`
-            // nobody reads.
+            // **The whole set at once, never a loop of `set_effect`.** A loop
+            // is silently wrong twice: `set_effect` *replaces* what the layer
+            // held of a kind and answers `true`, so a record naming two drop
+            // shadows would install one and say nothing; and it asks the budget
+            // once per effect, so a set that fits could be refused half way
+            // along and leave the layer holding a prefix of the file. Both are
+            // the shrug CLAUDE.md's "Partial exhaustiveness" section ends on,
+            // and `LayerStack::set_effects` is where they stop being possible —
+            // it refuses the set whole, and a refusal moves nothing.
             //
-            // `set_effect` answers `false` for a folder, for an index off the
-            // end and for the budget. The budget was settled above, for every
-            // caller and not only for the ORA reader; the index is the one the
-            // entry was just pushed at; so what is left is a folder, which
-            // `parse_stack` cannot produce because it reads the attribute off a
-            // `<layer>` alone. A caller that hand-built one gets the assertion.
-            //
-            // The second is worse and does *not* show up as `false`:
-            // `set_effect` **replaces** whatever the layer held of that kind and
-            // answers `true`, so a record naming two drop shadows would install
-            // one and say nothing. `openraster::load_effects` refuses such a
-            // record, and this counts what actually landed so that a *second*
-            // producer of an `ImportedLayer` cannot reintroduce it quietly. The
-            // real fix is a `LayerStack` method that takes the whole set and
-            // refuses duplicates; that is `layer.rs`'s to add.
-            for effect in layer.effects.iter().copied() {
-                let installed = stack.set_effect(i, effect);
+            // The assertion is what is left. `set_effects` refuses a folder, a
+            // duplicate kind and the budget; the budget was settled above for
+            // every caller and not only for the ORA reader, the duplicate was
+            // refused by `load_effects` asking the same rule, and `parse_stack`
+            // reads the attribute off a `<layer>` alone. So a `false` here
+            // means a caller hand-built something none of those cover, and it
+            // says so rather than losing the effects quietly.
+            if !layer.effects.is_empty() {
+                let installed = stack.set_effects(i, &layer.effects);
                 debug_assert!(
                     installed,
-                    "an imported effect was refused by the stack it was read for"
+                    "an imported layer's effects were refused by the stack built for them"
                 );
             }
-            debug_assert_eq!(
-                stack.get(i).map_or(0, |l| l.effects().len()),
-                layer.effects.len(),
-                "an imported effect replaced another instead of joining it"
-            );
             // A folder holds no pixels and takes no slice, so there is nothing
             // to upload and nothing to clear.
             let Some(slot) = slot else { continue };

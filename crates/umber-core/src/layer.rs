@@ -1254,6 +1254,82 @@ impl LayerStack {
         }
     }
 
+    /// The first kind `effects` names twice, if it names one twice.
+    ///
+    /// **The one statement of "at most one effect per kind", and it is a free
+    /// function of a slice so that everything can ask it.** The invariant is
+    /// [`Layer::effects`]'s and is maintained by [`LayerStack::
+    /// plan_set_effect`], which enforces it by *replacing* — the right answer
+    /// for a control setting one effect, and a silent one for anything handing
+    /// over a whole set: `set_effect` would install both and answer `true`
+    /// twice, leaving the layer holding one where the caller offered two.
+    ///
+    /// `docimport::openraster` has to ask the same question before there is a
+    /// stack to ask it of, because a record naming two drop shadows is a
+    /// malformed record and the reader is where a file is judged. Two guards
+    /// that each decided for themselves what a duplicate was would be worse
+    /// than one; this is the one, and both callers reach it.
+    pub fn duplicate_effect_kind(effects: &[Effect]) -> Option<EffectKind> {
+        effects
+            .iter()
+            .enumerate()
+            .find(|(i, e)| effects[..*i].iter().any(|p| p.kind == e.kind))
+            .map(|(_, e)| e.kind)
+    }
+
+    /// The effects the entry at `index` would hold if given `effects` **whole**,
+    /// or `None` where the set is refused.
+    ///
+    /// [`LayerStack::plan_set_effect`]'s refusals, plus the one that only a set
+    /// can commit: naming a kind twice. See [`LayerStack::
+    /// duplicate_effect_kind`].
+    ///
+    /// The budget is counted **once, over the whole set**, which is the other
+    /// thing installing one at a time cannot do. Feeding a set through
+    /// `set_effect` in a loop asks the budget a question per effect, so a set
+    /// that fits could still be refused half way through by an intermediate
+    /// state that does not — and the refusal would land on whichever effect
+    /// happened to be last, leaving the layer holding a prefix of what was
+    /// offered. This installs all of it or none of it.
+    fn plan_set_effects(&self, index: usize, effects: &[Effect]) -> Option<Vec<Effect>> {
+        let layer = self.layers.get(index)?;
+        if layer.folder || Self::duplicate_effect_kind(effects).is_some() {
+            return None;
+        }
+
+        let mut planned = effects.to_vec();
+        effect::sort_into_composite_order(&mut planned);
+
+        let elsewhere = self.enabled_effect_count() - layer.enabled_effect_count();
+        let here = planned.iter().filter(|e| e.enabled).count();
+        effect::within_budget(elsewhere + here).then_some(planned)
+    }
+
+    /// Would [`LayerStack::set_effects`] do it? See [`LayerStack::
+    /// plan_set_effects`] for the refusals.
+    pub fn can_set_effects(&self, index: usize, effects: &[Effect]) -> bool {
+        self.plan_set_effects(index, effects).is_some()
+    }
+
+    /// Give the entry at `index` exactly this set of effects, **replacing**
+    /// whatever it held. `false` where it is refused, and then nothing moved.
+    ///
+    /// What [`crate::docimport::ImportedDocument::open`] installs a file's
+    /// effects with. A loop of [`LayerStack::set_effect`] is the obvious
+    /// alternative and is wrong twice over — see [`LayerStack::
+    /// plan_set_effects`] — and both failures are *silent*, because each call
+    /// in such a loop answers `true` for a duplicate it overwrote and the loop
+    /// has no way to notice a budget refusal that arrived half way along.
+    pub fn set_effects(&mut self, index: usize, effects: &[Effect]) -> bool {
+        match self.plan_set_effects(index, effects) {
+            Some(planned) => {
+                self.layers[index].effects = planned;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Switch an effect the entry at `index` already holds on or off.
     ///
     /// A read-modify-write through [`LayerStack::set_effect`] rather than beside
@@ -3608,6 +3684,145 @@ mod tests {
         assert_eq!(s.enabled_effect_count(), 1);
     }
 
+    /// **A set naming a kind twice is refused whole**, where setting one
+    /// effect at a time replaces.
+    ///
+    /// The two are not inconsistent and the difference is the whole reason
+    /// [`LayerStack::set_effects`] exists. A *control* setting one effect means
+    /// "make the drop shadow this", so replacing is the only sensible answer. A
+    /// caller handing over a whole set is describing what the layer holds, and
+    /// there replacing is a silent loss: `set_effect` in a loop would install
+    /// the second, answer `true` both times, and leave the layer holding one of
+    /// the two the caller offered.
+    ///
+    /// The rule is [`LayerStack::duplicate_effect_kind`], asked here and by
+    /// `docimport::openraster::load_effects` — which has to ask before there is
+    /// a stack — so the model and the reader cannot come to different views of
+    /// what a duplicate is.
+    #[test]
+    fn a_set_of_effects_naming_one_kind_twice_is_refused_whole() {
+        let mut shadow = Effect::drop_shadow();
+        shadow.distance = 3.0;
+        let mut louder = Effect::drop_shadow();
+        louder.distance = 42.0;
+
+        assert_eq!(
+            LayerStack::duplicate_effect_kind(&[shadow, louder]),
+            Some(EffectKind::DropShadow)
+        );
+        assert_eq!(
+            LayerStack::duplicate_effect_kind(&[shadow, Effect::outline()]),
+            None
+        );
+        assert_eq!(LayerStack::duplicate_effect_kind(&[]), None);
+
+        let mut s = LayerStack::new();
+        assert!(s.set_effects(0, &[Effect::outline()]), "a legal set lands");
+        let before = effects_of(&s);
+
+        assert!(!s.can_set_effects(0, &[shadow, louder]));
+        assert!(!s.set_effects(0, &[shadow, louder]));
+        assert_eq!(
+            effects_of(&s),
+            before,
+            "a refused set must leave the layer exactly as it was"
+        );
+
+        // And the single-effect path still replaces, which is right for it.
+        assert!(s.set_effect(0, shadow));
+        assert!(s.set_effect(0, louder));
+        assert_eq!(s.get(0).unwrap().effects().len(), 2, "outline plus shadow");
+    }
+
+    /// **`set_effects` replaces the whole set and puts it in composite order.**
+    ///
+    /// The order matters because a file's sequence is not the writer's to
+    /// promise — an inside outline ranks above the layer and a drop shadow
+    /// below it — and `docimport` relies on this rather than sorting for
+    /// itself.
+    #[test]
+    fn setting_a_whole_set_replaces_what_was_there_and_orders_it() {
+        let mut s = LayerStack::new();
+        assert!(s.set_effect(0, Effect::drop_shadow()));
+
+        let inside = Effect {
+            position: OutlinePosition::Inside,
+            ..Effect::outline()
+        };
+        let shadow = Effect::drop_shadow();
+        assert!(shadow.rank() < inside.rank(), "the fixture is backwards");
+
+        // Handed over the wrong way round.
+        assert!(s.set_effects(0, &[inside, shadow]));
+        assert_eq!(s.get(0).unwrap().effects(), [shadow, inside]);
+
+        // And it is a replacement, not a join: the empty set empties the layer.
+        assert!(s.set_effects(0, &[]));
+        assert!(s.get(0).unwrap().effects().is_empty());
+        assert_eq!(s.enabled_effect_count(), 0);
+    }
+
+    /// **The budget is counted once over the whole set**, which a loop of
+    /// `set_effect` cannot do.
+    ///
+    /// A layer already at the budget being handed a *different* set of the same
+    /// size is free — nothing new is being asked for — where installing them
+    /// one at a time would pass through a state holding both the old and the
+    /// new and be refused by it. The refusal would land on whichever effect
+    /// happened to be last and leave a prefix of the caller's set behind.
+    #[test]
+    fn a_whole_set_meets_the_budget_once_rather_than_once_per_effect() {
+        let mut s = LayerStack::new();
+        while s.enabled_effect_count() < effect::MAX_ENABLED {
+            let at = s.len() - 1;
+            if !s.set_effect(at, Effect::drop_shadow()) || !s.set_effect(at, Effect::outline()) {
+                break;
+            }
+            if s.enabled_effect_count() < effect::MAX_ENABLED {
+                s.add();
+            }
+        }
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        // Swapping one layer's two effects for two others of the same kinds
+        // costs the budget nothing, so it must be allowed.
+        let at = 0;
+        assert_eq!(s.get(at).unwrap().effects().len(), 2);
+        let swapped = [
+            Effect {
+                distance: 99.0,
+                ..Effect::drop_shadow()
+            },
+            Effect {
+                spread: 9.0,
+                ..Effect::outline()
+            },
+        ];
+        assert!(
+            s.can_set_effects(at, &swapped),
+            "an exchange at the budget asks for nothing new"
+        );
+        assert!(s.set_effects(at, &swapped));
+        assert_eq!(s.enabled_effect_count(), effect::MAX_ENABLED);
+
+        // One more enabled effect anywhere is over, and changes nothing.
+        let elsewhere = s.len() - 1;
+        let before = effects_of(&s);
+        let three = [
+            Effect::drop_shadow(),
+            Effect::outline(),
+            Effect {
+                enabled: true,
+                ..Effect::drop_shadow()
+            },
+        ];
+        assert!(
+            !s.set_effects(elsewhere, &three),
+            "and that set is a duplicate as well, which is also a refusal"
+        );
+        assert_eq!(effects_of(&s), before);
+    }
+
     /// `docs/layer-effects.md` §9.5: a folder holds no slot and its contents
     /// composite in place, so there is no coverage to derive an effect from
     /// until group compositing exists.
@@ -3626,6 +3841,10 @@ mod tests {
         assert!(!s.can_set_effect(1, Effect::drop_shadow()));
         assert!(!s.set_effect(1, Effect::drop_shadow()));
         assert!(!s.can_set_effect_enabled(1, EffectKind::DropShadow, true));
+        // The set-install answers to the same gate, or the reader would have a
+        // way round it that the controls do not.
+        assert!(!s.can_set_effects(1, &[Effect::drop_shadow()]));
+        assert!(!s.set_effects(1, &[Effect::drop_shadow()]));
         assert_eq!(effects_of(&s), before);
         assert_eq!(s.enabled_effect_count(), 1);
     }
@@ -3636,6 +3855,8 @@ mod tests {
         let before = effects_of(&s);
         assert!(!s.can_set_effect(9, Effect::outline()));
         assert!(!s.set_effect(9, Effect::outline()));
+        assert!(!s.can_set_effects(9, &[Effect::outline()]));
+        assert!(!s.set_effects(9, &[Effect::outline()]));
         assert_eq!(s.remove_effect(9, EffectKind::Outline), None);
         assert_eq!(effects_of(&s), before);
     }

@@ -2150,6 +2150,12 @@ impl UmberApp {
                     visible: layer.visible,
                     opacity: layer.opacity,
                     mask: mask.as_deref(),
+                    // Straight off the layer, because a save reads the stack
+                    // it is looking at. The autosave cannot do this — its
+                    // pixels arrive over several frames, so its metadata is
+                    // snapshotted when the capture begins — and the two have
+                    // to write the same file. See `autosave::LayerMeta`.
+                    effects: layer.effects(),
                     clipped: layer.clipped,
                     locked: layer.locked,
                     link: layer.link,
@@ -4470,6 +4476,49 @@ fn combined_selection_op(add: bool, subtract: bool, setting: SelectionOp) -> Sel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every writer of a `SaveLayer` states its effects, and this is a text
+    /// guard on purpose.**
+    ///
+    /// There are two — Save, here, and the autosave — and both build the
+    /// struct with `..SaveLayer::new(…)`, which **defaults** `effects` to
+    /// empty. So deleting the field from either compiles and passes, and the
+    /// failure is silent in the worst way: the document opens with its effects
+    /// and is written back without them, which is precisely the
+    /// open-and-save-loses-it failure `umber-version` 3 was raised to prevent,
+    /// reproduced inside the build that raised it and invisible to the version
+    /// gate because that gate is `version > VERSION`.
+    ///
+    /// The autosave's half is checked by *behaviour* —
+    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` reopens
+    /// the file it wrote. Save's cannot be: it reads every layer back off the
+    /// GPU first, so exercising it needs a device and a whole document. What
+    /// is left is the shape, and the shape is worth pinning because the rule is
+    /// about *every* such writer rather than about one line — a third one
+    /// arrives already covered.
+    ///
+    /// **Wiring one and not the other would be worse than wiring neither**, and
+    /// that is why this insists on both at once rather than on Save alone: an
+    /// effect surviving or not depending on whether Save or the five-minute
+    /// timer last touched the file is not a rule anybody can learn, where
+    /// losing them consistently is at least a bug somebody reports.
+    #[test]
+    fn every_writer_of_a_save_layer_states_its_effects() {
+        for (file, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("autosave.rs", include_str!("autosave.rs")),
+        ] {
+            let literals = source.match_indices("SaveLayer {").count();
+            assert!(literals > 0, "{file} builds no SaveLayer any more");
+            let stated = source.matches("effects: ").count();
+            assert!(
+                stated >= literals,
+                "{file} builds {literals} SaveLayer(s) and states `effects:` \
+                 {stated} time(s); `..SaveLayer::new` defaults it to empty, so \
+                 the one that does not state it drops them in silence"
+            );
+        }
+    }
 
     #[test]
     fn a_modifier_overrides_the_strips_setting_for_one_gesture_and_no_longer() {
