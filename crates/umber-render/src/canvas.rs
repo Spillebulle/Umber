@@ -201,11 +201,11 @@ const fn effect_slices(layers: usize, ceiling: usize) -> usize {
 /// document never pays for a copy — see [`grown_capacity`].
 ///
 /// Four is only cheap on a canvas where a slice is. Taken literally it is
-/// 1.6 GB at 10000², of which 1.14 GB is speculation on behalf of a document
-/// that has one layer — nine times the 134 MB [`grown_capacity`] bounds itself
-/// by, decided twenty lines from the constant that states that bound. So it
-/// goes through [`initial_slots`], which is the same budget applied to the same
-/// question.
+/// 1.53 GiB at 10000², of which 1.12 GiB is speculation on behalf of a document
+/// that has one layer — over four times the 256 MiB [`grown_capacity`] bounds
+/// itself by, decided twenty lines from the constant that states that bound. So
+/// it goes through [`initial_slots`], which is the same budget applied to the
+/// same question.
 const INITIAL_SLOTS: u32 = 4;
 
 /// What one slice of a canvas this size costs.
@@ -277,7 +277,8 @@ const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 /// slice is.
 ///
 /// **Double while the resulting array would stay inside
-/// [`GROWTH_DOUBLING_BUDGET_BYTES`]; past that, grow to exactly `needed`.**
+/// [`GROWTH_DOUBLING_BUDGET_BYTES`]; past that, round `needed` up to a whole
+/// [`growth_quantum`].**
 ///
 /// A pure function so the policy is testable without a device, which is the
 /// arrangement [`band_rows`] already keeps and the only one that works here: the
@@ -304,21 +305,41 @@ const GROWTH_DOUBLING_BUDGET_BYTES: u64 = 256 << 20;
 /// just somebody putting a mask on each of 64 layers — is 112 growths and
 /// 134 GB copied. The copying is fine, 1.2 GB a click at device bandwidth. The
 /// 112 separate requests for a fresh multi-gigabyte texture with the old one
-/// still live, peaking at 4.28 GB, are not: a `create_texture` failure there is
-/// an uncaptured device error, and therefore fatal. Rounding to a quantum makes
-/// the same document 7 growths and 7.5 GB.
+/// still live are not: a `create_texture` failure there is an uncaptured device
+/// error, and therefore fatal. Rounding to a quantum makes the same document
+/// **7 growths and 7.5 GB**, which is the whole justification — it is a count,
+/// not a size.
+///
+/// **The peak transient argues the other way in the headline case, and that is
+/// worth saying rather than leaving to be recomputed.** Over the 16-to-128
+/// walk the quantum peaks at 4.03 GB against exact growth's 4.28. But for the
+/// 129th slice alone it is 128 + 144 = **4.56 GB**, where exact growth and the
+/// old accidental clamp both peak at 128 + 129 = 4.31 GB. So the rule chosen on
+/// the strength of a fatal allocation failure raises the largest single
+/// allocation, by 251 MB, in the one case this function is named for. The count
+/// is what justifies it; the peak does not, and a reader who checks will find
+/// that out.
 ///
 /// **So the 129th slice of a 2048² document lands at 144, and that is not a
-/// slip.** The waste is 252 MB, one quantum, which is the budget doing exactly
-/// what a budget is for. Landing on 129 was the *accident* this whole function
-/// exists to explain: a ceiling that happened to sit one above a power of two,
-/// so `.min` trimmed the overshoot to nothing and nobody noticed the overshoot.
-/// Preserving an accident is not a property. The property is that **a legal
-/// document must not double its layer array to reach one more slice** — 144
-/// does not, 256 did.
+/// slip.** The waste is 15 slices — one quantum less one, 251,658,240 bytes —
+/// which is the budget doing exactly what a budget is for. Landing on 129 was
+/// the *accident* this whole function exists to explain: a ceiling that
+/// happened to sit one above a power of two, so `.min` trimmed the overshoot to
+/// nothing and nobody noticed the overshoot. Preserving an accident is not a
+/// property.
 ///
-/// The trade, both directions, so it stays settled: 252 MB held against 105
-/// allocations not made.
+/// **What the property is, stated so it survives its own test suite:** past the
+/// budget, an array grows by whole quanta, so the overshoot is bounded by the
+/// budget rather than by the size of the array. It is *not* "a legal document
+/// must not double its array to reach one more slice", which this said and
+/// which its own sibling test disproves — the first quantum step **is** a
+/// doubling, `grown_capacity(16, 17, …)` at 2048² being exactly 16 to 32, and
+/// by construction so is the step from `q` to `2q` on every canvas. The
+/// difference from what was wrong before is the bound, not the ratio: 256
+/// slices for 129 is unbounded overshoot, 32 for 17 is 240 MiB.
+///
+/// The trade, both directions, so it stays settled: at most one budget held,
+/// against 105 allocations not made.
 fn grown_capacity(current: u32, needed: u32, slice_bytes: u64) -> u32 {
     let mut capacity = current.max(1);
     while capacity < needed
@@ -335,8 +356,15 @@ fn grown_capacity(current: u32, needed: u32, slice_bytes: u64) -> u32 {
     // Past the budget, up to the next whole quantum rather than to `needed`
     // exactly — see [`growth_quantum`] and the note above on what exact growth
     // costs in *allocations*.
+    //
+    // No `.max(needed)` after this: `div_ceil(q) * q >= needed` for every
+    // `q >= 1`, and `saturating_mul` caps at `u32::MAX`, which is also `>=`.
+    // One was here as belt and braces and came out — no mutation could reach
+    // it, which by this file's own rule makes it a guard whose comment would
+    // have claimed more than it demonstrated.
+    // `the_growth_rule_always_reaches_what_was_asked_for` is the real cover.
     let quantum = growth_quantum(slice_bytes);
-    needed.div_ceil(quantum).saturating_mul(quantum).max(needed)
+    needed.div_ceil(quantum).saturating_mul(quantum)
 }
 
 /// How many slices to round up to once doubling has stopped: as many as fit in
@@ -2284,9 +2312,10 @@ impl CanvasRenderer {
     /// Growth reallocates the array and copies every existing slice, so it
     /// doubles rather than growing by one — a document that reaches eight
     /// layers pays for two copies, not eight. **Only while the array is cheap**:
-    /// past a byte budget it grows to exactly what was asked for, because a
-    /// slice is canvas-sized and doubling one is not an optimisation but a
-    /// gigabyte. [`grown_capacity`] is the whole policy and has the argument.
+    /// past a byte budget it grows by whole quanta of that budget instead,
+    /// because a slice is canvas-sized and doubling one is not an optimisation
+    /// but a gigabyte. At 10000² a quantum is a single slice, so growth there is
+    /// exact. [`grown_capacity`] is the whole policy and has the argument.
     ///
     /// **The `.min` below fails open and the assertion is what stops it.**
     /// Asked for more than [`MAX_SLOTS`], this allocates the ceiling, logs a
@@ -2412,11 +2441,14 @@ impl CanvasRenderer {
     /// resize that guessed would drop layers, which is far worse than holding
     /// memory, so it deliberately holds memory.
     ///
-    /// A fix needs the live slot count threaded in from the caller:
-    /// `Editor::apply_canvas` has `LayerStack::slot_capacity_needed`, and with
-    /// it this could rebuild at `grown_capacity(0, live, slice_bytes(new_size))`
-    /// and copy only that depth. It is a signature change through one call site
-    /// and it belongs in a branch about resizing rather than one about growth.
+    /// A fix needs the live slot count threaded in from the caller. That is
+    /// **`App::apply_canvas`**, the one production call site, which reaches it
+    /// as `self.editor.layers.slot_capacity_needed()`; not
+    /// `Editor::apply_canvas`, which shares the name, returns a `bool` and never
+    /// touches a renderer. With it this could rebuild at
+    /// `grown_capacity(0, live, slice_bytes(new_size))` and copy only that
+    /// depth. It is a signature change through one call site and it belongs in
+    /// a branch about resizing rather than one about growth.
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
@@ -6104,6 +6136,37 @@ mod tests {
         side * side * LAYER_BYTES_PER_PIXEL
     }
 
+    /// Canvases to sweep the growth rule over.
+    ///
+    /// **Squares alone are not a sweep of canvas sizes, and powers of two alone
+    /// are not a sweep of slice sizes.** Both were true of the first draft and
+    /// each hid something. `slice_bytes` is `x * y * 4` and nothing makes a
+    /// canvas square, so `1024x512` — an ordinary shape — reaches a waste no
+    /// square canvas does. And every power-of-two side divides the budget
+    /// *exactly*, so `budget / slice` and `budget.div_ceil(slice)` agree at
+    /// every one of them: two rounding mutations in [`growth_quantum`] passed
+    /// the entire suite until `1920x1080` and `1500x1500` were added, where the
+    /// quantum is 32 against 33 and 29 against 30.
+    ///
+    /// So the list is deliberately a mix: powers of two, a non-square, and four
+    /// real display and print sizes whose slice divides nothing neatly.
+    const CANVASES: [(u64, u64); 14] = [
+        (1, 1),
+        (64, 64),
+        (256, 256),
+        (512, 512),
+        (1024, 512),
+        (1024, 1024),
+        (1500, 1500),
+        (1920, 1080),
+        (2048, 2048),
+        (2560, 1440),
+        (3000, 2000),
+        (4096, 4096),
+        (8192, 8192),
+        (10_000, 10_000),
+    ];
+
     /// **The regression this policy exists for, stated as the allocation it
     /// makes.**
     ///
@@ -6129,9 +6192,14 @@ mod tests {
     fn a_document_does_not_double_its_layer_array_to_reach_one_more_slice() {
         // 2048², the canvas the arithmetic was worked out on. One quantum of
         // 16 past 129. Plain doubling: 256. Exact: 129.
-        assert_eq!(grown_capacity(128, 129, slice_of(2048)), 144);
-        // The waste that buys, named so it cannot drift: 252 MB, one quantum.
-        let waste = u64::from(144u32 - 129) * slice_of(2048);
+        // The waste that buys, measured from what the function returns rather
+        // than from the literal beside it. Written `144 - 129` at first, which
+        // is two literals and an assertion no change to the rule could fail —
+        // exactly the `a - b + b == a` shape this file warns about two hundred
+        // lines up, in a line whose comment claimed it could not drift.
+        let cap = grown_capacity(128, 129, slice_of(2048));
+        assert_eq!(cap, 144);
+        let waste = u64::from(cap - 129) * slice_of(2048);
         assert_eq!(waste, 251_658_240);
         assert!(waste <= GROWTH_DOUBLING_BUDGET_BYTES);
 
@@ -6207,8 +6275,32 @@ mod tests {
         assert_eq!(growth_quantum(slice_of(2048)), 16);
         assert_eq!(growth_quantum(slice_of(4096)), 4);
         assert_eq!(growth_quantum(slice_of(8192)), 1);
-        for side in [1u64, 64, 512, 2048, 8192, 10_000, 40_000] {
-            assert!(growth_quantum(slice_of(side)) >= 1, "{side}²");
+
+        // **Canvases where the budget is not a whole number of slices**, which
+        // every power-of-two square hides: these are the only assertions that
+        // can tell the floor from a ceil or from a rounding to a power of two,
+        // and without them both mutations pass the suite. 1920×1080 divides the
+        // budget 32.36 times and 1500² 29.8.
+        assert_eq!(growth_quantum(1920 * 1080 * LAYER_BYTES_PER_PIXEL), 32);
+        assert_eq!(growth_quantum(1500 * 1500 * LAYER_BYTES_PER_PIXEL), 29);
+        assert_eq!(growth_quantum(2560 * 1440 * LAYER_BYTES_PER_PIXEL), 18);
+        assert_eq!(growth_quantum(3000 * 2000 * LAYER_BYTES_PER_PIXEL), 11);
+        // And what that means for a real allocation, so the quantum is pinned
+        // where it is *used* and not only where it is computed.
+        assert_eq!(
+            grown_capacity(33, 34, 1920 * 1080 * LAYER_BYTES_PER_PIXEL),
+            64
+        );
+        assert_eq!(
+            grown_capacity(16, 17, 1500 * 1500 * LAYER_BYTES_PER_PIXEL),
+            29
+        );
+
+        for (w, h) in CANVASES {
+            assert!(
+                growth_quantum(w * h * LAYER_BYTES_PER_PIXEL) >= 1,
+                "{w}x{h}"
+            );
         }
         assert!(growth_quantum(0) >= 1);
         // 400 MB a slice: one slice is already over the budget, so the quantum
@@ -6235,10 +6327,16 @@ mod tests {
     /// the most slices that fit in the budget. So one budget covers both.
     ///
     /// Swept rather than argued, because a proof about the code is not a
-    /// statement about the code. Measured, the worst is 252 MiB at 1024² asking
-    /// for a 65th slice — the quantum branch, one slice short of a full
-    /// quantum of 64. It falls to zero at 10000², where the quantum is a single
+    /// statement about the code. Measured, the worst is **254 MiB at 1024x512**
+    /// asking for a 129th slice — the quantum branch, one slice short of a full
+    /// quantum of 128. It falls to zero at 10000², where the quantum is a single
     /// slice and nothing is ever speculated.
+    ///
+    /// **That worst case is on a non-square canvas, which the first draft of
+    /// this sweep could not see**: it walked square sides only, while
+    /// `slice_bytes` is `x * y * 4` and nothing constrains a canvas to be
+    /// square. The bound held either way — see [`CANVASES`] for what else the
+    /// narrow list hid, which did not.
     ///
     /// **`current` is swept and the first draft did not sweep it**, which made
     /// this exactly the guard CLAUDE.md warns about: one whose comment claims
@@ -6257,22 +6355,31 @@ mod tests {
     #[test]
     fn the_overshoot_is_bounded_by_the_budget_on_every_canvas() {
         let mut worst = 0u64;
-        for side in [1u64, 64, 256, 512, 1024, 2048, 4096, 8192, 10_000] {
-            let slice = slice_of(side);
+        let mut worst_at = (0u64, 0u64, 0u32, 0u32);
+        for (w, h) in CANVASES {
+            let slice = w * h * LAYER_BYTES_PER_PIXEL;
             for needed in 1..=MAX_SLOTS as u32 {
                 for current in 0..needed {
                     let cap = grown_capacity(current, needed, slice);
+                    assert!(cap >= needed, "{w}x{h}: {current} -> {needed} gave {cap}");
                     let waste = u64::from(cap - needed) * slice;
                     assert!(
                         waste <= GROWTH_DOUBLING_BUDGET_BYTES,
-                        "{side}² growing {current} -> {needed} wasted {waste} bytes"
+                        "{w}x{h} growing {current} -> {needed} wasted {waste} bytes"
                     );
-                    worst = worst.max(waste);
+                    if waste > worst {
+                        worst = waste;
+                        worst_at = (w, h, current, needed);
+                    }
                 }
             }
         }
-        // The figure quoted above, so it cannot drift from what is measured.
-        assert_eq!(worst, 264_241_152);
+        // The figure quoted above, so it cannot drift from what is measured —
+        // and *where*, because the worst case moved off the squares the moment
+        // a non-square canvas was swept. 1024x512 needing a 129th slice, not
+        // 1024² needing a 65th.
+        assert_eq!(worst, 266_338_304);
+        assert_eq!(worst_at, (1024, 512, 0, 129));
         // And a canvas whose slices are larger than the budget never
         // speculates at all, from any starting capacity.
         for needed in 1..=MAX_SLOTS as u32 {
@@ -6286,11 +6393,12 @@ mod tests {
     /// would be a validation error rather than a waste.
     #[test]
     fn the_growth_rule_always_reaches_what_was_asked_for() {
-        for side in [1u64, 64, 256, 2048, 10_000] {
+        for (w, h) in CANVASES {
+            let slice = w * h * LAYER_BYTES_PER_PIXEL;
             for needed in 1..=MAX_SLOTS as u32 {
                 for current in [0u32, 1, 4, needed.saturating_sub(1)] {
-                    let got = grown_capacity(current, needed, slice_of(side));
-                    assert!(got >= needed, "{side}²: {current} -> {needed} gave {got}");
+                    let got = grown_capacity(current, needed, slice);
+                    assert!(got >= needed, "{w}x{h}: {current} -> {needed} gave {got}");
                 }
             }
         }
