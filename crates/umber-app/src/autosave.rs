@@ -1063,10 +1063,7 @@ pub struct Candidate {
 impl Candidate {
     /// The stack as the composite pass takes it, for the flattened preview.
     pub fn draws(&self) -> Vec<umber_render::LayerDraw> {
-        self.effected_draws()
-            .into_iter()
-            .map(|e| e.draw)
-            .collect()
+        self.effected_draws().into_iter().map(|e| e.draw).collect()
     }
 
     /// The same flattening with each layer's effects beside its draw.

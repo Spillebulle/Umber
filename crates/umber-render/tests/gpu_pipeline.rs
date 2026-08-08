@@ -5388,9 +5388,14 @@ impl Harness {
         frame: EffectFrame,
     ) -> BakedStack {
         let mut enc = self.encoder();
-        let baked =
-            self.canvas
-                .bake_effects(&self.gpu.device, &self.gpu.queue, &mut enc, base, stack, frame);
+        let baked = self.canvas.bake_effects(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut enc,
+            base,
+            stack,
+            frame,
+        );
         self.gpu.queue.submit(Some(enc.finish()));
         baked
     }
@@ -5709,7 +5714,10 @@ fn an_inner_outline_is_confined_to_the_layers_own_alpha() {
     // effect that composites *above* the layer it came from.
     assert_eq!(baked.draws.len(), 3);
     assert_eq!(baked.draws[1].slot, 0, "{:?}", baked.draws);
-    assert!(baked.draws[2].clipped, "an inner effect must carry the clip");
+    assert!(
+        baked.draws[2].clipped,
+        "an inner effect must carry the clip"
+    );
 
     // Two texels in from the edge: the band.
     assert_near(
@@ -5756,7 +5764,11 @@ fn an_effect_is_rebaked_when_its_pixels_move_and_not_otherwise() {
     assert_eq!(h.canvas.effect_bakes(), 1);
 
     h.bake(&[effected(draw, &effects)], 1);
-    assert_eq!(h.canvas.effect_bakes(), 1, "an unchanged effect was rebaked");
+    assert_eq!(
+        h.canvas.effect_bakes(),
+        1,
+        "an unchanged effect was rebaked"
+    );
 
     // The layer's own pixels: `slot_revision` is bumped inside every method that
     // writes a slice, which is what makes this exhaustive by construction.

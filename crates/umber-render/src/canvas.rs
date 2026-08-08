@@ -7038,11 +7038,7 @@ impl EffectCache {
     }
 
     /// The slice this key holds, allocating one if it does not hold any.
-    fn slot_for(
-        &mut self,
-        key: (u32, Option<u32>, EffectKind),
-        capacity: usize,
-    ) -> Option<u32> {
+    fn slot_for(&mut self, key: (u32, Option<u32>, EffectKind), capacity: usize) -> Option<u32> {
         if let Some(e) = self
             .entries
             .iter()
@@ -7289,7 +7285,13 @@ impl EffectScratch {
         // `debug_assert` below is the only thing holding the two together, which
         // is why they are written adjacently.
         let mut binds = Vec::with_capacity(EFFECT_BIND_COUNT);
-        binds.push(bind("effect-extract", &layers.array_view, stroke_view, b, none));
+        binds.push(bind(
+            "effect-extract",
+            &layers.array_view,
+            stroke_view,
+            b,
+            none,
+        ));
         binds.push(bind("effect-coverage", a, b, &coverage, none));
         binds.push(bind("effect-grow-0", a, b, &coverage, seed0));
         binds.push(bind("effect-grow-1", a, b, &coverage, seed1));
@@ -7959,5 +7961,204 @@ mod tests {
         // would name rows past the bottom of the texture, which is a validation
         // error and therefore an abort.
         assert_eq!(band_rows(u64::MAX, 256, 7), 7);
+    }
+
+    /// A softness of zero records **no blur pass**, which is the exact identity
+    /// the selection's feather and the brush's grain both keep — and the half of
+    /// "an effect with no reach is the identity" that is arithmetic rather than a
+    /// decision.
+    #[test]
+    fn no_softness_is_no_blur_pass_at_all() {
+        assert_eq!(tent_for(0.0), (1, 0));
+        assert_eq!(tent_for(-3.0), (1, 0));
+        assert!(tent_for(1.0).1 > 0, "a real softness must blur something");
+    }
+
+    /// The tent the blur runs is the tent that was asked for, to within the step
+    /// its own kernel can express.
+    ///
+    /// Two discrete box passes of `2r + 1` taps at a reduction of `d` have a half
+    /// support of `d(2r + 1)`, so the error is bounded by `d` — which is the whole
+    /// argument for [`EFFECT_FULL_RES_SOFTNESS`] and the reason that constant is a
+    /// parameter rather than a second implementation. **A pixel below the
+    /// threshold and thirteen per cent above it**; the assertion is written that
+    /// way round because lowering the threshold is the tempting change and it
+    /// makes the *narrow* end wrong, which is the end a painter dials.
+    #[test]
+    fn the_tent_is_the_width_it_was_asked_for() {
+        for asked in 1..=200 {
+            let softness = asked as f32;
+            let (down, radius) = tent_for(softness);
+            let support = down as f32 * (2 * radius + 1) as f32;
+            let slack = if softness < EFFECT_FULL_RES_SOFTNESS {
+                // A full-resolution tent's step is two texels, and the smallest
+                // it can express at all is three — so a softness of one and of
+                // two both come out at three.
+                3.0
+            } else {
+                0.13 * softness
+            };
+            assert!(
+                (support - softness).abs() <= slack,
+                "asked {softness}, got {support} from down {down} radius {radius}"
+            );
+        }
+    }
+
+    /// A softness the quarter-resolution kernel could not represent runs at full
+    /// resolution instead.
+    ///
+    /// The departure from §3.2 stated as a test rather than as a sentence: below
+    /// the threshold the reduction is 1, above it 4, and the point of the second
+    /// assertion is that the *cheap* path really is taken where it can be. A
+    /// change that took the reduction to 4 everywhere would fail the width test
+    /// above at the narrow end; a change that took it to 1 everywhere would pass
+    /// every assertion here except this one, and cost 83 ms a frame at 10000².
+    #[test]
+    fn a_narrow_soft_edge_is_blurred_at_full_resolution() {
+        assert_eq!(tent_for(EFFECT_FULL_RES_SOFTNESS - 1.0).0, 1);
+        assert_eq!(tent_for(EFFECT_FULL_RES_SOFTNESS).0, EFFECT_DOWN);
+        assert_eq!(tent_for(64.0).0, EFFECT_DOWN);
+    }
+
+    /// Which effects mark nothing, in the two forms the rule takes.
+    ///
+    /// The outline half is arithmetic — a band of no width is no band. The shadow
+    /// half is a decision and it is argued at [`effect_marks_nothing`]; what is
+    /// pinned here is that it is narrow, because widening it by one clause would
+    /// silently stop drawing a shadow somebody had dialled. A displacement alone
+    /// is enough, a spread alone is enough, and a softness alone is enough.
+    #[test]
+    fn only_an_effect_with_no_reach_marks_nothing() {
+        let shadow = Effect {
+            spread: 0.0,
+            softness: 0.0,
+            distance: 0.0,
+            ..Effect::drop_shadow()
+        };
+        assert!(effect_marks_nothing(&shadow));
+        assert!(!effect_marks_nothing(&Effect {
+            distance: 4.0,
+            ..shadow
+        }));
+        assert!(!effect_marks_nothing(&Effect {
+            spread: 1.0,
+            ..shadow
+        }));
+        assert!(!effect_marks_nothing(&Effect {
+            softness: 1.0,
+            ..shadow
+        }));
+
+        // An outline is its width and nothing else, at every position.
+        for position in OutlinePosition::ALL {
+            let bare = Effect {
+                spread: 0.0,
+                position,
+                ..Effect::outline()
+            };
+            assert!(effect_marks_nothing(&bare), "{position:?}");
+            assert!(
+                !effect_marks_nothing(&Effect { spread: 2.0, ..bare }),
+                "{position:?}"
+            );
+        }
+
+        // And the two that hold whatever the kind: off, and transparent.
+        for kind in EffectKind::ALL {
+            let live = Effect {
+                spread: 5.0,
+                softness: 5.0,
+                distance: 5.0,
+                ..Effect::of(kind)
+            };
+            assert!(!effect_marks_nothing(&live), "{kind:?}");
+            assert!(effect_marks_nothing(&Effect {
+                enabled: false,
+                ..live
+            }));
+            assert!(effect_marks_nothing(&Effect {
+                opacity: 0.0,
+                ..live
+            }));
+        }
+    }
+
+    /// The parameter hash covers what the **pixels** depend on and nothing else.
+    ///
+    /// The direction that matters is the second half: `opacity` and `blend` are
+    /// the draw's, applied by `composite.wgsl`, so dragging either must not
+    /// rebake — a canvas-sized bake per frame of a slider drag is exactly the cost
+    /// the cache exists to avoid. Property-driven over every field, because a
+    /// field missed is silent and looks like a driver bug.
+    #[test]
+    fn the_parameter_hash_reads_every_field_the_pixels_depend_on() {
+        let base = Effect {
+            spread: 3.0,
+            softness: 4.0,
+            angle: 30.0,
+            distance: 5.0,
+            ..Effect::drop_shadow()
+        };
+        let h = effect_params_hash(&base);
+
+        let moved: [Effect; 6] = [
+            Effect { spread: 3.5, ..base },
+            Effect {
+                softness: 4.5,
+                ..base
+            },
+            Effect { angle: 31.0, ..base },
+            Effect {
+                distance: 5.5,
+                ..base
+            },
+            Effect {
+                color: Color::new(0.1, 0.2, 0.3, 0.4),
+                ..base
+            },
+            Effect {
+                kind: EffectKind::Outline,
+                ..base
+            },
+        ];
+        for other in moved {
+            assert_ne!(
+                effect_params_hash(&other),
+                h,
+                "a parameter the pixels depend on is not in the hash: {other:?}"
+            );
+        }
+        // An outline's position changes which side of the edge the band is on and
+        // therefore which flood is run, so it is in the hash too.
+        assert_ne!(
+            effect_params_hash(&Effect {
+                kind: EffectKind::Outline,
+                position: OutlinePosition::Inside,
+                ..base
+            }),
+            effect_params_hash(&Effect {
+                kind: EffectKind::Outline,
+                position: OutlinePosition::Outside,
+                ..base
+            })
+        );
+
+        for same in [
+            Effect {
+                opacity: 0.25,
+                ..base
+            },
+            Effect {
+                blend: BlendMode::Screen,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                effect_params_hash(&same),
+                h,
+                "the draw's own settings must not rebake: {same:?}"
+            );
+        }
     }
 }

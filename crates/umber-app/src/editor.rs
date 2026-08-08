@@ -2254,6 +2254,78 @@ mod tests {
         );
     }
 
+    // --- layer effects ------------------------------------------------------
+
+    /// **A document with no effects produces the draw list it always did, entry
+    /// for entry.** `docs/layer-effects.md` §11 calls this the regression that
+    /// matters most, and it is the one that needs no device.
+    ///
+    /// Stated over the effect-carrying constructor as well, because
+    /// [`Editor::layer_draws`] is now written in terms of it: the two agreeing is
+    /// what stops one of them learning about folders, or about a float's preview
+    /// slice, and the other not.
+    #[test]
+    fn a_document_with_no_effects_produces_the_draw_list_it_always_did() {
+        let mut ed = with_a_folder();
+        ed.layers.get_mut(0).expect("a layer").visible = false;
+        ed.layers.get_mut(2).expect("a layer").clipped = true;
+
+        let plain = ed.layer_draws(None);
+        let effected = ed.effected_draws(None);
+        assert_eq!(plain.len(), effected.len());
+        for (a, b) in plain.iter().zip(&effected) {
+            assert_eq!(a.slot, b.draw.slot);
+            assert_eq!(a.visible, b.draw.visible);
+            assert_eq!(a.clipped, b.draw.clipped);
+            assert!(
+                b.effects.is_empty(),
+                "a layer nobody gave an effect carries none"
+            );
+        }
+    }
+
+    /// The float's preview slice is substituted in both readings.
+    ///
+    /// The one thing `layer_draws` does that a caller could not, and it has to
+    /// survive being written in terms of `effected_draws` — a float whose effects
+    /// were baked from the layer's own slice would leave a shadow standing where
+    /// the picture was, every frame of the drag.
+    #[test]
+    fn a_floats_preview_slice_reaches_both_readings() {
+        let ed = Editor::default();
+        let slot = ed.layers.layers()[0].slot().expect("a layer has a slot");
+        let float = Some((slot, 9));
+        assert_eq!(ed.layer_draws(float)[0].slot, 9);
+        assert_eq!(ed.effected_draws(float)[0].draw.slot, 9);
+    }
+
+    /// Effect slices start above everything the model has *claimed*, not above
+    /// everything the draw list names.
+    ///
+    /// The difference is a slice parked in an undo entry: claimed, in no layer,
+    /// and therefore in no draw. An effect written there would be an effect
+    /// written over a deleted layer's pixels, found when somebody undid the
+    /// delete — so this reads `slot_capacity_needed`, and the `+ 1` is the slice a
+    /// floating transform previews into.
+    #[test]
+    fn effect_slices_start_above_every_slice_the_model_has_claimed() {
+        let mut ed = Editor::default();
+        ed.layers.add();
+        ed.layers.add();
+        let needed = ed.layers.slot_capacity_needed();
+        assert_eq!(ed.effect_slot_base(), needed + 1);
+        let highest = ed
+            .effected_draws(None)
+            .iter()
+            .map(|e| e.draw.slot)
+            .max()
+            .expect("some draws");
+        assert!(
+            ed.effect_slot_base() > highest + 1,
+            "an effect slice would collide with the float's spare"
+        );
+    }
+
     // --- folders ------------------------------------------------------------
 
     /// A stack with a folder holding the top two of three layers.
