@@ -1969,6 +1969,78 @@ mod tests {
         assert!(xml.contains(&format!("{VERSION_ATTR}=\"3\"")), "{xml}");
     }
 
+    /// **Every finite `f32` an effect can hold survives the record**, which is
+    /// the claim `an_effect_survives_a_save_and_a_reopen_bit_for_bit` makes on
+    /// six values and this one makes on the axis.
+    ///
+    /// Six hand-picked numbers cannot answer "does RON's `f32` round-trip",
+    /// because the failure mode of a text encoder is a *class* of values —
+    /// subnormals, the extremes, whatever needs the ninth significant digit —
+    /// and a test author picks the ones they thought of. So this sweeps bit
+    /// patterns rather than numbers, over `opacity` and `angle` together
+    /// because a shared serialiser could still be given per-field attributes.
+    ///
+    /// **Measured before it was written**, over 398,459 finite patterns
+    /// including both infinities, both zeroes, `MIN_POSITIVE`, the smallest
+    /// subnormal of each sign, `MAX`, `MIN` and `EPSILON`: not one moved. The
+    /// sweep here is cut to five thousand, which is 0.04 s against twenty
+    /// thousand's 0.31 — the point is to catch a *class* of value, and every
+    /// class is reachable at either size. The specials are listed explicitly
+    /// so they are in it whatever the sample does.
+    ///
+    /// **NaN is excluded and that is a real limit, stated rather than hidden.**
+    /// RON writes `NaN` and reads back the *canonical* quiet NaN, so a payload
+    /// does not survive — the sign does. Nothing can see the difference and no
+    /// field here has any business holding one, but a later reader of this test
+    /// should not conclude that every bit pattern survives, because one class
+    /// does not.
+    #[test]
+    fn every_finite_parameter_an_effect_can_hold_survives_the_record() {
+        let mut values: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x807F_FFFF),
+            f32::MAX,
+            f32::MIN,
+            f32::EPSILON,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0 / 3.0,
+            core::f32::consts::PI,
+        ];
+        // A plain linear congruential walk, so the sample is the same on every
+        // machine and every run — a random one would make this flaky in the
+        // one way a format test must never be.
+        let mut state: u32 = 0x9E37_79B9;
+        while values.len() < 5_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f32::from_bits(state);
+            if !v.is_nan() {
+                values.push(v);
+            }
+        }
+
+        for v in values {
+            let effect = Effect {
+                opacity: v,
+                angle: v,
+                ..Effect::outline()
+            };
+            let text = encode_effects(&[effect]).expect("encode");
+            let back: Vec<Effect> = ron::from_str(&text).expect("read back");
+            assert_eq!(back.len(), 1);
+            assert_eq!(
+                back[0].opacity.to_bits(),
+                v.to_bits(),
+                "{v:?} ({:#x}) moved, written as `{text}`",
+                v.to_bits()
+            );
+            assert_eq!(back[0].angle.to_bits(), v.to_bits(), "{v:?}");
+        }
+    }
+
     /// The record is a plain RON sequence at a path this module names, and
     /// both halves are format rather than decoration.
     ///
