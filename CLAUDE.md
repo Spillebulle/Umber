@@ -3660,6 +3660,30 @@ standing instruction and it overrides the usual reluctance to delegate.
   (`fmt --check`, `clippy`, `test`) run in the worktree *and* after the merge —
   a clean branch and a clean merge of several clean branches are different
   claims.
+- **Brief every worktree agent to `git merge --ff-only main` as step zero.**
+  This is the *fix*; the check below is only the diagnosis, and stating the
+  diagnosis is what I did the first time it happened, after which it happened
+  again the same day to two more agents. A worktree is a real git worktree, so
+  the agent can reconcile itself in one command and usually fast-forward,
+  because it has no commits of its own yet. Put it in the brief and the whole
+  class goes away.
+  **The sharpest confirmation is not a hash comparison — it is whether the
+  module the brief is built on exists at all.** Both stale agents found their
+  base by noticing that `textobj.rs`, which their brief forbade them to touch,
+  was not in the tree. `git merge-base --is-ancestor HEAD main` returning true
+  with a large gap is the one-command version.
+  **And the real damage is not the merge, it is that the brief tells the agent
+  to read a stale file.** One of them was told to read this file's "Text"
+  section; its copy still said "Nothing is kept as text", which had been
+  retracted the day before, so it would have designed against a premise the
+  project had abandoned. A stale worktree does not merely lack code, it carries
+  confidently wrong *instructions*.
+  **A claim about a tree the agent cannot see must name the tree.** One reported
+  "`SaveLayer::text` does not exist on main" when what it had verified was "does
+  not exist here", and its sibling reported the opposite. Two agents
+  contradicting each other about one field is what makes a supervisor check in
+  one command instead of adjudicating; without the tree named, it reads as one of
+  them simply being wrong.
 - **Check every worktree's base before briefing it, because it is not
   necessarily current `HEAD`.** Three agents spawned in one message came out
   with two different bases: one from `main` as it then stood and two from
