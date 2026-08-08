@@ -572,12 +572,86 @@ draws the module and `cputext.rs` is the splash's own use of the same `Pen`.
   so the transform tool's handles move, scale, turn and flip it, Escape abandons
   it, and one undo takes it back off as an ordinary `EditKind::Transform`. No
   new float kind, no new undo variant, no second placer.
-- **Nothing is kept as text, and the panel says so rather than letting somebody
-  find out at the save.** The moment it goes down it is paint in the layer; the
-  string, the face and the size are recorded nowhere. `umber-version` did not
-  move and no byte of the format changed, which is the honest consequence of the
-  bullet above rather than an omission. Re-editable text objects are a different
-  feature and would need all three.
+- **Text *is* kept now, and `umber-core::textobj` is the record.** This bullet
+  used to say the opposite — "the string, the face and the size are recorded
+  nowhere" — and that was true and deliberate for as long as placing text was
+  only a paste. A `TextObject` is the string, the face, the colour and the
+  placement, written into the `.ora` under `umber/text/` and named by
+  `umber-text`: the shape `umber-mask` already uses, and for the same reason,
+  that `stack.xml` must not carry a paragraph of somebody's prose with XML
+  metacharacters in it. Placing text is *still* a paste; the record is what sits
+  beside the pixels afterwards.
+- **`umber-version` did not move for it, and the fingerprint is what makes that
+  honest rather than convenient.** An older build ignores the attribute, decodes
+  the ordinary PNG and shows the identical picture — plainer, not wrong. It can
+  also *paint* on that layer and save, leaving a record beside pixels it did not
+  make, and re-rendering would destroy the brushwork. So the record carries the
+  rectangle its layer image occupies and a hash of its bytes, and **on load a
+  mismatch discards the record and keeps the picture.** The same sentence a saved
+  history lives by. `a_text_layer_painted_on_by_an_older_build_opens_as_paint`
+  drives the *hash* half rather than the cheaper rectangle half, deliberately.
+- **The fingerprint belongs to the file and never to the session.** The writer
+  takes it from the bytes it is writing and the reader checks it against the
+  bytes it read, so a `TextObject` in memory carries none, nothing can go stale
+  and no readback is needed after an edit. What is hashed is the **trimmed
+  straight-alpha image**, not the canvas-sized layer buffer: `trim` drops fully
+  transparent pixels, so a premultiplied `(5,5,5,0)` would come back as zeroes
+  and a fingerprint over the buffer would refuse a document nobody had touched.
+- **A text layer is a layer that carries a record, not a third kind beside a
+  folder.** `docs/text-tool.md` §3 called it a layer *kind* and "a model change
+  of the same size as folders were"; it is not, and that shape is why nothing
+  else changed. It holds a slot, composites through the same pass, takes a mask,
+  clips, links, reorders, and travels into a structural undo entry with its
+  record inside it — so a folder deleted with text in it parks both and one undo
+  brings both back, with nothing written to make that happen. `LayerStack::MAX`
+  means what it always meant. Layer effects reached the same conclusion
+  independently, which is what makes it more than a convenience.
+- **Painting on one is refused at `LayerStack::refusal_at`, one gate with one
+  reason.** It subsumes the two tests `begin_stroke` already made — a lock and a
+  folder — and adds text, and it fails **closed** on an index off the end.
+  A stroke on a text layer's **mask** is allowed, because a mask bounds the alpha
+  the composite reads and changes no layer pixel, so it cannot put the record out
+  of step. **"Clear layer" is deliberately not refused** — it means to replace
+  the pixels, so it must take the record off instead, which is also the whole of
+  "convert to paint" and records no undo entry because no pixel changes.
+- **A canvas flip mirrors the placement; a resize drops the record.** The mirror
+  is exact, because `diag(-1,1)·R(θ)·diag(s)` *is* `R(-θ)·diag(-sx,sy)` — so a
+  flip costs nothing, which matters because undoing a flip is another flip and a
+  dropped record could never come back. A resize drops it for the reason a resize
+  clears the history: the placement is a rectangle of a canvas that has gone, and
+  a shrink has cropped the pixels. Translating by the anchor offset is exact for a
+  *grow* only, and two behaviours behind one command is how the cropping case ends
+  up untested.
+- **A missing font freezes and never substitutes.** `TextFace::resolve` asks for
+  the exact family and style and refuses; `FontLibrary::resolve` is deliberately
+  *not* what does it, because that one is total by construction and would
+  re-render somebody's caption in a face its author did not choose. The
+  PostScript name is recorded for the notice and is **not** a lookup key, because
+  `Face` carries none. **Embedding the font in the `.ora` is refused**: it is
+  redistribution performed by the artist without their knowledge, in a file they
+  may email, and for a machine-licensed system font it is a licence breach they
+  did not commit.
+- **The record has a size bound of its own**, and it may **not** share the
+  effects one. `MAX_EFFECTS_BYTES` is *derived* — one effect per kind,
+  `MAX_ENABLED` per document — so an over-long record is unwritable and the bound
+  is needed on the reading side alone. A text record cannot be derived: what
+  bounds a block is the area it renders to, not how much somebody typed, so a
+  legal block can outrun any figure. What the two share is the rule for **where
+  the figure lives: with whichever side can violate it.**
+- **No new `EditKind` and no `history::VERSION` bump.** A text edit puts a
+  rectangle of pixels back in one place, which is what a paste already does, so
+  it is `EditKind::Transform`. What it *also* restores is the record, which
+  belongs in an `EditBody` arm rather than a kind — `EditBody` is already where
+  the flip's difference lives. Not written to the file: a reopened undo restores
+  the pixels alone, which the next save's fresh fingerprint makes safe.
+- **The writer is not wired yet and that is the live gap.** Nothing under
+  `umber-app` fills `SaveLayer::text`, while the *read* side is wired — so a
+  document carrying `umber-text` opens as a text layer and is written back as
+  plain paint by both Save and the five-minute timer, with no warning. Latent
+  only because nothing yet creates one. Wiring it is **one commit**: both
+  writers, `text` on `autosave.rs`'s `LayerMeta` and its snapshot, and
+  `every_writer_of_a_save_layer_states_its_effects` widened — it counts the
+  literal `effects:` and is blind to a second field.
 - **A loss is named in the panel, not discovered.** Lines break only where the
   artist breaks them, a line mixing left-to-right and right-to-left writing is
   shaped but not reordered, and a character the face has no glyph for is left
