@@ -4538,6 +4538,12 @@ fn save_layer<'a>(
         // frames, so its metadata is snapshotted when the capture begins — and
         // the two have to write the same file. See `autosave::LayerMeta`.
         effects: layer.effects(),
+        // Straight off the layer for the same reason, and the field whose
+        // absence is silent: `..SaveLayer::new` writes `None`, so a document
+        // that opened carrying `umber-text` would be written back as plain
+        // paint with nothing said. `docformat` takes the fingerprint from the
+        // image *this* save is writing, so nothing stale can be handed over.
+        text: layer.text(),
         clipped: layer.clipped,
         locked: layer.locked,
         link: layer.link,
@@ -4644,21 +4650,90 @@ mod tests {
         );
     }
 
-    /// **Every writer of a `SaveLayer` states its effects, and this is a text
-    /// guard on purpose.**
+    /// **A Save writes the record that says the layer is text**, and this is the
+    /// behavioural half for exactly the reason the effects one above is.
+    ///
+    /// The text counterpart of that field was never filled at all: both writers
+    /// spread `..SaveLayer::new(…)`, which defaults `text` to `None`, so a
+    /// document opened out of an `.ora` carrying `umber-text` was written back
+    /// as plain paint — by Save and by the five-minute timer alike, with no
+    /// warning, because a record that is not offered is not a record that could
+    /// not be written. The text guard beside this one counts the field's
+    /// literal text and is defeated by a line that names it and passes `None`,
+    /// which is exactly what the default is; this asks the function by value.
+    #[test]
+    fn a_save_carries_the_text_the_layer_holds() {
+        use umber_core::text::{Align, TextBlock};
+        use umber_core::textobj::{Placement, TextFace, TextObject};
+
+        let mut stack = umber_core::LayerStack::new();
+        let record = TextObject::new(
+            TextBlock {
+                text: "A caption".into(),
+                size: 48.0,
+                line_spacing: 1.2,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: String::new(),
+            },
+            umber_core::Color::from_srgb_u8(20, 20, 20, 255),
+            Placement::identity(umber_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 24,
+            }),
+        );
+        assert!(
+            stack.set_text(0, record.clone()),
+            "the model should accept a record on a fresh layer"
+        );
+
+        let layer = &stack.layers()[0];
+        assert!(layer.is_text(), "precondition: the layer holds it");
+
+        let written = save_layer(layer, &[], None);
+        assert_eq!(
+            written.text,
+            Some(&record),
+            "a Save must write the record the layer is holding, not None: a text \
+             layer would open as text and be saved back as paint",
+        );
+    }
+
+    /// **Every writer of a `SaveLayer` states its effects and its text, and
+    /// this is a text guard on purpose.**
     ///
     /// There are two — Save, here, and the autosave — and both build the
     /// struct with `..SaveLayer::new(…)`, which **defaults** `effects` to
-    /// empty. So deleting the field from either compiles and passes, and the
-    /// failure is silent in the worst way: the document opens with its effects
-    /// and is written back without them, which is precisely the
-    /// open-and-save-loses-it failure `umber-version` 3 was raised to prevent,
-    /// reproduced inside the build that raised it and invisible to the version
-    /// gate because that gate is `version > VERSION`.
+    /// empty and `text` to `None`. So deleting either field from either writer
+    /// compiles and passes, and the failure is silent in the worst way: the
+    /// document opens with its effects and is written back without them, which
+    /// is precisely the open-and-save-loses-it failure `umber-version` 3 was
+    /// raised to prevent, reproduced inside the build that raised it and
+    /// invisible to the version gate because that gate is `version > VERSION`.
+    /// `text` is the same shape one step worse, because losing it needs no
+    /// version at all: `umber-text` deliberately did not move `VERSION`, so a
+    /// text layer written back as paint is a file every build reads happily and
+    /// nothing anywhere reports.
+    ///
+    /// **What this covers that the behavioural pair does not is *deletion*.**
+    /// `a_save_carries_the_effects_the_layer_holds` and
+    /// `a_save_carries_the_text_the_layer_holds` ask `save_layer` by value, so
+    /// they catch a field neutered to `&[]` or `None` — which a counter of
+    /// literal text cannot see, because the line is still there. This catches
+    /// the line going away, which they cannot see, because then the default
+    /// takes over and there is nothing to look at. Two failures, two guards,
+    /// and each says which it is for.
     ///
     /// The autosave's half is checked by *behaviour* —
-    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` reopens
-    /// the file it wrote. Save's cannot be: it reads every layer back off the
+    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with` and
+    /// `the_autosave_writes_the_text_the_snapshot_was_taken_with` reopen the
+    /// file they wrote. Save's cannot be: it reads every layer back off the
     /// GPU first, so exercising it needs a device and a whole document. What
     /// is left is the shape.
     ///
@@ -4694,7 +4769,7 @@ mod tests {
     ///   on it), which is the stronger guard and the reason the weaker one is
     ///   only asked to carry the writer that cannot have one.
     #[test]
-    fn every_writer_of_a_save_layer_states_its_effects() {
+    fn every_writer_of_a_save_layer_states_its_effects_and_its_text() {
         // **Everything from `#[cfg(test)]` on is cut off first, and that is
         // not tidiness.** This test's own body names both strings it counts,
         // and its failure message named one of them — so the first draft read
@@ -4710,14 +4785,23 @@ mod tests {
             let source = whole.split("#[cfg(test)]").next().unwrap_or(whole);
             let literals = source.match_indices("SaveLayer {").count();
             assert!(literals > 0, "{file} builds no SaveLayer any more");
-            let stated = source.match_indices("effects:").count();
-            assert!(
-                stated >= literals,
-                "{file} builds {literals} SaveLayer(s) outside its tests and \
-                 names the field {stated} time(s); `..SaveLayer::new` defaults \
-                 it to empty, so the one that does not name it drops a layer's \
-                 effects in silence"
-            );
+            // Both fields, because both default to something a writer that
+            // forgot them is indistinguishable from: an empty slice and no
+            // record. What is lost differs — an effect changes the picture,
+            // where a dropped record leaves every pixel and takes away the
+            // ability to set the caption again — and neither is announced.
+            for (field, what) in [
+                ("effects:", "drops a layer's effects"),
+                ("text:", "writes a text layer back as plain paint"),
+            ] {
+                let stated = source.match_indices(field).count();
+                assert!(
+                    stated >= literals,
+                    "{file} builds {literals} SaveLayer(s) outside its tests and \
+                     names `{field}` {stated} time(s); `..SaveLayer::new` supplies \
+                     a default, so the one that does not name it {what} in silence"
+                );
+            }
         }
     }
 

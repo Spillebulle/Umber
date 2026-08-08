@@ -91,6 +91,7 @@ use std::time::{Duration, Instant, SystemTime};
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 use umber_core::docformat::{self, SaveDocument, SaveLayer};
+use umber_core::textobj::TextObject;
 use umber_core::{Background, BlendMode, Effect};
 use umber_render::{CanvasRenderer, DocumentCapture, Gpu};
 
@@ -1005,6 +1006,21 @@ pub struct LayerMeta {
     /// A `Vec` of `Copy` structs, so the clone costs what the names already
     /// cost — and it is built once every few minutes, never on a frame.
     pub effects: Vec<Effect>,
+    /// What set this layer's pixels, where they were set rather than painted.
+    ///
+    /// **Here for exactly the reason [`LayerMeta::effects`] is here**, and the
+    /// hazard is one step worse. A record is derived from nothing the capture
+    /// reads, so taking it at write time would be free — and a caption re-set
+    /// while the readback was crossing frames would produce a file whose record
+    /// says one thing and whose pixels say another. That does not merely
+    /// misdescribe the layer: `docformat` fingerprints the record against the
+    /// image *it* is writing, so the two would agree, and reopening would
+    /// re-render the newer text over the older pixels with nothing to say a
+    /// mismatch had happened.
+    ///
+    /// Boxed as [`umber_core::Layer`] boxes it, so a stack of ordinary painted
+    /// layers pays a pointer per layer rather than a `TextObject` per layer.
+    pub text: Option<Box<TextObject>>,
     pub clipped: bool,
     pub locked: bool,
     pub link: Option<u8>,
@@ -1905,6 +1921,11 @@ fn snapshot(editor: &Editor, id: DocId) -> Option<Candidate> {
                 // Taken with the names, at the instant the capture begins —
                 // see `LayerMeta::effects`.
                 effects: l.effects().to_vec(),
+                // And the text record with them, for the reason
+                // `LayerMeta::text` gives: a record read at write time could
+                // describe a caption re-set since the pixels were read, and the
+                // fingerprint the writer takes would agree with it.
+                text: l.text().cloned().map(Box::new),
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -1972,6 +1993,11 @@ fn run_task(task: Task) -> Vec<Report> {
                 // The snapshot's, not the live stack's: this runs on the
                 // writer thread, minutes after the document was described.
                 effects: &l.effects,
+                // The same, and it is the field whose absence is silent: with
+                // nothing here `..SaveLayer::new` writes `None`, so a document
+                // that opened as text is written back as plain paint by the
+                // five-minute timer with no warning anywhere.
+                text: l.text.as_deref(),
                 clipped: l.clipped,
                 locked: l.locked,
                 link: l.link,
@@ -2320,6 +2346,7 @@ mod tests {
                 folder: false,
                 mask: None,
                 effects: Vec::new(),
+                text: None,
                 clipped: false,
                 locked: false,
                 link: None,
@@ -2643,6 +2670,111 @@ mod tests {
         );
     }
 
+    /// A text record for a layer of the fixture above.
+    fn a_record(caption: &str) -> TextObject {
+        use umber_core::text::{Align, TextBlock};
+        use umber_core::textobj::{Placement, TextFace};
+        TextObject::new(
+            TextBlock {
+                text: caption.to_string(),
+                size: 48.0,
+                line_spacing: 1.2,
+                tracking: 0.0,
+                align: Align::Left,
+            },
+            TextFace {
+                family: "Archivo".into(),
+                style: "Regular".into(),
+                postscript: String::new(),
+            },
+            umber_core::Color::from_srgb_u8(20, 20, 20, 255),
+            Placement::identity(umber_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+        )
+    }
+
+    /// **The autosave writes a layer's text record, and both writers had to be
+    /// wired in the same change** — the text twin of
+    /// `the_autosave_writes_the_effects_the_snapshot_was_taken_with`, and worse
+    /// in one respect.
+    ///
+    /// `SaveLayer::text` defaults to `None`, so a writer that does not name it
+    /// writes a text layer back as plain paint. Nothing reports that: a record
+    /// that was never offered is not one that failed to be written, and
+    /// `umber-text` deliberately did not raise `umber-version`, so the file that
+    /// comes out is one every build reads happily with a caption that can no
+    /// longer be set again. Wiring Save alone would have been worse than wiring
+    /// neither, because then survival would depend on which of the two last
+    /// touched the file — losing something every five minutes is a bug somebody
+    /// reports, losing it sometimes is one they doubt themselves over.
+    #[test]
+    fn the_autosave_writes_the_text_the_snapshot_was_taken_with() {
+        let internal = scratch("text-internal");
+        let mut doc = candidate(Session::default().active_id(), "Untitled 1");
+        doc.size = UVec2::ONE;
+        let record = a_record("A caption");
+        doc.layers[0].text = Some(Box::new(record.clone()));
+        let ours = internal.join("Untitled 1-7777777777777778.ora");
+
+        let reports = run_task(Task {
+            doc,
+            internal: Some(ours.clone()),
+            pixels: one_pixel_capture(),
+            expiry: None,
+        });
+        assert!(
+            reports.iter().all(|r| !matches!(r, Report::Failed { .. })),
+            "{reports:?}"
+        );
+
+        let back = umber_core::docimport::import(&ours).expect("reopen the copy");
+        assert_eq!(
+            back.layers[0].text.as_deref(),
+            Some(&record),
+            "an autosave wrote a text layer back as plain paint"
+        );
+
+        let _ = std::fs::remove_dir_all(&internal);
+    }
+
+    /// **The record comes off the snapshot, taken when the capture began** —
+    /// the text twin of `effects_are_snapshotted_when_the_capture_begins_not_
+    /// when_it_is_written`, and the case where reading late is not merely
+    /// inconsistent but undetectable.
+    ///
+    /// `docformat` fingerprints the record against the layer image *it* is
+    /// writing. So a caption re-set while the readback was crossing frames
+    /// would be written beside the older pixels with a fingerprint that agrees
+    /// with them, and the guard that exists to catch a record describing pixels
+    /// it did not make would pass. Reopening would then re-render the newer text
+    /// over the older picture with nothing anywhere to say so.
+    #[test]
+    fn text_is_snapshotted_when_the_capture_begins_not_when_it_is_written() {
+        let mut editor = Editor::default();
+        let id = editor.session.active_id();
+        assert!(editor.layers.set_text(0, a_record("As it was")));
+
+        let taken = snapshot(&editor, id).expect("the tab is open");
+        assert_eq!(
+            taken.layers[0].text.as_deref(),
+            Some(&a_record("As it was"))
+        );
+
+        // What an artist may do while the readback is still running.
+        assert!(editor.layers.set_text(0, a_record("Set again")));
+        assert!(editor.layers.take_text(0).is_some());
+
+        assert_eq!(
+            taken.layers[0].text.as_deref(),
+            Some(&a_record("As it was")),
+            "the snapshot followed the document instead of holding its instant"
+        );
+    }
+
     #[test]
     fn a_never_saved_document_goes_only_to_the_internal_copy() {
         // There is nowhere else it could go. Umber has not been told where the
@@ -2941,6 +3073,7 @@ mod tests {
             folder: false,
             mask,
             effects: Vec::new(),
+            text: None,
             clipped: false,
             locked: false,
             link: None,
@@ -2959,6 +3092,7 @@ mod tests {
                 folder: true,
                 mask: None,
                 effects: Vec::new(),
+                text: None,
                 clipped: false,
                 locked: false,
                 link: None,
