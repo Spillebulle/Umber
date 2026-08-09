@@ -603,10 +603,11 @@ pub enum ImportWarning {
     BlendDropped { layer: String, source: String },
     /// A layer group lost its grouping.
     ///
-    /// Raised from three places that lose it three different ways: a `.kra` and
-    /// a `.psd` group become plain layers at the top level, while an ORA group
-    /// nested deeper than [`LayerStack::MAX_DEPTH`](crate::LayerStack::MAX_DEPTH)
-    /// is merged into the folder outside it. So the sentence names the loss —
+    /// Raised from three places that lose it two different ways: a `.psd` group
+    /// becomes plain layers at the top level, while an ORA, `.kra` or `.clip`
+    /// group nested deeper than
+    /// [`LayerStack::MAX_DEPTH`](crate::LayerStack::MAX_DEPTH) is merged into
+    /// the folder outside it. So the sentence names the loss —
     /// the grouping — and deliberately says nothing about where the layers
     /// ended up or that they all arrived. It used to claim "Umber has no layer
     /// groups", which folders made false; a draft after that claimed the layers

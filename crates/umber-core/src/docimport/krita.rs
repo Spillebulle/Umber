@@ -16,6 +16,24 @@
 //! that case the `mergedimage.png` every `.kra` carries is imported as a single
 //! flat layer with a warning saying so.
 //!
+//! # Groups
+//!
+//! A `<layer nodetype="grouplayer">` is a **folder**, which it did not used to
+//! be: this reader flattened every group away and named the loss. Krita lists
+//! its layers uppermost first, so reversing the list puts a group after its own
+//! contents, which is exactly where a `LayerStack` keeps a folder — the nesting
+//! comes out of the reversal for free rather than out of a second pass.
+//!
+//! What still folds into the children is the group's **opacity**, because a
+//! folder at 50% over two overlapping children is not two children at 50% each
+//! and Umber's folders carry none; that is still an [`ImportWarning`]. What no
+//! longer folds is the **eye**: it lives on the folder, and
+//! `LayerStack::effective_visible` walks the ancestors, so a painter who
+//! reopens a folder finds its layers as they were rather than hidden by a fold
+//! nothing in the file said. A group nested deeper than
+//! [`LayerStack::MAX_DEPTH`] is merged into the folder outside it and *that* is
+//! what raises [`ImportWarning::GroupFlattened`] now.
+//!
 //! # Masks
 //!
 //! A layer's masks hang off it in `maindoc.xml` as `<mask>` children of a
@@ -51,7 +69,7 @@ use super::{
     lzf, srgb,
 };
 use crate::document::Background;
-use crate::layer::BlendMode;
+use crate::layer::{BlendMode, LayerStack};
 
 const FORMAT: SourceFormat = SourceFormat::Krita;
 
@@ -79,6 +97,10 @@ struct LayerSpec {
     /// is switched on. Everything else its `<masks>` element held has already
     /// been reported by the time this is filled in.
     mask: Option<MaskSpec>,
+    /// How deeply nested, 0 at the top level.
+    depth: u8,
+    /// A `grouplayer`: it holds no pixels and takes no slot.
+    folder: bool,
 }
 
 /// A `<mask nodetype="transparencymask">` as `maindoc.xml` describes it.
@@ -116,6 +138,14 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
 
     let mut layers = Vec::with_capacity(doc.layers.len());
     for spec in &doc.layers {
+        // A folder holds no pixels and takes no slot, so there is nothing to
+        // read out of the archive for one.
+        if spec.folder {
+            let mut folder = ImportedLayer::folder(spec.name.clone(), spec.depth, spec.visible);
+            folder.locked = false;
+            layers.push(folder);
+            continue;
+        }
         match load_layer(&mut zip, &doc.name, spec, doc.size, &mut warnings) {
             Ok(layer) => layers.push(layer),
             Err(reason) => warnings.push(ImportWarning::LayerSkipped {
@@ -125,7 +155,9 @@ pub fn read(bytes: &[u8]) -> Result<ImportedDocument, ImportError> {
         }
     }
 
-    if layers.is_empty() {
+    // A stack of nothing but folders has nothing to show and nowhere to paint,
+    // which is what `layers.is_empty()` used to mean before folders existed.
+    if layers.iter().all(|l| l.folder) {
         return flattened_fallback(
             &mut zip,
             doc.size,
@@ -174,10 +206,13 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
         detail,
     };
 
+    /// What an open `<layer nodetype="grouplayer">` passes to its children.
+    ///
+    /// Opacity only. Visibility used to be here too and now lives on the
+    /// folder — see the comment where a group is opened.
     #[derive(Clone)]
     struct Group {
         opacity: f32,
-        visible: bool,
     }
 
     /// What the `<layer>` element currently open turned into. Krita hangs
@@ -276,10 +311,7 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                         let attrs = Attrs::read(e).map_err(malformed)?;
                         let layer_name = attrs.string("name").unwrap_or_else(|| "Layer".into());
                         let node_type = attrs.get("nodetype").unwrap_or("paintlayer").to_string();
-                        let inherited = groups.last().cloned().unwrap_or(Group {
-                            opacity: 1.0,
-                            visible: true,
-                        });
+                        let inherited = groups.last().cloned().unwrap_or(Group { opacity: 1.0 });
                         let opacity = attrs
                             .parse::<f32>("opacity")
                             .filter(|v| v.is_finite())
@@ -290,19 +322,52 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
 
                         let open_name = layer_name.clone();
                         let mut pushed_group = false;
+                        // The nesting a `<layer>` element sits at is how many
+                        // groups are open around it.
+                        let depth = groups.len().min(LayerStack::MAX_DEPTH as usize) as u8;
                         let holder = match node_type.as_str() {
                             "grouplayer" => {
-                                warnings.push(ImportWarning::GroupFlattened {
-                                    group: layer_name.clone(),
-                                });
+                                // Nested deeper than Umber can hold. The depth
+                                // is capped, which merges this group into the
+                                // one outside it; said out loud, because the
+                                // grouping is the only thing a folder *is*.
+                                if groups.len() > LayerStack::MAX_DEPTH as usize {
+                                    warnings.push(ImportWarning::GroupFlattened {
+                                        group: layer_name.clone(),
+                                    });
+                                }
+                                // **An opacity does not fold into a folder**,
+                                // because a folder at 50% over two overlapping
+                                // children is not two children at 50% each —
+                                // Umber's folders carry no opacity at all, so
+                                // it is folded into the children and said out
+                                // loud. Visibility is the opposite: it lives on
+                                // the folder, and folding it into the children
+                                // as well would hide them twice, so a painter
+                                // who opened the folder again would find them
+                                // still hidden for a reason nothing in the file
+                                // said. `LayerStack::effective_visible` walks
+                                // the ancestors instead.
                                 if opacity < 1.0 {
                                     warnings.push(ImportWarning::GroupOpacityFolded {
                                         group: layer_name.clone(),
                                     });
                                 }
+                                specs.push(LayerSpec {
+                                    name: layer_name,
+                                    filename: String::new(),
+                                    x: 0,
+                                    y: 0,
+                                    opacity: 1.0,
+                                    visible,
+                                    composite_op: String::new(),
+                                    colourspace: None,
+                                    mask: None,
+                                    depth,
+                                    folder: true,
+                                });
                                 groups.push(Group {
                                     opacity: inherited.opacity * opacity,
-                                    visible: inherited.visible && visible,
                                 });
                                 pushed_group = true;
                                 Holder::Group
@@ -314,12 +379,14 @@ fn parse_maindoc(xml: &[u8], warnings: &mut Vec<ImportWarning>) -> Result<MainDo
                                     x: attrs.parse("x").unwrap_or(0),
                                     y: attrs.parse("y").unwrap_or(0),
                                     opacity: opacity * inherited.opacity,
-                                    visible: visible && inherited.visible,
+                                    visible,
                                     composite_op: canonical_op(
                                         attrs.get("compositeop").unwrap_or("normal"),
                                     ),
                                     colourspace: attrs.string("colorspacename"),
                                     mask: None,
+                                    depth,
+                                    folder: false,
                                 });
                                 Holder::Paint(specs.len() - 1)
                             }
@@ -535,6 +602,7 @@ fn load_layer(
     let mut layer = ImportedLayer::new(spec.name.clone(), mode, pixels);
     layer.visible = spec.visible;
     layer.opacity = spec.opacity;
+    layer.depth = spec.depth;
     // A mask that is named and then cannot be read is a *warning*, not a
     // skipped layer, for exactly the reason ORA's `load_mask` gives: the
     // layer's own pixels are all there, and one that comes back showing more
@@ -959,29 +1027,65 @@ mod tests {
         );
     }
 
+    /// **A Krita group arrives as a folder**, which it did not used to: this
+    /// reader flattened every group away and said so. Umber has folders now,
+    /// and a `<layer nodetype="grouplayer">` is exactly one.
+    ///
+    /// Three things are pinned and each was a decision. The folder sits
+    /// **after** its own contents in the stack, which is where a `LayerStack`
+    /// keeps one and is what the reversal of Krita's uppermost-first list
+    /// produces for free. Its **eye stays on the folder** rather than being
+    /// folded into the children, or a painter who reopened the folder would
+    /// find them still hidden for a reason nothing in the file said —
+    /// `LayerStack::effective_visible` walks the ancestors instead. Its
+    /// **opacity is still folded**, because a folder at 50% over two
+    /// overlapping children is not two children at 50% each and Umber's
+    /// folders carry no opacity at all, so that one is still a named loss.
     #[test]
-    fn a_group_is_flattened_and_its_state_folded_into_its_layers() {
+    fn a_group_arrives_as_a_folder_with_its_opacity_folded_into_its_layers() {
         let doc = read(&fixtures::kra_with_group()).unwrap();
 
-        // Three paint layers survive: the two inside the group and the one
-        // outside it, still bottom first.
-        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["Paper", "Fills", "Lines"]);
+        let shape: Vec<(&str, u8, bool)> = doc
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.depth, l.folder))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Paper", 0, false),
+                ("Fills", 1, false),
+                ("Lines", 1, false),
+                ("Ink", 0, true),
+            ]
+        );
 
-        // The group is hidden and half opaque; the layer outside it is neither.
+        // The group is hidden and half opaque. The eye is the folder's; the
+        // opacity is the children's.
         assert!(doc.layers[0].visible, "“Paper” is not in the group");
-        assert!(!doc.layers[1].visible, "a hidden group hides its layers");
+        assert!(!doc.layers[3].visible, "the folder carries the group's eye");
+        assert!(
+            doc.layers[1].visible,
+            "a child keeps its own eye; the folder's is what hides it"
+        );
         assert!((doc.layers[1].opacity - 128.0 / 255.0).abs() < 1e-6);
         assert_eq!(doc.layers[0].opacity, 1.0);
-
-        // "Lines" carries an ordinary transparency mask, which comes across
-        // rather than being reported — the group being flattened is a
-        // different loss and is still reported.
-        assert!(doc.layers[2].mask.is_some(), "{:?}", doc.warnings);
         assert!(doc.warnings.iter().any(|w| matches!(
             w,
-            ImportWarning::GroupFlattened { group } if group == "Ink"
+            ImportWarning::GroupOpacityFolded { group } if group == "Ink"
         )));
+
+        // The grouping is no longer a loss, so nothing may claim it was.
+        assert!(
+            !doc.warnings
+                .iter()
+                .any(|w| matches!(w, ImportWarning::GroupFlattened { .. })),
+            "{:?}",
+            doc.warnings
+        );
+
+        // "Lines" carries an ordinary transparency mask, which comes across.
+        assert!(doc.layers[2].mask.is_some(), "{:?}", doc.warnings);
     }
 
     #[test]
@@ -1273,11 +1377,17 @@ mod tests {
         )));
     }
 
+    /// A group arrives as a folder now, and a folder still cannot hold a
+    /// mask: it has no slot for one, because it has no pixels of its own. So
+    /// the loss is smaller than it was — the grouping survives — and it is
+    /// still a loss, because every layer inside the folder now covers more
+    /// than it did.
     #[test]
-    fn a_mask_on_a_group_is_reported_because_the_group_is_flattened_away() {
+    fn a_mask_on_a_group_is_reported_because_a_folder_cannot_hold_one() {
         let doc = read(&fixtures::kra_with_masked_group()).unwrap();
-        assert_eq!(doc.layers.len(), 1);
-        assert!(doc.layers[0].mask.is_none());
+        assert_eq!(doc.layers.len(), 2, "the folder and the layer inside it");
+        assert!(doc.layers[1].folder);
+        assert!(doc.layers.iter().all(|l| l.mask.is_none()));
         assert!(
             doc.warnings.iter().any(|w| matches!(
                 w,
