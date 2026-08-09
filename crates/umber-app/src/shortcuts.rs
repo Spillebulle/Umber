@@ -1065,6 +1065,560 @@ pub fn us_key_name(key: KeyCode) -> String {
     named.to_string()
 }
 
+// ---------------------------------------------------------------------------
+// A keymap as a file
+// ---------------------------------------------------------------------------
+
+/// The extension a keymap carries.
+pub const KEYMAP_EXTENSION: &str = "umberkeys";
+
+/// The first line of every keymap Umber writes.
+///
+/// **[`read_keymap`] does not look at it, and that is deliberate rather than an
+/// oversight.** It is there so somebody opening the file in a text editor knows
+/// what they are looking at. Requiring it would refuse a list typed by hand and
+/// refuse the preferences file itself, both of which are the same lines; and it
+/// could not carry a version either, because the format is line-based and every
+/// line is independent, so a later revision adding a line kind costs an older
+/// reader that one line — which is already counted and reported.
+///
+/// What decides whether a file is a keymap is therefore whether it names a
+/// command Umber knows. Nothing here may start reading this constant back
+/// without answering the two refusals above.
+const KEYMAP_HEADER: &str = "# Umber keymap";
+
+/// A keymap as a file's worth of text.
+///
+/// **Ids, never labels.** A shortcut's *label* follows the user's keyboard —
+/// `keylayout` asks the platform what a key prints, so the same binding reads
+/// "Ctrl++" on a Nordic board and "Ctrl+=" on a US one — and the stored form
+/// never may, for [`Chord::id`]'s own reason: the file has to parse on the next
+/// machine. So this writes exactly what the preferences file writes, through
+/// exactly the same two functions.
+///
+/// **Every action is written, including the ones at their factory binding and
+/// the ones deliberately unbound.** That is the one place this differs from
+/// `prefs::to_text`, which writes only what the user changed — and the two want
+/// opposite things. There, silence means "this build's default", so a release
+/// that adds a command arrives with it bound rather than blank. Here, silence
+/// would mean a keymap that quietly took whatever the *receiving* build thought
+/// the default was, which for a file whose whole purpose is to carry one
+/// keyboard onto another machine is the failure it exists to prevent.
+///
+/// **The line ending is `\n` on every platform, deliberately.** `docformat`'s
+/// rule: a file that travels may not take the platform's ending, or the same
+/// keymap written on Windows and on Linux differs byte for byte. That rule was
+/// written about a document and a keymap is the same kind of thing; a
+/// preferences file, which stays on the machine that wrote it, is not.
+pub fn to_keymap(bindings: &[Binding]) -> String {
+    let mut out = String::from(KEYMAP_HEADER);
+    out.push_str(
+        // One line per *key*, not per command: a command with two keys gets two
+        // lines. Saying "per command" here invited the two-keys-on-one-line
+        // form, which carries a key no counter could report the loss of.
+        "\n# Written by Umber. One line per key, naming the command and the key\n\
+         # in a spelling that is the same on every keyboard and every platform.\n\
+         # A command with no key after it is deliberately unbound.\n\n",
+    );
+    out.push_str(&shortcut_lines(bindings, true));
+    out
+}
+
+/// The `shortcut =` lines for a table, and **the one statement of what such a
+/// line looks like**.
+///
+/// Both writers call it: this module's keymap and `prefs::to_text`. They used to
+/// hold a copy each, which made "a keymap can be pasted into a preferences file"
+/// a coincidence that happened to be true rather than something the code says —
+/// and `read_keymap` and `prefs::parse_shortcuts` are the matching pair on the
+/// reading side, which is why [`merge`] exists.
+///
+/// `every` is the whole of the difference between the two files, and it is
+/// argued at [`to_keymap`]: a keymap names every command, a preferences file
+/// only the ones the user changed, and the two want opposite things from
+/// silence.
+pub fn shortcut_lines(bindings: &[Binding], every: bool) -> String {
+    let mut out = String::new();
+    for action in Action::ALL {
+        if !every && is_default(bindings, action) {
+            continue;
+        }
+        let chords = chords_for(bindings, action);
+        if chords.is_empty() {
+            // An action with no chord is how "this is deliberately unbound" is
+            // said, which is distinct from an action the file never names at
+            // all — that one is silence, and silence means the default.
+            out.push_str(&format!("shortcut = {}\n", action.id()));
+            continue;
+        }
+        for chord in chords {
+            out.push_str(&format!("shortcut = {} {}\n", action.id(), chord.id()));
+        }
+    }
+    out
+}
+
+/// What reading a keymap produced, and everything it could not read.
+///
+/// The counts are separate rather than one total because each is a different
+/// sentence, and **an import that loses something must say so** — the rule every
+/// importer in Umber keeps. A file naming a command this build has never heard
+/// of is a keymap from a newer Umber; a chord that will not parse is a corrupt
+/// or hand-mangled line; a command the file never mentions is a keymap from an
+/// older one. Rolled into one number, none of the three could be explained.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Keymap {
+    /// The whole table to publish: the file's answers over the current set.
+    pub bindings: Vec<Binding>,
+    /// Lines naming a command this build does not have.
+    pub unknown_actions: usize,
+    /// Lines naming a key this build cannot read. The commands they named keep
+    /// whatever they were bound to.
+    pub unreadable_chords: usize,
+    /// Lines that are not blank, not a comment and not a binding at all.
+    pub unreadable_lines: usize,
+    /// Commands the file never mentions, which keep whatever they were bound
+    /// to.
+    pub untouched: usize,
+}
+
+/// Read a keymap over the bindings in force, or `None` where the text is not a
+/// keymap at all.
+///
+/// `None` is a *refusal* and the caller has to report it: picking the wrong file
+/// out of a dialog is the ordinary way to get here, and a silent no-op would
+/// look exactly like a keymap that happened to bind nothing.
+///
+/// Tolerance is `prefs::parse_shortcuts`' and deliberately identical to it:
+///
+/// - An action the file mentions is **fully described** by the file, including
+///   "mentioned with no chord", which is how a deliberate unbinding is said.
+/// - **A line whose chord does not parse disqualifies its action from being
+///   mentioned at all**, so a stray byte restores a shortcut rather than
+///   removing one. Losing a binding to corruption and having no way to tell is
+///   the worse failure.
+/// - An action the file never mentions keeps what it has. Not what it *defaults*
+///   to: an older keymap simply predates a command, and resetting it would undo
+///   a choice the file says nothing about.
+///
+/// A chord the file gives to two commands is kept on both. That is what
+/// [`bind`] already does when somebody types a clash into the pane, and the
+/// clash is drawn on both rows rather than silently dropped — but the caller has
+/// to say it happened, which [`shadowed`] is for.
+pub fn read_keymap(text: &str, over: &[Binding]) -> Option<Keymap> {
+    let mut lines = 0usize;
+    let mut unknown = 0usize;
+    let mut observed: Vec<(Action, Option<&str>)> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // The `shortcut =` key is optional on the way in and always written on
+        // the way out, so a keymap can be pasted straight into a preferences
+        // file and a hand-written list of bare pairs still reads.
+        let body = match line.split_once('=') {
+            Some((key, value)) if key.trim() == "shortcut" => value.trim(),
+            Some(_) => {
+                lines += 1;
+                continue;
+            }
+            None => line,
+        };
+        let mut parts = body.split_whitespace();
+        let Some(name) = parts.next() else {
+            lines += 1;
+            continue;
+        };
+        let Some(action) = Action::from_id(name) else {
+            unknown += 1;
+            continue;
+        };
+        let chord = parts.next();
+        // A line is one command and one key. A third token is a key that would
+        // otherwise be dropped without a word — `Redo Ctrl+KeyZ Ctrl+KeyY` is
+        // the shape, and `to_keymap` writes Redo's two chords as two lines
+        // precisely so that form never has to be read.
+        if parts.next().is_some() {
+            lines += 1;
+            continue;
+        }
+        observed.push((action, chord));
+    }
+    // **At least one line has to name a command this build knows**, or this is
+    // not a keymap. Picking the wrong file out of a dialog is the ordinary way
+    // to get here, and every other bar was worse: demanding the header refuses a
+    // list somebody typed and refuses the preferences file itself, while
+    // accepting any file at all reads a paragraph of prose as thirty unknown
+    // commands and reports "imported, with notes".
+    if observed.is_empty() {
+        return None;
+    }
+
+    let mut out = merge(&observed, over);
+    out.unknown_actions = unknown;
+    out.unreadable_lines = lines;
+    Some(out)
+}
+
+/// Fold a file's `(command, key)` observations into the table in force, and
+/// **be the one statement of the tolerance both readers keep**.
+///
+/// `read_keymap` and `prefs::parse_shortcuts` tokenise differently — one reads a
+/// file, the other is handed the values a general `key = value` reader already
+/// split — and everything after that is this function. It used to be written
+/// twice, with `read_keymap`'s doc claiming the two were "deliberately
+/// identical", which is a promise held by discipline rather than by the code;
+/// this is that promise made structural.
+///
+/// The rules, and each was a bug somewhere before it was a rule:
+///
+/// - An action the file mentions is **fully described** by it, including
+///   "mentioned with no chord", which is how a deliberate unbinding is said.
+/// - **A chord that does not parse disqualifies its action from being mentioned
+///   at all**, so a stray byte restores a shortcut rather than removing one.
+///   Losing a binding to corruption and having no way to tell is the worse
+///   failure.
+/// - An action never mentioned keeps whatever `over` gives it. What `over` *is*
+///   is the caller's: the factory table when reading preferences, the table in
+///   force when importing a keymap over it.
+/// - The result is ordered by [`Action::ALL`] whatever order the file used,
+///   because [`resolve_in`] gives a chord held twice to whichever binding comes
+///   first — with file order, editing an unrelated line could change which of
+///   two clashing commands runs.
+///
+/// The two counters that are about *lines* are the tokeniser's and are left at
+/// zero here; this function never sees a line.
+pub fn merge(observed: &[(Action, Option<&str>)], over: &[Binding]) -> Keymap {
+    let mut out = Keymap::default();
+    // Every action named at all, broken chords included. What
+    // `Keymap::untouched` counts is what is *missing* from this, so an action
+    // whose only line would not parse is reported once, as an unreadable chord,
+    // rather than twice under two different explanations.
+    let mut named: Vec<Action> = Vec::new();
+    let mut broken: Vec<Action> = Vec::new();
+    let mut custom: Vec<Binding> = Vec::new();
+
+    for (action, chord_id) in observed {
+        if !named.contains(action) {
+            named.push(*action);
+        }
+        let Some(chord_id) = chord_id else {
+            continue; // Deliberately unbound.
+        };
+        match Chord::from_id(chord_id) {
+            Some(chord) => custom.push(Binding::new(*action, chord)),
+            None => {
+                out.unreadable_chords += 1;
+                if !broken.contains(action) {
+                    broken.push(*action);
+                }
+            }
+        }
+    }
+
+    out.untouched = Action::ALL
+        .into_iter()
+        .filter(|a| !named.contains(a))
+        .count();
+    named.retain(|a| !broken.contains(a));
+    for action in Action::ALL {
+        let source = if named.contains(&action) {
+            &custom
+        } else {
+            over
+        };
+        out.bindings
+            .extend(source.iter().copied().filter(|b| b.action == action));
+    }
+    out
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::*;
+
+    /// A keymap written and read back is the table it was written from.
+    ///
+    /// Read back over a table that is *not* the one it was written from, so the
+    /// assertion measures the file rather than the fallback: over the defaults,
+    /// a keymap that carried nothing at all would pass.
+    #[test]
+    fn a_keymap_written_and_read_back_is_the_table_it_came_from() {
+        let mut mine = defaults();
+        let at = slot_of(&mine, Action::BrushTool, 0);
+        bind(
+            &mut mine,
+            Action::BrushTool,
+            at,
+            Chord::new(KeyCode::F7, true, true, false),
+        );
+        clear_action(&mut mine, Action::ActualSize);
+        bind(
+            &mut mine,
+            Action::Redo,
+            None,
+            Chord::new(KeyCode::KeyR, true, false, true),
+        );
+
+        let text = to_keymap(&mine);
+        let read = read_keymap(&text, &defaults()).expect("its own output is a keymap");
+        // Per action rather than as one slice, because `bind` appends where the
+        // reader orders by `Action::ALL` — which is the *reader's* rule and is
+        // asserted separately below rather than folded into this comparison.
+        for action in Action::ALL {
+            assert_eq!(
+                chords_for(&read.bindings, action),
+                chords_for(&mine, action),
+                "{} came back different",
+                action.id(),
+            );
+        }
+        let order: Vec<Action> = read.bindings.iter().map(|b| b.action).collect();
+        let expected: Vec<Action> = Action::ALL
+            .into_iter()
+            .flat_map(|a| std::iter::repeat_n(a, chords_for(&mine, a).len()))
+            .collect();
+        assert_eq!(
+            order, expected,
+            "the reader must order by the action list, whatever order the file used",
+        );
+        assert_eq!(read.untouched, 0, "its own output names every command");
+        assert_eq!(read.unknown_actions, 0);
+        assert_eq!(read.unreadable_chords, 0);
+        assert_eq!(read.unreadable_lines, 0);
+    }
+
+    /// Every command is in the file, including the ones nobody has touched and
+    /// the ones deliberately unbound.
+    ///
+    /// This is the one place a keymap differs from the preferences file, and the
+    /// difference is load-bearing: silence there means "this build's default",
+    /// which is exactly what a file carrying one keyboard onto another machine
+    /// must not fall back to.
+    #[test]
+    fn a_keymap_names_every_command_bound_or_not() {
+        let mut mine = defaults();
+        clear_action(&mut mine, Action::ZoomTool);
+        let text = to_keymap(&mine);
+        for action in Action::ALL {
+            assert!(
+                text.contains(&format!("shortcut = {}", action.id())),
+                "{} is not in the file",
+                action.id(),
+            );
+        }
+        assert!(text.contains(&format!("shortcut = {}\n", Action::ZoomTool.id())));
+    }
+
+    /// The file records ids, never the labels a keyboard prints.
+    ///
+    /// `keylayout` asks the platform what a key prints, so a label follows the
+    /// board in front of the artist; the stored form never may, because the file
+    /// has to parse on the next machine. `Chord::id` says so and this is what
+    /// holds the keymap to it.
+    #[test]
+    fn a_keymap_records_ids_and_never_the_keys_a_board_prints() {
+        let chord = Chord::new(KeyCode::KeyZ, true, false, false);
+        assert_ne!(
+            chord.id(),
+            chord.display(),
+            "pick a chord whose two spellings differ, or this tests nothing",
+        );
+        let text = to_keymap(&defaults());
+        assert!(text.contains(&chord.id()), "the id is not in the file");
+        assert!(
+            !text.contains(&chord.display()),
+            "the file carries a label, which is what the next machine cannot read",
+        );
+    }
+
+    /// A line Umber cannot read costs that line, and a chord it cannot read
+    /// leaves the command it named exactly as it was.
+    ///
+    /// The second half is `prefs::parse_shortcuts`' rule and the direction
+    /// matters: a stray byte must restore a shortcut rather than remove one.
+    /// Each loss is counted separately, because each is a different sentence to
+    /// put in front of somebody.
+    #[test]
+    fn a_keymap_line_that_will_not_read_costs_only_itself() {
+        let text = concat!(
+            "# Umber keymap\n",
+            "shortcut = Kaleidoscope Ctrl+KeyK\n",
+            "shortcut = Undo Ctrl+KeyGarbage\n",
+            "this is not a shortcut = at all\n",
+            "shortcut = PanTool KeyP\n",
+        );
+        let read = read_keymap(text, &defaults()).expect("one line names a real command");
+        assert_eq!(read.unknown_actions, 1);
+        assert_eq!(read.unreadable_chords, 1);
+        assert_eq!(read.unreadable_lines, 1);
+        assert_eq!(
+            chords_for(&read.bindings, Action::Undo),
+            chords_for(&defaults(), Action::Undo),
+            "a chord that would not read took a shortcut away",
+        );
+        assert_eq!(
+            chords_for(&read.bindings, Action::PanTool),
+            vec![Chord::new(KeyCode::KeyP, false, false, false)],
+        );
+    }
+
+    /// A command the file never mentions keeps what it had, and is counted.
+    ///
+    /// Not what it *defaults* to: an older keymap simply predates a command, and
+    /// putting it back to the factory binding would undo a choice the file says
+    /// nothing about.
+    #[test]
+    fn a_command_missing_from_a_keymap_keeps_what_it_had() {
+        let mut mine = defaults();
+        let at = slot_of(&mine, Action::PanTool, 0);
+        bind(
+            &mut mine,
+            Action::PanTool,
+            at,
+            Chord::new(KeyCode::F9, false, false, false),
+        );
+        let read = read_keymap("shortcut = Undo Ctrl+KeyU\n", &mine).expect("a keymap");
+        assert_eq!(
+            chords_for(&read.bindings, Action::PanTool),
+            vec![Chord::new(KeyCode::F9, false, false, false)],
+        );
+        assert_eq!(read.untouched, Action::ALL.len() - 1);
+    }
+
+    /// A command named with no key after it is deliberately unbound, which is
+    /// the one thing silence could never say.
+    #[test]
+    fn a_keymap_can_take_a_shortcut_off() {
+        let read = read_keymap("shortcut = Undo\n", &defaults()).expect("a keymap");
+        assert!(chords_for(&read.bindings, Action::Undo).is_empty());
+        assert!(
+            !chords_for(&read.bindings, Action::Redo).is_empty(),
+            "unbinding one command took another with it",
+        );
+    }
+
+    /// A key the file gives to two commands is kept on both, and is findable.
+    ///
+    /// The same answer `bind` gives when somebody types a clash into a row:
+    /// flagged on both rows, never silently dropped. The caller has to be able
+    /// to *say* it happened, which is what this pins.
+    #[test]
+    fn a_key_a_keymap_gives_to_two_commands_is_kept_on_both() {
+        let read = read_keymap(
+            "shortcut = PanTool Ctrl+KeyZ\nshortcut = Undo Ctrl+KeyZ\n",
+            &defaults(),
+        )
+        .expect("a keymap");
+        assert_eq!(
+            shadowed(&read.bindings),
+            vec![Chord::new(KeyCode::KeyZ, true, false, false)],
+        );
+    }
+
+    /// A file that names no command Umber knows is refused, rather than read as
+    /// a keymap that happened to bind nothing.
+    ///
+    /// Picking the wrong file out of a dialog is the ordinary way to get here,
+    /// and a silent no-op looks exactly like an import that worked.
+    #[test]
+    fn a_file_that_is_not_a_keymap_is_refused() {
+        for not_a_keymap in [
+            "",
+            "# Umber keymap\n",
+            "Dear Umber,\n\nplease paint faster.\n",
+            "{\"shortcut\": \"Ctrl+Z\"}\n",
+        ] {
+            assert!(
+                read_keymap(not_a_keymap, &defaults()).is_none(),
+                "{not_a_keymap:?} was read as a keymap",
+            );
+        }
+    }
+
+    /// A keymap reads with or without the `shortcut =` key in front of it, so a
+    /// hand-typed list of bare pairs is a keymap too.
+    #[test]
+    fn a_keymap_reads_with_or_without_the_key_in_front_of_it() {
+        let with = read_keymap("shortcut = Undo Ctrl+KeyU\n", &defaults()).expect("a keymap");
+        let without = read_keymap("Undo Ctrl+KeyU\n", &defaults()).expect("a keymap");
+        assert_eq!(with.bindings, without.bindings);
+    }
+
+    /// A line carrying a second key loses it, so it is refused rather than half
+    /// read.
+    ///
+    /// `to_keymap` writes an action's two chords as two lines precisely so this
+    /// form never has to be read, and there is no counter that could say "one
+    /// key was dropped" — so the line is counted as one Umber could not read,
+    /// which is the sentence that is actually true. **A loss no counter counts
+    /// is the silent import this whole shape exists to prevent.**
+    #[test]
+    fn a_line_carrying_two_keys_is_refused_rather_than_half_read() {
+        let read =
+            read_keymap("Undo Ctrl+KeyU\nRedo Ctrl+KeyZ Ctrl+KeyY\n", &defaults()).expect("keymap");
+        assert_eq!(read.unreadable_lines, 1);
+        assert_eq!(
+            chords_for(&read.bindings, Action::Redo),
+            chords_for(&defaults(), Action::Redo),
+            "half of a two-key line was taken",
+        );
+    }
+
+    /// The keymap and the preferences file are one format, and this is the only
+    /// test that says so **across the module boundary**.
+    ///
+    /// Both sides now go through [`shortcut_lines`] and [`merge`], so this
+    /// cannot drift without one of them changing — but that is exactly the claim
+    /// that has to be checked rather than asserted. Before this test existed,
+    /// renaming the `shortcut` key in `prefs` left every test in both modules
+    /// green while the stated interoperability died.
+    #[test]
+    fn a_keymap_and_a_preferences_file_read_each_other() {
+        let mut mine = defaults();
+        let at = slot_of(&mine, Action::PanTool, 0);
+        bind(
+            &mut mine,
+            Action::PanTool,
+            at,
+            Chord::new(KeyCode::F9, true, false, false),
+        );
+        clear_action(&mut mine, Action::ZoomTool);
+
+        // A keymap, read by the preferences reader.
+        let from_keymap = crate::prefs::from_text(&to_keymap(&mine));
+        for action in Action::ALL {
+            assert_eq!(
+                chords_for(&from_keymap.shortcuts, action),
+                chords_for(&mine, action),
+                "{} did not survive a keymap read as preferences",
+                action.id(),
+            );
+        }
+
+        // And a preferences file, read by the keymap reader. Its other settings
+        // are `key = value` lines this reader does not know, which is what
+        // `unreadable_lines` is for — so the bindings have to come through
+        // *and* the file has to be recognisable as a keymap at all.
+        let prefs = crate::prefs::Prefs {
+            shortcuts: mine.clone(),
+            ..Default::default()
+        };
+        let from_prefs =
+            read_keymap(&crate::prefs::to_text(&prefs), &defaults()).expect("a keymap");
+        for action in Action::ALL {
+            assert_eq!(
+                chords_for(&from_prefs.bindings, action),
+                chords_for(&mine, action),
+                "{} did not survive preferences read as a keymap",
+                action.id(),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
