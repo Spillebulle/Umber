@@ -474,6 +474,17 @@ pub(crate) fn panel(
     // the controls claim their room first and the title takes what is left,
     // which is the arrangement the Layers body's own heading row already had to
     // make for the same reason.
+    //
+    // **This changes every module, not only Layers, and what it changes is a
+    // title that was overdrawn into one that is clipped.** In edit mode at 190
+    // points the room left is about 31, which is five characters: "Palette"
+    // reads "Palet…". That is worse to read than the full word and better than
+    // the full word with a button through it, and it is the state the panel is
+    // in while somebody is dragging it, where the title is the least useful
+    // thing on it. Outside edit mode at that width there are four marks rather
+    // than five and every module's title fits whole. There is no room to
+    // reclaim: the grip and its gap take the first 27 points and the marks are
+    // the panel's commands.
     let controls = Rect::from_min_max(
         pos2(rect.center().x, header.top()),
         pos2(rect.right() - pad, header.bottom()),
@@ -1454,6 +1465,16 @@ fn layers_body(ui: &mut Ui, p: &Palette, ed: &mut Editor, actions: &mut UiAction
         // on a second line instead of off the end.
         // `the_layers_body_fits_the_narrowest_column_it_can_be_dragged_to` is
         // the guard, and it failed by 23.75 points before this.
+        //
+        // **So this row's height follows what is on it, where
+        // `metrics::LAYER_TICK_ROW` is a constant precisely so the tick line's
+        // does not — and the difference is deliberate.** That constant exists
+        // because the thing that changes there is *ticking*, whose pointer is
+        // on the list the jump would move. Here the thing that changes is a
+        // mask being added or taken off, which is a press on the mask toggle,
+        // and the toggle stays on the first line whichever way the row breaks.
+        // A row held at two lines always would move the list for everybody to
+        // spare the one width where it wraps, and clipping is what it replaced.
         ui.horizontal_wrapped(|ui| {
             add_layer_button(ui, p, ed, actions);
             let has_mask = ed.layers.active_mask().is_some();
