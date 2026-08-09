@@ -12,12 +12,12 @@
 //!
 //! # What is here and what is not
 //!
-//! Four formats land: OpenRaster (`.ora`), Krita (`.kra`), Photoshop (`.psd`)
-//! and a flat `.png` as a single layer. Clip Studio, MediBang, Procreate, GIMP
-//! and layered TIFF are declined, each for a reason written down in
-//! `docs/document-import.md`. The governing rule is that an import which
-//! produces subtly wrong pixels is worse than one that refuses: a refusal sends
-//! the artist to export a PNG or an ORA, whereas a wrong import wastes an
+//! Five formats land: OpenRaster (`.ora`), Krita (`.kra`), Photoshop (`.psd`),
+//! Clip Studio Paint (`.clip`) and a flat `.png` as a single layer. MediBang,
+//! Procreate, GIMP and layered TIFF are declined, each for a reason written
+//! down in `docs/document-import.md`. The governing rule is that an import
+//! which produces subtly wrong pixels is worse than one that refuses: a refusal
+//! sends the artist to export a PNG or an ORA, whereas a wrong import wastes an
 //! afternoon before they notice the colours moved.
 //!
 //! The same rule shapes what happens *inside* a supported format. Umber has
@@ -26,11 +26,12 @@
 //! expected to show them. Clipping is no longer among the losses — Umber's own
 //! flag means what Photoshop's does, so a clipped PSD layer arrives clipped.
 //!
-//! Masks are read out of ORA and out of a `.kra`'s **transparency masks**,
-//! which are the one kind of Krita mask that means what Umber's does. Krita's
-//! other four — filter, transform, selection and colorize — and Photoshop's
-//! masks are all still reported as lost, the last of those because `psd` 0.3.5
-//! does not carry them out of the file at all. See [`krita`] and [`photoshop`].
+//! Masks are read out of ORA, out of a `.kra`'s **transparency masks** — the
+//! one kind of Krita mask that means what Umber's does — and out of a `.clip`'s
+//! layer masks. Krita's other four kinds (filter, transform, selection and
+//! colorize) and Photoshop's masks are still reported as lost, the last of
+//! those because `psd` 0.3.5 does not carry them out of the file at all. See
+//! [`krita`], [`clipstudio`] and [`photoshop`].
 //!
 //! # Pixel convention
 //!
@@ -40,6 +41,7 @@
 //! form and what the wrong ones look like.
 
 mod blend;
+mod clipstudio;
 mod container;
 // Visible inside the crate so `tip::TipMask::from_picture` can read a PNG
 // through the decoder that already exists rather than growing a second one.
@@ -70,7 +72,7 @@ pub use history::{ImportedBody, ImportedEdit, ImportedHistory, ImportedPiece};
 ///
 /// Ordered so that the file-open dialog can list the layered formats first.
 pub fn supported_extensions() -> &'static [&'static str] {
-    &["ora", "kra", "psd", "png"]
+    &["ora", "kra", "psd", "clip", "png"]
 }
 
 /// Read a document written by another application.
@@ -86,7 +88,7 @@ pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
         .to_ascii_lowercase();
 
     // Checked before the read so that an unreadable name gives the useful
-    // answer ("Umber cannot open .clip files") rather than an I/O error.
+    // answer ("Umber cannot open .mdp files") rather than an I/O error.
     if !supported_extensions().contains(&ext.as_str()) {
         return Err(ImportError::UnsupportedExtension(ext));
     }
@@ -96,6 +98,7 @@ pub fn import(path: &Path) -> Result<ImportedDocument, ImportError> {
         "ora" => openraster::read(&bytes),
         "kra" => krita::read(&bytes),
         "psd" => photoshop::read(&bytes),
+        "clip" => clipstudio::read(&bytes),
         "png" => flat::read_png(&bytes),
         _ => unreachable!("extension was checked against supported_extensions"),
     }?;
@@ -122,6 +125,7 @@ pub enum SourceFormat {
     OpenRaster,
     Krita,
     Photoshop,
+    ClipStudio,
     Png,
 }
 
@@ -131,6 +135,7 @@ impl SourceFormat {
             Self::OpenRaster => "OpenRaster",
             Self::Krita => "Krita",
             Self::Photoshop => "Photoshop",
+            Self::ClipStudio => "Clip Studio Paint",
             Self::Png => "PNG",
         }
     }
@@ -666,6 +671,14 @@ pub enum ImportWarning {
     EffectsOverBudget { disabled: usize, max: usize },
     /// A layer could not be brought across at all.
     LayerSkipped { layer: String, reason: String },
+    /// A layer that was not made of pixels arrived as pixels.
+    ///
+    /// Deliberately *not* [`LayerSkipped`](Self::LayerSkipped): the picture is
+    /// all there and looks right, which is the whole difference — what is lost
+    /// is that a caption cannot be retyped and a vector cannot be re-pulled.
+    /// Clip Studio's own PSD export makes exactly this trade, and an artist who
+    /// is told can go back and export the text separately.
+    LayerRasterised { layer: String, what: String },
     /// Layer structure was lost and the flattened image was used instead.
     DocumentFlattened { reason: String },
     /// Pixels were taken to be sRGB when the file said otherwise.
@@ -741,6 +754,11 @@ impl fmt::Display for ImportWarning {
             Self::LayerSkipped { layer, reason } => {
                 write!(f, "Layer “{layer}” could not be imported: {reason}.")
             }
+            Self::LayerRasterised { layer, what } => write!(
+                f,
+                "Layer “{layer}” was {what}, and arrived as ordinary pixels. Every pixel is \
+                 there; it cannot be edited as what it was."
+            ),
             Self::DocumentFlattened { reason } => write!(
                 f,
                 "The layers could not be read ({reason}), so the flattened image was imported as a single layer."
@@ -1081,14 +1099,14 @@ mod tests {
 
     #[test]
     fn an_unknown_extension_is_refused_by_name() {
-        let err = import(Path::new("drawing.clip")).unwrap_err();
+        let err = import(Path::new("drawing.mdp")).unwrap_err();
         assert!(
-            matches!(&err, ImportError::UnsupportedExtension(e) if e == "clip"),
+            matches!(&err, ImportError::UnsupportedExtension(e) if e == "mdp"),
             "got {err:?}"
         );
         // The extension is checked before the file is opened, so the message
         // does not depend on the file existing.
-        assert_eq!(err.to_string(), "Umber cannot open .clip files.");
+        assert_eq!(err.to_string(), "Umber cannot open .mdp files.");
     }
 
     #[test]

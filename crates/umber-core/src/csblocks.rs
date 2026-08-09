@@ -138,15 +138,19 @@ impl Packing {
 /// What a block Clip Studio did not store holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fill {
-    /// Nothing: the ordinary case, and every raster layer in every sample.
+    /// Nothing: the state of every ordinary raster layer, whose untouched
+    /// corners are transparent.
     Empty,
-    /// A colour the file states. Read as a *flag* and never as a colour —
-    /// what the section holds beyond that has not been established against a
-    /// real file, so a caller must refuse rather than paint something plausible.
-    Stated,
+    /// The file states a fill, and this is its **first channel** as a byte.
+    ///
+    /// That is the whole of what a mask needs — one channel, and `255` is
+    /// exactly the "reveal everything" a Clip Studio mask starts as. A
+    /// *colour* bitmap's fill needs four more values whose meaning has never
+    /// been checked against a file that paints with one, so a caller reading
+    /// colour must refuse this rather than invent something plausible.
+    Stated(u8),
     /// The `InitColor` section could not be located. Older files and the
-    /// material fixtures both land here; both are read as [`Fill::Empty`],
-    /// which is what every reader of this format does.
+    /// material fixtures both land here.
     Unknown,
 }
 
@@ -187,7 +191,11 @@ pub(crate) fn parse_attribute(attribute: &[u8], max_side: u32) -> Option<Bitmap>
 
     // `Parameter`'s remaining sixteen integers describe the pixel packing. The
     // first is the channel order, then the two halves and their sum.
-    let packing = match (be32(parameter, 20), be32(parameter, 24), be32(parameter, 28)) {
+    let packing = match (
+        be32(parameter, 20),
+        be32(parameter, 24),
+        be32(parameter, 28),
+    ) {
         (Some(first), Some(second), Some(total)) => {
             let (first, second) = (first as usize, second as usize);
             // Refused rather than repaired: a file whose own three numbers
@@ -216,33 +224,49 @@ pub(crate) fn parse_attribute(attribute: &[u8], max_side: u32) -> Option<Bitmap>
 /// own three lengths give — which is the only way to reach it, because the
 /// fields inside an `Attribute` carry a name and no length of their own.
 fn init_fill(attribute: &[u8], head: usize) -> Fill {
-    let (Some(info), Some(extra)) = (be32(attribute, 4), be32(attribute, 8)) else {
+    let (Some(info), Some(extra), Some(sizes)) =
+        (be32(attribute, 4), be32(attribute, 8), be32(attribute, 12))
+    else {
         return Fill::Unknown;
     };
-    let Some(at) = head.checked_add(info as usize) else {
+    // **The four lengths have to account for the blob exactly**, which is the
+    // only evidence available that this *is* the layout being read: the fields
+    // inside an `Attribute` carry a name and no length, so a header that does
+    // not add up leaves no way to know where the second one starts. It holds on
+    // every `Offscreen` row of every sample file. Anything else is
+    // [`Fill::Unknown`] rather than a guess.
+    let total = [head, info as usize, extra as usize, sizes as usize]
+        .into_iter()
+        .try_fold(0usize, |a, b| a.checked_add(b));
+    if total != Some(attribute.len()) {
         return Fill::Unknown;
-    };
-    // The section has to end inside the blob, or this is not the layout being
-    // read and nothing below it means anything. `checked_add` first, because an
-    // overflowing sum would otherwise compare as small.
-    match at.checked_add(extra as usize) {
-        Some(end) if end <= attribute.len() => {}
-        _ => return Fill::Unknown,
     }
+    let at = head + info as usize;
     let Some((name, body)) = field(attribute, at) else {
         return Fill::Unknown;
     };
     if name != "InitColor" {
         return Fill::Unknown;
     }
-    // `[u32][u32 flag]…`. Only the flag is read: what follows it is a colour
-    // whose form has never been checked against a file that uses one.
-    match be32(body, 4) {
-        Some(0) => Fill::Empty,
-        Some(_) => Fill::Stated,
-        None => Fill::Unknown,
+    // `[u32][u32 flag][u32 first channel][u32 second channel count][u32]
+    //  [u32 second channels…]`. The two shapes seen: `[20, 0, 0, 0, 4]` on an
+    // ordinary raster layer, whose absent blocks are transparent, and
+    // `[20, 1, 0xFFFFFFFF, 0, 4]` on a **mask**, whose absent blocks reveal
+    // everything — which is what a Clip Studio mask starts as, and the reason
+    // this section is read at all rather than assumed away.
+    //
+    // The channel is taken as its **top byte**. Only `0` and all-ones have ever
+    // been seen, and both read the same under any scaling; a value between them
+    // has not been observed and is not something to be confident about.
+    match (be32(body, 4), be32(body, 8)) {
+        (Some(0), _) => Fill::Empty,
+        (Some(_), Some(first)) => Fill::Stated((first >> 24) as u8),
+        _ => Fill::Unknown,
     }
 }
+
+/// Every block of one bitmap, in grid order, `None` for one not stored.
+pub(crate) type Blocks = Vec<Option<Vec<u8>>>;
 
 /// Every block of a `BlockData` blob, in grid order.
 ///
@@ -250,7 +274,7 @@ fn init_fill(attribute: &[u8], head: usize) -> Fill {
 /// an untouched corner of a layer. An outer `None` is a block this reader could
 /// not make sense of, and takes the whole bitmap with it rather than leaving a
 /// hole somebody would read as the artist's own transparency.
-pub(crate) fn blocks(blob: &[u8], packing: Packing) -> Option<Vec<Option<Vec<u8>>>> {
+pub(crate) fn blocks(blob: &[u8], packing: Packing) -> Option<Blocks> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while let Some(chunk) = record(blob, at) {
@@ -317,14 +341,175 @@ pub(crate) fn decode_block(payload: &[u8], expect: Option<Packing>) -> Option<Op
     Some(Some(pixels))
 }
 
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// The record framing and the `Attribute` blob, written.
+///
+/// The bargain `crate::sqlite::fixture` records applies here too: a generated
+/// fixture tests this module against *this file's* understanding of the format
+/// rather than against Clip Studio. What offsets it is that the writer is the
+/// inverse of the reader rather than a copy of it, and that every layout below
+/// was measured off real `.clip` files before it was written — the section
+/// lengths in [`fixture::attribute`] in particular, which is how the
+/// `InitColor` section is reached at all.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::{BLOCK, END_MARKER, PLANE, Packing};
+    use std::io::Write;
+
+    pub(crate) fn utf16be(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
+    }
+
+    /// `[u32 size][u32 name length][utf-16be name][payload]`.
+    pub(crate) fn record(name: &str, payload: &[u8]) -> Vec<u8> {
+        let name = utf16be(name);
+        let size = 8 + name.len() + payload.len();
+        let mut out = (size as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&((name.len() / 2) as u32).to_be_bytes());
+        out.extend_from_slice(&name);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `[u32 name length][utf-16be name][payload]` — an `Attribute` field,
+    /// which carries no length of its own.
+    fn field(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = (name.chars().count() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&utf16be(name));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn ints(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    /// A whole `Attribute` blob: the four section lengths, then `Parameter`,
+    /// `InitColor` and `BlockSize` in that order.
+    ///
+    /// `fill` is the value an absent block holds, `None` for transparent —
+    /// which is the difference between the two `InitColor` shapes real files
+    /// carry.
+    pub(crate) fn attribute(
+        width: u32,
+        height: u32,
+        packing: Packing,
+        fill: Option<u8>,
+    ) -> Vec<u8> {
+        let columns = (width as usize).div_ceil(BLOCK) as u32;
+        let rows = (height as usize).div_ceil(BLOCK) as u32;
+        let (first, second) = (packing.first as u32, packing.second as u32);
+        let parameter = field(
+            "Parameter",
+            &ints(&[
+                width,
+                height,
+                columns,
+                rows,
+                33,
+                first,
+                second,
+                first + second,
+                PLANE as u32,
+                second,
+                second * BLOCK as u32,
+                1,
+                BLOCK as u32,
+                PLANE as u32,
+                BLOCK as u32,
+                BLOCK as u32,
+                8,
+                8,
+                0,
+                0,
+            ]),
+        );
+        let init = match fill {
+            None => ints(&[20, 0, 0, 0, 4]),
+            Some(v) => {
+                let mut words = vec![20u32, 1, (u32::from(v) << 24) | 0x00ff_ffff, second, 4];
+                words.extend(std::iter::repeat_n(0xffff_ffffu32, packing.second));
+                ints(&words)
+            }
+        };
+        let init = field("InitColor", &init);
+        let mut sizes = ints(&[12, columns * rows, 4]);
+        sizes.extend(std::iter::repeat_n(0u8, (columns * rows) as usize * 4));
+        let sizes = field("BlockSize", &sizes);
+
+        let mut out = ints(&[
+            16,
+            parameter.len() as u32,
+            init.len() as u32,
+            sizes.len() as u32,
+        ]);
+        out.extend_from_slice(&parameter);
+        out.extend_from_slice(&init);
+        out.extend_from_slice(&sizes);
+        out
+    }
+
+    /// One block record, present or absent.
+    pub(crate) fn block(pixels: Option<&[u8]>, packing: Packing) -> Vec<u8> {
+        let declared = packing.block_len() as u32;
+        let mut head = Vec::new();
+        for v in [0u32, declared, BLOCK as u32, BLOCK as u32] {
+            head.extend_from_slice(&v.to_be_bytes());
+        }
+        let Some(pixels) = pixels else {
+            head.extend_from_slice(&0u32.to_be_bytes());
+            head.extend_from_slice(&record("BlockDataEndChunk", &[])[4..]);
+            return record("BlockDataBeginChunk", &head);
+        };
+        head.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(pixels).expect("deflate");
+        let stream = encoder.finish().expect("deflate");
+        // The pair of lengths real files carry: big-endian counting the second
+        // field, then little-endian counting the stream alone.
+        head.extend_from_slice(&(stream.len() as u32 + 4).to_be_bytes());
+        head.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        head.extend_from_slice(&stream);
+        head.extend_from_slice(&record("BlockDataEndChunk", &[])[4..]);
+        debug_assert_eq!(END_MARKER, record("BlockDataEndChunk", &[]).len() - 4);
+        record("BlockDataBeginChunk", &head)
+    }
+
+    /// A whole `BlockData` blob: one record per block, then `BlockStatus`.
+    pub(crate) fn block_data(blocks: &[Option<Vec<u8>>], packing: Packing) -> Vec<u8> {
+        let mut out = Vec::new();
+        for b in blocks {
+            out.extend_from_slice(&block(b.as_deref(), packing));
+        }
+        out.extend_from_slice(&record("BlockStatus", &[0u8; 8]));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MASK: Packing = Packing {
+        first: 1,
+        second: 0,
+    };
+    const COLOUR: Packing = Packing {
+        first: 1,
+        second: 4,
+    };
 
     /// The three numbers a bitmap's packing is stated by have to agree with
     /// each other, because everything downstream slices by them.
     #[test]
     fn a_packing_whose_own_numbers_disagree_is_refused() {
+        // Built by hand rather than through the fixture, which cannot state a
+        // sum that disagrees with its own parts — which is the point here.
         let build = |first: u32, second: u32, total: u32| {
             let mut parameter: Vec<u8> = Vec::new();
             for v in [512u32, 512, 2, 2, 33, first, second, total] {
@@ -335,26 +520,80 @@ mod tests {
                 out.extend_from_slice(&v.to_be_bytes());
             }
             out.extend_from_slice(&9u32.to_be_bytes());
-            out.extend_from_slice(
-                &"Parameter"
-                    .encode_utf16()
-                    .flat_map(u16::to_be_bytes)
-                    .collect::<Vec<u8>>(),
-            );
+            out.extend_from_slice(&fixture::utf16be("Parameter"));
             out.extend_from_slice(&parameter);
             out
         };
 
         let ok = parse_attribute(&build(1, 4, 5), 16384).expect("a legal packing");
-        assert_eq!(ok.packing, Some(Packing { first: 1, second: 4 }));
-        assert_eq!(ok.packing.expect("packing").block_len(), 5 * PLANE);
+        assert_eq!(ok.packing, Some(COLOUR));
+        assert_eq!(COLOUR.block_len(), 5 * PLANE);
 
         // The sum is what every slice downstream is taken against.
         assert!(parse_attribute(&build(1, 4, 6), 16384).is_none());
         // Wider than anything Clip Studio writes.
         assert!(parse_attribute(&build(2, 4, 6), 16384).is_none());
-        // No alpha plane at all is not a shape this reader knows.
+        // No first plane at all is not a shape this reader knows.
         assert!(parse_attribute(&build(0, 4, 4), 16384).is_none());
+    }
+
+    /// **An absent block is not always empty**, and the file says which.
+    ///
+    /// A mask's `InitColor` states all-ones, because a Clip Studio mask starts
+    /// revealing everything; a raster layer's states nothing, because its
+    /// untouched corners are transparent. Reading the second rule for both
+    /// would blank every masked layer in the document, silently.
+    #[test]
+    fn the_fill_an_absent_block_carries_is_read_and_not_assumed() {
+        assert_eq!(
+            parse_attribute(&fixture::attribute(300, 300, MASK, Some(255)), 16384)
+                .expect("a mask")
+                .fill,
+            Fill::Stated(255)
+        );
+        assert_eq!(
+            parse_attribute(&fixture::attribute(300, 300, COLOUR, None), 16384)
+                .expect("a layer")
+                .fill,
+            Fill::Empty
+        );
+        // An `Attribute` whose sections do not add up is not one this layout
+        // can be read out of, and saying so is not the same as saying "empty".
+        let mut short = fixture::attribute(300, 300, COLOUR, None);
+        short.truncate(short.len() - 4);
+        assert_eq!(
+            parse_attribute(&short, 16384)
+                .expect("the Parameter is intact")
+                .fill,
+            Fill::Unknown
+        );
+    }
+
+    /// The grid, the packing and the blocks come back off a blob the fixture
+    /// wrote, in order, with the absent one still absent.
+    #[test]
+    fn a_block_data_blob_reads_back_block_for_block() {
+        let bitmap = parse_attribute(&fixture::attribute(300, 300, MASK, None), 16384)
+            .expect("an attribute");
+        assert_eq!((bitmap.columns, bitmap.rows), (2, 2));
+        let packing = bitmap.packing.expect("a packing");
+
+        let written: Vec<Option<Vec<u8>>> = (0..4)
+            .map(|i| (i != 2).then(|| vec![(i * 17) as u8; packing.block_len()]))
+            .collect();
+        let blob = fixture::block_data(&written, packing);
+        let read = blocks(&blob, packing).expect("the blocks");
+        assert_eq!(read, written);
+    }
+
+    /// A block whose declared size disagrees with the bitmap's stated packing
+    /// is refused rather than sliced by whichever number is smaller.
+    #[test]
+    fn a_block_that_disagrees_with_the_packing_is_refused() {
+        let payload = fixture::block(Some(&vec![7u8; COLOUR.block_len()]), COLOUR);
+        let chunk = record(&payload, 0).expect("a record");
+        assert!(decode_block(chunk.payload, Some(COLOUR)).is_some());
+        assert!(decode_block(chunk.payload, Some(MASK)).is_none());
     }
 
     /// A picture whose two dimensions are individually plausible and whose
@@ -362,8 +601,8 @@ mod tests {
     /// stops it, and the bound belongs to the caller rather than to the file.
     #[test]
     fn a_bitmap_larger_than_the_caller_allows_is_refused_before_it_is_believed() {
-        let mut parameter: Vec<u8> = Vec::new();
         let (w, h) = (2_000_000_000u32, 2_000_000_000u32);
+        let mut parameter: Vec<u8> = Vec::new();
         for v in [w, h, w.div_ceil(256), h.div_ceil(256)] {
             parameter.extend_from_slice(&v.to_be_bytes());
         }
@@ -372,12 +611,7 @@ mod tests {
             out.extend_from_slice(&v.to_be_bytes());
         }
         out.extend_from_slice(&9u32.to_be_bytes());
-        out.extend_from_slice(
-            &"Parameter"
-                .encode_utf16()
-                .flat_map(u16::to_be_bytes)
-                .collect::<Vec<u8>>(),
-        );
+        out.extend_from_slice(&fixture::utf16be("Parameter"));
         out.extend_from_slice(&parameter);
         assert!(parse_attribute(&out, 16384).is_none());
     }
@@ -393,7 +627,7 @@ mod tests {
             let _ = record(&bytes, 0);
             let _ = decode_block(&bytes, None);
             let _ = field(&bytes, 0);
-            let _ = blocks(&bytes, Packing { first: 1, second: 4 });
+            let _ = blocks(&bytes, COLOUR);
         }
     }
 }

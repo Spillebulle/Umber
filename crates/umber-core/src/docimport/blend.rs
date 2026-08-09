@@ -45,11 +45,15 @@ pub fn nearest(canonical: &str) -> (BlendMode, Fidelity) {
         // clamps the sum of straight colour. The two agree wherever both
         // layers are opaque, which is most of the time, and differ at soft
         // edges — so: approximate, not exact.
-        "plus" | "linear-dodge" | "add" => (BlendMode::Add, Approximate),
+        // `add-glow` is Clip Studio's Add that ignores what is under it where
+        // that is transparent — the same direction, one step further from the
+        // formula Umber has.
+        "plus" | "linear-dodge" | "add" | "add-glow" => (BlendMode::Add, Approximate),
 
-        // Same family, different curve.
+        // Same family, different curve. `glow-dodge` is Clip Studio's spelling
+        // of a dodge that keeps highlights.
         "darken" | "color-burn" | "linear-burn" => (BlendMode::Multiply, Approximate),
-        "lighten" | "color-dodge" => (BlendMode::Screen, Approximate),
+        "lighten" | "color-dodge" | "glow-dodge" => (BlendMode::Screen, Approximate),
         "hard-light" | "soft-light" | "vivid-light" | "linear-light" | "pin-light" => {
             (BlendMode::Overlay, Approximate)
         }

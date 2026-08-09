@@ -16,6 +16,10 @@ use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::csblocks::{self, Packing};
+use crate::sqlite::Value;
+use crate::sqlite::fixture::TableSpec;
+
 // ---------------------------------------------------------------- PNG
 
 fn encode_png(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
@@ -1017,4 +1021,408 @@ pub fn ora_missing_layer_data() -> Vec<u8> {
         &png_rgba(2, 2, &solid(2, 2, &[1, 2, 3, 255])),
     );
     archive.finish()
+}
+
+// ---------------------------------------------------------- Clip Studio
+
+/// One layer of a `.clip` fixture.
+///
+/// The tree is built from these bottom first, which is the order Clip Studio's
+/// own `LayerNextIndex` chain runs in — see [`super::clipstudio`]'s docs for how
+/// that direction was established, since building the fixture the other way
+/// round would make every test here agree with a reader that inverts documents.
+pub struct ClipLayer {
+    pub name: &'static str,
+    /// `LayerType`. `1` is an ordinary raster layer.
+    pub kind: i64,
+    pub folder: bool,
+    pub visible: bool,
+    pub locked: bool,
+    pub clipped: bool,
+    /// `LayerOpacity`, out of 256.
+    pub opacity: i64,
+    pub composite: i64,
+    /// Canvas-sized straight-alpha RGBA. `None` gives the layer no bitmap at
+    /// all, which is what a folder has.
+    pub pixels: Option<Vec<u8>>,
+    /// Canvas-sized coverage, `0` hiding and `255` revealing.
+    pub mask: Option<Vec<u8>>,
+    /// What an absent mask block holds. `Some(255)` is what Clip Studio writes,
+    /// because a mask starts revealing everything.
+    pub mask_fill: Option<u8>,
+    pub children: Vec<ClipLayer>,
+}
+
+impl ClipLayer {
+    /// A raster layer of one flat colour.
+    pub fn flat(name: &'static str, width: u32, height: u32, rgba: [u8; 4]) -> Self {
+        Self {
+            name,
+            kind: 1,
+            folder: false,
+            visible: true,
+            locked: false,
+            clipped: false,
+            opacity: 256,
+            composite: 0,
+            pixels: Some(
+                std::iter::repeat_n(rgba, width as usize * height as usize)
+                    .flatten()
+                    .collect(),
+            ),
+            mask: None,
+            mask_fill: Some(255),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn folder(name: &'static str, children: Vec<ClipLayer>) -> Self {
+        Self {
+            name,
+            kind: 0,
+            folder: true,
+            visible: true,
+            locked: false,
+            clipped: false,
+            opacity: 256,
+            composite: 0,
+            pixels: None,
+            mask: None,
+            mask_fill: None,
+            children,
+        }
+    }
+
+    pub fn kind(mut self, kind: i64) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn composite(mut self, composite: i64) -> Self {
+        self.composite = composite;
+        self
+    }
+
+    pub fn opacity(mut self, opacity: i64) -> Self {
+        self.opacity = opacity;
+        self
+    }
+
+    pub fn hidden(mut self) -> Self {
+        self.visible = false;
+        self
+    }
+
+    pub fn locked(mut self) -> Self {
+        self.locked = true;
+        self
+    }
+
+    pub fn clipped(mut self) -> Self {
+        self.clipped = true;
+        self
+    }
+
+    pub fn mask(mut self, coverage: Vec<u8>) -> Self {
+        self.mask = Some(coverage);
+        self
+    }
+
+    pub fn mask_fill(mut self, fill: Option<u8>) -> Self {
+        self.mask_fill = fill;
+        self
+    }
+}
+
+/// Everything the tables need while the tree is being walked.
+struct ClipBuild {
+    width: u32,
+    height: u32,
+    layers: Vec<Vec<Value>>,
+    mipmaps: Vec<Vec<Value>>,
+    infos: Vec<Vec<Value>>,
+    offscreens: Vec<Vec<Value>>,
+    external: Vec<(Vec<u8>, Vec<u8>)>,
+    next_id: i64,
+    next_chunk: usize,
+}
+
+const CLIP_COLOUR: Packing = Packing {
+    first: 1,
+    second: 4,
+};
+const CLIP_MASK: Packing = Packing {
+    first: 1,
+    second: 0,
+};
+
+impl ClipBuild {
+    fn id(&mut self) -> i64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// A forty-character `extrnlid…` name, which is the shape a real one has.
+    fn chunk_name(&mut self) -> Vec<u8> {
+        self.next_chunk += 1;
+        format!("extrnlid{:032}", self.next_chunk).into_bytes()
+    }
+
+    /// Cut a canvas-sized buffer into 256-square blocks and register the
+    /// `Offscreen` row, the mipmap chain and the external chunk for it.
+    ///
+    /// A block every byte of which equals `fill` is **not stored**, which is
+    /// what a real writer does and what makes the `InitColor` path reachable.
+    fn bitmap(&mut self, source: &[u8], packing: Packing, fill: Option<u8>) -> i64 {
+        let columns = (self.width as usize).div_ceil(256);
+        let rows = (self.height as usize).div_ceil(256);
+        let mut blocks: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns * rows);
+        for row in 0..rows {
+            for column in 0..columns {
+                let mut block = vec![0u8; packing.block_len()];
+                let mut painted = false;
+                for y in 0..256 {
+                    for x in 0..256 {
+                        let (sx, sy) = (column * 256 + x, row * 256 + y);
+                        if sx >= self.width as usize || sy >= self.height as usize {
+                            continue;
+                        }
+                        painted = true;
+                        let i = y * 256 + x;
+                        if packing.second == 0 {
+                            block[i] = source[sy * self.width as usize + sx];
+                        } else {
+                            // Straight RGBA in, `[alpha plane][BGRX]` out.
+                            let px = (sy * self.width as usize + sx) * 4;
+                            block[i] = source[px + 3];
+                            let at = 256 * 256 + i * packing.second;
+                            block[at] = source[px + 2];
+                            block[at + 1] = source[px + 1];
+                            block[at + 2] = source[px];
+                        }
+                    }
+                }
+                let absent = fill.is_some_and(|f| block.iter().all(|b| *b == f))
+                    || (fill.is_none() && block.iter().all(|b| *b == 0));
+                blocks.push((!absent && painted).then_some(block));
+            }
+        }
+
+        let name = self.chunk_name();
+        self.external.push((
+            name.clone(),
+            csblocks::fixture::block_data(&blocks, packing),
+        ));
+
+        let offscreen = self.id();
+        self.offscreens.push(vec![
+            Value::Integer(offscreen),
+            Value::Blob(csblocks::fixture::attribute(
+                self.width,
+                self.height,
+                packing,
+                fill,
+            )),
+            Value::Blob(name),
+        ]);
+        let info = self.id();
+        self.infos
+            .push(vec![Value::Integer(info), Value::Integer(offscreen)]);
+        let mipmap = self.id();
+        self.mipmaps
+            .push(vec![Value::Integer(mipmap), Value::Integer(info)]);
+        mipmap
+    }
+
+    /// One `LayerNextIndex` chain, bottom first, returning the first id.
+    fn chain(&mut self, layers: &[ClipLayer]) -> i64 {
+        let ids: Vec<i64> = layers.iter().map(|_| self.id()).collect();
+        for (i, layer) in layers.iter().enumerate() {
+            let first_child = if layer.children.is_empty() {
+                0
+            } else {
+                self.chain(&layer.children)
+            };
+            let render = match &layer.pixels {
+                Some(pixels) => self.bitmap(pixels, CLIP_COLOUR, None),
+                None => 0,
+            };
+            let mask = match &layer.mask {
+                Some(coverage) => self.bitmap(coverage, CLIP_MASK, layer.mask_fill),
+                None => 0,
+            };
+            self.layers.push(vec![
+                Value::Integer(ids[i]),
+                Value::Text(layer.name.to_string()),
+                Value::Integer(layer.kind),
+                Value::Integer(i64::from(layer.folder)),
+                Value::Integer(i64::from(layer.visible)),
+                Value::Integer(i64::from(layer.locked)),
+                Value::Integer(i64::from(layer.clipped)),
+                Value::Integer(layer.opacity),
+                Value::Integer(layer.composite),
+                Value::Integer(ids.get(i + 1).copied().unwrap_or(0)),
+                Value::Integer(first_child),
+                Value::Integer(render),
+                Value::Integer(mask),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+            ]);
+        }
+        ids.first().copied().unwrap_or(0)
+    }
+}
+
+const CLIP_LAYER_COLUMNS: [&str; 21] = [
+    "MainId",
+    "LayerName",
+    "LayerType",
+    "LayerFolder",
+    "LayerVisibility",
+    "LayerLock",
+    "LayerClip",
+    "LayerOpacity",
+    "LayerComposite",
+    "LayerNextIndex",
+    "LayerFirstChildIndex",
+    "LayerRenderMipmap",
+    "LayerLayerMaskMipmap",
+    "LayerOffsetX",
+    "LayerOffsetY",
+    "LayerRenderOffscrOffsetX",
+    "LayerRenderOffscrOffsetY",
+    "LayerMaskOffsetX",
+    "LayerMaskOffsetY",
+    "LayerMaskOffscrOffsetX",
+    "LayerMaskOffscrOffsetY",
+];
+
+/// A whole `.clip`: the database, its external chunks and the chunk stream.
+pub fn clip(width: u32, height: u32, layers: &[ClipLayer]) -> Vec<u8> {
+    clip_with(width, height, layers, |db| db)
+}
+
+/// The same, with one hand on the finished database — for a test that has to
+/// damage it.
+pub fn clip_with(
+    width: u32,
+    height: u32,
+    layers: &[ClipLayer],
+    damage: impl FnOnce(Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut build = ClipBuild {
+        width,
+        height,
+        layers: Vec::new(),
+        mipmaps: Vec::new(),
+        infos: Vec::new(),
+        offscreens: Vec::new(),
+        external: Vec::new(),
+        // Clip Studio numbers its own root folder 2 and Umber's reader does not
+        // care what the number is, only that `CanvasRootFolder` names it.
+        next_id: 1,
+        next_chunk: 0,
+    };
+    let root = build.id();
+    let first_child = build.chain(layers);
+    build.layers.push(vec![
+        Value::Integer(root),
+        Value::Text(String::new()),
+        Value::Integer(256),
+        Value::Integer(1),
+        Value::Integer(1),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(256),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(first_child),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Integer(0),
+    ]);
+
+    let mut canvas = TableSpec::new(
+        "Canvas",
+        &[
+            "MainId",
+            "CanvasWidth",
+            "CanvasHeight",
+            "CanvasResolution",
+            "CanvasRootFolder",
+        ],
+    );
+    canvas = canvas.row(vec![
+        Value::Integer(1),
+        Value::Real(f64::from(width)),
+        Value::Real(f64::from(height)),
+        Value::Real(350.0),
+        Value::Integer(root),
+    ]);
+
+    let mut layer_table = TableSpec::new("Layer", &CLIP_LAYER_COLUMNS);
+    for row in build.layers {
+        layer_table = layer_table.row(row);
+    }
+    let mut mipmap = TableSpec::new("Mipmap", &["MainId", "BaseMipmapInfo"]);
+    for row in build.mipmaps {
+        mipmap = mipmap.row(row);
+    }
+    let mut info = TableSpec::new("MipmapInfo", &["MainId", "Offscreen"]);
+    for row in build.infos {
+        info = info.row(row);
+    }
+    let mut offscreen = TableSpec::new("Offscreen", &["MainId", "Attribute", "BlockData"]);
+    for row in build.offscreens {
+        offscreen = offscreen.row(row);
+    }
+
+    let database = damage(crate::sqlite::fixture::database(&[
+        canvas,
+        layer_table,
+        mipmap,
+        info,
+        offscreen,
+    ]));
+    clip_container(&build.external, &database)
+}
+
+/// Wrap the pieces in the `CSFCHUNK` stream.
+pub fn clip_container(external: &[(Vec<u8>, Vec<u8>)], database: &[u8]) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    let chunk = |tag: &[u8; 8], payload: &[u8]| {
+        let mut out = tag.to_vec();
+        out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    };
+    body.extend_from_slice(&chunk(b"CHNKHead", &[0u8; 40]));
+    for (name, data) in external {
+        let mut payload = (name.len() as u64).to_be_bytes().to_vec();
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        payload.extend_from_slice(data);
+        body.extend_from_slice(&chunk(b"CHNKExta", &payload));
+    }
+    body.extend_from_slice(&chunk(b"CHNKSQLi", database));
+    body.extend_from_slice(&chunk(b"CHNKFoot", &[]));
+
+    let mut out = b"CSFCHUNK".to_vec();
+    out.extend_from_slice(&((body.len() + 24) as u64).to_be_bytes());
+    out.extend_from_slice(&24u64.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
 }
