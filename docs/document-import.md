@@ -24,9 +24,10 @@ groups, another application's masks, blend modes Umber lacks — it is imported
 and the loss is reported in `ImportedDocument::warnings`, which the UI shows.
 Clipping is no longer in that list: Umber's own flag means what Photoshop's
 does, so a clipped `.psd` layer arrives clipped. Umber's own masks arrive too,
-out of its own `.ora`, and a Krita **transparency** mask arrives too. Krita's
-other four mask kinds — filter, transform, selection, colorize — are reported as
-lost, because Umber has no equivalent for any of them. A `.psd` mask is reported
+out of its own `.ora`; so does a Krita **transparency** mask, and so does a Clip
+Studio layer mask. Krita's other four mask kinds — filter, transform, selection,
+colorize — are reported as lost, because Umber has no equivalent for any of
+them. A `.psd` mask is reported
 as lost for a different reason: the pinned `psd` crate skips the block holding
 the mask's own rectangle, keeps the bytes behind a private accessor, and panics
 on an RLE mask channel, so reading one means a second parser beside the crate's.
@@ -40,9 +41,9 @@ on an RLE mask channel, so reading one means a second parser beside the crate's.
 | `.psd` Photoshop | **Landed, lossy** | 8-bit RGB only. Groups flatten and masks are dropped; clipping arrives. A file with an RLE-compressed mask channel is refused outright, because the `psd` crate panics on one. Every loss is reported. |
 | `.png` | **Landed, exact** | A single layer. Also the decoder ORA uses. |
 | `.psb` Photoshop large | Declined | Header version 2; the `psd` crate reads version 1 only. |
-| `.clip` Clip Studio | Declined | Undocumented proprietary schema inside SQLite. Research project, not a feature. |
+| `.clip` Clip Studio | **Landed, layer-aware** | Layers, folders, masks, blend modes, opacity and locks arrive out of the embedded SQLite database. Correction layers are refused; text and vector layers arrive rasterised. Every loss is reported. |
 | `.procreate` | Declined | Undocumented LZ4 tile layout behind a binary plist. |
-| `.mdp` MediBang | Declined | Proprietary, effectively undocumented. |
+| `.mdp` MediBang | Declined for now | Specified, and there are real samples — but nothing available settles whether the layer list runs top first or bottom first, and two of its three tile codecs are unwritten. |
 | `.xcf` GIMP | Declined for now | Documented but large; several precisions and a colour model of its own. GIMP exports ORA. |
 | Layered `.tiff` | Declined | Photoshop's layers ride in a private tag as a PSD blob; a plain multi-page TIFF has pages, not layers. |
 | `.jpg` | Declined for now | Needs EXIF orientation handling to avoid importing photographs sideways. |
@@ -147,7 +148,13 @@ panics on malformed input; LZF is a fixed published format with no upstream to
 track, so owning it costs nothing and lets a corrupt tile return an error.
 
 Krita's layer list is uppermost first, like ORA — its own documentation example
-ends with `Background` — so it is reversed too.
+ends with `Background` — so it is reversed too. That reversal is also what makes
+groups free: a `<layer nodetype="grouplayer">` becomes a **folder**, and
+reversing an uppermost-first list puts a group after its own contents, which is
+exactly where a `LayerStack` keeps one. A group's *opacity* still folds into its
+children, because a folder at 50% over two overlapping children is not two
+children at 50% each and Umber's folders carry none; its *eye* does not, because
+it lives on the folder and `LayerStack::effective_visible` walks the ancestors.
 
 **Where it refuses:** a document whose colour space is not 8-bit `RGBA`
 (`RGBA16`, `RGBAF32`, `GRAYA`, `CMYKA`, `LABA`) has the same tile *layout* with
@@ -216,6 +223,105 @@ line-audited, and because it still cannot read `Lr16`/`Lr32` nested layers —
 so the 16-bit case, its main advantage, is exactly the one it does not solve.
 Worth revisiting when it has a track record.
 
+## Clip Studio Paint (`.clip`) — landed, layer-aware
+
+This was a declined format and is not any more. The reason it was declined —
+"an undocumented proprietary schema inside SQLite; a research project, not a
+feature" — was right about the schema and wrong about the cost, because by the
+time it was re-opened Umber already had both halves of the machinery, each built
+for the brush importer:
+
+- `umber-core::sqlite` is a read-only SQLite reader, written so that a `.sut`
+  brush could be imported without putting a C toolchain in every CI job and
+  every cross-compile. A `.clip` is the same database with a different schema.
+- `umber-core::csblocks` is the 256-square zlib block stream a Clip Studio
+  *material* stores its pixels in. A document layer's pixels are in the same
+  stream, so it moved out of `brushimport::csmaterial` and both read it.
+
+What was actually new is the container, the table walk and the tree.
+
+### The container
+
+`CSFCHUNK`, a 24-byte file header, then chunks of `[8-byte tag][u64 be size]
+[payload]`: `CHNKHead` (forty bytes nothing here reads), one `CHNKExta` per
+stored bitmap, one `CHNKSQLi` holding the whole database, and an empty
+`CHNKFoot`. An `Exta` payload is `[u64 be name length][name][u64 be data
+length][block data]` and the name is the forty-character `extrnlid…` an
+`Offscreen` row points at.
+
+### Finding a layer's pixels
+
+Four tables and three hops, none of which can be short-circuited:
+
+```
+Layer.LayerRenderMipmap -> Mipmap.BaseMipmapInfo -> MipmapInfo.Offscreen -> Offscreen
+```
+
+and the `Offscreen` row holds an `Attribute` blob describing the bitmap and a
+`BlockData` naming the external chunk. A layer's **mask** is the identical chain
+from `LayerLayerMaskMipmap`. The other `MipmapInfo` rows are the 50%, 25% and
+smaller mipmap levels and are deliberately not followed.
+
+Columns are looked up **by name**. The `Layer` table's schema is not fixed: the
+Clip Studio version that wrote the sample files has no `LayerEffectInfo` and no
+`OutputAttribute`, both of which newer versions do.
+
+### The stack order, and how it was settled
+
+`Canvas.CanvasRootFolder` names a folder layer; `LayerFirstChildIndex` names its
+first child and `LayerNextIndex` walks to the next. **The chain runs bottom to
+top**, which happens to be Umber's own order, and a reader that gets this
+backwards still produces a picture — so it was established from files rather
+than assumed:
+
+- The root chain of a fresh Clip Studio document begins at "Layer 1", the layer
+  a new document is created with and the one everything else is added *above*.
+- Inside a folder of layers made one after another, the chain visits them in
+  ascending `MainId`, which is creation order, which in Clip Studio is bottom
+  upwards.
+
+A folder is emitted **after** its own contents, which is where a `LayerStack`
+keeps one.
+
+### What it loses, and what each loss says
+
+| Lost | Reported as | Why |
+|---|---|---|
+| A correction layer (brightness, tone curve, level correction, gradient map) | `LayerSkipped` | It is an operation on the layers below rather than a picture. Its `Offscreen` exists and holds a stated fill, so importing it would put a flat sheet over the drawing. |
+| A layer that was not made of pixels (text, vector, frame border, 3D) | `LayerRasterised` | It arrives as the pixels Clip Studio rendered for it — which is what Clip Studio's own PSD export does — and can no longer be edited as what it was. |
+| A bitmap whose absent blocks carry a stated colour fill | `LayerSkipped` | `InitColor` is readable as a *flag* and as one channel, which is all a mask needs; a colour fill is four more values nothing has checked against a file that paints with one. |
+| A bitmap packed some other way (1-bit, 16-bit) | `LayerSkipped` | One alpha plane then four interleaved bytes is colour, one is greyscale, none is a mask. Anything else would be sliced by a byte count that does not describe it. |
+| A blend mode Umber lacks | `BlendApproximated` / `BlendDropped` | The same table every other reader uses. |
+| Animation, rulers, tones, the comic-page furniture | nothing | Not read at all. A `.clip` opens as its layers. |
+
+An **alpha lock** is deliberately not reported, for the reason a resolution is
+not: it changes no pixel. A full lock does come across, as does clipping, a
+folder's eye, an opacity out of 256, and a layer mask.
+
+### What was and was not checked against a real file
+
+Checked, against five real `.clip` documents: the container, the schema, the
+four-table chain, the tree and its direction, the `Attribute` layout including
+the section lengths that are the only way to reach `InitColor`, the twenty-eight
+blend-mode numbers, and the two `InitColor` shapes — a raster layer states no
+fill and a mask states all-ones, which is the "reveal everything" a Clip Studio
+mask starts as.
+
+**Not** checked against one, and said out loud rather than implied away:
+
+- **The pixel bytes.** Every layer of every obtainable sample is empty. The
+  `[alpha plane][B G R X interleaved]` reading rests on two independent sources
+  instead: `csmaterial`'s measurement of the same block format in real Clip
+  Studio *materials*, where the five-channel shape it refuses is exactly this
+  one, and `clip_to_psd`, whose output people use.
+- **The placement of a bitmap smaller than the canvas.** Every sample's bitmap
+  is canvas-sized at offset zero, so `LayerOffsetX + LayerRenderOffscrOffsetX`
+  is taken on `clip_to_psd`'s word. It is where to look first if an imported
+  layer lands in the wrong place, and a bitmap that misses the canvas entirely
+  is refused rather than imported blank.
+- **The greyscale packing.** One alpha plane and one interleaved byte is read as
+  a grey; no sample carries pixels in that shape.
+
 ## Blend modes
 
 Umber has five: Normal, Multiply, Screen, Overlay, Add. Photoshop has
@@ -240,33 +346,6 @@ for them would be a worse lie than Normal, so they are reported as dropped.
 
 ## Declined formats
 
-### Clip Studio Paint (`.clip`)
-
-A `.clip` is a chunked container — `CSFCHUNK`, `CHNKHead`, one or more
-`CHNKExta`, `CHNKSQLi`, `CHNKFoot` — whose `CHNKSQLi` chunk is an embedded
-SQLite database and whose `CHNKExta` chunks hold zlib-compressed image data.
-The community reverse-engineering that exists ([Inochi2D/clip-d's
-SPEC.md](https://github.com/Inochi2D/clip-d/blob/main/SPEC.md), `clipthumb`)
-covers the container: enough to find the database and extract the embedded
-thumbnail, and explicitly not enough to describe the layer bitmap encoding —
-the tile/block structure, the mipmap and offscreen tables, and how a layer's
-external chunk ids relate to its pixels are all still "don't know yet".
-
-So the choice was between three things:
-
-1. A **thumbnail import**, which would open a `.clip` and show a low-resolution
-   preview of it. That is a lie dressed as a feature.
-2. A **layer-bitmap import**, which is the research project: reverse-engineering
-   an undocumented proprietary tile format with no reference implementation to
-   check against, on a format the vendor changes at will.
-3. **Decline**, and tell the user that Clip Studio exports PSD.
-
-Option 3. It also avoids `rusqlite`, which is a C build in every CI job and every
-future mobile cross-compile, bought for a feature that would not work.
-
-Clip Studio Paint exports layered PSD (File → Export → .psd), which Umber reads.
-That is the supported route, and it is one menu item away.
-
 ### Procreate (`.procreate`)
 
 A ZIP containing a binary property list and LZ4-compressed tile chunks. The
@@ -275,11 +354,88 @@ exist but disagree, and the chunk-to-layer mapping and orientation handling are
 the sort of thing that is right for one file and wrong for the next. Procreate
 exports PSD and PNG.
 
-### MediBang Paint (`.mdp`)
+### MediBang Paint (`.mdp`) — not landed, and not for want of a specification
 
-Proprietary and barely documented — no specification, no maintained reader, no
-fixtures to test against. There is nothing here that could be shipped honestly.
-MediBang exports PSD and PNG.
+This section used to say the format was "proprietary and barely documented — no
+specification, no maintained reader, no fixtures to test against". Every clause
+of that turned out to be false, and the correct reason for not shipping it is
+much narrower. What follows is the research, so the next attempt starts here
+rather than at the beginning.
+
+`.mdp` is **MDIPACK**, the format `mdiapp+`, FireAlpaca, MediBang Paint and
+LayerPaint HD all write. There is a specification by the nattou.org group who
+wrote both the format and most of the applications using it, mirrored as
+[`extras/mdp_format_wiki.md`](https://github.com/weeb-poly/krita-plugin-mdp/blob/main/extras/mdp_format_wiki.md)
+in `weeb-poly/krita-plugin-mdp`, which is a working Python reader; the same
+author's `gimp-file-mdp-plugin` is a second one. That repository also ships
+three real `.mdp` sample files, which is more than was available for `.clip`.
+
+Everything below was verified by decoding those three files.
+
+**The container.** `mdipack\0` (8 bytes), then `[u32 le version][u32 le MDI
+size][u32 le MDIBIN size]`, then the two sections back to back — the whole file
+is exactly `20 + mdi + mdibin` bytes.
+
+**MDI** is UTF-8 XML and is completely legible:
+
+```xml
+<Mdiapp width="370" height="320" dpi="72" checkerBG="true"
+        bgColorR="255" bgColorG="255" bgColorB="255">
+  <Thumb width="256" height="221" bin="thumb" />
+  <Layers active="1">
+    <Layer ofsx="0" ofsy="0" width="370" height="320" mode="normal" alpha="255"
+           visible="false" protectAlpha="false" locked="false" clipping="false"
+           masking="false" maskingType="0" id="1" parentId="-1" name="…"
+           binType="2" bin="layer0img" type="32bpp" />
+  </Layers>
+</Mdiapp>
+```
+
+`parentId` is the folder tree. `type` is `32bpp`, `8bpp` or `1bpp`; the last two
+carry a `color="AARRGGBB"` attribute and their samples are an **alpha channel**
+painted with that colour, not a greyscale image.
+
+**MDIBIN** is a run of 132-byte `PAC ` headers, each followed by its stream:
+`[4s "PAC "][u32 chunkSize][u32 streamType][u32 streamSize][u32 archiveSize]
+[48 reserved][64-byte name]`, little-endian, `streamType` 0 raw and 1 zlib. The
+name is what a `<Layer bin="…">` or `<Thumb bin="…">` points at.
+
+**An archive is tiles.** `[u32 tileNum]`, then — only when there is at least one
+— `[u32 tileDim]` and one record per tile: `[u32 col][u32 row][u32 ctype]
+[u32 size][payload]`, padded to a 4-byte boundary. `tileDim` is 128 in all three
+samples. `ctype` is 0 for zlib, 1 for Snappy and 2 for FastLZ; **all three
+samples use zlib only**.
+
+**32bpp samples are BGRA with straight alpha.** The BGRA reading is the Krita
+plugin's, whose comment says so out loud ("For some reason, this reads in BGRA
+data"); straight alpha is visible in the samples, where pixels with `a = 0` keep
+their colour.
+
+**What is missing is one bit of information and two codecs.**
+
+1. **The stack direction.** The three samples cannot settle it: one has a single
+   layer, and in the other two the visible layers do not overlap, so
+   compositing them in either order and comparing against the file's own
+   thumbnail gives the same answer to five decimal places. The circumstantial
+   evidence points at *first element = bottom* — in the three-layer sample the
+   ids ascend with the XML and the first is a white matte, which is a bottom
+   layer — but the Krita plugin adds nodes in a way that reads as the opposite,
+   and the wiki does not say. **A reader that gets this wrong inverts every
+   multi-layer document silently**, so it is not something to ship on a
+   three-to-one prior. Settling it takes one `.mdp` with two overlapping visible
+   layers and its own embedded thumbnail, which is thirty seconds for anybody
+   with MediBang installed.
+2. **Snappy**, for `ctype == 1`. About a hundred and twenty lines, or a
+   dependency.
+3. **FastLZ**, for `ctype == 2`. Level 1 of FastLZ is byte-compatible with LZF,
+   which `docimport::lzf` already decodes for Krita; level 2 is not, and which
+   level MediBang writes has not been established. A tile in a codec the reader
+   does not have is a named loss rather than a wrong picture, so this could ship
+   incomplete.
+
+So the honest verdict is **not yet, and cheaply**: perhaps a day's work once
+somebody has produced the one file that settles the direction. Until then
+MediBang exports PSD and PNG, which Umber reads.
 
 ### GIMP (`.xcf`)
 
@@ -311,7 +467,9 @@ well-understood, and not done yet.
 ## Dependencies added
 
 All four are pure Rust with no C build step, which keeps `cargo test -p
-umber-core` instant and keeps an Android or iOS cross-build plausible.
+umber-core` instant and keeps an Android or iOS cross-build plausible. **Clip
+Studio added none**: its SQLite reader and its block decoder were already in the
+crate, written for the brush importer, and `flate2` was already a dependency.
 
 | Crate | Why |
 |---|---|
@@ -348,6 +506,11 @@ Photoshop. It is mitigated two ways:
   the file that panics). Those files are not in this repository, so those runs
   are not tests — but the behaviours they exposed are, and every compensation
   in `photoshop.rs` cites the file that revealed the need for it.
+- The Clip Studio reader was run over five real `.clip` documents the same way,
+  and the Clip Studio section above says exactly which of its readings that did
+  and did not settle. The one it settled that no fixture could is the **stack
+  direction**, which is the reading a `.clip` reader is most likely to get
+  backwards and which a self-written fixture would have agreed with either way.
 
 The tests were also mutation-checked: inverting the visibility compensation,
 removing either stack reversal, premultiplying in the wrong colour space and
@@ -388,8 +551,12 @@ the adapter's real `max_texture_dimension_2d` before uploading.
 - No import writes into an *existing* document — an import replaces the
   document. Placing a file as a new layer in the current document is a separate
   feature.
-- Layer groups flatten. Whenever Umber grows real groups, every reader here has
-  the tree available and can stop flattening.
+- **Photoshop groups still flatten**, and are the last reader that does.
+  ORA, `.kra` and `.clip` all produce folders. The `psd` crate exposes
+  `groups()`, `group_ids_in_order()` and a `parent_id` on both layers and
+  groups, so the tree is reachable; what is not directly given is where a
+  group's own divider sits among its siblings, which has to be reconstructed
+  from the file positions of its descendants. That is the whole of the work.
 - Krita's `.krz` (the same container with different compression) is untested and
   not claimed.
 - Photoshop layer masks are detected and reported but not applied, and with the
@@ -400,3 +567,34 @@ the adapter's real `max_texture_dimension_2d` before uploading.
   a mask would be a multiply into alpha; getting one to multiply is a second
   parser walking the same bytes, which is the fork this module declines.
   Density and feather would still have to be right afterwards.
+
+  **That verdict was re-opened and is now narrower.** "A second parser walking
+  the same bytes" was written about a *whole* PSD reader, and that is the right
+  thing to refuse: PackBits per scanline, additional-info blocks, Unicode names,
+  section dividers, colour modes and depths. What a mask actually needs is much
+  smaller — the layer records section is a length-prefixed sequence, and inside
+  each record the layer-mask block is itself length-prefixed and holds a
+  rectangle, a default colour and two flag bytes and nothing else. Reading only
+  that is perhaps two hundred lines, and it does not have to agree with the
+  crate about anything except where each layer record begins.
+
+  It is still not free, and the cost is in three places rather than one. The
+  **channel data** would have to be walked as well, because a mask's samples are
+  a fifth channel with its own compression, and that is where the crate panics
+  today — so the fork would have to read the channels too, at which point it is
+  most of a layer reader. The **fifth channel's length** is what the crate gets
+  wrong (it assumes every channel is the layer's height), so the two parsers
+  would disagree about where a record ends, which is exactly the drift the
+  original refusal names. And **an RLE mask channel currently refuses the whole
+  file**, which is the loss that costs a user something today and would be fixed
+  by the same work.
+
+  So the honest ranking is: the file that is *refused* is a worse failure than
+  the mask that is *dropped*, and both are fixed by the same fork. If Photoshop
+  masks are wanted, the shape to build is a small parser that walks the layer
+  records section for the mask block **and** the channel lengths, keeps the
+  crate for the pixels, and compares its own record boundaries against the
+  crate's on every layer — refusing the mask, not the document, wherever the two
+  disagree. `ag-psd` is the reference implementation to check against; see
+  "Why not write our own reader" above for why replacing the crate outright is
+  still the wrong trade.

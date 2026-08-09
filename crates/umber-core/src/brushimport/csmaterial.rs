@@ -36,7 +36,10 @@
 //!    whose blocks are all absent has no picture in it — rather than by
 //!    `MainId`, which is a number this reader has no key to.
 //!
-//! 3. **A record stream**, in both `Attribute` and `BlockData`:
+//! 3. **A record stream**, in both `Attribute` and `BlockData`, and it is
+//!    [`crate::csblocks`]'s rather than this module's — the `.clip` document
+//!    reader reaches the identical structure by a different route, and two
+//!    copies of it is the drift refused everywhere else here. The shape:
 //!    `[u32 be size][u32 be name length][utf-16be name][payload]`, the size
 //!    covering the whole record. `Attribute`'s first record is `Parameter`,
 //!    whose payload opens with the material's true width and height as plain
@@ -68,12 +71,8 @@
 //! by [`MAX_SIDE`], because a block's declared size says nothing about the
 //! dimensions the material claims and the allocation follows those.
 
-use std::io::Read;
-
+use crate::csblocks::{self, BLOCK, decode_block, record};
 use crate::sqlite::{Database, Value};
-
-/// Blocks are always this square. It is in the file too, and checked against.
-const BLOCK: usize = 256;
 
 /// The page a material's embedded database starts at.
 ///
@@ -177,39 +176,23 @@ fn offscreen(row: &crate::sqlite::Row) -> Option<Material> {
         return None;
     };
 
-    // `Attribute` opens with a short header whose first word is its own
-    // length, and the first named field follows it.
-    let head = be32(attribute, 0)? as usize;
-    if !(8..=64).contains(&head) {
-        return None;
-    }
-    let (name, parameter) = field(attribute, head)?;
-    if name != "Parameter" {
-        return None;
-    }
-    let width = be32(parameter, 0)?;
-    let height = be32(parameter, 4)?;
-    let columns = be32(parameter, 8)? as usize;
-    let rows = be32(parameter, 12)? as usize;
-    if width == 0 || height == 0 || columns == 0 || rows == 0 {
-        return None;
-    }
     // **The size is refused before it is believed**, and `checked_mul` below is
     // not enough on its own: a consistent pair of very large numbers multiplies
     // to something a 64-bit `usize` holds happily and then asks the allocator
     // for it, so a file a stranger wrote could take the application down by
-    // naming a picture nobody drew. The bound is generous — every material in
+    // naming a picture nobody drew. [`MAX_SIDE`] is generous — every material in
     // the sample files is under 1200 on a side, and Clip Studio's own canvas
-    // does not reach this — and the cost of exceeding it is a fall back to the
+    // does not reach it — and the cost of exceeding it is a fall back to the
     // thumbnail rather than a refusal to import.
-    if width > MAX_SIDE || height > MAX_SIDE {
-        return None;
-    }
-    // A grid that does not cover the picture — or covers far more of it than
-    // it needs to — is a parse that has gone wrong, not a material.
-    if columns != (width as usize).div_ceil(BLOCK) || rows != (height as usize).div_ceil(BLOCK) {
-        return None;
-    }
+    //
+    // The `Parameter` field and the grid check are [`csblocks`]'s, shared with
+    // the `.clip` document reader. The **packing** it also reads is deliberately
+    // not used here: a material's channel count is derived from each block's own
+    // declared size, which is what lets the one-plane and two-plane shapes below
+    // be told apart per block rather than per bitmap.
+    let bitmap = csblocks::parse_attribute(attribute, MAX_SIDE)?;
+    let (width, height) = (bitmap.width, bitmap.height);
+    let (columns, rows) = (bitmap.columns, bitmap.rows);
 
     let texels = (width as usize).checked_mul(height as usize)?;
     let mut coverage = vec![0u8; texels];
@@ -230,7 +213,9 @@ fn offscreen(row: &crate::sqlite::Row) -> Option<Material> {
         // nothing — so it costs no inflate and no copy. That is also what makes
         // the two empty mipmap levels free: neither yields a single block, so
         // `from_layer` finds no picture in them and moves on.
-        let Some(block) = decode_block(chunk.payload)? else {
+        // `None` for the packing: see `offscreen`'s note above — the channel
+        // count comes from the block's own declared size here.
+        let Some(block) = decode_block(chunk.payload, None)? else {
             continue;
         };
         // **One or two planes, and the first is the mask.** Both readings are
@@ -286,122 +271,6 @@ fn offscreen(row: &crate::sqlite::Row) -> Option<Material> {
     })
 }
 
-/// `[u32 index][u32 uncompressed bytes][u32 block width][u32 block height]
-/// [u32 present]`, then — only where it is present —
-/// `[u32 length + 4][u32 le length][zlib stream]`.
-///
-/// `Ok(None)` is a block that is simply not there, which is the ordinary state
-/// of a mipmap level Clip Studio has not built; `None` is a block this reader
-/// could not parse, and takes the whole material with it.
-///
-/// The two lengths disagree by exactly the four bytes of the second, in both
-/// sample files and in every block of both. Neither is trusted for the *end*
-/// of the stream: the record's own size is, minus the nested
-/// `BlockDataEndChunk` marker that closes it, because that is the one bound
-/// the container itself guarantees.
-///
-/// `take` stops the decoder at the size the block declared, which bounds what
-/// a hostile stream can cost to one block.
-fn decode_block(payload: &[u8]) -> Option<Option<Vec<u8>>> {
-    const PLANE: usize = BLOCK * BLOCK;
-    /// A material of more than this many planes is not one this reader knows.
-    /// Five is the most any sample has — an alpha, three colours, and one more
-    /// that nothing reads.
-    const MAX_PLANES: usize = 5;
-
-    let declared = be32(payload, 4)? as usize;
-    let block_width = be32(payload, 8)? as usize;
-    let block_height = be32(payload, 12)? as usize;
-    let present = be32(payload, 16)?;
-    if block_width != BLOCK || block_height != BLOCK {
-        return None;
-    }
-    if present == 0 {
-        return Some(None);
-    }
-    // A block is a whole number of 256-square planes and nothing else. Checked
-    // only where the block is real: an absent one carries a stale figure, and
-    // one of the sample materials leaves five channels' worth there.
-    if declared < PLANE || !declared.is_multiple_of(PLANE) || declared > MAX_PLANES * PLANE {
-        return None;
-    }
-
-    // The stream runs from here to the end of the record, less the nested
-    // marker. `record` has already trimmed the payload to the record, so the
-    // marker is what is left over at the end.
-    let stream = payload.get(28..payload.len().checked_sub(END_MARKER)?)?;
-    let mut pixels = Vec::with_capacity(declared);
-    flate2::read::ZlibDecoder::new(stream)
-        .take(declared as u64)
-        .read_to_end(&mut pixels)
-        .ok()?;
-    if pixels.len() != declared {
-        return None;
-    }
-    Some(Some(pixels))
-}
-
-/// `[u32 17]["BlockDataEndChunk"]`, which closes every block record.
-const END_MARKER: usize = 4 + 17 * 2;
-
-/// A `[u32 name length][utf-16be name]` label, and everything after it.
-///
-/// `Attribute`'s fields are framed this way — no length, so a reader has to
-/// know how long each is. Only the first, `Parameter`, is read, and its own
-/// fields are fixed-position, so nothing here needs to walk to the second.
-fn field(blob: &[u8], at: usize) -> Option<(String, &[u8])> {
-    let units = be32(blob, at)? as usize;
-    if units == 0 || units > 64 {
-        return None;
-    }
-    let body = at.checked_add(4)?.checked_add(units * 2)?;
-    let name = utf16be(blob.get(at + 4..body)?);
-    Some((name, blob.get(body..)?))
-}
-
-/// A record of the `[u32 size][u32 name length][utf-16be name][payload]` form.
-struct Record<'a> {
-    name: String,
-    payload: &'a [u8],
-    /// Where the record after this one starts.
-    end: usize,
-}
-
-fn record(blob: &[u8], at: usize) -> Option<Record<'_>> {
-    let size = be32(blob, at)? as usize;
-    let units = be32(blob, at + 4)? as usize;
-    // A name is a handful of ASCII words; anything else is not this format.
-    if units == 0 || units > 64 {
-        return None;
-    }
-    let head = 8 + units * 2;
-    if size < head {
-        return None;
-    }
-    let end = at.checked_add(size)?;
-    let body = blob.get(at..end)?;
-    Some(Record {
-        name: utf16be(&body[8..head]),
-        payload: &body[head..],
-        end,
-    })
-}
-
-fn utf16be(bytes: &[u8]) -> String {
-    String::from_utf16_lossy(
-        &bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_be_bytes([p[0], p[1]]))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn be32(bytes: &[u8], at: usize) -> Option<u32> {
-    bytes
-        .get(at..at + 4)
-        .map(|b| u32::from_be_bytes(b.try_into().expect("four bytes")))
-}
-
 /// Copy one 256-square block into its place in the mask, clipped to the
 /// picture.
 ///
@@ -436,7 +305,8 @@ fn blit(plane: &mut [u8], width: u32, height: u32, column: usize, row: usize, bl
 /// first.
 #[cfg(test)]
 pub(crate) mod fixture {
-    use super::{BLOCK, END_MARKER, FIRST_PAGE, PAGE_SIZE};
+    use super::{BLOCK, FIRST_PAGE, PAGE_SIZE};
+    use crate::csblocks::END_MARKER;
     use crate::sqlite::{Value, fixture::headerless};
     use std::io::Write;
 
