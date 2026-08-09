@@ -1723,10 +1723,17 @@ mod strip_budget {
     pub const FEATHER: f32 = 165.0;
     /// The eyedropper's second sentence: what a drag off the window does, or
     /// why it does nothing here. Both readings are within a few characters of
-    /// each other, so unlike the navigation pair one figure covers them —
-    /// measured at the same points-per-character `ZOOM`'s 370 for seventy-four
-    /// characters gives.
-    pub const EYEDROPPER: f32 = 305.0;
+    /// each other, so unlike the navigation pair one figure covers them.
+    ///
+    /// **Bisected against its own guard rather than estimated**, which is what
+    /// the estimate was worth: the sentence needs somewhere between 295 and
+    /// 305 points, so a figure taken from `ZOOM`'s points-per-character would
+    /// have landed either side of it by luck. 320 is the smallest round number
+    /// with real slack in it, and
+    /// `the_eyedroppers_hint_does_not_overrun_the_strip_it_is_drawn_on` fails
+    /// at 295 and 305 — the second by four points, which is exactly the sort of
+    /// margin a font metric moves by.
+    pub const EYEDROPPER: f32 = 320.0;
     // Pan's and Zoom's second sentence are budgeted per tool, on
     // `navigate_hint`'s own third field, because the two lines are a third
     // apart in width and one figure for both drops Pan's while it still fits.
