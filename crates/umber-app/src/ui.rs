@@ -19,6 +19,7 @@
 
 use crate::editor::{self, BrushTab, Editor, Tool};
 use crate::icons::{self, Icon};
+use crate::loupe;
 use crate::panels;
 use crate::shortcuts::{self, Action};
 use crate::syspick;
@@ -399,6 +400,15 @@ pub fn draw(root: &mut egui::Ui, ed: &mut Editor) -> UiOutput {
     // Last, so the drop it resolves is tested against a frame in which every
     // panel has already had its say.
     panels::drag_overlay(root, &p, ed, &geo);
+
+    // The eyedropper's magnifier, over everything and part of nothing. Drawn
+    // from here rather than from the central panel because a pick over the
+    // *interface* is now a real read, so the circle has to be able to sit over
+    // a docked panel — and a central panel's painter is clipped to its own
+    // rect. It is a bare layer painter and not an `Area`, which is what keeps
+    // it out of `layer_id_at` and therefore out of every gate that asks
+    // whether egui owns the pointer.
+    loupe_overlay(root, &p, ed);
     ed.layout.save_if_dirty();
 
     // Keys are read off the winit event before egui is asked, so a field with
@@ -1262,20 +1272,177 @@ fn pen_cursor(ui: &egui::Ui, p: &Palette, ed: &Editor) {
 /// [`Editor::pen_dot`](crate::Editor::pen_dot) for why that shape was chosen
 /// over a latch.
 fn aiming_cursor(ui: &egui::Ui, ed: &Editor) {
-    if ed.ui.tool != Tool::Eyedropper || ed.pen_pointer {
+    if ed.pen_pointer {
         return;
     }
     // The same two readings `pen_cursor` hands to `Editor::pen_dot`, and for
     // the same reasons: over a panel or a modal the ordinary cursor is the
     // right one, and asking for a shape while another application has the
     // keyboard would set it across the whole desktop.
-    if editor::over_egui_area(ed, ui.ctx(), ed.cursor)
-        || !ui.ctx().input(|i| i.focused)
-        || !ed.pointer_over_canvas(ed.cursor)
-    {
+    //
+    // The rule they feed is `Editor::aiming_pick`, shared with `App::
+    // pick_aimed` — so the crosshair and the loupe cannot end up promising a
+    // colour in different places.
+    let around = editor::Surroundings {
+        over_area: editor::over_egui_area(ed, ui.ctx(), ed.cursor),
+        focused: ui.ctx().input(|i| i.focused),
+    };
+    if !ed.aiming_pick(around) {
         return;
     }
     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+}
+
+/// The eyedropper's magnifier: a circle of screen or document pixels, beside
+/// the pointer, with the one a release would take marked.
+///
+/// **The picture is read, never invented.** Every cell is a texel
+/// `App::pick_this_frame` actually sampled, and a texel it could not read draws
+/// nothing at all — the rim shows through, which is what a position off every
+/// monitor or off the canvas looks like. A loupe that filled those in with
+/// black would be a control that lies, which is the standard everything else
+/// here is held to, and it is why [`loupe::Patch`] carries an `Option` per
+/// texel rather than a colour.
+///
+/// **The middle cell is drawn from the colour that will be taken and not from
+/// the block**, which matters only off the screen, where the two come from
+/// different GDI calls: `syspick::sample` is the one that answers "nothing" on
+/// no monitor and is therefore the one that decides. Over the canvas they are
+/// the same render and the same texel.
+///
+/// Where the circle goes is [`loupe::place`]'s, in a model with no drawing in
+/// it, for the reason `overlay::place_strip` and `ScrollSpan` are — and it
+/// carries a rule the painter cannot state: the circle never comes within half
+/// a block of the pointer, because over the interface and the desktop the block
+/// is read off the same screen the circle is drawn on.
+///
+/// The cells are clipped to the circle *conservatively*, per row, so the grid
+/// never pokes past the ring; whatever gap that leaves shows the rim, which is
+/// why the rim is drawn first and is a whole surface colour rather than a
+/// hairline.
+fn loupe_overlay(root: &egui::Ui, p: &Palette, ed: &Editor) {
+    let Some(seen) = ed.loupe.as_ref() else {
+        return;
+    };
+    let ctx = root.ctx();
+    let pointer = ed.to_points(seen.at);
+    // `content_rect` and not `viewport_rect`: on a platform with a notch or a
+    // status bar the second includes the part of the window nothing may be
+    // drawn in, and a loupe clamped into *that* would sit under it.
+    let view = ctx.content_rect();
+    let Some(centre) = loupe::place(
+        glam::Vec2::new(pointer.x, pointer.y),
+        loupe::View {
+            min: glam::Vec2::new(view.min.x, view.min.y),
+            max: glam::Vec2::new(view.max.x, view.max.y),
+        },
+        loupe::RADIUS,
+    ) else {
+        return;
+    };
+    let centre = pos2(centre.x, centre.y);
+
+    // A bare layer painter, not an `Area`: an `Area` registers a rectangle that
+    // `Memory::layer_id_at` then answers with, which would make the loupe the
+    // thing `ui_owns_pointer` and `Editor::pen_dot` see — a magnifier that
+    // refused the press it exists to aim.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("umber-loupe"),
+    ));
+
+    let rim = 3.0;
+    painter.circle_filled(centre, loupe::RADIUS + rim, p.popover);
+
+    let taken = seen.taken.map(|c| {
+        let [r, g, b, _] = c.to_srgb_u8();
+        egui::Color32::from_rgb(r, g, b)
+    });
+    match seen.patch.as_ref() {
+        Some(patch) => loupe_cells(&painter, p, patch, centre, taken),
+        // Only the one pixel could be read, so it is shown large rather than
+        // magnified into a grid it never had. The alternative — a fake
+        // neighbourhood — is the one thing this control may not do.
+        None => {
+            if let Some(fill) = taken {
+                painter.circle_filled(centre, loupe::RADIUS, fill);
+            }
+        }
+    }
+
+    // The ring last, over the cells, so the conservative clipping above cannot
+    // leave a stepped edge standing proud of it.
+    painter.circle_stroke(
+        centre,
+        loupe::RADIUS + rim * 0.5,
+        Stroke::new(1.0, p.popover_border),
+    );
+}
+
+/// The grid inside the circle, and the mark on the cell a release would take.
+fn loupe_cells(
+    painter: &egui::Painter,
+    p: &Palette,
+    patch: &loupe::Patch,
+    centre: egui::Pos2,
+    taken: Option<egui::Color32>,
+) {
+    let size = patch.size();
+    let cell = 2.0 * loupe::RADIUS / size as f32;
+    let top_left = centre - vec2(loupe::RADIUS, loupe::RADIUS);
+    let middle = patch.middle();
+    let mut mark = None;
+
+    for row in 0..size {
+        let y0 = top_left.y + row as f32 * cell;
+        let y1 = y0 + cell;
+        // The row edge *further* from the centre, so the half-width is the
+        // smaller of the two the row could claim and the cells stay strictly
+        // inside the circle. Reading it at the row's centre instead would let
+        // the top and bottom rows overhang the ring by half a cell.
+        let dy = (y0 - centre.y).abs().max((y1 - centre.y).abs());
+        if dy >= loupe::RADIUS {
+            continue;
+        }
+        let half = (loupe::RADIUS * loupe::RADIUS - dy * dy).sqrt();
+        for col in 0..size {
+            let x0 = (top_left.x + col as f32 * cell).max(centre.x - half);
+            let x1 = (top_left.x + (col + 1) as f32 * cell).min(centre.x + half);
+            if x1 <= x0 {
+                continue;
+            }
+            let rect = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1));
+            if col == middle && row == middle {
+                // Unclipped: the middle of an odd grid is nowhere near the
+                // boundary, and the mark has to sit on the whole cell.
+                mark = Some(Rect::from_min_size(
+                    pos2(top_left.x + col as f32 * cell, y0),
+                    vec2(cell, cell),
+                ));
+                if let Some(fill) = taken {
+                    painter.rect_filled(rect, 0.0, fill);
+                }
+                continue;
+            }
+            if let Some([r, g, b]) = patch.at(col, row) {
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+            }
+        }
+    }
+
+    if let Some(rect) = mark {
+        // Derived from the colour it sits on, so it reads on a white swatch and
+        // on a black one — the rule `theme::contrast` exists for, and the only
+        // way a fixed ink could work here would be if the loupe were never
+        // aimed at the theme's own extremes, which is exactly what it is for.
+        let on = taken.unwrap_or(p.popover);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.5, contrast::ink_on(on, Ink::Strong)),
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
 fn menu_bar(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiActions) {

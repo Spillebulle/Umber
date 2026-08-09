@@ -6,6 +6,7 @@ use crate::editor::{self, Editor, Floating, Interaction, Tool};
 use crate::gesture;
 use crate::keylayout;
 use crate::logo;
+use crate::loupe;
 use crate::session::{DocId, DocumentState};
 use crate::shortcuts::{self, Action};
 use crate::splash::{self, Splash};
@@ -40,6 +41,24 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+/// What a frame owes the eyedropper.
+///
+/// Three answers rather than a `bool`, because reading a pixel and *keeping* it
+/// are different things: the loupe has to be on screen before the button goes
+/// down, and a hover that wrote the painting colour would repaint the swatch
+/// every time the pointer crossed the window. [`UmberApp::pick_aimed`] decides
+/// which, and it is the only thing that produces one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Aimed {
+    /// No pick in hand: nothing is read and the loupe comes off the screen.
+    No,
+    /// The eyedropper tool in hand with no button down. Read, show, keep
+    /// nothing.
+    Hovering,
+    /// `Interaction::Picking` — a button is held, so the colour is taken.
+    Dragging,
+}
 
 /// What one press of the zoom-in shortcut multiplies the camera by.
 ///
@@ -2599,18 +2618,65 @@ impl UmberApp {
     /// runs only while a button is held, and only for a gesture during which
     /// nothing is being painted.
     fn pick_this_frame(&mut self) {
-        if self.editor.interaction != Interaction::Picking {
+        let aiming = self.pick_aimed();
+        if aiming == Aimed::No {
             // Not picking, so nothing to remember. Cleared here rather than at
             // the release so that every path out of the gesture — a release, a
             // cancel, a second finger, a tab switch — is covered by one line
-            // instead of by five that have to agree.
+            // instead of by five that have to agree. The loupe goes with it,
+            // for exactly that reason: it is a picture of a gesture, so it must
+            // not outlive one.
             self.picked_at = None;
+            self.editor.loupe = None;
             return;
         }
         if self.picked_at == Some(self.editor.cursor) {
             return;
         }
-        self.pick_now();
+        self.picked_at = Some(self.editor.cursor);
+        self.take_sample(aiming == Aimed::Dragging);
+    }
+
+    /// Whether a pick is being *made* this frame, merely aimed, or neither.
+    ///
+    /// **A hover is a reading and not an edit**, which is the whole of why this
+    /// answers three things rather than a `bool`. The loupe has to be there
+    /// *before* the button goes down — "the colour you will select if you
+    /// click" is the artist's own words for it — so the sample is taken while
+    /// the eyedropper is merely in hand; but a hover must never write the
+    /// painting colour, or crossing the window on the way to the Layers panel
+    /// would repaint the swatch a hundred times.
+    ///
+    /// The drag is `Interaction::Picking`, which both ways in resolve to. The
+    /// hover is the eyedropper *tool*: Alt with another tool in hand is
+    /// deliberately not a hover, because Alt with no button is the brush
+    /// resize, and a loupe over that gesture would be a second reading of a
+    /// modifier that already means something else.
+    ///
+    /// The hover's rule is [`Editor::aiming_pick`], shared with
+    /// `ui::aiming_cursor` so that the crosshair and the loupe cannot promise a
+    /// colour in different places. It is the canvas alone — a hover over a
+    /// docked panel would be offering a colour a press will not take there,
+    /// because a press on a panel operates the panel. **The drag is not gated
+    /// on it**, and that is the fix the artist asked for: once
+    /// `Interaction::Picking` is in flight the pointer may cross onto the
+    /// interface and off the window, and both read.
+    fn pick_aimed(&self) -> Aimed {
+        if self.editor.interaction == Interaction::Picking {
+            return Aimed::Dragging;
+        }
+        let Some(gfx) = self.gfx.as_ref() else {
+            return Aimed::No;
+        };
+        let around = editor::Surroundings {
+            over_area: editor::over_egui_area(&self.editor, &gfx.egui_ctx, self.editor.cursor),
+            focused: gfx.egui_ctx.input(|i| i.focused),
+        };
+        if self.editor.aiming_pick(around) {
+            Aimed::Hovering
+        } else {
+            Aimed::No
+        }
     }
 
     /// Take the colour under the cursor as the painting colour, now.
@@ -2636,31 +2702,136 @@ impl UmberApp {
     /// `Color::from_srgb_u8` here.
     fn pick_now(&mut self) {
         self.picked_at = Some(self.editor.cursor);
-        self.pick_colour_at_cursor();
+        self.take_sample(true);
     }
 
-    /// The read itself, wherever the pointer is.
-    fn pick_colour_at_cursor(&mut self) {
-        let aim = self.pick_aim(self.editor.cursor);
-        match aim {
-            // Over Umber's own panels, or off the window on a platform with no
-            // screen read. Both read nothing, and both are silent: this runs on
-            // every frame of a drag, and a notice raised per frame is not a
-            // refusal, it is a fault. Where the platform sentence belongs is
-            // the tool options strip, *before* somebody tries — see
-            // `ui::options_strip` and `syspick::outside_line`.
-            syspick::Aim::Interface | syspick::Aim::Unreachable => {}
-            syspick::Aim::Desktop(x, y) => {
-                if let Some([r, g, b]) = syspick::sample(x, y) {
-                    // The desktop hands over sRGB bytes and the engine is
-                    // linear throughout, so this goes through the one door the
-                    // clipboard and the palette also use. Never a second
-                    // `powf`.
-                    self.editor.set_color(Color::from_srgb_u8(r, g, b, 255));
-                }
-            }
-            syspick::Aim::Canvas => self.pick_colour_off_canvas(),
+    /// One read under the cursor: the loupe's picture, and — where `keep` — the
+    /// painting colour.
+    ///
+    /// **One read serves both**, which is the rule the cut and the clipboard
+    /// already keep for a readback. Over the canvas the loupe's middle texel
+    /// *is* what `pick_colour` answers, because it is the same render; over the
+    /// screen the colour comes from `syspick::sample` and the picture from
+    /// `syspick::sample_patch`, and that pair is deliberate rather than
+    /// wasteful — see [`Self::sample_screen`].
+    fn take_sample(&mut self, keep: bool) {
+        let seen = self.read_under_cursor();
+        if keep && let Some(colour) = seen.as_ref().and_then(|s| s.taken) {
+            self.editor.set_color(colour);
         }
+        self.editor.loupe = seen;
+    }
+
+    /// What is under the cursor, wherever the pointer is.
+    ///
+    /// `None` is "there is nothing to show here", which is not the same as a
+    /// [`loupe::Loupe`] whose `taken` is `None` — that one is a position that
+    /// *was* read and holds no colour, a transparent document pixel or a
+    /// coordinate on no monitor, and it still draws a loupe saying so.
+    fn read_under_cursor(&mut self) -> Option<loupe::Loupe> {
+        match self.pick_aim(self.editor.cursor) {
+            // Off the window on a platform with no screen read, and now also
+            // over Umber's own chrome there, since the two fail for one reason.
+            // Silent: this runs on every frame of a drag, and a notice raised
+            // per frame is not a refusal, it is a fault. Where the platform
+            // sentence belongs is the tool options strip, *before* somebody
+            // tries — see `ui::options_strip` and `syspick::outside_line`.
+            syspick::Aim::Unreachable => None,
+            // **The interface reads the screen, exactly as the desktop does.**
+            // It used to read nothing, on the argument that a panel off the
+            // screen surface is the theme's ink composited with whatever egui
+            // drew over it. That is what an eyedropper is *for*: it takes the
+            // colour you can see, and Umber's chrome is on the screen precisely
+            // as another application's window is.
+            syspick::Aim::Interface(x, y) | syspick::Aim::Desktop(x, y) => {
+                Some(self.sample_screen(x, y))
+            }
+            syspick::Aim::Canvas => self.sample_canvas(),
+        }
+    }
+
+    /// A pixel of the screen and the block around it.
+    ///
+    /// **Two calls, and the second may not decide the colour.** `syspick::
+    /// sample` is `GetPixel`, which answers `CLR_INVALID` for a position on no
+    /// monitor; `sample_patch` is one `BitBlt`, which succeeds against nothing
+    /// and hands back black. So the colour that a release keeps comes from the
+    /// first and the picture from the second, and a position in the gap between
+    /// two screens of different heights reads as nothing rather than as black.
+    /// `examples/measure-screenpick.rs` times the pair.
+    ///
+    /// The block is skipped where there is no colour at all, which is the
+    /// common shape of that gap: nothing to magnify, so nothing to pay a second
+    /// screen read for.
+    fn sample_screen(&self, x: i32, y: i32) -> loupe::Loupe {
+        // The desktop hands over sRGB bytes and the engine is linear
+        // throughout, so this goes through the one door the clipboard and the
+        // palette also use. Never a second `powf`.
+        let taken = syspick::sample(x, y).map(|[r, g, b]| Color::from_srgb_u8(r, g, b, 255));
+        let patch = taken.and_then(|_| {
+            syspick::sample_patch(x, y, loupe::CELLS)
+                .and_then(|texels| loupe::Patch::new(loupe::CELLS, texels))
+        });
+        loupe::Loupe {
+            at: self.editor.cursor,
+            taken,
+            patch,
+        }
+    }
+
+    /// The canvas half: the colour the document shows under the cursor, and its
+    /// neighbours.
+    ///
+    /// Straight through `CanvasRenderer::pick_patch`, which reuses the screen
+    /// composite pass — so the eyedropper, the flat PNG export and a smudging
+    /// brush's canvas probe are all one piece of blend maths. Do not add a
+    /// second path here.
+    ///
+    /// **The document rather than the screen, and that is why `Aim::Canvas` is
+    /// still a separate answer** now that the interface reads the screen. This
+    /// is the composite *before* the interface is drawn over it, at one texel
+    /// per document pixel whatever the camera is doing — so a pick at 37% takes
+    /// the pixel it names rather than whatever the sampler resolved several of
+    /// them into, and the loupe magnifies the document rather than magnifying a
+    /// magnification.
+    ///
+    /// Texels off the document are `None` rather than whatever the composite
+    /// happens to hand back outside its own bounds, which is the same refusal
+    /// the single-pixel read has always made — it declined a point outside the
+    /// picture rather than sampling the edge.
+    fn sample_canvas(&mut self) -> Option<loupe::Loupe> {
+        let doc = self.editor.screen_to_doc(self.editor.cursor);
+        let size = self.editor.doc.size;
+
+        let float = self.float_preview();
+        let layers = self.baked_draws(float)?;
+        let id = self.editor.session.active_id();
+        let gfx = self.gfx.as_ref()?;
+        let canvas = gfx.canvases.get(&id)?;
+        let rgba = canvas.pick_patch(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc, loupe::CELLS);
+
+        // The document pixel the top-left texel stands for. `pick_patch` maps
+        // texel `k` to `doc + (k - CELLS / 2)`, so this is one subtraction and
+        // not a second copy of that mapping's rounding.
+        let half = (loupe::CELLS / 2) as i32;
+        let first = (doc.x.floor() as i32 - half, doc.y.floor() as i32 - half);
+        let patch = loupe::Patch::from_document(
+            loupe::CELLS,
+            &rgba,
+            first,
+            (size.x as i32, size.y as i32),
+        )?;
+        let middle = patch.middle();
+        Some(loupe::Loupe {
+            at: self.editor.cursor,
+            // Transparent means there is nothing to pick; taking it would
+            // silently set the brush to black. So would a point outside the
+            // picture, which `from_document` has already made `None`.
+            taken: patch
+                .at(middle, middle)
+                .map(|[r, g, b]| Color::from_srgb_u8(r, g, b, 255)),
+            patch: Some(patch),
+        })
     }
 
     /// Where the pointer at `pos` is, as far as a pick is concerned.
@@ -2702,39 +2873,6 @@ impl UmberApp {
             origin,
             syspick::DESKTOP_READABLE,
         )
-    }
-
-    /// The canvas half: the colour the document shows under the cursor.
-    ///
-    /// Straight through `CanvasRenderer::pick_colour`, which reuses the screen
-    /// composite pass — so the eyedropper, the flat PNG export and a smudging
-    /// brush's canvas probe are all one piece of blend maths. Do not add a
-    /// second path here.
-    fn pick_colour_off_canvas(&mut self) {
-        let doc = self.editor.screen_to_doc(self.editor.cursor);
-        let size = self.editor.doc.size;
-        if doc.x < 0.0 || doc.y < 0.0 || doc.x >= size.x as f32 || doc.y >= size.y as f32 {
-            return;
-        }
-
-        let float = self.float_preview();
-        let Some(layers) = self.baked_draws(float) else {
-            return;
-        };
-        let id = self.editor.session.active_id();
-        let Some(gfx) = self.gfx.as_ref() else { return };
-        let Some(canvas) = gfx.canvases.get(&id) else {
-            return;
-        };
-        let px = canvas.pick_colour(&gfx.gpu.device, &gfx.gpu.queue, &layers, doc);
-
-        // Transparent means there is nothing to pick; taking it would silently
-        // set the brush to black.
-        if px[3] == 0 {
-            return;
-        }
-        self.editor
-            .set_color(Color::from_srgb_u8(px[0], px[1], px[2], 255));
     }
 
     /// Write the whole layered document out, and remember where it went.

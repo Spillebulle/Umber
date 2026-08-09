@@ -48,20 +48,25 @@
 //! Settings → Input & pen is where somebody with one would see what the press
 //! actually resolved to.
 //!
-//! **There is no loupe, and that is what the overlay would have been for.** A
-//! magnifier has to be drawn at the pointer, the pointer is on somebody else's
-//! window, so it is an always-on-top borderless window moved once per event —
-//! which is then either occluding the pixel it exists to magnify or offset from
-//! it by a hand-tuned margin, and either way is a second wgpu surface and a
-//! second render pass. It is the right thing to build eventually and it is not
-//! built. What stands in for it is that the sample follows the pointer: the
-//! colour under it becomes the painting colour as the drag moves, so the
-//! Colour module's swatch is the readout. Not *live* — `App::pick_this_frame`
-//! skips a frame the pointer did not move on, so a pixel that changes
+//! **There is a loupe now, and it lives inside Umber's window.** The first
+//! draft of this module argued there could not be one: a magnifier has to be
+//! drawn at the pointer, the pointer is on somebody else's window, so it is an
+//! always-on-top borderless window moved once per event, occluding the pixel it
+//! exists to magnify or offset from it by a hand-tuned margin, plus a second
+//! wgpu surface and a second render pass. **Every clause of that is true and
+//! the conclusion does not follow**, because a magnifier does not have to be
+//! *at* the pointer to be useful. `loupe::place` keeps it in Umber's own view —
+//! beside the pointer while the pointer is in the window, clamped to the edge
+//! once the pointer has left — so it is an ordinary egui overlay in a
+//! foreground layer, with no window and no surface of its own. See `loupe.rs`
+//! for where it goes and [`sample_patch`] for where its pixels come from.
+//!
+//! The colour also follows the pointer as the drag moves, so the Colour
+//! module's swatch is a second readout. Neither is *live* — `App::pick_this_
+//! frame` skips a frame the pointer did not move on, so a pixel that changes
 //! underneath a hand held still (a video, another window repainting) is not
 //! re-read. That is the throttle earning its keep and it is worth saying,
-//! because the swatch is the whole of the feedback and somebody will hold
-//! still over something that moves.
+//! because somebody will hold still over something that moves.
 //!
 //! # What is only true on Windows
 //!
@@ -103,9 +108,15 @@
 //! note that a machine with a 60 Hz panel should read about 16 ms rather than
 //! 7 — the number is the display's, not the code's.
 //!
-//! It also settles the loupe from a second direction: a `BitBlt` of a block
-//! costs what a `BitBlt` of one pixel costs, because the wait is the wait. A
-//! magnifier would be no more expensive to *read* than this already is.
+//! It also settles the loupe from a second direction, and this is now measured
+//! rather than predicted: a `BitBlt` of an 11×11 block costs what a `BitBlt` of
+//! one pixel costs, because the wait is the wait. Reading the same
+//! neighbourhood with `GetPixel` would be 121 refreshes — 850 ms a frame, which
+//! is not a control — so [`sample_patch`] is one `BitBlt` and there is no
+//! second candidate. **A frame of the drag pays both calls**, because the
+//! colour that is actually *taken* still comes from [`sample`]: that is the one
+//! route that answers "nothing" off every monitor, and the loupe must not be
+//! what decides which pixel a click keeps.
 //!
 //! # What is subtly wrong even on Windows
 //!
@@ -159,7 +170,7 @@ use glam::Vec2;
 /// spellings of the same question.
 pub const DESKTOP_READABLE: bool = cfg!(windows);
 
-/// What the tool options strip says about picking *outside* the window.
+/// What the tool options strip says about picking *beyond the canvas*.
 ///
 /// One line per platform and every one of them is drawn — this is not a refusal
 /// message, it is the sentence, and on Windows it says what the gesture does.
@@ -167,16 +178,20 @@ pub const DESKTOP_READABLE: bool = cfg!(windows);
 /// capability the module does not have, which is the failure a separate
 /// "supported" string and "unsupported" string invite.
 ///
+/// It used to say *outside the window*, which was the boundary while Umber's
+/// own chrome read nothing. The boundary is now the canvas: past it the screen
+/// answers, whether what is there is a Layers panel or somebody else's window.
+///
 /// Short, because it shares one unwrapped row with the sentence beside it and a
 /// strip does not reflow. Everything longer is [`outside_detail`], on hover,
 /// which is the split every long explanation in this interface makes.
 pub const fn outside_line() -> &'static str {
     if cfg!(windows) {
-        "Drag off the window to take one from anywhere on the screen."
+        "Drag anywhere on the screen to take the colour under the pointer."
     } else if cfg!(target_os = "macos") {
-        "Picking outside the window is not built for macOS yet."
+        "Picking beyond the canvas is not built for macOS yet."
     } else {
-        "Picking outside the window is not built for this system yet."
+        "Picking beyond the canvas is not built for this system yet."
     }
 }
 
@@ -189,16 +204,16 @@ pub const fn outside_line() -> &'static str {
 /// obstacle to explain so it says where to look for the answer instead.
 pub const fn outside_detail() -> &'static str {
     if cfg!(windows) {
-        "The colour under the pointer becomes the painting colour as you drag, \
-         so the Colour module's swatch is the readout."
+        "The loupe shows what a release would take, and the colour under the \
+         pointer becomes the painting colour as you drag."
     } else if cfg!(target_os = "macos") {
         "It needs the Screen Recording permission, which is a prompt and an \
          entitlement, and nobody working on Umber has a Mac to test it on. \
-         Picking inside the window works as it always has."
+         Picking on the canvas works as it always has."
     } else {
-        "On Wayland a colour off the desktop has to come from the compositor's \
-         own picker, and the X11 route has not been written. Picking inside \
-         the window works as it always has."
+        "On Wayland a colour off the screen has to come from the compositor's \
+         own picker, and the X11 route has not been written. Picking on the \
+         canvas works as it always has."
     }
 }
 
@@ -211,8 +226,9 @@ pub enum Aim {
     Canvas,
     /// Inside Umber's own window and not on the document: a panel, the tab
     /// strip, a scrollbar, the selection's strip, the margin round a canvas
-    /// smaller than the view. **Nothing is read**, and that is the whole of
-    /// what this variant is for.
+    /// smaller than the view. Read **off the screen**, at these virtual-screen
+    /// physical pixels — the same reading [`Aim::Desktop`] takes, from the same
+    /// arithmetic, one line above.
     ///
     /// It exists because the first draft did not have it. `Editor::cursor` is
     /// not clipped to the canvas region and `screen_to_doc` is a plain camera
@@ -222,10 +238,28 @@ pub enum Aim {
     /// on changing the painting colour to colours the artist could not see.
     /// The press was already safe (`ui_owns_pointer` refuses it); the drag was
     /// not, because nothing after the press asked again.
-    Interface,
+    ///
+    /// **It then read nothing at all, and that was wrong for a second
+    /// reason.** The stated argument was that reading a panel off the screen
+    /// surface hands back the theme's own ink already composited with whatever
+    /// egui drew over it. That is exactly what an eyedropper is for: it takes
+    /// the colour you can *see*. Umber's chrome is on the screen precisely as
+    /// another application's window is, so a picker that read Photoshop's title
+    /// bar and refused Umber's own swatch grid was incoherent from the side
+    /// that matters — and it is what the artist reported. The variant survives
+    /// the correction because the *canvas* still answers through the document
+    /// (`pick_colour`, the composite before the interface is drawn over it,
+    /// which is exact at any zoom); only this one changed instrument.
+    Interface(i32, i32),
     /// Outside the window, at these virtual-screen physical pixels.
     Desktop(i32, i32),
-    /// Outside the window, and this build cannot read the desktop.
+    /// Nothing here can be read: outside the window, or over the interface, on
+    /// a build with no screen read.
+    ///
+    /// It used to mean the first of those alone. Once the interface became a
+    /// screen read it had to cover the second, because the two now fail for one
+    /// reason — [`DESKTOP_READABLE`] — and giving them separate answers would
+    /// be two variants meaning "this platform cannot".
     Unreachable,
 }
 
@@ -247,18 +281,22 @@ pub enum Aim {
 /// * `desktop_readable` is injected rather than read from [`DESKTOP_READABLE`]
 ///   for the reason `install::detect` takes a `Probe`.
 ///
-/// **The order is canvas, then window, then desktop**, and the middle one is
-/// what stops Umber's own interface being sampled: reading a panel off the
-/// screen surface would hand back the theme's own ink already composited with
-/// whatever egui had drawn over it, which is a colour the palette can give you
-/// properly.
+/// **The order is canvas, then window, then desktop.** The canvas is first
+/// because the document is a better instrument than the screen for the pixels
+/// it owns — it is the composite *before* the interface is drawn over it, so it
+/// is exact at any zoom, where a screen read of a canvas at 37% would hand back
+/// whatever the sampler resolved several document pixels into. The other two
+/// differ only in which side of the client rectangle the pointer is on, and
+/// they take the identical reading: **there is one statement of the
+/// screen-coordinate arithmetic below and both answers are built from it**, so
+/// the interface half cannot drift from the desktop half by a pixel.
 ///
-/// **Umber's title bar and window borders are the one exception**, and it is
+/// **Umber's title bar and window borders fall in the second group**, and it is
 /// stated rather than fixed: they are outside the *client* area, so a drag onto
-/// them reads them off the desktop like anything else. What comes back is the
-/// title bar's own colour, which is harmless and is the same answer any other
-/// screen picker gives; excluding them would mean reading `outer_position` and
-/// `outer_size` as well and having two rectangles to keep in step for that.
+/// them is an [`Aim::Desktop`] rather than an [`Aim::Interface`]. Both read the
+/// screen, so nothing observable turns on it; excluding them would mean reading
+/// `outer_position` and `outer_size` as well and having two rectangles to keep
+/// in step.
 pub fn aim(
     pointer: Vec2,
     over_canvas: bool,
@@ -273,15 +311,18 @@ pub fn aim(
         && pointer.y >= 0.0
         && pointer.x < client.x.max(0.0)
         && pointer.y < client.y.max(0.0);
-    if inside {
-        return Aim::Interface;
-    }
     if !desktop_readable {
         return Aim::Unreachable;
     }
     let Some((ox, oy)) = origin else {
         return Aim::Unreachable;
     };
+    // **One statement, two answers.** The interface and the desktop differ in
+    // which variant they wear and in nothing else, so a second copy of these
+    // two lines — which is what putting the interface case in its own branch
+    // would have meant — is a pixel of drift waiting to be introduced by
+    // whichever of the two somebody edits next.
+    //
     // `floor` rather than `as i32`, which truncates towards zero and would
     // therefore round the wrong way for every position left of or above the
     // window — the exact half of the range this branch exists for.
@@ -292,10 +333,13 @@ pub fn aim(
     // build. winit's Windows path bounds these to a `i16` in practice, so this
     // is not reachable today and costs nothing to make unreachable by
     // construction.
-    Aim::Desktop(
-        ox.saturating_add(pointer.x.floor() as i32),
-        oy.saturating_add(pointer.y.floor() as i32),
-    )
+    let x = ox.saturating_add(pointer.x.floor() as i32);
+    let y = oy.saturating_add(pointer.y.floor() as i32);
+    if inside {
+        Aim::Interface(x, y)
+    } else {
+        Aim::Desktop(x, y)
+    }
 }
 
 /// Read one pixel of the desktop, at virtual-screen physical pixels.
@@ -347,6 +391,142 @@ pub fn sample(_x: i32, _y: i32) -> Option<[u8; 3]> {
     None
 }
 
+/// Read a `size`×`size` neighbourhood of the screen, centred on `(x, y)`.
+///
+/// Row-major, `size * size` entries, top-left first. A texel that is on **no
+/// monitor** is `None` rather than black, which is the loupe's whole reason for
+/// taking this shape: a patch at the edge of a screen, or in the gap two
+/// monitors of different heights leave, is mostly desktop and partly nothing,
+/// and a black band would read as a black window. That is the same distinction
+/// [`sample`] makes with `CLR_INVALID`, applied per texel.
+///
+/// **One `BitBlt`, and the alternative is not close.** `GetPixel` waits for a
+/// display refresh, so an 11×11 neighbourhood read that way is 121 refreshes —
+/// about 850 ms per frame of a drag. `examples/measure-screenpick.rs` times
+/// this against the single pixel; a block costs what one pixel costs, because
+/// the wait is the wait rather than the pixels.
+///
+/// **It does not decide what a click takes.** [`sample`] does, on every path,
+/// and this is only the picture around it. That is deliberate rather than
+/// redundant: `GetPixel` is the route that answers "nothing" off every monitor
+/// where a `BitBlt` succeeds against nothing and hands back black, so the
+/// colour that is kept must never come out of here. The cost of the pair is
+/// measured beside the block in that example.
+///
+/// `None` for a GDI failure or a `size` of zero. No `CAPTUREBLT`, for the
+/// reason the module docs give: it repaints the whole desktop.
+#[cfg(windows)]
+pub fn sample_patch(x: i32, y: i32, size: u32) -> Option<Vec<Option<[u8; 3]>>> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, MONITOR_DEFAULTTONULL,
+        MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject,
+    };
+
+    if size == 0 {
+        return None;
+    }
+    let n = i32::try_from(size).ok()?;
+    // The centre texel is the pixel `sample` would read, so the top-left is
+    // half a block up and to the left. Integer division, so an even `size`
+    // puts the centre one past the middle — which is why the loupe's own
+    // constant is odd and says so.
+    let half = n / 2;
+    let (left, top) = (x.saturating_sub(half), y.saturating_sub(half));
+
+    // SAFETY: as `sample` for the screen DC. Every handle created here is
+    // checked for null before use and destroyed on every path, including the
+    // early ones; the bitmap is deselected before `GetDIBits` because MSDN
+    // requires it not to be selected into a DC when that is called; and the
+    // destination buffer is `n * n` 32-bit pixels, which is exactly what the
+    // `BITMAPINFOHEADER` beside it describes.
+    let raw: Option<Vec<[u8; 3]>> = unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, n, n);
+        let mut out = None;
+        if !mem.is_null() && !bmp.is_null() {
+            let old = SelectObject(mem, bmp as _);
+            let blitted = BitBlt(mem, 0, 0, n, n, screen, left, top, SRCCOPY) != 0;
+            SelectObject(mem, old);
+            if blitted {
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                info.bmiHeader.biWidth = n;
+                // Negative height asks for a top-down bitmap, so the first row
+                // of the buffer is the top row of the block and the caller's
+                // row-major order needs no flip.
+                info.bmiHeader.biHeight = -n;
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                info.bmiHeader.biCompression = BI_RGB;
+                let count = (size as usize) * (size as usize);
+                let mut px = vec![0u8; count * 4];
+                if GetDIBits(
+                    mem,
+                    bmp,
+                    0,
+                    size,
+                    px.as_mut_ptr().cast(),
+                    &mut info,
+                    DIB_RGB_COLORS,
+                ) != 0
+                {
+                    // A 32-bit DIB is BGRA in memory.
+                    out = Some(
+                        px.chunks_exact(4)
+                            .map(|c| [c[2], c[1], c[0]])
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        if !bmp.is_null() {
+            DeleteObject(bmp as _);
+        }
+        if !mem.is_null() {
+            DeleteDC(mem);
+        }
+        ReleaseDC(std::ptr::null_mut(), screen);
+        out
+    };
+
+    let raw = raw?;
+    // Which texels exist. `MonitorFromPoint` with `MONITOR_DEFAULTTONULL` is
+    // the only reading that answers this: the gap between two screens of
+    // different heights is *inside* the virtual screen's bounding rectangle
+    // and on no monitor, so no arithmetic over `SM_*VIRTUALSCREEN` can find
+    // it. It computes rather than waiting on the compositor, which is why 121
+    // of them beside one `BitBlt` is not a second refresh.
+    Some(
+        raw.into_iter()
+            .enumerate()
+            .map(|(i, rgb)| {
+                let px = left + (i % size as usize) as i32;
+                let py = top + (i / size as usize) as i32;
+                // SAFETY: takes a `POINT` by value and a flag, and returns a
+                // handle this never dereferences.
+                let monitor = unsafe {
+                    MonitorFromPoint(POINT { x: px, y: py }, MONITOR_DEFAULTTONULL)
+                };
+                (!monitor.is_null()).then_some(rgb)
+            })
+            .collect(),
+    )
+}
+
+/// The same, on a platform with no screen read.
+///
+/// Never called, for [`sample`]'s reason and gated at the same place.
+#[cfg(not(windows))]
+pub fn sample_patch(_x: i32, _y: i32, _size: u32) -> Option<Vec<Option<[u8; 3]>>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,25 +557,48 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_onto_a_panel_reads_nothing_at_all() {
-        // **The defect this variant was added for.** The press is refused by
-        // `ui_owns_pointer`, but the *drag* asks nothing after it, and
-        // `screen_to_doc` is a plain camera transform with no clip to the
-        // canvas region — so at any zoom that fills the window a point over the
-        // Layers panel maps to a real document pixel, and the painting colour
-        // went on changing to colours the artist could not see.
+    fn a_drag_onto_a_panel_reads_the_screen_where_the_panel_is() {
+        // **Two defects, one variant, and the second was this module's own
+        // decision.** The first: the press is refused by `ui_owns_pointer`, but
+        // the *drag* asked nothing after it, and `screen_to_doc` is a plain
+        // camera transform with no clip to the canvas region — so at any zoom
+        // that fills the window a point over the Layers panel mapped to a real
+        // document pixel, and the painting colour went on changing to colours
+        // the artist could not see. The second: the repair read nothing at all,
+        // on the argument that a panel off the screen surface is the theme's
+        // ink composited with whatever egui drew over it. That is what an
+        // eyedropper is *for*, and the artist reported it as the picker not
+        // working on Umber's own interface.
         //
-        // The tempting answers are both wrong. `Canvas` was the original and is
-        // this bug. `Desktop` reads Umber's own panel off the screen surface,
-        // which hands back the theme's ink already composited with whatever
-        // egui drew over it — a colour the palette can give properly.
-        for at in [
-            Vec2::new(4.0, 4.0),
-            Vec2::new(1279.0, 400.0),
-            Vec2::new(640.0, 799.0),
-        ] {
-            assert_eq!(off_canvas(at), Aim::Interface, "at {at:?}");
-        }
+        // So the answer is the screen, at the same coordinates the desktop
+        // branch computes — the panel at window (4, 4) with the window at
+        // (100, 50) is screen (104, 54), whatever is drawn there.
+        assert_eq!(off_canvas(Vec2::new(4.0, 4.0)), Aim::Interface(104, 54));
+        assert_eq!(
+            off_canvas(Vec2::new(1279.0, 400.0)),
+            Aim::Interface(1379, 450)
+        );
+        assert_eq!(
+            off_canvas(Vec2::new(640.0, 799.0)),
+            Aim::Interface(740, 849)
+        );
+    }
+
+    #[test]
+    fn the_interface_and_the_desktop_are_one_piece_of_arithmetic() {
+        // The pair either side of the client edge. `client.x` is 1280, so 1279
+        // is the last column inside the window and 1280 is the first outside
+        // it — and the two answers must be consecutive screen pixels, or the
+        // colour under the pointer would jump by however much the two copies of
+        // the arithmetic had drifted. There is one copy, and this is what says
+        // so from the outside.
+        let last_in = off_canvas(Vec2::new(1279.0, 400.0));
+        let first_out = off_canvas(Vec2::new(1280.0, 400.0));
+        assert_eq!(last_in, Aim::Interface(1379, 450));
+        assert_eq!(first_out, Aim::Desktop(1380, 450));
+        // And down the other edge, where the origin's y is what is added.
+        assert_eq!(off_canvas(Vec2::new(40.0, 799.0)), Aim::Interface(140, 849));
+        assert_eq!(off_canvas(Vec2::new(40.0, 800.0)), Aim::Desktop(140, 850));
     }
 
     #[test]
@@ -496,16 +699,21 @@ mod tests {
 
     #[test]
     fn a_build_that_cannot_read_the_desktop_says_so_rather_than_guessing() {
-        // The macOS and Linux answer, tested on the machine that can. Both of
-        // the inside-the-window answers are unchanged there: the canvas half
-        // works everywhere, and a panel still reads nothing.
+        // The macOS and Linux answer, tested on the machine that can. The
+        // canvas half works everywhere — that is the document and no platform
+        // is involved — and **everything past it is now one refusal**, because
+        // the interface and the desktop fail there for the same single reason.
+        // Before the interface became a screen read this line asserted
+        // `Aim::Interface` for the panel, which meant "read nothing" and read
+        // the same as this does; what changed is that the variant now carries a
+        // reading, so a platform that has none must not wear it.
         assert_eq!(
             aim(Vec2::new(4.0, 4.0), true, CLIENT, ORIGIN, false),
             Aim::Canvas
         );
         assert_eq!(
             aim(Vec2::new(4.0, 4.0), false, CLIENT, ORIGIN, false),
-            Aim::Interface
+            Aim::Unreachable
         );
         assert_eq!(
             aim(Vec2::new(-4.0, 4.0), false, CLIENT, ORIGIN, false),
@@ -551,7 +759,7 @@ mod tests {
         assert!(!line.is_empty());
         assert!(!outside_detail().is_empty());
         assert_eq!(
-            line.starts_with("Drag off the window"),
+            line.starts_with("Drag anywhere on the screen"),
             DESKTOP_READABLE,
             "only the platform that can do it may say it can"
         );

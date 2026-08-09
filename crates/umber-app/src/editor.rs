@@ -600,6 +600,18 @@ pub struct Editor {
     /// pane. Nothing on the stroke path may start reading it, or the diagnostic
     /// becomes part of what it is meant to be observing.
     pub input: crate::inputlog::InputLog,
+    /// What the eyedropper's magnifier is showing, or `None` for no pick aimed.
+    ///
+    /// Above the `--- documents ---` line with `input` and for the same reason:
+    /// it describes where a pointer is and what is under it, which belongs to
+    /// the gesture rather than to any picture — and a tab switch abandons the
+    /// gesture, exactly as it abandons a `SelectionDraft`.
+    ///
+    /// Written once per frame by `App::pick_this_frame`, which is the one place
+    /// a pixel is read; read only by `ui::loupe`, which paints it. Where it
+    /// goes and what it may hold are `crate::loupe`'s, in a model with no
+    /// drawing in it.
+    pub loupe: Option<crate::loupe::Loupe>,
     /// What the Text module holds: the block being composed, the face it is in,
     /// and the machine's fonts once they have been found.
     ///
@@ -735,6 +747,7 @@ impl Default for Editor {
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
+            loupe: None,
             text: crate::textpanel::TextState::default(),
             font_folder: None,
             interaction: Interaction::Idle,
@@ -1989,6 +2002,36 @@ pub struct Surroundings {
     /// Does this window have the keyboard focus? A cursor belongs to whoever
     /// the user is working in, so an unfocused Umber asks for nothing.
     pub focused: bool,
+}
+
+impl Editor {
+    /// Is a pick *aimed* — the eyedropper in hand, over somewhere a press would
+    /// actually take a colour from?
+    ///
+    /// One function because there are two things that must agree about it and
+    /// they are in different modules, which is [`over_egui_area`]'s own reason:
+    /// `ui::aiming_cursor` draws the crosshair here, and `App::pick_aimed`
+    /// reads a pixel and shows the loupe here. Two copies would be a magnifier
+    /// promising a colour where the crosshair is not, or the reverse.
+    ///
+    /// **It is deliberately the canvas alone, even though a *drag* now picks
+    /// off the interface too.** A press over a docked panel operates the panel
+    /// — those are controls, and an eyedropper does not get to take the Layers
+    /// panel's eye toggle away — so a loupe hovering there would be offering a
+    /// colour that clicking will not take, which is exactly the control that
+    /// lies this project refuses everywhere. Once a drag is in flight
+    /// `Interaction::Picking` answers instead and the interface is read like
+    /// anything else; that is the gesture the artist's report was about.
+    ///
+    /// Alt with another tool in hand is not aimed either: Alt with no button is
+    /// the brush resize, so a loupe there would be a second reading of a
+    /// modifier that already means something.
+    pub fn aiming_pick(&self, around: Surroundings) -> bool {
+        self.ui.tool == Tool::Eyedropper
+            && !around.over_area
+            && around.focused
+            && self.pointer_over_canvas(self.cursor)
+    }
 }
 
 /// Is egui drawing something of its own *over* the canvas at `screen`?

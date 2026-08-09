@@ -41,6 +41,7 @@ mod keylayout;
 mod layerdrag;
 mod localtime;
 mod logo;
+mod loupe;
 mod palettelib;
 mod panels;
 mod prefs;

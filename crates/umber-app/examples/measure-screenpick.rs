@@ -25,6 +25,15 @@
 //!   multi-monitor claim is that the screen DC's space is the virtual screen,
 //!   negative coordinates included, and that a position off every monitor comes
 //!   back `CLR_INVALID` rather than as black.
+//! * **What does a *block* cost, and what does a block on top of the single
+//!   pixel cost?** The loupe needs a neighbourhood, and a neighbourhood read
+//!   with `GetPixel` is N² display refreshes — 850 ms for an 11×11, which is
+//!   not a control. One `BitBlt` of the block is the only candidate. The pair
+//!   matters separately, because the colour that is *taken* still comes from
+//!   `GetPixel` (it is the one route that answers "nothing" off every monitor),
+//!   so a frame of the drag pays both: if the wait is the compositor's, the
+//!   second read of the same frame should be nearly free, and if it is not the
+//!   loupe costs a second refresh.
 //!
 //! **This reads the screen, which is why it is an example and not a test.** No
 //! test in Umber may: a CI runner has no desktop to read, and sampling
