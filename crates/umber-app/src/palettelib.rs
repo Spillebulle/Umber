@@ -3007,6 +3007,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The adding mark is dead with editing off too, and that is a claim about
+    /// the *header* rather than about the grid.**
+    ///
+    /// `a_read_only_palette_cannot_be_changed_by_any_gesture` drives `panel`,
+    /// and the plus is not in `panel` — it is in [`header_controls`], which no
+    /// test reached at all. That gap was demonstrated by mutation rather than
+    /// argued: deleting `state.editing &&` from `can_add` left every one of the
+    /// crate's tests green while a press on the plus wrote a colour into
+    /// somebody's palette file, on the spot, with no undo anywhere in Umber to
+    /// take it back. Exactly the "a guard on a model is not a guard on the
+    /// panel" failure CLAUDE.md records, one storey up from where it was fixed.
+    ///
+    /// The sweep is the read-only test's, minus its geometry: the mark's
+    /// position is `Layout::right_to_left`'s and reading it back off the shapes
+    /// would mean identifying an icon by its strokes, so this presses at every
+    /// point across the strip instead. **Both readings are taken**, because a
+    /// sweep that only checked the off state would pass with the plus drawn
+    /// nowhere at all — the "start from a case where the two readings disagree"
+    /// rule, which is what the second half is for.
+    #[test]
+    fn the_palette_headers_adding_mark_is_dead_with_editing_off() {
+        use crate::theme::{Palette as Theme, ThemeKind};
+        use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
+
+        let (library, id, dir) = probe_library("header-add");
+        let theme = Theme::of(ThemeKind::Graphite);
+        // The strip the real header hands these marks: right-aligned into the
+        // right half of a `metrics::PANEL`-wide line, at `icon_button`'s height.
+        let strip = Rect::from_min_size(Pos2::ZERO, vec2(metrics::PANEL / 2.0, 20.0));
+        let before = library.get(&id).expect("there").swatches.clone();
+        assert_eq!(before.len(), 12);
+
+        let ctx = egui::Context::default();
+        let mut now = 0.0f64;
+        let mut added = 0usize;
+        for editing in [false, true] {
+            // Every point along the strip, so the mark is hit wherever
+            // right-to-left put it. Three marks share this line and only one of
+            // them adds, which is why the *palette* is what is read rather than
+            // whether something was clicked.
+            for step in 0..(strip.width() as usize) {
+                let at = Pos2::new(step as f32 + 0.5, strip.center().y);
+                let mut ed = Editor::default();
+                // A colour the palette does not already hold, so an add that
+                // happens is an add this can see.
+                ed.set_color(umber_core::Color::from_srgb_u8(9, 200, 77, 255));
+                store(
+                    &ctx,
+                    State {
+                        store: Store::Ready(Arc::new(library.clone())),
+                        selected: Some(id.clone()),
+                        library_open: false,
+                        renaming: None,
+                        naming: None,
+                        pasting: None,
+                        confirming: None,
+                        editing,
+                    },
+                );
+                let button = |pressed: bool| Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::default(),
+                };
+                for events in [
+                    vec![Event::PointerMoved(at)],
+                    vec![button(true)],
+                    vec![button(false)],
+                ] {
+                    now += 0.05;
+                    let _ = ctx.run_ui(
+                        RawInput {
+                            screen_rect: Some(strip),
+                            time: Some(now),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let mut ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(strip)
+                                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                            );
+                            header_controls(&mut ui, &theme, &mut ed);
+                        },
+                    );
+                }
+                let after = ctx
+                    .data(|d| d.get_temp::<State>(state_id()))
+                    .expect("the module kept its state")
+                    .current()
+                    .cloned()
+                    .expect("the palette is still in front")
+                    .swatches;
+                if editing {
+                    added += usize::from(after != before);
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "a press at {at:?} added a colour to a palette whose module is read-only"
+                    );
+                }
+            }
+        }
+        assert!(
+            added > 0,
+            "the adding mark never added a colour with editing on either, so the \
+             read-only half of this is passing for the wrong reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A disabled control says why, and the three reasons are not
     /// interchangeable: "there is nowhere to keep palettes on this system" is
     /// not "make a palette first", and neither is "this one is full". A tooltip
