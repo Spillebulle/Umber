@@ -15,6 +15,39 @@
 //! returns, so a harmony of a grey is a row of identical greys — correct, and is
 //! also why the picker draws the base swatch beside the rest rather than
 //! relying on the ring to tell them apart.
+//!
+//! ## Which wheel these angles are on
+//!
+//! The **RGB wheel**, because that is what [`crate::Hsv`]'s hue is: 0° is red,
+//! 120° green, 240° blue. So the complement of blue here is *yellow* and the
+//! complement of red is *cyan*. On the painter's RYB wheel taught as colour
+//! theory, blue's complement is orange and red's is green. Both are defensible
+//! and they are visibly different answers, so it is worth saying plainly which
+//! one this is and why it is not going to change quietly.
+//!
+//! The offsets below are right **for the wheel they are stated on** — 180° is
+//! genuinely the opposite hue, a triad is genuinely three equal thirds — and
+//! that is the only sense in which a set of angles can be right. Reading them
+//! as RYB angles is what would be wrong.
+//!
+//! It also matches every painting application that draws a hue wheel. Krita's
+//! selectors are HSV/HSL/HSI/HSY' over RGB and offer no harmony rules at all
+//! (gamut masks instead); Clip Studio's Color Wheel palette is HSV or HLS with
+//! no relation generator; Photoshop has had none in the application since the
+//! Adobe Color Themes panel was withdrawn. The one mainstream tool that
+//! computes harmonies on RYB is **Adobe Color**, a web tool rather than a
+//! painting application, and it converts RGB to RYB and back for exactly this
+//! — which is why its complement of red comes out near hue 137 rather than 180
+//! and reads as an error to anybody checking the arithmetic.
+//!
+//! **An RYB mode would be a real feature and is not a bug fix.** It needs a
+//! control, because a painter who wants one wheel does not want the other by
+//! surprise; it may not change what any existing preset or document means, and
+//! nothing here reaches a file today; and it cannot be a second `hues` beside
+//! this one, because the whole module would then have two answers to one
+//! question. The shape it would take is a hue *mapping* on the way in and out —
+//! RGB hue to RYB, the offsets applied there, RYB back to RGB — leaving these
+//! angles and every caller untouched. Nobody has asked for it twice yet.
 
 /// One of the relations the design's Harmony mode names.
 ///
@@ -210,6 +243,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The wheel these angles are on is the RGB one, and that is a decision
+    /// rather than an accident — see the module docs.
+    ///
+    /// Pinned as the three pairs somebody would actually check by eye, because
+    /// "the complement of blue is yellow" is the sentence an RYB reading would
+    /// make false, and a change to RYB that left the offsets alone would leave
+    /// every other test in this file green.
+    #[test]
+    fn a_complement_is_the_opposite_hue_on_the_rgb_wheel() {
+        let opposite = |hue: f32| Harmony::Complementary.hues(hue).as_slice()[1];
+        assert_eq!(
+            opposite(240.0),
+            60.0,
+            "blue's complement is yellow, not orange"
+        );
+        assert_eq!(opposite(0.0), 180.0, "red's complement is cyan, not green");
+        assert_eq!(opposite(120.0), 300.0, "green's complement is magenta");
     }
 
     /// The relations are what their names say. Checked as *angles*, because
