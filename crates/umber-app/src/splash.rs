@@ -776,6 +776,12 @@ mod tests {
     ///
     /// Ignored: it exists to be run by hand when the design changes.
     ///
+    /// **One shot per theme as well as one per stage**, because the splash is
+    /// the one screen whose *only* surface is the canvas pit — so it is where
+    /// a supporting line inked in something the pit cannot carry shows up
+    /// first, and it went four themes without anybody looking. Krita's pit is a
+    /// 50% grey and the four stages say nothing about it.
+    ///
     /// ```sh
     /// cargo test -p umber-app splash_preview -- --ignored
     /// ```
@@ -785,26 +791,12 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/splash");
         std::fs::create_dir_all(&dir).expect("create preview directory");
 
-        for (name, stage, adapter) in [
-            ("1-adapter", Stage::Adapter, ""),
-            (
-                "2-surface",
-                Stage::Surface,
-                "D3D12 · NVIDIA GeForce RTX 4070",
-            ),
-            (
-                "3-shaders",
-                Stage::Shaders,
-                "D3D12 · NVIDIA GeForce RTX 4070",
-            ),
-            ("4-ready", Stage::Ready, "D3D12 · NVIDIA GeForce RTX 4070"),
-        ] {
-            let px = render(W, H, 1.0, &Palette::of(ThemeKind::Graphite), stage, adapter);
+        let write = |name: String, px: Vec<u32>| {
             let mut rgba = Vec::with_capacity(W * H * 4);
             for p in px {
                 rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, 255]);
             }
-            let file = std::fs::File::create(dir.join(format!("{name}.png"))).expect("create png");
+            let file = std::fs::File::create(dir.join(name)).expect("create png");
             let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), W as u32, H as u32);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
@@ -813,6 +805,21 @@ mod tests {
                 .expect("png header")
                 .write_image_data(&rgba)
                 .expect("png data");
+        };
+
+        const ADAPTER: &str = "D3D12 · NVIDIA GeForce RTX 4070";
+        for (name, stage, adapter) in [
+            ("1-adapter", Stage::Adapter, ""),
+            ("2-surface", Stage::Surface, ADAPTER),
+            ("3-shaders", Stage::Shaders, ADAPTER),
+            ("4-ready", Stage::Ready, ADAPTER),
+        ] {
+            let px = render(W, H, 1.0, &Palette::of(ThemeKind::Graphite), stage, adapter);
+            write(format!("{name}.png"), px);
+        }
+        for kind in ThemeKind::ALL {
+            let px = render(W, H, 1.0, &Palette::of(kind), Stage::Shaders, ADAPTER);
+            write(format!("theme-{}.png", kind.id()), px);
         }
     }
 }
