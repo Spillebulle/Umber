@@ -2475,6 +2475,154 @@ mod tests {
         assert!(sv_gestures > 0, "no gesture reached the centre");
     }
 
+    /// Swapping exchanges white and black and moves nothing else.
+    ///
+    /// Both halves matter and only together. That the two corners change places
+    /// is the feature; that the *outline* does not move is what makes the
+    /// setting free — the hit test, the skirt and the ring's clearance are all
+    /// derived from these three points, so a swap that also turned the shape
+    /// would need every one of them re-checked.
+    #[test]
+    fn swapping_exchanges_white_and_black_and_moves_nothing_else() {
+        for degrees in [0.0_f32, 17.0, 90.0, 233.0, 359.0] {
+            let base = degrees.to_radians();
+            let (hue, white, black) = triangle_corners(CENTRE, RADIUS, base, false);
+            let (hue_s, white_s, black_s) = triangle_corners(CENTRE, RADIUS, base, true);
+
+            assert!(
+                apart(hue, hue_s) < 1e-3,
+                "the hue corner moved at {degrees}"
+            );
+            assert!(
+                apart(white_s, black) < 1e-3,
+                "white did not land where black was, at {degrees}"
+            );
+            assert!(
+                apart(black_s, white) < 1e-3,
+                "black did not land where white was, at {degrees}"
+            );
+        }
+    }
+
+    /// **No angle whatever reaches the swapped arrangement**, which is the whole
+    /// reason this is a second control rather than two more stops on the Angle
+    /// rail.
+    ///
+    /// The rail turns all three corners together, so it walks the three
+    /// *rotations* of the corner labelling; the swap is a reflection and gives
+    /// the other three. Somebody proposing to fold one into the other would
+    /// find this test, which is the point of writing it: the two together reach
+    /// all six arrangements and neither reaches more than three.
+    #[test]
+    fn no_angle_reaches_the_arrangement_the_swap_makes() {
+        let swapped = triangle_corners(CENTRE, RADIUS, 0.0, true);
+        for step in 0..720 {
+            let base = (step as f32 * 0.5).to_radians();
+            let plain = triangle_corners(CENTRE, RADIUS, base, false);
+            let same = apart(plain.0, swapped.0) < 0.5
+                && apart(plain.1, swapped.1) < 0.5
+                && apart(plain.2, swapped.2) < 0.5;
+            assert!(!same, "{}° reproduces the swap", step as f32 * 0.5);
+        }
+    }
+
+    /// The setting reaches the canvas, and not only [`triangle_corners`].
+    ///
+    /// A guard on a model is not a guard on the panel. `wheel` has to hand
+    /// `mirrored` to `hub_of` at **both** of its call sites — the one that
+    /// judges a press and the one that paints the shape and reads the drag —
+    /// and every test above passes with either of them dropped. So this drives
+    /// the shipped [`show`], and it starts from the case where the two readings
+    /// disagree, which is the only kind of test of a two-state reading that is
+    /// worth anything.
+    ///
+    /// A sweep rather than an aimed press at the white corner: working out
+    /// where that corner lands on the panel would be a second copy of the
+    /// geometry [`Hub`] exists to be the only statement of. What is asserted is
+    /// that *some* press on the wheel reads a different colour with the corners
+    /// swapped — which is exactly what "the setting arrives" means, and is
+    /// false the moment either call site drops it.
+    ///
+    /// Presses stay inside the wheel's own square, and the flag is checked
+    /// afterwards: the toggle that sets it is a few points below, and a sweep
+    /// that clicked its own control would prove nothing about the triangle.
+    #[test]
+    fn swapping_white_and_black_actually_changes_the_colour_a_press_reads() {
+        use crate::theme::{Palette, ThemeKind, metrics};
+        use egui::{Event, Modifiers, PointerButton, RawInput, Rect};
+
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(metrics::PANEL, 600.0));
+
+        // One click on the wheel, with the swap set either way, answering the
+        // colour it left behind. The angle is held still — "Rotate with hue" is
+        // off — so the only thing that can differ between the two runs is which
+        // corner is white.
+        let click = |mirrored: bool, at: Pos2| {
+            let mut shape = WheelShape::Triangle;
+            let mut rotate = false;
+            let mut swap = mirrored;
+            let mut angles = WheelAngles::default();
+            let mut harmony = Harmony::Complementary;
+            let mut hsv = Hsv::new(210.0, 0.4, 0.6);
+            let mut frame = |events: Vec<Event>| {
+                let _ = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        show(
+                            ui,
+                            &palette,
+                            PickerMode::Wheel,
+                            &mut shape,
+                            &mut rotate,
+                            &mut swap,
+                            &mut angles,
+                            &mut harmony,
+                            &mut hsv,
+                        );
+                    },
+                );
+            };
+            frame(vec![Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                frame(vec![Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::default(),
+                }]);
+            }
+            (hsv, swap)
+        };
+
+        let mut disagreed = 0;
+        for row in 0..10 {
+            for column in 0..10 {
+                let at = pos2(
+                    screen.left() + (column as f32 + 0.5) * screen.width() / 10.0,
+                    screen.top() + (row as f32 + 0.5) * 170.0 / 10.0,
+                );
+                let (plain, plain_flag) = click(false, at);
+                let (swapped, swapped_flag) = click(true, at);
+                assert!(!plain_flag && swapped_flag, "a press moved the setting");
+                if (plain.s, plain.v) != (swapped.s, swapped.v) {
+                    disagreed += 1;
+                }
+            }
+        }
+        assert!(
+            disagreed > 0,
+            "the swap changed no colour anywhere on the wheel: the setting is \
+             not reaching the shape the press is judged against, or the one it \
+             is read from"
+        );
+    }
+
     /// A gesture is settled at its press and not at its release.
     ///
     /// egui reports a *drag* only once the pointer has travelled far enough to

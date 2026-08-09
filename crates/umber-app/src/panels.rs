@@ -2272,7 +2272,13 @@ fn history_row(ui: &mut Ui, p: &Palette, row: &HistoryRow) -> egui::Response {
 /// [`widgets::dropdown`] — and the one that keeps its leading mark, because a
 /// half-filled disc genuinely says "colour picker" where none of the others has
 /// a glyph to hand.
-fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
+///
+/// Reachable from `settings::token_picker` as well as from this panel, because
+/// the theme editor draws the *same* picker over a palette token and a second
+/// copy of this switch would be two controls for one setting. It writes
+/// `ed.ui.picker`, which is the point: there is one colour picker in Umber and
+/// it is set up once.
+pub(crate) fn picker_mode_switch(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let label = ed.ui.picker.label();
     widgets::dropdown(
         ui,
