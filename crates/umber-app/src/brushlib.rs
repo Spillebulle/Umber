@@ -2627,9 +2627,13 @@ fn browser_pane(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
                     ui.set_width(300.0);
                     controls::search_field(ui, p, &mut state.query, "Search brushes");
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Right-to-left, so New brush lands left of Import — the
-                    // same pairing and the same order the panel's links keep.
+                // Right to left, so New brush lands left of Import — the same
+                // pairing and the same order the panel's links keep. Through
+                // `button_row` rather than a bare `with_layout`, because this
+                // modal sets the horizontal spacing to zero to butt its rail
+                // against its pane and that zero reaches every row inside it;
+                // without the gap these two touch and read as one control.
+                controls::button_row(ui, |ui| {
                     if controls::text_button(ui, p, "Import…", true, writable)
                         .on_hover_text(if writable {
                             // Every application `import`'s own file filters
@@ -3182,6 +3186,105 @@ mod tests {
             "the Brushes panel body is {measured} points with nothing listed, \
              which is room for a control under the list"
         );
+    }
+
+    /// No two buttons in the browser touch.
+    ///
+    /// The sixth time this defect has been fixed, and the first time it has
+    /// been measured. The mechanism is in [`controls::button_row`]'s docs: this
+    /// modal sets its row spacing to zero so the rail butts against the pane,
+    /// egui inherits that all the way down, and a pair of buttons drawn several
+    /// levels below it comes out touching — Import and New brush read as one
+    /// control with a divider through it.
+    ///
+    /// **It measures what was drawn rather than restating the rule.** Asserting
+    /// that `button_row` sets the spacing would only agree with itself; the five
+    /// previous repairs were each correct in exactly that way and the sixth site
+    /// still shipped wrong. So this runs the real modal, keeps every rectangle
+    /// the height of a [`metrics::TEXT_BUTTON`], groups them into rows by their
+    /// top edge, and reads the gaps. Demonstrated by mutation: take the
+    /// `item_spacing` line out of `button_row` and this fails with a gap of 0.
+    ///
+    /// One rectangle per button, because `text_button` paints a fill and a
+    /// stroke over the same rect — hence the dedup, without which every gap
+    /// would be zero and the guard would fail on a browser that is perfectly
+    /// laid out.
+    #[test]
+    fn no_two_buttons_in_the_library_browser_touch() {
+        use crate::editor::Editor;
+        use crate::theme::{Palette, ThemeKind};
+        use egui::{Rect, pos2};
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let palette = Palette::of(ThemeKind::Graphite);
+        // Umber's own style, or this measures egui's spacing rather than the
+        // one the application draws with.
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &palette);
+        let mut ed = Editor::default();
+
+        // Twice: the first pass through a fresh context builds the font atlas,
+        // and a button is as wide as its label's galley.
+        let mut rows: Vec<(f32, Vec<Rect>)> = Vec::new();
+        for _ in 0..2 {
+            seed_broken_library(&ctx, &ed, "no library", None);
+            store(
+                &ctx,
+                State {
+                    browser_open: true,
+                    ..load(&ctx, &mut ed)
+                },
+            );
+            let out = ctx.run_ui(input.clone(), |ui| {
+                super::dialogs(ui, &palette, &mut ed);
+            });
+
+            let mut found: Vec<Rect> = Vec::new();
+            for clipped in &out.shapes {
+                if let egui::Shape::Rect(rect) = &clipped.shape
+                    && (rect.rect.height() - metrics::TEXT_BUTTON).abs() < 0.5
+                    && !found.iter().any(|seen| {
+                        seen.min.distance(rect.rect.min) < 0.5
+                            && seen.max.distance(rect.rect.max) < 0.5
+                    })
+                {
+                    found.push(rect.rect);
+                }
+            }
+
+            rows.clear();
+            for rect in found {
+                match rows
+                    .iter_mut()
+                    .find(|(top, _)| (top - rect.top()).abs() < 1.0)
+                {
+                    Some((_, row)) => row.push(rect),
+                    None => rows.push((rect.top(), vec![rect])),
+                }
+            }
+        }
+
+        let pairs = rows.iter().filter(|(_, row)| row.len() > 1).count();
+        assert!(
+            pairs > 0,
+            "the browser drew no line holding two buttons, so this measured nothing"
+        );
+        for (top, row) in &mut rows {
+            row.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            for pair in row.windows(2) {
+                let gap = pair[1].left() - pair[0].right();
+                assert!(
+                    gap >= metrics::BUTTON_GAP - 0.5,
+                    "two buttons on the browser's line at y={top} are {gap} points apart, \
+                     where {} is the gap: they touch and read as one control",
+                    metrics::BUTTON_GAP
+                );
+            }
+        }
     }
 
     /// The library browser, with a shipped brush and one of the user's own in

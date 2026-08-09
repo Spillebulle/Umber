@@ -166,6 +166,34 @@ pub fn icon_button(
     response.on_hover_text(tooltip)
 }
 
+/// A trailing strip of [`text_button`]s, right to left, [`metrics::BUTTON_GAP`]
+/// apart.
+///
+/// **This exists because the same defect has now been fixed six times**, in
+/// four files, and the first five fixes were each a line of
+/// `item_spacing.x = metrics::BUTTON_GAP` written at the call site — which is
+/// the discipline this codebase refuses everywhere else, and it failed in the
+/// ordinary way: the sixth site did not have the line and its buttons touched.
+///
+/// The mechanism is worth stating, because nothing about a row of buttons
+/// suggests it. Both modals that hold a strip like this butt a rail against a
+/// pane by setting the row's horizontal spacing to **zero** — the rail's own
+/// fill is the hairline between them — and egui inherits spacing down the whole
+/// `Ui` tree. So every row of every pane inside those modals starts at zero,
+/// however many levels down it is, and a pair of buttons drawn there touches
+/// and reads as one control with a divider through it. The container is
+/// entirely right to want the zero, and the button strip cannot see it.
+///
+/// Read the *inner* value, so a caller can collect a request out of the strip
+/// the way `theme_editor_header` does.
+pub fn button_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+        add(ui)
+    })
+    .inner
+}
+
 /// A small pill with a word in it.
 ///
 /// `emphasis` marks the one the user most likely wants — the accent border

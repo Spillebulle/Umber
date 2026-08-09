@@ -2673,6 +2673,25 @@ design shows a whole row of them.
   buttons floating in the middle of it. `canvasdlg.rs` already wraps its footer
   for this reason and `updatedlg::actions_row` is the same wrap named; it is
   invisible on a dialog whose content is tall, which is why it went unnoticed.
+- **A strip of buttons is `controls::button_row`, and never a bare
+  `with_layout`.** Umber's two big modals butt a rail against a pane by setting
+  the row's horizontal spacing to **zero** — the rail's own fill is the hairline
+  — and egui inherits spacing down the whole `Ui` tree, so *every* row of every
+  pane inside those modals starts at zero however many levels down it is. A pair
+  of buttons drawn there touches and reads as one control with a divider through
+  it. The container is right to want the zero and the button strip cannot see
+  it, which is why this cannot be left to whoever writes the next strip.
+  **It was fixed five times as a line at the call site before it was fixed
+  once** — the theme editor's Delete/New, the theme pane's Import/Export, the
+  Shortcuts page's Import/Export, and twice more — and the sixth site, the brush
+  library's Import and New brush, shipped touching, reported by the artist. That
+  is the discipline-versus-structure failure this file records everywhere else,
+  arriving through a *layout property* rather than through a `matches!`.
+  `no_two_buttons_in_the_library_browser_touch` is the guard and it **measures
+  the rectangles that were drawn**: asserting that `button_row` sets the spacing
+  would only agree with itself, which is exactly the shape all five previous
+  repairs had. Demonstrated by mutation — take the line out and it fails with a
+  gap of 0.
 - **A widget revealed on hover must not be what decides the hover.** egui stops
   its hover search at the topmost *interactive* widget, so a `Sense::hover()`
   row reads as not-hovered the moment the pointer is over a button inside it —

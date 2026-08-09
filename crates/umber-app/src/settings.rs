@@ -2461,8 +2461,7 @@ fn theme_editor_header(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor, state: &
         // need a second one.
         let mut renamed = false;
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+        controls::button_row(ui, |ui| {
             if let Some(theme) = &ed.custom_theme {
                 let confirming = state.confirming.as_deref() == Some(theme.id.as_str());
                 let label = if confirming { "Delete?" } else { "Delete" };
@@ -3303,13 +3302,9 @@ fn shortcuts_pane(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
             controls::search_field(ui, p, &mut editing.query, "Search actions");
         });
         // Right to left, so Export goes on first to end up on the right —
-        // reading Import then Export, as the design has them.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // The gap the theme pane's own Import/Export pair sets, and for the
-            // same reason: a `right_to_left` scope does not inherit the
-            // horizontal spacing of the row it is nested in, so without this the
-            // two buttons touch and read as one control with a divider.
-            ui.spacing_mut().item_spacing.x = metrics::BUTTON_GAP;
+        // reading Import then Export, as the design has them. `button_row` is
+        // what carries the gap; see its docs for why the row starts at zero.
+        controls::button_row(ui, |ui| {
             if controls::text_button(ui, p, "Export", false, true)
                 .on_hover_text("Write every shortcut to a file you can carry to another machine")
                 .clicked()
