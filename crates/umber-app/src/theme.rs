@@ -706,7 +706,10 @@ impl Palette {
             text_muted: Color32::from_rgb(0xB4, 0xB4, 0xB4),
             // Held up to `#9C` by the `#4E4E4E` menu bar, which is the
             // lightest surface any theme here draws text on: at `#949494` it
-            // is 2.73:1, under the 2.9 floor Paper set.
+            // is 2.74:1, under the 2.9 floor Paper set. Demonstrated by
+            // mutation rather than argued — `#949494` is what
+            // `text_reads_against_every_surface_it_is_drawn_on` was fed to
+            // check that it can still see this palette at all.
             text_dim: Color32::from_rgb(0x9C, 0x9C, 0x9C),
             rail: Color32::from_rgb(0x2C, 0x2C, 0x2C),
             knob: Color32::from_rgb(0xC8, 0xC8, 0xC8),
