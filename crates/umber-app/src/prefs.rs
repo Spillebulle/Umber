@@ -53,24 +53,46 @@ pub const MAX_SCALE: f32 = 2.0;
 ///
 /// The floor is not zero, and could not usefully be: a patch is the whole
 /// rectangle a stroke damaged, so below about this a single broad stroke on an
-/// ordinary canvas is the entire history and undo stops being worth having. The
-/// ceiling is where a few open tabs would be most of a machine's memory — the
-/// budget is per document, so four tabs at the top of the range is 16 GB, which
-/// is why the setting has to say so rather than reading as free depth.
+/// ordinary canvas is the entire history and undo stops being worth having.
+///
+/// **The ceiling is 32 GB, and it is a statement about what the engine can use
+/// rather than about what a machine has.** It was 4 GB, which was too low the
+/// moment somebody with 64 GB of memory asked for more, and the honest question
+/// is not "how much memory is there" — Umber cannot read that, and a per-document
+/// figure taken from it would be wrong the moment a second tab opened — but "at
+/// what point does a bigger number stop buying depth". A patch is the rectangle
+/// a stroke covered, so its cost follows the canvas: on the largest canvas Umber
+/// paints, 10000², a stroke drawn across the picture is 400 MB, and 32 GB is
+/// eighty of them. On an ordinary 2048² canvas a full-canvas stroke is 16 MB,
+/// and 32 GB is two thousand entries — past anything a session produces, so the
+/// budget has stopped being what limits the history and the canvas has taken
+/// over. Above this the answer is a patch that stores *tiles* rather than the
+/// stroke's bounding box, which is what "Undo" in `CLAUDE.md` already says, and
+/// not a larger number here.
+///
+/// It is still **per document**, so two tabs at the ceiling is 64 GB — the whole
+/// of the machine the request came from — which is why the note under the
+/// control says so rather than letting the figure read as free depth.
 pub const MIN_UNDO_BUDGET_MB: u32 = 64;
-pub const MAX_UNDO_BUDGET_MB: u32 = 4096;
+pub const MAX_UNDO_BUDGET_MB: u32 = 32768;
 
-/// The budgets the dialog offers, in megabytes.
+/// The budgets the dialog's rail lands on, in megabytes.
 ///
 /// A ladder rather than a free slider, like the autosave's expiry: the useful
 /// answers are doublings, and nobody is trying to land on 813 MB by dragging.
-/// The preferences file still takes any number in range, which is what makes a
-/// hand-edited value honoured rather than snapped.
-pub const UNDO_BUDGET_LADDER: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+/// The preferences file still takes any number in range, and so does the figure
+/// beside the rail — which is what makes a value between two rungs honoured
+/// rather than snapped.
+pub const UNDO_BUDGET_LADDER: [u32; 10] = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
 
 /// A number of megabytes as the history counts bytes.
+///
+/// Saturating rather than plain, because [`MAX_UNDO_BUDGET_MB`] is 32768 and
+/// `32768 << 20` does not fit a 32-bit `usize`. Every target Umber ships is
+/// 64-bit, so this cannot fire today; it is one word against a build for a
+/// target where the arithmetic would panic in debug and wrap in release.
 pub fn undo_budget_bytes(megabytes: u32) -> usize {
-    megabytes as usize * 1024 * 1024
+    (megabytes as usize).saturating_mul(1024 * 1024)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -967,35 +989,41 @@ pub fn flush_if_idle(ctx: &egui::Context, ed: &Editor) {
     save(&capture(ctx, ed));
 }
 
+/// The right to be the only test writing the undo budget's process-global.
+///
+/// `apply` and [`set_undo_budget`] both publish to
+/// `umber_core::history::set_default_budget`, which is deliberate — a `History`
+/// is built by three things that cannot see a `Prefs`, so the setting reaches
+/// them the way `shortcuts::publish` does. The cost is that every test touching
+/// either writes one variable, and the harness runs them on parallel threads.
+///
+/// Measured before it was fixed: `the_undo_budget_reaches_the_history_and_back`
+/// failed **10 runs in 40** at sixteen threads. It publishes 1024 MB and asserts
+/// it; three other tests publish the default and land between the two lines. It
+/// survived the whole-workspace run because six hundred other tests change the
+/// interleaving, which is the worst shape for this — green on the gate, red on
+/// whoever next runs `cargo test prefs`.
+///
+/// Hold the guard for the **whole** test; binding it with `let _ =` drops it on
+/// the spot and buys nothing. Poisoning is recovered from so one failing test
+/// reports its own assertion rather than turning every later one into a mutex
+/// error — `gputest::lock`'s reasoning, and this is that idiom for a global that
+/// is not a device.
+///
+/// It is `pub(crate)` and not private to this module's tests because
+/// `settings`' undo-budget row writes the same global through the same door, and
+/// **two mutexes would serialise nothing**: a lock only orders the tests that
+/// take the same one.
+#[cfg(test)]
+pub(crate) fn prefs_lock() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The right to be the only test calling [`apply`].
-    ///
-    /// `apply` publishes the undo budget to a **process-global**
-    /// (`umber_core::history::set_default_budget`), which is deliberate — a
-    /// `History` is built by three things that cannot see a `Prefs`, so the
-    /// setting reaches them the way `shortcuts::publish` does. The cost is that
-    /// every test calling `apply` writes one variable, and the harness runs
-    /// them on parallel threads.
-    ///
-    /// Measured before it was fixed: `the_undo_budget_reaches_the_history_and_
-    /// back` failed **10 runs in 40** at sixteen threads. It publishes 1024 MB
-    /// and asserts it; three other tests publish the default and land between
-    /// the two lines. It survived the whole-workspace run because six hundred
-    /// other tests change the interleaving, which is the worst shape for this —
-    /// green on the gate, red on whoever next runs `cargo test prefs`.
-    ///
-    /// Hold the guard for the **whole** test; binding it with `let _ =` drops it
-    /// on the spot and buys nothing. Poisoning is recovered from so one failing
-    /// test reports its own assertion rather than turning every later one into a
-    /// mutex error — `gputest::lock`'s reasoning, and this is that idiom for a
-    /// global that is not a device.
-    fn prefs_lock() -> MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
     use winit::keyboard::KeyCode;
 
     fn turned(triangle: f32, square: f32) -> WheelAngles {
@@ -1336,6 +1364,25 @@ mod tests {
             UNDO_BUDGET_LADDER.contains(&Prefs::default().undo_budget_mb),
             "the shipped default has to be a rung, or the slider cannot show it"
         );
+    }
+
+    /// Every rung is twice the one below it, starting at the floor.
+    ///
+    /// Not decoration. `settings::budget_position` turns a budget into a place
+    /// on the rail with a `log2` rather than a search, which is only the same
+    /// answer while this holds; insert 768 MB between two rungs and the knob
+    /// would sit somewhere the readout disagrees with, silently, on a control
+    /// whose whole job is to say what it set. Nothing about the constant's type
+    /// says it is a geometric series, so it is said here.
+    #[test]
+    fn the_undo_budget_ladder_is_doublings_from_the_floor() {
+        for (i, rung) in UNDO_BUDGET_LADDER.iter().enumerate() {
+            assert_eq!(
+                *rung,
+                MIN_UNDO_BUDGET_MB << i,
+                "rung {i} is not the floor doubled {i} times"
+            );
+        }
     }
 
     /// The autosave's settings, and — the part that matters — which way each of

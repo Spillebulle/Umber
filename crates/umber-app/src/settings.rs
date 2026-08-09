@@ -148,6 +148,12 @@ pub fn show(root: &mut egui::Ui, p: &Palette, ed: &mut Editor, actions: &mut UiA
     if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::Themes {
         forget_themes_edit(&ctx);
     }
+    // And the undo budget's figure, for exactly the same reason: it is a field
+    // inside this modal, so Escape shuts the dialog rather than reaching the
+    // caret, and a buffer left standing would be applied by the next blur.
+    if !ed.ui.settings_open || ed.ui.settings_tab != SettingsTab::General {
+        forget_budget_edit(&ctx);
+    }
 
     if !ed.ui.settings_open {
         // Closing the dialog while a field was listening would otherwise leave
@@ -703,71 +709,285 @@ pub(crate) fn scale_row() -> widgets::NumberRow<'static> {
 /// A section of its own rather than a line under Documents: the setting above
 /// is about what goes in a *file*, and this is about what a running session
 /// holds. They are both "the undo history" and they trade different things.
+///
+/// **This row is deliberately not a [`widgets::number_row`], and the ladder is
+/// why rather than taste.** That widget's rail is linear by construction, and
+/// this figure spans 512:1 — on the 320-point row below, a linear rail puts the
+/// shipped 512 MB four pixels from the left end, so every budget anybody
+/// actually uses lives in the first six per cent of the travel. The rungs are
+/// *doublings*, which are evenly spaced in the logarithm and not in the value,
+/// so [`widgets::NumberRow::snap`] could not produce them even on a logarithmic
+/// rail: it lands on multiples of a number. What is shared instead is the field
+/// — [`inset_field`], the same dressed `TextEdit` the theme editor and the
+/// Colour panel's hex readout use — and the rule the recorded defect gives, that
+/// a field applies what was **typed** and that Escape is not a blur. See
+/// [`budget_field`].
 fn undo_section(ui: &mut egui::Ui, p: &Palette, ed: &mut Editor) {
     controls::section(ui, p, "Undo memory");
 
+    // Whatever the history is actually holding itself to, which is not
+    // necessarily a rung: a figure hand-edited into the preferences file, or
+    // typed into the field below, is honoured rather than snapped.
+    let held = (ed.history.budget_bytes() / (1024 * 1024)) as u32;
+    let mut chosen = None;
+
     ui.scope(|ui| {
         ui.set_max_width(320.0);
-        // A ladder of doublings, like the autosave's expiry — the nearest rung
-        // to whatever the history is actually holding itself to, so a
-        // hand-edited figure between two rungs shows as the one it is closest
-        // to rather than resetting the setting the moment the pane is drawn.
-        let held = (ed.history.budget_bytes() / (1024 * 1024)) as u32;
-        let nearest = prefs::UNDO_BUDGET_LADDER
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, mb)| mb.abs_diff(held))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let mut step = nearest as f32;
-        if widgets::slider_row(
-            ui,
-            p,
-            "Keep up to",
-            &mut step,
-            0.0..=(prefs::UNDO_BUDGET_LADDER.len() - 1) as f32,
-            false,
-            |v| budget_label(prefs::UNDO_BUDGET_LADDER[budget_index(v)]),
-        ) {
-            let chosen = prefs::UNDO_BUDGET_LADDER[budget_index(step)];
-            // The one door, so the document being edited and the one opened
-            // next cannot end up on different limits — see `set_undo_budget`.
-            prefs::set_undo_budget(ed, chosen);
-            prefs::mark_dirty();
+
+        // The header: the name on the left and the figure on the right, at a
+        // rail's height rather than a line of text's, because a caret needs
+        // somewhere to stand. `number_row`'s own geometry, for the row it would
+        // be if the rungs were multiples of one number.
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let width = ui.available_width().max(widgets::MIN_TRACK);
+            let (header, _) =
+                ui.allocate_exact_size(vec2(width, metrics::SLIDER_ROW), Sense::hover());
+            ui.painter().text(
+                header.left_center(),
+                Align2::LEFT_CENTER,
+                "Keep up to",
+                FontId::proportional(text::SMALL),
+                p.text_dim,
+            );
+            chosen = budget_field(ui, p, header, held);
+        });
+
+        // The rail. `slider_row` is the settings page's rail and draws its own
+        // header, which this row has already drawn — hence the empty label and
+        // the empty readout. Nothing in `widgets` exposes that rail alone at
+        // this size; `bare_slider` is the layer list's knobless one.
+        //
+        // The position is continuous in ladder space, so the knob sits where a
+        // typed figure actually is rather than at the rung nearest it, and a
+        // drag lands on a rung because the answer is rounded back to one.
+        let last = (prefs::UNDO_BUDGET_LADDER.len() - 1) as f32;
+        let mut position = budget_position(held);
+        if widgets::slider_row(ui, p, "", &mut position, 0.0..=last, false, |_| {
+            String::new()
+        }) {
+            let rung = prefs::UNDO_BUDGET_LADDER[budget_index(position)];
+            // A typed figure wins over the rail on the frame it lands, because
+            // the click that puts the pointer on the rail is the same click that
+            // blurs the field: taking the rail's answer would discard what was
+            // typed, in the one gesture where the two arrive together. A second
+            // click on the rail does what it says.
+            if rung != held && chosen.is_none() {
+                chosen = Some(rung);
+            }
         }
     });
+
+    if let Some(megabytes) = chosen
+        && megabytes != held
+    {
+        // The one door, so the document being edited, the ones parked in other
+        // tabs and the one opened next cannot end up on different limits — see
+        // `set_undo_budget`.
+        prefs::set_undo_budget(ed, megabytes);
+        prefs::mark_dirty();
+    }
+
     controls::note(
         ui,
         p,
-        "Per document, not per session: four tabs at 1 GB each is four \
-         gigabytes of memory.\n\nHow many steps that buys depends on the \
-         canvas, because an entry holds the whole rectangle a stroke covered. \
-         A sketch gets hundreds; on a very large canvas a few broad strokes \
-         fill any figure offered here and the oldest are dropped.\n\nMore \
-         costs memory the rest of the machine cannot then use, less costs how \
-         far back you can go. The History panel says when it has started \
-         dropping edits.",
+        &format!(
+            "Per document, not per session: four tabs at 1 GB each is four \
+             gigabytes of memory.\n\nThe rail lands on doublings. Click the \
+             figure to type anything between {} and {}.\n\nHow many steps that \
+             buys depends on the canvas, because an entry holds the whole \
+             rectangle a stroke covered. A sketch gets hundreds; on a very \
+             large canvas a few broad strokes fill any figure offered here and \
+             the oldest are dropped.\n\nMore costs memory the rest of the \
+             machine cannot then use, less costs how far back you can go. The \
+             History panel says when it has started dropping edits.",
+            budget_label(prefs::MIN_UNDO_BUDGET_MB),
+            budget_label(prefs::MAX_UNDO_BUDGET_MB),
+        ),
     );
 }
 
-/// A ladder step, clamped — a slider's value is a float and the ends can land a
+/// The width of the budget field, in points.
+///
+/// Sized for the longest thing typed into it rather than the longest thing shown
+/// in it: the readout is at most "32 GB", and somebody may well type "32768".
+const BUDGET_FIELD: f32 = 48.0;
+
+/// Where the buffer of a budget being typed lives.
+///
+/// In egui's temporary store rather than on `Editor`, for [`number_row`]'s
+/// reason: the caller reads its copy back out of the thing being set, so a
+/// caller-held buffer would be overwritten by the value it is trying to change.
+///
+/// [`number_row`]: widgets::number_row
+fn budget_buffer_id() -> egui::Id {
+    egui::Id::new("settings-undo-budget-typing")
+}
+
+/// Abandon a half-typed budget.
+///
+/// The same rule, for the same reason, as [`forget_themes_edit`]: **Escape is
+/// not a blur here.** `egui::TextEdit` handles no `Key::Escape` and
+/// `egui::Modal` consumes it to shut the dialog, so a field abandoned that way
+/// is simply never drawn again, `lost_focus` is never observed, and a buffer
+/// left behind would be applied by the *next* blur — a budget nobody asked for,
+/// set minutes later, from digits they thought they had cancelled.
+fn forget_budget_edit(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<String>(budget_buffer_id()));
+}
+
+/// The figure at the right of the undo budget's header, as a field.
+///
+/// Returns megabytes on the one frame something is committed — Enter, or the
+/// focus going elsewhere — and `None` on every other frame, including the frame
+/// Escape is pressed. It is [`widgets::number_row`]'s `number_field` in shape
+/// and deliberately so: that shape is what the recorded defect taught, and the
+/// two rules it encodes are that a field applies **what was typed** rather than
+/// what its buffer happens to hold, and that a buffer only exists while somebody
+/// is actually editing.
+///
+/// The unit is the one the readout was showing. Selecting "8 GB" and typing "16"
+/// means sixteen gigabytes; selecting "512 MB" and typing "256" means two
+/// hundred and fifty-six megabytes; and a unit written out wins over both. The
+/// tooltip says so, because a bare figure is otherwise ambiguous in exactly the
+/// direction that costs a gigabyte.
+fn budget_field(ui: &mut egui::Ui, p: &Palette, header: Rect, held: u32) -> Option<u32> {
+    let field_id = egui::Id::new("settings-undo-budget-field");
+    let buffer_id = budget_buffer_id();
+
+    let buffer: Option<String> = ui.ctx().data(|d| d.get_temp(buffer_id));
+    let editing = buffer.is_some();
+    let mut text = buffer.unwrap_or_else(|| budget_label(held));
+
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(header)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let field = inset_field(
+        &mut child,
+        p,
+        field_id,
+        &mut text,
+        BUDGET_FIELD,
+        FontId::monospace(text::TINY),
+    )
+    .on_hover_text(
+        "Type a figure in the unit shown, or name the unit: 512 MB, 8 GB. \
+         The rail below lands on doublings.",
+    );
+
+    if field.gained_focus() {
+        // Start from the bare figure, whole and selected, so the first keystroke
+        // replaces it — which is what somebody who clicked a number and typed
+        // "16" meant. The suffix is never something to delete before typing.
+        text = budget_bare(held);
+        let mut state = egui::TextEdit::load_state(child.ctx(), field_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::default(),
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+        state.store(child.ctx(), field_id);
+    }
+
+    if field.has_focus() {
+        child.ctx().data_mut(|d| d.insert_temp(buffer_id, text));
+        return None;
+    }
+    // No buffer means nobody was typing, so there is nothing to apply: a frame
+    // in which the field merely sat there must not write the value back.
+    if !editing {
+        return None;
+    }
+    child.ctx().data_mut(|d| d.remove::<String>(buffer_id));
+    if child.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return None;
+    }
+    parse_budget(&text, held >= GIGABYTE)
+}
+
+/// Where the readout stops counting in megabytes and starts counting in
+/// gigabytes.
+const GIGABYTE: u32 = 1024;
+
+/// A ladder step, clamped — a rail's value is a float and the ends can land a
 /// hair outside. [`ladder_index`]'s counterpart for the undo budget.
 fn budget_index(value: f32) -> usize {
     (value.round().max(0.0) as usize).min(prefs::UNDO_BUDGET_LADDER.len() - 1)
 }
 
+/// A budget as a position along the ladder, whole numbers being the rungs.
+///
+/// This is `log2` and not a search because [`prefs::UNDO_BUDGET_LADDER`] is
+/// doublings from [`prefs::MIN_UNDO_BUDGET_MB`] up;
+/// `the_undo_budget_ladder_is_doublings_from_the_floor` is what holds the two
+/// together, since nothing about the constant's *type* says so.
+fn budget_position(megabytes: u32) -> f32 {
+    let last = (prefs::UNDO_BUDGET_LADDER.len() - 1) as f32;
+    let ratio = megabytes.max(1) as f32 / prefs::MIN_UNDO_BUDGET_MB as f32;
+    ratio.log2().clamp(0.0, last)
+}
+
+/// A budget with nothing after it, in whichever unit [`budget_label`] would use.
+fn budget_bare(megabytes: u32) -> String {
+    if megabytes < GIGABYTE {
+        return megabytes.to_string();
+    }
+    let gb = megabytes as f32 / GIGABYTE as f32;
+    if (gb - gb.round()).abs() < 0.01 {
+        format!("{}", gb.round() as u32)
+    } else {
+        format!("{gb:.1}")
+    }
+}
+
 /// A budget as the dialog says it: megabytes up to a gigabyte, then gigabytes.
 fn budget_label(megabytes: u32) -> String {
-    if megabytes < 1024 {
-        format!("{megabytes} MB")
+    let unit = if megabytes < GIGABYTE { "MB" } else { "GB" };
+    format!("{} {unit}", budget_bare(megabytes))
+}
+
+/// What a typed budget means, in megabytes, or `None` where it means nothing at
+/// all — in which case the figure is left exactly as it was.
+///
+/// The inverse of [`budget_label`] and [`budget_bare`] together: a unit written
+/// out is taken, and a bare figure is read in `bare_is_gb`'s unit, which is the
+/// one the readout was showing when the field was opened.
+///
+/// **Out of range is clamped rather than refused**, which is `parse_u32`'s rule
+/// in the preferences reader and the right one here for the same reason:
+/// somebody who types 999999 is asking for the largest budget Umber offers, not
+/// for the control to do nothing.
+fn parse_budget(text: &str, bare_is_gb: bool) -> Option<u32> {
+    let lower = text.trim().to_ascii_lowercase();
+    let (figure, in_gb) = if let Some(rest) = lower.strip_suffix("gb") {
+        (rest, true)
+    } else if let Some(rest) = lower.strip_suffix("mb") {
+        (rest, false)
+    } else if let Some(rest) = lower.strip_suffix('g') {
+        (rest, true)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest, false)
     } else {
-        let gb = megabytes as f32 / 1024.0;
-        if (gb - gb.round()).abs() < 0.01 {
-            format!("{} GB", gb.round() as u32)
-        } else {
-            format!("{gb:.1} GB")
-        }
+        (lower.as_str(), bare_is_gb)
+    };
+    let typed: f32 = figure.trim().parse().ok()?;
+    if !typed.is_finite() || typed < 0.0 {
+        return None;
     }
+    let megabytes = if in_gb {
+        typed * GIGABYTE as f32
+    } else {
+        typed
+    };
+    // A float-to-integer cast saturates in Rust, so a figure past `i64` lands on
+    // its end rather than wrapping to something small.
+    Some((megabytes.round() as i64).clamp(
+        prefs::MIN_UNDO_BUDGET_MB as i64,
+        prefs::MAX_UNDO_BUDGET_MB as i64,
+    ) as u32)
 }
 
 /// Autosave: whether, how often, how long the internal copies are kept, and the
@@ -3056,6 +3276,120 @@ mod tests {
             assert!(
                 width <= given,
                 "the {tab:?} pane reported {width} points in a {given}-point column",
+            );
+        }
+    }
+
+    /// What the budget readout says, and what typing it back means.
+    ///
+    /// The two are one pair, exactly as `NumberRow::bare` and `NumberRow::parse`
+    /// are: the field opens on the bare figure the readout was showing, so a
+    /// parser that read it in a different unit would turn 8 GB into 8 MB the
+    /// moment somebody clicked into the field and out again without typing.
+    #[test]
+    fn a_budget_typed_back_is_the_budget_that_was_shown() {
+        for megabytes in [64u32, 512, 1024, 1536, 4096, 32768] {
+            let in_gb = megabytes >= GIGABYTE;
+            assert_eq!(
+                parse_budget(&budget_bare(megabytes), in_gb),
+                Some(megabytes),
+                "{megabytes} MB did not survive its own readout",
+            );
+            assert_eq!(
+                parse_budget(&budget_label(megabytes), in_gb),
+                Some(megabytes),
+                "{megabytes} MB did not survive its own label",
+            );
+        }
+        // A unit written out wins over the one the readout was showing, in both
+        // directions. This is the whole reason the tooltip names the form.
+        assert_eq!(parse_budget("512 MB", true), Some(512));
+        assert_eq!(parse_budget("8gb", false), Some(8192));
+        assert_eq!(parse_budget("2.5 GB", false), Some(2560));
+        // And a bare figure is read in the unit that was showing, which is what
+        // makes "select 8 GB, type 16" mean sixteen gigabytes.
+        assert_eq!(parse_budget("16", true), Some(16384));
+        assert_eq!(parse_budget("256", false), Some(256));
+    }
+
+    /// A figure the rail could not reach is clamped, never refused, and nonsense
+    /// leaves the budget exactly as it was.
+    ///
+    /// The clamp is `prefs::parse_u32`'s rule: somebody typing 999999 is asking
+    /// for the largest budget Umber offers rather than for the control to sit
+    /// there doing nothing. The refusals are the other half — an empty field, or
+    /// a word, must not be read as a number at all, because the value they would
+    /// otherwise land on is the floor and that is somebody's undo history gone.
+    #[test]
+    fn an_out_of_range_budget_is_clamped_and_nonsense_is_refused() {
+        assert_eq!(
+            parse_budget("999999", false),
+            Some(prefs::MAX_UNDO_BUDGET_MB)
+        );
+        assert_eq!(
+            parse_budget("1e30 GB", false),
+            Some(prefs::MAX_UNDO_BUDGET_MB),
+            "a figure past i64 must saturate rather than wrap",
+        );
+        assert_eq!(parse_budget("1", false), Some(prefs::MIN_UNDO_BUDGET_MB));
+        for refused in ["", "  ", "plenty", "GB", "-4", "NaN", "8 gigs"] {
+            assert_eq!(
+                parse_budget(refused, false),
+                None,
+                "{refused:?} was read as a number",
+            );
+        }
+    }
+
+    /// Every rung sits on a whole number of the rail, and the rail's position is
+    /// the value's own rather than the nearest rung's.
+    ///
+    /// The second half is what a typed figure needs: a budget between two rungs
+    /// puts the knob between them, so the rail and the figure beside it cannot
+    /// disagree about what is set.
+    #[test]
+    fn every_rung_sits_on_a_whole_number_of_the_budget_rail() {
+        for (i, rung) in prefs::UNDO_BUDGET_LADDER.iter().enumerate() {
+            let at = budget_position(*rung);
+            assert!(
+                (at - i as f32).abs() < 1e-4,
+                "{rung} MB is rung {i} and sits at {at}",
+            );
+            assert_eq!(budget_index(at), i);
+        }
+        // Half way between 2048 and 4096 in the value is *past* half way along
+        // the rail, because the rungs are doublings: 3072 is 0.585 of the way.
+        let between = budget_position(3072);
+        assert!(
+            between > 5.5 && between < 6.0,
+            "a budget between two rungs landed at {between}",
+        );
+    }
+
+    /// Drawing the pane does not change the budget, and a figure between two
+    /// rungs is one of the cases that has to hold.
+    ///
+    /// A rail over a ladder is exactly the shape that snaps a value on the frame
+    /// it is first drawn, and the figure it would snap to is not the one the
+    /// preferences file holds. It writes a **process-global** if it regresses,
+    /// hence the lock — see `prefs::prefs_lock`.
+    #[test]
+    fn drawing_the_undo_row_leaves_the_budget_alone() {
+        let _serial = prefs::prefs_lock();
+        let ctx = egui::Context::default();
+        let palette = Palette::of(ThemeKind::Graphite);
+        for megabytes in [prefs::MIN_UNDO_BUDGET_MB, 512, 3072, 32768] {
+            let mut ed = Editor::default();
+            ed.history.set_budget(prefs::undo_budget_bytes(megabytes));
+            for _ in 0..3 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    undo_section(ui, &palette, &mut ed);
+                });
+            }
+            assert_eq!(
+                ed.history.budget_bytes(),
+                prefs::undo_budget_bytes(megabytes),
+                "drawing the row moved a budget of {megabytes} MB",
             );
         }
     }
