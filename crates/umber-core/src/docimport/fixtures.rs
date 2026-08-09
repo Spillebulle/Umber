@@ -1050,6 +1050,9 @@ pub struct ClipLayer {
     /// What an absent mask block holds. `Some(255)` is what Clip Studio writes,
     /// because a mask starts revealing everything.
     pub mask_fill: Option<u8>,
+    /// What an absent *colour* block holds. `None` is what every raster layer
+    /// in every real file states; a `Some` is the shape the reader refuses.
+    pub pixel_fill: Option<u8>,
     pub children: Vec<ClipLayer>,
 }
 
@@ -1072,6 +1075,7 @@ impl ClipLayer {
             ),
             mask: None,
             mask_fill: Some(255),
+            pixel_fill: None,
             children: Vec::new(),
         }
     }
@@ -1089,6 +1093,7 @@ impl ClipLayer {
             pixels: None,
             mask: None,
             mask_fill: None,
+            pixel_fill: None,
             children,
         }
     }
@@ -1130,6 +1135,13 @@ impl ClipLayer {
 
     pub fn mask_fill(mut self, fill: Option<u8>) -> Self {
         self.mask_fill = fill;
+        self
+    }
+
+    /// State a colour fill for the blocks this layer does not store, which is
+    /// what a Clip Studio *fill* layer carries and what the reader refuses.
+    pub fn pixel_fill(mut self, fill: u8) -> Self {
+        self.pixel_fill = Some(fill);
         self
     }
 }
@@ -1244,7 +1256,7 @@ impl ClipBuild {
                 self.chain(&layer.children)
             };
             let render = match &layer.pixels {
-                Some(pixels) => self.bitmap(pixels, CLIP_COLOUR, None),
+                Some(pixels) => self.bitmap(pixels, CLIP_COLOUR, layer.pixel_fill),
                 None => 0,
             };
             let mask = match &layer.mask {

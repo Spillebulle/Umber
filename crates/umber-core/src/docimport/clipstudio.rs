@@ -409,6 +409,16 @@ impl Tables {
     /// until the stack does. So does the entry count, which is checked as the
     /// list grows rather than after it — a hostile file naming a million layers
     /// must not build a million entries to be told there are too many.
+    ///
+    /// **The nesting needs a bound of its own, and the entry count is not it.**
+    /// This descends into a folder *before* pushing anything, so a hundred
+    /// thousand folders nested one inside the next is a hundred thousand stack
+    /// frames with `out` still empty — `seen` stops it repeating a row and does
+    /// nothing about a chain of distinct ones. Every level of nesting is a
+    /// folder and every folder is an entry, so a document nested deeper than
+    /// [`LayerStack::MAX`] has more entries than the stack holds however it is
+    /// counted, and saying so is the honest refusal rather than a guard figure
+    /// invented for the recursion.
     fn chain(
         &self,
         first: i64,
@@ -417,6 +427,12 @@ impl Tables {
         out: &mut Vec<Node>,
         warnings: &mut Vec<ImportWarning>,
     ) -> Result<(), ImportError> {
+        if depth >= LayerStack::MAX {
+            return Err(ImportError::TooManyLayers {
+                found: depth + 1,
+                max: LayerStack::MAX,
+            });
+        }
         let mut id = first;
         while id != 0 {
             if !seen.insert(id) {
@@ -705,7 +721,16 @@ fn colour(
             packing.first, packing.second
         ));
     }
-    if bitmap.fill != Fill::Empty {
+    // **A stated fill is refused and an unreadable one is not**, and the two
+    // must not be run together. `Stated` means the file says an absent block
+    // carries a colour, and a colour fill is four values whose meaning nothing
+    // here has checked against a file that paints with one. `Unknown` means the
+    // `InitColor` section could not be located at all — an older `Attribute`
+    // layout, say — and refusing every layer of such a document over a section
+    // that is *usually* "nothing" would cost the artist their picture to protect
+    // a case that has never been seen. It is read as empty, which is what every
+    // other reader of this format does.
+    if let Fill::Stated(_) = bitmap.fill {
         return Err(
             "it is filled with a colour Clip Studio states in a form Umber cannot read".to_string(),
         );
@@ -1203,6 +1228,97 @@ mod tests {
         let mut warnings = Vec::new();
         let nodes = tables.tree(1, &mut warnings).expect("a bounded walk");
         assert!(nodes.len() <= 2, "{} nodes", nodes.len());
+    }
+
+    /// **Nesting is bounded, and the entry count is not what bounds it.**
+    ///
+    /// The walk descends into a folder before pushing anything, so a chain of
+    /// folders each inside the last recurses with nothing in the list to count
+    /// — `seen` only stops a row repeating. Every level is a folder and every
+    /// folder is an entry, so past `LayerStack::MAX` levels the document cannot
+    /// be one a stack holds, whichever way it is counted.
+    ///
+    /// The fixture cannot write this either, which is why it is driven against
+    /// `Tables` directly: 200 folders is 200 stack frames on the way down and a
+    /// hundred thousand is the application gone.
+    #[test]
+    fn a_stack_of_folders_nested_deeper_than_the_stack_holds_is_refused_not_recursed() {
+        let mut rows = HashMap::new();
+        let deep = LayerStack::MAX as i64 * 4;
+        for id in 1..=deep {
+            let mut r = plain_row();
+            r.folder = 1;
+            r.first_child = if id < deep { id + 1 } else { 0 };
+            rows.insert(id, r);
+        }
+        let tables = Tables {
+            rows,
+            mipmaps: HashMap::new(),
+            infos: HashMap::new(),
+            offscreens: HashMap::new(),
+        };
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            tables.tree(1, &mut warnings),
+            Err(ImportError::TooManyLayers { .. })
+        ));
+    }
+
+    /// **An `InitColor` this reader could not locate is not the same as one
+    /// that states a fill**, and only the second may cost a layer.
+    ///
+    /// `Stated` says the file put a colour in every block it did not store,
+    /// which is four values nothing here has checked against a file that paints
+    /// with one — so the layer is refused rather than opened with a sheet over
+    /// it. `Unknown` says the section was not where the header's own lengths
+    /// put it, which an older `Attribute` layout would produce; refusing every
+    /// layer of such a document would cost the artist the picture to protect a
+    /// case never seen.
+    ///
+    /// The test starts from the case where the two readings disagree, which is
+    /// the only way to know which one is in force: a single `!=` against
+    /// `Fill::Empty` passes the first half of this and fails the second.
+    #[test]
+    fn an_unreadable_fill_still_imports_where_a_stated_one_is_refused() {
+        let (w, h) = (300u32, 300u32);
+        let plain = ClipLayer::flat("Ink", w, h, [7, 8, 9, 255]);
+
+        // A stated colour fill: refused, and named.
+        let filled = fixtures::clip(
+            w,
+            h,
+            &[ClipLayer::flat("Ink", w, h, [7, 8, 9, 255]).pixel_fill(255)],
+        );
+        let err = read(&filled).unwrap_err();
+        assert!(matches!(err, ImportError::Empty { .. }), "{err:?}");
+
+        // An `InitColor` that cannot be located: the layer still arrives. The
+        // header's fourth length is overwritten so the four sections stop
+        // accounting for the blob, which is the one signal `init_fill` has that
+        // this is the layout it is reading. `Parameter` is untouched, so the
+        // picture is as readable as it ever was.
+        let attribute = crate::csblocks::fixture::attribute(
+            w,
+            h,
+            Packing {
+                first: 1,
+                second: 4,
+            },
+            None,
+        );
+        let mut bytes = fixtures::clip(w, h, &[plain]);
+        let mut patched = 0;
+        for at in 0..bytes.len().saturating_sub(16) {
+            if bytes[at..at + 12] == attribute[..12] {
+                bytes[at + 12] = bytes[at + 12].wrapping_add(1);
+                patched += 1;
+            }
+        }
+        assert!(patched > 0, "the fixture must carry an Attribute header");
+
+        let doc = read(&bytes).expect("a document");
+        assert_eq!(&doc.layers[0].pixels[0..4], &[7, 8, 9, 255]);
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     }
 
     /// More layers than a `LayerStack` holds is refused **as the list grows**,
