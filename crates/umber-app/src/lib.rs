@@ -41,6 +41,14 @@ mod keylayout;
 mod layerdrag;
 mod localtime;
 mod logo;
+/// The eyedropper's magnifier: what it holds and where it goes.
+///
+/// Public for [`syspick`]'s reason and no other — `examples/measure-screenpick.
+/// rs` times the neighbourhood read at [`loupe::CELLS`] wide, and an example
+/// sees only what the crate exposes. Stating that figure twice is exactly the
+/// drift these measurements exist to prevent. Nothing else here is opened up:
+/// the decision reaches the interface through `app.rs` and `ui.rs` alone.
+pub mod loupe;
 mod palettelib;
 mod panels;
 mod prefs;

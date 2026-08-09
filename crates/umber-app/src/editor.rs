@@ -46,6 +46,29 @@ pub enum Interaction {
     Picking,
 }
 
+impl Interaction {
+    /// May the eyedropper be *aimed* while this is going on?
+    ///
+    /// Idle is the hover, Picking is the drag itself, and everything else is
+    /// another gesture holding the pointer — so the crosshair comes off and
+    /// nothing is read. That last part is what makes this more than tidiness:
+    /// a middle-drag pans with any tool selected, so without it a pan with the
+    /// eyedropper in hand drew a loupe over a canvas sliding underneath it,
+    /// promising a colour the release would not take, and paid a blocking GPU
+    /// readback on every frame of a gesture that had cost nothing.
+    ///
+    /// An exhaustive `match` and not a `matches!`, which is CLAUDE.md's
+    /// standing rule: this answers `false` by *decision* for four
+    /// interactions, and a `matches!` would answer it by accident for a fifth
+    /// nobody had thought about.
+    pub fn allows_aim(self) -> bool {
+        match self {
+            Self::Idle | Self::Picking => true,
+            Self::Drawing | Self::Selecting | Self::Panning | Self::Zooming => false,
+        }
+    }
+}
+
 /// A brush-size drag in progress: Alt held down with no button pressed.
 ///
 /// Not an [`Interaction`], because it is not what the *pointer* is doing —
@@ -600,6 +623,18 @@ pub struct Editor {
     /// pane. Nothing on the stroke path may start reading it, or the diagnostic
     /// becomes part of what it is meant to be observing.
     pub input: crate::inputlog::InputLog,
+    /// What the eyedropper's magnifier is showing, or `None` for no pick aimed.
+    ///
+    /// Above the `--- documents ---` line with `input` and for the same reason:
+    /// it describes where a pointer is and what is under it, which belongs to
+    /// the gesture rather than to any picture — and a tab switch abandons the
+    /// gesture, exactly as it abandons a `SelectionDraft`.
+    ///
+    /// Written once per frame by `App::pick_this_frame`, which is the one place
+    /// a pixel is read; read only by `ui::loupe`, which paints it. Where it
+    /// goes and what it may hold are `crate::loupe`'s, in a model with no
+    /// drawing in it.
+    pub loupe: Option<crate::loupe::Loupe>,
     /// What the Text module holds: the block being composed, the face it is in,
     /// and the machine's fonts once they have been found.
     ///
@@ -735,6 +770,7 @@ impl Default for Editor {
             history: History::default(),
             pressure: PressureModel::default(),
             input: crate::inputlog::InputLog::default(),
+            loupe: None,
             text: crate::textpanel::TextState::default(),
             font_folder: None,
             interaction: Interaction::Idle,
@@ -1991,6 +2027,47 @@ pub struct Surroundings {
     pub focused: bool,
 }
 
+impl Editor {
+    /// Is a pick *aimed* — the eyedropper in hand, over somewhere a press would
+    /// actually take a colour from?
+    ///
+    /// One function because there are two things that must agree about it and
+    /// they are in different modules, which is [`over_egui_area`]'s own reason:
+    /// `ui::aiming_cursor` draws the crosshair here, and `App::pick_aimed`
+    /// reads a pixel and shows the loupe here. Two copies would be a magnifier
+    /// promising a colour where the crosshair is not, or the reverse.
+    ///
+    /// **It is deliberately the canvas alone, even though a *drag* now picks
+    /// off the interface too.** A press over a docked panel operates the panel
+    /// — those are controls, and an eyedropper does not get to take the Layers
+    /// panel's eye toggle away — so a loupe hovering there would be offering a
+    /// colour that clicking will not take, which is exactly the control that
+    /// lies this project refuses everywhere. Once a drag is in flight
+    /// `Interaction::Picking` answers instead and the interface is read like
+    /// anything else; that is the gesture the artist's report was about.
+    ///
+    /// Alt with another tool in hand is not aimed either: Alt with no button is
+    /// the brush resize, so a loupe there would be a second reading of a
+    /// modifier that already means something.
+    ///
+    /// **And no other gesture may be in flight**, which the first draft left
+    /// out and which is worse than it sounds. A middle-drag pans with *any*
+    /// tool selected, so panning with the eyedropper in hand answered "aimed":
+    /// a loupe promising a colour over a canvas sliding under the pointer, that
+    /// a release would not take — and a blocking GPU readback inserted into
+    /// every frame of a gesture that had cost nothing. [`Interaction::allows_
+    /// aim`] is the reading, and it is an exhaustive `match` rather than a
+    /// `matches!` for the reason CLAUDE.md gives: a new interaction has to
+    /// decide.
+    pub fn aiming_pick(&self, around: Surroundings) -> bool {
+        self.ui.tool == Tool::Eyedropper
+            && self.interaction.allows_aim()
+            && !around.over_area
+            && around.focused
+            && self.pointer_over_canvas(self.cursor)
+    }
+}
+
 /// Is egui drawing something of its own *over* the canvas at `screen`?
 ///
 /// A menu, a popup, a modal or a floating panel — all of them `Area`s, all of
@@ -2188,6 +2265,76 @@ mod tests {
             over_area: false,
             focused: true,
         }
+    }
+
+    #[test]
+    fn a_pick_is_only_aimed_when_no_other_gesture_holds_the_pointer() {
+        // **A middle-drag pans with any tool selected**, so this is not an
+        // exotic combination: it is what happens when somebody with the
+        // eyedropper in hand shoves the canvas along to see the rest of it.
+        // Answering "aimed" there drew a loupe over a picture sliding under the
+        // pointer, promising a colour the release would not take — and paid a
+        // blocking GPU readback on every frame of a gesture that had cost
+        // nothing. The first draft of `aiming_pick` did not read `interaction`
+        // at all.
+        let mut ed = windowed();
+        ed.ui.tool = Tool::Eyedropper;
+        ed.cursor = Vec2::new(500.0, 400.0);
+        assert!(
+            ed.pointer_over_canvas(ed.cursor),
+            "the fixture aims at canvas"
+        );
+
+        assert!(ed.aiming_pick(clear()), "idle over the canvas is the hover");
+        ed.interaction = Interaction::Picking;
+        assert!(
+            ed.aiming_pick(clear()),
+            "and the drag itself keeps the crosshair"
+        );
+        for busy in [
+            Interaction::Drawing,
+            Interaction::Selecting,
+            Interaction::Panning,
+            Interaction::Zooming,
+        ] {
+            ed.interaction = busy;
+            assert!(!ed.aiming_pick(clear()), "{busy:?} is another gesture");
+        }
+    }
+
+    #[test]
+    fn nothing_but_the_eyedropper_over_the_canvas_aims_a_pick() {
+        // The other three clauses, each on its own, because a conjunction is
+        // only tested by cases where one term is false and the rest are true.
+        let mut ed = windowed();
+        ed.ui.tool = Tool::Eyedropper;
+        ed.cursor = Vec2::new(500.0, 400.0);
+        assert!(ed.aiming_pick(clear()));
+
+        // A menu, a dropdown or a modal over the pointer: the ordinary cursor
+        // is the right one and nothing is read.
+        assert!(!ed.aiming_pick(Surroundings {
+            over_area: true,
+            focused: true
+        }));
+        // Another application has the keyboard.
+        assert!(!ed.aiming_pick(Surroundings {
+            over_area: false,
+            focused: false
+        }));
+        // Over a panel. A press there operates the panel, so a loupe would be
+        // offering a colour clicking will not take — the drag reaches the
+        // interface through `Interaction::Picking` instead.
+        ed.cursor = Vec2::new(500.0, 5.0);
+        assert!(
+            !ed.pointer_over_canvas(ed.cursor),
+            "the menu bar, not canvas"
+        );
+        assert!(!ed.aiming_pick(clear()));
+        // And any other tool. Alt with a brush in hand is the brush resize.
+        ed.cursor = Vec2::new(500.0, 400.0);
+        ed.ui.tool = Tool::Brush;
+        assert!(!ed.aiming_pick(clear()));
     }
 
     #[test]

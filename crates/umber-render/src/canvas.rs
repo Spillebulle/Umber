@@ -5058,6 +5058,10 @@ impl CanvasRenderer {
     ///
     /// Returns straight-alpha sRGB. A fully transparent pixel yields alpha 0,
     /// which the caller should treat as "nothing there" rather than as black.
+    ///
+    /// [`Self::pick_patch`] at a size of one, so the eyedropper's colour and
+    /// the loupe's picture cannot come out of two different renders. See there
+    /// for why the middle texel of a patch is exactly this pixel.
     pub fn pick_colour(
         &self,
         device: &wgpu::Device,
@@ -5065,11 +5069,61 @@ impl CanvasRenderer {
         layers: &[LayerDraw],
         doc_point: Vec2,
     ) -> [u8; 4] {
+        let px = self.pick_patch(device, queue, layers, doc_point, 1);
+        [px[0], px[1], px[2], px[3]]
+    }
+
+    /// Sample a `size`×`size` block of the flattened stack, centred on one
+    /// document pixel.
+    ///
+    /// Straight-alpha sRGB, row-major, `size * size * 4` bytes, top-left first
+    /// — the eyedropper's loupe, whose neighbourhood over the canvas comes from
+    /// the *document* rather than from the screen. That is the better
+    /// instrument for the pixels Umber owns: the composite before the interface
+    /// is drawn over it, one texel per document pixel whatever the camera is
+    /// doing, so a loupe over a canvas at 37% shows the pixels a release would
+    /// take rather than what the sampler resolved them into.
+    ///
+    /// **The camera is snapped to the middle of the pixel `doc_point` is in,
+    /// and without that this whole function is a lie.** `composite.wgsl` samples
+    /// the layer array through a `Linear` filter at `uv = doc / doc_size`, so a
+    /// texel centre lands on a *document* pixel only where the coordinate is
+    /// `n + 0.5`. `screen_to_doc` is a camera transform and hands over an
+    /// arbitrary fraction, so an unsnapped block is 121 bilinear blends of four
+    /// pixels each — a hard edge in the picture arrives in the loupe as a soft
+    /// ramp, which is the one thing a magnifier is for reading. It is not only
+    /// the loupe's problem: `pick_colour` has always been this render, so the
+    /// colour an eyedropper *took* was a blend of four pixels at every
+    /// coordinate but a pixel centre, and at `frac == 0` it was the flat
+    /// average of all four. **The existing guards could not see it** because
+    /// both pick at `(32.5, 32.5)`, the one fraction where a bilinear tap is
+    /// the identity. `a_pick_takes_the_pixel_it_is_over_rather_than_a_blend_of_
+    /// four` is the guard, and it aims deliberately at a pixel's corner.
+    ///
+    /// **The middle texel is exactly what [`Self::pick_colour`] answers**, and
+    /// that is what the pivot is for: with an odd `size`, the fragment at
+    /// `(size / 2) + 0.5` maps to the snapped centre and its neighbours to the
+    /// document pixels either side. At a `size` of one it is the identity, so
+    /// `pick_colour` is this function and there is one render rather than two
+    /// that have to agree about which pixel is the sample.
+    ///
+    /// Blocking, like `pick_colour` and for the same reason — see
+    /// `App::pick_this_frame`, which is the one caller allowed to do it per
+    /// frame and says why.
+    pub fn pick_patch(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[LayerDraw],
+        doc_point: Vec2,
+        size: u32,
+    ) -> Vec<u8> {
+        let size = size.max(1);
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("umber-pick"),
             size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
+                width: size,
+                height: size,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -5081,12 +5135,21 @@ impl CanvasRenderer {
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // The lone fragment sits at screen (0.5, 0.5); with zoom 1 and the
-        // pivot there, that maps exactly to `doc_point`.
+        // The middle fragment sits at screen `(size / 2) + 0.5`; with zoom 1
+        // and the pivot there, that maps exactly to the camera's centre and
+        // every other texel to a whole document pixel from it. For one texel
+        // this is the (0.5, 0.5) the single-pixel pick always used.
+        //
+        // `floor + 0.5` is the snap the docs above argue for: the middle of the
+        // pixel `doc_point` falls in, which is where the `Linear` sampler's tap
+        // is exact. Written here rather than at the call site because both
+        // callers want it and a caller that forgot would get a plausible,
+        // slightly soft answer.
         let camera = Camera {
-            center: doc_point,
+            center: doc_point.floor() + Vec2::splat(0.5),
             zoom: 1.0,
         };
+        let pivot = Vec2::splat((size / 2) as f32 + 0.5);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("pick"),
@@ -5097,7 +5160,7 @@ impl CanvasRenderer {
             &view,
             &CompositeParams {
                 camera: &camera,
-                pivot: Vec2::splat(0.5),
+                pivot,
                 layers,
                 active_index: 0,
                 stroke: StrokeStyle {
@@ -5108,44 +5171,23 @@ impl CanvasRenderer {
                 export: true,
             },
         );
+        // Submitted before the readback rather than sharing its encoder, for
+        // `export_rgba`'s reason: the read may take more than one submission
+        // and the composite has to happen once and before all of them.
+        queue.submit(Some(encoder.finish()));
 
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pick-readback"),
-            size: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
+        self.read_texture_rows(
+            device,
+            queue,
+            "pick",
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
-                    rows_per_image: Some(1),
-                },
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let mapped = slice.get_mapped_range();
-        let px = [mapped[0], mapped[1], mapped[2], mapped[3]];
-        drop(mapped);
-        staging.unmap();
-        px
+            (size, size),
+        )
     }
 
     /// Ask what the canvas looks like under the brush, without waiting for it.
