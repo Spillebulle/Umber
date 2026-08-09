@@ -83,6 +83,7 @@ use umber_core::palette::{
 };
 use umber_core::{Hsv, Swatch};
 
+use crate::colorpicker::PickerMode;
 use crate::controls;
 use crate::editor::Editor;
 use crate::icons::Icon;
@@ -152,6 +153,17 @@ struct State {
     /// palette cannot be undone — the history covers painting only — so it
     /// asks.
     confirming: Option<String>,
+    /// Whether the grid may be changed at all: added to, named, rearranged or
+    /// taken from. Off by default, and see [`editing_tip`] for why.
+    ///
+    /// **It resets, and that is the whole point of it.** Off is the safe state,
+    /// and a mode that persisted would be one somebody left on months ago — the
+    /// same argument that keeps a tick off a layer out of the `.ora`. It lives
+    /// in this `State`, which is egui's temporary store, so it is neither
+    /// written to `prefs` nor carried between runs; if egui ever drops the whole
+    /// entry the module comes back read-only, which is the direction a lapse
+    /// here has to fail in.
+    editing: bool,
 }
 
 impl State {
@@ -236,6 +248,7 @@ fn load(ctx: &egui::Context, ed: &mut Editor) -> State {
         renaming: None,
         naming: None,
         confirming: None,
+        editing: false,
     };
     state.settle_selection();
     state
@@ -279,38 +292,97 @@ fn write<T>(
 // The panel
 // ---------------------------------------------------------------------------
 
-/// The three marks in the Palette panel's header: save the colour in hand, save
-/// its whole harmony, and open the library.
+/// What the pencil mark says it is for, in both of its states.
+///
+/// A `const` pair rather than two strings at the call site, because the reason
+/// this mode exists at all is the sentence in it: **there is no undo for a
+/// palette anywhere in Umber**, and a `PaletteLibrary` write reaches the disk on
+/// the spot. Removing a colour is therefore unrecoverable, the remove mark sits
+/// inside a swatch a pixel from the colour it throws away, and egui calls a
+/// press a drag on *time* alone — three things that between them made an
+/// accidental deletion easy. The lock is that the marks are not drawn and the
+/// drag model is not fed at all until somebody asks for them.
+const EDITING_ON: &str = "Editing is on. Colours can be added, named, rearranged and removed.";
+const EDITING_OFF: &str =
+    "Turn editing on to add, name, rearrange or remove colours. Removing one cannot be undone.";
+
+/// The three marks in the Palette panel's header: add, edit mode, and the
+/// library.
 pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
     let mut state = load(ui.ctx(), ed);
 
     // Right-to-left: added first lands furthest right, next to the close mark,
     // which is where the Brushes panel draws its own save.
-    let room = state.current().is_some_and(ColourPalette::has_room);
-    let can_add = state.writable() && room;
-    let tip = if can_add {
-        "Add the colour in hand to this palette".to_owned()
+    //
+    // **One adding mark, and what it adds follows the Colour panel's picker.**
+    // There used to be two — a plus and a harmony mark beside it — and the
+    // second was a control most people never pressed, sitting permanently
+    // beside the one they did. In Harmony mode the whole relation is what is on
+    // screen and is what somebody means by "keep this"; in any other mode there
+    // is one colour and nothing else to mean.
+    //
+    // **The glyph is what says which**, not the tooltip alone. A plus that
+    // sometimes puts in one colour and sometimes five is exactly the control
+    // whose behaviour depends on state you cannot see, and a tooltip is
+    // something you have to go and hover for. So the mark itself becomes the
+    // harmony mark, and the tooltip names the relation and how many colours it
+    // is — which it did before and still does.
+    let harmony = ed.ui.picker == PickerMode::Harmony;
+    // `room_for(1)` rather than `has_room` so the count is stated once: the two
+    // are the same function, and asking the same question two ways is how the
+    // mark and its own tooltip come to disagree about whether it will fit.
+    let hues = if harmony {
+        ed.ui.harmony.hues(ed.hsv.h).len()
     } else {
-        no_room_because(&state, 1)
+        1
     };
-    if icon_button(ui, p, Icon::Plus, can_add, &tip) {
-        add_current_colour(&mut state, ed);
-    }
-
-    // Beside the single Add, because it is a kind of Add. See the module docs
-    // for why it is here rather than under the wheel that shows the harmony.
-    let hues = ed.ui.harmony.hues(ed.hsv.h).len();
-    let can_keep = state.writable() && state.current().is_some_and(|q| q.room_for(hues));
-    let tip = if can_keep {
+    let fits = state.writable() && state.current().is_some_and(|q| q.room_for(hues));
+    let can_add = state.editing && fits;
+    let tip = if !state.editing {
+        EDITING_OFF.to_owned()
+    } else if !fits {
+        no_room_because(&state, hues)
+    } else if harmony {
         format!(
             "{} harmony: add its {hues} colours to this palette",
             ed.ui.harmony.label()
         )
     } else {
-        no_room_because(&state, hues)
+        "Add the colour in hand to this palette".to_owned()
     };
-    if icon_button(ui, p, Icon::Harmony, can_keep, &tip) {
-        keep_harmony(&mut state, ed);
+    if icon_button(
+        ui,
+        p,
+        if harmony { Icon::Harmony } else { Icon::Plus },
+        can_add,
+        &tip,
+    ) {
+        if harmony {
+            keep_harmony(&mut state, ed);
+        } else {
+            add_current_colour(&mut state, ed);
+        }
+    }
+
+    // Beside the mark it gates, so what turns the plus on is the thing next to
+    // the plus. A toggle rather than a button, because the mode is a state
+    // somebody has to be able to read off the panel without pressing anything.
+    if widgets::icon_toggle(
+        ui,
+        p,
+        Icon::Pencil,
+        state.editing,
+        true,
+        if state.editing { EDITING_ON } else { EDITING_OFF },
+    ) {
+        state.editing = !state.editing;
+        // Whatever gesture was in flight is abandoned with the mode. A drag
+        // left in the store cannot act — `swatchdrag::Drag::palette` guards
+        // that — but an open naming field would come back on the next frame
+        // editing was switched on, over a colour nobody was naming.
+        if !state.editing {
+            forget_gesture(ui.ctx(), &mut state);
+        }
     }
 
     if icon_button(
@@ -328,11 +400,14 @@ pub fn header_controls(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
 
 /// Why a control that adds `count` colours is dead.
 ///
-/// One function for both adding marks, because the three reasons are the same
-/// three and the wording of them is what the disabled control has instead of an
-/// action. Stated in this order deliberately: nowhere to write beats no palette
-/// beats no room, since each later answer assumes the earlier one is not the
-/// problem.
+/// It answers for the one adding mark in both of its readings — a single colour
+/// and a whole harmony — because the three reasons are the same three whichever
+/// it is about, and the wording of them is what the disabled control has instead
+/// of an action. Stated in this order deliberately: nowhere to write beats no
+/// palette beats no room, since each later answer assumes the earlier one is not
+/// the problem. Editing being off is *not* one of them and is tested before this
+/// is reached: it is a thing the artist can undo in one press, where these three
+/// are all states of the machine.
 fn no_room_because(state: &State, count: usize) -> String {
     if !state.writable() {
         state.why_not().to_owned()
@@ -367,6 +442,15 @@ pub fn panel(ui: &mut Ui, p: &Palette, ed: &mut Editor) {
         empty_library(ui, p, ed, &mut state);
         store(ui.ctx(), state);
         return;
+    }
+
+    // Editing off is one more place the grid stops offering a gesture, so it is
+    // one more place a gesture in flight has to be abandoned — the same rule the
+    // two early returns above already follow, and the reason the header's own
+    // toggle calls this as well. Both, because the mode can also arrive off from
+    // a `State` egui rebuilt while a drag sat in the store beside it.
+    if !state.editing {
+        forget_gesture(ui.ctx(), &mut state);
     }
 
     let act = swatch_grid(ui, p, ed, &state);
@@ -780,12 +864,23 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     let id = state.selected.as_deref()?;
     let palette = library.get(id)?;
 
+    // **Every gesture the grid offers is behind this**, and it is read once so
+    // the marks, the drag and the clicks cannot come to disagree about whether
+    // the palette may be changed. See [`EDITING_OFF`] for the argument.
+    let editing = state.editing;
+
     if palette.is_empty() {
         controls::note(
             ui,
             p,
-            "Nothing in this palette yet. The plus above adds the colour you \
-             are painting with.",
+            if editing {
+                "Nothing in this palette yet. The plus above adds the colour \
+                 you are painting with."
+            } else {
+                "Nothing in this palette yet. Turn editing on, with the pencil \
+                 above, and the plus beside it adds the colour you are \
+                 painting with."
+            },
         );
         return None;
     }
@@ -795,8 +890,13 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     // and an index means nothing without the palette it indexes. Dropped rather
     // than carried across, or a release would rearrange a palette nobody was
     // dragging.
+    //
+    // Editing off drops it here as well as in the caller, which is what makes
+    // the drag model *inert* rather than merely invisible: nothing is pushed
+    // into `cells`, so `aim` has nothing to land on, and the store is cleared
+    // below by the same `None` arm that clears it after an ordinary drop.
     let mut drag: Option<swatchdrag::Drag> = ui.ctx().data(|d| d.get_temp(drag_id()));
-    if drag.as_ref().is_some_and(|carried| carried.palette != id) {
+    if !editing || drag.as_ref().is_some_and(|carried| carried.palette != id) {
         drag = None;
     }
     // Where a drop would land, as `Drag::aim` left it at the end of the *last*
@@ -816,8 +916,9 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     });
     // Collected only while a button is down or something is already carried:
     // the grid is redrawn every frame and this would otherwise be a `Vec` built
-    // sixty times a second to answer a question nobody is asking.
-    let watching = dragging || down;
+    // sixty times a second to answer a question nobody is asking. And never at
+    // all with editing off, which is the half that makes the drag inert.
+    let watching = editing && (dragging || down);
     let mut cells: Vec<swatchdrag::Cell> = Vec::new();
     // The colour whose name is being typed keeps its mark while the field is
     // open, so there is something on the grid saying which one the field below
@@ -825,7 +926,7 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
     let named = state
         .naming
         .as_ref()
-        .filter(|naming| naming.palette == id)
+        .filter(|naming| editing && naming.palette == id)
         .map(|naming| naming.index);
 
     let width = ui.available_width();
@@ -892,46 +993,60 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
 
         // Both marks are allocated whether or not they are drawn, so their ids
         // and their rectangles do not appear and disappear between frames.
-        let mark = remove_rect(cell);
-        let remove = ui.interact(mark, ui.id().with(("swatch-remove", index)), Sense::click());
-        let naming = name_rect(cell);
-        let name = ui.interact(naming, ui.id().with(("swatch-name", index)), Sense::click());
-        // Not while a colour is being carried: the marks sit under the pointer
-        // for the whole of a drag, and two chips flickering over the grid say
-        // nothing about where the colour is going.
-        let revealed = pointer_inside && !dragging;
-        if revealed {
-            ui.painter().rect_filled(mark, metrics::RADIUS, p.popover);
-            crate::icons::draw(
-                ui.painter(),
-                mark.shrink(2.0),
-                Icon::Close,
-                if remove.hovered() {
-                    p.warning
-                } else {
-                    p.text_dim
-                },
-            );
-        }
-        // The name mark alone stays out while the field below is open, so there
-        // is something on the grid saying which colour that field belongs to.
-        // **The remove mark deliberately does not**: it is destructive, there is
-        // no undo for a palette, and leaving it standing would park a live
-        // delete one pixel-slip from the field somebody is typing into. A mark
-        // that is only there to identify a colour has no business being the one
-        // that can throw it away.
-        if revealed || named == Some(index) {
-            ui.painter().rect_filled(naming, metrics::RADIUS, p.popover);
-            crate::icons::draw(
-                ui.painter(),
-                naming.shrink(2.0),
-                Icon::Rename,
-                if name.hovered() || named == Some(index) {
-                    p.accent
-                } else {
-                    p.text_dim
-                },
-            );
+        //
+        // **With editing off they are not allocated at all**, and that is the
+        // difference between a control that is hidden and one that is gone: the
+        // `interact` is what makes a rectangle a target, so skipping it is what
+        // stops a click on the top-right corner of a swatch removing a colour
+        // while nothing says it can. The appearing-and-disappearing id this
+        // guards against is a *per-frame* oscillation — a mark revealed by the
+        // hover it then swallows — and a mode somebody switches is not that.
+        let marks = editing.then(|| {
+            let mark = remove_rect(cell);
+            let remove =
+                ui.interact(mark, ui.id().with(("swatch-remove", index)), Sense::click());
+            let naming = name_rect(cell);
+            let name = ui.interact(naming, ui.id().with(("swatch-name", index)), Sense::click());
+            (mark, remove, naming, name)
+        });
+        if let Some((mark, remove, naming, name)) = &marks {
+            // Not while a colour is being carried: the marks sit under the
+            // pointer for the whole of a drag, and two chips flickering over
+            // the grid say nothing about where the colour is going.
+            let revealed = pointer_inside && !dragging;
+            if revealed {
+                ui.painter().rect_filled(*mark, metrics::RADIUS, p.popover);
+                crate::icons::draw(
+                    ui.painter(),
+                    mark.shrink(2.0),
+                    Icon::Close,
+                    if remove.hovered() {
+                        p.warning
+                    } else {
+                        p.text_dim
+                    },
+                );
+            }
+            // The name mark alone stays out while the field below is open, so
+            // there is something on the grid saying which colour that field
+            // belongs to. **The remove mark deliberately does not**: it is
+            // destructive, there is no undo for a palette, and leaving it
+            // standing would park a live delete one pixel-slip from the field
+            // somebody is typing into. A mark that is only there to identify a
+            // colour has no business being the one that can throw it away.
+            if revealed || named == Some(index) {
+                ui.painter().rect_filled(*naming, metrics::RADIUS, p.popover);
+                crate::icons::draw(
+                    ui.painter(),
+                    naming.shrink(2.0),
+                    Icon::Rename,
+                    if name.hovered() || named == Some(index) {
+                        p.accent
+                    } else {
+                        p.text_dim
+                    },
+                );
+            }
         }
 
         // A release that ends a drag is not also a click on the colour it
@@ -952,6 +1067,15 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
                 swatch.hex()
             } else {
                 format!("{} · {}", swatch.name, swatch.hex())
+            };
+            // Taking the colour is the one thing a click still does with
+            // editing off, which is the whole of what the mode leaves: a
+            // palette you can paint out of and cannot damage.
+            let Some((_, remove, _, name)) = marks else {
+                if response.on_hover_text(label).clicked() {
+                    act = Some(Act::Take(index));
+                }
+                continue;
             };
             if remove.on_hover_text("Remove this colour").clicked() {
                 act = Some(Act::Remove(index));
@@ -1011,6 +1135,13 @@ fn swatch_grid(ui: &mut Ui, p: &Palette, ed: &Editor, state: &State) -> Option<A
 }
 
 /// What the panel shows with no palette to show.
+///
+/// **Deliberately not behind editing.** The mode guards the *colours* in a
+/// palette — the four things that are destructive or unrecoverable — and this is
+/// the way in to having a palette at all. Gating it would leave somebody with an
+/// empty module, a sentence telling them to make one, and two dead buttons; and
+/// making a palette costs nothing that cannot be undone by deleting it, which
+/// the library modal already asks twice about.
 fn empty_library(ui: &mut Ui, p: &Palette, ed: &mut Editor, state: &mut State) {
     controls::note(
         ui,
@@ -1670,6 +1801,7 @@ mod tests {
             renaming: None,
             naming: None,
             confirming: None,
+            editing: true,
         };
         // Nothing selected takes the first, so a library with palettes in it
         // never draws a panel that looks broken.
@@ -1762,22 +1894,28 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/palette-module");
         std::fs::create_dir_all(&dir).expect("create the preview directory");
 
-        for (name, open, empty, naming, dragging) in [
-            ("1-panel", false, false, false, false),
-            ("2-panel-empty", false, true, false, false),
-            ("3-library", true, false, false, false),
+        for (name, open, empty, naming, dragging, editing) in [
+            ("1-panel", false, false, false, false, true),
+            ("2-panel-empty", false, true, false, false, true),
+            ("3-library", true, false, false, false, true),
             // The naming field, which is the one piece of this module whose
             // size is decided by a `TextEdit` sharing a line with a chip. A
             // field that overran the panel would look exactly like a field that
             // fitted, in every assertion anybody could write about it.
-            ("4-naming", false, false, true, false),
+            ("4-naming", false, false, true, false, true),
             // A drag in flight, which is the only way anybody looks at the drop
             // ring. `the_drop_ring_covers_no_colour_and_reaches_no_neighbour`
             // pins the geometry and can say nothing about whether the mark
             // reads as "the colour lands here" beside the solid accent outline
             // that means "this is the colour in hand" — which is the whole
             // argument for it being dashed and square.
-            ("5-dragging", false, false, false, true),
+            ("5-dragging", false, false, false, true, true),
+            // The state the module opens in, which is the one most people will
+            // ever see: no corner marks on the swatches, the pencil unlit and
+            // the plus beside it dead. What a picture answers and no assertion
+            // does is whether a grid with nothing on its corners still reads as
+            // a palette rather than as one that has failed to finish drawing.
+            ("6-read-only", false, false, false, false, false),
         ] {
             let mut ed = Editor::default();
             ed.layout = Layout::default();
@@ -1796,6 +1934,7 @@ mod tests {
                 renaming: None,
                 naming: None,
                 confirming: None,
+                editing,
             };
             seed.settle_selection();
             // The panel shots want the palette with something in it, which is
@@ -1860,7 +1999,7 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 5 shots to {}", dir.display());
+        println!("wrote 6 shots to {}", dir.display());
     }
 
     /// A palette laid out in fours reads as fours where there is room, and a
@@ -2042,6 +2181,7 @@ mod tests {
             renaming: None,
             naming: None,
             confirming: None,
+            editing: true,
         };
         state.naming = naming_for(&state, 1);
         let naming = state.naming.clone().expect("a field on the middle colour");
@@ -2076,6 +2216,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A library of twelve distinguishable colours in a directory of its own.
+    fn probe_library(tag: &str) -> (PaletteLibrary, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("umber-palette-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut library = PaletteLibrary::load_from(&dir);
+        let id = library.create("Probe").expect("made");
+        let mut palette = library.get(&id).expect("there").clone();
+        for n in 0..12u8 {
+            palette.add(umber_core::Swatch::new([n * 20 + 3, 40, 200 - n * 10]));
+        }
+        library.save(palette).expect("saved");
+        (library, id, dir)
+    }
+
+    /// **With editing off the grid is inert, not merely undecorated**, and that
+    /// is the whole of what the mode is worth.
+    ///
+    /// There is no undo for a palette anywhere in Umber and a `PaletteLibrary`
+    /// write reaches the disk on the spot, so a remove is unrecoverable. The
+    /// mode exists because that remove mark sits *inside* a swatch, a pixel from
+    /// the colour it throws away — and because egui calls a press a drag on
+    /// **time** alone, so holding still over one is already recorded here as a
+    /// bug that rearranged somebody's palette silently.
+    ///
+    /// So the test drives real pointer events at the real panel rather than
+    /// asserting that some flag is false: every swatch's remove mark, name mark
+    /// and centre, as a click and as a drag slow enough for
+    /// `is_decidedly_dragging`. **Where the cells are is read off the shapes the
+    /// grid drew** rather than recomputed, for `drop_ring_rect`'s reason: a test
+    /// that restated the layout would be probing pixels the grid had moved away
+    /// from and passing for it.
+    ///
+    /// The editing-on pass is not decoration either. A test of a two-state
+    /// reading has to start from a case where the two readings disagree, or it
+    /// is testing the reading it happens to like — so the same sweep has to
+    /// *change* the palette with the mode on, and the assertion says so.
+    #[test]
+    fn a_read_only_palette_cannot_be_changed_by_any_gesture() {
+        use crate::theme::{Palette as Theme, ThemeKind};
+        use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect};
+
+        fn rect_fills(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        rect_fills(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (library, id, dir) = probe_library("inert");
+        let theme = Theme::of(ThemeKind::Graphite);
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(metrics::PANEL, 420.0));
+        let seed = State {
+            store: Store::Ready(Arc::new(library.clone())),
+            selected: Some(id.clone()),
+            library_open: false,
+            renaming: None,
+            naming: None,
+            confirming: None,
+            editing: true,
+        };
+        let before: Vec<Swatch> = seed.current().expect("there").swatches.clone();
+        assert_eq!(before.len(), 12);
+
+        let button = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::default(),
+        };
+
+        // egui asserts its own clock never runs backwards, and one context is
+        // shared by every gesture below — so time is a running total rather than
+        // a fresh stopwatch per gesture.
+        let mut now = 0.0f64;
+
+        // Where the twelve colours landed, read off the fills the grid drew.
+        // The stroke is a second `Rect` shape over the same rectangle with a
+        // transparent fill, so matching on the colour picks the right one.
+        let ctx = egui::Context::default();
+        let mut cells: Vec<Rect> = Vec::new();
+        for _ in 0..2 {
+            cells.clear();
+            let mut ed = Editor::default();
+            store(&ctx, seed.clone());
+            now += 0.1;
+            let output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(now),
+                    ..Default::default()
+                },
+                |ui| panel(ui, &theme, &mut ed),
+            );
+            let mut fills = Vec::new();
+            for clipped in &output.shapes {
+                rect_fills(&clipped.shape, &mut fills);
+            }
+            for swatch in &before {
+                let want = Color32::from_rgb(swatch.rgb[0], swatch.rgb[1], swatch.rgb[2]);
+                if let Some((rect, _)) = fills.iter().find(|(_, fill)| *fill == want) {
+                    cells.push(*rect);
+                }
+            }
+        }
+        assert_eq!(
+            cells.len(),
+            before.len(),
+            "the grid drew no swatch this could aim at, so nothing was measured"
+        );
+
+        // Every target the grid offers, and the two ways a press can end.
+        let mut probes: Vec<Pos2> = Vec::new();
+        for cell in &cells {
+            probes.push(remove_rect(*cell).center());
+            probes.push(name_rect(*cell).center());
+            probes.push(cell.center());
+        }
+        let elsewhere = cells[cells.len() - 1].center();
+
+        let mut changed_with_editing_on = 0;
+        for editing in [false, true] {
+            for &at in &probes {
+                for slow in [false, true] {
+                    let mut ed = Editor::default();
+                    store(
+                        &ctx,
+                        State {
+                            store: Store::Ready(Arc::new(library.clone())),
+                            editing,
+                            ..seed.clone()
+                        },
+                    );
+                    // Present, pressed, held past `max_click_duration` and
+                    // moved, released. `slow` is what turns the same three
+                    // points into a drag rather than a click.
+                    let frames: Vec<(f64, Vec<Event>)> = if slow {
+                        vec![
+                            (0.05, vec![Event::PointerMoved(at)]),
+                            (0.05, vec![button(at, true)]),
+                            (1.4, vec![Event::PointerMoved(elsewhere)]),
+                            (0.05, vec![button(elsewhere, false)]),
+                        ]
+                    } else {
+                        vec![
+                            (0.05, vec![Event::PointerMoved(at)]),
+                            (0.05, vec![button(at, true)]),
+                            (0.05, vec![button(at, false)]),
+                        ]
+                    };
+                    for (step, events) in frames {
+                        now += step;
+                        let _ = ctx.run_ui(
+                            RawInput {
+                                screen_rect: Some(screen),
+                                time: Some(now),
+                                events,
+                                ..Default::default()
+                            },
+                            |ui| panel(ui, &theme, &mut ed),
+                        );
+                    }
+                    let after: Vec<Swatch> = ctx
+                        .data(|d| d.get_temp::<State>(state_id()))
+                        .and_then(|s| s.current().cloned())
+                        .expect("the palette is still in front")
+                        .swatches;
+                    if editing {
+                        changed_with_editing_on += usize::from(after != before);
+                    } else {
+                        assert_eq!(
+                            after, before,
+                            "a {} at {at:?} changed a palette whose module is read-only",
+                            if slow { "drag" } else { "click" }
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            changed_with_editing_on > 0,
+            "the same sweep changed nothing with editing *on* either, so the \
+             assertion above is passing for the wrong reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A disabled control says why, and the three reasons are not
     /// interchangeable: "there is nowhere to keep palettes on this system" is
     /// not "make a palette first", and neither is "this one is full". A tooltip
@@ -2095,6 +2426,7 @@ mod tests {
             renaming: None,
             naming: None,
             confirming: None,
+            editing: true,
         };
         // Nowhere to write beats everything, and the wording is the library's
         // own rather than one invented here.
