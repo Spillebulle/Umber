@@ -1074,11 +1074,17 @@ pub const KEYMAP_EXTENSION: &str = "umberkeys";
 
 /// The first line of every keymap Umber writes.
 ///
-/// A marker rather than a version: the format is line-based and every line is
-/// independent, so a later revision adding a line kind costs an older reader
-/// that one line — which is what [`read_keymap`] already counts and reports. It
-/// is what tells "an empty keymap" from "a file that is not a keymap at all",
-/// which are two different sentences to put in front of somebody.
+/// **[`read_keymap`] does not look at it, and that is deliberate rather than an
+/// oversight.** It is there so somebody opening the file in a text editor knows
+/// what they are looking at. Requiring it would refuse a list typed by hand and
+/// refuse the preferences file itself, both of which are the same lines; and it
+/// could not carry a version either, because the format is line-based and every
+/// line is independent, so a later revision adding a line kind costs an older
+/// reader that one line — which is already counted and reported.
+///
+/// What decides whether a file is a keymap is therefore whether it names a
+/// command Umber knows. Nothing here may start reading this constant back
+/// without answering the two refusals above.
 const KEYMAP_HEADER: &str = "# Umber keymap";
 
 /// A keymap as a file's worth of text.
@@ -1098,6 +1104,12 @@ const KEYMAP_HEADER: &str = "# Umber keymap";
 /// would mean a keymap that quietly took whatever the *receiving* build thought
 /// the default was, which for a file whose whole purpose is to carry one
 /// keyboard onto another machine is the failure it exists to prevent.
+///
+/// **The line ending is `\n` on every platform, deliberately.** `docformat`'s
+/// rule: a file that travels may not take the platform's ending, or the same
+/// keymap written on Windows and on Linux differs byte for byte. That rule was
+/// written about a document and a keymap is the same kind of thing; a
+/// preferences file, which stays on the machine that wrote it, is not.
 pub fn to_keymap(bindings: &[Binding]) -> String {
     let mut out = String::from(KEYMAP_HEADER);
     out.push_str(
