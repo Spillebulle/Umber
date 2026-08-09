@@ -10,6 +10,7 @@ pub mod brushimport;
 pub mod camera;
 pub mod clipboard;
 pub mod color;
+mod csblocks;
 pub mod curve;
 pub mod damage;
 pub mod docformat;
