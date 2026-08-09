@@ -306,11 +306,12 @@ covered pixel. So the mask is what gets used and the rings are what get drawn.
   composite where they cross, and Add drew Intersect's darker lens until the
   union became three disjoint rectangles.
 - **The feather rail is `widgets::inline_slider` and applies to the next
-  gesture.** `number_row` is the *typable* rail and is two stacked rows tall,
-  which does not fit `metrics::OPTIONS_STRIP`'s 36 points; this figure cannot be
-  typed, so it is the strip's own control and not a second "type it or drag it".
-  That it sets what the next shape will be rather than softening the one
-  standing is every application's spelling of a tool-options feather — and
+  gesture.** Its figure can be typed now — `inline_slider` is `typed_rail`'s
+  one-line shape rather than a second control — so the sentence that used to
+  stand here, that the strip's figures could not be typed, no longer holds. What
+  has not changed is that it sets what the next shape will be rather than
+  softening the one standing, which is every application's spelling of a
+  tool-options feather — and
   re-applying it live is not merely expensive but lossy, since the sharp mask is
   gone after a boolean. **A budget on that strip must be measured where it is
   spent**: the combine line reads `available_width()` afresh, *after* the mode
@@ -644,14 +645,16 @@ draws the module and `cputext.rs` is the splash's own use of the same `Pen`.
   belongs in an `EditBody` arm rather than a kind — `EditBody` is already where
   the flip's difference lives. Not written to the file: a reopened undo restores
   the pixels alone, which the next save's fresh fingerprint makes safe.
-- **The writer is not wired yet and that is the live gap.** Nothing under
-  `umber-app` fills `SaveLayer::text`, while the *read* side is wired — so a
-  document carrying `umber-text` opens as a text layer and is written back as
-  plain paint by both Save and the five-minute timer, with no warning. Latent
-  only because nothing yet creates one. Wiring it is **one commit**: both
-  writers, `text` on `autosave.rs`'s `LayerMeta` and its snapshot, and
-  `every_writer_of_a_save_layer_states_its_effects` widened — it counts the
-  literal `effects:` and is blind to a second field.
+- **The writer is wired, and this bullet used to say it was the live gap.** Both
+  ends are there now: `app.rs` fills `SaveLayer::text` off the layer and
+  `autosave.rs` off its snapshot, for the reason each takes `effects` from the
+  same place — a save reads the stack it is looking at, an autosave's pixels
+  arrive over several frames and its metadata is snapshotted when the capture
+  begins, and the two have to write the same file. **`text` is the field whose
+  absence is silent**: `..SaveLayer::new` writes `None`, so a writer that forgot
+  it would turn a document that opened as text back into plain paint with
+  nothing said. That is why the guard counts the literal at every construction
+  site rather than trusting the two to agree.
 - **Bold and italic are a family's own faces or they are nothing.**
   `FontLibrary::restyle` answers with a real face of the family, and its `None`
   *is* the feature: Umber never smears an outline to make a bold and never
@@ -1029,6 +1032,33 @@ are the contiguous run immediately below it whose `depth` is greater.
   not an inconsistency: ticking a folder cascades, so "ticked, contents not" is
   unreachable there, while "some of the stack" is the ordinary case here and an
   empty box would say none was ticked.
+- **A module's header lays its controls out before its title, and the title takes
+  what is left.** Four marks and a close mark want 114 points; the header's
+  control strip is 120 at `metrics::PANEL`, 83 at `limits::SIDEBAR_MIN_WIDTH` and
+  38 at `metrics::TOOL_RAIL`. So at the design's width it fits and at every
+  narrower one the strip overruns leftwards into the title — which is the
+  "3 ticked" label and the six bulk buttons drawn over each other, one storey up.
+  Truncating the title is the fix and it costs a word: in edit mode at 190 points
+  "Palette" reads "Palet…". That is better than the full word with a button
+  through it, and it only happens while somebody is dragging the panel. The guard
+  sweeps **each kind's own `min_width`** rather than one constant — missing
+  `PanelKind::Tools`' 100-point floor is the "domain the code sees" failure again
+  — and carries the galley's **row count** as well as the two rectangles.
+- **The Layers module's stack commands are in its header**, for the reason the
+  Brushes module's Edit mark is: a panel body is a scroll area, and with a stack
+  of any size the list fills it immediately, so the four commands that act on the
+  stack were the first thing to scroll away. Group is bulk (`targets`); the
+  chevrons and the header's trash mean *this layer*, because `reorder` moves one
+  entry and the bulk delete already lives in the ticked strip. The add mark went
+  to the **flags row** instead, because it acts on neither the selection nor the
+  tick set.
+- **The flags row wraps and the tick line does not, and the asymmetry is the
+  point.** `metrics::LAYER_TICK_ROW` is a constant because the thing that changes
+  there is *ticking*, whose pointer is on the list a jump would move. What changes
+  the flags row is a mask being added or taken off, which is a press on a toggle
+  that stays on the first line whichever way the row breaks. Holding it at two
+  lines always would move the list for everybody to spare the one width where it
+  wraps.
 - **A thumbnail is the layer's *content*, and it is two passes because the
   bounding box of that content is on the GPU.** `thumbnail.wgsl` reduces a
   rectangle of one slice to a 64-square: first the whole slice to the
@@ -1726,6 +1756,59 @@ reporter's own window.
   premultiplied in linear space** — exactly what a layer texture holds, so it
   goes straight to `write_texture`. Premultiplying in sRGB is the classic way to
   get haloed edges here.
+- **A `.clip` is a SQLite database in a chunk wrapper, and both halves were
+  already here.** `umber-core::sqlite` exists because a `.sut` brush is one too,
+  and `csblocks` is the 256-square zlib block stream a brush *material* stores
+  pixels in — a document layer's are in the same stream. That is why Clip Studio
+  support added **no dependency**. Two copies of the block framing is the drift
+  `docformat`'s "there must never be a second ORA reader" refuses, so it is one
+  module and `csmaterial` is a caller.
+- **A `.clip`'s stack runs bottom to top, and that was established from files
+  rather than assumed.** `Canvas.CanvasRootFolder` → `LayerFirstChildIndex` →
+  `LayerNextIndex`. A reader that gets this backwards still produces a picture,
+  which is why it was worth five real files to settle.
+- **What an absent block holds is read out of the file, never assumed.** A raster
+  layer's `InitColor` states nothing and a **mask's states all-ones**, because a
+  Clip Studio mask begins revealing everything — taking an absent block for zero
+  blanks the layer everywhere nobody painted. And a test of that has to start
+  from a canvas whose blocks can *actually* be absent: at 300 square every block
+  but the first overhangs, so none can be left out and the guard tests nothing.
+- **A bitmap's size must be bounded by the canvas, not by `MAX_DIMENSION`.**
+  Nothing else ties a layer's own bitmap to the document, so a 1×1 canvas with 64
+  layers passes at 256 bytes while each layer may still declare 16384² — 1.3 GB
+  of inflate each, all discarded by the blit. **A blit must clip against the
+  bitmap as well as the canvas**: a bitmap is padded to whole blocks, so clipping
+  only against the canvas copies that padding over the picture.
+- **A Krita group is a folder now.** Krita lists layers uppermost first, so the
+  reversal the reader already did puts a group after its own contents — where a
+  `LayerStack` keeps one. A group's **opacity** still folds into its children (a
+  folder at 50% over two overlapping children is not two children at 50% each);
+  its **eye** does not, because it lives on the folder. `GroupFlattened` now
+  means only what it means for ORA: nested past `MAX_DEPTH`.
+- **A folder carries less than a layer, and the difference is a loss list.**
+  Umber's folders are pass-through, so a source folder's opacity, blend mode and
+  mask all have to be reported. In `.clip` the opacity cannot even be folded —
+  the contents are built before the folder is reached. And a folder's blend mode
+  is lost **whether or not Umber has that mode**, so the test is "is it
+  pass-through", not `blend::nearest`.
+- **MediBang `.mdp` is not read, and the blocker is one bit of information.** The
+  format is documented well enough to write — the note calling it "proprietary
+  and barely documented" was wrong in every clause — but whether the XML layer
+  list runs top first or bottom first cannot be settled from the samples
+  available: one has a single layer, and in the others the visible layers do not
+  overlap, so either order matches the file's own thumbnail. A reader that
+  guesses inverts every multi-layer document silently. `docs/document-import.md`
+  has the format; what it needs is a file that settles the direction.
+- **`.psd` masks: the verdict was re-opened and a narrow fork is now the right
+  answer.** "A second parser walking the same bytes" is correct about a *whole*
+  PSD reader and overstated for a mask — the layer-mask block is length-prefixed
+  and holds a rectangle, a default colour and two flag bytes. But it does not
+  stop there: the mask's samples are a fifth channel, and the crate's channel
+  walk assumes every channel is the layer's height, so the fork has to read
+  channel lengths too. Roughly 200–300 lines, and the same work fixes the RLE
+  refusal that currently rejects the whole file. Keep the crate for pixels,
+  compare record boundaries against it per layer, and refuse **the mask, not the
+  document** on disagreement.
 - **`psd` 0.3.5's `Layer::visible()` returns its own opposite.** Adobe's flag is
   *hidden*; the crate reads it as *visible*. `photoshop.rs` inverts it, and a
   test pins that. Do not "fix" the inversion.
@@ -2132,6 +2215,70 @@ it records a small composite into a rotation of staging buffers, and
   brushes in "Blenders" and emptied the paints. Erasing is the only setting that
   overrides a name.
 
+### The eyedropper
+
+`umber-app::syspick` reads a pixel of the *desktop*; the canvas half is
+`CanvasRenderer::pick_colour`, unchanged. `Tool::Eyedropper` is the tool and Alt
+with any other tool in hand is the same gesture.
+
+- **One gesture, two ways in, one route to a colour.** Both resolve to
+  `gesture::Press::Eyedropper`, so `app.rs` routes one answer and there is still
+  exactly one call to `pick_colour`. A second `Press` variant would have been a
+  second thing to route.
+- **It is a drag, and that is the whole of how a colour outside the window is
+  reachable.** winit takes the mouse capture on button-down — `capture_mouse`
+  from `WM_LBUTTONDOWN` on Windows, the protocol's implicit passive grab on X11 —
+  so `CursorMoved` goes on arriving with coordinates past the client size and the
+  button-up arrives wherever it happens. No grab of our own, no global hook, no
+  overlay; an overlay would be *under* the pointer and therefore the thing a
+  screen read reads. **The pen path has not been run**: winit's `WM_POINTER`
+  handler does not capture, so a pen rests on Windows' own implicit pointer
+  capture; and a pen's Alt-tap is a *click*, because Alt-with-contact is the
+  brush resize until the release settles it. A pen reaches the desktop half
+  through the tool.
+- **A read of the desktop costs a display refresh, so the sample is once per
+  frame.** `examples/measure-screenpick.rs`: `GetPixel` against the screen DC is
+  about 7 ms and `GetDC`/`ReleaseDC` is 9 µs, so there is no handle to cache and
+  no cheaper call — 7 ms is 1/144 s and the read waits for the compositor.
+  Re-run the example before changing any of it; a 60 Hz panel should read 16 ms.
+- **That puts a blocking `pick_colour` on the frame loop, and it is the one
+  exception to the rule under "Colour pickup".** The rule protects a *stroke*; a
+  pick cannot coexist with one. `probe_canvas` is the obvious reuse and is the
+  wrong instrument: its two-frame lag is free for a trailing average and wrong
+  for a gesture the hand aims by a readout.
+- **Three answers, not two, and the middle one was a bug.** `aim` answers Canvas,
+  Interface, Desktop or Unreachable. `ui_owns_pointer` gates the *press* and
+  nothing asked again, so a drag onto a panel went on sampling the document —
+  `screen_to_doc` is a plain camera transform and maps a point over the Layers
+  panel to a real document pixel at any zoom that fills the window.
+  `Aim::Interface` reads nothing, gated on the same `Editor::pointer_over_canvas`
+  that places the crosshair, so the mark and the behaviour cannot disagree.
+  Reading a panel off the *screen* is the tempting alternative and hands back the
+  theme's ink already composited with whatever egui drew over it.
+- **`GetPixel` rather than `BitBlt`, and off every monitor is why.** Measured:
+  outside the virtual screen `GetPixel` answers `CLR_INVALID` where a `BitBlt`
+  succeeds against nothing and returns black. Two screens of different heights
+  leave a real gap a drag crosses. `CAPTUREBLT` is refused: it repaints the whole
+  desktop.
+- **Windows only, and the strip says so where it is not.** The *tool* is not
+  disabled elsewhere — picking inside the window works everywhere — so what is
+  drawn is a sentence, in `syspick::outside_line`, which is the one place both
+  readings live. X11 would be `xcb_get_image`; Wayland's answer is the
+  compositor's own `org.freedesktop.portal.Screenshot.PickColor`, which is a
+  different interaction rather than a backend; macOS needs Screen Recording
+  permission and nobody here has a Mac.
+- **A wide-gamut or HDR display hands back a number in its own space and it is
+  read as sRGB.** Umber has no colour management anywhere, so there is nothing to
+  convert against. Hardware overlays are not in it either — video planes read as
+  black.
+- **No loupe**, and Umber's own title bar is outside the client area and does
+  read off the desktop. Both stated rather than denied.
+- **`Tool::paints` was a `matches!` and is a `match`** — the standing rule paying
+  for itself, since a new tool would silently have been one that paints nothing.
+- **The eyedropper is the one tool with a cursor of its own.** Every other tool
+  has a mark whose size is what the hand aims with; a pick has no mark and a
+  one-pixel target.
+
 ### Undo
 
 Stores the RGBA bytes a stroke replaced, not whole layers (a full 2048²
@@ -2282,6 +2429,14 @@ once per stroke but must never move into the drawing loop.
   pointer-up, and as much again to decode on undo. If depth on a large canvas
   is ever genuinely wanted, the fix is a patch that stores *tiles* rather than
   the stroke's bounding box; nothing short of that is worth the change.
+  The ceiling is **32 GB per document**, and the figure argues from what the
+  engine can use rather than from what a machine has, which is the only honest
+  source: Umber cannot read the machine's memory, and a per-document figure taken
+  from it would be wrong the moment a second tab opened. A full-width stroke on a
+  10000² canvas is 400 MB, so 32 GB is eighty of them; on 2048² it is two
+  thousand entries, past the point where the budget rather than the canvas limits
+  the history. Above that the answer is a patch storing tiles, not a larger
+  number.
 - **`restore` rebuilds the whole timeline from one read out of a file** —
   entries in timeline order, the position within them, and `dropped` — and still
   answers to the in-memory budget, so a file written by a build with a larger
@@ -2403,6 +2558,41 @@ design shows a whole row of them.
 
 - **Never hard-code a colour.** Everything comes from `theme::Palette`, which is
   what makes the second theme a table of values rather than an edit sweep.
+- **Six themes ship, and four of them are other applications' greys.** Every one
+  is a `Palette` and nothing else, which is the claim above being cashed in.
+  Every grey is sampled from a screenshot rather than eyeballed; the deviations
+  are stated at the palette rather than in a commit message. Four rules came out
+  of it:
+  - **`ThemeKind::id` is the one statement of what a file calls a theme.**
+    `prefs` writes it to the preferences file and `themelib` to a
+    `.umbertheme`'s `base` line; the two used to hold a `match` each with a
+    comment saying they were deliberately the same words, which is a thing that
+    has to be true with nothing making it so. Pinned as literal strings, because
+    a round trip is self-consistent under any rename. The shipped labels are also
+    **reserved names**: nobody can call their own theme "Krita" any more.
+  - **`Accent::Umber` means "this theme's own accent".** It used to spell
+    Graphite's and Paper's out; for a theme accented in blue that hands back a
+    colour it has never worn.
+  - **A contrast floor has to be what ships, not the round number.**
+    `text_reads_against_every_surface_it_is_drawn_on` runs over every theme
+    rather than the ones being added, and the first thing it caught was Paper:
+    `text_dim` on its own `window` is 2.92:1. A bound the shipped set does not
+    meet is a bound stated wrongly — and a bound loosened to admit a palette that
+    fails it is a defect wearing a guard's clothes.
+  - **A guard's domain is the code's, and `style_from` is only half of it.** The
+    tokens egui is handed miss every control this interface *paints* —
+    `controls.rs`'s buttons, the canvas scrollbar, the pen dot, the splash. Three
+    of four defects a critic found were pairs outside that domain.
+  - **A preset theme's identity may live in a token the previews cannot show.**
+    `every_theme_preview` draws the Settings dialog because it puts most of the
+    palette on one screen, and `control_active` is not on it. A theme sampled
+    from another application is likely to be recognisable by exactly that colour.
+    Render a panel before judging one.
+  - **A figure in a comment is what the next change gets argued against.**
+    `no_two_accents_look_alike_in_one_theme` said the tightest shipped accent
+    pair was 64; it is 68, and a new palette's accent had already been argued
+    against the wrong number. Compute the figure with the code that will later
+    check it, not beside it.
 - **`theme::metrics` holds the design's fixed sizes.** Use them instead of
   re-typing 264.0 or 36.0 at the call site.
 - **Never put a Unicode symbol in the UI.** Archivo carries none of them, so
@@ -2419,6 +2609,18 @@ design shows a whole row of them.
   `keylayout::name_for` is a pure function of an injected reading, which is the
   only way the Norwegian and German answers are tested at all, and the reading is
   cached — the platform is asked from the *input* path, never while painting.
+- **A keymap is `shortcut = <ActionId> <ChordId>`, and there is one statement of
+  that line and one of the merge.** `shortcuts::shortcut_lines` writes it for
+  both the `.umberkeys` keymap and the preferences file; `shortcuts::merge` is
+  the tolerance both readers keep. They used to be two copies with a doc comment
+  claiming they were identical, which is a promise held by discipline — and
+  *nothing tested it across the boundary*, so renaming `prefs`' key left every
+  test in both modules green while the interoperability died.
+  `a_keymap_and_a_preferences_file_read_each_other` is that test. The one real
+  difference is `every`: a keymap names every command including the unbound ones,
+  a preferences file only the customised ones, because silence means opposite
+  things in the two files — and a file carrying a keyboard to another machine
+  must not fall back on "this build's default".
 - **A dialog's button strip goes inside a `horizontal`.** A bare
   `Layout::right_to_left(Align::Center)` takes the *whole* of the remaining
   height of the `Ui` it is in, because the align is the cross axis — so on a
@@ -2466,15 +2668,54 @@ design shows a whole row of them.
 - The design's sliders, toggles and segmented pickers are **painted** in
   `widgets.rs`. Restyling egui's stock widgets into them was tried and fights
   the framework; add to `widgets.rs` instead.
-- **A rail whose figure can be typed is `widgets::number_row`, and there is one
-  of it.** The readout is a real `TextEdit` dressed as the painted readout, the
-  drag lands on each multiple of `snap` within an eighth of a step, Alt
-  suppresses that, and a *typed* figure is clamped to the range and snapped to
-  nothing — the point of typing it is to say something the rail cannot. Every
-  number in `NumberRow` is in the value's own units, never the readout's, which
-  is what lets the wheel's angle (45°) and the interface scale (25%, shown as a
-  percentage of a 0.75..=2.0 value) be the same control. Two implementations of
-  "type it or drag it" is how the two end up disagreeing about what Escape does.
+- **A rail whose figure can be typed is `widgets::typed_rail`, and there is one
+  of it — in two shapes.** `typed_row` is a panel body's two stacked lines and
+  `inline_slider` is the tool options strip's single line; `RailShape` decides
+  only where the label, the track and the figure are put. `number_row` is a thin
+  adapter over it, kept because `colorpicker` and `settings` build a `NumberRow`
+  by struct literal. The drag lands on each multiple of `snap` within an eighth
+  of a step, Alt suppresses that, and a *typed* figure is snapped to nothing —
+  the point of typing it is to say something the rail cannot. Every number is in
+  the value's own units, never the readout's, which is what lets the wheel's
+  angle (45°) and the interface scale be the same control.
+  **The strip used to have a rail of its own whose figure could not be typed at
+  all**, on the recorded ground that `number_row`'s two rows do not fit
+  `metrics::OPTIONS_STRIP`'s 36 points — which was true and led straight to the
+  wrong repair. Two implementations of "type it or drag it" is how the two end
+  up disagreeing about what Escape does.
+  - **`widgets::Figure` is the readout's rule** — scale, suffix, decimals, and a
+    word for zero — and the one statement of format/bare/parse, so a call site
+    cannot hand over a parser that disagrees with its own formatter. The zero
+    word is the airbrush's "off", and the field *accepts* it as well as showing
+    it: a readout its own control refuses is one the control cannot reproduce.
+  - **`Rail::limit` is what a typed figure is clamped to; `Rail::span` is only
+    what the rail lays out.** They differ only for brush size, whose rail stops
+    at `tweaks::SIZE_RAIL_TOP` (1000) while `Brush::MAX_SIZE` is 2000, so typing
+    1500 means 1500. A `const` assert keeps the two apart, because a rail that
+    reached the whole range would retire the distinction silently and every test
+    of it would go on passing by being vacuous.
+  - **A buffer is compared against its *seed*, never against the value.** The
+    value moves under a held buffer more often than it looks: egui surrenders a
+    `TextEdit`'s focus on a click, so clicking the rail beneath a focused field
+    is a commit and a drag in one frame. Comparing against the value then reads
+    an untouched buffer as "somebody typed something" and writes the stale seed
+    over the drag. `typed_value` takes the seed and has no access to the value,
+    so the comparison cannot be written the wrong way round again.
+  - **A `number_row` cannot carry a unit that changes with the magnitude**, and
+    that is the one thing to check before reaching for it. Its readout is
+    `value * per_unit` at one fixed suffix, which is what makes `parse` the exact
+    inverse of `bare` *by construction rather than by agreement*. The undo budget
+    says "512 MB" at one end and "32 GB" at the other, so it is the settings
+    dialog's one hand-built typable figure, trading that structural guarantee for
+    a tested one. Its rail being linear is **not** the reason and reads like one.
+    **It opens on the readout *including* its unit**, unlike `number_field`,
+    which drops the suffix: there the unit is fixed by the row, here it is the
+    only thing on screen saying what a bare figure means, and opening "1 GB" as
+    "1" turned a typed 512 into 32 GB.
+  - **The figure is pinned to the end of its box that faces its own rail** —
+    right when stacked, left when inline. A field is as wide as the widest figure
+    its rail can show, so a figure floating in the middle of its reserve reads as
+    belonging to whatever is across the gap.
 - **A rail's span is not a bound on the value, and `drag_track` is where that
   has to be true.** `tweaks::Tweak::range` states the principle and the rail
   broke it. A value outside the span pins the knob at an end, and a stationary
@@ -2487,6 +2728,13 @@ design shows a whole row of them.
   granularity at the size a painter actually uses, to prevent a mis-click. The
   rule lives in `track_value`, a pure function, so "this is a no-op for every
   value in span" is a test rather than a sentence.
+  **The size rail was later widened anyway, and for a different reason.**
+  400 → 1000 was asked for, and it costs 13.3% of the granularity at every size
+  (a log rail loses uniformly: `ln 1000 / ln 400` is 1.153). What makes it
+  payable is that the figure can now be typed, so the exactness the rail gives up
+  is exactness the keyboard hands back — the argument the earlier refusal did not
+  have available. Preventing a mis-click is still not a reason to widen a span;
+  `track_value`'s tap refusal is.
 - **A menu row that stands for an `Action` takes its label and its key from
   `shortcuts`, never from a string at the call site.** The View menu drew
   `Action::FitView` as "Fit to window" while the Shortcuts page listed it as
@@ -2508,9 +2756,15 @@ design shows a whole row of them.
   not the identity either — `set_color` guards hue and copies saturation across
   unguarded, so clicking into the readout and out again wiped the picker's
   saturation on a colour dialled to zero value. Gate the write on somebody
-  having actually typed. **`settings::token_row` still has the Escape half and
-  writes the theme file to disk** — `egui::Modal::show` draws its content and
-  *then* consumes Escape, so the pane is drawn with the caret already gone.
+  having actually typed. **`settings::token_row`'s Escape half is fixed, and how
+  is the generalisable part.** Nothing *on the field* distinguishes an Escape
+  blur from a click elsewhere, because the caret is already gone by the time the
+  row draws. The key is the only evidence, and it is still in the input then —
+  `egui::Modal` consumes it in `should_close`, which runs **after** its content.
+  Read it, do not consume it, and the dialog still closes on the same keystroke.
+  The guard has to run **inside a real `Modal`** or it proves nothing about the
+  premise it argues from. What it does not claim: a complete six-digit hex has
+  already been applied live and Escape does not take that back.
 - **A text field in the interface needs no `shortcuts::set_capturing`.**
   `ui::draw` calls `shortcuts::set_typing(ctx.text_edit_focused())` once for the
   whole interface, so any real `TextEdit` is covered. `set_capturing` belongs to
@@ -2539,6 +2793,59 @@ design shows a whole row of them.
 - egui keeps separate light and dark styles; `theme::apply` writes both and sets
   the preference, otherwise switching themes leaves egui's internals in the old
   mode.
+- **A harmony's angles are on the RGB wheel, and `harmony.rs` says so.** `Hsv`'s
+  hue is 0 red, 120 green, 240 blue, so the complement of blue here is yellow
+  where a painter's RYB wheel gives orange. Both are defensible and visibly
+  different, so the module states which one it is, what a painter should expect,
+  and what an RYB mode would have to be — a hue *mapping* on the way in and out,
+  behind a control, leaving the offsets and every caller untouched, never a
+  second `hues`. Checked rather than assumed: Krita's selectors are HSV/HSL/HSI/
+  HSY′ over RGB with **no** harmony rules at all, Clip Studio's Color Wheel is
+  HSV or HLS with no relation generator, and Photoshop has had none in the
+  application since the Adobe Color Themes panel was withdrawn. The one
+  mainstream tool computing harmonies on RYB is **Adobe Color**, a web tool,
+  which is why its complement of red lands near hue 137.
+  `a_complement_is_the_opposite_hue_on_the_rgb_wheel` pins the three pairs
+  somebody would check by eye — every other test in that file is stated in
+  *offsets*, so a switch to RYB that left the offsets alone would leave all of
+  them green.
+- **Both tetrads are named and neither may be left bare.** `Tetrad` is the square
+  (0/90/180/270) and `RectangleTetrad` the double complementary (0/60/180/240) —
+  a different set, not a rotation. The word names two things, so with both in one
+  dropdown a row reading "Tetrad" would be a control lying about which it drew.
+  The **variant** keeps its bare name because `tetrad` is what a preferences file
+  has been writing since the enum existed; the **label** is what moved.
+- **A `widgets::dropdown` alone on a line reads as a caption, not a control.** It
+  draws no fill, so a trigger with nothing before it is a word and a chevron on
+  the panel's own background. The harmony relation picker was read exactly that
+  way — an artist asked for a triad and a tetrad that were already in the menu —
+  and the fix is a small dim caption *above* it rather than a label beside it,
+  because beside costs the width the longest option needs and `Dropdown` elides a
+  label it cannot fit. The picker-mode switch escapes this only because it keeps
+  a leading mark.
+- **The triangle's Angle rail rotates and Swap white and black reflects, and
+  neither reaches the other's arrangements.** Rotation walks the three rotations
+  of the corner labelling; the reflection gives the other three. Together they
+  reach all six and neither needs to grow. Because the shape is equilateral and
+  the axis runs through a corner the *outline* does not move, so `Hub::contains`
+  cannot tell the two apart: the hub that judges a press is handed the flag for
+  construction's sake and is provably a no-op today — demonstrated by mutation,
+  and said at both places rather than claimed as guarded.
+- **The theme editor's token chip opens the picker, not a picker.**
+  `settings::token_picker` draws `colorpicker::show` with the artist's own
+  settings and with `picker_mode_switch` itself, so every setting it can move has
+  a control on the same modal. That is the *opposite* of `show_sliders`' rule for
+  the New document and Export dialogs, and the difference is exactly that those
+  draw sliders alone. What is never shared is the colour — `Editor::hsv` is the
+  paint in hand and a token is not paint. **The palette is written live and the
+  file is not**: a `ThemeLibrary` write reaches the disk immediately, so the
+  write waits for the pointer to come up or the picker to close.
+- **A nested `egui::Modal` must not paint a second backdrop.** `Modal` dims the
+  whole window by default, so one inside another puts the interface at 37% — and
+  a colour picker over a theme editor exists precisely to be judged against that
+  interface. `backdrop_color(Color32::TRANSPARENT)` keeps every modal property
+  that matters: the backdrop is what makes a click outside close it, and it
+  refuses input painted or not.
 - **HSV is the colour picker's state, not a derivative of the colour.** Hue is
   undefined for greys, so deriving it from RGB each frame means dragging value
   to black silently resets the hue to red. `Editor::hsv` is the source of truth;
@@ -2578,14 +2885,51 @@ design shows a whole row of them.
   strip already has a filled pill in `widgets::chip`, where the fill means *not
   a control*, so a second one that opens would teach the opposite.
   `metrics::DROPDOWN` is the height and `text::TINY` the font, everywhere.
-- **The canvas dialogs are one form and two call sites** (`canvasdlg.rs`). New
-  document and Canvas settings ask the same four questions, so they share
-  `CanvasForm` and one body; two dialogs drifting apart is how "New" ends up
-  offering a preset "Canvas settings" cannot express. They are drawn from
+- **The canvas dialogs are one form and two call sites** (`canvasdlg.rs`), and
+  what a size *is* is `umber-core::canvassize`'s — the shapes, the sizes under
+  each, the paper table, the rounding, which shape a canvas reads as, and the
+  device's bound. Same division `CanvasCopy::plan` and `Clip::place` keep. They
+  share `CanvasForm` and one body; two dialogs drifting apart is how "New" ends
+  up offering a preset "Canvas settings" cannot express. **Both open on an aspect
+  ratio and the sizes follow from it**: the shape a canvas is has nothing to do
+  with whether it exists yet, and offering the sizes to one of the two is how the
+  pair starts to drift — which it had, since presets used to be New's alone. Only
+  the heading, the button label and the anchor block differ. They are drawn from
   `ui::draw`, not from a panel body, for the reason the brush library's modals
   are. The anchor control appears **only** when the size is actually changing —
   on a New document there is nothing to anchor, and on an unchanged size it
   would be a live knob that does nothing.
+  - **A paper size is a physical size, so the resolution is half of it.** Pixels
+    are `round(inches × dpi)`, half away from zero, and the resolution has to
+    reach `Document`: 2480 × 3508 recorded at 72 dpi is not A4, it is an
+    875 × 1238 mm poster. The rounding is a rule rather than a coin toss because
+    at 72 dpi it reproduces the PostScript page sizes exactly (A4 595 × 842,
+    Letter 612 × 792) — an authority fixed decades ago. Ties are reachable at odd
+    typed resolutions, since Letter is 8.5 in wide, so rounding up is pinned. The
+    dialog re-derives the pixels whenever the resolution moves — **once, at the
+    top of the body**, not beside each control that can move it, or it draws the
+    old pixels beside the new dpi for a frame, which is a millimetre readout
+    wrong by the ratio rather than merely stale.
+  - **`Sheet::pixels` is deliberately not clamped at `MAX_EDGE`.** Clamping made
+    A3 at 1402 dpi come back as 16384 square: an A3 button lit over a perfect
+    square, `read` filing it as 1:1, and `max_dpi` answering that it fitted. One
+    clamp, three lies. A sheet too large is reported at its true size and refused
+    by the caller's limit.
+  - **`Aspect::holds` and `choose` share one rounding, and it is the lock's
+    too.** Cross-multiplying exactly while `choose` rounds is wrong twice: a
+    canvas 1601 wide cannot be exactly 16:9, so dragging the width made the row
+    of sizes appear and vanish once per pixel, and `choose`'s own output was not
+    a shape the same module recognised. The lock was a third copy, in `f32`, in
+    the UI file, agreeing with the others only by the accident that
+    `1608 / (16/9)` lands exactly on `904.5`.
+  - **The device's `max_texture_dimension_2d` is what decides whether a canvas
+    can exist, and a canvas dialog has to ask.** Past it, creating the layer
+    array is a validation error, which is fatal. Sizes past it are not drawn and
+    a sentence says what the machine holds; a sheet's resolution is capped so an
+    unreachable size cannot be asked for; and `document()` clamps as a backstop,
+    which makes the guarantee one function rather than nine call sites. The old
+    dialog never asked because nothing it offered exceeded 3840 — the shape of
+    this class of bug: correct until the day something reaches the limit.
 - **The settings dialog is one size, whatever page is in front.** A header, one
   vertical `ScrollArea` with `auto_shrink([false, false])` and an explicit max
   height, a footer. Each pane used to size itself — two had no scroll area at
@@ -2745,6 +3089,68 @@ design shows a whole row of them.
   `.gpl` carries it, `grid_columns` honours it as a maximum and the writer
   writes it back; nothing sets it. Named here so the next person does not
   rediscover it.
+- **There is one adding mark and its glyph says what it will add.** In Harmony
+  mode it is the harmony mark and puts the whole relation in through
+  `Palette::add_all`; otherwise it is a plus and puts in the colour in hand. A
+  plus that sometimes adds five colours is the control whose behaviour depends on
+  state you cannot see — and the state it follows is the *Colour* panel's picker
+  mode, which is kept in prefs and survives that module being taken out of the
+  layout, so the mark itself has to say. Every member including the base still
+  comes off `Editor::hsv`.
+- **The grid is read-only until a pencil in the header says otherwise, and it
+  resets every run.** There is no undo for a palette anywhere in Umber and a
+  `PaletteLibrary` write reaches the disk on the spot, so a remove is
+  unrecoverable — with a mark sitting *inside* a swatch a pixel from the colour
+  it throws away, and egui calling a press a drag on **time** alone. With editing
+  off the corner marks are not *allocated*, not merely unpainted, and no cells
+  are collected, so the drag model is inert rather than invisible. Off is the
+  safe state, so the flag lives in egui's temporary store: never written to
+  prefs, and an evicted store brings the module back read-only. Taking a colour
+  is not gated — what is left is a palette you can paint out of and cannot
+  damage. **The gate has to be tested at every mark, including the header's**:
+  `a_read_only_palette_cannot_be_changed_by_any_gesture` drives `panel`, and the
+  adding mark is in `header_controls`, which nothing under `cfg(test)` called at
+  all — deleting its gate left 1,955 tests green while a press wrote a colour
+  into the artist's `.gpl`.
+- **Import reads six formats and export writes one, and that asymmetry is the
+  point.** `umber-core::palimport` converts *into* `.gpl` on the way in, so "the
+  interchange format is the storage format" still holds: one storage decoder, one
+  encoder, and the readers are conversions rather than a second library. Which
+  six was decided by what the generators artists use actually hand out — Coolors
+  exports a URL, CSS, SVG, PDF and `.ase` and **no `.gpl` at all** — not by a
+  list of extensions. `.act` is refused because it pads with zeroes and a padded
+  entry is indistinguishable from a real black; `.kpl` because its floats are
+  stated against ICC profiles in the zip and Krita writes `.gpl` too.
+- **The highest-value reader is not a file format.** A list of hex codes is what
+  a Coolors URL, a CSS dump, a `.hex`, a Paint.NET `.txt` and a message in a chat
+  window all are, so one tolerant parser reads all of them. Two rules carry it.
+  **A bare hex run is a colour only on a line holding nothing else** — `facade`,
+  `beefed`, `accede` and `deadbeef` are words made only of hex digits, and
+  trusting a bare run in prose puts colours nobody chose into somebody's palette.
+  **Eight digits are read by whether they were prefixed**: `#RRGGBBAA` is CSS, a
+  bare `AARRGGBB` is Paint.NET, and one rule is right in both worlds where a mode
+  flag per file type would have been wrong for whichever of the two somebody
+  pasted rather than opened. CSS's four-digit `#RGBA` is deliberately not read at
+  all: `#1234` is an issue reference and `#cafe` is a selector.
+- **A URL is unwrapped only once it has been shown to be a palette.** Its last
+  path segment is handed to the scanner as a line of *bare* codes, which switches
+  off the rule above — so without a test there, `wikipedia.org/wiki/Facade` is a
+  pink and a short git commit hash is two colours. Twelve hex characters in a
+  path is a commit hash far more often than a pair of colours.
+- **The paste is a field and not a button that reads the clipboard**, and
+  `arboard` being already present is what makes that a decision. A one-click
+  version reaches into the system clipboard and makes a file from whatever it
+  found with nothing on screen between the two; a field shows what is about to be
+  read, can be corrected, takes a link typed by hand, and needs no clipboard code
+  — which keeps `sysclip`'s "no test may touch the real clipboard" *structural*
+  here rather than obeyed.
+- **A flat struct of loss counts has the same partial-exhaustiveness trap an enum
+  does.** `Losses::any` is `self != default` and total by construction;
+  `sentences` was six hand-written `if self.field > 0` blocks, so a seventh field
+  would be *silently* absent — a paste raising a notice with a heading and no
+  lines, and an import saying nothing at all. It opens with a destructuring `let`,
+  which makes a seventh field a compile error. The derived reading and its
+  hand-written twin is the shape to look for.
 
 ### The dockable modules
 
@@ -2886,6 +3292,50 @@ the binary with `STATUS_ACCESS_VIOLATION` at process exit on the ARM64 Windows
 runner. Every test passed and the run failed on the way out, which is the worst
 shape of this bug, and it is invisible on a desktop driver. Anything here that
 wants a device takes `gputest::lock()` and holds the guard for the whole test.
+
+`prefs_lock` is `pub(crate)` and lives beside `set_undo_budget` rather than
+inside `prefs::tests`, because **two mutexes serialise nothing** — a lock only
+orders the tests that take the same one, and `settings`' undo row writes the same
+global through the same door. Anything that draws the General pane takes it.
+
+**A guard that restates the panel's own rule inside the test can only agree with
+itself.** This is `pressing_bold_actually_puts_a_heavier_mark_on_the_canvas`'s
+lesson and it recurred four times in one session, so it is worth stating as a
+method rather than as an anecdote:
+
+- **Measure the output, never restate the rule.** Two canvas-dialog guards
+  claimed to pin the dialog's bounds and drew nothing — one asserted about
+  `max_dpi`'s return value while claiming to pin the field's range, the other
+  copied the panel's own filter into its own loop. Deleting either filter left
+  both green, and the visible result was a 16384 button on a 4096 device. What
+  catches it is reading the text egui actually drew: `ctx.run_ui` returns a
+  `FullOutput` whose `shapes` carry every galley, so asking whether a label is
+  there is a genuine panel test that needs no window.
+- **A guard on a model is not a guard on the panel, and the panel is where the
+  gate usually is.** `a_read_only_palette_cannot_be_changed_by_any_gesture`
+  drives `panel`; the palette's adding mark is in `header_controls`, which
+  nothing under `cfg(test)` called at all. Deleting its gate left 1,955 tests
+  green while a press wrote to the artist's file. Enumerate the *call sites* of
+  the rule, not the rule.
+- **A widget drawn through `ui.new_child(max_rect(…))` allocates nothing in its
+  parent**, so one taller than its slot paints over its neighbours instead of
+  pushing them down — a defect no layout test can see. Measure it rather than
+  looking: `inset_field` is 18.22 points at `text::TINY` against
+  `metrics::SLIDER_ROW`'s 16.
+- **A budget on the tool options strip is hand-measured, and a guard has to
+  measure the *reserve*, not the glyphs.** The strip is one unwrapped row, so a
+  budget a few points short draws a rail off the right edge rather than
+  reflowing. That was theoretical while the readouts were painted labels sized to
+  the figure showing; a field is sized to the widest figure its rail can produce
+  and paints its galley at one end of that box, so up to three characters of
+  allocated width carry no shape at all — and the group whose reserve hangs off
+  the edge is exactly the last one drawn. Read the frame's own rect as well as
+  the shapes, sweep a point at a time, and say out loud which strip the sweep
+  declines to cover and why.
+- **The cheap way to find out whether a test agrees for the wrong reason is to
+  mutate the code it claims to cover.** Commit first, so `git checkout --`
+  reverts the mutation and not your work — that collision is now routine enough
+  to be worth the habit.
 
 `composite_pixel` runs the real composite pass into an offscreen target, which
 is the only way to test layer opacity and blend modes. Two things to copy when
@@ -3938,7 +4388,7 @@ controls, how to build it and the licence.
   does not need a paragraph saying it shows pressure. Somebody who has opened
   Umber learns all of it in less time than reading about it takes, and somebody
   who has not is deciding whether to download, which a feature inventory does
-  not help them do. Name the thing and stop. "Two themes and an interface
+  not help them do. Name the thing and stop. "Six themes and an interface
   scale" is a fact; "Shortcuts lists every command with a search field and lets
   you rebind" is the manual, and Umber does not ship one because it does not
   need one.
