@@ -5084,9 +5084,25 @@ impl CanvasRenderer {
     /// doing, so a loupe over a canvas at 37% shows the pixels a release would
     /// take rather than what the sampler resolved them into.
     ///
+    /// **The camera is snapped to the middle of the pixel `doc_point` is in,
+    /// and without that this whole function is a lie.** `composite.wgsl` samples
+    /// the layer array through a `Linear` filter at `uv = doc / doc_size`, so a
+    /// texel centre lands on a *document* pixel only where the coordinate is
+    /// `n + 0.5`. `screen_to_doc` is a camera transform and hands over an
+    /// arbitrary fraction, so an unsnapped block is 121 bilinear blends of four
+    /// pixels each — a hard edge in the picture arrives in the loupe as a soft
+    /// ramp, which is the one thing a magnifier is for reading. It is not only
+    /// the loupe's problem: `pick_colour` has always been this render, so the
+    /// colour an eyedropper *took* was a blend of four pixels at every
+    /// coordinate but a pixel centre, and at `frac == 0` it was the flat
+    /// average of all four. **The existing guards could not see it** because
+    /// both pick at `(32.5, 32.5)`, the one fraction where a bilinear tap is
+    /// the identity. `a_pick_takes_the_pixel_it_is_over_rather_than_a_blend_of_
+    /// four` is the guard, and it aims deliberately at a pixel's corner.
+    ///
     /// **The middle texel is exactly what [`Self::pick_colour`] answers**, and
-    /// that is what the pivot below is for: with an odd `size`, the fragment at
-    /// `(size / 2) + 0.5` maps to `doc_point` and its neighbours to the
+    /// that is what the pivot is for: with an odd `size`, the fragment at
+    /// `(size / 2) + 0.5` maps to the snapped centre and its neighbours to the
     /// document pixels either side. At a `size` of one it is the identity, so
     /// `pick_colour` is this function and there is one render rather than two
     /// that have to agree about which pixel is the sample.
@@ -5120,11 +5136,17 @@ impl CanvasRenderer {
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // The middle fragment sits at screen `(size / 2) + 0.5`; with zoom 1
-        // and the pivot there, that maps exactly to `doc_point` and every other
-        // texel to a whole document pixel from it. For one texel this is the
-        // (0.5, 0.5) the single-pixel pick always used.
+        // and the pivot there, that maps exactly to the camera's centre and
+        // every other texel to a whole document pixel from it. For one texel
+        // this is the (0.5, 0.5) the single-pixel pick always used.
+        //
+        // `floor + 0.5` is the snap the docs above argue for: the middle of the
+        // pixel `doc_point` falls in, which is where the `Linear` sampler's tap
+        // is exact. Written here rather than at the call site because both
+        // callers want it and a caller that forgot would get a plausible,
+        // slightly soft answer.
         let camera = Camera {
-            center: doc_point,
+            center: doc_point.floor() + Vec2::splat(0.5),
             zoom: 1.0,
         };
         let pivot = Vec2::splat((size / 2) as f32 + 0.5);

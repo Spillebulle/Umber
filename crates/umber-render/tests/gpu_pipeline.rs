@@ -3431,6 +3431,143 @@ fn the_eyedropper_can_pick_the_background_up() {
     assert_near(px, [200, 40, 40], 3, "picked background");
 }
 
+/// Four opaque pixels of known colour meeting at the document corner
+/// `(21, 21)`, on an otherwise empty layer.
+///
+/// A corner rather than a middle deliberately: it is the position at which a
+/// bilinear tap of the layer array is the flat average of all four, so it tells
+/// "the pixel the point is in" from "whatever the sampler resolved" by the
+/// widest possible margin. Every other fixture in this file picks at
+/// `(32.5, 32.5)`, which is a pixel centre and therefore the one coordinate
+/// where the two readings agree.
+fn four_pixels_at_a_corner(h: &mut Harness) {
+    for (x, y, rgba) in [
+        (20u32, 20u32, [255u8, 0, 0, 255]),
+        (21, 20, [0, 255, 0, 255]),
+        (20, 21, [0, 0, 255, 255]),
+        (21, 21, [255, 255, 0, 255]),
+    ] {
+        h.write_block(
+            0,
+            PixelRect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+            rgba,
+        );
+    }
+}
+
+#[test]
+fn a_pick_takes_the_pixel_it_is_over_rather_than_a_blend_of_four() {
+    // `composite.wgsl` samples the layer array through a `Linear` filter at
+    // `uv = doc / doc_size`, so a texel centre is only hit where the document
+    // coordinate is `n + 0.5` — and `screen_to_doc` is a camera transform,
+    // which hands over an arbitrary fraction. Unsnapped, an eyedropper
+    // therefore took a bilinear blend of up to four pixels, and at a pixel
+    // *corner* it took the flat average of all four. `pick_patch` snaps the
+    // camera to `floor + 0.5` for exactly this.
+    //
+    // This was live for as long as the eyedropper has existed and no test could
+    // see it, because the two that pick both aim at `(32.5, 32.5)`.
+    let mut h = harness_or_skip!();
+    four_pixels_at_a_corner(&mut h);
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+
+    for (at, want, what) in [
+        (
+            Vec2::new(21.0, 21.0),
+            [255u8, 255, 0],
+            "the corner all four meet at",
+        ),
+        (
+            Vec2::new(20.0, 20.0),
+            [255, 0, 0],
+            "the far corner of the block",
+        ),
+        (
+            Vec2::new(21.4, 20.6),
+            [0, 255, 0],
+            "inside the top-right pixel",
+        ),
+        (
+            Vec2::new(20.6, 21.4),
+            [0, 0, 255],
+            "inside the bottom-left pixel",
+        ),
+        (
+            Vec2::new(21.5, 21.5),
+            [255, 255, 0],
+            "and a pixel centre, unchanged",
+        ),
+    ] {
+        let px = h
+            .canvas
+            .pick_colour(&h.gpu.device, &h.gpu.queue, &stack, at);
+        assert_eq!(px[3], 255, "{what}: the pixel is opaque");
+        assert_near(px, want, 3, what);
+    }
+}
+
+#[test]
+fn a_block_of_the_picture_holds_the_pixels_around_the_one_a_click_takes() {
+    // The loupe's neighbourhood, and the only test of `pick_patch` at a size
+    // greater than one — which is the size where the pivot, the snap and the
+    // caller's `first = floor(doc) - size / 2` all have to agree. At a size of
+    // one every one of those offsets is zero, so `pick_colour` exercises none
+    // of them: reverting the pivot to the old `(0.5, 0.5)` leaves the whole
+    // workspace green while moving the loupe five pixels off the pointer and
+    // the colour taken with it.
+    let mut h = harness_or_skip!();
+    four_pixels_at_a_corner(&mut h);
+    let stack = [layer(0, 1.0, BlendMode::Normal)];
+
+    // Deliberately not a pixel centre and not a corner: an ordinary place for a
+    // pointer to be. `floor` is (21, 21), so the middle texel is that pixel and
+    // texel `k` is `21 + (k - 1)`.
+    let at = Vec2::new(21.3, 21.7);
+    let block = h
+        .canvas
+        .pick_patch(&h.gpu.device, &h.gpu.queue, &stack, at, 3);
+    assert_eq!(block.len(), 3 * 3 * 4, "row-major, tightly packed");
+    let texel = |col: usize, row: usize| {
+        let i = (row * 3 + col) * 4;
+        [block[i], block[i + 1], block[i + 2], block[i + 3]]
+    };
+
+    assert_near(texel(0, 0), [255, 0, 0], 3, "texel (0,0) is pixel (20,20)");
+    assert_near(texel(1, 0), [0, 255, 0], 3, "texel (1,0) is pixel (21,20)");
+    assert_near(texel(0, 1), [0, 0, 255], 3, "texel (0,1) is pixel (20,21)");
+    assert_near(
+        texel(1, 1),
+        [255, 255, 0],
+        3,
+        "texel (1,1) is pixel (21,21)",
+    );
+    // The right column and the bottom row fall on empty layer, which is what
+    // says the block is centred rather than anchored at its top-left.
+    for (col, row) in [(2, 0), (2, 1), (2, 2), (0, 2), (1, 2)] {
+        assert_eq!(
+            texel(col, row)[3],
+            0,
+            "texel ({col},{row}) is off the painted block"
+        );
+    }
+
+    // And the middle texel is what a click would keep, which is the promise
+    // `pick_colour` being `pick_patch(.., 1)` is supposed to make structural.
+    let single = h
+        .canvas
+        .pick_colour(&h.gpu.device, &h.gpu.queue, &stack, at);
+    assert_eq!(
+        texel(1, 1),
+        single,
+        "the middle of the block is the colour the eyedropper takes"
+    );
+}
+
 /// Drive the smudge probe the way `app.rs` does — record, submit, collect —
 /// and give the GPU as long as it needs, since the whole point of the thing is
 /// that it does not block.
