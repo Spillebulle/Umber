@@ -733,7 +733,12 @@ impl Palette {
             dock: Color32::from_rgb(0x39, 0x37, 0x37),
             chrome: Color32::from_rgb(0x4A, 0x47, 0x47),
             border: Color32::from_rgb(0x26, 0x24, 0x24),
-            popover: Color32::from_rgb(0x39, 0x37, 0x37),
+            // Off the measured `#393737` the panel headers wear, because the
+            // dock column already has that value and a menu dropped over one
+            // would be nothing but its own hairline. Graphite and Paper both
+            // keep these two apart; noticed in `every_theme_preview`, which is
+            // what a picture is for.
+            popover: Color32::from_rgb(0x40, 0x3D, 0x3D),
             popover_border: Color32::from_rgb(0x5C, 0x5C, 0x5C),
             control: Color32::from_rgb(0x5A, 0x57, 0x57),
             control_hover: Color32::from_rgb(0x66, 0x62, 0x62),
