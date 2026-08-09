@@ -179,10 +179,14 @@ impl fmt::Display for PaletteError {
                 "{source} holds {found} colours, and Umber reads at most {max} in one palette"
             ),
             Self::Malformed { source, what } => write!(f, "{source}: {what}"),
+            // "is 4 MB, and Umber reads palettes up to 4 MB" is what whole-MB
+            // rounding produced one byte over the limit: a refusal that
+            // contradicts itself. Say only the limit, which is the half that
+            // tells somebody anything.
             Self::TooLarge { source, len, max } => write!(
                 f,
-                "{source} is {} MB, and Umber reads palettes up to {} MB",
-                len / (1024 * 1024),
+                "{source} is {len} bytes, which is more than the {} MB Umber \
+                 reads a palette up to",
                 max / (1024 * 1024)
             ),
             Self::NoColours { source } => {
@@ -603,7 +607,12 @@ fn parse_entry(line: &str) -> Option<Swatch> {
     }
     Some(Swatch {
         rgb,
-        name: rest.trim().to_owned(),
+        // Through the writer's own rule, exactly as [`Palette::name_swatch`] is
+        // and for the same reason. This reader was the one place a name reached
+        // the field uncleaned: `"Black\tish"` out of somebody else's `.gpl`
+        // would show with its tab in the panel and come back as `"Black ish"`
+        // after a save, so what was held was not what a round trip gave back.
+        name: clean_line(rest),
     })
 }
 

@@ -148,6 +148,18 @@ const PASTED_NAME: &str = "Pasted colours";
 /// somebody would go looking for.
 const PASTE_SOURCE: &str = "The pasted text";
 
+/// The most text the paste field will hold on to.
+///
+/// **Much smaller than `palimport::MAX_FILE_BYTES`, and for a different
+/// reason.** That bound is on the *parse*, which is linear and cheap; this one
+/// is on `egui::TextEdit::multiline`, which lays out the whole string and does
+/// not virtualise, so a multi-megabyte paste is unbounded layout work on every
+/// frame the galley cache misses — before the parse ever gets to say "too
+/// large". A palette of `MAX_SWATCHES` colours is about eighty kilobytes of
+/// text, so a quarter of a megabyte is generous for anything that is actually a
+/// palette and is a size egui handles without noticing.
+const MAX_PASTE_BYTES: usize = 256 * 1024;
+
 /// How many lines of the pasted text are on screen at once.
 ///
 /// A palette is a handful of colours, so five lines shows a whole Coolors link
@@ -180,7 +192,29 @@ struct Pasting {
 
 impl Pasting {
     /// Read the text again. Called from the one place the text can change.
+    ///
+    /// It **cuts** the text at [`MAX_PASTE_BYTES`] rather than only refusing
+    /// it, and says so. Refusing alone would leave the field holding megabytes
+    /// that `TextEdit` re-lays out for as long as the pane is open; cutting
+    /// bounds every frame after the one that accepted the paste, which is the
+    /// most that can be done from this side of egui. The cut is at a character
+    /// boundary, or the `String` would not be one.
     fn reread(&mut self) {
+        if self.text.len() > MAX_PASTE_BYTES {
+            let cut = (0..=MAX_PASTE_BYTES)
+                .rev()
+                .find(|at| self.text.is_char_boundary(*at))
+                .unwrap_or(0);
+            self.text.truncate(cut);
+            self.found.clear();
+            self.losses = palimport::Losses::default();
+            self.refusal = Some(format!(
+                "That is more text than a palette can be, so it was cut at {} \
+                 kB. Paste a list of colours rather than a whole file.",
+                MAX_PASTE_BYTES / 1024
+            ));
+            return;
+        }
         match palimport::text::parse(&self.text, PASTE_SOURCE) {
             Ok((found, losses)) => {
                 self.found = found;
@@ -1534,14 +1568,21 @@ pub fn dialogs(root: &mut Ui, p: &Palette, ed: &mut Editor) {
                     }
                 });
             });
+            // The list of extensions is `readable_formats()`'s and not a second
+            // hand-written one twenty lines from the Import tooltip that calls
+            // it: a seventh format would otherwise update one and not the
+            // other, and this is the copy an artist reads.
             controls::note(
                 ui,
                 p,
-                "Every palette is kept as one .gpl file in a folder of its own, \
-                 which is the format GIMP, Krita, Inkscape and Aseprite all \
-                 read. Import takes .gpl, .hex, .txt, .pal, .ase and .aco, so \
-                 a palette from Coolors, Lospec, Adobe Color, Photoshop or \
-                 Paint.NET comes straight in.",
+                &format!(
+                    "Every palette is kept as one .gpl file in a folder of its \
+                     own, which is the format GIMP, Krita, Inkscape and \
+                     Aseprite all read. Import takes {}, so a palette from \
+                     Coolors, Lospec, Adobe Color, Photoshop or Paint.NET \
+                     comes straight in.",
+                    palimport::readable_formats()
+                ),
             );
             ui.add_space(10.0);
 
@@ -1939,7 +1980,7 @@ mod tests {
     /// different palette. It is pure state and needs no window.
     #[test]
     fn the_palette_in_front_is_a_name_and_never_a_position() {
-        let dir = std::env::temp_dir().join("umber-palette-settle");
+        let dir = std::env::temp_dir().join(format!("umber-palette-settle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         // Named so the sorted order is a, b, c.
@@ -1997,7 +2038,7 @@ mod tests {
     /// `paste_pane` for why it was built that way.
     #[test]
     fn what_was_pasted_is_what_lands_in_the_library() {
-        let dir = std::env::temp_dir().join("umber-palette-paste");
+        let dir = std::env::temp_dir().join(format!("umber-palette-paste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let library = PaletteLibrary::load_from(&dir);
         let mut ed = Editor::default();
@@ -2064,7 +2105,8 @@ mod tests {
     /// artist has to go and delete.
     #[test]
     fn a_paste_with_no_colours_in_it_writes_nothing() {
-        let dir = std::env::temp_dir().join("umber-palette-paste-empty");
+        let dir =
+            std::env::temp_dir().join(format!("umber-palette-paste-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut ed = Editor::default();
         let mut state = State {
@@ -2309,7 +2351,7 @@ mod tests {
             });
             docshot::write_png(&dir.join(format!("{name}.png")), &image).expect("write the png");
         }
-        println!("wrote 5 shots to {}", dir.display());
+        println!("wrote the shots to {}", dir.display());
     }
 
     /// A palette laid out in fours reads as fours where there is room, and a
@@ -2474,7 +2516,7 @@ mod tests {
     /// is the division CLAUDE.md draws everywhere else.
     #[test]
     fn a_naming_field_whose_colour_moved_under_it_names_nothing() {
-        let dir = std::env::temp_dir().join("umber-palette-naming");
+        let dir = std::env::temp_dir().join(format!("umber-palette-naming-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         let id = library.create("Ochres").expect("made");
@@ -2533,7 +2575,8 @@ mod tests {
     /// failure the whole disabled-with-a-reason arrangement exists to avoid.
     #[test]
     fn a_dead_adding_mark_gives_the_reason_it_is_dead() {
-        let dir = std::env::temp_dir().join("umber-palette-reasons");
+        let dir =
+            std::env::temp_dir().join(format!("umber-palette-reasons-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut library = PaletteLibrary::load_from(&dir);
         let id = library.create("Ochres").expect("made");

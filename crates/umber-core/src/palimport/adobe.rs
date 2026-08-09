@@ -37,7 +37,7 @@ use crate::color::{Color, Hsv};
 use crate::palette::{PaletteError, Swatch};
 
 use super::text::from_linear;
-use super::{BigEndian, Losses, push};
+use super::{BigEndian, Losses, push, shortfall};
 
 /// What every `.ase` begins with.
 const ASE_MAGIC: &[u8; 4] = b"ASEF";
@@ -102,7 +102,7 @@ pub fn read_ase(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pal
     }
     // A file that promised more blocks than it carried lost them somewhere
     // before it reached here, and the ones that are here are still good.
-    losses.skipped += stated.saturating_sub(blocks);
+    losses.skipped += shortfall(stated, blocks);
     Ok((out, losses))
 }
 
@@ -235,7 +235,7 @@ fn aco_block(
             None => losses.skipped += 1,
         }
     }
-    losses.skipped += stated.saturating_sub(read);
+    losses.skipped += shortfall(stated, read);
     Ok((out, losses))
 }
 
@@ -319,6 +319,16 @@ fn from_cmyk(c: f32, m: f32, y: f32, k: f32) -> Swatch {
 }
 
 /// A grey level with no grey profile beside it, read as sRGB.
+///
+/// **One is white and zero is black**, which is the direction and is checked
+/// rather than assumed: every published description of the `.ase` Gray model
+/// says "one float between [0,1] with 1 being white, 0 being black", and the
+/// `.aco` grey channel is a percentage of *lightness* over 0..10000 the same
+/// way. The direction is worth stating because it is the mirror of the trap one
+/// arm away — Photoshop's `.aco` CMYK **is** inverted, so getting the habit the
+/// wrong way round here would turn every grey in every file inside out. The
+/// guard is `a_grey_is_not_read_inside_out`, which is deliberately asymmetric:
+/// a test at 0.5 alone cannot tell the two readings apart.
 fn from_grey(level: f32) -> Swatch {
     let byte = (level.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     Swatch::new([byte, byte, byte])
@@ -485,6 +495,31 @@ mod tests {
         );
     }
 
+    /// **A test at one value cannot tell a reading from its own opposite**, and
+    /// grey is the place that bites: `a_converted_colour_space_is_always_named`
+    /// checks 0.5 and is symmetric about it, so it would pass just as happily
+    /// with the direction inverted. Both ends, and both formats, because
+    /// Photoshop's `.aco` CMYK *is* stored inverted one arm away and the habit
+    /// must not leak.
+    #[test]
+    fn a_grey_is_not_read_inside_out() {
+        for (level, want) in [(0.0f32, 0u8), (0.25, 64), (1.0, 255)] {
+            let file = ase(&[ase_colour_block("", b"Gray", &[level])]);
+            let (swatches, _) = read_ase(&file, "test").expect("a palette");
+            assert_eq!(
+                swatches[0].rgb, [want; 3],
+                "an .ase grey of {level} is not {want}"
+            );
+        }
+        // `.aco` states the same axis over 0..10000, and the same way up.
+        for (raw, want) in [(0u16, 0u8), (10000, 255)] {
+            let mut file = Vec::from(1u16.to_be_bytes());
+            file.extend_from_slice(&aco_entries(false, &[(8u16, [raw, 0, 0, 0], "")]));
+            let (swatches, _) = read_aco(&file, "test").expect("a palette");
+            assert_eq!(swatches[0].rgb, [want; 3], "an .aco grey of {raw}");
+        }
+    }
+
     /// Lab's landmarks, which is the only way to say the D50 matrix is the
     /// right one rather than merely a matrix. Black and white are exact; a mid
     /// grey is a grey and nothing else.
@@ -550,7 +585,9 @@ mod tests {
         file[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
         let (swatches, losses) = read_ase(&file, "test").expect("the colour that is there");
         assert_eq!(swatches.len(), 1);
-        assert_eq!(losses.skipped, u32::MAX as usize - 1);
+        // Capped rather than the arithmetically correct 4,294,967,294, which is
+        // a correct number and an unusable sentence. See `palimport::shortfall`.
+        assert_eq!(losses.skipped, crate::palette::MAX_SWATCHES);
 
         // A block whose stated length runs off the end.
         let mut lying = ase(&[ase_colour_block("Ochre", b"RGB ", &[0.8, 0.46, 0.13])]);
@@ -708,7 +745,7 @@ mod tests {
         file.extend_from_slice(&[0u8; 8]);
         let (swatches, losses) = read_aco(&file, "test").expect("the colour that is there");
         assert_eq!(swatches.len(), 1);
-        assert_eq!(losses.skipped, u16::MAX as usize - 1);
+        assert_eq!(losses.skipped, crate::palette::MAX_SWATCHES);
     }
 
     /// Refused by name where nothing was understood, and answering rather than

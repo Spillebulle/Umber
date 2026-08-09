@@ -9,10 +9,11 @@
 //!
 //! # The rules, and why each one is needed
 //!
-//! - **A prefixed code may sit anywhere in a line.** `#RGB`, `#RGBA`,
-//!   `#RRGGBB`, `#RRGGBBAA`, `0xRRGGBB`, `0xRRGGBBAA`, `rgb(…)` and `rgba(…)`.
-//!   A `#` is a statement that what follows is a colour, so it is trusted in
-//!   prose.
+//! - **A prefixed code may sit anywhere in a line.** `#RGB`, `#RRGGBB`,
+//!   `#RRGGBBAA`, `0xRRGGBB`, `0xRRGGBBAA`, `rgb(…)` and `rgba(…)`. A `#` is a
+//!   statement that what follows is a colour, so it is trusted in prose. CSS's
+//!   four-digit `#RGBA` is the one spelling left out, because `#1234` is an
+//!   issue reference and `#cafe` is a selector; see [`hex_swatch`].
 //! - **A bare code is a colour only on a line that holds nothing else.**
 //!   `facade`, `beefed`, `accede` and `deadbeef` are all words made only of hex
 //!   digits, so a bare run trusted in prose would put colours nobody chose into
@@ -289,10 +290,19 @@ fn word_end(bytes: &[u8], at: usize) -> usize {
 
 /// A run of hex digits as a colour and the alpha it carried.
 ///
-/// The three-and-four digit short forms are **prefixed only**. A bare `abc` is
-/// a word far more often than it is a colour, and a bare `f0f` is a filename.
-/// Six and eight digits are accepted either way, and eight is the one place the
-/// prefix changes the answer — see the module docs.
+/// The three-digit short form is **prefixed only**. A bare `abc` is a word far
+/// more often than it is a colour, and a bare `f0f` is a filename. Six and
+/// eight digits are accepted either way, and eight is the one place the prefix
+/// changes the answer — see the module docs.
+///
+/// **Four digits, CSS's `#RGBA`, are deliberately not read at all.** It is the
+/// rarest of the four spellings by a distance, and it is the one that collides:
+/// `#1234` is an issue reference in every chat window there has ever been, and
+/// `#cafe`, `#face`, `#fade` and `#feed` are ordinary CSS selectors. Reading
+/// them gave a colour nobody wrote **and** a "1 colour was partly transparent"
+/// notice about its last digit. Refusing costs the handful of real `#RGBA`
+/// codes anybody writes, which is a refusal rather than a wrong answer, and
+/// that is the trade the importers' standing rule already names.
 fn hex_swatch(digits: &str, prefixed: bool) -> Option<([u8; 3], u8)> {
     if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -304,7 +314,6 @@ fn hex_swatch(digits: &str, prefixed: bool) -> Option<([u8; 3], u8)> {
     };
     match (digits.len(), prefixed) {
         (3, true) => Some(([wide(0)?, wide(1)?, wide(2)?], u8::MAX)),
-        (4, true) => Some(([wide(0)?, wide(1)?, wide(2)?], wide(3)?)),
         (6, _) => Some(([byte(0)?, byte(2)?, byte(4)?], u8::MAX)),
         // CSS puts the alpha last; Paint.NET puts it first and never writes a
         // `#`. So the prefix decides, and both files are read correctly.
@@ -378,19 +387,36 @@ fn looks_like_url(token: &str) -> bool {
     }
 }
 
-/// A web address reduced to the part that might be a palette: its last path
-/// segment, with any query or fragment taken off.
+/// The shortest run of concatenated codes a URL segment is read as a palette.
+///
+/// Four colours, which is what the sites that write them that way write. **Two
+/// is not enough and the difference is a real file**: a twelve-character hex
+/// string in a URL path is a short git commit hash far more often than it is a
+/// pair of colours, and three colours' worth is an eighteen-character
+/// identifier, which is also a thing. Four is where the reading stops being a
+/// guess.
+const RUN_COLOURS: usize = 4;
+
+/// A web address reduced to the part that *is* a palette, or `None`.
 ///
 /// Coolors puts the palette in the path — `coolors.co/10121c-2c1e31-6b2643` —
 /// and pasting that link is, by every account of how these are shared, the
 /// commonest way one palette reaches another person.
 ///
-/// A segment that is **entirely** hex digits and a whole number of colours long
-/// is split into six-digit groups, because some sites run them together with no
-/// separator at all. That reading is confined to a URL path segment on purpose:
-/// nothing else puts a twenty-four-character hex string there, where in
-/// ordinary text it would be a rule that turns any long identifier into four
-/// colours.
+/// **The segment has to be a palette and nothing else**, and that is the whole
+/// of what this function decides. A URL's last segment is handed to [`collect`]
+/// as a line of *bare* codes, which switches off the rule the rest of the
+/// parser rests on — so without a test here, `wikipedia.org/wiki/Facade` is a
+/// pink, `example.com/decade` is a mauve, and `github.com/x/y/commit/deadbeef`
+/// is a blue with a false transparency notice beside it. Requiring at least two
+/// pieces, every one of them exactly six hex digits, refuses all four while
+/// keeping every palette link anybody actually shares: a palette of one colour
+/// is not something a generator produces a link for.
+///
+/// A segment that is **entirely** hex digits and [`RUN_COLOURS`] colours long
+/// is split into six-digit groups first, because some sites run them together
+/// with no separator at all. That reading is confined to a URL path segment on
+/// purpose, and to four colours or more for the reason the constant gives.
 fn unwrap_url(token: &str) -> Option<Cow<'_, str>> {
     if !looks_like_url(token) {
         return None;
@@ -398,16 +424,23 @@ fn unwrap_url(token: &str) -> Option<Cow<'_, str>> {
     let cut = token.find(['?', '#']).unwrap_or(token.len());
     let path = &token[..cut];
     let segment = path.rsplit('/').find(|piece| !piece.is_empty())?;
-    let hex = segment.len() >= 12
+
+    let run = segment.len() >= RUN_COLOURS * 6
         && segment.len() % 6 == 0
         && segment.bytes().all(|b| b.is_ascii_hexdigit());
-    if hex {
+    if run {
         let groups: Vec<&str> = (0..segment.len() / 6)
             .map(|group| &segment[group * 6..group * 6 + 6])
             .collect();
         return Some(Cow::Owned(groups.join("-")));
     }
-    Some(Cow::Borrowed(segment))
+
+    let pieces: Vec<&str> = segment.split('-').filter(|p| !p.is_empty()).collect();
+    let palette = pieces.len() >= 2
+        && pieces
+            .iter()
+            .all(|piece| piece.len() == 6 && piece.bytes().all(|b| b.is_ascii_hexdigit()));
+    palette.then_some(Cow::Borrowed(segment))
 }
 
 /// What is left of a line once its one colour is taken out, as a name.
@@ -475,7 +508,6 @@ mod tests {
         assert_eq!(rgbs("#C72"), vec![[0xCC, 0x77, 0x22]]);
         assert_eq!(rgbs("#fff"), vec![[255, 255, 255]]);
         assert_eq!(rgbs("#000"), vec![[0, 0, 0]]);
-        assert_eq!(rgbs("#C72F"), vec![[0xCC, 0x77, 0x22]]);
         assert_eq!(rgbs("rgb(204, 119, 34)"), vec![[204, 119, 34]]);
         assert_eq!(rgbs("rgb(204 119 34)"), vec![[204, 119, 34]]);
         assert_eq!(rgbs("RGBA(204, 119, 34, 0.5)"), vec![[204, 119, 34]]);
@@ -494,6 +526,32 @@ mod tests {
         assert!(rgbs("#abcde").is_empty());
         assert!(rgbs("#abcdefa").is_empty());
         assert!(rgbs("abcdefa").is_empty());
+    }
+
+    /// **Four digits are refused, and that is a decision rather than a gap.**
+    /// CSS spells a translucent short colour `#RGBA`, and reading it made
+    /// `#1234` — an issue reference in every chat window there has ever been —
+    /// into a colour nobody wrote, *with* a "1 colour was partly transparent"
+    /// notice about its last digit. `#cafe`, `#face`, `#fade` and `#feed` are
+    /// ordinary CSS selectors and did the same. A refusal is the trade the
+    /// importers' rule already names.
+    #[test]
+    fn a_four_digit_code_is_refused_because_an_issue_reference_is_not_a_colour() {
+        for text in [
+            "#1234",
+            "see #1234 for the fix",
+            "#cafe",
+            "#face { }",
+            "#C72F",
+        ] {
+            let (found, losses) = parse(text, "test").expect("read");
+            assert!(found.is_empty(), "{text:?} became {found:?}");
+            assert!(!losses.any(), "{text:?} reported a loss it did not have");
+        }
+        // The six-digit selector is the one that cannot be told from a colour
+        // and is knowingly read as one. Pinned so it is a stated answer rather
+        // than an accident nobody wrote down.
+        assert_eq!(rgbs("#facade { color: red }"), vec![[0xfa, 0xca, 0xde]]);
     }
 
     /// **The rule the whole parser rests on.** A run of hex digits in prose is
@@ -564,7 +622,7 @@ mod tests {
         assert!(!opaque.any(), "an opaque paste loses nothing at all");
 
         let (swatches, lost) =
-            parse("#2c1e3180\nrgba(1, 2, 3, 0.5)\n#C72A\n", "test").expect("read");
+            parse("#2c1e3180\nrgba(1, 2, 3, 0.5)\n0x11223344\n", "test").expect("read");
         assert_eq!(lost.transparency, 3);
         assert_eq!(swatches.len(), 3);
         assert_eq!(lost.sentences().len(), 1);
@@ -594,8 +652,9 @@ mod tests {
             rgbs("Look at https://coolors.co/10121c-2c1e31 nice one").len(),
             2
         );
-        // A run with no separators is split only inside a URL segment, where
-        // nothing else puts a twenty-four character hex string.
+        // A run with no separators is split only inside a URL segment, and only
+        // at four colours or more: twelve hex characters in a path is a short
+        // git commit hash far more often than it is a pair of colours.
         assert_eq!(
             rgbs("https://colorhunt.co/palette/222831393e4652948979f2f2"),
             vec![
@@ -613,6 +672,13 @@ mod tests {
     /// A link that is not a palette contributes nothing rather than guessing,
     /// and a Windows path is not a link at all — its dot is on the wrong side
     /// of the slash.
+    ///
+    /// **The last four are the ones that matter.** A URL's segment is read as a
+    /// line of *bare* codes, which switches off the rule the whole parser rests
+    /// on, so without a test in `unwrap_url` a Wikipedia article on facades is
+    /// a pink, `/decade` is a mauve, and a short git commit hash is two
+    /// colours or one blue with a false transparency notice beside it. Every
+    /// one of these was live.
     #[test]
     fn something_that_is_not_a_palette_link_yields_nothing() {
         for link in [
@@ -621,8 +687,14 @@ mod tests {
             "https://example.com/some-page-name",
             "C:/Users/somebody/palette.gpl",
             "/home/somebody/palette.gpl",
+            "https://en.wikipedia.org/wiki/Facade",
+            "https://example.com/decade",
+            "https://github.com/owner/repo/commit/a1b2c3d4e5f6",
+            "https://github.com/owner/repo/commit/deadbeef",
         ] {
-            assert!(rgbs(link).is_empty(), "{link}");
+            let (found, losses) = parse(link, "test").expect("read");
+            assert!(found.is_empty(), "{link} became {found:?}");
+            assert!(!losses.any(), "{link} reported a loss it did not have");
         }
     }
 

@@ -150,9 +150,13 @@ impl Format {
 
     /// Which format a path names, by extension alone.
     ///
-    /// By extension and never by sniffing the bytes: `.txt` and `.hex` hold the
-    /// same digits and differ only in how an eight-digit code is read, which no
-    /// amount of looking at the file can settle.
+    /// By extension and never by sniffing the bytes. `.hex` and `.txt` are in
+    /// fact the *same* reader — see [`text`], which is the one parser both a
+    /// paste and either file go through — so nothing is being told apart there;
+    /// the point is `.gpl`, `.pal`, `.ase` and `.aco`, where guessing from a
+    /// header would mean a file with a plausible first four bytes being read as
+    /// a format nobody said it was. `read_pal` is the one place bytes decide
+    /// anything, and only because the extension genuinely names two formats.
     pub fn of_path(path: &Path) -> Option<Format> {
         let extension = path.extension()?.to_str()?;
         Format::ALL
@@ -212,55 +216,68 @@ impl Losses {
     /// No em-dashes and no house voice: these are drawn in a dialog over
     /// somebody's canvas. See CLAUDE.md's README section, which holds every
     /// string the interface draws to the same standard.
+    ///
+    /// **It opens by destructuring, and that is not style.** [`Self::any`] is
+    /// `self != default`, which is total by construction — a seventh field
+    /// counts itself. This is six hand-written blocks, and left as
+    /// `if self.field > 0` a seventh would be *silently* absent from it: a
+    /// paste would then raise a notice with a heading and no lines in it, and
+    /// an import, which guards on `lines.is_empty()`, would say nothing at all.
+    /// That is exactly the partial-exhaustiveness failure CLAUDE.md records,
+    /// in struct form, with the derived reading total and its hand-written twin
+    /// quiet. The `let` makes the seventh field a **compile error** instead.
     pub fn sentences(self) -> Vec<String> {
+        let Losses {
+            skipped,
+            transparency,
+            cmyk,
+            lab,
+            grey,
+            groups,
+        } = self;
         let mut out = Vec::new();
-        if self.skipped > 0 {
+        if skipped > 0 {
             out.push(format!(
-                "{} {} not read, because {} did not hold to the format.",
-                self.skipped,
-                plural(self.skipped, "entry was", "entries were"),
-                plural(self.skipped, "it", "they")
+                "{skipped} {} not read, because {} did not hold to the format.",
+                plural(skipped, "entry was", "entries were"),
+                plural(skipped, "it", "they")
             ));
         }
-        if self.transparency > 0 {
+        if transparency > 0 {
             out.push(format!(
-                "{} {} partly transparent. A palette names a colour, so the \
-                 transparency was dropped and how much goes down is the \
-                 brush's opacity.",
-                self.transparency,
-                plural(self.transparency, "colour was", "colours were")
+                "{transparency} {} partly transparent. A palette names a \
+                 colour, so the transparency was dropped and how much goes \
+                 down is the brush's opacity.",
+                plural(transparency, "colour was", "colours were")
             ));
         }
-        if self.cmyk > 0 {
+        if cmyk > 0 {
             out.push(format!(
-                "{} {} CMYK. The file carries no colour profile, so those are \
-                 an approximation and will not match a print proof.",
-                self.cmyk,
-                plural(self.cmyk, "colour was", "colours were")
+                "{cmyk} {} CMYK. The file carries no colour profile, so those \
+                 are an approximation and will not match a print proof.",
+                plural(cmyk, "colour was", "colours were")
             ));
         }
-        if self.lab > 0 {
+        if lab > 0 {
             out.push(format!(
-                "{} {} CIE Lab. Umber converted them against the D50 white \
+                "{lab} {} CIE Lab. Umber converted them against the D50 white \
                  point Adobe states Lab in, which is an approximation.",
-                self.lab,
-                plural(self.lab, "colour was", "colours were")
+                plural(lab, "colour was", "colours were")
             ));
         }
-        if self.grey > 0 {
+        if grey > 0 {
             out.push(format!(
-                "{} {} grey with no grey profile beside it, so Umber read the \
-                 level as sRGB.",
-                self.grey,
-                plural(self.grey, "colour was", "colours were")
+                "{grey} {} grey with no grey profile beside it, so Umber read \
+                 the level as sRGB.",
+                plural(grey, "colour was", "colours were")
             ));
         }
-        if self.groups > 0 {
+        if groups > 0 {
             out.push(format!(
-                "The file sorted its colours into {} {}. A .gpl keeps one flat \
-                 row, so the colours are all here and the grouping is not.",
-                self.groups,
-                plural(self.groups, "group", "groups")
+                "The file sorted its colours into {groups} {}. A .gpl keeps \
+                 one flat row, so the colours are all here and the grouping is \
+                 not.",
+                plural(groups, "group", "groups")
             ));
         }
         out
@@ -357,32 +374,56 @@ fn named(name: String, swatches: Vec<Swatch>) -> Palette {
 
 /// The filename without its extension, which is what every palette reader in
 /// the world falls back to for a file that states no name of its own.
+///
+/// Through the file writer's own cleaning rule, for the reason `Swatch::name`
+/// is: a filename may hold a tab or a control character on some filesystems,
+/// and `to_gpl` would take it out — so the panel would show one name and a save
+/// and a reopen would give back another.
 fn file_stem(path: &Path) -> String {
     path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.trim().is_empty())
+        .map(|stem| crate::palette::clean_line(&stem.to_string_lossy()))
+        .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| crate::palette::UNTITLED.to_owned())
 }
 
-/// A file's bytes, refused before they are read if the file is too large.
+/// A file's bytes, refused if the file is too large.
 ///
-/// The length is taken from the directory entry rather than by reading and then
-/// measuring, which is the whole point: a bound applied after the allocation is
-/// not a bound.
+/// **The read itself is bounded, not only the reported length**, and both
+/// halves are needed. `metadata` is consulted first so an ordinary large file
+/// is refused before a byte of it is touched; but it follows symlinks, and it
+/// reports **zero** for a character device, a FIFO and everything under procfs,
+/// all of which the file dialog's "All files" filter can select. A bound that
+/// trusted the reported length would read `/dev/zero` until the process died.
+/// So the reader is capped at one byte past the limit and the answer is checked
+/// afterwards, which is what makes the guarantee true rather than reported.
 pub fn read_bytes(path: &Path) -> Result<Vec<u8>, PaletteError> {
+    use std::io::Read;
+
     let io = |source| PaletteError::Io {
         path: path.to_path_buf(),
         source,
     };
+    let too_large = |len: u64| PaletteError::TooLarge {
+        source: path.display().to_string(),
+        len,
+        max: MAX_FILE_BYTES,
+    };
     let len = fs::metadata(path).map_err(io)?.len();
     if len > MAX_FILE_BYTES {
-        return Err(PaletteError::TooLarge {
-            source: path.display().to_string(),
-            len,
-            max: MAX_FILE_BYTES,
-        });
+        return Err(too_large(len));
     }
-    fs::read(path).map_err(io)
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(io)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        // Whatever this is, it is not the size it claimed to be, so the figure
+        // reported is what was actually read rather than what was promised.
+        return Err(too_large(bytes.len() as u64));
+    }
+    Ok(bytes)
 }
 
 /// Bytes as text, **lossily**, with a byte-order mark taken off.
@@ -511,13 +552,19 @@ fn read_riff_pal(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pa
             "its “data” chunk is too short to hold a palette header",
         ));
     }
-    // The count is read for the diagnostic below and never used to size an
-    // allocation: what bounds the loop is the bytes that are actually there.
+    // The count never sizes an allocation — what bounds the loop is the bytes
+    // that are actually there — but it **does** bound how many of them are
+    // colours, and that half is not optional. A RIFF palette is commonly
+    // written at a fixed length with the unused entries left as zeroes, and a
+    // zero entry is *black*: reading every four-byte group would import a run
+    // of blacks nobody chose, which is precisely the hazard this module refuses
+    // `.act` outright for. So `take(stated)`, and the shortfall the other way
+    // is a named loss.
     let stated = u16::from_le_bytes([body[2], body[3]]) as usize;
     let entries = &body[4..];
     let mut out = Vec::new();
     let mut losses = Losses::default();
-    for entry in entries.chunks_exact(4) {
+    for entry in entries.chunks_exact(4).take(stated) {
         push(
             &mut out,
             Swatch::new([entry[0], entry[1], entry[2]]),
@@ -526,8 +573,21 @@ fn read_riff_pal(bytes: &[u8], source: &str) -> Result<(Vec<Swatch>, Losses), Pa
     }
     // A file claiming more colours than it carries has lost them somewhere, and
     // that is a loss rather than a refusal — the ones that are there are good.
-    losses.skipped = stated.saturating_sub(out.len());
+    losses.skipped = shortfall(stated, out.len());
     Ok((out, losses))
+}
+
+/// How many entries a header promised and the bytes did not supply, as a figure
+/// a sentence can carry.
+///
+/// **Capped**, because the count is a number in a file a stranger wrote and the
+/// arithmetic is otherwise correct and unusable: corrupt four bytes of a good
+/// `.ase` and the notice reads "4294967294 entries were not read". Nothing may
+/// hold more than [`MAX_SWATCHES`] anyway, so that is the largest figure that
+/// means anything, and the sentence is then about a damaged file rather than
+/// about a number.
+pub(crate) fn shortfall(stated: usize, read: usize) -> usize {
+    stated.saturating_sub(read).min(MAX_SWATCHES)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +824,38 @@ mod tests {
         assert_eq!(losses, Losses::default());
     }
 
+    /// **Padding is not black.** A RIFF palette is commonly written at a fixed
+    /// length with the unused entries left as zeroes, and a zero entry is a
+    /// black. Reading every four-byte group in the chunk therefore imports a
+    /// run of blacks nobody chose, which is exactly the hazard this module
+    /// refuses `.act` outright for and says so in its own docs — and it had it.
+    /// The count is what bounds how many entries are colours.
+    #[test]
+    fn riff_padding_is_not_imported_as_a_row_of_blacks() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0300u16.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes()); // two colours
+        body.extend_from_slice(&[10, 20, 30, 0]);
+        body.extend_from_slice(&[40, 50, 60, 0]);
+        // Room for 256 entries, as a fixed-size writer leaves it.
+        body.resize(4 + 256 * 4, 0);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&((4 + 8 + body.len()) as u32).to_le_bytes());
+        file.extend_from_slice(b"PAL ");
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body);
+
+        let (swatches, losses) = read_pal(&file, "test").expect("a palette");
+        assert_eq!(
+            swatches,
+            vec![Swatch::new([10, 20, 30]), Swatch::new([40, 50, 60])],
+            "the padding came in as colours"
+        );
+        assert_eq!(losses, Losses::default());
+    }
+
     /// A count is a number in a file a stranger wrote. It may not size an
     /// allocation, and where it disagrees with the bytes the bytes win and the
     /// difference is reported.
@@ -783,7 +875,10 @@ mod tests {
 
         let (swatches, losses) = read_pal(&file, "test").expect("the colour that is there");
         assert_eq!(swatches, vec![Swatch::new([10, 20, 30])]);
-        assert_eq!(losses.skipped, 65534);
+        // Capped rather than the arithmetically correct 65,534: a count that
+        // absurd means a damaged file, and "65534 entries were not read" is a
+        // sentence nobody can act on. See `shortfall`.
+        assert_eq!(losses.skipped, MAX_SWATCHES);
 
         // And a chunk length past the end of the file is refused rather than
         // sliced.
