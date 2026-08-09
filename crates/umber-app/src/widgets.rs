@@ -4011,23 +4011,27 @@ mod tests {
         for tweak in Tweak::ALL {
             let figure = tweak.figure();
             let range = tweak.range();
-            for value in [*range.start(), *range.end(), 0.0, 1.0] {
-                let value = value.clamp(*range.start(), *range.end());
-                // Only where the readout states the value exactly, which is
-                // what a round trip can promise at nought decimal places.
-                let Some(back) = figure.parse(&figure.format(value)) else {
-                    panic!(
-                        "{tweak:?} showed {value} as {:?} and refused it",
-                        figure.format(value)
-                    );
-                };
-                if (back - value).abs() > 1e-4 {
-                    assert!(
-                        (figure.format(back)) == figure.format(value),
-                        "{tweak:?}: {value} showed as {:?} and read back as {back}",
-                        figure.format(value)
-                    );
-                }
+            // Both ends and a rung half way, each pulled onto a figure the
+            // readout can state exactly. Every one of these is drawn at nought
+            // decimal places, so a value *between* two of them is not
+            // something a round trip could promise and asserting over one
+            // would be asserting about `format!`'s rounding instead.
+            let mid =
+                ((*range.start() + *range.end()) * 0.5 * figure.per_unit).round() / figure.per_unit;
+            for value in [*range.start(), *range.end(), mid] {
+                assert_eq!(
+                    figure.parse(&figure.format(value)),
+                    Some(value),
+                    "{tweak:?} showed {value} as {:?} and did not read it back",
+                    figure.format(value)
+                );
+                assert_eq!(
+                    figure.parse(&figure.bare(value)),
+                    Some(value),
+                    "{tweak:?} offered {value} as {:?} to be typed over and did not read \
+                     it back",
+                    figure.bare(value)
+                );
             }
         }
     }
